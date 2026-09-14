@@ -1574,7 +1574,7 @@ fn main() -> anyhow::Result<()> {
             if let Err(e) = crystalline_service::temp_store::point_at_state_dir() {
                 eprintln!("crystalline: could not claim a scratch directory: {e}");
             }
-            on_runtime(move || {
+            match on_runtime(move || {
                 crystalline_service::run_serve(
                     daemon,
                     autostarted,
@@ -1585,7 +1585,25 @@ fn main() -> anyhow::Result<()> {
                     read_only,
                     take_over,
                 )
-            })
+            }) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    // A lost index lock gets its own exit code so a unit file
+                    // can stop restarting on it (RestartPreventExitStatus).
+                    // Matched by type, never by message text. `serve` alone:
+                    // the embedded MCP stack and `hold-lock` take the same
+                    // lock and keep today's exit behaviour, inheriting only
+                    // the better wording.
+                    if err
+                        .downcast_ref::<crystalline_service::LockHeld>()
+                        .is_some()
+                    {
+                        eprintln!("Error: {err}");
+                        std::process::exit(crystalline_service::EXIT_LOCK_HELD);
+                    }
+                    Err(err)
+                }
+            }
         }
         Some(Command::Mcp {
             embedded,

@@ -17,7 +17,7 @@ use serde_json::Value;
 /// the releases page, so a single fixture exercises the interesting path.
 fn mcpb_skew_status() -> StubStatus {
     StubStatus {
-        reason: "cannot run an embedded MCP server: another Crystalline instance owns the index (pid 4242)".to_string(),
+        reason: "cannot run an embedded MCP server: this process asked for the index, but another Crystalline instance already owns it: pid 4242, v99.0.0, started by serve, and its record says it bound 127.0.0.1:7411".to_string(),
         binary_version: crystalline_core::VERSION.to_string(),
         daemon_version: Some("99.0.0".to_string()),
         daemon_pid: Some(4242),

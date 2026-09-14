@@ -282,7 +282,11 @@ fn daemon_publishes_a_readable_record_and_serves_mcp_over_the_pipe() {
 }
 
 /// A second serve must fail fast and name the live owner's real pid: before the
-/// split it could not even read who owned the lock, so it reported pid 0.
+/// split it could not even read who owned the lock, so it reported pid 0. It
+/// must also exit on the lock's own code (3, so a unit file can set
+/// RestartPreventExitStatus) and name the key that reconciles the two
+/// bindings. The unix leg of the same contract lives in service.rs, as
+/// `a_serve_that_loses_the_lock_exits_three_and_says_what_was_lost`.
 #[test]
 fn a_second_serve_fails_fast_naming_the_owner() {
     let env = Env::new("win-second");
@@ -297,15 +301,19 @@ fn a_second_serve_fails_fast_naming_the_owner() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert!(
-        !out.status.success(),
-        "the second serve exits nonzero while the owner holds the lock"
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "lock loss has its own exit code, not the generic 1"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("another Crystalline instance owns the index")
-            && stderr.contains(&owner_pid.to_string()),
+        stderr.contains(&owner_pid.to_string()),
         "the refusal names the live owner (pid {owner_pid}): {stderr}"
+    );
+    assert!(
+        stderr.contains("service.http"),
+        "and the key that makes every daemon here bind the same way: {stderr}"
     );
 
     drop(daemon);

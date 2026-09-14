@@ -357,7 +357,7 @@ mod tests {
         channel: Option<&str>,
     ) -> StubStatus {
         StubStatus {
-            reason: "cannot run an embedded MCP server: another Crystalline instance owns the index (pid 4242)".to_string(),
+            reason: "cannot run an embedded MCP server: this process asked for the index, but another Crystalline instance already owns it: pid 4242, v99.0.0, started by serve, and its record says it bound 127.0.0.1:7411".to_string(),
             binary_version: "0.8.2".to_string(),
             daemon_version: daemon_version.map(str::to_string),
             daemon_pid,

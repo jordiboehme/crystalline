@@ -1411,6 +1411,26 @@ fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Poll until a departing daemon has let the index lock go.
+///
+/// `Ownership`'s drop removes the owner record, unlocks and only then removes
+/// the lock file, so the lock file's absence is the last step and the honest
+/// signal that a fresh `serve` can take the lock. Without it a test that runs
+/// `ctl shutdown` and immediately starts a second daemon races the first one's
+/// teardown, and on a slow runner the second `serve` loses the lock and exits
+/// before it ever binds. Best effort: a holder killed with `-9` leaves the
+/// file behind with the lock already released, so a timeout returns quietly
+/// and lets the caller proceed.
+fn wait_lock_released(env: &Env) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(8) {
+        if !env.lock_path().exists() && !env.info_path().exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_port(addr: &str) {
     let start = Instant::now();
     loop {
@@ -1928,6 +1948,74 @@ fn evolve_reports_a_planted_finding_over_the_daemon() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// A second `serve` loses the index lock, and says so in a way an operator can
+/// act on: exit code 3 (distinct from every other startup failure, so a unit
+/// file can set RestartPreventExitStatus=3), and a message naming what this
+/// invocation asked to bind, what the holder's record says it bound, and the
+/// key that makes every daemon on the machine bind the same way.
+///
+/// The holder is alive for the whole test (the `Mcp` client keeps it up), so
+/// there is no teardown window to race here: the lock is held on purpose.
+#[test]
+fn a_serve_that_loses_the_lock_exits_three_and_says_what_was_lost() {
+    let env = Env::new("lockexit");
+    env.setup_domain("eng");
+
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+    let owner_pid = env
+        .lock_pid()
+        .expect("the autostarted daemon published a record");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut second = Command::new(bin());
+    env.apply(&mut second);
+    let out = second
+        .args([
+            "serve",
+            "--http",
+            &addr,
+            "--allowed-host",
+            "muthur.lan",
+            "--config",
+        ])
+        .arg(env.config_path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "lock loss has its own exit code, not the generic 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&addr),
+        "it names what this serve asked to bind: {stderr}"
+    );
+    assert!(
+        stderr.contains("muthur.lan"),
+        "and the allow-list it asked for: {stderr}"
+    );
+    assert!(
+        stderr.contains(&owner_pid.to_string()),
+        "it names the holder ({owner_pid}): {stderr}"
+    );
+    assert!(
+        stderr.contains("autostart"),
+        "and how the holder started: {stderr}"
+    );
+    assert!(
+        stderr.contains("service.http"),
+        "and the key that reconciles them: {stderr}"
+    );
+
+    drop(client);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The owner record says how its daemon was started. A daemon an agent's
 /// `crystalline mcp` connection spawned and one an operator ran are
 /// indistinguishable from the outside today, which is what let a managed unit
@@ -1950,6 +2038,9 @@ fn the_owner_record_says_how_the_daemon_was_started() {
     assert_eq!(record["http"], "off", "{record}");
     drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
+    // The autostarted daemon still owns the lock until its teardown finishes;
+    // a second serve started inside that window loses the lock and never binds.
+    wait_lock_released(&env);
 
     // A deliberate serve on the same state directory records the other mode.
     let port = free_port();
