@@ -28,3 +28,7 @@ __pycache__/
 .idea/
 .vscode/
 /.cargo/config.toml
+
+# Scale test corpus and run outputs (regenerated, never committed)
+evals/scale/corpus/
+evals/scale/out/
