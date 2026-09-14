@@ -257,6 +257,201 @@ impl TursoStore {
     /// cleared here: an upsert preserves them so [`Store::replace_chunks`] can
     /// carry over embeddings whose fingerprint is unchanged. Deleting an engram
     /// clears its chunks explicitly in [`Store::delete_engram`].
+    /// Write one row of the `engram` table, in one actor's dimension.
+    ///
+    /// The single writer behind both [`Store::upsert_engram`] (which passes the
+    /// empty actor, the base row) and [`Store::upsert_overlay`] (which passes
+    /// an actor key). Keeping them one body is what makes a draft a full engram
+    /// row rather than a second shape: the same children, the same tags, the
+    /// same id-stable upsert, and no read downstream has to know which of the
+    /// two wrote it.
+    ///
+    /// Everything this statement touches is scoped to `actor`, including the
+    /// duplicate-permalink probe: two actors may each hold `a` at their own
+    /// path, and only a clash inside one actor's own dimension is a conflict.
+    async fn upsert_row(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId> {
+        // One probe for both the existing-by-path row (insert vs update) and a
+        // duplicate-permalink owned by a different path. Pre-checking the
+        // duplicate means no failing statement aborts the batch transaction.
+        let probe = query_all(
+            &self.conn,
+            "SELECT id, path FROM engram WHERE domain_id=?1 AND actor=?4 AND (path=?2 OR permalink=?3)",
+            vec![
+                Value::Integer(domain.0),
+                Value::Text(record.path.clone()),
+                Value::Text(record.permalink.clone()),
+                Value::Text(actor.to_string()),
+            ],
+        )
+        .await?;
+        let mut existing_id: Option<i64> = None;
+        for r in &probe {
+            let row_path = cell_text(r, 1).unwrap_or_default();
+            if row_path == record.path {
+                existing_id = cell_i64(r, 0);
+            } else {
+                // The permalink is owned by a different path.
+                return Err(IndexError::Constraint(format!(
+                    "permalink '{}' already used by '{}'",
+                    record.permalink, row_path
+                )));
+            }
+        }
+
+        let params = vec![
+            Value::Integer(domain.0),
+            Value::Text(record.path.clone()),
+            Value::Text(record.permalink.clone()),
+            Value::Text(record.title.clone()),
+            Value::Text(record.engram_type.clone()),
+            Value::Text(record.status.clone()),
+            opt_text(&record.recorded_at),
+            opt_text(&record.valid_from),
+            opt_text(&record.valid_to),
+            opt_text(&record.timestamp),
+            opt_text(&record.description),
+            Value::Text(record.content.clone()),
+            Value::Text(record.metadata.to_string()),
+            Value::Integer(record.stamp.mtime),
+            Value::Integer(record.stamp.size as i64),
+            Value::Text(record.stamp.sha256.clone()),
+            Value::Text(actor.to_string()),
+            Value::Integer(record.tombstone as i64),
+        ];
+        self.conn
+            .execute(
+                "INSERT INTO engram(domain_id, path, permalink, title, engram_type, status, \
+                 recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
+                 mtime, size, sha256, actor, tombstone) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) \
+                 ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
+                 permalink=excluded.permalink, title=excluded.title, engram_type=excluded.engram_type, \
+                 status=excluded.status, recorded_at=excluded.recorded_at, valid_from=excluded.valid_from, \
+                 valid_to=excluded.valid_to, timestamp=excluded.timestamp, description=excluded.description, \
+                 content=excluded.content, metadata=excluded.metadata, mtime=excluded.mtime, \
+                 size=excluded.size, sha256=excluded.sha256, tombstone=excluded.tombstone",
+                params,
+            )
+            .await?;
+
+        // A new row's id is the last insert; an updated row keeps its id. Only
+        // an update needs its stale child rows cleared first.
+        let engram_id = match existing_id {
+            Some(id) => {
+                self.delete_children(id).await?;
+                id
+            }
+            None => self.conn.last_insert_rowid(),
+        };
+
+        // Observations: insert in chunks and read each new row's id back joined
+        // on its source line (unique within one engram), so observation tags map
+        // to the right observation without relying on RETURNING row order.
+        let mut obs_id_by_line: HashMap<i64, i64> = HashMap::new();
+        for batch in record.observations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 5);
+            for obs in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(obs.line as i64));
+                params.push(Value::Text(obs.category.clone()));
+                params.push(Value::Text(obs.content.clone()));
+                params.push(opt_text(&obs.context));
+            }
+            let rows = query_all(&self.conn, &observation_insert_sql(batch.len()), params).await?;
+            for r in &rows {
+                if let (Some(id), Some(line)) = (cell_i64(r, 0), cell_i64(r, 1)) {
+                    obs_id_by_line.insert(line, id);
+                }
+            }
+        }
+
+        // Observation tags: intern each tag through the cache, then insert the
+        // (observation, tag) pairs in multi-row statements.
+        let mut obs_tag_pairs: Vec<(i64, i64)> = Vec::new();
+        for obs in &record.observations {
+            let Some(&oid) = obs_id_by_line.get(&(obs.line as i64)) else {
+                continue;
+            };
+            for tag in &obs.tags {
+                let tid = self.tag_id(tag).await?;
+                obs_tag_pairs.push((oid, tid));
+            }
+        }
+        for batch in obs_tag_pairs.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 2);
+            for (oid, tid) in batch {
+                params.push(Value::Integer(*oid));
+                params.push(Value::Integer(*tid));
+            }
+            let sql = format!(
+                "INSERT OR IGNORE INTO observation_tag(observation_id, tag_id) VALUES {}",
+                value_rows(2, batch.len(), None)
+            );
+            self.conn.execute(&sql, params).await?;
+        }
+
+        for batch in record.relations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 7);
+            for rel in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(domain.0));
+                params.push(Value::Integer(rel.line as i64));
+                params.push(Value::Text(rel.rel_type.clone()));
+                params.push(Value::Text(rel.to_target.clone()));
+                params.push(opt_text(&rel.to_domain));
+                params.push(Value::Text(rel.to_raw.clone()));
+            }
+            let sql = format!(
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(7, batch.len(), Some("NULL"))
+            );
+            self.conn.execute(&sql, params).await?;
+        }
+
+        for batch in record.links.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 6);
+            for link in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(domain.0));
+                params.push(Value::Integer(link.line as i64));
+                params.push(Value::Text(link.to_target.clone()));
+                params.push(opt_text(&link.to_domain));
+                params.push(Value::Text(link.to_raw.clone()));
+            }
+            let sql = format!(
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(6, batch.len(), Some("NULL"))
+            );
+            self.conn.execute(&sql, params).await?;
+        }
+
+        // Engram tags: intern each tag, then insert the pairs in multi-row
+        // statements.
+        let mut tag_ids: Vec<i64> = Vec::with_capacity(record.tags.len());
+        for tag in &record.tags {
+            tag_ids.push(self.tag_id(tag).await?);
+        }
+        for batch in tag_ids.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 2);
+            for tid in batch {
+                params.push(Value::Integer(engram_id));
+                params.push(Value::Integer(*tid));
+            }
+            let sql = format!(
+                "INSERT OR IGNORE INTO engram_tag(engram_id, tag_id) VALUES {}",
+                value_rows(2, batch.len(), None)
+            );
+            self.conn.execute(&sql, params).await?;
+        }
+
+        Ok(EngramId(engram_id))
+    }
+
     async fn delete_children(&self, engram_id: i64) -> Result<()> {
         let eid = vec![Value::Integer(engram_id)];
         self.conn
@@ -421,6 +616,19 @@ fn like_escape(s: &str) -> String {
 fn path_prefix_like(n: usize, negated: bool) -> String {
     let not = if negated { " NOT" } else { "" };
     format!("lower(e.path){not} LIKE lower(?{n}) ESCAPE '\\'")
+}
+
+/// The `path, permalink, content, sha256, actor, tombstone` projection as a
+/// [`StoredEngram`], in that column order.
+fn stored_engram_from_row(row: &Row) -> StoredEngram {
+    StoredEngram {
+        path: cell_text(row, 0).unwrap_or_default(),
+        permalink: cell_text(row, 1).unwrap_or_default(),
+        content: cell_text(row, 2).unwrap_or_default(),
+        sha256: cell_text(row, 3).unwrap_or_default(),
+        actor: cell_text(row, 4).unwrap_or_default(),
+        tombstone: cell_i64(row, 5).unwrap_or(0) != 0,
+    }
 }
 
 fn cell_text(row: &Row, idx: usize) -> Option<String> {
@@ -596,7 +804,14 @@ impl Store for TursoStore {
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>> {
         let rows = query_all(
             &self.conn,
-            "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=?1",
+            // The snapshot names what is on disk, so it is the base rows and
+            // only the base rows. The sync driver derives its deletes by
+            // subtracting the walk from this map, so a draft here - a row that
+            // is on nobody's disk - would be proposed as a deletion on every
+            // single sync, and a draft at a base path would corrupt change
+            // detection outright. Same phantom-deletion class the generated
+            // indexes already document in `crystalline_remote::changes`.
+            "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=?1 AND actor = ''",
             vec![Value::Integer(domain.0)],
         )
         .await?;
@@ -621,178 +836,7 @@ impl Store for TursoStore {
     }
 
     async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId> {
-        // One probe for both the existing-by-path row (insert vs update) and a
-        // duplicate-permalink owned by a different path. Pre-checking the
-        // duplicate means no failing statement aborts the batch transaction.
-        let probe = query_all(
-            &self.conn,
-            "SELECT id, path FROM engram WHERE domain_id=?1 AND (path=?2 OR permalink=?3)",
-            vec![
-                Value::Integer(domain.0),
-                Value::Text(record.path.clone()),
-                Value::Text(record.permalink.clone()),
-            ],
-        )
-        .await?;
-        let mut existing_id: Option<i64> = None;
-        for r in &probe {
-            let row_path = cell_text(r, 1).unwrap_or_default();
-            if row_path == record.path {
-                existing_id = cell_i64(r, 0);
-            } else {
-                // The permalink is owned by a different path.
-                return Err(IndexError::Constraint(format!(
-                    "permalink '{}' already used by '{}'",
-                    record.permalink, row_path
-                )));
-            }
-        }
-
-        let params = vec![
-            Value::Integer(domain.0),
-            Value::Text(record.path.clone()),
-            Value::Text(record.permalink.clone()),
-            Value::Text(record.title.clone()),
-            Value::Text(record.engram_type.clone()),
-            Value::Text(record.status.clone()),
-            opt_text(&record.recorded_at),
-            opt_text(&record.valid_from),
-            opt_text(&record.valid_to),
-            opt_text(&record.timestamp),
-            opt_text(&record.description),
-            Value::Text(record.content.clone()),
-            Value::Text(record.metadata.to_string()),
-            Value::Integer(record.stamp.mtime),
-            Value::Integer(record.stamp.size as i64),
-            Value::Text(record.stamp.sha256.clone()),
-        ];
-        self.conn
-            .execute(
-                "INSERT INTO engram(domain_id, path, permalink, title, engram_type, status, \
-                 recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
-                 mtime, size, sha256) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
-                 ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
-                 permalink=excluded.permalink, title=excluded.title, engram_type=excluded.engram_type, \
-                 status=excluded.status, recorded_at=excluded.recorded_at, valid_from=excluded.valid_from, \
-                 valid_to=excluded.valid_to, timestamp=excluded.timestamp, description=excluded.description, \
-                 content=excluded.content, metadata=excluded.metadata, mtime=excluded.mtime, \
-                 size=excluded.size, sha256=excluded.sha256",
-                params,
-            )
-            .await?;
-
-        // A new row's id is the last insert; an updated row keeps its id. Only
-        // an update needs its stale child rows cleared first.
-        let engram_id = match existing_id {
-            Some(id) => {
-                self.delete_children(id).await?;
-                id
-            }
-            None => self.conn.last_insert_rowid(),
-        };
-
-        // Observations: insert in chunks and read each new row's id back joined
-        // on its source line (unique within one engram), so observation tags map
-        // to the right observation without relying on RETURNING row order.
-        let mut obs_id_by_line: HashMap<i64, i64> = HashMap::new();
-        for batch in record.observations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 5);
-            for obs in batch {
-                params.push(Value::Integer(engram_id));
-                params.push(Value::Integer(obs.line as i64));
-                params.push(Value::Text(obs.category.clone()));
-                params.push(Value::Text(obs.content.clone()));
-                params.push(opt_text(&obs.context));
-            }
-            let rows = query_all(&self.conn, &observation_insert_sql(batch.len()), params).await?;
-            for r in &rows {
-                if let (Some(id), Some(line)) = (cell_i64(r, 0), cell_i64(r, 1)) {
-                    obs_id_by_line.insert(line, id);
-                }
-            }
-        }
-
-        // Observation tags: intern each tag through the cache, then insert the
-        // (observation, tag) pairs in multi-row statements.
-        let mut obs_tag_pairs: Vec<(i64, i64)> = Vec::new();
-        for obs in &record.observations {
-            let Some(&oid) = obs_id_by_line.get(&(obs.line as i64)) else {
-                continue;
-            };
-            for tag in &obs.tags {
-                let tid = self.tag_id(tag).await?;
-                obs_tag_pairs.push((oid, tid));
-            }
-        }
-        for batch in obs_tag_pairs.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 2);
-            for (oid, tid) in batch {
-                params.push(Value::Integer(*oid));
-                params.push(Value::Integer(*tid));
-            }
-            let sql = format!(
-                "INSERT OR IGNORE INTO observation_tag(observation_id, tag_id) VALUES {}",
-                value_rows(2, batch.len(), None)
-            );
-            self.conn.execute(&sql, params).await?;
-        }
-
-        for batch in record.relations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 7);
-            for rel in batch {
-                params.push(Value::Integer(engram_id));
-                params.push(Value::Integer(domain.0));
-                params.push(Value::Integer(rel.line as i64));
-                params.push(Value::Text(rel.rel_type.clone()));
-                params.push(Value::Text(rel.to_target.clone()));
-                params.push(opt_text(&rel.to_domain));
-                params.push(Value::Text(rel.to_raw.clone()));
-            }
-            let sql = format!(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) VALUES {}",
-                value_rows(7, batch.len(), Some("NULL"))
-            );
-            self.conn.execute(&sql, params).await?;
-        }
-
-        for batch in record.links.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 6);
-            for link in batch {
-                params.push(Value::Integer(engram_id));
-                params.push(Value::Integer(domain.0));
-                params.push(Value::Integer(link.line as i64));
-                params.push(Value::Text(link.to_target.clone()));
-                params.push(opt_text(&link.to_domain));
-                params.push(Value::Text(link.to_raw.clone()));
-            }
-            let sql = format!(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) VALUES {}",
-                value_rows(6, batch.len(), Some("NULL"))
-            );
-            self.conn.execute(&sql, params).await?;
-        }
-
-        // Engram tags: intern each tag, then insert the pairs in multi-row
-        // statements.
-        let mut tag_ids: Vec<i64> = Vec::with_capacity(record.tags.len());
-        for tag in &record.tags {
-            tag_ids.push(self.tag_id(tag).await?);
-        }
-        for batch in tag_ids.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 2);
-            for tid in batch {
-                params.push(Value::Integer(engram_id));
-                params.push(Value::Integer(*tid));
-            }
-            let sql = format!(
-                "INSERT OR IGNORE INTO engram_tag(engram_id, tag_id) VALUES {}",
-                value_rows(2, batch.len(), None)
-            );
-            self.conn.execute(&sql, params).await?;
-        }
-
-        Ok(EngramId(engram_id))
+        self.upsert_row(domain, "", record).await
     }
 
     async fn upsert_engram_checked(
@@ -808,7 +852,7 @@ impl Store for TursoStore {
         if let Some(expected) = expected_sha {
             let stored = query_first(
                 &self.conn,
-                "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2",
+                "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
                 vec![Value::Integer(domain.0), Value::Text(record.path.clone())],
             )
             .await?
@@ -828,7 +872,7 @@ impl Store for TursoStore {
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
         let row = query_first(
             &self.conn,
-            "SELECT content FROM engram WHERE domain_id=?1 AND path=?2",
+            "SELECT content FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
             vec![Value::Integer(domain.0), Value::Text(path.to_string())],
         )
         .await?;
@@ -848,19 +892,12 @@ impl Store for TursoStore {
         // differ from turso's binary one.
         let rows = query_all(
             &self.conn,
-            "SELECT path, permalink, content, sha256 FROM engram WHERE domain_id=?1",
+            "SELECT path, permalink, content, sha256, actor, tombstone \
+             FROM engram WHERE domain_id=?1 AND actor = ''",
             vec![Value::Integer(domain.0)],
         )
         .await?;
-        let mut out: Vec<StoredEngram> = rows
-            .iter()
-            .map(|r| StoredEngram {
-                path: cell_text(r, 0).unwrap_or_default(),
-                permalink: cell_text(r, 1).unwrap_or_default(),
-                content: cell_text(r, 2).unwrap_or_default(),
-                sha256: cell_text(r, 3).unwrap_or_default(),
-            })
-            .collect();
+        let mut out: Vec<StoredEngram> = rows.iter().map(stored_engram_from_row).collect();
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
@@ -873,6 +910,10 @@ impl Store for TursoStore {
         // themselves; attachment blobs before the attachment rows that own
         // them. `upsert_domain` reuses the id for a name it has seen, so
         // anything left here would resurface as the next registration's own.
+        // -- actor: all - a domain's removal takes its drafts with it. Nothing
+        // survives the domain they were drafts of, so these statements name
+        // every actor's rows on purpose; the overlay journal is swept on the
+        // same paths so the rows and their mirror go together.
         let did = vec![Value::Integer(domain.0)];
         for sql in [
             "DELETE FROM observation_tag WHERE observation_id IN \
@@ -898,7 +939,10 @@ impl Store for TursoStore {
         self.invalidate_coverage();
         let id = query_first(
             &self.conn,
-            "SELECT id FROM engram WHERE domain_id=?1 AND path=?2",
+            // The base row at this path. A draft is dropped by its own
+            // actor through `clear_overlay_entry`, never by the sync driver
+            // noticing that a file left disk - the draft was never on disk.
+            "SELECT id FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
             vec![Value::Integer(domain.0), Value::Text(path.to_string())],
         )
         .await?
@@ -911,6 +955,8 @@ impl Store for TursoStore {
                     vec![Value::Integer(id)],
                 )
                 .await?;
+            // -- actor: all - the row is already named by its id, which the
+            // base-scoped lookup above resolved.
             self.conn
                 .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
                 .await?;
@@ -927,7 +973,7 @@ impl Store for TursoStore {
             .execute(
                 "UPDATE engram SET path=?1, \
                  permalink = CASE WHEN permalink=?2 THEN ?3 ELSE permalink END \
-                 WHERE domain_id=?4 AND path=?5",
+                 WHERE domain_id=?4 AND path=?5 AND actor = ''",
                 vec![
                     Value::Text(to.to_string()),
                     Value::Text(old_slug),
@@ -976,8 +1022,12 @@ impl Store for TursoStore {
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
         let row = query_first(
             &self.conn,
-            "SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id WHERE d.name=?1 AND e.permalink=?2",
-            vec![Value::Text(domain.to_string()), Value::Text(permalink.to_string())],
+            "SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE d.name=?1 AND e.permalink=?2 AND e.actor = ''",
+            vec![
+                Value::Text(domain.to_string()),
+                Value::Text(permalink.to_string()),
+            ],
         )
         .await?;
         Ok(row.and_then(|r| cell_i64(&r, 0)).map(EngramId))
@@ -988,7 +1038,7 @@ impl Store for TursoStore {
             &self.conn,
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name=?1 AND (e.permalink=?2 OR lower(e.title)=lower(?2)) \
+             WHERE e.actor = '' AND d.name=?1 AND (e.permalink=?2 OR lower(e.title)=lower(?2)) \
              ORDER BY CASE WHEN e.permalink=?2 THEN 0 ELSE 1 END, e.path LIMIT 1",
             vec![Value::Text(domain.to_string()), Value::Text(key.to_string())],
         )
@@ -1001,7 +1051,7 @@ impl Store for TursoStore {
             &self.conn,
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.permalink=?1 OR lower(e.title)=lower(?1) \
+             WHERE e.actor = '' AND (e.permalink=?1 OR lower(e.title)=lower(?1)) \
              ORDER BY CASE WHEN e.permalink=?1 THEN 0 ELSE 1 END, d.name, e.path",
             vec![Value::Text(key.to_string())],
         )
@@ -1029,7 +1079,8 @@ impl Store for TursoStore {
         }
         let sql = format!(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {} ORDER BY e.path",
+             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.actor = '' AND {} \
+             ORDER BY e.path",
             clauses.join(" AND ")
         );
         let rows = query_all(&self.conn, &sql, params).await?;
@@ -1087,7 +1138,8 @@ impl Store for TursoStore {
         let total = scalar_i64(
             &self.conn,
             &format!(
-                "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level}"
+                "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE e.actor = '' AND {level}"
             ),
             level_params.clone(),
         )
@@ -1098,7 +1150,8 @@ impl Store for TursoStore {
             &self.conn,
             &format!(
                 "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-                 FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level} \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE e.actor = '' AND {level} \
                  ORDER BY e.path LIMIT {limit}"
             ),
             level_params,
@@ -1126,7 +1179,7 @@ impl Store for TursoStore {
             &format!(
                 "SELECT DISTINCT substr({rel}, 1, instr({rel}, '/') - 1) \
                  FROM engram e JOIN domain d ON d.id=e.domain_id \
-                 WHERE {under} AND instr({rel}, '/') > 0"
+                 WHERE e.actor = '' AND {under} AND instr({rel}, '/') > 0"
             ),
             params,
         )
@@ -1158,7 +1211,7 @@ impl Store for TursoStore {
         let sql = format!(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE (EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+             WHERE e.actor = '' AND (EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
                             WHERE et.engram_id=e.id AND t.name=?1) \
                  OR EXISTS (SELECT 1 FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
                             JOIN observation o ON o.id=ot.observation_id \
@@ -1263,15 +1316,15 @@ impl Store for TursoStore {
             &self.conn,
             "SELECT d.name, r.domain_id, e.path, r.to_target, 0, r.to_domain \
              FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE r.to_id=?1 \
+             WHERE e.actor = '' AND (r.to_id=?1 \
                 OR (r.to_id IS NULL AND r.domain_id=?2 AND r.to_domain IS NULL \
-                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4))) \
+                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4)))) \
              UNION ALL \
              SELECT d.name, l.domain_id, e.path, l.to_target, 1, l.to_domain \
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE l.to_id=?1 \
+             WHERE e.actor = '' AND (l.to_id=?1 \
                 OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
-                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4))) \
+                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))) \
              ORDER BY 1, 3",
             params,
         )
@@ -1310,15 +1363,15 @@ impl Store for TursoStore {
             "SELECT d.name AS domain, e.permalink AS permalink, e.title AS title, \
                     e.path AS path, e.status AS status, r.rel_type AS rel \
              FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE r.to_id=?1 \
+             WHERE e.actor = '' AND (r.to_id=?1 \
                 OR (r.to_id IS NULL AND r.domain_id=?2 AND r.to_domain IS NULL \
-                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4))) \
+                    AND (r.to_target=?3 OR lower(r.to_target)=lower(?4)))) \
              UNION ALL \
              SELECT d.name, e.permalink, e.title, e.path, e.status, '{LINKS_TO}' \
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE l.to_id=?1 \
+             WHERE e.actor = '' AND (l.to_id=?1 \
                 OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
-                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4)))"
+                    AND (l.to_target=?3 OR lower(l.to_target)=lower(?4))))"
         );
         let target = || {
             vec![
@@ -1479,11 +1532,11 @@ impl Store for TursoStore {
             &self.conn,
             "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path \
              FROM relation r JOIN engram e ON e.id=r.engram_id \
-             WHERE r.to_id IS NULL AND r.domain_id=?1 \
+             WHERE e.actor = '' AND r.to_id IS NULL AND r.domain_id=?1 \
              UNION ALL \
              SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path \
              FROM link l JOIN engram e ON e.id=l.engram_id \
-             WHERE l.to_id IS NULL AND l.domain_id=?1 \
+             WHERE e.actor = '' AND l.to_id IS NULL AND l.domain_id=?1 \
              ORDER BY 7, 6, 2, 5",
             vec![Value::Integer(domain.0)],
         )
@@ -1566,11 +1619,10 @@ impl Store for TursoStore {
             where_clauses.push(format!("e.engram_type IN ({})", placeholders.join(",")));
         }
 
-        let where_sql = if where_clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_clauses.join(" AND "))
-        };
+        // The base predicate is the clause that is always present, so the
+        // reader-chosen filters join it rather than standing alone.
+        where_clauses.insert(0, "e.actor = ''".to_string());
+        let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
         let limit = if filter.limit == 0 { 20 } else { filter.limit };
         let sql = format!(
             "SELECT d.name, e.permalink, e.title, e.engram_type, e.status, e.recorded_at, \
@@ -1709,6 +1761,9 @@ impl Store for TursoStore {
                 })
                 .collect();
             sql.push_str(&format!(
+                // -- actor: all - a draft's chunks reach the same embedding
+                // backlog a base row's do, which is what makes an overlay entry
+                // a full engram row rather than a second shape.
                 " AND engram_id IN (SELECT id FROM engram WHERE domain_id IN ({}))",
                 placeholders.join(",")
             ));
@@ -1801,7 +1856,8 @@ impl Store for TursoStore {
             &self.conn,
             "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
              JOIN engram e ON e.id=c.engram_id \
-             WHERE e.domain_id=?1 AND c.seq=0 AND c.model=?2 AND c.embedding IS NOT NULL \
+             WHERE e.actor = '' AND e.domain_id=?1 AND c.seq=0 AND c.model=?2 \
+               AND c.embedding IS NOT NULL \
              ORDER BY c.engram_id ASC",
             vec![Value::Integer(domain.0), Value::Text(model.to_string())],
         )
@@ -1912,6 +1968,120 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    // --- the actor dimension -------------------------------------------------
+
+    async fn upsert_overlay(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "an overlay entry needs an actor; the empty actor is the base row".to_string(),
+            ));
+        }
+        self.upsert_row(domain, actor, record).await
+    }
+
+    async fn overlay_entry(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<StoredEngram>> {
+        if actor.is_empty() {
+            return Ok(None);
+        }
+        let row = query_first(
+            &self.conn,
+            "SELECT path, permalink, content, sha256, actor, tombstone \
+             FROM engram WHERE domain_id=?1 AND actor=?2 AND path=?3",
+            vec![
+                Value::Integer(domain.0),
+                Value::Text(actor.to_string()),
+                Value::Text(path.to_string()),
+            ],
+        )
+        .await?;
+        Ok(row.as_ref().map(stored_engram_from_row))
+    }
+
+    async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>> {
+        if actor.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Unordered in SQL and sorted by path in Rust, for the reason
+        // `all_engram_contents` spells out: this projection carries bodies, and
+        // an `ORDER BY` would push every one of them through the sorter.
+        let rows = query_all(
+            &self.conn,
+            "SELECT path, permalink, content, sha256, actor, tombstone \
+             FROM engram WHERE domain_id=?1 AND actor=?2",
+            vec![Value::Integer(domain.0), Value::Text(actor.to_string())],
+        )
+        .await?;
+        let mut out: Vec<StoredEngram> = rows.iter().map(stored_engram_from_row).collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool> {
+        if actor.is_empty() {
+            return Ok(false);
+        }
+        // Deletes the draft's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let id = query_first(
+            &self.conn,
+            "SELECT id FROM engram WHERE domain_id=?1 AND actor=?2 AND path=?3",
+            vec![
+                Value::Integer(domain.0),
+                Value::Text(actor.to_string()),
+                Value::Text(path.to_string()),
+            ],
+        )
+        .await?
+        .and_then(|r| cell_i64(&r, 0));
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        self.delete_children(id).await?;
+        self.conn
+            .execute(
+                "DELETE FROM chunk WHERE engram_id=?1",
+                vec![Value::Integer(id)],
+            )
+            .await?;
+        // -- actor: all - the row is already named by its id, which one actor's
+        // own lookup above resolved.
+        self.conn
+            .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
+            .await?;
+        Ok(true)
+    }
+
+    async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT actor, count(*) FROM engram WHERE domain_id=?1 AND actor <> '' \
+             GROUP BY actor",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        let mut out: Vec<(String, u64)> = rows
+            .iter()
+            .filter_map(|r| {
+                let actor = cell_text(r, 0)?;
+                Some((actor, cell_i64(r, 1).unwrap_or(0).max(0) as u64))
+            })
+            .collect();
+        // Sorted in Rust so both backends order actors by bytes without either
+        // dialect's collation having a say.
+        out.sort();
+        Ok(out)
+    }
+
     async fn store_info(&self) -> Result<StoreInfo> {
         // The active full-text path in this milestone is always the candidate
         // scan. `fts_native` records the probe outcome for diagnostics; when a
@@ -1934,8 +2104,9 @@ impl Store for TursoStore {
         let rows = query_all(
             &self.conn,
             "SELECT d.id, d.name, d.path, d.kind, d.last_sync, \
-             (SELECT count(*) FROM engram e WHERE e.domain_id=d.id), \
-             (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=d.id), \
+             (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = ''), \
+             (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id \
+              WHERE e.domain_id=d.id AND e.actor = ''), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
@@ -2001,7 +2172,7 @@ impl Store for TursoStore {
              JOIN tag t ON t.id=et.tag_id \
              JOIN engram e ON e.id=et.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name=?1 GROUP BY t.id"
+             WHERE e.actor = '' AND d.name=?1 GROUP BY t.id"
         } else {
             "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id GROUP BY t.id"
         };
@@ -2013,7 +2184,7 @@ impl Store for TursoStore {
              JOIN observation o ON o.id=ot.observation_id \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name=?1 GROUP BY t.id"
+             WHERE e.actor = '' AND d.name=?1 GROUP BY t.id"
         } else {
             "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id GROUP BY t.id"
         };
@@ -2023,7 +2194,7 @@ impl Store for TursoStore {
             "SELECT o.category, COUNT(*) FROM observation o \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE o.category <> '' AND d.name=?1 GROUP BY o.category"
+             WHERE e.actor = '' AND o.category <> '' AND d.name=?1 GROUP BY o.category"
         } else {
             "SELECT o.category, COUNT(*) FROM observation o WHERE o.category <> '' GROUP BY o.category"
         };
@@ -2046,18 +2217,20 @@ impl Store for TursoStore {
         let type_sql = if domain.is_some() {
             "SELECT e.engram_type, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.engram_type <> '' AND d.name=?1 GROUP BY e.engram_type"
+             WHERE e.actor = '' AND e.engram_type <> '' AND d.name=?1 GROUP BY e.engram_type"
         } else {
-            "SELECT e.engram_type, COUNT(*) FROM engram e WHERE e.engram_type <> '' GROUP BY e.engram_type"
+            "SELECT e.engram_type, COUNT(*) FROM engram e \
+             WHERE e.actor = '' AND e.engram_type <> '' GROUP BY e.engram_type"
         };
         let types = decode(&query_all(&self.conn, type_sql, dparam()).await?);
 
         let status_sql = if domain.is_some() {
             "SELECT e.status, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.status <> '' AND d.name=?1 GROUP BY e.status"
+             WHERE e.actor = '' AND e.status <> '' AND d.name=?1 GROUP BY e.status"
         } else {
-            "SELECT e.status, COUNT(*) FROM engram e WHERE e.status <> '' GROUP BY e.status"
+            "SELECT e.status, COUNT(*) FROM engram e \
+             WHERE e.actor = '' AND e.status <> '' GROUP BY e.status"
         };
         let statuses = decode(&query_all(&self.conn, status_sql, dparam()).await?);
 
@@ -2350,6 +2523,8 @@ mod tests {
                 size: 4,
                 sha256: "sha".to_string(),
             },
+            actor: String::new(),
+            tombstone: false,
         }
     }
 

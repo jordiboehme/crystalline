@@ -59,6 +59,8 @@ fn record(path: &str, permalink: &str, content: &str, sha: &str) -> EngramRecord
             size: content.len() as u64,
             sha256: sha.to_string(),
         },
+        actor: String::new(),
+        tombstone: false,
     }
 }
 
@@ -5236,3 +5238,397 @@ parity!(
     registration_stamp_records_when_a_domain_was_last_seen,
     registration_stamp
 );
+
+// --- the actor dimension -----------------------------------------------------
+
+/// The body `sync_domain` stores for the fixture engram below: what the parser
+/// keeps of the file, heading and all.
+const BASE_BODY: &str = "\n# A\n\nbase body\n\n";
+
+/// An overlay row is a full engram row belonging to one actor, sitting beside
+/// the base row at the same path, and nothing that reads the base sees it.
+///
+/// This is the whole contract of the actor dimension in one body: a draft
+/// round-trips through the overlay verbs whole, it is addressed by actor so a
+/// second actor asking the same question gets nothing, and every base-facing
+/// read - content, listing, browse, stats, stamps, resolution, export, search -
+/// answers exactly what it answered before the draft existed. The file stamps
+/// are the sharpest of those: the sync driver derives deletes by subtracting
+/// the walk from that snapshot, so a draft leaking into it would be proposed as
+/// a deletion on every single sync.
+async fn overlay_rows_shadow_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "base body\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_id = store
+        .lookup_id("d", "a")
+        .await
+        .unwrap()
+        .expect("a base row");
+
+    // An empty actor is the base row's own name, so it is not an overlay and
+    // the verb refuses it rather than writing over the base.
+    let draft = record("a.md", "a", "draft body\n", "dddd");
+    assert!(
+        store.upsert_overlay(domain, "", &draft).await.is_err(),
+        "the empty actor names the base row, so it is not a draft key"
+    );
+
+    let draft_id = store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    assert_ne!(
+        draft_id, base_id,
+        "a draft is a row of its own, not an edit of the base row"
+    );
+
+    // Nothing that reads the base has changed.
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "the base content is what the files on disk say it is"
+    );
+    assert_eq!(
+        store.list_engrams("d", None, None).await.unwrap().len(),
+        1,
+        "the listing holds the base row alone"
+    );
+    assert_eq!(
+        store.browse_level("d", None, 1, 50).await.unwrap().total,
+        1,
+        "and the browse level counts the same one"
+    );
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stats.iter().find(|s| s.name == "d").unwrap().engrams,
+        1,
+        "a domain holding a draft is not a domain holding two engrams"
+    );
+    let stamps = store.file_stamps(domain).await.unwrap();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "the stamp snapshot names only what is on disk, or every sync would \
+         propose the draft as a deletion"
+    );
+    assert_eq!(
+        store.lookup_id("d", "a").await.unwrap(),
+        Some(base_id),
+        "resolution still lands on the base row"
+    );
+    assert_eq!(
+        store.find_engram("d", "a").await.unwrap().map(|d| d.id),
+        Some(base_id)
+    );
+    assert_eq!(
+        store.find_engram_any("a").await.unwrap().len(),
+        1,
+        "and the cross-domain lookup finds one answer, not two"
+    );
+    let exported = store.all_engram_contents(domain).await.unwrap();
+    assert_eq!(
+        exported
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![BASE_BODY],
+        "an export writes the domain back as its files, drafts excluded"
+    );
+    let hits = store.search(&SearchQuery::text("draft")).await.unwrap();
+    assert_eq!(hits.total, 0, "a draft is not in the base search either");
+
+    // And the draft itself round-trips, for its own actor only.
+    let mine = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .expect("alice sees her own draft");
+    assert_eq!(mine.content, "draft body\n");
+    assert_eq!(mine.path, "a.md");
+    assert_eq!(mine.permalink, "a");
+    assert_eq!(mine.actor, "alice");
+    assert!(!mine.tombstone, "an ordinary draft is not a tombstone");
+    assert!(
+        store
+            .overlay_entry(domain, "bob", "a.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "and nobody else's"
+    );
+    assert_eq!(
+        store.overlay_entries(domain, "alice").await.unwrap().len(),
+        1
+    );
+    assert!(
+        store
+            .overlay_entries(domain, "bob")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1)],
+        "the per-actor count names who holds drafts here and how many"
+    );
+
+    // A second write at the same path replaces the draft rather than adding one.
+    let second = record("a.md", "a", "later draft\n", "eeee");
+    let again = store
+        .upsert_overlay(domain, "alice", &second)
+        .await
+        .unwrap();
+    assert_eq!(again, draft_id, "one row per actor per path");
+    assert_eq!(
+        store
+            .overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "later draft\n"
+    );
+
+    // A second actor holds a draft at the same path without disturbing hers.
+    store
+        .upsert_overlay(domain, "bob", &record("a.md", "a", "bob's\n", "bbbb"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1), ("bob".to_string(), 1)],
+        "two actors, one path, one row each"
+    );
+
+    // Clearing is per actor and idempotent, and the base row is untouched.
+    assert!(
+        store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap(),
+        "clearing a draft that exists reports that it did"
+    );
+    assert!(
+        !store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap(),
+        "and clearing it again reports that there was nothing to clear"
+    );
+    assert!(
+        store
+            .overlay_entry(domain, "bob", "a.md")
+            .await
+            .unwrap()
+            .is_some(),
+        "the other actor's draft is still there"
+    );
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "and the base row never moved"
+    );
+}
+parity!(
+    overlay_rows_shadow_nothing_until_asked_and_round_trip,
+    overlay_rows_shadow_nothing
+);
+
+/// A tombstone is an overlay row like any other, carrying the flag instead of a
+/// replacement body.
+///
+/// It has to be a row rather than an absence for the same reason a draft does:
+/// it belongs to one actor, it survives a forced resync, and the journal that
+/// mirrors it needs something to mirror. What it must never do is reach the
+/// base - the file on disk is still there, so every base read still answers
+/// with it.
+async fn a_tombstone_is_a_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "base body\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let mut stone = record("a.md", "a", "", "");
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let entry = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .expect("the tombstone is a row, so it is found");
+    assert!(entry.tombstone, "and it says what it is");
+    assert_eq!(entry.actor, "alice");
+    assert_eq!(
+        store.overlay_entries(domain, "alice").await.unwrap().len(),
+        1,
+        "a tombstone is one of an actor's overlay entries"
+    );
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1)],
+        "and it counts as one"
+    );
+
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "the file on disk is still there, so the base still answers with it"
+    );
+    assert_eq!(
+        store.list_engrams("d", None, None).await.unwrap().len(),
+        1,
+        "and the base listing is one row, not two and not zero"
+    );
+    assert_eq!(
+        store.file_stamps(domain).await.unwrap().len(),
+        1,
+        "the stamp snapshot is what is on disk, tombstone or no tombstone"
+    );
+
+    // Turning a tombstone back into a draft is one more write at the same key.
+    store
+        .upsert_overlay(domain, "alice", &record("a.md", "a", "back\n", "aaaa"))
+        .await
+        .unwrap();
+    let entry = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !entry.tombstone,
+        "the flag clears with the row that carried it"
+    );
+    assert_eq!(entry.content, "back\n");
+}
+parity!(a_tombstone_is_an_overlay_row_too, a_tombstone_is_a_row);
+
+/// Every statement that reads the `engram` table says which actor's rows it
+/// means, or says in as many words that it means all of them.
+///
+/// A source scan rather than a behavioural assertion, because the failure this
+/// guards against is one a new statement introduces, not one an existing test
+/// exercises: the moment a read forgets the predicate, an actor's private draft
+/// leaks into somebody else's answer, and no existing test would notice because
+/// no existing test has a draft in it. Two cases are allowed and there is no
+/// third. Either the statement carries the base predicate (`actor = ''`, or a
+/// bound actor for the overlay verbs), or it carries a `-- actor: all` waiver
+/// saying in one line why it means every actor's rows.
+///
+/// `engram_tag` is not this table and is skipped: it has no actor column, and a
+/// predicate on it would not compile in either dialect. Writes are scanned
+/// alongside reads, because a `DELETE` that forgets the predicate destroys a
+/// draft rather than merely leaking one.
+#[test]
+fn every_engram_reading_sql_carries_an_actor_predicate() {
+    // The predicate in each of the spellings the two dialects and the bound
+    // forms use, and the waiver token.
+    const PREDICATES: &[&str] = &[
+        "actor = ''",
+        "actor=''",
+        "actor = ?",
+        "actor=?",
+        "actor = $",
+        "actor=$",
+        "actor=excluded",
+        // The overlay counts ask for every actor but the base one, which is as
+        // much a statement about whose rows it means as the base predicate is.
+        "actor <> ''",
+        // An insert says whose row it writes through the conflict target it
+        // names, which is the actor-aware unique index.
+        "ON CONFLICT(domain_id, path, actor)",
+    ];
+    const WAIVER: &str = "-- actor: all";
+    // How far around a statement its predicate or waiver may sit. A statement
+    // built from clause fragments has them a few lines above the SQL text.
+    const WINDOW: usize = 14;
+
+    let files: &[(&str, &str)] = &[
+        ("turso/mod.rs", include_str!("../src/turso/mod.rs")),
+        ("postgres/mod.rs", include_str!("../src/postgres/mod.rs")),
+        ("turso/search.rs", include_str!("../src/turso/search.rs")),
+        (
+            "postgres/search.rs",
+            include_str!("../src/postgres/search.rs"),
+        ),
+        ("store.rs", include_str!("../src/store.rs")),
+    ];
+
+    let mut sites = 0usize;
+    let mut waived = 0usize;
+    for (file, src) in files {
+        let lines: Vec<&str> = src.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !names_the_engram_table(line) {
+                continue;
+            }
+            sites += 1;
+            let lo = n.saturating_sub(WINDOW);
+            let hi = (n + WINDOW + 1).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            // The predicate is looked for first: a waiver in the window belongs
+            // to a neighbouring statement whenever this one names its actor,
+            // and counting it as waived here would hide the real waiver list.
+            if PREDICATES.iter().any(|p| window.contains(p)) {
+                continue;
+            }
+            if window.contains(WAIVER) {
+                waived += 1;
+                continue;
+            }
+            panic!(
+                "{file}:{} reads the engram table without saying whose rows it means, \
+                 and carries no `{WAIVER}` waiver either: {}",
+                n + 1,
+                line.trim()
+            );
+        }
+    }
+    assert_eq!(
+        sites, 106,
+        "the engram statement census moved; every new one needs a predicate or a waiver"
+    );
+    assert_eq!(
+        waived, 14,
+        "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
+         Seven per backend: the five statements of `clear_domain`, the id-scoped delete inside \
+         `delete_engram`, and `chunks_needing_embedding`'s domain scope"
+    );
+}
+
+/// Whether a line of source names the `engram` table itself, as opposed to
+/// `engram_tag` or an `engram_id` column.
+fn names_the_engram_table(line: &str) -> bool {
+    for keyword in ["FROM engram", "JOIN engram", "INTO engram", "UPDATE engram"] {
+        let mut rest = line;
+        while let Some(at) = rest.find(keyword) {
+            let tail = &rest[at + keyword.len()..];
+            if !tail.starts_with('_') {
+                return true;
+            }
+            rest = &rest[at + keyword.len()..];
+        }
+    }
+    false
+}

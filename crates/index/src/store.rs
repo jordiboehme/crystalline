@@ -92,15 +92,19 @@ pub(crate) fn reference_match(table: &str) -> String {
         "{table}.to_domain IS NOT NULL \
          AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
     );
+    // Every arm resolves to a base row. A draft is one actor's private reading
+    // of a path, so a reference in somebody else's engram must never land on
+    // it - a resolved edge is a fact about the domain, not about a reader.
     format!(
         "COALESCE(\
-         (SELECT e.id FROM engram e WHERE e.permalink = {table}.to_target \
+         (SELECT e.id FROM engram e WHERE e.actor = '' AND e.permalink = {table}.to_target \
           AND e.domain_id = {target_domain} LIMIT 1), \
-         (SELECT e.id FROM engram e WHERE lower(e.title) = lower({table}.to_target) \
+         (SELECT e.id FROM engram e WHERE e.actor = '' AND lower(e.title) = lower({table}.to_target) \
           AND e.domain_id = {target_domain} LIMIT 1), \
-         (SELECT e.id FROM engram e WHERE {unregistered} AND e.permalink = {table}.to_raw \
+         (SELECT e.id FROM engram e WHERE e.actor = '' AND {unregistered} AND e.permalink = {table}.to_raw \
           AND e.domain_id = {table}.domain_id LIMIT 1), \
-         (SELECT e.id FROM engram e WHERE {unregistered} AND lower(e.title) = lower({table}.to_raw) \
+         (SELECT e.id FROM engram e WHERE e.actor = '' AND {unregistered} \
+          AND lower(e.title) = lower({table}.to_raw) \
           AND e.domain_id = {table}.domain_id LIMIT 1))"
     )
 }
@@ -188,6 +192,21 @@ pub struct EngramRecord {
     pub links: Vec<LinkRecord>,
     /// The file stamp for the sync prefilter.
     pub stamp: FileStamp,
+    /// Whose row this is: the empty string for the base row - the one the
+    /// domain's files on disk say exists - and an actor key for that actor's
+    /// private draft of the same path.
+    ///
+    /// [`EngramRecord::from_engram`] never sets it, and that is the rule rather
+    /// than an omission: a record built by parsing a file describes what is on
+    /// disk, which is the base row by definition. An overlay write names its
+    /// actor as an argument, so the only records carrying one here are those a
+    /// caller built for an actor on purpose.
+    pub actor: String,
+    /// Whether this row is an actor's draft deletion of the base row at the
+    /// same path rather than a draft replacement of it. Never true on a base
+    /// row: the base is what the files say, and a file that is gone has no row
+    /// at all.
+    pub tombstone: bool,
 }
 
 fn date_str(d: Option<NaiveDate>) -> Option<String> {
@@ -291,6 +310,8 @@ impl EngramRecord {
             relations,
             links,
             stamp,
+            actor: String::new(),
+            tombstone: false,
         }
     }
 }
@@ -802,6 +823,12 @@ pub struct StoredEngram {
     pub content: String,
     /// The lowercase hex SHA-256 of `content`, the CAS token.
     pub sha256: String,
+    /// Whose row this is: the empty string for the base row, an actor key for
+    /// that actor's draft of the same path.
+    pub actor: String,
+    /// Whether the row is an actor's draft deletion of the base row rather than
+    /// a draft replacement of it. A tombstone carries no content of its own.
+    pub tombstone: bool,
 }
 
 /// One inbound reference to an engram: a relation or a prose link that resolves
@@ -1771,6 +1798,62 @@ pub trait Store: Send + Sync {
     /// domain's rebuild is unfinished and is never cleared by a run that did
     /// not finish one.
     async fn end_rebuild(&self, domain: DomainId) -> Result<()>;
+
+    // --- the actor dimension -------------------------------------------------
+    // An overlay entry is one actor's private draft of a path in a shared
+    // domain: a full `engram` row carrying that actor's key, sitting beside the
+    // base row - the one the domain's files on disk say exists - rather than
+    // replacing it. Because it is a full row, its chunks, embeddings and graph
+    // rows key to its id exactly as a base row's do, and nothing downstream has
+    // to learn a second shape.
+    //
+    // Every method above this comment reads the base and only the base. These
+    // five are the whole of the other direction: they name their actor, and an
+    // empty actor is refused rather than silently meaning the base.
+
+    /// Write one actor's draft of a path, replacing that actor's previous draft
+    /// there. Returns the row's id, which is stable across rewrites so the
+    /// chunks already keyed to it survive.
+    ///
+    /// `actor` is authoritative and `record.actor` is ignored, so a caller
+    /// cannot write into one actor's overlay while naming another. An empty
+    /// `actor` is a [`crate::IndexError::Constraint`]: the empty string is the
+    /// base row's own key, and a draft that silently overwrote the base would
+    /// be the one failure this whole dimension exists to prevent.
+    ///
+    /// A tombstone - this actor's draft deletion of the base row - is written
+    /// the same way, with `record.tombstone` set.
+    async fn upsert_overlay(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId>;
+
+    /// One actor's draft at a domain-relative path, or `None` when that actor
+    /// holds none there. A tombstone is a draft like any other and is returned,
+    /// carrying its flag; a caller deciding what a reader sees reads the flag
+    /// rather than the absence.
+    async fn overlay_entry(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<StoredEngram>>;
+
+    /// Every draft one actor holds in a domain, ordered by path. Tombstones
+    /// included, for the same reason.
+    async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>>;
+
+    /// Drop one actor's draft at a path. Returns whether a row was there to
+    /// drop, so a caller can tell "cleared" from "there was nothing to clear"
+    /// without asking twice.
+    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool>;
+
+    /// How many drafts each actor holds in a domain, ordered by actor. Base
+    /// rows are not counted and an actor holding none is not listed, so an
+    /// empty answer means nobody is drafting here.
+    async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>>;
 
     /// Diagnostics about the open store.
     async fn store_info(&self) -> Result<StoreInfo>;

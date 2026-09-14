@@ -151,12 +151,17 @@ async fn run_lexical(
         let mut params: Vec<Value> = Vec::new();
         let mut n = 1usize;
         build_scalar_filters(query, &mut clauses, &mut params, &mut n, aliases);
-        let where_sql = if clauses.is_empty() {
+        // The reader-chosen filters, as a trailing conjunction rather than a
+        // `WHERE` of their own: every statement below opens its own `WHERE` with
+        // the base predicate, so a search answers out of the domain's files and
+        // never out of somebody's draft. Threading the actor through here is Task
+        // 5's job; until then the base is the only dimension a search reads.
+        let and_filters = if clauses.is_empty() {
             String::new()
         } else {
-            format!("WHERE {}", clauses.join(" AND "))
+            format!("AND {}", clauses.join(" AND "))
         };
-        return filter_only(conn, &where_sql, params, limit, page).await;
+        return filter_only(conn, &and_filters, params, limit, page).await;
     }
 
     let mut scored = scored_lexical(conn, query, &terms, aliases, candidate_cap).await?;
@@ -216,10 +221,15 @@ async fn scored_lexical(
         clauses.push(format!("({})", ors.join(" OR ")));
     }
 
-    let where_sql = if clauses.is_empty() {
+    // The reader-chosen filters, as a trailing conjunction rather than a
+    // `WHERE` of their own: every statement below opens its own `WHERE` with
+    // the base predicate, so a search answers out of the domain's files and
+    // never out of somebody's draft. Threading the actor through here is Task
+    // 5's job; until then the base is the only dimension a search reads.
+    let and_filters = if clauses.is_empty() {
         String::new()
     } else {
-        format!("WHERE {}", clauses.join(" AND "))
+        format!("AND {}", clauses.join(" AND "))
     };
     // `ORDER BY e.id` is the cheapest order this wide projection can be given:
     // unscoped, or scoped by path alone, it is satisfied from the table's own
@@ -232,8 +242,8 @@ async fn scored_lexical(
     // `tests/turso_only.rs`. Keep the bound and keep the order: any other
     // ordering here, or a `GROUP BY`, would spill every matched body to disk.
     let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
-         ORDER BY e.id LIMIT {candidate_cap}"
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE e.actor = '' {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
     );
     let rows = query_all(conn, &sql, params).await?;
 
@@ -261,14 +271,17 @@ async fn scored_lexical(
 
 async fn filter_only(
     conn: &Connection,
-    where_sql: &str,
+    and_filters: &str,
     params: Vec<Value>,
     limit: usize,
     page: usize,
 ) -> Result<Page<SearchHit>> {
     let total = scalar_i64(
         conn,
-        &format!("SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}"),
+        &format!(
+            "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE e.actor = '' {and_filters}"
+        ),
         params.clone(),
     )
     .await?
@@ -280,7 +293,8 @@ async fn filter_only(
     // records, so the wide projection costs one page of bodies rather than the
     // whole match set. Adding a `GROUP BY` here would remove that bound.
     let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE e.actor = '' {and_filters} \
          ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
     );
     let rows = query_all(conn, &sql, params).await?;
@@ -527,11 +541,12 @@ const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_ty
 /// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
 /// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins)
 /// and costs nothing: it is the grouping key, already in the sorter record.
-fn semantic_phase1_sql(where_sql: &str) -> String {
+fn semantic_phase1_sql(and_filters: &str) -> String {
     format!(
         "SELECT c.engram_id, min(vector_distance_cos(c.embedding, ?1)) AS dist \
          FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
-         {where_sql} GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC LIMIT {SEMANTIC_TOPK}"
+         WHERE e.actor = '' {and_filters} \
+         GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC LIMIT {SEMANTIC_TOPK}"
     )
 }
 
@@ -542,7 +557,7 @@ fn semantic_phase1_sql(where_sql: &str) -> String {
 fn semantic_hydrate_sql(ids: &str) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE e.id IN ({ids})"
+         WHERE e.actor = '' AND e.id IN ({ids})"
     )
 }
 
@@ -578,8 +593,8 @@ async fn semantic_candidates(
         "c.embedding IS NOT NULL AND c.model = ?{model_ph} AND c.dims = ?{dims_ph}"
     ));
 
-    let where_sql = format!("WHERE {}", clauses.join(" AND "));
-    let rows = query_all(conn, &semantic_phase1_sql(&where_sql), params).await?;
+    let and_filters = format!("AND {}", clauses.join(" AND "));
+    let rows = query_all(conn, &semantic_phase1_sql(&and_filters), params).await?;
     let winners: Vec<(i64, f64)> = rows
         .iter()
         .map(|r| (cell_i64(r, 0).unwrap_or(0), cell_real(r, 1).unwrap_or(1.0)))
@@ -1156,7 +1171,8 @@ pub(super) async fn neighbors(
             &format!(
                 "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
                  CAST(json_extract(e.metadata, '$.salience') AS REAL), e.status \
-                 FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.id IN ({list}) ORDER BY e.id"
+                 FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE e.actor = '' AND e.id IN ({list}) ORDER BY e.id"
             ),
             vec![],
         )
@@ -1380,9 +1396,9 @@ mod tests {
     async fn the_semantic_split_plans_a_sorter_free_hydrate() {
         let store = crate::TursoStore::open_in_memory().await.unwrap();
 
-        let where_sql = "WHERE c.embedding IS NOT NULL AND c.model = ?2 AND c.dims = ?3";
+        let and_filters = "AND c.embedding IS NOT NULL AND c.model = ?2 AND c.dims = ?3";
         let phase1 = store
-            .explain_query_plan(&semantic_phase1_sql(where_sql))
+            .explain_query_plan(&semantic_phase1_sql(and_filters))
             .await
             .unwrap()
             .join(" | ");

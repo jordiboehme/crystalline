@@ -514,6 +514,23 @@ pub(super) async fn scalar_i64(
         .unwrap_or(0))
 }
 
+/// The `path, permalink, content, sha256, actor, tombstone` projection as a
+/// [`StoredEngram`], in that column order.
+fn stored_engram_from_row(row: &PgRow) -> StoredEngram {
+    StoredEngram {
+        path: cell_text(row, 0).unwrap_or_default(),
+        permalink: cell_text(row, 1).unwrap_or_default(),
+        content: cell_text(row, 2).unwrap_or_default(),
+        sha256: cell_text(row, 3).unwrap_or_default(),
+        actor: cell_text(row, 4).unwrap_or_default(),
+        tombstone: row
+            .try_get::<Option<bool>, _>(5)
+            .ok()
+            .flatten()
+            .unwrap_or(false),
+    }
+}
+
 pub(super) fn cell_i64(row: &PgRow, idx: usize) -> Option<i64> {
     row.try_get::<Option<i64>, _>(idx).ok().flatten()
 }
@@ -738,11 +755,18 @@ impl Store for PostgresStore {
 
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>> {
         let mut conn = self.acquire().await?;
-        let rows = sqlx::query("SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=$1")
-            .bind(domain.0)
-            .fetch_all(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
+        // The snapshot names what is on disk, so it is the base rows and only
+        // the base rows. The sync driver derives its deletes by subtracting the
+        // walk from this map, so a draft here - a row that is on nobody's disk -
+        // would be proposed as a deletion on every single sync, and a draft at a
+        // base path would corrupt change detection outright.
+        let rows = sqlx::query(
+            "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=$1 AND actor = ''",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
         let mut out = HashMap::with_capacity(rows.len());
         for r in &rows {
             let Some(path) = cell_text(r, 0) else {
@@ -761,177 +785,7 @@ impl Store for PostgresStore {
     }
 
     async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId> {
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-
-        // One probe for both the existing-by-path row and a duplicate permalink
-        // owned by a different path. Pre-checking the duplicate keeps a failing
-        // unique-violation from aborting the surrounding batch transaction, so
-        // the sync engine can collect it into `failed` instead.
-        let probe = sqlx::query(
-            "SELECT id, path FROM engram WHERE domain_id=$1 AND (path=$2 OR permalink=$3)",
-        )
-        .bind(domain.0)
-        .bind(&record.path)
-        .bind(&record.permalink)
-        .fetch_all(&mut *c)
-        .await
-        .map_err(IndexError::from)?;
-        let mut existing_id: Option<i64> = None;
-        for r in &probe {
-            let row_path = cell_text(r, 1).unwrap_or_default();
-            if row_path == record.path {
-                existing_id = cell_i64(r, 0);
-            } else {
-                return Err(IndexError::Constraint(format!(
-                    "permalink '{}' already used by '{}'",
-                    record.permalink, row_path
-                )));
-            }
-        }
-
-        // `RETURNING id` yields the id on both insert and conflict-update, so no
-        // separate id lookup is needed.
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO engram(domain_id, path, permalink, title, engram_type, status, \
-             recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
-             mtime, size, sha256) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16) \
-             ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
-             permalink=EXCLUDED.permalink, title=EXCLUDED.title, engram_type=EXCLUDED.engram_type, \
-             status=EXCLUDED.status, recorded_at=EXCLUDED.recorded_at, valid_from=EXCLUDED.valid_from, \
-             valid_to=EXCLUDED.valid_to, timestamp=EXCLUDED.timestamp, description=EXCLUDED.description, \
-             content=EXCLUDED.content, metadata=EXCLUDED.metadata, mtime=EXCLUDED.mtime, \
-             size=EXCLUDED.size, sha256=EXCLUDED.sha256 \
-             RETURNING id",
-        )
-        .bind(domain.0)
-        .bind(&record.path)
-        .bind(&record.permalink)
-        .bind(&record.title)
-        .bind(&record.engram_type)
-        .bind(&record.status)
-        .bind(record.recorded_at.as_deref())
-        .bind(record.valid_from.as_deref())
-        .bind(record.valid_to.as_deref())
-        .bind(record.timestamp.as_deref())
-        .bind(record.description.as_deref())
-        .bind(&record.content)
-        .bind(record.metadata.to_string())
-        .bind(record.stamp.mtime)
-        .bind(record.stamp.size as i64)
-        .bind(&record.stamp.sha256)
-        .fetch_one(&mut *c)
-        .await
-        .map_err(IndexError::from)?;
-        let engram_id = row.0;
-
-        // Only an update needs its stale child rows cleared first.
-        if existing_id.is_some() {
-            delete_children(&mut *c, engram_id).await?;
-        }
-
-        // Observations: insert in chunks and read each new row's id back joined
-        // on its source line (unique within one engram), so observation tags map
-        // to the right observation without relying on RETURNING row order.
-        let mut obs_id_by_line: HashMap<i64, i64> = HashMap::new();
-        for batch in record.observations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 5);
-            for obs in batch {
-                params.push(Param::Int(engram_id));
-                params.push(Param::Int(obs.line as i64));
-                params.push(Param::Text(obs.category.clone()));
-                params.push(Param::Text(obs.content.clone()));
-                params.push(Param::TextOpt(obs.context.clone()));
-            }
-            let rows = query_all(&mut *c, &observation_insert_sql(batch.len()), params).await?;
-            for r in &rows {
-                if let (Some(id), Some(line)) = (cell_i64(r, 0), cell_i64(r, 1)) {
-                    obs_id_by_line.insert(line, id);
-                }
-            }
-        }
-
-        // Observation tags: intern each tag through the cache, then insert the
-        // (observation, tag) pairs in multi-row statements.
-        let mut obs_tag_pairs: Vec<(i64, i64)> = Vec::new();
-        for obs in &record.observations {
-            let Some(&oid) = obs_id_by_line.get(&(obs.line as i64)) else {
-                continue;
-            };
-            for tag in &obs.tags {
-                let tid = self.tag_id(&mut *c, tag).await?;
-                obs_tag_pairs.push((oid, tid));
-            }
-        }
-        for batch in obs_tag_pairs.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 2);
-            for (oid, tid) in batch {
-                params.push(Param::Int(*oid));
-                params.push(Param::Int(*tid));
-            }
-            let sql = format!(
-                "INSERT INTO observation_tag(observation_id, tag_id) VALUES {} ON CONFLICT DO NOTHING",
-                value_rows(2, batch.len(), None)
-            );
-            exec(&mut *c, &sql, params).await?;
-        }
-
-        for batch in record.relations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
-            for rel in batch {
-                params.push(Param::Int(engram_id));
-                params.push(Param::Int(domain.0));
-                params.push(Param::Int(rel.line as i64));
-                params.push(Param::Text(rel.rel_type.clone()));
-                params.push(Param::Text(rel.to_target.clone()));
-                params.push(Param::TextOpt(rel.to_domain.clone()));
-                params.push(Param::Text(rel.to_raw.clone()));
-            }
-            let sql = format!(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) VALUES {}",
-                value_rows(7, batch.len(), Some("NULL"))
-            );
-            exec(&mut *c, &sql, params).await?;
-        }
-
-        for batch in record.links.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 6);
-            for link in batch {
-                params.push(Param::Int(engram_id));
-                params.push(Param::Int(domain.0));
-                params.push(Param::Int(link.line as i64));
-                params.push(Param::Text(link.to_target.clone()));
-                params.push(Param::TextOpt(link.to_domain.clone()));
-                params.push(Param::Text(link.to_raw.clone()));
-            }
-            let sql = format!(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) VALUES {}",
-                value_rows(6, batch.len(), Some("NULL"))
-            );
-            exec(&mut *c, &sql, params).await?;
-        }
-
-        // Engram tags: intern each tag, then insert the pairs in multi-row
-        // statements.
-        let mut tag_ids: Vec<i64> = Vec::with_capacity(record.tags.len());
-        for tag in &record.tags {
-            tag_ids.push(self.tag_id(&mut *c, tag).await?);
-        }
-        for batch in tag_ids.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 2);
-            for tid in batch {
-                params.push(Param::Int(engram_id));
-                params.push(Param::Int(*tid));
-            }
-            let sql = format!(
-                "INSERT INTO engram_tag(engram_id, tag_id) VALUES {} ON CONFLICT DO NOTHING",
-                value_rows(2, batch.len(), None)
-            );
-            exec(&mut *c, &sql, params).await?;
-        }
-
-        Ok(EngramId(engram_id))
+        self.upsert_row(domain, "", record).await
     }
 
     async fn upsert_engram_checked(
@@ -946,13 +800,15 @@ impl Store for PostgresStore {
         // the write are one atomic unit.
         if let Some(expected) = expected_sha {
             let mut conn = self.acquire().await?;
-            let stored = sqlx::query("SELECT sha256 FROM engram WHERE domain_id=$1 AND path=$2")
-                .bind(domain.0)
-                .bind(&record.path)
-                .fetch_optional(conn.as_mut())
-                .await
-                .map_err(IndexError::from)?
-                .and_then(|r| cell_text(&r, 0));
+            let stored = sqlx::query(
+                "SELECT sha256 FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''",
+            )
+            .bind(domain.0)
+            .bind(&record.path)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?
+            .and_then(|r| cell_text(&r, 0));
             drop(conn);
             if let Some(found) = stored
                 && found != expected
@@ -968,12 +824,13 @@ impl Store for PostgresStore {
 
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
         let mut conn = self.acquire().await?;
-        let row = sqlx::query("SELECT content FROM engram WHERE domain_id=$1 AND path=$2")
-            .bind(domain.0)
-            .bind(path)
-            .fetch_optional(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
+        let row =
+            sqlx::query("SELECT content FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''")
+                .bind(domain.0)
+                .bind(path)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?;
         Ok(row.and_then(|r| cell_text(&r, 0)))
     }
 
@@ -985,21 +842,15 @@ impl Store for PostgresStore {
         // path-ordered listing) is unchanged, and sorting in Rust makes the two
         // backends agree byte for byte, where Postgres' locale collation could
         // otherwise differ from turso's binary one.
-        let rows =
-            sqlx::query("SELECT path, permalink, content, sha256 FROM engram WHERE domain_id=$1")
-                .bind(domain.0)
-                .fetch_all(conn.as_mut())
-                .await
-                .map_err(IndexError::from)?;
-        let mut out: Vec<StoredEngram> = rows
-            .iter()
-            .map(|r| StoredEngram {
-                path: cell_text(r, 0).unwrap_or_default(),
-                permalink: cell_text(r, 1).unwrap_or_default(),
-                content: cell_text(r, 2).unwrap_or_default(),
-                sha256: cell_text(r, 3).unwrap_or_default(),
-            })
-            .collect();
+        let rows = sqlx::query(
+            "SELECT path, permalink, content, sha256, actor, tombstone \
+             FROM engram WHERE domain_id=$1 AND actor = ''",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        let mut out: Vec<StoredEngram> = rows.iter().map(stored_engram_from_row).collect();
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
@@ -1012,6 +863,10 @@ impl Store for PostgresStore {
         // satisfied, attachment blobs before the attachment rows that own them.
         // `upsert_domain` reuses the id for a name it has seen, so anything left
         // here would resurface as the next registration's own.
+        // -- actor: all - a domain's removal takes its drafts with it. Nothing
+        // survives the domain they were drafts of, so these statements name
+        // every actor's rows on purpose; the overlay journal is swept on the
+        // same paths so the rows and their mirror go together.
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         for sql in [
@@ -1042,7 +897,10 @@ impl Store for PostgresStore {
         self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
-        let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND path=$2")
+        // The base row at this path. A draft is dropped by its own actor
+        // through `clear_overlay_entry`, never by the sync driver noticing that
+        // a file left disk - the draft was never on disk.
+        let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''")
             .bind(domain.0)
             .bind(path)
             .fetch_optional(&mut *c)
@@ -1056,6 +914,8 @@ impl Store for PostgresStore {
                 .execute(&mut *c)
                 .await
                 .map_err(IndexError::from)?;
+            // -- actor: all - the row is already named by its id, which the
+            // base-scoped lookup above resolved.
             sqlx::query("DELETE FROM engram WHERE id=$1")
                 .bind(id)
                 .execute(&mut *c)
@@ -1074,7 +934,7 @@ impl Store for PostgresStore {
         sqlx::query(
             "UPDATE engram SET path=$1, \
              permalink = CASE WHEN permalink=$2 THEN $3 ELSE permalink END \
-             WHERE domain_id=$4 AND path=$5",
+             WHERE domain_id=$4 AND path=$5 AND actor = ''",
         )
         .bind(to)
         .bind(&old_slug)
@@ -1127,7 +987,8 @@ impl Store for PostgresStore {
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
         let mut conn = self.acquire().await?;
         let row = sqlx::query(
-            "SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id WHERE d.name=$1 AND e.permalink=$2",
+            "SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE d.name=$1 AND e.permalink=$2 AND e.actor = ''",
         )
         .bind(domain)
         .bind(permalink)
@@ -1145,7 +1006,7 @@ impl Store for PostgresStore {
         let row = sqlx::query(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name=$1 AND (e.permalink=$2 OR lower(e.title)=lower($2)) \
+             WHERE e.actor = '' AND d.name=$1 AND (e.permalink=$2 OR lower(e.title)=lower($2)) \
              ORDER BY CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END, e.path COLLATE \"C\" LIMIT 1",
         )
         .bind(domain)
@@ -1161,7 +1022,7 @@ impl Store for PostgresStore {
         let rows = sqlx::query(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.permalink=$1 OR lower(e.title)=lower($1) \
+             WHERE e.actor = '' AND (e.permalink=$1 OR lower(e.title)=lower($1)) \
              ORDER BY CASE WHEN e.permalink=$1 THEN 0 ELSE 1 END, \
                       d.name COLLATE \"C\", e.path COLLATE \"C\"",
         )
@@ -1192,7 +1053,7 @@ impl Store for PostgresStore {
         }
         let sql = format!(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {} \
+             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.actor = '' AND {} \
              ORDER BY e.path COLLATE \"C\"",
             clauses.join(" AND ")
         );
@@ -1257,7 +1118,8 @@ impl Store for PostgresStore {
         let total = scalar_i64(
             conn.as_mut(),
             &format!(
-                "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level}"
+                "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE e.actor = '' AND {level}"
             ),
             bound(&level_binds),
         )
@@ -1268,7 +1130,8 @@ impl Store for PostgresStore {
             conn.as_mut(),
             &format!(
                 "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-                 FROM engram e JOIN domain d ON d.id=e.domain_id WHERE {level} \
+                 FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE e.actor = '' AND {level} \
                  ORDER BY e.path COLLATE \"C\" LIMIT {limit}"
             ),
             bound(&level_binds),
@@ -1296,7 +1159,7 @@ impl Store for PostgresStore {
             &format!(
                 "SELECT DISTINCT split_part({rel}, '/', 1) \
                  FROM engram e JOIN domain d ON d.id=e.domain_id \
-                 WHERE {under} AND strpos({rel}, '/') > 0"
+                 WHERE e.actor = '' AND {under} AND strpos({rel}, '/') > 0"
             ),
             bound(&binds),
         )
@@ -1327,7 +1190,7 @@ impl Store for PostgresStore {
         let sql = format!(
             "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE (EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+             WHERE e.actor = '' AND (EXISTS (SELECT 1 FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
                             WHERE et.engram_id=e.id AND t.name=$1) \
                  OR EXISTS (SELECT 1 FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
                             JOIN observation o ON o.id=ot.observation_id \
@@ -1442,16 +1305,16 @@ impl Store for PostgresStore {
                       r.to_target AS to_target, 0::int8 AS kind, r.to_domain AS to_domain \
                FROM relation r JOIN engram e ON e.id=r.engram_id \
                     JOIN domain d ON d.id=e.domain_id \
-               WHERE r.to_id=$1 \
+               WHERE e.actor = '' AND (r.to_id=$1 \
                   OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
-                      AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
+                      AND (r.to_target=$3 OR lower(r.to_target)=lower($4)))) \
                UNION ALL \
                SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8, l.to_domain \
                FROM link l JOIN engram e ON e.id=l.engram_id \
                     JOIN domain d ON d.id=e.domain_id \
-               WHERE l.to_id=$1 \
+               WHERE e.actor = '' AND (l.to_id=$1 \
                   OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
-                      AND (l.to_target=$3 OR lower(l.to_target)=lower($4))) \
+                      AND (l.to_target=$3 OR lower(l.to_target)=lower($4)))) \
              ) i ORDER BY i.name COLLATE \"C\", i.path COLLATE \"C\"",
         )
         .bind(engram_id.0)
@@ -1490,15 +1353,15 @@ impl Store for PostgresStore {
             "SELECT d.name AS domain, e.permalink AS permalink, e.title AS title, \
                     e.path AS path, e.status AS status, r.rel_type AS rel \
              FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE r.to_id=$1 \
+             WHERE e.actor = '' AND (r.to_id=$1 \
                 OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
-                    AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
+                    AND (r.to_target=$3 OR lower(r.to_target)=lower($4)))) \
              UNION ALL \
              SELECT d.name, e.permalink, e.title, e.path, e.status, '{LINKS_TO}'::text \
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
-             WHERE l.to_id=$1 \
+             WHERE e.actor = '' AND (l.to_id=$1 \
                 OR (l.to_id IS NULL AND l.domain_id=$2 AND l.to_domain IS NULL \
-                    AND (l.to_target=$3 OR lower(l.to_target)=lower($4)))"
+                    AND (l.to_target=$3 OR lower(l.to_target)=lower($4))))"
         );
         let target = || {
             vec![
@@ -1680,11 +1543,11 @@ impl Store for PostgresStore {
                SELECT r.engram_id, 0::int8 AS kind, r.rel_type, r.to_domain, r.to_target, \
                       r.line, e.path \
                FROM relation r JOIN engram e ON e.id=r.engram_id \
-               WHERE r.to_id IS NULL AND r.domain_id=$1 \
+               WHERE e.actor = '' AND r.to_id IS NULL AND r.domain_id=$1 \
                UNION ALL \
                SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path \
                FROM link l JOIN engram e ON e.id=l.engram_id \
-               WHERE l.to_id IS NULL AND l.domain_id=$1 \
+               WHERE e.actor = '' AND l.to_id IS NULL AND l.domain_id=$1 \
              ) u \
              ORDER BY u.path COLLATE \"C\", u.line, u.kind, u.to_target COLLATE \"C\"",
         )
@@ -1776,11 +1639,10 @@ impl Store for PostgresStore {
             where_clauses.push(format!("e.engram_type IN ({})", placeholders.join(",")));
         }
 
-        let where_sql = if where_clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", where_clauses.join(" AND "))
-        };
+        // The base predicate is the clause that is always present, so the
+        // reader-chosen filters join it rather than standing alone.
+        where_clauses.insert(0, "e.actor = ''".to_string());
+        let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
         let limit = if filter.limit == 0 { 20 } else { filter.limit };
         // Both sort keys are TEXT, and the `LIMIT` makes their order decide which
         // rows come back at all, so both are pinned to `COLLATE "C"` to match
@@ -1936,6 +1798,9 @@ impl Store for PostgresStore {
                 })
                 .collect();
             sql.push_str(&format!(
+                // -- actor: all - a draft's chunks reach the same embedding
+                // backlog a base row's do, which is what makes an overlay entry
+                // a full engram row rather than a second shape.
                 " AND engram_id IN (SELECT id FROM engram WHERE domain_id IN ({}))",
                 placeholders.join(",")
             ));
@@ -2051,7 +1916,8 @@ impl Store for PostgresStore {
         let sql = format!(
             "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
              JOIN engram e ON e.id=c.engram_id \
-             WHERE e.domain_id=$1 AND c.seq=0 AND c.model=$2 AND c.embedding IS NOT NULL \
+             WHERE e.actor = '' AND e.domain_id=$1 AND c.seq=0 AND c.model=$2 \
+               AND c.embedding IS NOT NULL \
              ORDER BY c.engram_id ASC /* w{generation} */"
         );
         let rows = query_all(
@@ -2167,6 +2033,124 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    // --- the actor dimension -------------------------------------------------
+
+    async fn upsert_overlay(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "an overlay entry needs an actor; the empty actor is the base row".to_string(),
+            ));
+        }
+        self.upsert_row(domain, actor, record).await
+    }
+
+    async fn overlay_entry(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<StoredEngram>> {
+        if actor.is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query(
+            "SELECT path, permalink, content, sha256, actor, tombstone \
+             FROM engram WHERE domain_id=$1 AND actor=$2 AND path=$3",
+        )
+        .bind(domain.0)
+        .bind(actor)
+        .bind(path)
+        .fetch_optional(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(row.as_ref().map(stored_engram_from_row))
+    }
+
+    async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>> {
+        if actor.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.acquire().await?;
+        // Unordered in SQL and sorted by path in Rust, for the reason
+        // `all_engram_contents` spells out: this projection carries bodies.
+        let rows = sqlx::query(
+            "SELECT path, permalink, content, sha256, actor, tombstone \
+             FROM engram WHERE domain_id=$1 AND actor=$2",
+        )
+        .bind(domain.0)
+        .bind(actor)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        let mut out: Vec<StoredEngram> = rows.iter().map(stored_engram_from_row).collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool> {
+        if actor.is_empty() {
+            return Ok(false);
+        }
+        // Deletes the draft's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND actor=$2 AND path=$3")
+            .bind(domain.0)
+            .bind(actor)
+            .bind(path)
+            .fetch_optional(&mut *c)
+            .await
+            .map_err(IndexError::from)?
+            .and_then(|r| cell_i64(&r, 0));
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        delete_children(&mut *c, id).await?;
+        sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
+            .bind(id)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        // -- actor: all - the row is already named by its id, which one actor's
+        // own lookup above resolved.
+        sqlx::query("DELETE FROM engram WHERE id=$1")
+            .bind(id)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(true)
+    }
+
+    async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT actor, count(*) FROM engram WHERE domain_id=$1 AND actor <> '' \
+             GROUP BY actor",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        let mut out: Vec<(String, u64)> = rows
+            .iter()
+            .filter_map(|r| {
+                let actor = cell_text(r, 0)?;
+                Some((actor, cell_i64(r, 1).unwrap_or(0).max(0) as u64))
+            })
+            .collect();
+        // Sorted in Rust so both backends order actors by bytes without either
+        // dialect's collation having a say.
+        out.sort();
+        Ok(out)
+    }
+
     async fn store_info(&self) -> Result<StoreInfo> {
         // The active full-text path is the candidate scan on both backends, so
         // hybrid ranking and every search test match across them.
@@ -2182,8 +2166,9 @@ impl Store for PostgresStore {
         let mut conn = self.acquire().await?;
         let rows = sqlx::query(
             "SELECT d.id, d.name, d.path, d.kind, d.last_sync, \
-             (SELECT count(*) FROM engram e WHERE e.domain_id=d.id), \
-             (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=d.id), \
+             (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = ''), \
+             (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id \
+              WHERE e.domain_id=d.id AND e.actor = ''), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
@@ -2254,7 +2239,7 @@ impl Store for PostgresStore {
              JOIN tag t ON t.id=et.tag_id \
              JOIN engram e ON e.id=et.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name=$1 GROUP BY t.id"
+             WHERE e.actor = '' AND d.name=$1 GROUP BY t.id"
         } else {
             "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id GROUP BY t.id"
         };
@@ -2264,7 +2249,7 @@ impl Store for PostgresStore {
              JOIN observation o ON o.id=ot.observation_id \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name=$1 GROUP BY t.id"
+             WHERE e.actor = '' AND d.name=$1 GROUP BY t.id"
         } else {
             "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id GROUP BY t.id"
         };
@@ -2272,7 +2257,7 @@ impl Store for PostgresStore {
             "SELECT o.category, COUNT(*) FROM observation o \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE o.category <> '' AND d.name=$1 GROUP BY o.category"
+             WHERE e.actor = '' AND o.category <> '' AND d.name=$1 GROUP BY o.category"
         } else {
             "SELECT o.category, COUNT(*) FROM observation o WHERE o.category <> '' GROUP BY o.category"
         };
@@ -2291,16 +2276,18 @@ impl Store for PostgresStore {
         let type_sql = if domain.is_some() {
             "SELECT e.engram_type, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.engram_type <> '' AND d.name=$1 GROUP BY e.engram_type"
+             WHERE e.actor = '' AND e.engram_type <> '' AND d.name=$1 GROUP BY e.engram_type"
         } else {
-            "SELECT e.engram_type, COUNT(*) FROM engram e WHERE e.engram_type <> '' GROUP BY e.engram_type"
+            "SELECT e.engram_type, COUNT(*) FROM engram e \
+             WHERE e.actor = '' AND e.engram_type <> '' GROUP BY e.engram_type"
         };
         let status_sql = if domain.is_some() {
             "SELECT e.status, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.status <> '' AND d.name=$1 GROUP BY e.status"
+             WHERE e.actor = '' AND e.status <> '' AND d.name=$1 GROUP BY e.status"
         } else {
-            "SELECT e.status, COUNT(*) FROM engram e WHERE e.status <> '' GROUP BY e.status"
+            "SELECT e.status, COUNT(*) FROM engram e \
+             WHERE e.actor = '' AND e.status <> '' GROUP BY e.status"
         };
         // The last scan surfaces the derived tag aliases in effect. Scoped by
         // domain name like the counts; `build_vocabulary` dedupes and sorts.
@@ -2593,6 +2580,201 @@ impl Store for PostgresStore {
         // snapshot recomputed mid-transaction must not survive it.
         self.invalidate_coverage();
         Ok(())
+    }
+}
+
+impl PostgresStore {
+    /// Write one row of the `engram` table, in one actor's dimension.
+    ///
+    /// The single writer behind both [`Store::upsert_engram`] (the empty actor,
+    /// the base row) and [`Store::upsert_overlay`] (an actor key), for the
+    /// reason its Turso twin gives: a draft is a full engram row with the same
+    /// children and the same id-stable upsert, not a second shape.
+    ///
+    /// Everything here is scoped to `actor`, the duplicate-permalink probe
+    /// included: two actors may each hold `a` in their own dimension, and only
+    /// a clash inside one actor's own is a conflict.
+    async fn upsert_row(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId> {
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+
+        // One probe for both the existing-by-path row and a duplicate permalink
+        // owned by a different path. Pre-checking the duplicate keeps a failing
+        // unique-violation from aborting the surrounding batch transaction, so
+        // the sync engine can collect it into `failed` instead.
+        let probe = sqlx::query(
+            "SELECT id, path FROM engram WHERE domain_id=$1 AND actor=$4 \
+             AND (path=$2 OR permalink=$3)",
+        )
+        .bind(domain.0)
+        .bind(&record.path)
+        .bind(&record.permalink)
+        .bind(actor)
+        .fetch_all(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        let mut existing_id: Option<i64> = None;
+        for r in &probe {
+            let row_path = cell_text(r, 1).unwrap_or_default();
+            if row_path == record.path {
+                existing_id = cell_i64(r, 0);
+            } else {
+                return Err(IndexError::Constraint(format!(
+                    "permalink '{}' already used by '{}'",
+                    record.permalink, row_path
+                )));
+            }
+        }
+
+        // `RETURNING id` yields the id on both insert and conflict-update, so no
+        // separate id lookup is needed.
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO engram(domain_id, path, permalink, title, engram_type, status, \
+             recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
+             mtime, size, sha256, actor, tombstone) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17,$18) \
+             ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
+             permalink=EXCLUDED.permalink, title=EXCLUDED.title, engram_type=EXCLUDED.engram_type, \
+             status=EXCLUDED.status, recorded_at=EXCLUDED.recorded_at, valid_from=EXCLUDED.valid_from, \
+             valid_to=EXCLUDED.valid_to, timestamp=EXCLUDED.timestamp, description=EXCLUDED.description, \
+             content=EXCLUDED.content, metadata=EXCLUDED.metadata, mtime=EXCLUDED.mtime, \
+             size=EXCLUDED.size, sha256=EXCLUDED.sha256, tombstone=EXCLUDED.tombstone \
+             RETURNING id",
+        )
+        .bind(domain.0)
+        .bind(&record.path)
+        .bind(&record.permalink)
+        .bind(&record.title)
+        .bind(&record.engram_type)
+        .bind(&record.status)
+        .bind(record.recorded_at.as_deref())
+        .bind(record.valid_from.as_deref())
+        .bind(record.valid_to.as_deref())
+        .bind(record.timestamp.as_deref())
+        .bind(record.description.as_deref())
+        .bind(&record.content)
+        .bind(record.metadata.to_string())
+        .bind(record.stamp.mtime)
+        .bind(record.stamp.size as i64)
+        .bind(&record.stamp.sha256)
+        .bind(actor)
+        .bind(record.tombstone)
+        .fetch_one(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        let engram_id = row.0;
+
+        // Only an update needs its stale child rows cleared first.
+        if existing_id.is_some() {
+            delete_children(&mut *c, engram_id).await?;
+        }
+
+        // Observations: insert in chunks and read each new row's id back joined
+        // on its source line (unique within one engram), so observation tags map
+        // to the right observation without relying on RETURNING row order.
+        let mut obs_id_by_line: HashMap<i64, i64> = HashMap::new();
+        for batch in record.observations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 5);
+            for obs in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(obs.line as i64));
+                params.push(Param::Text(obs.category.clone()));
+                params.push(Param::Text(obs.content.clone()));
+                params.push(Param::TextOpt(obs.context.clone()));
+            }
+            let rows = query_all(&mut *c, &observation_insert_sql(batch.len()), params).await?;
+            for r in &rows {
+                if let (Some(id), Some(line)) = (cell_i64(r, 0), cell_i64(r, 1)) {
+                    obs_id_by_line.insert(line, id);
+                }
+            }
+        }
+
+        // Observation tags: intern each tag through the cache, then insert the
+        // (observation, tag) pairs in multi-row statements.
+        let mut obs_tag_pairs: Vec<(i64, i64)> = Vec::new();
+        for obs in &record.observations {
+            let Some(&oid) = obs_id_by_line.get(&(obs.line as i64)) else {
+                continue;
+            };
+            for tag in &obs.tags {
+                let tid = self.tag_id(&mut *c, tag).await?;
+                obs_tag_pairs.push((oid, tid));
+            }
+        }
+        for batch in obs_tag_pairs.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 2);
+            for (oid, tid) in batch {
+                params.push(Param::Int(*oid));
+                params.push(Param::Int(*tid));
+            }
+            let sql = format!(
+                "INSERT INTO observation_tag(observation_id, tag_id) VALUES {} ON CONFLICT DO NOTHING",
+                value_rows(2, batch.len(), None)
+            );
+            exec(&mut *c, &sql, params).await?;
+        }
+
+        for batch in record.relations.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
+            for rel in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(domain.0));
+                params.push(Param::Int(rel.line as i64));
+                params.push(Param::Text(rel.rel_type.clone()));
+                params.push(Param::Text(rel.to_target.clone()));
+                params.push(Param::TextOpt(rel.to_domain.clone()));
+                params.push(Param::Text(rel.to_raw.clone()));
+            }
+            let sql = format!(
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(7, batch.len(), Some("NULL"))
+            );
+            exec(&mut *c, &sql, params).await?;
+        }
+
+        for batch in record.links.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 6);
+            for link in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(domain.0));
+                params.push(Param::Int(link.line as i64));
+                params.push(Param::Text(link.to_target.clone()));
+                params.push(Param::TextOpt(link.to_domain.clone()));
+                params.push(Param::Text(link.to_raw.clone()));
+            }
+            let sql = format!(
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(6, batch.len(), Some("NULL"))
+            );
+            exec(&mut *c, &sql, params).await?;
+        }
+
+        // Engram tags: intern each tag, then insert the pairs in multi-row
+        // statements.
+        let mut tag_ids: Vec<i64> = Vec::with_capacity(record.tags.len());
+        for tag in &record.tags {
+            tag_ids.push(self.tag_id(&mut *c, tag).await?);
+        }
+        for batch in tag_ids.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 2);
+            for tid in batch {
+                params.push(Param::Int(engram_id));
+                params.push(Param::Int(*tid));
+            }
+            let sql = format!(
+                "INSERT INTO engram_tag(engram_id, tag_id) VALUES {} ON CONFLICT DO NOTHING",
+                value_rows(2, batch.len(), None)
+            );
+            exec(&mut *c, &sql, params).await?;
+        }
+
+        Ok(EngramId(engram_id))
     }
 }
 

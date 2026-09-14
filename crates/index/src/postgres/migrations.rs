@@ -613,7 +613,10 @@ mod tests {
         )
         .execute(&mut conn)
         .await;
-        assert!(dup.is_err(), "but one actor still gets only one row at a path");
+        assert!(
+            dup.is_err(),
+            "but one actor still gets only one row at a path"
+        );
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&mut conn)

@@ -160,12 +160,17 @@ async fn run_lexical(
         let mut params: Vec<Param> = Vec::new();
         let mut n = 1usize;
         build_scalar_filters(query, &mut clauses, &mut params, &mut n, aliases);
-        let where_sql = if clauses.is_empty() {
+        // The reader-chosen filters, as a trailing conjunction rather than a
+        // `WHERE` of their own: every statement below opens its own `WHERE` with
+        // the base predicate, so a search answers out of the domain's files and
+        // never out of somebody's draft. Threading the actor through here is Task
+        // 5's job; until then the base is the only dimension a search reads.
+        let and_filters = if clauses.is_empty() {
             String::new()
         } else {
-            format!("WHERE {}", clauses.join(" AND "))
+            format!("AND {}", clauses.join(" AND "))
         };
-        return filter_only(conn, &where_sql, params, limit, page).await;
+        return filter_only(conn, &and_filters, params, limit, page).await;
     }
 
     let mut scored = scored_lexical(conn, query, &terms, aliases, candidate_cap).await?;
@@ -225,17 +230,22 @@ async fn scored_lexical(
         clauses.push(format!("({})", ors.join(" OR ")));
     }
 
-    let where_sql = if clauses.is_empty() {
+    // The reader-chosen filters, as a trailing conjunction rather than a
+    // `WHERE` of their own: every statement below opens its own `WHERE` with
+    // the base predicate, so a search answers out of the domain's files and
+    // never out of somebody's draft. Threading the actor through here is Task
+    // 5's job; until then the base is the only dimension a search reads.
+    let and_filters = if clauses.is_empty() {
         String::new()
     } else {
-        format!("WHERE {}", clauses.join(" AND "))
+        format!("AND {}", clauses.join(" AND "))
     };
     // `ORDER BY e.id` is answered from the primary key, so this wide projection
     // never reaches a sort node. Keep it that way: any other ordering here would
     // sort every matched body.
     let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
-         ORDER BY e.id LIMIT {candidate_cap}"
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE e.actor = '' {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
     );
     let rows = query_all(conn, &sql, params).await?;
 
@@ -263,14 +273,17 @@ async fn scored_lexical(
 
 async fn filter_only(
     conn: &mut PgConnection,
-    where_sql: &str,
+    and_filters: &str,
     params: Vec<Param>,
     limit: usize,
     page: usize,
 ) -> Result<Page<SearchHit>> {
     let total = scalar_i64(
         conn,
-        &format!("SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}"),
+        &format!(
+            "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
+             WHERE e.actor = '' {and_filters}"
+        ),
         clone_params(&params),
     )
     .await?
@@ -283,7 +296,8 @@ async fn filter_only(
     // `COLLATE "C"` to match Turso's byte order: the sort decides which rows land
     // on the requested page, so an unpinned key would page differently here.
     let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE e.actor = '' {and_filters} \
          ORDER BY e.recorded_at COLLATE \"C\" DESC, e.permalink COLLATE \"C\" ASC \
          LIMIT {limit} OFFSET {offset}"
     );
@@ -507,11 +521,12 @@ const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_ty
 /// Ties. `dist` alone leaves engrams at an equal distance in an unspecified
 /// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
 /// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins).
-fn semantic_phase1_sql(where_sql: &str) -> String {
+fn semantic_phase1_sql(and_filters: &str) -> String {
     format!(
         "SELECT c.engram_id, min(c.embedding <=> $1) AS dist \
          FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
-         {where_sql} GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC LIMIT {SEMANTIC_TOPK}"
+         WHERE e.actor = '' {and_filters} \
+         GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC LIMIT {SEMANTIC_TOPK}"
     )
 }
 
@@ -522,7 +537,7 @@ fn semantic_phase1_sql(where_sql: &str) -> String {
 fn semantic_hydrate_sql(ids: &str) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE e.id IN ({ids})"
+         WHERE e.actor = '' AND e.id IN ({ids})"
     )
 }
 
@@ -558,8 +573,8 @@ async fn semantic_candidates(
         "c.embedding IS NOT NULL AND c.model = ${model_ph} AND c.dims = ${dims_ph}"
     ));
 
-    let where_sql = format!("WHERE {}", clauses.join(" AND "));
-    let rows = query_all(conn, &semantic_phase1_sql(&where_sql), params).await?;
+    let and_filters = format!("AND {}", clauses.join(" AND "));
+    let rows = query_all(conn, &semantic_phase1_sql(&and_filters), params).await?;
     let winners: Vec<(i64, f64)> = rows
         .iter()
         .map(|r| (cell_i64(r, 0).unwrap_or(0), cell_real(r, 1).unwrap_or(1.0)))
@@ -1141,7 +1156,8 @@ pub(super) async fn neighbors(
                 "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
                  CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
                  e.status \
-                 FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.id IN ({list}) ORDER BY e.id"
+                 FROM engram e JOIN domain d ON d.id=e.domain_id \
+                 WHERE e.actor = '' AND e.id IN ({list}) ORDER BY e.id"
             ),
             vec![],
         )

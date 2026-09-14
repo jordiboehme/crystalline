@@ -718,6 +718,14 @@ mod tests {
         .unwrap();
 
         conn.execute_batch(MIGRATIONS[9].sql).await.unwrap();
+        // And the migrations after it, because `reference_match` below is the
+        // current expression and reads the current schema: it names the actor
+        // column v13 added, so a database stopped at v10 has no column for the
+        // statement to compile against. The rows under test are untouched by
+        // any of them.
+        for m in &MIGRATIONS[10..] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
         // Only the second row is reindexed, which is what a reindex does: it
         // rewrites the reference rows of the engram it read.
         conn.execute(
@@ -885,7 +893,10 @@ mod tests {
         for m in &MIGRATIONS[..12] {
             conn.execute_batch(m.sql).await.unwrap();
         }
-        assert_eq!(MIGRATIONS[12].version, 13, "the thirteenth migration is v13");
+        assert_eq!(
+            MIGRATIONS[12].version, 13,
+            "the thirteenth migration is v13"
+        );
 
         // A database in the field: the two `domain` columns v11 and v12 added
         // are already there, and an engram with child rows hangs off it.

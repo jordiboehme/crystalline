@@ -59,6 +59,8 @@ fn record(path: &str, permalink: &str, content: &str, sha: &str) -> EngramRecord
             size: content.len() as u64,
             sha256: sha.to_string(),
         },
+        actor: String::new(),
+        tombstone: false,
     }
 }
 
