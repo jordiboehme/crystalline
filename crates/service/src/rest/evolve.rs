@@ -518,6 +518,7 @@ pub async fn unacknowledge(
             &body.rule,
             body.scope.as_deref(),
             Some(&format!("human:{}", caller.name())),
+            &identity.scope(),
         )
         .await?;
     if !removed {

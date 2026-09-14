@@ -53,7 +53,7 @@ pub use client::{
     use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
-pub use engine::{Engine, EngineError, ShareActor};
+pub use engine::{Engine, EngineError, OVERLAY_NEEDS_IDENTITY, ShareActor};
 pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };

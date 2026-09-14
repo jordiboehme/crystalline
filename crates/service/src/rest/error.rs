@@ -481,9 +481,14 @@ impl From<EngineError> for ApiError {
             EngineError::ConnectInProgress | EngineError::ConfirmationRequired(_) => {
                 ApiError::conflict(detail)
             }
+            // And a fourth shares the 422 with the malformed requests: the
+            // request is well formed and the caller may make it, but the
+            // domain it names takes changes in a shape this call did not
+            // satisfy. The message is the way in, so it travels whole.
             EngineError::Ambiguous(_)
             | EngineError::Conflict(_)
             | EngineError::Invalid(_)
+            | EngineError::Refused(_)
             | EngineError::EnvTokenConnect => unprocessable_error(detail),
             EngineError::Remote(remote) => remote_to_api_error(remote, detail),
             EngineError::Io { .. } | EngineError::Internal(_) => internal_error(detail),

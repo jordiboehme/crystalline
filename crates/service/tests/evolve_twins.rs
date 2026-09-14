@@ -469,7 +469,14 @@ async fn withdrawing_one_pair_leaves_the_other_acknowledged() {
     }
 
     let removed = engine
-        .unacknowledge_finding_as("notes", &hub, "V301", Some(&rows[0].0), None)
+        .unacknowledge_finding_as(
+            "notes",
+            &hub,
+            "V301",
+            Some(&rows[0].0),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(removed);

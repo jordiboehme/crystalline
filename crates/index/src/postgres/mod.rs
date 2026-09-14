@@ -514,7 +514,7 @@ pub(super) async fn scalar_i64(
         .unwrap_or(0))
 }
 
-/// The `path, permalink, content, sha256, actor, tombstone` projection as a
+/// The `path, permalink, content, sha256, actor, tombstone, id` projection as a
 /// [`StoredEngram`], in that column order.
 fn stored_engram_from_row(row: &PgRow) -> StoredEngram {
     StoredEngram {
@@ -528,6 +528,7 @@ fn stored_engram_from_row(row: &PgRow) -> StoredEngram {
             .ok()
             .flatten()
             .unwrap_or(false),
+        id: EngramId(cell_i64(row, 6).unwrap_or_default()),
     }
 }
 
@@ -844,7 +845,7 @@ impl Store for PostgresStore {
         // backends agree byte for byte, where Postgres' locale collation could
         // otherwise differ from turso's binary one.
         let rows = sqlx::query(
-            "SELECT path, permalink, content, sha256, actor, tombstone \
+            "SELECT path, permalink, content, sha256, actor, tombstone, id \
              FROM engram WHERE domain_id=$1 AND actor = ''",
         )
         .bind(domain.0)
@@ -2061,7 +2062,7 @@ impl Store for PostgresStore {
         }
         let mut conn = self.acquire().await?;
         let row = sqlx::query(
-            "SELECT path, permalink, content, sha256, actor, tombstone \
+            "SELECT path, permalink, content, sha256, actor, tombstone, id \
              FROM engram WHERE domain_id=$1 AND actor=$2 AND path=$3",
         )
         .bind(domain.0)
@@ -2081,7 +2082,7 @@ impl Store for PostgresStore {
         // Unordered in SQL and sorted by path in Rust, for the reason
         // `all_engram_contents` spells out: this projection carries bodies.
         let rows = sqlx::query(
-            "SELECT path, permalink, content, sha256, actor, tombstone \
+            "SELECT path, permalink, content, sha256, actor, tombstone, id \
              FROM engram WHERE domain_id=$1 AND actor=$2",
         )
         .bind(domain.0)

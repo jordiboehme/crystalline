@@ -618,7 +618,7 @@ fn path_prefix_like(n: usize, negated: bool) -> String {
     format!("lower(e.path){not} LIKE lower(?{n}) ESCAPE '\\'")
 }
 
-/// The `path, permalink, content, sha256, actor, tombstone` projection as a
+/// The `path, permalink, content, sha256, actor, tombstone, id` projection as a
 /// [`StoredEngram`], in that column order.
 fn stored_engram_from_row(row: &Row) -> StoredEngram {
     StoredEngram {
@@ -628,6 +628,7 @@ fn stored_engram_from_row(row: &Row) -> StoredEngram {
         sha256: cell_text(row, 3).unwrap_or_default(),
         actor: cell_text(row, 4).unwrap_or_default(),
         tombstone: cell_i64(row, 5).unwrap_or(0) != 0,
+        id: EngramId(cell_i64(row, 6).unwrap_or_default()),
     }
 }
 
@@ -892,7 +893,7 @@ impl Store for TursoStore {
         // differ from turso's binary one.
         let rows = query_all(
             &self.conn,
-            "SELECT path, permalink, content, sha256, actor, tombstone \
+            "SELECT path, permalink, content, sha256, actor, tombstone, id \
              FROM engram WHERE domain_id=?1 AND actor = ''",
             vec![Value::Integer(domain.0)],
         )
@@ -1995,7 +1996,7 @@ impl Store for TursoStore {
         }
         let row = query_first(
             &self.conn,
-            "SELECT path, permalink, content, sha256, actor, tombstone \
+            "SELECT path, permalink, content, sha256, actor, tombstone, id \
              FROM engram WHERE domain_id=?1 AND actor=?2 AND path=?3",
             vec![
                 Value::Integer(domain.0),
@@ -2016,7 +2017,7 @@ impl Store for TursoStore {
         // an `ORDER BY` would push every one of them through the sorter.
         let rows = query_all(
             &self.conn,
-            "SELECT path, permalink, content, sha256, actor, tombstone \
+            "SELECT path, permalink, content, sha256, actor, tombstone, id \
              FROM engram WHERE domain_id=?1 AND actor=?2",
             vec![Value::Integer(domain.0), Value::Text(actor.to_string())],
         )

@@ -834,6 +834,13 @@ pub struct StoredEngram {
     /// there. A reader decides by this flag, never by finding the content
     /// empty.
     pub tombstone: bool,
+    /// The row's own engram id, which is what its chunks, observations and
+    /// graph edges key to.
+    ///
+    /// Here because a draft is a full row: a caller serving one has to be able
+    /// to ask the index about that row's edges, and for a draft at a path no
+    /// base row holds there is no other id to ask with.
+    pub id: EngramId,
 }
 
 /// One inbound reference to an engram: a relation or a prose link that resolves
