@@ -220,7 +220,9 @@ enum Command {
         /// at all is discarded and recreated. The corruption-recovery path, and
         /// the only one that loses work - re-embedding a large corpus takes
         /// hours. Needs exclusive access to the index, so stop the daemon
-        /// first.
+        /// first, and refuses outright while a virtual domain is registered,
+        /// since its engrams live only in the index and no rebuild can bring
+        /// them back.
         #[arg(long, conflicts_with = "full")]
         wipe: bool,
         /// After reindexing, embed any chunks that need it for the active model.

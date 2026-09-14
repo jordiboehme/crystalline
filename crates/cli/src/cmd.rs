@@ -1362,10 +1362,27 @@ pub async fn reindex(
     let targets = select_domains(cfg, None)?;
     let params = chunk_params(cfg);
 
-    // Everything goes, including the virtual domains whose only source of truth
-    // is the database: a wipe is the explicit "this index cannot be trusted"
-    // verb, and the rebuild below can only restore what is on disk.
+    // A wipe destroys everything in the database and rebuilds from the files on
+    // disk, so it is only ever safe when the files are the whole truth. A
+    // virtual domain's engrams live nowhere else: wiping them is not a rebuild,
+    // it is deleting knowledge, and no rebuild afterwards can bring them back.
+    // Refuse rather than quietly doing something narrower than the verb's name,
+    // and name the way out. (The corruption case this flag exists for is
+    // unaffected in practice: a database file that will not open has already
+    // taken its virtual rows with it before this runs.)
     if wipe {
+        let virtual_domains: Vec<&str> = targets
+            .iter()
+            .filter(|(_, entry)| entry.is_virtual())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !virtual_domains.is_empty() {
+            bail!(
+                "refusing to wipe: {} virtual domain(s) keep their engrams only in the index, so a wipe would delete them for good: {}. Copy them out first with: crystalline domain export <name> <dir>, or rebuild without destroying anything: crystalline reindex --full",
+                virtual_domains.len(),
+                virtual_domains.join(", ")
+            );
+        }
         let store = store.lock().await;
         store
             .wipe()

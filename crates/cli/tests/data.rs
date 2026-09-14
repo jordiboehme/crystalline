@@ -1184,3 +1184,81 @@ fn wipe_rebuilds_from_nothing_and_does_not_combine_with_full() {
         "the parser says why: {err}"
     );
 }
+
+/// A wipe destroys the database and rebuilds from the files on disk, so it is
+/// only ever safe when the files are the whole truth. A virtual domain's
+/// engrams live nowhere else, and no rebuild can bring them back, so the verb
+/// refuses rather than quietly deleting them and exiting 0.
+#[test]
+fn wipe_refuses_while_a_virtual_domain_holds_the_only_copy() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    bin()
+        .args(["domain", "add", "notes", "--virtual", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    bin()
+        .args(["write", "notes", "Kept Note"])
+        .args(["--content", "virtual body that must survive"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let out = bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the wipe refuses");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("refusing to wipe")
+            && err.contains("notes")
+            && err.contains("crystalline domain export")
+            && err.contains("crystalline reindex --full"),
+        "the refusal names the domain and both ways out: {err}"
+    );
+
+    // The engram is still there, which is the whole point.
+    let out = bin()
+        .args([
+            "--json",
+            "read",
+            "kept-note",
+            "--domain",
+            "notes",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the virtual engram is still readable");
+    let read: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("virtual body that must survive"),
+        "{read}"
+    );
+
+    // The non-destructive rebuild the refusal points at works as advertised.
+    bin()
+        .args(["reindex", "--full", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+}
