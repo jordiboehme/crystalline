@@ -1155,3 +1155,222 @@ async fn every_write_verb_lands_in_the_draft_and_none_of_them_touches_the_tree()
         "every draft and the one deletion are mirrored"
     );
 }
+
+// --- the registered-set screen composes ahead of the actor dimension --------
+
+/// The review-mode domain again, made private to `owner` with `alice` invited
+/// and `out` a signed-in stranger, plus a `ghost` domain the index holds rows
+/// for and nobody registered.
+async fn screened_fixture() -> Fixture {
+    let f = review_fixture().await;
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&f.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["owner", "alice", "out"] {
+        auth.add_user(
+            name,
+            name,
+            None,
+            crystalline_service::rest::Role::Editor,
+            "pw12345678",
+        )
+        .await
+        .unwrap();
+    }
+    auth.set_domain_visibility("team", true, "owner")
+        .await
+        .unwrap();
+    auth.upsert_domain_member(
+        "team",
+        "alice",
+        crystalline_service::rest::MemberLevel::Editor,
+        "owner",
+    )
+    .await
+    .unwrap();
+    f.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+    f
+}
+
+/// A draft is not a way around the domain screen. Alice's draft in a private
+/// domain reads for her and is the same nothing a stranger gets about every
+/// other engram in there - and, crucially, about the domain itself.
+#[tokio::test]
+async fn a_draft_in_a_hidden_domain_is_invisible_to_a_reader_who_cannot_see_the_domain() {
+    let f = screened_fixture().await;
+    let alice = account("alice");
+    f.engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] a page only alice has #team"),
+            Some("claude-code/2.0-for-alice"),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.reads("fresh", &alice).await.is_ok(),
+        "alice, who is a member, reads her own draft"
+    );
+
+    // A draft the stranger holds themselves, written straight into the store
+    // the way one left behind by an account whose membership was later
+    // withdrawn would be. This is what makes the test sharp: with nothing of
+    // their own in there, a stranger asking the overlay question first would
+    // still find nothing, and the composition order would be untested.
+    let stranger = account("out");
+    f.draft("team", "out", "secret.md", ALICE_NEW).await;
+    let mine = f
+        .reads("fresh", &stranger)
+        .await
+        .expect_err("a draft of their own is no way back into a domain they may not see");
+    assert!(
+        mine.contains("no engram 'fresh' in domain 'team'"),
+        "and it is the ordinary miss: {mine}"
+    );
+
+    // And the two shapes the domain itself holds, because they fail
+    // differently: a draft over a base row, and one at a path the domain's
+    // files never held.
+    for identifier in ["fresh", "plan"] {
+        let miss = f
+            .reads(identifier, &stranger)
+            .await
+            .expect_err("a stranger reads nothing in a domain they may not see");
+        assert!(
+            miss.contains(&format!("no engram '{identifier}' in domain 'team'")),
+            "and it is the miss an engram nobody wrote produces: {miss}"
+        );
+    }
+}
+
+/// The other half of the same screen. A domain this instance has no
+/// registration for is not an answer, and a draft sitting in one is not an
+/// answer either - the rows are left in the index, they simply stop being
+/// something a read can reach.
+#[tokio::test]
+async fn a_draft_in_an_unregistered_domain_is_not_an_answer() {
+    let f = review_fixture().await;
+    // A domain the index holds and the configuration does not: rows written
+    // straight into the store, the way a domain removed from the config leaves
+    // its rows behind.
+    {
+        let store = f.store.lock().await;
+        let id = store
+            .upsert_domain("ghost", None, DomainKind::Virtual)
+            .await
+            .unwrap();
+        store
+            .upsert_engram(id, &record(ALICE_NEW, "fresh.md"))
+            .await
+            .unwrap();
+        store
+            .upsert_overlay(id, "alice", &record(ALICE_DRAFT, "plan.md"))
+            .await
+            .unwrap();
+    }
+
+    let alice = account("alice");
+    for scope in [&alice, &Scope::Unrestricted] {
+        let miss = f
+            .engine
+            .read_engram(
+                &ReadParams {
+                    identifier: "plan".to_string(),
+                    domain: Some("ghost".to_string()),
+                },
+                scope,
+            )
+            .await
+            .expect_err("a domain nobody registered answers nothing, drafts included");
+        assert!(
+            miss.to_string()
+                .contains("no engram 'plan' in domain 'ghost'"),
+            "and it is the ordinary miss: {miss}"
+        );
+    }
+}
+
+/// An overlay write on a domain the caller may not see is refused as an
+/// unregistered one, not with the teaching sentence about review mode.
+///
+/// The surface gates are in front of the engine and would refuse this first;
+/// the point is what the engine says when it is reached anyway, because
+/// "this domain reviews changes before they land" is a fact about a domain the
+/// caller must not learn exists.
+#[tokio::test]
+async fn an_overlay_write_on_a_hidden_domain_refuses_as_an_unknown_one() {
+    let f = screened_fixture().await;
+    let before = f.tree("team");
+
+    let err = f
+        .engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] a stranger's page #team"),
+            Some("claude-code/2.0-for-out"),
+            &account("out"),
+        )
+        .await
+        .expect_err("a stranger's write is refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("domain 'team' not registered"),
+        "refused as an unregistered domain: {text}"
+    );
+    assert!(
+        !text.contains("reviews changes before they land"),
+        "and never with the sentence that says what kind of domain it is: {text}"
+    );
+    assert!(
+        f.held("team", "out").await.is_empty(),
+        "and no draft was written"
+    );
+    assert_eq!(f.tree("team"), before, "and nothing reached the tree");
+}
+
+/// Review mode is a key on a registration, so a domain in review mode is
+/// registered by construction and the unregistered half of the screen can
+/// never hide one.
+///
+/// The converse is the half worth pinning: a domain nobody registered reviews
+/// nothing, so an unregistered name can never route a write into a draft of a
+/// domain that does not exist.
+#[tokio::test]
+async fn review_mode_implies_a_registration_so_the_collector_never_hides_it() {
+    let f = review_fixture().await;
+    {
+        let store = f.store.lock().await;
+        store
+            .upsert_domain("ghost", None, DomainKind::Virtual)
+            .await
+            .unwrap();
+    }
+
+    // The registered review-mode domain answers, so it is in neither half of
+    // the screen.
+    assert!(f.reads("plan", &account("alice")).await.is_ok());
+
+    // The unregistered one reviews nothing: a write there is the unregistered
+    // refusal every other verb gives it, never the review-mode sentence and
+    // never a draft.
+    let err = f
+        .engine
+        .write_engram_as(
+            &write_params("ghost", "Fresh", "- [idea] into a domain nobody has #team"),
+            Some("claude-code/2.0-for-alice"),
+            &account("alice"),
+        )
+        .await
+        .expect_err("a domain nobody registered takes no write at all");
+    let text = err.to_string();
+    assert!(
+        text.contains("domain 'ghost' not registered"),
+        "the ordinary unregistered refusal: {text}"
+    );
+    assert!(
+        !text.contains("reviews changes before they land"),
+        "and nothing about review mode: {text}"
+    );
+}

@@ -2193,17 +2193,30 @@ impl Engine {
     /// reviewed truth, which is the one outcome this whole mode exists to
     /// prevent.
     ///
-    /// **Deliberately not a gate on visibility.** A domain this caller may not
-    /// see is refused before this is ever reached, by the write verb's own
-    /// resolution through [`Engine::content_source`] and by the surface's
-    /// membership check in front of it, and both answer as though the domain
-    /// were not registered. Asking here would mean this refusal could be the
-    /// first thing a stranger hears about a private domain, and "this domain
-    /// reviews changes" is a fact about a domain they must not learn exists.
-    fn overlay_for_write(&self, name: &str, scope: &crate::scope::Scope) -> Result<Option<String>> {
+    /// **The registered-set screen composes ahead of the actor dimension here
+    /// too, and on this side it is load bearing twice over.** A write that
+    /// routed would put a stranger's draft into a domain they may not see; and
+    /// the refusal itself says "this domain reviews changes before they land",
+    /// which is a fact about a domain they must not learn exists. So a domain
+    /// [`Engine::hidden_for`] hides is answered here exactly as a domain nobody
+    /// registered, by the same [`Engine::refuse_hidden_domain`] every read
+    /// goes through, before either answer below can be reached.
+    ///
+    /// **A direct domain never reaches that screen**, and that is deliberate
+    /// rather than an oversight: this function answers `None` for it on the
+    /// first line, which is what it answered before review mode existed, so
+    /// every direct write behaves byte for byte as it always has and keeps
+    /// relying on the surface gate in front of it (MCP `refuse_unwritable`,
+    /// REST `require_domain_write`) exactly as its neighbours do.
+    async fn overlay_for_write(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<String>> {
         if !self.reviews_changes(name) {
             return Ok(None);
         }
+        self.refuse_hidden_domain(name, scope).await?;
         match crate::scope::overlay_actor(scope) {
             Some(actor) => Ok(Some(actor)),
             None => Err(EngineError::Refused(OVERLAY_NEEDS_IDENTITY.to_string())),
@@ -3257,7 +3270,7 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let source = self.content_source(&p.domain)?;
-        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let overlay = self.overlay_for_write(&p.domain, scope).await?;
         let actor = self.actor_for(client, overlay.as_ref());
         let engram_type = p
             .engram_type
@@ -3423,7 +3436,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let overlay = self.overlay_for_write(&p.domain, scope).await?;
         // A document that is not an engram would poison the index on reindex,
         // so it is refused before anything is written. This is the one hard
         // gate, and it is deliberately narrow: the text must parse (clean
@@ -3642,7 +3655,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(domain, scope)?;
+        let overlay = self.overlay_for_write(domain, scope).await?;
         let parsed =
             parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
@@ -4432,7 +4445,7 @@ impl Engine {
             })
             .transpose()?;
 
-        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let overlay = self.overlay_for_write(&p.domain, scope).await?;
         let actor = self.actor_for(client, overlay.as_ref());
         let (desc, source) = self
             .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
@@ -4799,7 +4812,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let overlay = self.overlay_for_write(&p.domain, scope).await?;
         let actor = self.actor_for(client, overlay.as_ref());
         let (desc, source) = self
             .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
@@ -5382,7 +5395,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let overlay = self.overlay_for_write(&p.domain, scope).await?;
         let actor = self.actor_for(client, overlay.as_ref());
         let (desc, source) = self
             .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
@@ -6044,7 +6057,7 @@ impl Engine {
         // Resolved once, before anything is written, and used twice below: to
         // look the destination up, and to bound the inbound rewrite.
         let hidden = self.hidden_for(scope).await?;
-        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let overlay = self.overlay_for_write(&p.domain, scope).await?;
         let (src, src_source) = self
             .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
             .await?;
@@ -6666,7 +6679,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let overlay = self.overlay_for_write(&p.domain, scope).await?;
         if let Some(path) = attachment_identifier(&p.identifier) {
             // Refused rather than ignored: `expected_checksum` is a promise
             // about markdown a caller read, and an attachment's bytes are not
@@ -8967,7 +8980,7 @@ impl Engine {
         if rule_info(&rule).is_none() {
             return Err(EngineError::Invalid(unknown_rule_message(&rule)));
         }
-        let overlay = self.overlay_for_write(domain, acting)?;
+        let overlay = self.overlay_for_write(domain, acting).await?;
         let actor = self.actor_for(client, overlay.as_ref());
         let scope = scope
             .map(str::trim)
