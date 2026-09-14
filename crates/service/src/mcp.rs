@@ -5078,9 +5078,15 @@ mod tests {
             RemoteError::RepoNotFound {
                 repo: "acme/brand-knowledge".to_string(),
             },
+            // Carries a candidate so this loop's `assert_eq!(err.message,
+            // message)` below actually exercises that the suggestion clause
+            // reaches the MCP caller verbatim rather than being trimmed to
+            // the refusal's first line.
             RemoteError::NotADomain {
                 repo: "acme/brand-knowledge".to_string(),
                 path: None,
+                candidates: vec!["memory".to_string()],
+                more_candidates: 0,
             },
             RemoteError::ConflictsPending { count: 2 },
             RemoteError::ProposalNotFound { number: 7 },

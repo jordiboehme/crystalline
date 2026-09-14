@@ -336,11 +336,18 @@ pub async fn subscribe(
     let (extracted, skipped_large) = extract_tarball(&bytes, spec.subpath.as_deref())?;
 
     // A domain is defined by a MANIFEST.md at its root; without one the target
-    // is not something to subscribe to, and nothing is written.
+    // is not something to subscribe to, and nothing is written. The tarball
+    // is already in hand, so a MANIFEST.md living one folder down is a fact
+    // this refusal already holds rather than something the caller has to
+    // guess and retry into.
     if !extracted.contains_key("MANIFEST.md") {
+        let (candidates, more_candidates) =
+            manifest_candidates(&extracted, spec.subpath.as_deref());
         return Err(RemoteError::NotADomain {
             repo: spec.repo.clone(),
             path: spec.subpath.clone(),
+            candidates,
+            more_candidates,
         });
     }
 
@@ -416,6 +423,48 @@ pub async fn subscribe(
         adopted,
         local_changes,
     })
+}
+
+/// Above this many candidates a `NotADomain` refusal stops listing and starts
+/// counting instead; five is plenty to let a caller pick the right one.
+const MAX_MANIFEST_CANDIDATES: usize = 5;
+
+/// Finds every MANIFEST.md an extraction actually holds, for the
+/// [`RemoteError::NotADomain`] refusal: no second request, just a scan of the
+/// tree that already failed the root check. Shallowest first, then lexical;
+/// capped at [`MAX_MANIFEST_CANDIDATES`] with the overflow counted rather than
+/// silently dropped.
+///
+/// `extracted` is keyed relative to whatever was requested (the repository
+/// root when `subpath` is `None`, that subtree when it is `Some`), so a hit
+/// found one level under an empty subpath is itself the value to retry with,
+/// while a hit under a requested subpath needs that subpath folded back in:
+/// the value a retry passes is always repository-relative, never relative to
+/// the failed attempt.
+fn manifest_candidates(
+    extracted: &BTreeMap<String, Vec<u8>>,
+    subpath: Option<&str>,
+) -> (Vec<String>, usize) {
+    let mut found: Vec<(usize, String)> = extracted
+        .keys()
+        .filter_map(|key| {
+            let dir = key.strip_suffix("/MANIFEST.md")?;
+            let depth = dir.matches('/').count();
+            let full = match subpath {
+                Some(base) if !base.is_empty() => format!("{base}/{dir}"),
+                _ => dir.to_string(),
+            };
+            Some((depth, full))
+        })
+        .collect();
+    found.sort();
+    let more = found.len().saturating_sub(MAX_MANIFEST_CANDIDATES);
+    let candidates = found
+        .into_iter()
+        .take(MAX_MANIFEST_CANDIDATES)
+        .map(|(_, path)| path)
+        .collect();
+    (candidates, more)
 }
 
 /// Brings an already-connected domain up to date with its origin.

@@ -79,10 +79,14 @@ pub enum RemoteError {
     },
 
     /// The repository, or the given subpath within it, has no MANIFEST.md, so
-    /// it does not look like a domain Crystalline can subscribe to.
+    /// it does not look like a domain Crystalline can subscribe to. When the
+    /// download the refusal is built from held a MANIFEST.md somewhere else,
+    /// `candidates` names it so the caller can copy the path rather than
+    /// guess it and re-learn it as folklore.
     #[error(
-        "{repo} does not look like a knowledge domain: no MANIFEST.md was found {}",
-        manifest_location(.path)
+        "{repo} does not look like a knowledge domain: no MANIFEST.md was found {}{}",
+        manifest_location(.path),
+        manifest_candidates_clause(candidates, *more_candidates)
     )]
     NotADomain {
         /// The repository, `owner/name`.
@@ -90,6 +94,15 @@ pub enum RemoteError {
         /// The subpath checked within the repository, or `None` for the
         /// repository root.
         path: Option<String>,
+        /// Every other MANIFEST.md this download actually holds, rendered as
+        /// the subpath value a retry passes: repository-relative, shallowest
+        /// first then lexical, capped at a handful. Empty when none were
+        /// found, which keeps the message identical to a repository that
+        /// truly has no domain in it anywhere.
+        candidates: Vec<String>,
+        /// How many further candidates the cap left out, `0` when the list
+        /// above is everything that was found.
+        more_candidates: usize,
     },
 
     /// GitHub could not be reached at all: DNS failure, connection refused or
@@ -216,6 +229,40 @@ fn manifest_location(path: &Option<String>) -> String {
     match path {
         Some(p) => format!("at {p}"),
         None => "at the repository root".to_string(),
+    }
+}
+
+/// Renders the `NotADomain` suggestion clause: empty when nothing else was
+/// found, so the message reads exactly as it always did for a repository with
+/// no domain in it anywhere. Otherwise names every MANIFEST.md the download
+/// actually held and the subpath value a retry passes for each, so the
+/// caller copies a fact instead of guessing one.
+fn manifest_candidates_clause(candidates: &[String], more: usize) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let manifests: Vec<String> = candidates
+        .iter()
+        .map(|c| format!("{c}/MANIFEST.md"))
+        .collect();
+    let found = if more > 0 {
+        format!("{}, and {more} more", manifests.join(", "))
+    } else {
+        join_with(&manifests, "and")
+    };
+    let pass = join_with(candidates, "or");
+    format!(". Found MANIFEST.md at {found}; pass {pass}.")
+}
+
+/// Joins a list in natural language with `conj` ("and" or "or") before the
+/// last item: one item alone, `"a {conj} b"` for two, `"a, b, {conj} c"` for
+/// three or more.
+fn join_with(items: &[String], conj: &str) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} {conj} {second}"),
+        [init @ .., last] => format!("{}, {conj} {last}", init.join(", ")),
     }
 }
 
@@ -362,6 +409,8 @@ mod tests {
         let err = RemoteError::NotADomain {
             repo: "acme/brand-knowledge".to_string(),
             path: Some("knowledge".to_string()),
+            candidates: vec![],
+            more_candidates: 0,
         };
         let msg = err.to_string();
         assert!(msg.contains("acme/brand-knowledge"), "{msg}");
@@ -374,8 +423,104 @@ mod tests {
         let err = RemoteError::NotADomain {
             repo: "acme/brand-knowledge".to_string(),
             path: None,
+            candidates: vec![],
+            more_candidates: 0,
         };
         assert!(err.to_string().contains("at the repository root"));
+    }
+
+    /// A repository whose only manifest sits one folder down: the refusal
+    /// names it, and the value it names is exactly what a retry passes as
+    /// the subpath - copied, not translated.
+    #[test]
+    fn not_a_domain_names_a_manifest_found_one_folder_down() {
+        let err = RemoteError::NotADomain {
+            repo: "planview-dev/scotty-knowledge".to_string(),
+            path: None,
+            candidates: vec!["memory".to_string()],
+            more_candidates: 0,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no MANIFEST.md was found at the repository root"),
+            "{msg}"
+        );
+        assert!(msg.contains("memory/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("pass memory"), "{msg}");
+    }
+
+    /// Two depths: both are listed, shallowest first, so the caller sees the
+    /// more likely one named first without having to compare depths itself.
+    #[test]
+    fn not_a_domain_lists_manifests_at_two_depths_shallowest_first() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec!["memory".to_string(), "archive/notes".to_string()],
+            more_candidates: 0,
+        };
+        let msg = err.to_string();
+        let memory_at = msg.find("memory/MANIFEST.md").expect(&msg);
+        let archive_at = msg.find("archive/notes/MANIFEST.md").expect(&msg);
+        assert!(memory_at < archive_at, "{msg}");
+        assert!(msg.contains("pass memory or archive/notes"), "{msg}");
+    }
+
+    /// No MANIFEST.md anywhere in what was downloaded: the message is
+    /// unchanged from before this feature existed, which is now true and
+    /// complete rather than a guess about what else might be there.
+    #[test]
+    fn not_a_domain_keeps_todays_wording_when_nothing_else_was_found() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec![],
+            more_candidates: 0,
+        };
+        assert_eq!(
+            err.to_string(),
+            "acme/brand-knowledge does not look like a knowledge domain: no MANIFEST.md was found at the repository root"
+        );
+    }
+
+    /// Asked for at a subpath that itself has no manifest, while one exists
+    /// nested under that same subpath: the candidate names the OTHER path,
+    /// composed with the requested subpath folded back in, since that is
+    /// what a retry must pass from the repository root.
+    #[test]
+    fn not_a_domain_names_a_manifest_found_elsewhere_under_the_requested_subpath() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: Some("wrong".to_string()),
+            candidates: vec!["wrong/memory".to_string()],
+            more_candidates: 0,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("no MANIFEST.md was found at wrong"), "{msg}");
+        assert!(msg.contains("wrong/memory/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("pass wrong/memory"), "{msg}");
+    }
+
+    /// The cap: more candidates exist than the message lists, and it says
+    /// so rather than pretending the list is exhaustive.
+    #[test]
+    fn not_a_domain_says_how_many_more_candidates_the_cap_left_out() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+            ],
+            more_candidates: 3,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("a/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("e/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("3 more"), "{msg}");
     }
 
     #[test]
@@ -535,6 +680,8 @@ mod tests {
             RemoteError::NotADomain {
                 repo: "acme/brand-knowledge".to_string(),
                 path: Some("knowledge".to_string()),
+                candidates: vec!["knowledge/memory".to_string(), "archive/notes".to_string()],
+                more_candidates: 2,
             }
             .to_string(),
             RemoteError::ConflictsPending { count: 1 }.to_string(),

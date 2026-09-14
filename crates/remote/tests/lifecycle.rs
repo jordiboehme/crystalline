@@ -287,8 +287,114 @@ async fn scenario_01_subscribe_without_manifest_is_not_a_domain_and_writes_nothi
         matches!(err, crystalline_remote::RemoteError::NotADomain { .. }),
         "{err:?}"
     );
+    // Nothing to suggest either: today's wording is the whole message,
+    // proving it stays true and complete rather than gaining a dangling
+    // "found nothing" clause.
+    assert_eq!(
+        err.to_string(),
+        "team/knowledge does not look like a knowledge domain: no MANIFEST.md was found at the repository root"
+    );
     assert!(!domain_root.exists(), "target must be untouched");
     assert!(OriginState::load(&state_dir).unwrap().is_none());
+}
+
+/// A repository whose only MANIFEST.md sits one folder down: the refusal
+/// names it, and names it as the exact subpath a retry passes, so the caller
+/// copies a fact it already held rather than guessing one and re-learning it
+/// as folklore.
+#[tokio::test]
+async fn scenario_01_subscribe_names_a_manifest_found_one_folder_down() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("memory/MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha"),
+        ]),
+        None,
+    );
+    mock.set_branch("main", &c1);
+
+    let work = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let domain_root = work.path().join("domain");
+    let state_dir = state.path().join("origin");
+
+    let err = subscribe(&mock, &spec(), &domain_root, &state_dir)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("memory/MANIFEST.md"), "{msg}");
+    assert!(msg.contains("pass memory"), "{msg}");
+    assert!(!domain_root.exists(), "target must be untouched");
+}
+
+/// Two MANIFEST.md files at different depths: both are named, shallowest
+/// first, so the caller sees the more likely candidate first without having
+/// to compare paths itself.
+#[tokio::test]
+async fn scenario_01_subscribe_lists_manifests_at_two_depths_shallowest_first() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("archive/notes/MANIFEST.md", b"# Old manifest"),
+            ("memory/MANIFEST.md", b"# Manifest"),
+        ]),
+        None,
+    );
+    mock.set_branch("main", &c1);
+
+    let work = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let domain_root = work.path().join("domain");
+    let state_dir = state.path().join("origin");
+
+    let err = subscribe(&mock, &spec(), &domain_root, &state_dir)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    let memory_at = msg.find("memory/MANIFEST.md").expect(&msg);
+    let archive_at = msg.find("archive/notes/MANIFEST.md").expect(&msg);
+    assert!(
+        memory_at < archive_at,
+        "shallowest should be named first: {msg}"
+    );
+    assert!(msg.contains("pass memory or archive/notes"), "{msg}");
+}
+
+/// Asked for at a subpath that itself has no manifest, while one exists
+/// nested under that same subpath: the candidate names the OTHER path,
+/// repository-relative (the requested subpath folded back in), which is
+/// exactly what a retry has to pass.
+#[tokio::test]
+async fn scenario_01_subscribe_at_a_subpath_names_a_manifest_found_elsewhere_under_it() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("wrong/memory/MANIFEST.md", b"# Manifest"),
+            ("wrong/notes/a.md", b"alpha"),
+        ]),
+        None,
+    );
+    mock.set_branch("main", &c1);
+
+    let requested = OriginSpec {
+        repo: "team/knowledge".to_string(),
+        subpath: Some("wrong".to_string()),
+        branch: "main".to_string(),
+    };
+
+    let work = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let domain_root = work.path().join("domain");
+    let state_dir = state.path().join("origin");
+
+    let err = subscribe(&mock, &requested, &domain_root, &state_dir)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("no MANIFEST.md was found at wrong"), "{msg}");
+    assert!(msg.contains("wrong/memory/MANIFEST.md"), "{msg}");
+    assert!(msg.contains("pass wrong/memory"), "{msg}");
 }
 
 #[tokio::test]

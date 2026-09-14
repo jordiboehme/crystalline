@@ -583,6 +583,26 @@ mod tests {
         );
     }
 
+    /// A `NotADomain` refusal that names a candidate MANIFEST.md reaches this
+    /// surface's `detail` whole: `detail` is computed once, from the same
+    /// `to_string()` the caller would print, before the status match ever
+    /// runs, so the suggestion clause cannot be trimmed to the refusal's
+    /// first line by the 404 mapping below it.
+    #[test]
+    fn not_a_domain_is_not_found_and_the_candidate_reaches_the_client_whole() {
+        let e = crystalline_remote::RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec!["memory".to_string()],
+            more_candidates: 0,
+        };
+        let detail = e.to_string();
+        let api = remote_to_api_error(e, detail.clone());
+        assert_eq!(api.status, StatusCode::NOT_FOUND);
+        assert_eq!(api.detail, detail);
+        assert!(api.detail.contains("pass memory"), "{}", api.detail);
+    }
+
     /// An organization policy refusal is 422 on this surface, beside a
     /// teaching refusal and for the same reason: the token works, nothing on
     /// this instance is broken, and the message names the GitHub page that
