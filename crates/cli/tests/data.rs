@@ -1002,7 +1002,7 @@ fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
 /// A second domain whose folder has gone makes the run fail after it stamped
 /// that domain and before its rebuild could commit - the same window a SIGTERM
 /// lands in. Afterwards a fresh `status` process reads the stamp off disk and
-/// says the rebuild never finished, while the domain's rows are still all
+/// says the rebuild did not finish, while the domain's rows are still all
 /// there.
 #[test]
 fn an_interrupted_full_reindex_leaves_a_marker_a_later_status_reports() {
@@ -1091,7 +1091,7 @@ fn an_interrupted_full_reindex_leaves_a_marker_a_later_status_reports() {
     let human = String::from_utf8_lossy(&out.stdout);
     assert!(
         human.contains("a full rebuild of 'two' started")
-            && human.contains("never finished")
+            && human.contains("did not finish")
             && human.contains("Run: crystalline reindex --full"),
         "{human}"
     );
@@ -1261,4 +1261,191 @@ fn wipe_refuses_while_a_virtual_domain_holds_the_only_copy() {
         .arg(&db)
         .assert()
         .success();
+}
+
+/// The guard has to ask the database, not the config it was handed. A wipe is
+/// unscoped, so what is at risk is every virtual domain the *index* holds, and
+/// the two sets come apart routinely: a domain dropped from the config keeps
+/// its rows, and `--db`/`--config` are the documented way to point one config
+/// at another's index. A config-driven guard would wave this through and delete
+/// the only copy.
+#[test]
+fn wipe_refuses_for_a_virtual_domain_the_config_does_not_mention() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    bin()
+        .args(["domain", "add", "notes", "--virtual", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    bin()
+        .args(["write", "notes", "Kept Note"])
+        .args(["--content", "virtual body that must survive"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    // A second config over the same index that knows only the file domain -
+    // the shape a `--config` override produces, and the shape a config edit
+    // leaves behind.
+    let narrow = work.path().join("narrow.yaml");
+    bin()
+        .args(["domain", "add", "eng"])
+        .arg(work.path().join("kb"))
+        .args(["--config"])
+        .arg(&narrow)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let narrow_text = std::fs::read_to_string(&narrow).unwrap();
+    assert!(
+        !narrow_text.contains("notes"),
+        "the narrow config really does not mention the virtual domain: {narrow_text}"
+    );
+
+    let out = bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&narrow)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the wipe refuses on what the index holds, not on what this config lists"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("refusing to wipe") && err.contains("notes"),
+        "the refusal names the domain the index holds: {err}"
+    );
+
+    // Still there, read back through the config that knows it.
+    let out = bin()
+        .args([
+            "--json",
+            "read",
+            "kept-note",
+            "--domain",
+            "notes",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let read: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("virtual body that must survive"),
+        "{read}"
+    );
+}
+
+/// A Postgres index is a shared database with no exclusive open, so nothing can
+/// establish that no other instance is serving from it - and a wipe deletes
+/// every instance's rows and releases their host claims. The flag has nothing
+/// to offer that backend anyway (its reason for existing is a local database
+/// file that will not open), so it refuses before it connects to anything.
+#[test]
+fn wipe_refuses_on_a_postgres_index() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("pg.yaml");
+    std::fs::write(
+        &config,
+        "database:\n  backend: postgres\n  url: postgres://nobody@127.0.0.1:1/nothing\ndomains: {}\n",
+    )
+    .unwrap();
+
+    let out = bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the wipe refuses on postgres");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("refusing to wipe")
+            && err.contains("PostgreSQL")
+            && err.contains("crystalline reindex --full"),
+        "the refusal names the shared-database reason and the rebuild that works: {err}"
+    );
+    // It never opened anything: the URL above points at a port nothing listens
+    // on, so a connection attempt would have failed with a different message.
+    assert!(
+        !err.contains("connection") && !err.contains("Connection"),
+        "the refusal comes before any connection: {err}"
+    );
+}
+
+/// `--full` stopped self-healing a damaged database when it moved off the
+/// resilient open, which is right for the split - but the sentence a person
+/// then gets points at `doctor --fix`, which clears a stale lock and does not
+/// repair a database. The one command that does has to be named where they
+/// meet the failure, not only in the docs.
+#[test]
+fn a_full_reindex_on_a_damaged_database_names_the_wipe() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    // Garbage in place of the database, the same corruption the recovery test
+    // in the index crate uses.
+    std::fs::write(
+        &db,
+        b"this is not a sqlite database, just garbage bytes \x00\x01\x02",
+    )
+    .unwrap();
+    for sidecar in ["-wal", "-shm"] {
+        let mut p = db.as_os_str().to_os_string();
+        p.push(sidecar);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+    }
+
+    let out = bin()
+        .args(["reindex", "--full", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a damaged database stops --full");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("crystalline reindex --wipe"),
+        "the failure names the command that repairs it: {err}"
+    );
+
+    // And that command does repair it.
+    bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = bin()
+        .args(["--json", "search", "zephyrtoken", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        search["total"],
+        serde_json::json!(2),
+        "rebuilt from the files"
+    );
 }

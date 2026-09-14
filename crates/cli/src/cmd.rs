@@ -221,7 +221,7 @@ pub(crate) fn index_absent(verb: &str, db: &Path) -> anyhow::Error {
 
 /// Whether the effective backend is the local Turso file (so an absent file
 /// means "no index yet"). Postgres has no local file and is always opened.
-fn backend_is_turso(cfg: &GlobalConfig) -> bool {
+pub(crate) fn backend_is_turso(cfg: &GlobalConfig) -> bool {
     cfg.database().backend == DatabaseBackend::Turso
 }
 
@@ -1367,23 +1367,35 @@ pub async fn reindex(
     // virtual domain's engrams live nowhere else: wiping them is not a rebuild,
     // it is deleting knowledge, and no rebuild afterwards can bring them back.
     // Refuse rather than quietly doing something narrower than the verb's name,
-    // and name the way out. (The corruption case this flag exists for is
-    // unaffected in practice: a database file that will not open has already
-    // taken its virtual rows with it before this runs.)
+    // and name the way out.
+    //
+    // The question is asked of the DATABASE, not of this config. `Store::wipe`
+    // is unscoped - thirteen bare deletes ending in `domain` - so what is at
+    // risk is every virtual domain the index holds, and the two are routinely
+    // not the same set: a domain dropped from the config keeps its rows until
+    // something collects them (the whole orphaned-rows surface exists for that
+    // state), and `--db`/`--config`, the flags that force this direct path in
+    // the first place, are the documented way to point a narrower config at a
+    // wider index. Reading `cfg.domains` here would refuse in the easy case and
+    // destroy silently in exactly the cases the flags exist for.
     if wipe {
-        let virtual_domains: Vec<&str> = targets
+        let store = store.lock().await;
+        let stats = store
+            .domain_stats()
+            .await
+            .map_err(|e| anyhow!("could not read the index before wiping it: {e}"))?;
+        let virtual_domains: Vec<&str> = stats
             .iter()
-            .filter(|(_, entry)| entry.is_virtual())
-            .map(|(name, _)| name.as_str())
+            .filter(|d| d.kind == DomainKind::Virtual)
+            .map(|d| d.name.as_str())
             .collect();
         if !virtual_domains.is_empty() {
             bail!(
-                "refusing to wipe: {} virtual domain(s) keep their engrams only in the index, so a wipe would delete them for good: {}. Copy them out first with: crystalline domain export <name> <dir>, or rebuild without destroying anything: crystalline reindex --full",
+                "refusing to wipe: the index holds {} virtual domain(s) whose engrams live nowhere else, so a wipe would delete them for good: {}. Copy them out first with: crystalline domain export <name> <dir>, or rebuild without destroying anything: crystalline reindex --full",
                 virtual_domains.len(),
                 virtual_domains.join(", ")
             );
         }
-        let store = store.lock().await;
         store
             .wipe()
             .await
@@ -1588,11 +1600,15 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     // sitting somewhere else in the report.
     //
     // The marker is durable and nothing clears it when a process is killed, so
-    // it says history, not liveness. Only a live `reindex` in the daemon's own
-    // activity snapshot - which a direct read has none of - turns it into a
-    // "running now" line; without one it reads as a rebuild that never
-    // finished. Either way the domain's rows are complete, because a rebuild
-    // clears nothing and coverage can only go up across one.
+    // it says history, not liveness. A live `reindex` in the daemon's activity
+    // snapshot - which a direct read has none of - says a rebuild is running,
+    // but not *which* domain's: the activity record carries no domain, so a
+    // marker standing from a run that died last week and a rebuild running now
+    // on another domain cannot be told apart from here. So the live line says
+    // only what is known - a rebuild is running, and this domain is stamped -
+    // and never claims the two are the same one. Either way the domain's rows
+    // are complete, because a rebuild clears nothing and coverage can only go
+    // up across one.
     let rebuild_is_live = data["activity"]["now"]
         .as_array()
         .is_some_and(|now| now.iter().any(|a| a["kind"].as_str() == Some("reindex")));
@@ -1603,11 +1619,11 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         let name = d["name"].as_str().unwrap_or("");
         if rebuild_is_live {
             println!(
-                "  rebuilding '{name}' since {started}; the numbers above are its rows from before it"
+                "  a rebuild is running now; '{name}' was stamped {started} and its rows are the ones from before that rebuild lands"
             );
         } else {
             println!(
-                "  a full rebuild of '{name}' started {started} never finished; that domain's rows are the ones from before it. Run: crystalline reindex --full"
+                "  a full rebuild of '{name}' started {started} and did not finish; that domain's rows are the ones from before it. Run: crystalline reindex --full"
             );
         }
     }

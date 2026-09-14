@@ -1979,6 +1979,26 @@ async fn reindex_dispatch(
 ) -> anyhow::Result<()> {
     use serde_json::json;
     let cfg = cmd::load(config.as_deref())?.effective;
+
+    // A wipe needs the index to itself, and only the embedded backend can
+    // establish that: opening the local database file takes an exclusive lock,
+    // so a daemon still serving it makes the wipe refuse rather than delete
+    // underneath it. A Postgres index has no such moment. It is a shared
+    // database several instances connect to at once, nothing in a connection
+    // says "nobody else is using this", and a wipe there deletes every other
+    // instance's rows and releases their host claims mid-serve. The host-lock
+    // table would catch a collaborating instance, but a daemon outside
+    // collaboration mode writes no row at all, so no check can see it.
+    //
+    // The flag also has nothing to offer that backend: what it exists for is a
+    // local database file that will not open, and Postgres has no local file.
+    // So it refuses there, and names the rebuild that does work.
+    if wipe && !cmd::backend_is_turso(&cfg) {
+        anyhow::bail!(
+            "refusing to wipe: this index is a PostgreSQL database, which several instances can be connected to at once, and nothing here can establish that nobody else is serving from it - a wipe would delete their rows and release their host claims while they run. The corruption case --wipe exists for is a local database file that will not open, which this backend does not have. Rebuild without destroying anything instead: crystalline reindex --full. If the database itself must really be cleared, stop every daemon that serves it and drop the schema with your own database tools."
+        );
+    }
+
     // `--wipe` is the corruption-recovery path and the only one that needs the
     // resilient open, which discards a Turso database that will not open at
     // all. It is also the only one a running daemon cannot do for us: it needs
@@ -2009,6 +2029,17 @@ async fn reindex_dispatch(
             print_embed_scheduled(&data, json);
             Ok(())
         }
+        // An index that will not open is the one failure where this verb has
+        // something to say that the shared wording cannot: `--full` opens
+        // ordinarily now, so a damaged database file stops it dead, and the
+        // sentence a person gets points at `doctor --fix`, which clears a stale
+        // lock and does not repair a database. `--wipe` is what repairs one,
+        // and nothing else in the program will ever name it to them. Said only
+        // here, where the remedy is a flag on the command they just ran.
+        cmd::IndexRoute::Unreachable(why) if !wipe => Err(anyhow::anyhow!(
+            "{} If the database file itself is damaged, throw it away and rebuild from your files with: crystalline reindex --wipe",
+            cmd::index_unreachable("reindex", &why)
+        )),
         other => {
             cmd::reindex(
                 cmd::local_store(other, "reindex")?,
