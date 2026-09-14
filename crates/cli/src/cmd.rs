@@ -1,9 +1,10 @@
 //! Implementations of the data and domain-management subcommands.
 //!
-//! These are the first subcommands that touch the derived index. For now they
-//! open the database directly in-process; the M5 daemon will route them over the
-//! control socket when one is running, falling back to this direct path. The
-//! spot where that dispatch slots in is [`open_store`].
+//! Every one of these that touches the derived index reaches it through
+//! [`reach_index`] and nowhere else: a running daemon owns the index file, so a
+//! verb that opens the database on its own answers a person with a lock error
+//! on exactly the machines the daemon is there to serve. `crates/cli/tests/index_access.rs`
+//! guards the rule.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,22 +82,132 @@ pub(crate) fn db_path(override_path: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// Open the configured backend as a `dyn Store` through the shared factory, so
-/// these standalone commands honor `backend: postgres` (or a Turso file at the
-/// resolved path) without a running daemon, exactly like the daemon and doctor
-/// paths do. `resilient` selects the corruption-recovery open for Turso (the
-/// `reindex --full` recovery path) and is ignored by Postgres.
+// --- one way to reach the index -----------------------------------------------
+
+/// How a verb wants the index opened when it opens one directly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAs {
+    /// A read. On the Turso backend an absent index file means nothing has
+    /// been synced on this machine yet, and the verb answers that rather than
+    /// creating an empty database to read no rows from.
+    Read,
+    /// A write. The index is created when it is not there yet.
+    Write,
+    /// `reindex --full`'s corruption-recovery open, which rebuilds a Turso
+    /// database that will not open at all. Creates like [`OpenAs::Write`],
+    /// and a no-op distinction on Postgres, which has no local file.
+    Rebuild,
+}
+
+/// Where a CLI verb reached the index, and how.
+pub(crate) enum IndexRoute {
+    /// A running daemon owns the index and answered the verb's control
+    /// request; this is its reply, in the daemon's own JSON.
+    Daemon(serde_json::Value),
+    /// No daemon was asked, or none answered, and the index opened here.
+    Direct(Arc<TokioMutex<dyn Store>>),
+    /// There is no index on this machine yet, so there is nothing to read.
+    /// Only an [`OpenAs::Read`] ever lands here; a write creates the file.
+    Absent(PathBuf),
+    /// There is an index and this command could not reach it: a daemon owns
+    /// the file and answered nothing, or the open failed outright. The string
+    /// says which, naming the daemon and a remedy, and carries the raw error
+    /// at its end rather than on its own.
+    Unreachable(String),
+}
+
+/// The one way a CLI verb reaches the index.
 ///
-/// The M5 daemon dispatch still slots in above this: when a service socket is
-/// live the command routes over it instead of opening the database in-process.
-async fn open_backend(
+/// Ask a running daemon first, since on any machine with one the daemon owns
+/// the index file and a second opener gets a lock error rather than an answer;
+/// open the index directly when there is no daemon to ask; and where neither
+/// is possible say so in words that name the daemon and the remedy, so that a
+/// verb which can answer part of its question from configuration alone
+/// degrades (see [`domain_list`]) and one which cannot refuses readably (see
+/// [`index_unreachable`]).
+///
+/// `request` is the verb's ctl request, or `None` for a verb whose caller has
+/// already asked the daemon under a different verb (`domain add`, which asks
+/// for a sync of the one domain it just registered). An explicit `--db` or
+/// `--config` override names an exact index the running daemon may not serve,
+/// so it bypasses the daemon entirely; that is
+/// [`crystalline_service::use_daemon`]'s rule and this is the only place the
+/// CLI applies it to the index.
+pub(crate) async fn reach_index(
+    request: Option<serde_json::Value>,
     cfg: &GlobalConfig,
+    config_override: Option<&Path>,
     db_override: Option<&Path>,
-    resilient: bool,
-) -> Result<Arc<TokioMutex<dyn Store>>> {
-    crystalline_index::open_store(&cfg.database(), db_override, resilient)
+    open_as: OpenAs,
+) -> Result<IndexRoute> {
+    let bypassed = !crystalline_service::use_daemon(db_override, config_override);
+    if !bypassed
+        && let Some(request) = request
+        && let Some(data) = crystalline_service::ctl_if_running(request).await?
+    {
+        return Ok(IndexRoute::Daemon(data));
+    }
+    let db = db_path(db_override)?;
+    let turso = backend_is_turso(cfg);
+    if open_as == OpenAs::Read && turso && !db.exists() {
+        return Ok(IndexRoute::Absent(db));
+    }
+    // Postgres has no local file, so naming one in a failure would point at a
+    // path nothing lives at.
+    let location = if turso {
+        db.display().to_string()
+    } else {
+        "the configured database".to_string()
+    };
+    match crystalline_index::open_store(&cfg.database(), db_override, open_as == OpenAs::Rebuild)
         .await
-        .map_err(|e| anyhow!("could not open the index: {e}"))
+    {
+        Ok(store) => Ok(IndexRoute::Direct(store)),
+        Err(e) => Ok(IndexRoute::Unreachable(unreachable_words(
+            &location,
+            &e.to_string(),
+            bypassed,
+        ))),
+    }
+}
+
+/// Why the index could not be reached, in words a person can act on. A raw
+/// lock error names no daemon and no remedy, which is how a colleague's agent
+/// spent a session on the wrong diagnosis; every branch here names the holder
+/// it can see and one command to run, and appends the underlying error rather
+/// than leading with it.
+fn unreachable_words(location: &str, error: &str, bypassed: bool) -> String {
+    let live = crystalline_service::instance::read_lock_info()
+        .filter(|info| crystalline_service::instance::process_alive(info.pid));
+    match (live, bypassed) {
+        (Some(info), true) => format!(
+            "the running Crystalline daemon (pid {}) owns the index at {location}, and --db or --config told this command to read that file directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}",
+            info.pid
+        ),
+        (Some(info), false) => format!(
+            "the running Crystalline daemon (pid {}) owns the index at {location} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}",
+            info.pid
+        ),
+        (None, _) => format!(
+            "the index at {location} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+        ),
+    }
+}
+
+/// The error a verb fails with when it needs the index and
+/// [`reach_index`] could not reach it. One wording for every verb, so a
+/// person meets the same sentence wherever they hit the same state.
+pub(crate) fn index_unreachable(verb: &str, reason: &str) -> anyhow::Error {
+    anyhow!("`crystalline {verb}` needs the index and could not reach it: {reason}")
+}
+
+/// The error a verb fails with when there is no index on this machine at all
+/// and it has nothing to answer from.
+pub(crate) fn index_absent(verb: &str, db: &Path) -> anyhow::Error {
+    anyhow!(
+        "`crystalline {verb}` needs the index and there is none at {} yet: nothing has been synced on this machine. Run: crystalline sync",
+        db.display()
+    )
 }
 
 /// Whether the effective backend is the local Turso file (so an absent file
@@ -302,10 +413,15 @@ pub(crate) fn print_domain_add_virtual(name: &str, scaffold: &serde_json::Value,
     }
 }
 
-/// Sync a single, just-registered domain directly (no daemon involved) and
-/// return its report. Parse failures in individual files land in the
-/// report's `failed` list rather than aborting; only a harder error (the
-/// store will not open, the transaction fails) is propagated.
+/// Sync a single, just-registered domain directly and return its report.
+/// Parse failures in individual files land in the report's `failed` list
+/// rather than aborting; only a harder error (the index cannot be reached,
+/// the transaction fails) is propagated.
+///
+/// Reaches the index with no ctl request of its own: `domain add`'s dispatch
+/// has already asked the daemon to sync this one domain and only falls through
+/// to here when none answered, so asking a second time would ask the same
+/// question twice.
 pub(crate) async fn sync_domain_direct(
     name: &str,
     root: &Path,
@@ -313,7 +429,13 @@ pub(crate) async fn sync_domain_direct(
     db_override: Option<&Path>,
 ) -> Result<crystalline_index::SyncReport> {
     let cfg = load(config_override)?.effective;
-    let store = open_backend(&cfg, db_override, false).await?;
+    let store = match reach_index(None, &cfg, config_override, db_override, OpenAs::Write).await? {
+        IndexRoute::Direct(store) => store,
+        IndexRoute::Absent(db) => return Err(index_absent("domain add", &db)),
+        IndexRoute::Unreachable(why) => return Err(index_unreachable("domain add", &why)),
+        // Never asked for, so never answered.
+        IndexRoute::Daemon(_) => unreachable!("sync_domain_direct sends no ctl request"),
+    };
     let params = chunk_params(&cfg);
     // First lock window: resolve the domain id and snapshot its stamps. The scan
     // then runs with no lock held; the second window applies transactionally.
@@ -827,7 +949,53 @@ pub fn print_domain_remove(name: &str, report: &serde_json::Value, json: bool) {
 
 // --- domain list -------------------------------------------------------------
 
-/// List registered domains, with engram counts when the index is present.
+/// The slice of a domain's index stats this listing prints: how many engrams
+/// it holds, and which instance hosts it in a shared database. Both routes to
+/// the index produce it, so the daemon's answer and a direct read render
+/// identically. Read field by field rather than deserialized whole: the
+/// daemon's rows carry an annotation of its own and [`crystalline_index::DomainStats`]
+/// is a write-only shape.
+struct ListedStats {
+    name: String,
+    engrams: i64,
+    host_instance_id: Option<String>,
+    host_heartbeat_at: Option<String>,
+}
+
+impl ListedStats {
+    fn from_stats(d: &crystalline_index::DomainStats) -> ListedStats {
+        ListedStats {
+            name: d.name.clone(),
+            engrams: d.engrams,
+            host_instance_id: d.host_instance_id.clone(),
+            host_heartbeat_at: d.host_heartbeat_at.clone(),
+        }
+    }
+
+    fn from_json(v: &serde_json::Value) -> Option<ListedStats> {
+        let text = |key: &str| {
+            v.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Some(ListedStats {
+            name: text("name")?,
+            engrams: v.get("engrams").and_then(serde_json::Value::as_i64)?,
+            host_instance_id: text("host_instance_id"),
+            host_heartbeat_at: text("host_heartbeat_at"),
+        })
+    }
+}
+
+/// List registered domains, with engram counts when the index can be read.
+///
+/// The registrations come from configuration, so this command always answers:
+/// it is the counts, and only the counts, that need the index. When the index
+/// cannot be reached the list still prints and each count says it was not
+/// read, rather than the whole command failing or, worse, reporting a domain
+/// as unindexed because a daemon happened to be holding the file. The daemon's
+/// `status` reply carries the same per-domain stats a direct read would, so a
+/// machine with a daemon gets real counts instead of a lock error.
 pub async fn domain_list(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
@@ -837,15 +1005,70 @@ pub async fn domain_list(
     // overlay marks which rows an environment variable defines.
     let loaded = load(config_override)?;
     let cfg = loaded.effective;
-    let should_open = !backend_is_turso(&cfg) || db_path(db_override)?.exists();
-    let stats = if should_open {
-        match open_backend(&cfg, db_override, false).await {
-            Ok(store) => store.lock().await.domain_stats().await.ok(),
-            Err(_) => None,
+    // Why the counts are missing when they are, in the helper's words; `None`
+    // once they were read, whichever route delivered them.
+    let mut not_read: Option<String> = None;
+    let stats: Option<Vec<ListedStats>> = match reach_index(
+        Some(serde_json::json!({ "v": 1, "cmd": "status" })),
+        &cfg,
+        config_override,
+        db_override,
+        OpenAs::Read,
+    )
+    .await?
+    {
+        // The daemon's own `domain_stats`, annotated with a `hosted_here`
+        // field this command has no use for. A reply that carries no counts,
+        // or a row that does not read back, is a count nobody read: saying so
+        // is the point, and rendering it as an empty set would put every
+        // domain back on the "(not indexed)" line this routing exists to end.
+        IndexRoute::Daemon(data) => {
+            match data.get("domains").and_then(serde_json::Value::as_array) {
+                Some(rows) => {
+                    let parsed: Vec<ListedStats> =
+                        rows.iter().filter_map(ListedStats::from_json).collect();
+                    if parsed.len() == rows.len() {
+                        Some(parsed)
+                    } else {
+                        not_read = Some(
+                            "the running Crystalline daemon answered, but its per-domain counts did not read back in the shape this listing expects. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
+                        );
+                        None
+                    }
+                }
+                None => {
+                    not_read = Some(
+                        "the running Crystalline daemon answered without the per-domain counts this listing reads. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
+                    );
+                    None
+                }
+            }
         }
-    } else {
-        None
+        IndexRoute::Direct(store) => match store.lock().await.domain_stats().await {
+            Ok(rows) => Some(rows.iter().map(ListedStats::from_stats).collect()),
+            // Open, and still no counts: the index answered the open and not
+            // the question, which is a different state from both "unreachable"
+            // and "never synced" and must not be rendered as either.
+            Err(e) => {
+                not_read = Some(format!(
+                    "the index opened, but its per-domain counts could not be read. Look at it with: crystalline doctor --fix. The index reported: {e}"
+                ));
+                None
+            }
+        },
+        // No index yet is not a failure to read one: a registered domain that
+        // was never synced is exactly the "(not indexed)" case below.
+        IndexRoute::Absent(_) => Some(Vec::new()),
+        IndexRoute::Unreachable(why) => {
+            not_read = Some(why);
+            None
+        }
     };
+    if let Some(why) = &not_read
+        && !json
+    {
+        eprintln!("note: engram counts were not read; {why}");
+    }
     let stat_for = |name: &str| {
         stats
             .as_ref()
@@ -887,7 +1110,18 @@ pub async fn domain_list(
                 })
             })
             .collect();
-        println!("{}", serde_json::json!({ "domains": domains }));
+        // `engrams: null` alone cannot tell "not synced yet" from "nobody
+        // read the index", and those want opposite reactions from a reader.
+        // `counts` says which, and carries the helper's words when the
+        // counts are missing.
+        let counts = match &not_read {
+            Some(why) => serde_json::json!({ "read": false, "reason": why }),
+            None => serde_json::json!({ "read": true }),
+        };
+        println!(
+            "{}",
+            serde_json::json!({ "domains": domains, "counts": counts })
+        );
         return Ok(());
     }
 
@@ -920,6 +1154,9 @@ pub async fn domain_list(
             .unwrap_or_default();
         match count_for(name) {
             Some(n) => println!("{name}\t{location}\t{n} engrams{host}"),
+            None if not_read.is_some() => {
+                println!("{name}\t{location}\t(counts not read){host}")
+            }
             None => println!("{name}\t{location}\t(not indexed){host}"),
         }
     }
@@ -928,18 +1165,20 @@ pub async fn domain_list(
 
 // --- sync --------------------------------------------------------------------
 
-/// Sync one or all registered domains, optionally embedding new chunks after.
+/// Sync one or all registered domains, optionally embedding new chunks after,
+/// into an index its dispatch already reached through [`reach_index`]. Taking
+/// the opened store rather than opening one keeps the daemon-or-direct
+/// decision in `main.rs`'s dispatch layer, where `reindex` and `status` make
+/// the same one.
 pub async fn sync(
+    store: Arc<TokioMutex<dyn Store>>,
+    cfg: &GlobalConfig,
     only: Option<&str>,
     embed: bool,
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load(config_override)?.effective;
-    let targets = select_domains(&cfg, only)?;
-    let store = open_backend(&cfg, db_override, false).await?;
-    let params = chunk_params(&cfg);
+    let targets = select_domains(cfg, only)?;
+    let params = chunk_params(cfg);
 
     let mut reports = Vec::new();
     for (name, entry) in targets {
@@ -984,7 +1223,7 @@ pub async fn sync(
 
     if embed {
         let store = store.lock().await;
-        embed_pass(&*store, &cfg).await?;
+        embed_pass(&*store, cfg).await?;
     }
 
     // Any sync, not just a full reindex, is a snapshot-preparation verb: a
@@ -1063,21 +1302,21 @@ pub(crate) fn sync_failure(
 /// Reindex all domains. `--full` wipes the index first (the corruption-recovery
 /// path), opening resiliently so a database that will not open is rebuilt.
 pub async fn reindex(
+    store: Arc<TokioMutex<dyn Store>>,
+    cfg: &GlobalConfig,
     full: bool,
     embed: bool,
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load(config_override)?.effective;
-    let targets = select_domains(&cfg, None)?;
-    let params = chunk_params(&cfg);
+    let targets = select_domains(cfg, None)?;
+    let params = chunk_params(cfg);
 
-    // `--full` opens resiliently (Turso rebuilds a database that will not open;
-    // a no-op for Postgres). Rather than a global wipe, it clears each file
-    // domain's rows per-domain and resyncs, so virtual-domain rows, whose only
-    // source of truth is the database, survive the reindex.
-    let store = open_backend(&cfg, db_override, full).await?;
+    // Rather than a global wipe, `--full` clears each file domain's rows
+    // per-domain and resyncs, so virtual-domain rows, whose only source of
+    // truth is the database, survive the reindex. The resilient open `--full`
+    // also wants (Turso rebuilds a database that will not open; a no-op for
+    // Postgres) is `OpenAs::Rebuild`, chosen by the dispatch that reached this
+    // store.
     // Only the file domains have files to (re)index.
     let file_targets: Vec<(String, PathBuf)> = targets
         .into_iter()
@@ -1138,7 +1377,7 @@ pub async fn reindex(
 
     if embed {
         let store = store.lock().await;
-        embed_pass(&*store, &cfg).await?;
+        embed_pass(&*store, cfg).await?;
     }
 
     // Any reindex, full or incremental, is a snapshot-preparation verb: a
@@ -1162,27 +1401,26 @@ pub async fn reindex(
 /// `status` returns (minus its liveness fields and the exposure facts only a
 /// serving process recorded - `started_by`, `http`, `allowed_hosts`), so both
 /// paths render through [`render_status`] and `--json` yields one stable shape
-/// either way.
-pub async fn status_value(
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
-) -> Result<serde_json::Value> {
-    let cfg = load(config_override)?.effective;
+/// either way. Reads whatever [`reach_index`] reached, and is the one verb
+/// here that refuses rather than degrading: a status with no numbers in it
+/// would be a report about nothing.
+pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde_json::Value> {
     let registered: Vec<String> = cfg.domains.keys().cloned().collect();
-    // Only the Turso backend has a local file whose absence means "no index
-    // yet"; Postgres is always opened.
-    if backend_is_turso(&cfg) {
-        let db = db_path(db_override)?;
-        if !db.exists() {
+    let store = match route {
+        IndexRoute::Direct(store) => store,
+        // No index on this machine yet: the same "nothing synced" report the
+        // direct path used to build for an absent database file.
+        IndexRoute::Absent(db) => {
             return Ok(serde_json::json!({
                 "indexed": false,
                 "db_path": db.display().to_string(),
                 "registered": registered,
             }));
         }
-    }
-
-    let store = open_backend(&cfg, db_override, false).await?;
+        IndexRoute::Unreachable(why) => return Err(index_unreachable("status", &why)),
+        // The dispatch renders the daemon's own report; it never arrives here.
+        IndexRoute::Daemon(_) => unreachable!("the daemon's status report renders on its own"),
+    };
     let store = store.lock().await;
     let info = store
         .store_info()
@@ -1375,15 +1613,16 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     }
 }
 
-/// Show per-domain counts and index diagnostics from a directly opened
-/// index. `daemon_note` explains why the daemon was not consulted.
+/// Show per-domain counts and index diagnostics from the index the dispatch
+/// reached. `daemon_note` says which view this is, so a direct read never
+/// masquerades as a running daemon's.
 pub async fn status(
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
+    route: IndexRoute,
+    cfg: &GlobalConfig,
     json: bool,
     daemon_note: &str,
 ) -> Result<()> {
-    let value = status_value(config_override, db_override).await?;
+    let value = status_value(route, cfg).await?;
     if json {
         println!("{value}");
     } else {

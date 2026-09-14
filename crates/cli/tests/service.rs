@@ -1616,6 +1616,106 @@ fn status_without_a_daemon_and_no_index_reports_registered_domains_as_not_indexe
     assert!(out.contains("eng\t(not indexed yet)"), "{out}");
 }
 
+/// `domain list` reaches the index the same way every other verb does, so a
+/// machine with a daemon gets real counts. Before the routing it opened the
+/// database itself, and the daemon that owns the file turned every count into
+/// the "(not indexed)" a person reads as lost work.
+#[test]
+fn domain_list_with_a_daemon_reports_its_counts() {
+    let env = Env::new("list-up");
+    env.setup_domain("eng");
+
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["domain", "list"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("eng\t"), "{out}");
+    assert!(
+        out.contains(" engrams"),
+        "a running daemon should still yield counts: {out}"
+    );
+    assert!(
+        !out.contains("(not indexed)") && !out.contains("(counts not read)"),
+        "{out}"
+    );
+}
+
+/// With the index unreachable, `domain list` still answers: the registrations
+/// come from configuration, and only the counts are missing. They say so in
+/// words, rather than reading as a domain nobody has synced.
+#[test]
+fn domain_list_degrades_when_the_index_cannot_be_reached() {
+    let env = Env::new("list-degraded");
+    env.setup_domain("eng");
+    // A directory is not a database, so the open fails the way a file nobody
+    // may read does, with no daemon in the picture to answer instead.
+    let wall = env.dir.join("not-a-database");
+    std::fs::create_dir_all(&wall).unwrap();
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd
+        .args(["domain", "list", "--db"])
+        .arg(&wall)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the listing still answers");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("eng\t"), "{stdout}");
+    assert!(stdout.contains("(counts not read)"), "{stdout}");
+    assert!(
+        stderr.contains("engram counts were not read"),
+        "the note says which half is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("crystalline doctor --fix"),
+        "and names a remedy rather than a raw lock error: {stderr}"
+    );
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd
+        .args(["--json", "domain", "list", "--db"])
+        .arg(&wall)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["counts"]["read"], json!(false), "{value}");
+    assert!(
+        value["counts"]["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "a null count is ambiguous without the reason beside it: {value}"
+    );
+    assert_eq!(value["domains"][0]["name"], json!("eng"), "{value}");
+}
+
+/// A verb that cannot answer any part of its question without the index
+/// refuses in the same words, naming the daemon and a remedy rather than
+/// handing a person a raw lock error to guess at.
+#[test]
+fn status_refuses_readably_when_the_index_cannot_be_reached() {
+    let env = Env::new("status-unreachable");
+    env.setup_domain("eng");
+    let wall = env.dir.join("not-a-database");
+    std::fs::create_dir_all(&wall).unwrap();
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd.args(["status", "--db"]).arg(&wall).output().unwrap();
+    assert!(!out.status.success(), "status needs the index");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`crystalline status` needs the index and could not reach it"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("crystalline doctor --fix"), "{stderr}");
+}
+
 /// `--db`/`--config` overrides bypass the daemon on purpose; the first line
 /// says so instead of pretending to be the daemon's view.
 #[test]

@@ -1748,23 +1748,30 @@ async fn status_dispatch(
 ) -> anyhow::Result<()> {
     use serde_json::json;
     let bypassed = db.is_some() || config.is_some();
-    if !bypassed {
-        if let Some(data) =
-            crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
-        {
-            if json {
-                println!("{data}");
-            } else {
-                let note = format!(
-                    "running (pid {}, v{}, up {})",
-                    data["pid"].as_u64().unwrap_or(0),
-                    data["version"].as_str().unwrap_or("unknown"),
-                    format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
-                );
-                cmd::render_status(&data, &note);
-            }
-            return Ok(());
+    let cfg = cmd::load(config.as_deref())?.effective;
+    let route = cmd::reach_index(
+        Some(json!({ "v": 1, "cmd": "status" })),
+        &cfg,
+        config.as_deref(),
+        db.as_deref(),
+        cmd::OpenAs::Read,
+    )
+    .await?;
+    if let cmd::IndexRoute::Daemon(data) = &route {
+        if json {
+            println!("{data}");
+        } else {
+            let note = format!(
+                "running (pid {}, v{}, up {})",
+                data["pid"].as_u64().unwrap_or(0),
+                data["version"].as_str().unwrap_or("unknown"),
+                format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
+            );
+            cmd::render_status(data, &note);
         }
+        return Ok(());
+    }
+    if !bypassed {
         // Nothing answered. Diagnose the lock holder before falling back:
         // `status` is read-only and never signals anything, but a wedged
         // daemon - alive, holding the lock, answering nothing - is exactly
@@ -1777,8 +1784,8 @@ async fn status_dispatch(
                 );
                 eprintln!("note: daemon {state}; reporting from a direct index read instead");
                 return cmd::status(
-                    config.as_deref(),
-                    db.as_deref(),
+                    route,
+                    &cfg,
                     json,
                     &format!("{state}; reading the index directly"),
                 )
@@ -1809,7 +1816,7 @@ async fn status_dispatch(
     } else {
         "not running; reading the index directly"
     };
-    cmd::status(config.as_deref(), db.as_deref(), json, note).await
+    cmd::status(route, &cfg, json, note).await
 }
 
 /// Render seconds of uptime compactly: `42s`, `12m` or `3h07m`.
@@ -1839,12 +1846,18 @@ async fn sync_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-        && let Some(data) = crystalline_service::ctl_if_running(
+    let cfg = cmd::load(config.as_deref())?.effective;
+    let route = cmd::reach_index(
+        Some(
             json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
-        )
-        .await?
-    {
+        ),
+        &cfg,
+        config.as_deref(),
+        db.as_deref(),
+        cmd::OpenAs::Write,
+    )
+    .await?;
+    if let cmd::IndexRoute::Daemon(data) = route {
         print_value(&data, json);
         // Two failure classes ride inside the daemon's JSON as ordinary
         // fields, so the ctl envelope around either is still `ok`: the
@@ -1880,14 +1893,14 @@ async fn sync_dispatch(
         }
         return Ok(());
     }
-    cmd::sync(
-        domain.as_deref(),
-        embed,
-        config.as_deref(),
-        db.as_deref(),
-        json,
-    )
-    .await
+    match route {
+        cmd::IndexRoute::Direct(store) => {
+            cmd::sync(store, &cfg, domain.as_deref(), embed, json).await
+        }
+        cmd::IndexRoute::Absent(db) => Err(cmd::index_absent("sync", &db)),
+        cmd::IndexRoute::Unreachable(why) => Err(cmd::index_unreachable("sync", &why)),
+        cmd::IndexRoute::Daemon(_) => unreachable!("the daemon's reply is handled above"),
+    }
 }
 
 /// `reindex`: route to the daemon when one owns the index and no explicit
@@ -1902,16 +1915,30 @@ async fn reindex_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-        && let Some(data) = crystalline_service::ctl_if_running(
-            json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }),
-        )
-        .await?
-    {
-        print_value(&data, json);
-        return Ok(());
+    let cfg = cmd::load(config.as_deref())?.effective;
+    // `--full` is the corruption-recovery path, so its direct open is the
+    // resilient one that rebuilds a Turso database which will not open.
+    let route = cmd::reach_index(
+        Some(json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed })),
+        &cfg,
+        config.as_deref(),
+        db.as_deref(),
+        if full {
+            cmd::OpenAs::Rebuild
+        } else {
+            cmd::OpenAs::Write
+        },
+    )
+    .await?;
+    match route {
+        cmd::IndexRoute::Daemon(data) => {
+            print_value(&data, json);
+            Ok(())
+        }
+        cmd::IndexRoute::Direct(store) => cmd::reindex(store, &cfg, full, embed, json).await,
+        cmd::IndexRoute::Absent(db) => Err(cmd::index_absent("reindex", &db)),
+        cmd::IndexRoute::Unreachable(why) => Err(cmd::index_unreachable("reindex", &why)),
     }
-    cmd::reindex(full, embed, config.as_deref(), db.as_deref(), json).await
 }
 
 /// `config show|set|unset`: route over the daemon's ctl `configure` command
