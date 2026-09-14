@@ -2057,25 +2057,34 @@ fn a_serve_that_loses_the_lock_exits_three_and_says_what_was_lost() {
         "lock loss has its own exit code, not the generic 1"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Scoped to the refusal's own line. These flags also contradict this env's
+    // configuration, so the startup notice prints the address, the allow-list
+    // and both keys to the same stderr before the lock is ever attempted -
+    // asserting over the whole capture would pass even if the refusal said
+    // none of it.
+    let refusal = stderr
+        .lines()
+        .find(|l| l.contains("already owns it"))
+        .unwrap_or_else(|| panic!("the refusal reaches stderr: {stderr}"));
     assert!(
-        stderr.contains(&addr),
-        "it names what this serve asked to bind: {stderr}"
+        refusal.contains(&addr),
+        "it names what this serve asked to bind: {refusal}"
     );
     assert!(
-        stderr.contains("muthur.lan"),
-        "and the allow-list it asked for: {stderr}"
+        refusal.contains("muthur.lan"),
+        "and the allow-list it asked for: {refusal}"
     );
     assert!(
-        stderr.contains(&owner_pid.to_string()),
-        "it names the holder ({owner_pid}): {stderr}"
+        refusal.contains(&owner_pid.to_string()),
+        "it names the holder ({owner_pid}): {refusal}"
     );
     assert!(
-        stderr.contains("autostart"),
-        "and how the holder started: {stderr}"
+        refusal.contains("autostart"),
+        "and how the holder started: {refusal}"
     );
     assert!(
-        stderr.contains("service.http"),
-        "and the key that reconciles them: {stderr}"
+        refusal.contains("service.http"),
+        "and the key that reconciles them: {refusal}"
     );
 
     drop(client);

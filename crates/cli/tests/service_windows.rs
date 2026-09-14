@@ -312,17 +312,24 @@ fn a_second_serve_fails_fast_naming_the_owner() {
         "lock loss has its own exit code, not the generic 1"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Scoped to the refusal's own line: the allow-list flag also contradicts
+    // this env's configuration, so the startup notice prints the same key to
+    // the same stderr before the lock is attempted.
+    let refusal = stderr
+        .lines()
+        .find(|l| l.contains("already owns it"))
+        .unwrap_or_else(|| panic!("the refusal reaches stderr: {stderr}"));
     assert!(
-        stderr.contains(&owner_pid.to_string()),
-        "the refusal names the live owner (pid {owner_pid}): {stderr}"
+        refusal.contains(&owner_pid.to_string()),
+        "the refusal names the live owner (pid {owner_pid}): {refusal}"
     );
     assert!(
-        stderr.contains("service.http"),
-        "and the key that makes every daemon here bind the same way: {stderr}"
+        refusal.contains("service.http"),
+        "and the key that makes every daemon here bind the same way: {refusal}"
     );
     assert!(
-        stderr.contains("service.allowed_hosts muthur.lan"),
-        "and the allow-list key, in the spelling the setting takes: {stderr}"
+        refusal.contains("service.allowed_hosts muthur.lan"),
+        "and the allow-list key, in the spelling the setting takes: {refusal}"
     );
 
     drop(daemon);
