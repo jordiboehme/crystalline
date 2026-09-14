@@ -217,12 +217,15 @@ enum Command {
         full: bool,
         /// Destroy the index and rebuild it from disk: every row and every
         /// embedding is deleted first, and a database file that will not open
-        /// at all is discarded and recreated. The corruption-recovery path, and
-        /// the only one that loses work - re-embedding a large corpus takes
-        /// hours. Needs exclusive access to the index, so stop the daemon
-        /// first, and refuses outright while a virtual domain is registered,
-        /// since its engrams live only in the index and no rebuild can bring
-        /// them back.
+        /// at all is discarded and recreated. The corruption-recovery path for
+        /// an embedded (turso) index, and the only one that loses work -
+        /// re-embedding a large corpus takes hours. Needs exclusive access to
+        /// the index, so stop the daemon first; refuses while another process
+        /// holds the database, refuses on a postgres index (a shared database
+        /// cannot be made exclusive: drop and recreate it with your database
+        /// tools, then `crystalline sync`), and refuses while the index holds
+        /// a virtual domain, since its engrams live only there and no rebuild
+        /// can bring them back.
         #[arg(long, conflicts_with = "full")]
         wipe: bool,
         /// After reindexing, embed any chunks that need it for the active model.
