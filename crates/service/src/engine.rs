@@ -38,9 +38,9 @@ use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, BrowseLevel, ChunkParams, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
     EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
-    FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
-    IndexError, RULES, RecentFilter, ReindexHooks, SearchMode, SearchQuery, ShareFacts, Store,
-    SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram,
+    EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
+    InboundQuery, IndexError, RULES, RecentFilter, ReindexHooks, SearchMode, SearchQuery,
+    ShareFacts, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram,
     configured_model_id, detect, is_retired_status, order_jobs_for_batching,
     parse_metadata_filters, provider_from_config, rank, reindex_domains, resolve_forward_refs,
     retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
@@ -7794,13 +7794,135 @@ impl Engine {
             engram_types: Some(p.types.clone()).filter(|t| !t.is_empty()),
             limit: 50,
         };
-        let store = self.store.lock().await;
-        let items = store.recent(&filter).await?;
+        let mut items = {
+            let store = self.store.lock().await;
+            store.recent(&filter).await?
+        };
+        // This reader's own drafts, folded in after the screen above exactly as
+        // they are on a browse: the domains `hidden_for` already allowed, and
+        // only then whose drafts they are.
+        self.shadow_recent(&filter, &hidden, scope, &mut items)
+            .await?;
         Ok(json!({
             "timeframe": timeframe,
             "count": items.len(),
             "engrams": serde_json::to_value(&items).unwrap_or(Value::Null),
         }))
+    }
+
+    /// Fold one reader's drafts into a recency listing.
+    ///
+    /// The same three edits shadowing means everywhere: a row this actor has
+    /// tombstoned leaves, a row they are drafting is described by their draft,
+    /// and a draft the base listing does not hold joins it. The result is
+    /// re-sorted and re-cut exactly as the statement sorted and cut it, so a
+    /// caller reading `count` reads the count of what came back.
+    ///
+    /// **The base page was already cut to the limit in SQL**, so a draft
+    /// joining it can push out a base row that would otherwise have been the
+    /// last one shown, and a tombstone over a row below the cut subtracts
+    /// nothing. Both are the same imprecision [`Engine::shadow_level`] carries
+    /// and for the same reason: an exact answer needs the actor threaded into
+    /// the statement, which is the index-side work Task 5 does for search.
+    /// Neither can hide a draft from its own author, which is the hole this
+    /// closes.
+    async fn shadow_recent(
+        &self,
+        filter: &RecentFilter,
+        hidden: &HashSet<String>,
+        scope: &crate::scope::Scope,
+        items: &mut Vec<EngramSummary>,
+    ) -> Result<()> {
+        let reviewed: Vec<(String, String)> = self
+            .registered_domain_names()
+            .into_iter()
+            .filter(|name| !hidden.contains(name))
+            .filter(|name| {
+                filter
+                    .domains
+                    .as_ref()
+                    .is_none_or(|only| only.iter().any(|d| d == name))
+            })
+            .filter_map(|name| {
+                self.overlay_for_read(&name, scope)
+                    .map(|actor| (name, actor))
+            })
+            .collect();
+        if reviewed.is_empty() {
+            return Ok(());
+        }
+        for (domain, actor) in reviewed {
+            let (domain_id, _) = self.domain_source(&domain).await?;
+            let entries = {
+                let store = self.store.lock().await;
+                store.overlay_entries(domain_id, &actor).await?
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            for entry in &entries {
+                // What the base row at this path answers to, which is the only
+                // thing that ties a draft to the row it shadows here: a
+                // recency listing carries no path.
+                let shadowed = {
+                    let store = self.store.lock().await;
+                    store
+                        .list_engrams(&domain, Some(&entry.path), None)
+                        .await?
+                        .into_iter()
+                        .find(|found| found.path == entry.path)
+                        .map(|found| found.permalink)
+                };
+                items.retain(|item| {
+                    item.domain != domain
+                        || (Some(&item.permalink) != shadowed.as_ref()
+                            && item.permalink != entry.permalink)
+                });
+                if entry.tombstone {
+                    continue;
+                }
+                let Ok(engram) = parse_engram(&entry.content) else {
+                    continue;
+                };
+                let record =
+                    EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
+                // The caller's own filters, applied to a draft exactly as the
+                // statement applied them to a base row.
+                let recorded = record.recorded_at.map(|at| at.to_string());
+                if filter
+                    .after
+                    .as_ref()
+                    .is_some_and(|after| recorded.as_ref().is_none_or(|at| at < after))
+                {
+                    continue;
+                }
+                if filter
+                    .engram_types
+                    .as_ref()
+                    .is_some_and(|types| !types.iter().any(|t| *t == record.engram_type))
+                {
+                    continue;
+                }
+                items.push(EngramSummary {
+                    domain: domain.clone(),
+                    permalink: entry.permalink.clone(),
+                    title: record.title,
+                    engram_type: record.engram_type,
+                    status: record.status,
+                    recorded_at: recorded,
+                    tags: record.tags,
+                });
+            }
+        }
+        // The statement's own order, re-applied over the folded list.
+        items.sort_by(|a, b| {
+            b.recorded_at
+                .cmp(&a.recorded_at)
+                .then_with(|| a.permalink.cmp(&b.permalink))
+        });
+        let limit = if filter.limit == 0 { 20 } else { filter.limit };
+        items.truncate(limit);
+        Ok(())
     }
 
     // --- list domains --------------------------------------------------------

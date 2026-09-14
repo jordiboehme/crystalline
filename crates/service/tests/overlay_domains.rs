@@ -1891,3 +1891,106 @@ async fn a_split_in_review_mode_lands_both_engrams_as_drafts() {
         "and both are mirrored"
     );
 }
+
+/// Catching up is catching up on YOUR work. An agent that has just written a
+/// draft asks `recent_activity` and has to see it there; the row it shadows is
+/// the team's answer, not this reader's, and a path this reader deleted is not
+/// recent activity for them at all.
+#[tokio::test]
+async fn recent_activity_lists_the_readers_own_drafts_and_not_the_rows_they_shadow() {
+    let f = review_fixture().await;
+    std::fs::write(f.domain_root("team").join("notes.md"), NOTES).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+
+    // A draft over a base row, retitled; a draft at a path no file holds; and
+    // a deletion of a second base row.
+    let read_plan = f.engine.read_engram(&read("plan"), &alice).await.unwrap();
+    f.engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                content: PLAN.replace("title: Plan", "title: Alice's Plan"),
+                expected_checksum: read_plan["checksum"].as_str().unwrap().to_string(),
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+    f.engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] a page only alice has #team"),
+            who,
+            &alice,
+        )
+        .await
+        .unwrap();
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "notes".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            who,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    let recent = |scope: Scope| {
+        let engine = f.engine.clone();
+        async move {
+            let answer = engine
+                .recent_activity(
+                    &crystalline_service::params::RecentParams {
+                        domains: vec!["team".to_string()],
+                        // Wide enough to reach the base rows the fixture's
+                        // files carry, which are dated rather than written now.
+                        timeframe: Some("10y".to_string()),
+                        types: Vec::new(),
+                    },
+                    &scope,
+                )
+                .await
+                .unwrap();
+            let titles: Vec<String> = answer["engrams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["title"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (answer, titles)
+        }
+    };
+
+    let (mine, my_titles) = recent(alice.clone()).await;
+    assert!(
+        my_titles.contains(&"Alice's Plan".to_string()) && !my_titles.contains(&"Plan".to_string()),
+        "her draft is the row, and the one it shadows is not beside it: {mine}"
+    );
+    assert!(
+        my_titles.contains(&"Fresh".to_string()),
+        "the page only she has is in her catch-up: {mine}"
+    );
+    assert!(
+        !my_titles.contains(&"Notes".to_string()),
+        "and the one she deleted is not: {mine}"
+    );
+    assert_eq!(
+        mine["count"],
+        serde_json::json!(my_titles.len()),
+        "the count is the count of what came back: {mine}"
+    );
+
+    let (theirs, their_titles) = recent(account("bob")).await;
+    assert!(
+        their_titles.contains(&"Plan".to_string())
+            && their_titles.contains(&"Notes".to_string())
+            && !their_titles.contains(&"Alice's Plan".to_string())
+            && !their_titles.contains(&"Fresh".to_string()),
+        "everybody else catches up on what the team reviewed: {theirs}"
+    );
+}
