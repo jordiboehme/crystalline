@@ -1580,10 +1580,34 @@ fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static
 /// Liveness probe for load balancers and uptime monitors: a static payload
 /// with no engine or database work, so a probe can never queue behind
 /// indexing and never needs an MCP handshake.
+///
+/// It also says how this daemon was started and what it was asked to bind,
+/// which is the difference between "something answers on this port" and "the
+/// endpoint this host is configured for exists". Both come from the
+/// process-wide serve intent [`crate::instance::record_serve_intent`] recorded
+/// before the lock was taken, so this stays a pointer read: no engine, no
+/// store, no `Shared`. That intent is the requested binding rather than a
+/// proven listener - a probe that reached this handler has already proven the
+/// listener it dialled, and `http` tells it whether that is the endpoint the
+/// daemon was asked for. A process that never ran `run_serve` (a router built
+/// by a test) reports `"unknown"` and `"unrecorded"`: it did not record the
+/// facts, which is not the same as being too old to have them.
 async fn health() -> axum::Json<Value> {
+    let intent = crate::instance::serve_intent();
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": crystalline_core::VERSION,
+        "started_by": intent
+            .map(|i| i.started_by.as_str())
+            .unwrap_or("unknown"),
+        "http": match intent.map(|i| &i.http) {
+            Some(crate::instance::HttpBinding::Bound(addr)) => addr.as_str(),
+            Some(crate::instance::HttpBinding::Off) => "off",
+            _ => "unrecorded",
+        },
+        "allowed_hosts": intent
+            .map(|i| i.allowed_hosts.clone())
+            .unwrap_or_default(),
     }))
 }
 

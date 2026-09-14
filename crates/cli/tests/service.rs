@@ -2078,3 +2078,96 @@ fn the_owner_record_says_how_the_daemon_was_started() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// A localhost probe can tell a deliberately started daemon from one an agent's
+/// connection spawned, and can see what it actually bound. Without this, a
+/// health check passes while the endpoint an operator configured does not exist
+/// - the exact shape that hid the 2026-09-10 outage.
+///
+/// One daemon, one state directory, no reuse: nothing here has to wait for a
+/// departing holder to let the lock go.
+#[test]
+fn health_and_status_say_how_the_daemon_started_and_what_it_bound() {
+    let env = Env::new("expose");
+    env.setup_domain("eng");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args([
+            "serve",
+            "--http",
+            &addr,
+            "--allowed-host",
+            "muthur.lan",
+            "--config",
+        ])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_port(&addr);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let body: Value = reqwest::blocking::Client::new()
+        .get(format!("http://{addr}/health"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["status"], "ok", "{body}");
+    assert_eq!(body["started_by"], "serve", "{body}");
+    assert_eq!(body["http"], addr, "{body}");
+    assert_eq!(
+        body["allowed_hosts"],
+        serde_json::json!(["muthur.lan"]),
+        "{body}"
+    );
+
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "{out}");
+    let ctl: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(ctl["started_by"], "serve", "{ctl}");
+    assert_eq!(ctl["http"], addr, "{ctl}");
+    assert_eq!(
+        ctl["allowed_hosts"],
+        serde_json::json!(["muthur.lan"]),
+        "{ctl}"
+    );
+
+    let (ok, human) = env.run(&["status"]);
+    assert!(ok, "{human}");
+    assert!(
+        human.contains("started by serve") && human.contains(&addr),
+        "the human status names both: {human}"
+    );
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The other half: an autostarted daemon says so, and the endpoint this test
+/// environment turns off reads as off rather than as missing.
+#[test]
+fn an_autostarted_daemon_reports_itself_as_autostarted() {
+    let env = Env::new("autoexp");
+    env.setup_domain("eng");
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "{out}");
+    let ctl: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(ctl["started_by"], "autostart", "{ctl}");
+    assert!(
+        ctl["http"].is_null(),
+        "the endpoint is off in this env: {ctl}"
+    );
+
+    drop(client);
+    let _ = env.run(&["ctl", "shutdown"]);
+}

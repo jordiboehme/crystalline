@@ -1159,8 +1159,10 @@ pub async fn reindex(
 // --- status ------------------------------------------------------------------
 
 /// Build the in-process status report in the same shape the daemon's ctl
-/// `status` returns (minus its liveness fields), so both paths render through
-/// [`render_status`] and `--json` yields one stable shape either way.
+/// `status` returns (minus its liveness fields and the exposure facts only a
+/// serving process recorded - `started_by`, `http`, `allowed_hosts`), so both
+/// paths render through [`render_status`] and `--json` yields one stable shape
+/// either way.
 pub async fn status_value(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
@@ -1226,6 +1228,28 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     use serde_json::Value;
 
     println!("Daemon: {daemon_note}");
+    // Only the daemon's own report carries these; a direct index read has no
+    // daemon to describe, so the line is absent rather than guessed at. The
+    // phrasing says "asked to bind" on purpose: these are the exposure facts
+    // the daemon recorded on the way up, not a listener this command probed.
+    if let Some(started_by) = data.get("started_by").and_then(Value::as_str) {
+        let bound = data["http"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "off".to_string());
+        let hosts: Vec<&str> = data["allowed_hosts"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let host_note = if hosts.is_empty() {
+            "loopback only".to_string()
+        } else {
+            hosts.join(", ")
+        };
+        println!(
+            "Exposure: asked to bind HTTP {bound}, Host allow-list {host_note} (started by {started_by})"
+        );
+    }
     let registered: Vec<&str> = data["registered"]
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
@@ -2009,10 +2033,15 @@ const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// capped at whatever time remains before the deadline, tracked by hand
 /// since there is no thread involved to enforce it from outside. On
 /// success, prints the health body (the `{"status":"ok","version":...}` JSON
-/// that also lands in `docker inspect`) and returns `Ok`; any failure -
-/// connection refused, a timeout, a non-200 status or a malformed response -
-/// comes back as a single-line `Err` naming the address it failed against,
-/// so the process exits nonzero through the normal error path.
+/// that also lands in `docker inspect`, carrying `started_by`, `http` and
+/// `allowed_hosts` beside those two: how the daemon was started, the endpoint
+/// it was asked to bind and the Host allow-list it serves with, so the
+/// container `HEALTHCHECK` surfaces the start mode in `docker inspect` too.
+/// Those three are added keys, so a monitor reading `status` is unaffected)
+/// and returns `Ok`; any failure - connection refused, a timeout, a non-200
+/// status or a malformed response - comes back as a single-line `Err` naming
+/// the address it failed against, so the process exits nonzero through the
+/// normal error path.
 ///
 /// B14 exemption: unlike the other data verbs, this default output is not given
 /// a human rendering and does not honor `--json`. The line printed here is the

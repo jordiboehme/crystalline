@@ -64,6 +64,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("");
     match cmd {
         "status" => {
+            let intent = crate::instance::serve_intent();
             let mut data = json!({
                 "pid": shared.pid,
                 "version": crystalline_core::VERSION,
@@ -72,6 +73,14 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "http": shared.http_addr.clone(),
                 "http_sessions": shared.http_session_count(),
                 "read_only": shared.engine.read_only(),
+                // How this daemon came to be running, and the Host allow-list
+                // it serves with: a probe that cannot see these cannot tell a
+                // managed daemon from one a client spawned. Both come from the
+                // intent this process recorded before it took the lock, so
+                // `started_by` is "unknown" when nothing recorded one rather
+                // than when the daemon is old.
+                "started_by": intent.map(|i| i.started_by.as_str()).unwrap_or("unknown"),
+                "allowed_hosts": intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
             });
             match shared.engine.status_report().await {
                 Ok(report) => {
