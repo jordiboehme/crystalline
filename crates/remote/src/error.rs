@@ -251,7 +251,11 @@ fn manifest_candidates_clause(candidates: &[String], more: usize) -> String {
         join_with(&manifests, "and")
     };
     let pass = join_with(candidates, "or");
-    format!(". Found MANIFEST.md at {found}; pass {pass}.")
+    // The value has to be named as what it is passed as. "pass memory" reads
+    // like an instruction to pass something called memory somewhere; the
+    // subpath is the `path` parameter, and saying so is the difference between
+    // a fact to copy and a guess to make.
+    format!(". Found MANIFEST.md at {found}; pass {pass} as the path.")
 }
 
 /// Joins a list in natural language with `conj` ("and" or "or") before the

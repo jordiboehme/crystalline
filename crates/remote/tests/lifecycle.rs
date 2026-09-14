@@ -324,7 +324,9 @@ async fn scenario_01_subscribe_names_a_manifest_found_one_folder_down() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("memory/MANIFEST.md"), "{msg}");
-    assert!(msg.contains("pass memory"), "{msg}");
+    // Named as what it is passed as: the subpath is the `path` parameter, and
+    // "pass memory" on its own reads like an instruction about something else.
+    assert!(msg.contains("pass memory as the path"), "{msg}");
     assert!(!domain_root.exists(), "target must be untouched");
 }
 
@@ -358,7 +360,10 @@ async fn scenario_01_subscribe_lists_manifests_at_two_depths_shallowest_first() 
         memory_at < archive_at,
         "shallowest should be named first: {msg}"
     );
-    assert!(msg.contains("pass memory or archive/notes"), "{msg}");
+    assert!(
+        msg.contains("pass memory or archive/notes as the path"),
+        "{msg}"
+    );
 }
 
 /// Asked for at a subpath that itself has no manifest, while one exists
@@ -394,7 +399,7 @@ async fn scenario_01_subscribe_at_a_subpath_names_a_manifest_found_elsewhere_und
     let msg = err.to_string();
     assert!(msg.contains("no MANIFEST.md was found at wrong"), "{msg}");
     assert!(msg.contains("wrong/memory/MANIFEST.md"), "{msg}");
-    assert!(msg.contains("pass wrong/memory"), "{msg}");
+    assert!(msg.contains("pass wrong/memory as the path"), "{msg}");
 }
 
 #[tokio::test]
