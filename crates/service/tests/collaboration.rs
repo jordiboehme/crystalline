@@ -293,3 +293,61 @@ both_backends!(
     two_instances_collaborate_over_one_database,
     collaboration_flow
 );
+
+/// A non-host never rebuilds the host's rows out from under it, and under a
+/// forced reindex that now means something sharper than before: the skip has to
+/// happen before the domain is stamped, or a domain nobody rebuilt would carry
+/// a rebuild marker forever.
+///
+/// The claim moved into the shared driver's `before_domain` hook when the two
+/// reindex loops were collapsed, so this pins the branch at its new home: B's
+/// forced reindex of a domain A hosts writes no report for it, leaves its rows
+/// alone and leaves it unmarked.
+async fn a_forced_reindex_skips_a_domain_another_instance_hosts(store: Arc<Mutex<dyn Store>>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng_dir = tmp.path().join("eng");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(eng_dir.join("MANIFEST.md"), manifest("Eng")).unwrap();
+    std::fs::write(
+        eng_dir.join("alpha.md"),
+        engram("Alpha", "alpha", "hosted file body about turbines"),
+    )
+    .unwrap();
+
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("eng".to_string(), DomainEntry::file(eng_dir.clone()));
+
+    let engine_a =
+        Engine::new(store.clone(), cfg.clone(), None, None).with_instance_id("inst-a".to_string());
+    let engine_b =
+        Engine::new(store.clone(), cfg.clone(), None, None).with_instance_id("inst-b".to_string());
+
+    // A hosts and indexes it.
+    engine_a.sync(None).await.unwrap();
+
+    let result = engine_b.reindex(true).await.unwrap();
+    let reports = result["reports"].as_array().cloned().unwrap_or_default();
+    assert!(
+        reports.is_empty(),
+        "B rebuilt nothing: the domain A hosts is not its to rebuild, got {result}"
+    );
+
+    let store = store.lock().await;
+    let stats = store.domain_stats().await.unwrap();
+    let eng = stats.iter().find(|d| d.name == "eng").expect("domain eng");
+    assert_eq!(eng.engrams, 2, "A's rows are untouched");
+    assert!(
+        eng.rebuild_started.is_none(),
+        "a domain that was skipped was never stamped as rebuilding"
+    );
+    assert_eq!(
+        eng.host_instance_id.as_deref(),
+        Some("inst-a"),
+        "and the host lock still belongs to A"
+    );
+}
+both_backends!(
+    a_forced_reindex_leaves_a_domain_another_instance_hosts_alone,
+    a_forced_reindex_skips_a_domain_another_instance_hosts
+);
