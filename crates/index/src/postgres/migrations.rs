@@ -363,15 +363,21 @@ ALTER TABLE domain ADD COLUMN IF NOT EXISTS rebuild_started TEXT;
 // pair is the same pair of actor-aware unique indexes, under the same names, so
 // the two backends read alike: one path and one permalink may now carry one row
 // per actor, and no actor may hold two rows at either.
+//
+// Every statement converges on a retry, the way v10 and v11 above it do. This
+// dialect runs the DDL batch as one implicit transaction, so no half-applied
+// schema is possible - but the version stamp is a separate statement, so a
+// crash between the two would replay this migration on the next start, and a
+// bare `ADD COLUMN` would wedge it on a duplicate-column error.
 const SCHEMA_V12: &str = r#"
-ALTER TABLE engram ADD COLUMN actor TEXT NOT NULL DEFAULT '';
-ALTER TABLE engram ADD COLUMN tombstone BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE engram ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAULT '';
+ALTER TABLE engram ADD COLUMN IF NOT EXISTS tombstone BOOLEAN NOT NULL DEFAULT FALSE;
 
-ALTER TABLE engram DROP CONSTRAINT engram_domain_id_permalink_key;
-DROP INDEX idx_engram_path;
+ALTER TABLE engram DROP CONSTRAINT IF EXISTS engram_domain_id_permalink_key;
+DROP INDEX IF EXISTS idx_engram_path;
 
-CREATE UNIQUE INDEX idx_engram_permalink_actor ON engram(domain_id, permalink, actor);
-CREATE UNIQUE INDEX idx_engram_path_actor ON engram(domain_id, path, actor);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_engram_permalink_actor ON engram(domain_id, permalink, actor);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_engram_path_actor ON engram(domain_id, path, actor);
 "#;
 
 const SCHEMA_V8: &str = r#"
@@ -579,6 +585,14 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
+        // And again, because the version stamp is a statement of its own: a
+        // crash between the DDL and the stamp replays this migration on the
+        // next start, and it has to converge rather than wedge on a duplicate
+        // column.
+        sqlx::raw_sql(MIGRATIONS[11].sql)
+            .execute(&mut conn)
+            .await
+            .expect("v12 applies twice");
 
         let base: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM engram WHERE path='a.md' AND sha256='ff' AND actor='' AND NOT tombstone",

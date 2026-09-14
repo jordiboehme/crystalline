@@ -478,6 +478,11 @@ pub const WIPE_TABLES: &[&str] = &[
 /// Ensure the migration ledger exists, then apply every migration above the
 /// recorded version. Returns the resulting schema version.
 pub async fn apply(conn: &Connection) -> Result<i64> {
+    apply_migrations(conn, MIGRATIONS).await
+}
+
+/// [`apply`] over a given list, so a test can hand it a migration that fails.
+async fn apply_migrations(conn: &Connection, migrations: &[Migration]) -> Result<i64> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_migration (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
         (),
@@ -486,20 +491,51 @@ pub async fn apply(conn: &Connection) -> Result<i64> {
     .map_err(|e| IndexError::Migration(e.to_string()))?;
 
     let current = current_version(conn).await?;
-    for m in MIGRATIONS {
+    for m in migrations {
         if m.version <= current {
             continue;
         }
-        conn.execute_batch(m.sql)
+        // The DDL and the row that stamps it are one transaction, rolled back
+        // together if anything in either fails.
+        //
+        // Not belt and braces: `execute_batch` prepares and runs the statements
+        // one at a time with no transaction of its own, so an unwrapped v13 -
+        // which drops `engram` and renames another table into its place - can
+        // die between those two statements and leave a database with no
+        // `engram` table at all, no version row, and a retry that fails on
+        // `INSERT INTO engram_new ... FROM engram` forever. A virtual domain's
+        // index is its source of truth, so that loss has nothing to resync
+        // from. Turso honours DDL inside an explicit transaction and rolls a
+        // dropped table back whole, which is what makes this the fix.
+        //
+        // Keeping the stamp inside the same transaction closes the other half:
+        // a migration that applied but was not stamped would be replayed on the
+        // next start, and v13 replayed over an already-swapped table would
+        // flatten every draft back to a base row.
+        conn.execute("BEGIN", ())
             .await
-            .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
+            .map_err(|e| IndexError::Migration(e.to_string()))?;
+        if let Err(e) = conn.execute_batch(m.sql).await {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(IndexError::Migration(format!(
+                "v{} ({}): {e}",
+                m.version, m.label
+            )));
+        }
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "INSERT INTO schema_migration (version, applied_at) VALUES (?1, ?2)",
-            vec![turso::Value::Integer(m.version), turso::Value::Text(now)],
-        )
-        .await
-        .map_err(|e| IndexError::Migration(e.to_string()))?;
+        if let Err(e) = conn
+            .execute(
+                "INSERT INTO schema_migration (version, applied_at) VALUES (?1, ?2)",
+                vec![turso::Value::Integer(m.version), turso::Value::Text(now)],
+            )
+            .await
+        {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(IndexError::Migration(e.to_string()));
+        }
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| IndexError::Migration(e.to_string()))?;
     }
     current_version(conn).await
 }
@@ -1039,6 +1075,113 @@ mod tests {
             .await
             .is_err(),
             "and only one row per permalink, per actor"
+        );
+    }
+
+    /// A migration that dies partway through leaves the database exactly as it
+    /// was, and unstamped.
+    ///
+    /// v13 is the migration that makes this matter. Every one before it was a
+    /// single `ALTER TABLE ... ADD COLUMN` whose worst case was "applied but
+    /// not stamped", with the data untouched; v13 drops `engram` and renames
+    /// another table into its place, so a statement error, a kill or a power
+    /// loss anywhere after that `DROP` would - unwrapped - leave a database
+    /// with no `engram` table at all, no version row, and a retry that fails on
+    /// `INSERT INTO engram_new ... FROM engram` forever. For a virtual domain
+    /// the index is the source of truth, so that loss has nothing to resync
+    /// from.
+    ///
+    /// The failure is injected the way it would really arrive: a statement
+    /// after the `DROP` that does not run. What is asserted is both halves of
+    /// the invariant - the table and its rows are still there, and the ledger
+    /// still says v12 - because the stamp is written inside the same
+    /// transaction as the DDL it stamps.
+    #[tokio::test]
+    async fn a_migration_that_dies_after_the_drop_leaves_the_table_and_no_stamp() {
+        // v13, cut off immediately after the `DROP TABLE engram` and given a
+        // statement that cannot run. That is the exact window the unwrapped
+        // batch could die in: the old table is gone and the new one has not
+        // been renamed into its place yet.
+        let cut = SCHEMA_V13
+            .find("DROP TABLE engram;")
+            .expect("v13 drops the table")
+            + "DROP TABLE engram;".len();
+        let poisoned: &'static str = Box::leak(
+            format!(
+                "{}\nSELECT no_such_function_at_all();\n",
+                &SCHEMA_V13[..cut]
+            )
+            .into_boxed_str(),
+        );
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut list: Vec<Migration> = Vec::new();
+        for m in &MIGRATIONS[..12] {
+            list.push(Migration {
+                version: m.version,
+                label: m.label,
+                sql: m.sql,
+            });
+        }
+        list.push(Migration {
+            version: 13,
+            label: "engram actor dimension (poisoned)",
+            sql: poisoned,
+        });
+        apply_migrations(&conn, &list[..12]).await.unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO domain(id, name, path) VALUES (1,'d','/tmp/d');\n\
+             INSERT INTO engram(id, domain_id, path, permalink, sha256) \
+             VALUES (7,1,'a.md','a','ff');\n",
+        )
+        .await
+        .unwrap();
+
+        let err = apply_migrations(&conn, &list)
+            .await
+            .expect_err("the poisoned migration fails");
+        assert!(
+            err.to_string().contains("v13"),
+            "and says which migration died: {err}"
+        );
+
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='engram'"
+            )
+            .await,
+            1,
+            "the engram table survives a migration that dropped it and then died"
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM engram WHERE id=7 AND sha256='ff'"
+            )
+            .await,
+            1,
+            "with its rows, so there is something to retry over"
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migration"
+            )
+            .await,
+            12,
+            "and the ledger still says v12, so the retry runs v13 again rather than \
+             skipping it as applied"
+        );
+
+        // And the retry over that untouched database finishes the job.
+        apply_migrations(&conn, &MIGRATIONS[..13]).await.unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM engram WHERE id=7 AND actor=''").await,
+            1,
+            "the row came through the retry as a base row"
         );
     }
 }
