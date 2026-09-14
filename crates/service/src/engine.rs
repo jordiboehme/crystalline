@@ -2824,10 +2824,14 @@ impl Engine {
     /// ever asked. Asking in the other order would make a draft the one thing
     /// that could name a private domain.
     ///
-    /// A bare identifier with no domain named resolves across base rows only.
-    /// The cross-domain form counts its matches to decide whether an identifier
-    /// is ambiguous, and drafts would make that count depend on who is asking;
-    /// naming the domain is how a reader reaches their own draft.
+    /// A bare identifier with no domain named FINDS base rows only: the
+    /// cross-domain form counts its matches to decide whether an identifier is
+    /// ambiguous, and drafts would make that count depend on who is asking, so
+    /// naming the domain is how a reader reaches a draft at a path the files
+    /// never held. It still honours a tombstone, and that costs nothing: by the
+    /// time one base row has been resolved the domain is known, so "has this
+    /// reader deleted it" is one lookup away and a deletion is a deletion
+    /// however the engram was addressed.
     async fn resolve_shadowed(
         &self,
         identifier: &str,
@@ -2845,6 +2849,25 @@ impl Engine {
             .and_then(|name| self.overlay_for_read(name, scope));
         let Some(actor) = overlay else {
             let (desc, source) = self.resolve_scoped(identifier, domain, hidden).await?;
+            // A bare identifier with no domain named reaches here, and by now
+            // the domain IS known: the descriptor says which one. So a path
+            // this reader has tombstoned is absent for them however they
+            // addressed it. Only the DRAFT half stays conditional on naming a
+            // domain - see the doc above.
+            if let Some(actor) = self.overlay_for_read(&desc.domain, scope) {
+                let held = {
+                    let store = self.store.lock().await;
+                    store
+                        .overlay_entry(desc.domain_id, &actor, &desc.path)
+                        .await?
+                };
+                if held.is_some_and(|entry| entry.tombstone) {
+                    return Err(EngineError::NotFound(format!(
+                        "no engram matches '{identifier}'"
+                    )));
+                }
+                return Ok((desc, source, Some(actor)));
+            }
             return Ok((desc, source, None));
         };
         let name = named.expect("an overlay actor is only resolved for a named domain");
@@ -3327,20 +3350,15 @@ impl Engine {
 
         // The domain's index id, resolved once: the two arms below both need
         // it, and the overlay check above needs it before either runs.
-        let domain_id = {
-            let store = self.store.lock().await;
-            match &source {
-                ContentSource::File { root } => {
-                    store
-                        .upsert_domain(&p.domain, Some(&root.to_string_lossy()), DomainKind::File)
-                        .await?
-                }
-                ContentSource::Virtual => {
-                    store
-                        .upsert_domain(&p.domain, None, DomainKind::Virtual)
-                        .await?
-                }
-            }
+        // Resolved here only when the collision check below needs it, which is
+        // only in review mode: the overlay probe is keyed on the domain's id
+        // where the base probe is keyed on its name. A direct write resolves it
+        // in its own arm after the file is written, exactly where it always
+        // did, so a create this call is about to refuse leaves behind no
+        // `domain` row it would not have created before.
+        let overlay_domain_id = match &overlay {
+            Some(_) => Some(self.domain_source(&p.domain).await?.0),
+            None => None,
         };
 
         // Enforce overwrite semantics against what this writer can see there.
@@ -3351,16 +3369,18 @@ impl Engine {
         // nothing there).
         {
             let store = self.store.lock().await;
-            let taken = match &overlay {
-                Some(actor) => match store.overlay_entry(domain_id, actor, &rel).await? {
-                    Some(entry) if entry.tombstone => None,
-                    Some(entry) => Some(entry.path),
-                    None => store
-                        .find_engram(&p.domain, &permalink)
-                        .await?
-                        .map(|existing| existing.path),
-                },
-                None => store
+            let taken = match (&overlay, overlay_domain_id) {
+                (Some(actor), Some(domain_id)) => {
+                    match store.overlay_entry(domain_id, actor, &rel).await? {
+                        Some(entry) if entry.tombstone => None,
+                        Some(entry) => Some(entry.path),
+                        None => store
+                            .find_engram(&p.domain, &permalink)
+                            .await?
+                            .map(|existing| existing.path),
+                    }
+                }
+                _ => store
                     .find_engram(&p.domain, &permalink)
                     .await?
                     .map(|existing| existing.path),
@@ -3403,7 +3423,7 @@ impl Engine {
         // The third place a write can land, and the reason it comes first: on a
         // domain in review mode the folder and the database both stay as the
         // team left them, so neither arm below may run.
-        if let Some(actor) = &overlay {
+        if let (Some(actor), Some(domain_id)) = (&overlay, overlay_domain_id) {
             let warning = self
                 .write_overlay_entry(&p.domain, domain_id, actor, &rel, &markdown)
                 .await?;
@@ -3417,10 +3437,16 @@ impl Engine {
                 let abs = join_rel(root, &rel);
                 write_file(&abs, &markdown)?;
                 let store = self.store.lock().await;
+                let domain_id = store
+                    .upsert_domain(&p.domain, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await?;
                 self.reindex_file(&*store, domain_id, root, &rel).await?;
             }
             ContentSource::Virtual => {
                 let store = self.store.lock().await;
+                let domain_id = store
+                    .upsert_domain(&p.domain, None, DomainKind::Virtual)
+                    .await?;
                 let stamp = virtual_stamp(&markdown);
                 self.index_markdown(&*store, domain_id, &rel, &markdown, stamp, None, true)
                     .await?;
@@ -6861,9 +6887,18 @@ impl Engine {
             // A draft of a path no file holds is this actor's alone, so
             // deleting it takes the draft and its mirror away rather than
             // standing a tombstone over a base row that was never there.
+            // By PATH, not by permalink: a tombstone stands over the base row
+            // at a path, so "is there one to stand over" is a question about
+            // that path. Asking by permalink would take the tombstone branch
+            // for a draft whose permalink happens to match a base row
+            // somewhere else, and then read a file that path does not have.
             let base = {
                 let store = self.store.lock().await;
-                store.find_engram(&desc.domain, &desc.permalink).await?
+                store
+                    .list_engrams(&desc.domain, Some(&desc.path), None)
+                    .await?
+                    .into_iter()
+                    .find(|found| found.path == desc.path)
             };
             match base {
                 None => {
@@ -17036,10 +17071,6 @@ fn assets_reserved_error(rel: &str) -> String {
     )
 }
 
-/// A synthesized file stamp for a virtual write: the current epoch seconds, the
-/// content byte length and its SHA-256. The sha doubles as the CAS token, so a
-/// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
-/// without ever touching a filesystem.
 /// Put a mirror's failure on a draft's receipt, when there was one.
 ///
 /// One field on every routed verb, so a caller learns the same thing the same
@@ -17097,6 +17128,10 @@ fn overwrite_from_draft(row: &mut EngramDescriptor, draft: &crystalline_index::S
     }
 }
 
+/// A synthesized file stamp for a virtual write: the current epoch seconds, the
+/// content byte length and its SHA-256. The sha doubles as the CAS token, so a
+/// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
+/// without ever touching a filesystem.
 pub(crate) fn virtual_stamp(content: &str) -> FileStamp {
     FileStamp {
         mtime: chrono::Utc::now().timestamp(),

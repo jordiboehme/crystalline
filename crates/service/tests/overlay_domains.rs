@@ -1994,3 +1994,55 @@ async fn recent_activity_lists_the_readers_own_drafts_and_not_the_rows_they_shad
         "everybody else catches up on what the team reviewed: {theirs}"
     );
 }
+
+/// A deletion is a deletion however the engram was addressed. An identifier
+/// that names no domain resolves across base rows, and once one has resolved
+/// the domain is known - so the reader's own tombstone over it is one lookup
+/// away and is honoured.
+///
+/// The draft half stays conditional on naming a domain, and the test says so
+/// rather than leaving a reader to find out: an engram that exists only as a
+/// draft is reached by naming its domain.
+#[tokio::test]
+async fn a_tombstone_is_honoured_for_an_identifier_that_names_no_domain() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let bare = |identifier: &str| ReadParams {
+        identifier: identifier.to_string(),
+        domain: None,
+    };
+
+    assert!(
+        f.engine.read_engram(&bare("plan"), &alice).await.is_ok(),
+        "before the deletion she reads it unnamed like anybody else"
+    );
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            Some("claude-code/2.0-for-alice"),
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    let miss = f
+        .engine
+        .read_engram(&bare("plan"), &alice)
+        .await
+        .expect_err("her deletion holds for an identifier that names no domain");
+    assert!(
+        miss.to_string().contains("no engram matches 'plan'"),
+        "in the words a bare identifier nobody wrote produces: {miss}"
+    );
+    assert!(
+        f.engine
+            .read_engram(&bare("plan"), &account("bob"))
+            .await
+            .is_ok(),
+        "and it is still there for everybody else"
+    );
+}
