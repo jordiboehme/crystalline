@@ -30,10 +30,11 @@
  * glance that a group is partly in.
  *
  * Generated folder listings are the one thing kept out of the groups, and the
- * one thing with no box. An `index.md` is rebuilt from the engrams beside it so
- * a team repository stays browsable on the forge, and it travels with a share
- * for that reason alone: a sweep that touched forty folders would put forty
- * derived paths in front of a reader looking for the three engrams they wrote.
+ * one thing with no box. An `index.md` is rebuilt from the engrams beside it,
+ * and travels with a share only where the domain's MANIFEST declares
+ * `generated_indexes: shared`: a sweep that touched forty folders would
+ * otherwise put forty derived paths in front of a reader looking for the three
+ * engrams they wrote.
  * So they are counted rather than listed, in one muted line under the groups,
  * and the count follows the ticks - the listing of a folder nothing was chosen
  * from stays behind with it.

@@ -1298,8 +1298,9 @@ enum OriginCommand {
         #[arg(long)]
         proposal: Option<u64>,
         /// Share only this changed file, relative to the domain root. Repeat
-        /// for several; omit to share every unshared change. The generated
-        /// index.md of each chosen file's folder rides along.
+        /// for several; omit to share every unshared change. Where the domain
+        /// shares its generated listings, the index.md of each chosen file's
+        /// folder rides along.
         #[arg(long = "file")]
         files: Vec<String>,
         /// Load the global config from this file instead of the default path.
@@ -2310,8 +2311,9 @@ fn ahead_line(d: &serde_json::Value) -> String {
 /// says nothing on its own.
 ///
 /// Empty when the domain owes its origin nothing, listings included: a
-/// refreshed listing rides along with a share, so with nothing to share there
-/// is nothing for it to ride along with and the block says nothing at all. A
+/// refreshed listing only ever rides along with a share, so with nothing to
+/// share there is nothing for it to ride along with and the block says nothing
+/// at all. A
 /// domain whose working tree could not be walked says so instead of printing
 /// an empty group, which would read as "nothing to share".
 fn unshared_file_lines(d: &serde_json::Value) -> Vec<String> {

@@ -27,9 +27,10 @@
  * The files are grouped by kind rather than listed flat, in {@link ChangeList}:
  * an evolve pass or an ingest shares hundreds at once, and the shape of that -
  * three added, a hundred and twenty-one modified - is what a reader decides on.
- * The generated folder listings a share carries alongside them are counted into
- * one line there rather than grouped, for the same reason: they are what keeps
- * the team repository browsable, never what somebody is deciding about.
+ * The generated folder listings a share carries alongside them, where the
+ * domain shares its listings at all, are counted into one line there rather
+ * than grouped, for the same reason: they are what keeps the team repository
+ * browsable, never what somebody is deciding about.
  *
  * Which of those files travel is a choice too, and on a shared instance it is
  * the choice that matters most: the delta in front of somebody may be half

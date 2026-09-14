@@ -3691,10 +3691,11 @@ fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
 /// about the layer they named.
 ///
 /// **Generated folder listings get one line at the end and no place in the
-/// list.** `index.md` files ride along with a share so the team repository
-/// stays browsable on the forge, and they are derived from the engrams beside
+/// list.** `index.md` files ride along with a share in a domain that declares
+/// `generated_indexes: shared`, and they are derived from the engrams beside
 /// them: counted among the changes they would crowd the real work out of the
-/// ten-file cap and say nothing in return. So they are summarized - "Also
+/// ten-file cap and say nothing in return. A domain that keeps its listings
+/// local has none of them here at all, and the line simply never appears. So they are summarized - "Also
 /// refreshes 3 folder indexes." - and a share carrying nothing else says that
 /// plainly instead of reading as a share of nothing.
 ///
@@ -3738,10 +3739,11 @@ fn share_question(preview: &Value) -> String {
     let title = preview["effective_title"].as_str().unwrap_or_default();
     let empty = Vec::new();
     let all = preview["changes"].as_array().unwrap_or(&empty);
-    // The generated folder listings are counted, never listed. They travel with
-    // the share so the team repository stays browsable, and a person deciding
-    // whether to publish is deciding about the engrams: ten paths of derived
-    // churn ahead of them would push the real work off the end of the cap.
+    // The generated folder listings are counted, never listed. A person
+    // deciding whether to publish is deciding about the engrams: ten paths of
+    // derived churn ahead of them would push the real work off the end of the
+    // cap. There are none to count unless the domain shares its listings, in
+    // which case the count is zero and the line is skipped.
     let indexes = all.iter().filter(|c| is_index_change(c)).count();
     let changes: Vec<&Value> = all.iter().filter(|c| !is_index_change(c)).collect();
     let (mut added, mut updated, mut deleted) = (0usize, 0usize, 0usize);

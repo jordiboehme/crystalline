@@ -582,12 +582,14 @@ pub async fn pull(
 
     for edit in &edits {
         let rel = &edit.path;
-        // A generated directory index rides along with a share so the team
-        // repository stays browsable, but the local generator is the single
-        // authority on its content: the origin's copy is recorded in the base
-        // snapshot below - so the next share carries the delta and the
-        // repository converges on this machine's listing - and is never
-        // written over the file on disk. Skipping the whole merge here is also
+        // Whether a generated directory index rides along with a share is the
+        // domain's own choice (`crystalline_core::GeneratedIndexes`), but
+        // recording one is not: the origin's copy is written into the base
+        // snapshot below whatever the domain declares, and is never written
+        // over the file on disk. For a domain that shares its listings that is
+        // what carries the delta upstream, so the repository converges on this
+        // machine's listing; for one that keeps them local the row is inert,
+        // because detection skips that path on both sides. Skipping the whole merge here is also
         // what keeps a diverged index structurally incapable of raising a
         // conflict: a derived file is nothing to ask a person to choose sides
         // over.

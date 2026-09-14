@@ -673,8 +673,10 @@ fn single_domain(
                            the unshared-work count a client shows as pending, \
                            counting real work only: a refreshed folder listing \
                            (`index.md`) is derived from the engrams beside it \
-                           and rides along with a share without ever being the \
-                           reason for one. `owned_changes` counts how many of \
+                           and is never the reason for a share, riding along \
+                           with one where the domain's MANIFEST declares \
+                           `generated_indexes: shared` and staying on this \
+                           machine where it does not. `owned_changes` counts how many of \
                            those changes THIS session's account last wrote, by \
                            the changed file's own `generated.by` line - \
                            last-writer provenance, never authorship - so a \
@@ -876,8 +878,9 @@ pub async fn sync_status(
                            domain, and the domains whose own status read \
                            failed. `local_changes` is the unshared-work count \
                            a share action shows as pending, real work only: a \
-                           refreshed folder listing (`index.md`) rides along \
-                           with a share and never makes one worth offering. \
+                           refreshed folder listing (`index.md`) never makes \
+                           a share worth offering, and rides along with one \
+                           only where the domain shares its listings. \
                            `owned_changes` is how many of that domain's \
                            changes this session's account last wrote, by the \
                            file's own `generated.by` line, or null when there \
@@ -1374,9 +1377,10 @@ pub struct ShareBody {
     #[schema(example = 4)]
     pub proposal: Option<u64>,
     /// Share only these changed files, as domain-relative paths. Absent
-    /// shares every unshared change; the generated `index.md` of each chosen
-    /// file's folder rides along, and a path that is not among this domain's
-    /// unshared changes is refused by name.
+    /// shares every unshared change; where the domain shares its generated
+    /// listings, the `index.md` of each chosen file's folder rides along, and
+    /// a path that is not among this domain's unshared changes is refused by
+    /// name.
     #[serde(default)]
     #[schema(example = json!(["notes/a.md"]))]
     pub files: Option<Vec<String>>,

@@ -662,11 +662,13 @@ fn stack_line(proposal: &serde_json::Value) -> Option<String> {
 /// somebody wrote, and one quiet line for the folder listings that rode along
 /// with it.
 ///
-/// The listings are `index.md` files, generated from the engrams beside them so
-/// the team repository stays browsable on the forge. They travel with a share
-/// and they say nothing on their own, so counting them among the engrams would
-/// inflate every number a reader uses to recognize their own work. The second
-/// line is skipped entirely when there are none, which is most shares.
+/// The listings are `index.md` files, generated from the engrams beside them.
+/// They travel with a share only in a domain that declares
+/// `generated_indexes: shared`, and they say nothing on their own, so counting
+/// them among the engrams would inflate every number a reader uses to
+/// recognize their own work. The second line is skipped entirely when there
+/// are none, which is most shares and all of them in a domain that keeps its
+/// listings local.
 fn print_change_counts(proposal: &serde_json::Value) {
     let (added, added_indexes) = split_indexes(&proposal["added"]);
     let (updated, updated_indexes) = split_indexes(&proposal["updated"]);

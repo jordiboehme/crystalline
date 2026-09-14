@@ -67,9 +67,9 @@ impl LocalChange {
     /// Whether this change is a generated directory index rather than
     /// knowledge somebody wrote.
     ///
-    /// An index refresh rides along with a share so the team repository stays
-    /// browsable, but it is derived from the files beside it and says nothing
-    /// on its own. Every surface that counts unshared work to decide whether
+    /// An index refresh rides along with a share in a domain that declares
+    /// `generated_indexes: shared`, and it is derived from the files beside it
+    /// and says nothing on its own. Every surface that counts unshared work to decide whether
     /// to offer sharing at all leaves these out, and every surface that lists
     /// what a share carries draws them as one quiet line rather than among the
     /// engrams.
@@ -154,9 +154,7 @@ impl LocalChanges {
 /// The domain's generated-index policy is read from its own `MANIFEST.md`
 /// rather than passed in, and that is the point: a repository is shared by
 /// people who must not disagree about what a share contains, so no caller gets
-/// to choose. A domain that declares nothing keeps its indexes local. Pass the
-/// policy explicitly with [`detect_local_changes_with`] only where it is
-/// already known.
+/// to choose. A domain that declares nothing keeps its indexes local.
 ///
 /// Walk rules, mirroring `crystalline_index::sync`'s conventions:
 ///
@@ -207,8 +205,10 @@ pub fn detect_local_changes(
 
 /// [`detect_local_changes`] with the domain's generated-index policy supplied
 /// rather than read: the pure half, whose only IO is reading the files it
-/// walks.
-pub fn detect_local_changes_with(
+/// walks. Crate-internal on purpose: a caller outside would be a caller
+/// choosing what a share contains, which is the domain's choice and not
+/// theirs.
+pub(crate) fn detect_local_changes_with(
     domain_root: &Path,
     base: &BTreeMap<String, BaseStamp>,
     indexes: GeneratedIndexes,
@@ -620,9 +620,6 @@ mod tests {
 
     use super::*;
     use crate::state::BaseStamp;
-
-    #[allow(unused_imports)]
-    use crystalline_core::GeneratedIndexes;
 
     fn stamp_for(bytes: &[u8]) -> BaseStamp {
         BaseStamp {
