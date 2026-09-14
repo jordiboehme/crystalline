@@ -8919,8 +8919,14 @@ impl Engine {
         let id = store
             .upsert_domain(domain, path_str.as_deref(), kind)
             .await?;
-        let restored =
-            crate::overlay_journal::restore_into(&*store, &state_dir, domain, id).await?;
+        let restored = crate::overlay_journal::restore_into(
+            &*store,
+            &state_dir,
+            domain,
+            id,
+            &self.chunk_params,
+        )
+        .await?;
         Ok(restored)
     }
 

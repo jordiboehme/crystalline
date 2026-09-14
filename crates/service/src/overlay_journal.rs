@@ -50,7 +50,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crystalline_core::{config, parse_engram};
-use crystalline_index::{DomainId, EngramRecord, Store};
+use crystalline_index::{ChunkParams, DomainId, EngramRecord, Store, chunk_engram};
 
 use crate::engine::{is_within_domain, virtual_stamp};
 
@@ -326,6 +326,11 @@ pub fn journal_remove_domain(state_dir: &Path, domain: &str) -> io::Result<u64> 
 /// ever allowed to fill a gap. That makes it safe to run on every sync, where
 /// almost always it writes nothing at all.
 ///
+/// A restored draft is a whole row: it is chunked the way a write verb chunks
+/// one, and the domain's pending relations and links are resolved once at the
+/// end, so a draft that came back through a wipe is as complete as one that was
+/// never wiped.
+///
 /// **A restored draft stores its full markdown**, frontmatter and all, exactly
 /// as a virtual domain's rows do (`Engine::index_markdown`'s `store_full`): a
 /// draft is on nobody's disk, so the row is the only place its document
@@ -345,6 +350,7 @@ pub async fn restore_into(
     state_dir: &Path,
     domain_name: &str,
     domain: DomainId,
+    chunk_params: &ChunkParams,
 ) -> crystalline_index::Result<u64> {
     let mut restored = 0u64;
     for entry in journal_entries(state_dir, domain_name) {
@@ -365,8 +371,34 @@ pub async fn restore_into(
                 None => continue,
             },
         };
-        store.upsert_overlay(domain, &entry.actor, &record).await?;
+        let id = store.upsert_overlay(domain, &entry.actor, &record).await?;
+        // A draft is chunked exactly as a write verb chunks one
+        // (`Engine::index_markdown`'s tail), or it comes back as a row nothing
+        // can ever embed: chunks are written at write time and nothing
+        // downstream creates them later, and `chunks_needing_embedding` is
+        // unscoped by actor precisely so a draft's chunks reach the same
+        // backlog a base row's do. A tombstone is left chunkless on purpose - a
+        // deletion's content does not belong in the embedding backlog.
+        if !record.tombstone {
+            let chunks = chunk_engram(
+                &record.title,
+                record.description.as_deref(),
+                &record.content,
+                chunk_params,
+            );
+            store.replace_chunks(id, &chunks).await?;
+        }
         restored += 1;
+    }
+    // The restored rows' relations and links point at engrams that are already
+    // in the index, so they resolve now rather than waiting for a write that
+    // may never come. Runs only when something was restored, and it is what
+    // keeps the two callers equal: the engine's sync pass has a trailing
+    // `resolve_forward_refs` that a restored row would ride on, and the CLI's
+    // reindex has already run its own by the time the restore happens.
+    if restored > 0 {
+        store.resolve_pending_relations(domain).await?;
+        store.resolve_pending_links(domain).await?;
     }
     Ok(restored)
 }

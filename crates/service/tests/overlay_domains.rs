@@ -30,7 +30,7 @@ const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - 
 const ALICE_DRAFT: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Plan\n\n- [decision] the plan as alice would have it #team\n";
 /// A draft of a path no file holds: the sharp case, since nothing on disk
 /// could ever bring it back.
-const ALICE_NEW: &str = "---\ntype: engram\ntitle: Fresh\npermalink: fresh\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Fresh\n\n- [idea] a page only alice has #team\n";
+const ALICE_NEW: &str = "---\ntype: engram\ntitle: Fresh\npermalink: fresh\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Fresh\n\n- [idea] a page only alice has #team\n- relates_to [[Plan]]\n";
 
 /// One engine over one temp directory, with everything a test here needs to
 /// act as the write verbs will.
@@ -206,6 +206,44 @@ async fn an_index_wipe_keeps_drafts_through_the_journal() {
     assert_eq!(
         bob[0].1, base_content,
         "the restored tombstone stands over the base row's own content"
+    );
+
+    // A restored draft is a whole row, chunks included. Task 1 kept
+    // `chunks_needing_embedding` unscoped precisely so a draft's chunks reach
+    // the same embedding backlog a base row's do; a restore that wrote the row
+    // and no chunks would make every draft that has been through a wipe
+    // permanently un-embeddable, and nothing else in the wave would notice.
+    let backlog = {
+        let store = f.store.lock().await;
+        store
+            .chunks_needing_embedding("test-model", None, 100, None)
+            .await
+            .unwrap()
+    };
+    assert!(
+        backlog
+            .iter()
+            .any(|job| job.text.contains("a page only alice has")),
+        "the restored draft is in the embedding backlog like any other row: {:?}",
+        backlog.iter().map(|j| &j.text).collect::<Vec<_>>()
+    );
+    // And its edges resolve. The draft relates to the base engram, and asking
+    // the store to resolve what is still pending is the only probe that can see
+    // a draft's edges at all today: every reading surface is screened to the
+    // base until Task 5 threads the actor through them. A restore that left the
+    // rows pending would have work for this call to do.
+    let pending = {
+        let store = f.store.lock().await;
+        let id = f.domain_id(&*store, "team").await;
+        (
+            store.resolve_pending_relations(id).await.unwrap(),
+            store.resolve_pending_links(id).await.unwrap(),
+        )
+    };
+    assert_eq!(
+        pending,
+        (0, 0),
+        "the restore left no relation or link of its own pointing forward"
     );
 
     // The base is untouched by any of it: a reader who is nobody in particular

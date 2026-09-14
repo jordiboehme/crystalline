@@ -1428,7 +1428,7 @@ pub async fn reindex(
     // to read it. Runs on every reindex, not only a wipe: it costs one
     // directory read per domain when there is nothing to restore, and a
     // daemonless installation has no other pass that would ever heal a draft.
-    let drafts_restored = restore_overlay_journals(&store, &file_targets).await;
+    let drafts_restored = restore_overlay_journals(&store, &file_targets, &params).await;
 
     if json {
         println!(
@@ -1484,6 +1484,7 @@ pub async fn reindex(
 async fn restore_overlay_journals(
     store: &Arc<TokioMutex<dyn Store>>,
     targets: &[(String, PathBuf)],
+    chunk_params: &ChunkParams,
 ) -> u64 {
     let state_dir = match crystalline_core::config::state_dir() {
         Ok(dir) => dir,
@@ -1512,8 +1513,14 @@ async fn restore_overlay_journals(
                 continue;
             }
         };
-        match crystalline_service::overlay_journal::restore_into(&*store, &state_dir, name, id)
-            .await
+        match crystalline_service::overlay_journal::restore_into(
+            &*store,
+            &state_dir,
+            name,
+            id,
+            chunk_params,
+        )
+        .await
         {
             Ok(n) => restored += n,
             Err(e) => tracing::warn!("the overlay journal for '{name}' was not restored: {e}"),
