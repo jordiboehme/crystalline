@@ -694,10 +694,14 @@ where
 /// the same way whichever crate happened to open the index. The backend's own
 /// words are kept, last, inside it: nothing is hidden, it just stops leading.
 ///
-/// An override that took this path at all - whether the open below succeeds
-/// or fails - gets [`crate::instance::BYPASS_NOTE`] on stderr first, the same
-/// sentence `status` prints for a bypass: a read verb's empty answer from a
+/// An override that opens the index successfully here gets
+/// [`crate::instance::BYPASS_NOTE`] on stderr too, the same sentence
+/// `status` prints for a bypass: a read verb's empty answer from a
 /// deliberately different index must never be mistaken for a genuine miss.
+/// A failed open says nothing besides the composed error below, which
+/// already names the override as the reason nothing was asked of the
+/// daemon - printing the plain note first there would claim a direct read
+/// that the very next line reports could not happen.
 async fn open_standalone_reporting(
     loaded: overlay::LoadedConfig,
     db_path: &Path,
@@ -717,10 +721,7 @@ async fn open_standalone_reporting(
     // An explicit --db or --config never asked the daemon in the first place,
     // which changes the remedy rather than the diagnosis.
     let bypassed = !use_daemon(db, config_path);
-    if bypassed {
-        eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
-    }
-    open_standalone(loaded, db_path, want_embeddings)
+    let engine = open_standalone(loaded, db_path, want_embeddings)
         .await
         .map_err(|e| {
             anyhow::anyhow!(crate::instance::index_unreachable_words(
@@ -728,7 +729,11 @@ async fn open_standalone_reporting(
                 &format!("{e:#}"),
                 bypassed
             ))
-        })
+        })?;
+    if bypassed {
+        eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
+    }
+    Ok(engine)
 }
 
 /// Run a tool by name: over the socket when a daemon is up, else in-process

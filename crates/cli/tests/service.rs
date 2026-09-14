@@ -1238,6 +1238,10 @@ fn search_with_a_db_override_names_the_holder_on_a_held_lock() {
         stderr.contains("--db or --config"),
         "the override remedy is given: {stderr}"
     );
+    assert!(
+        !stderr.contains("reading the index directly"),
+        "a failed direct read must never claim it read the index directly: {stderr}"
+    );
     let holder_at = stderr
         .find("owns the index at")
         .unwrap_or_else(|| panic!("the holder is named: {stderr}"));
