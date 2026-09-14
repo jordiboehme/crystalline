@@ -1374,3 +1374,132 @@ async fn review_mode_implies_a_registration_so_the_collector_never_hides_it() {
         "and nothing about review mode: {text}"
     );
 }
+
+/// The tree an agent navigates by is this reader's tree: their drafts describe
+/// the rows they are drafting, their deletions leave it, and a draft at a path
+/// the domain's files never held is in it - folder and all.
+#[tokio::test]
+async fn a_browse_level_is_drawn_from_the_readers_own_drafts() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+
+    // A draft over the base row, retitled, and a draft in a folder nobody has.
+    f.engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                content: PLAN.replace("title: Plan", "title: Alice's Plan"),
+                expected_checksum:
+                    f.engine.read_engram(&read("plan"), &alice).await.unwrap()["checksum"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("notes".to_string()),
+                ..write_params("team", "Fresh", "- [idea] a page only alice has #team")
+            },
+            who,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    let browse = |scope: Scope| {
+        let engine = f.engine.clone();
+        async move {
+            engine
+                .browse_domain(
+                    &crystalline_service::params::BrowseParams {
+                        domain: "team".to_string(),
+                        path: None,
+                        depth: None,
+                        glob: None,
+                    },
+                    &scope,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let mine = browse(alice.clone()).await;
+    let titles: Vec<&str> = mine["engrams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.contains(&"Alice's Plan"),
+        "her draft describes the row she is drafting: {mine}"
+    );
+    assert_eq!(
+        mine["folders"],
+        serde_json::json!(["notes"]),
+        "and the folder her new draft sits in is in her tree: {mine}"
+    );
+
+    let theirs = browse(account("bob")).await;
+    let their_titles: Vec<&str> = theirs["engrams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        their_titles.contains(&"Plan") && !their_titles.contains(&"Alice's Plan"),
+        "bob's tree is the one the team reviewed: {theirs}"
+    );
+    assert_eq!(
+        theirs["folders"],
+        serde_json::json!([]),
+        "and it has no folder alice invented: {theirs}"
+    );
+
+    // A deletion leaves the level, for its author alone.
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            who,
+            &alice,
+        )
+        .await
+        .unwrap();
+    let after = browse(alice).await;
+    let paths: Vec<&str> = after["engrams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        !paths.contains(&"plan.md"),
+        "the path she deleted is not in her tree: {after}"
+    );
+    assert_eq!(
+        after["total"],
+        serde_json::json!(paths.len()),
+        "and the level's own count says the same: {after}"
+    );
+    assert!(
+        browse(account("bob")).await["engrams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "plan.md"),
+        "while it is still in everybody else's"
+    );
+}

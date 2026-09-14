@@ -35,7 +35,7 @@ use crystalline_core::{
     Manifest, YamlValue, is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
-    AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
+    AckCounts, AckEntry, AttachmentRow, BrowseLevel, ChunkParams, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
     EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
     FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
@@ -5988,11 +5988,20 @@ impl Engine {
         // The SOURCE first, and the order is forced rather than preferred: one
         // actor holds one row per permalink per domain, and until the source is
         // a tombstone (which answers to no permalink) or gone, the engram's own
-        // permalink is still spoken for and the destination cannot take it. The
-        // cost is that a failure between the two writes leaves this actor
-        // seeing the engram at neither address for the moment; the base row and
-        // the reviewed file are untouched either way, and the mirror says what
-        // happened, so nothing is lost and a retry lands the destination.
+        // permalink is still spoken for and the destination cannot take it.
+        //
+        // Which is why the destination's failure puts the source back. Once the
+        // source is a tombstone this actor reads nothing at that path, so a
+        // retry would not find the engram to move and the text - which for a
+        // draft lives in that row and nowhere else - would be gone. The
+        // rollback is what makes a move that fails a move that did not happen.
+        let held_draft = {
+            let store = self.store.lock().await;
+            store
+                .overlay_entry(src.domain_id, actor, &src.path)
+                .await?
+                .is_some_and(|entry| !entry.tombstone)
+        };
         let base = {
             let store = self.store.lock().await;
             store
@@ -6015,8 +6024,30 @@ impl Engine {
                     .await?
             }
         }
-        self.write_overlay_entry(&p.domain, src.domain_id, actor, dest_rel, &text)
-            .await?;
+        if let Err(e) = self
+            .write_overlay_entry(&p.domain, src.domain_id, actor, dest_rel, &text)
+            .await
+        {
+            // Back to exactly what this actor held: their own draft when they
+            // had one, and otherwise nothing of their own at all, which is the
+            // base row showing through again.
+            let undo = if held_draft {
+                self.write_overlay_entry(&p.domain, src.domain_id, actor, &src.path, &text)
+                    .await
+            } else {
+                self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
+                    .await
+            };
+            if let Err(undo) = undo {
+                tracing::error!(
+                    domain = p.domain.as_str(),
+                    path = src.path.as_str(),
+                    "the move could not write the destination and could not put the source back \
+                     either: {undo}"
+                );
+            }
+            return Err(e);
+        }
         let dest_permalink = parse_engram(&text)
             .map(|engram| {
                 EngramRecord::from_engram(&engram, dest_rel, virtual_stamp(&text)).permalink
@@ -8215,10 +8246,20 @@ impl Engine {
         // into SQL in every case, the root included, so a client that refetches
         // its tree can never pull tens of thousands of rows across per request.
         let store = self.store.lock().await;
-        let level = store
+        let mut level = store
             .browse_level(&p.domain, prefix.as_deref(), depth, TREE_LEVEL_CAP)
             .await?;
         drop(store);
+
+        // This reader's own drafts shadow the level they are in: a path they
+        // have tombstoned leaves it, a path they are drafting is described by
+        // their draft, and a draft at a path the domain's files never held
+        // joins it. Applied AFTER the domain screen above, which is the order
+        // the whole actor dimension composes in.
+        if let Some(actor) = self.overlay_for_read(&p.domain, scope) {
+            self.shadow_level(&p.domain, &actor, prefix.as_deref(), depth, &mut level)
+                .await?;
+        }
 
         // Whether the level was cut is a fact about the rows, decided before the
         // glob narrows them: a glob that matches two of five hundred rows has
@@ -8254,6 +8295,102 @@ impl Engine {
             "truncated": truncated,
             "total": level.total,
         }))
+    }
+
+    /// Fold one reader's drafts into a browse level.
+    ///
+    /// Three edits, which are the whole of what shadowing means for a listing:
+    /// a row this actor has tombstoned leaves, a row they are drafting is
+    /// described by their draft rather than by the file, and a draft at a path
+    /// the domain's files never held joins the level and contributes its folder
+    /// if it is in one.
+    ///
+    /// **The level's `total` is adjusted by what this pass can see, and on a
+    /// level the cap already cut that is the base level's count plus this
+    /// actor's drafts rather than an exact one.** `browse_level` pushes the
+    /// prefix, the depth and [`TREE_LEVEL_CAP`] into SQL and counts under the
+    /// same filter, so a tombstone over a row that fell outside the returned
+    /// page cannot be subtracted here without reading the page the cap
+    /// withheld. A cut level is already telling its client to ask for the
+    /// listing instead; an exact count for one needs the actor threaded into
+    /// the statement, which is the index-side work Task 5 does for search.
+    async fn shadow_level(
+        &self,
+        domain: &str,
+        actor: &str,
+        prefix: Option<&str>,
+        depth: usize,
+        level: &mut BrowseLevel,
+    ) -> Result<()> {
+        let (domain_id, _) = self.domain_source(domain).await?;
+        let entries = {
+            let store = self.store.lock().await;
+            store.overlay_entries(domain_id, actor).await?
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let folder = folder_slash_lower(prefix.unwrap_or_default());
+        let mut drafts: HashMap<String, &crystalline_index::StoredEngram> = HashMap::new();
+        let mut tombstones: HashSet<String> = HashSet::new();
+        for entry in &entries {
+            if entry.tombstone {
+                tombstones.insert(entry.path.clone());
+            } else {
+                drafts.insert(entry.path.clone(), entry);
+            }
+        }
+
+        let before = level.engrams.len();
+        level.engrams.retain(|d| !tombstones.contains(&d.path));
+        let removed = before - level.engrams.len();
+
+        let mut seen: HashSet<String> = level.engrams.iter().map(|d| d.path.clone()).collect();
+        for row in level.engrams.iter_mut() {
+            if let Some(draft) = drafts.get(&row.path) {
+                overwrite_from_draft(row, draft);
+            }
+        }
+
+        // The drafts the base level does not hold, at this level and under this
+        // prefix: the same two cuts `browse_level` makes in SQL, made here in
+        // Rust over a handful of rows.
+        let mut added = 0usize;
+        let mut folders: BTreeSet<String> = level.folders.iter().cloned().collect();
+        for entry in &entries {
+            if entry.tombstone || seen.contains(&entry.path) {
+                continue;
+            }
+            let lowered = entry.path.to_lowercase();
+            let Some(rel) = lowered.strip_prefix(folder.as_str()) else {
+                continue;
+            };
+            let rel = &entry.path[entry.path.len() - rel.len()..];
+            if let Some((head, _)) = rel.split_once('/') {
+                folders.insert(head.to_string());
+            }
+            if rel.matches('/').count() >= depth {
+                continue;
+            }
+            let mut row = EngramDescriptor {
+                id: entry.id,
+                domain_id,
+                domain: domain.to_string(),
+                path: entry.path.clone(),
+                permalink: entry.permalink.clone(),
+                title: String::new(),
+                engram_type: String::new(),
+                status: String::new(),
+            };
+            overwrite_from_draft(&mut row, entry);
+            seen.insert(entry.path.clone());
+            level.engrams.push(row);
+            added += 1;
+        }
+        level.engrams.sort_by(|a, b| a.path.cmp(&b.path));
+        level.folders = folders.into_iter().collect();
+        level.total = level.total.saturating_sub(removed) + added;
+        Ok(())
     }
 
     // --- validate ------------------------------------------------------------
@@ -16687,6 +16824,35 @@ fn assets_reserved_error(rel: &str) -> String {
 /// content byte length and its SHA-256. The sha doubles as the CAS token, so a
 /// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
 /// without ever touching a filesystem.
+/// A browse prefix as a lowercased folder prefix: empty for the root, and
+/// otherwise ending in the slash that makes it a folder. The Rust counterpart
+/// of the backends' own `folder_slash`, used to cut draft paths to the level
+/// being browsed.
+fn folder_slash_lower(prefix: &str) -> String {
+    if prefix.is_empty() {
+        return String::new();
+    }
+    let mut out = prefix.to_lowercase();
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
+/// Describe a browse row by the draft standing at its path: the permalink,
+/// title, type and status the reader's own document carries, so a listing says
+/// what they would open rather than what the file says.
+fn overwrite_from_draft(row: &mut EngramDescriptor, draft: &crystalline_index::StoredEngram) {
+    row.permalink = draft.permalink.clone();
+    row.id = draft.id;
+    if let Ok(engram) = parse_engram(&draft.content) {
+        let record = EngramRecord::from_engram(&engram, &draft.path, virtual_stamp(&draft.content));
+        row.title = record.title;
+        row.engram_type = record.engram_type;
+        row.status = record.status;
+    }
+}
+
 pub(crate) fn virtual_stamp(content: &str) -> FileStamp {
     FileStamp {
         mtime: chrono::Utc::now().timestamp(),
