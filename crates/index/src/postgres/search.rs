@@ -1094,8 +1094,21 @@ pub(super) async fn neighbors(
         let rel_rows = query_all(
             conn,
             &format!(
-                "SELECT engram_id, to_id, rel_type FROM relation \
-                 WHERE to_id IS NOT NULL AND (engram_id IN ({list}) OR to_id IN ({list}))"
+                // A draft's relation and link rows are written exactly as a
+                // base row's, so a frontier that stops at those tables walks
+                // them without ever naming the table that knows whose they are:
+                // the traversal would push a draft's id into the visited set
+                // and the node hydrate below - which does carry the predicate -
+                // would then drop it, leaving an edge with no node and base
+                // engrams pulled into the neighbourhood through somebody else's
+                // private draft. Both endpoints are screened, because an edge
+                // reaching INTO a draft is as far outside the base graph as one
+                // leaving it.
+                "SELECT r.engram_id, r.to_id, r.rel_type FROM relation r \
+                 JOIN engram src ON src.id=r.engram_id AND src.actor = '' \
+                 JOIN engram dst ON dst.id=r.to_id AND dst.actor = '' \
+                 WHERE r.to_id IS NOT NULL \
+                   AND (r.engram_id IN ({list}) OR r.to_id IN ({list}))"
             ),
             vec![],
         )
@@ -1119,8 +1132,13 @@ pub(super) async fn neighbors(
         let link_rows = query_all(
             conn,
             &format!(
-                "SELECT engram_id, to_id FROM link \
-                 WHERE to_id IS NOT NULL AND (engram_id IN ({list}) OR to_id IN ({list}))"
+                // The prose-link twin of the relation frontier above, and
+                // screened for the same reason.
+                "SELECT l.engram_id, l.to_id FROM link l \
+                 JOIN engram src ON src.id=l.engram_id AND src.actor = '' \
+                 JOIN engram dst ON dst.id=l.to_id AND dst.actor = '' \
+                 WHERE l.to_id IS NOT NULL \
+                   AND (l.engram_id IN ({list}) OR l.to_id IN ({list}))"
             ),
             vec![],
         )

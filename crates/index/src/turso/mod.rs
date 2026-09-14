@@ -253,10 +253,6 @@ impl TursoStore {
         Ok(())
     }
 
-    /// Delete the child rows recreated on every upsert. Chunk rows are NOT
-    /// cleared here: an upsert preserves them so [`Store::replace_chunks`] can
-    /// carry over embeddings whose fingerprint is unchanged. Deleting an engram
-    /// clears its chunks explicitly in [`Store::delete_engram`].
     /// Write one row of the `engram` table, in one actor's dimension.
     ///
     /// The single writer behind both [`Store::upsert_engram`] (which passes the
@@ -452,6 +448,10 @@ impl TursoStore {
         Ok(EngramId(engram_id))
     }
 
+    /// Delete the child rows recreated on every upsert. Chunk rows are NOT
+    /// cleared here: an upsert preserves them so [`Store::replace_chunks`] can
+    /// carry over embeddings whose fingerprint is unchanged. Deleting an engram
+    /// clears its chunks explicitly in [`Store::delete_engram`].
     async fn delete_children(&self, engram_id: i64) -> Result<()> {
         let eid = vec![Value::Integer(engram_id)];
         self.conn
@@ -2053,8 +2053,9 @@ impl Store for TursoStore {
                 vec![Value::Integer(id)],
             )
             .await?;
-        // -- actor: all - the row is already named by its id, which one actor's
-        // own lookup above resolved.
+        // The row is already named by its id, which the actor-scoped lookup
+        // above resolved, so this statement is inside that actor's dimension
+        // and carries no waiver of its own.
         self.conn
             .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
             .await?;
@@ -2107,10 +2108,14 @@ impl Store for TursoStore {
              (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = ''), \
              (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id \
               WHERE e.domain_id=d.id AND e.actor = ''), \
-             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
-             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
-             (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
-             (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
+             (SELECT count(*) FROM relation r JOIN engram e ON e.id=r.engram_id \
+              WHERE r.domain_id=d.id AND e.actor = ''), \
+             (SELECT count(*) FROM relation r JOIN engram e ON e.id=r.engram_id \
+              WHERE r.domain_id=d.id AND r.to_id IS NULL AND e.actor = ''), \
+             (SELECT count(*) FROM link l JOIN engram e ON e.id=l.engram_id \
+              WHERE l.domain_id=d.id AND e.actor = ''), \
+             (SELECT count(*) FROM link l JOIN engram e ON e.id=l.engram_id \
+              WHERE l.domain_id=d.id AND l.to_id IS NULL AND e.actor = ''), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
              d.last_registered, d.rebuild_started \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
@@ -2174,7 +2179,9 @@ impl Store for TursoStore {
              JOIN domain d ON d.id=e.domain_id \
              WHERE e.actor = '' AND d.name=?1 GROUP BY t.id"
         } else {
-            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id GROUP BY t.id"
+            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+             JOIN engram e ON e.id=et.engram_id \
+             WHERE e.actor = '' GROUP BY t.id"
         };
         let engram_tags = decode(&query_all(&self.conn, engram_tag_sql, dparam()).await?);
 
@@ -2186,7 +2193,10 @@ impl Store for TursoStore {
              JOIN domain d ON d.id=e.domain_id \
              WHERE e.actor = '' AND d.name=?1 GROUP BY t.id"
         } else {
-            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id GROUP BY t.id"
+            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
+             JOIN observation o ON o.id=ot.observation_id \
+             JOIN engram e ON e.id=o.engram_id \
+             WHERE e.actor = '' GROUP BY t.id"
         };
         let observation_tags = decode(&query_all(&self.conn, obs_tag_sql, dparam()).await?);
 
@@ -2196,16 +2206,21 @@ impl Store for TursoStore {
              JOIN domain d ON d.id=e.domain_id \
              WHERE e.actor = '' AND o.category <> '' AND d.name=?1 GROUP BY o.category"
         } else {
-            "SELECT o.category, COUNT(*) FROM observation o WHERE o.category <> '' GROUP BY o.category"
+            "SELECT o.category, COUNT(*) FROM observation o \
+             JOIN engram e ON e.id=o.engram_id \
+             WHERE o.category <> '' AND e.actor = '' GROUP BY o.category"
         };
         let categories = decode(&query_all(&self.conn, category_sql, dparam()).await?);
 
         let rel_sql = if domain.is_some() {
             "SELECT r.rel_type, COUNT(*) FROM relation r \
              JOIN domain d ON d.id=r.domain_id \
-             WHERE d.name=?1 GROUP BY r.rel_type"
+             JOIN engram e ON e.id=r.engram_id \
+             WHERE d.name=?1 AND e.actor = '' GROUP BY r.rel_type"
         } else {
-            "SELECT r.rel_type, COUNT(*) FROM relation r GROUP BY r.rel_type"
+            "SELECT r.rel_type, COUNT(*) FROM relation r \
+             JOIN engram e ON e.id=r.engram_id \
+             WHERE e.actor = '' GROUP BY r.rel_type"
         };
         let relation_types = decode(&query_all(&self.conn, rel_sql, dparam()).await?);
 

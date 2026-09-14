@@ -5540,6 +5540,19 @@ parity!(a_tombstone_is_an_overlay_row_too, a_tombstone_is_a_row);
 /// predicate on it would not compile in either dialect. Writes are scanned
 /// alongside reads, because a `DELETE` that forgets the predicate destroys a
 /// draft rather than merely leaking one.
+///
+/// **What this scan structurally cannot see, and what covers it instead.** A
+/// draft's `relation`, `link`, `observation`, `engram_tag` and `chunk` rows are
+/// written exactly as a base row's, so a statement that stops at one of those
+/// tables reaches a draft's children without ever naming `engram` - and this
+/// scan would never know. Every such statement that feeds a base-facing answer
+/// has been given a join onto `engram` for exactly that reason, which is what
+/// puts it back inside this census (the graph frontier in both `search.rs`,
+/// `domain_stats`' four edge counts, and `vocabulary`'s unscoped branches and
+/// its relation-type scan). The behavioural counterpart is
+/// `a_draft_never_reaches_a_base_count_or_the_base_graph`, which gives a draft
+/// child rows of every kind and then asks those surfaces; a new statement over
+/// a child table alone needs that test extended, not this one.
 #[test]
 fn every_engram_reading_sql_carries_an_actor_predicate() {
     // The predicate in each of the spellings the two dialects and the bound
@@ -5606,8 +5619,10 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         }
     }
     assert_eq!(
-        sites, 106,
-        "the engram statement census moved; every new one needs a predicate or a waiver"
+        sites, 132,
+        "the engram statement census moved; every new one needs a predicate or a waiver. \
+         54 per backend in mod.rs, 10 per backend in search.rs, 4 in the shared \
+         reference-resolution expression"
     );
     assert_eq!(
         waived, 14,
@@ -5632,3 +5647,178 @@ fn names_the_engram_table(line: &str) -> bool {
     }
     false
 }
+
+/// A draft's child rows never reach a base-facing answer, even where the
+/// statement that would have to screen them never names the `engram` table.
+///
+/// `upsert_row` writes a draft's relations, links, observations, tags and
+/// chunks exactly as a base row's - that is what makes an overlay entry a full
+/// engram row rather than a second shape - so every one of those child rows is
+/// reachable from a statement that joins `relation`, `link`, `observation` or
+/// `engram_tag` and stops there. The source scan cannot see those statements at
+/// all, which is precisely why this one is behavioural: it gives a draft
+/// relation bullets, prose links, an observation with a category, a tag of its
+/// own and a type and status nobody else uses, and then asks every base-facing
+/// surface that counts or traverses them.
+///
+/// The graph is the sharpest of the three. The draft's edges resolve like any
+/// other row's (`resolve_pending_relations` scopes by domain, not by actor), so
+/// an unscreened frontier walks them, pushes the draft's id into the visited
+/// set, and the node hydrate - which does carry the predicate - then drops the
+/// node: an edge naming an id with no node, plus base engrams pulled into the
+/// neighbourhood through somebody else's private draft.
+async fn a_draft_reaches_no_base_answer_through_its_children(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- relates_to [[b]]\n"),
+    );
+    write(root, "b.md", &engram("B", "b", "engram", "", "plain\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let a = store.lookup_id("d", "a").await.unwrap().unwrap();
+    let b = store.lookup_id("d", "b").await.unwrap().unwrap();
+
+    let base_stats = || async {
+        store
+            .domain_stats()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "d")
+            .unwrap()
+    };
+    let before = base_stats().await;
+    let vocab_before = store.vocabulary(None).await.unwrap();
+    let scoped_before = store.vocabulary(Some("d")).await.unwrap();
+    let graph_before = store.neighbors(&[a], 2).await.unwrap();
+
+    // One draft, carrying every kind of child row a base row can carry: a
+    // relation and a prose link that both resolve onto base engrams, an
+    // observation in a category of its own, its own tag, and a type and status
+    // nobody else in the index uses.
+    let draft_body = "- [secretly] a private note #draftonly\n\n\
+                      - refers_privately [[b]]\n\n\
+                      and a prose link to [[b]] as well\n";
+    let parsed =
+        crystalline_core::parse_engram(&engram("Draft", "draft-only", "draftkind", "", draft_body))
+            .unwrap();
+    let mut draft = EngramRecord::from_engram(
+        &parsed,
+        "a.md",
+        FileStamp {
+            mtime: 0,
+            size: 0,
+            sha256: "draft".to_string(),
+        },
+    );
+    draft.status = "draftstatus".to_string();
+    store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    // Resolution runs over the whole domain, so the draft's references settle
+    // onto real ids exactly as a base row's do. This is the setup, not the
+    // assertion: without it the edges would be unresolved and the graph would
+    // skip them for a reason that has nothing to do with the actor.
+    store.resolve_pending_relations(domain).await.unwrap();
+    store.resolve_pending_links(domain).await.unwrap();
+
+    // The counts beside the two that were already predicated.
+    let after = base_stats().await;
+    assert_eq!(
+        (
+            after.engrams,
+            after.observations,
+            after.relations,
+            after.links,
+            after.unresolved_relations,
+            after.unresolved_links
+        ),
+        (
+            before.engrams,
+            before.observations,
+            before.relations,
+            before.links,
+            before.unresolved_relations,
+            before.unresolved_links
+        ),
+        "a domain holding a draft reports the counts it reported without one, \
+         edges included: `engrams: 0` beside `relations: 1` is not a domain state"
+    );
+
+    // The vocabulary, scoped and unscoped. A draft's tag, category, relation
+    // type, engram type and status are names, not just numbers.
+    for (label, vocab, before) in [
+        (
+            "all domains",
+            store.vocabulary(None).await.unwrap(),
+            vocab_before,
+        ),
+        (
+            "one domain",
+            store.vocabulary(Some("d")).await.unwrap(),
+            scoped_before,
+        ),
+    ] {
+        let names = |v: &Vocabulary| {
+            (
+                v.tags.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                v.categories
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+                v.relation_types
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .collect::<Vec<_>>(),
+                v.types.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                v.statuses
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            names(&vocab),
+            names(&before),
+            "the {label} vocabulary is what the domain's files are written in, \
+             and names nothing out of a draft"
+        );
+    }
+
+    // The graph. The seeds are base rows, so nothing the traversal returns may
+    // name the draft - and every edge it does return must have a node.
+    let graph = store.neighbors(&[a], 2).await.unwrap();
+    assert_eq!(
+        graph.edges.len(),
+        graph_before.edges.len(),
+        "the frontier walked no edge it did not walk before the draft existed"
+    );
+    assert_eq!(graph.nodes.len(), graph_before.nodes.len());
+    let node_ids: Vec<i64> = graph.nodes.iter().map(|n| n.id.0).collect();
+    for edge in &graph.edges {
+        assert!(
+            node_ids.contains(&edge.from.0) && node_ids.contains(&edge.to.0),
+            "every edge names nodes the slice carries; an edge with a missing \
+             node is a draft the hydrate dropped after the frontier walked it: \
+             {edge:?} among {node_ids:?}"
+        );
+    }
+    // And the same from the other end: seeding on the draft's target must not
+    // drag the draft in either.
+    let from_b = store.neighbors(&[b], 2).await.unwrap();
+    let from_b_ids: Vec<i64> = from_b.nodes.iter().map(|n| n.id.0).collect();
+    for edge in &from_b.edges {
+        assert!(
+            from_b_ids.contains(&edge.from.0) && from_b_ids.contains(&edge.to.0),
+            "an edge into a draft is an edge out of the base graph: {edge:?}"
+        );
+    }
+}
+parity!(
+    a_draft_never_reaches_a_base_count_or_the_base_graph,
+    a_draft_reaches_no_base_answer_through_its_children
+);

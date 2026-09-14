@@ -827,7 +827,12 @@ pub struct StoredEngram {
     /// that actor's draft of the same path.
     pub actor: String,
     /// Whether the row is an actor's draft deletion of the base row rather than
-    /// a draft replacement of it. A tombstone carries no content of its own.
+    /// a draft replacement of it.
+    ///
+    /// A tombstone is a full row like any other and nothing empties the columns
+    /// beside this flag, so `content` may well hold whatever the caller wrote
+    /// there. A reader decides by this flag, never by finding the content
+    /// empty.
     pub tombstone: bool,
 }
 
@@ -1808,8 +1813,12 @@ pub trait Store: Send + Sync {
     // to learn a second shape.
     //
     // Every method above this comment reads the base and only the base. These
-    // five are the whole of the other direction: they name their actor, and an
-    // empty actor is refused rather than silently meaning the base.
+    // five are the whole of the other direction, and all of them name their
+    // actor. The empty actor never reaches a base row through any of them:
+    // `upsert_overlay` refuses it outright, because a write that fell through
+    // to the base is the one failure this dimension exists to prevent, while
+    // the three readers answer as they would for an actor holding nothing -
+    // `None`, empty, `false`.
 
     /// Write one actor's draft of a path, replacing that actor's previous draft
     /// there. Returns the row's id, which is stable across rewrites so the

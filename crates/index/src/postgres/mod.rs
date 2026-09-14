@@ -641,7 +641,8 @@ pub(super) fn like_escape(s: &str) -> String {
 ///
 /// What it costs, stated because it is a real trade and not a free lunch: on a C
 /// or POSIX collated database `e.path LIKE 'notes/%'` can drive
-/// `idx_engram_path(domain_id, path)` as a prefix range scan, and wrapping the
+/// `idx_engram_path_actor(domain_id, path, actor)` as a prefix range scan on its
+/// leading columns, and wrapping the
 /// column in `lower()` gives that up. The filter becomes O(table) rather than
 /// O(result), which is the part that matters: it scales with how much the
 /// database holds, not with how much the query returns. Measured on a
@@ -653,7 +654,7 @@ pub(super) fn like_escape(s: &str) -> String {
 /// opclass is not optional, since the plain `(domain_id, lower(path))` shape is
 /// used on a C-collated database and ignored entirely on a UTF-8 one, while the
 /// `text_pattern_ops` variant serves both (0.375 ms on the same replica). None
-/// exists yet; on any non-C collation the prefix never drove `idx_engram_path`
+/// exists yet; on any non-C collation the prefix never drove that index
 /// in the first place, so this fold took nothing away there, and that collation
 /// was already scanning the table before the fold.
 ///
@@ -2118,8 +2119,9 @@ impl Store for PostgresStore {
             .execute(&mut *c)
             .await
             .map_err(IndexError::from)?;
-        // -- actor: all - the row is already named by its id, which one actor's
-        // own lookup above resolved.
+        // The row is already named by its id, which the actor-scoped lookup
+        // above resolved, so this statement is inside that actor's dimension
+        // and carries no waiver of its own.
         sqlx::query("DELETE FROM engram WHERE id=$1")
             .bind(id)
             .execute(&mut *c)
@@ -2169,10 +2171,14 @@ impl Store for PostgresStore {
              (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = ''), \
              (SELECT count(*) FROM observation o JOIN engram e ON e.id=o.engram_id \
               WHERE e.domain_id=d.id AND e.actor = ''), \
-             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id), \
-             (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
-             (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
-             (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
+             (SELECT count(*) FROM relation r JOIN engram e ON e.id=r.engram_id \
+              WHERE r.domain_id=d.id AND e.actor = ''), \
+             (SELECT count(*) FROM relation r JOIN engram e ON e.id=r.engram_id \
+              WHERE r.domain_id=d.id AND r.to_id IS NULL AND e.actor = ''), \
+             (SELECT count(*) FROM link l JOIN engram e ON e.id=l.engram_id \
+              WHERE l.domain_id=d.id AND e.actor = ''), \
+             (SELECT count(*) FROM link l JOIN engram e ON e.id=l.engram_id \
+              WHERE l.domain_id=d.id AND l.to_id IS NULL AND e.actor = ''), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
              d.last_registered, d.rebuild_started \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
@@ -2241,7 +2247,9 @@ impl Store for PostgresStore {
              JOIN domain d ON d.id=e.domain_id \
              WHERE e.actor = '' AND d.name=$1 GROUP BY t.id"
         } else {
-            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id GROUP BY t.id"
+            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+             JOIN engram e ON e.id=et.engram_id \
+             WHERE e.actor = '' GROUP BY t.id"
         };
         let obs_tag_sql = if domain.is_some() {
             "SELECT t.name, COUNT(*) FROM observation_tag ot \
@@ -2251,7 +2259,10 @@ impl Store for PostgresStore {
              JOIN domain d ON d.id=e.domain_id \
              WHERE e.actor = '' AND d.name=$1 GROUP BY t.id"
         } else {
-            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id GROUP BY t.id"
+            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
+             JOIN observation o ON o.id=ot.observation_id \
+             JOIN engram e ON e.id=o.engram_id \
+             WHERE e.actor = '' GROUP BY t.id"
         };
         let category_sql = if domain.is_some() {
             "SELECT o.category, COUNT(*) FROM observation o \
@@ -2259,14 +2270,19 @@ impl Store for PostgresStore {
              JOIN domain d ON d.id=e.domain_id \
              WHERE e.actor = '' AND o.category <> '' AND d.name=$1 GROUP BY o.category"
         } else {
-            "SELECT o.category, COUNT(*) FROM observation o WHERE o.category <> '' GROUP BY o.category"
+            "SELECT o.category, COUNT(*) FROM observation o \
+             JOIN engram e ON e.id=o.engram_id \
+             WHERE o.category <> '' AND e.actor = '' GROUP BY o.category"
         };
         let rel_sql = if domain.is_some() {
             "SELECT r.rel_type, COUNT(*) FROM relation r \
              JOIN domain d ON d.id=r.domain_id \
-             WHERE d.name=$1 GROUP BY r.rel_type"
+             JOIN engram e ON e.id=r.engram_id \
+             WHERE d.name=$1 AND e.actor = '' GROUP BY r.rel_type"
         } else {
-            "SELECT r.rel_type, COUNT(*) FROM relation r GROUP BY r.rel_type"
+            "SELECT r.rel_type, COUNT(*) FROM relation r \
+             JOIN engram e ON e.id=r.engram_id \
+             WHERE e.actor = '' GROUP BY r.rel_type"
         };
         // The engram `type` and `status` columns, counted as stored: no folding
         // of `stable` and `current` and no retirement filter, because this

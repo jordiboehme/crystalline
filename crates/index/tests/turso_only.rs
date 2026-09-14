@@ -214,7 +214,8 @@ fn a_body_projection_never_reaches_an_unbounded_sorter() {
 /// The folder derivation must stay index-only.
 ///
 /// The claim on `Store::browse_level` - that no body is read to learn a folder
-/// exists - is true exactly while `idx_engram_path` covers this query. If a
+/// exists - is true exactly while `idx_engram_path_actor` covers this query on
+/// its `(domain_id, path)` prefix. If a
 /// later edit widens the projection or the filter past the index, the cheapest
 /// of the three tree queries quietly becomes a table read per browse, and the
 /// tree's whole reason for existing goes with it.
