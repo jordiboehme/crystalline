@@ -1040,3 +1040,114 @@ describe("the sidebar's own width", () => {
     expect(localStorage.getItem("fluid.nav")).toBe("expanded");
   });
 });
+
+/**
+ * The other half of the frame's shape: how wide what you came to read is
+ * allowed to be. The sidebar folding is a choice about the column beside the
+ * content; this is a choice about the content itself, and it is remembered the
+ * same way, for the same reason.
+ */
+describe("the content's own width", () => {
+  it("takes the whole window and remembers it", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const widen = await screen.findByRole("button", { name: "Use full width" });
+    // In the frame's own top bar rather than on the screen inside it: this is
+    // a choice about every screen, and it is drawn where the theme control is.
+    expect(widen.closest("header")).not.toBeNull();
+    expect(widen.closest("main")).toBeNull();
+    // The name says which way it will switch rather than which way it is, so
+    // a reader who hears it knows what pressing it does.
+    expect(await screen.findByRole("main")).not.toHaveAttribute("data-width");
+
+    await user.click(widen);
+
+    // One attribute on the frame is the whole of what the stylesheet reads:
+    // the measure is lifted under it, everywhere, with no screen saying so.
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+    expect(
+      screen.getByRole("button", { name: "Use reading width" }),
+    ).toBeVisible();
+    expect(localStorage.getItem("fluid.layout.width")).toBe("full");
+  });
+
+  it("reads a stored full width at mount", async () => {
+    localStorage.setItem("fluid.layout.width", "full");
+    serveSignedIn();
+
+    renderApp("/");
+
+    expect(
+      await screen.findByRole("button", { name: "Use reading width" }),
+    ).toBeVisible();
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+  });
+
+  it("goes back to the measure, and remembers that too", async () => {
+    localStorage.setItem("fluid.layout.width", "full");
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Use reading width" }),
+    );
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+    expect(localStorage.getItem("fluid.layout.width")).toBe("reading");
+  });
+
+  it("answers the bare backslash from anywhere", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByRole("main");
+    await user.keyboard("\\");
+
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+
+    await user.keyboard("\\");
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("leaves the backslash alone while somebody is writing one", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const search = await screen.findByRole("searchbox", { name: "Search" });
+    await user.click(search);
+    await user.keyboard("\\");
+
+    // The character lands in the field it was typed into and nothing else
+    // happens: a bare key is only a shortcut where no field has the focus.
+    expect(search).toHaveValue("\\");
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("is on the palette and in the shortcut map", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByRole("main");
+    await user.keyboard("{Meta>}k{/Meta}");
+
+    await user.click(
+      await screen.findByRole("option", { name: /toggle full width/i }),
+    );
+
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+
+    // And written down where a reader goes looking for the key itself.
+    await user.keyboard("?");
+    const help = await screen.findByRole("dialog", {
+      name: /keyboard shortcuts/i,
+    });
+    expect(help).toHaveTextContent(/full width/i);
+  });
+});

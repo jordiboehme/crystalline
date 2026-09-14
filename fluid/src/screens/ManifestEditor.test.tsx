@@ -135,6 +135,24 @@ beforeEach(() => {
 });
 
 describe("the MANIFEST editor", () => {
+  it("keeps the findings under the buffer at full width", async () => {
+    // The one thing this screen's column held, and it is never what goes: the
+    // notice above the buffer names the findings, and jumping to the line a
+    // finding is about is offered nowhere else on the screen.
+    localStorage.setItem("fluid.layout.width", "full");
+    serveEditor();
+
+    renderApp("/d/eng/manifest/edit");
+    await screen.findByLabelText("MANIFEST source");
+
+    // The mode is on: one column, at every viewport.
+    const main = await screen.findByRole("main");
+    expect(main.querySelector('[class*="lg:grid-cols-"]')).toBeNull();
+    expect(
+      await screen.findByRole("region", { name: "Validation findings" }),
+    ).toBeVisible();
+  });
+
   it("loads the exact file text and saves it back with the If-Match token", async () => {
     const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
     serveEditor(savingManifest(put));

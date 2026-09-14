@@ -833,3 +833,80 @@ describe("the engram page", () => {
     ).toBeVisible();
   });
 });
+
+/**
+ * The same screen with the frame's full width turned on.
+ *
+ * What the details column holds is metadata, and a reader who asked for the
+ * whole window asked for the prose instead of it. Two things in there are not
+ * metadata though - the crystalline address, which nothing else on this screen
+ * copies, and the files the engram carries, which a writer removes from that
+ * list and nowhere else - so those two come with, and that is what is pinned
+ * here beside the column's absence.
+ */
+describe("the engram page at full width", () => {
+  /** The body, plus a file, so the attachments list has something to draw. */
+  const WITH_FILE = BODY.replace(
+    "Body prose",
+    "The [deck](assets/deck.pdf) says more. Body prose",
+  );
+
+  function serveWithFile() {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ content: WITH_FILE }),
+      "/domains/eng/attachments": () => ({
+        attachments: [
+          {
+            path: "assets/deck.pdf",
+            mime: "application/pdf",
+            size: 2048,
+            modified: "2026-08-18T10:00:00Z",
+            sha256: "abc",
+          },
+        ],
+      }),
+    });
+  }
+
+  it("drops the column and keeps what only the column carried", async () => {
+    localStorage.setItem("fluid.layout.width", "full");
+    serveWithFile();
+
+    renderApp("/d/eng/e/alpha");
+    const main = await screen.findByRole("main");
+    await screen.findByRole("heading", { name: "Alpha" });
+
+    expect(screen.queryByRole("region", { name: "Details" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Backlinks" })).toBeNull();
+    // One column at every width, so the body has the whole of it.
+    expect(main.querySelector('[class*="lg:grid-cols-"]')).toBeNull();
+
+    // The address control moves into the header strip beside the other
+    // utilities rather than disappearing with the panel that held it: "Share
+    // link" beside it copies the browser's URL, which is a different string.
+    const copy = screen.getByRole("button", { name: "Copy address" });
+    expect(copy.closest("header")).not.toBeNull();
+    // And the files the engram carries stand under the body, where the graph
+    // and the agent's eye already stand.
+    expect(
+      await screen.findByRole("region", { name: "Attachments" }),
+    ).toBeVisible();
+  });
+
+  it("keeps the column at the reading measure", async () => {
+    serveWithFile();
+
+    renderApp("/d/eng/e/alpha");
+    const main = await screen.findByRole("main");
+
+    expect(
+      await screen.findByRole("region", { name: "Backlinks" }),
+    ).toBeVisible();
+    expect(main.querySelector('[class*="lg:grid-cols-"]')).not.toBeNull();
+    // Exactly one of it either way: the panel's copy is the only copy here.
+    expect(
+      screen.getAllByRole("button", { name: "Copy address" }),
+    ).toHaveLength(1);
+  });
+});

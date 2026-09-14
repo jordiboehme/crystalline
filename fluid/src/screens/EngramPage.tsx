@@ -56,9 +56,10 @@ import { useAuth } from "../auth/AuthContext";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { AgentsEye } from "../components/AgentsEye";
+import { AttachmentsSection } from "../components/AttachmentsSection";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
-import { DetailsPanel } from "../components/DetailsPanel";
+import { CopyAddress, DetailsPanel } from "../components/DetailsPanel";
 import { EngramActions } from "../components/EngramActions";
 import type { EngramActionHandlers } from "../components/EngramActions";
 import { LifecycleBanner } from "../components/LifecycleBanner";
@@ -71,6 +72,7 @@ import { BUTTON, IconButton } from "../components/primitives";
 import { RetireDialog } from "../components/RetireDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
+import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import { prefetchEngramEditor } from "../prefetch";
 import type { WikilinkResolver } from "../wikilinks";
@@ -85,6 +87,7 @@ export default function EngramPage() {
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
   const { capabilities } = useAuth();
+  const { fullWidth } = useFullWidth();
   const navigate = useNavigate();
   const [retiring, setRetiring] = useState(false);
   const [moving, setMoving] = useState(false);
@@ -245,6 +248,14 @@ export default function EngramPage() {
             ref; it draws nothing here but the region that announces a copy.
           */}
           <div className="flex flex-wrap items-center gap-2 print:hidden">
+            {/*
+              At full width there is no details column to hold it, and this
+              is the only control on the screen that copies the engram's
+              `crystalline://` name - "Share link" beside it copies the
+              browser's URL, which is a different string for a different
+              purpose. So it stands here instead of going with the column.
+            */}
+            {fullWidth && <CopyAddress address={engram.url} />}
             <IconButton
               label="Share link"
               icon={Link2}
@@ -344,8 +355,18 @@ export default function EngramPage() {
         The body leads and the panels follow it: one column on a narrow screen,
         with the panels under what they describe, and a column beside it once
         there is room for one.
+
+        Unless the reader asked for the whole window, which is what full width
+        is: the column is metadata about the engram, and somebody who asked for
+        the prose asked for it instead of that. What the column held that is
+        not metadata comes with it - the address control into the header above,
+        the files into this column under the body.
       */}
-      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
+      <div
+        className={`grid gap-8 ${
+          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18rem]"
+        }`}
+      >
         <div className="flex min-w-0 flex-col gap-8">
           <article aria-labelledby="engram-title">
             {/*
@@ -362,6 +383,21 @@ export default function EngramPage() {
               domain={engram.domain}
             />
           </article>
+          {/*
+            The files this engram carries, which the details panel lists at
+            the reading measure. They are not metadata - they are things a
+            reader opens, and the only place a writer removes one - so at full
+            width they stand under the body with the graph and the eye.
+          */}
+          {fullWidth && (
+            <div className="print:hidden">
+              <AttachmentsSection
+                domain={engram.domain}
+                body={engram.content}
+                canDelete={capabilities.canWrite}
+              />
+            </div>
+          )}
           <div className="print:hidden">
             <GraphSection domain={engram.domain} permalink={engram.permalink} />
           </div>
@@ -373,22 +409,24 @@ export default function EngramPage() {
             />
           </div>
         </div>
-        <aside className="flex flex-col gap-6 print:hidden">
-          <DetailsPanel
-            frontmatter={engram.frontmatter}
-            address={engram.url}
-            domain={engram.domain}
-            // The body decides which of the domain's files this engram
-            // carries: the panel lists what the prose actually references.
-            body={engram.content}
-            canDelete={capabilities.canWrite}
-          />
-          <BacklinksPanel
-            domain={engram.domain}
-            permalink={engram.permalink}
-            inboundCount={engram.inboundCount}
-          />
-        </aside>
+        {!fullWidth && (
+          <aside className="flex flex-col gap-6 print:hidden">
+            <DetailsPanel
+              frontmatter={engram.frontmatter}
+              address={engram.url}
+              domain={engram.domain}
+              // The body decides which of the domain's files this engram
+              // carries: the panel lists what the prose actually references.
+              body={engram.content}
+              canDelete={capabilities.canWrite}
+            />
+            <BacklinksPanel
+              domain={engram.domain}
+              permalink={engram.permalink}
+              inboundCount={engram.inboundCount}
+            />
+          </aside>
+        )}
       </div>
       {retiring && (
         <RetireDialog

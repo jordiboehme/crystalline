@@ -16,6 +16,7 @@ import type { HelpOverlayProps } from "./HelpOverlay";
 const SHORTCUTS: { keys: string; does: string }[] = [
   { keys: "Cmd/Ctrl K", does: "Command palette" },
   { keys: "?", does: "This help" },
+  { keys: "\\", does: "Full width for the content" },
   { keys: "Cmd/Ctrl S", does: "Save (in the editor)" },
   { keys: "Cmd/Ctrl F", does: "Find in the document (in the editor)" },
   { keys: "Cmd/Ctrl B", does: "Bold (in the editor)" },

@@ -202,6 +202,24 @@
   .measured > :not(.breakout) {
     max-width: 70ch;
   }
+
+  /*
+   * Unless the frame says the content has the whole width. Here rather than
+   * on any screen: the measure is one rule about every rendered document in
+   * the app, and a screen that had to lift its own would be a screen that can
+   * forget to. The frame sets the attribute on `main`; everything under it
+   * follows, including the editor's preview.
+   *
+   * On screens only. The print sheet below widens `main` and leaves the
+   * measure on the document's own children, which is the typography of the
+   * printed page; letting a preference nobody can see on paper decide it
+   * would mean two prints of one engram coming out at two measures.
+   */
+  @media screen {
+    main[data-width="full"] .measured > :not(.breakout) {
+      max-width: none;
+    }
+  }
 }
 
 @media print {

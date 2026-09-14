@@ -155,13 +155,19 @@ function Row({
 /**
  * Hand the engram's address to the clipboard.
  *
+ * Exported because this panel is not the only place it is drawn: at full width
+ * the page has no details column and the control moves into the article's own
+ * header, where "Share link" beside it copies the browser's URL rather than
+ * the `crystalline://` name. One component rather than two, so the name a
+ * reader hears cannot drift between the two places it is heard.
+ *
  * The outcome is announced in a live region beside the button rather than
  * written into the button's own label. A control that renames itself is a
  * control a reader navigating by name loses track of, and a label that changes
  * silently is no announcement at all: the region is in the document from the
  * start and empty, so the text arriving in it is what gets read out.
  */
-function CopyAddress({ address }: { address: string }) {
+export function CopyAddress({ address }: { address: string }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
 
   useEffect(() => {

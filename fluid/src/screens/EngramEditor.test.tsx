@@ -615,6 +615,30 @@ describe("the engram editor", () => {
     expect(putBody(0)).toEqual({ content: linked });
   });
 
+  it("keeps the findings under the buffer at full width, form and all", async () => {
+    // The frame's own preference, read by the screen through the context the
+    // frame provides. The column beside the buffer goes, and what goes with
+    // it is decided by where else a reader could get at the same thing: every
+    // field the form writes is a line of the frontmatter block in the text
+    // right there, and the findings are named by the notice above the buffer
+    // and are the only way to jump to the line one is about.
+    localStorage.setItem("fluid.layout.width", "full");
+    serveEditor();
+
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+
+    // The mode is on: one column, at every viewport.
+    const main = await screen.findByRole("main");
+    expect(main.querySelector('[class*="lg:grid-cols-"]')).toBeNull();
+    expect(
+      await screen.findByRole("region", { name: "Validation findings" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("region", { name: "Frontmatter form" }),
+    ).toBeNull();
+  });
+
   it("assists the frontmatter beside the buffer, writing single lines into it", async () => {
     serveEditor({
       "/domains/eng/engrams/alpha": (_path, init) =>

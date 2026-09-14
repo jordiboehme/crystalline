@@ -52,6 +52,7 @@ import {
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { fenceMono } from "../editor/fenceMono";
 import { fencePreviews } from "../editor/fencePreviews";
+import { useFullWidth } from "../layoutWidth";
 import { imagePreviews } from "../editor/imagePreviews";
 import { imageContextListener } from "../editor/imageVerbs";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
@@ -479,6 +480,7 @@ function Surface({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { resolved } = useTheme();
+  const { fullWidth } = useFullWidth();
   const { ytext, awareness } = collab;
   /**
    * The session this buffer belongs to, or null on the solo surface. Fixed
@@ -926,6 +928,24 @@ function Surface({
     ],
   );
 
+  // Written once and drawn in whichever place the width puts it: beside the
+  // buffer at the reading measure, under it at full width. The same element
+  // either way, so the two placements cannot drift apart in what they hand
+  // the panel.
+  const findings = (
+    <FindingsPanel
+      report={session.report}
+      pending={session.checking}
+      unavailable={session.validationUnavailable}
+      onJump={(line) => {
+        const view = session.viewRef.current;
+        if (view) {
+          jumpToLine(view, line);
+        }
+      }}
+    />
+  );
+
   return (
     <div className="flex flex-col gap-4">
       <header className="flex flex-col gap-2">
@@ -1227,8 +1247,20 @@ function Surface({
         where a reader already expects it. The form is a view over the buffer
         rather than a second place a value lives: it reads `buffer` and writes
         back through ordinary transactions on the view.
+
+        That is also what makes the column safe to drop at full width: every
+        field the form writes is a line of the frontmatter block in the text
+        right there, and a hand edit to it lands on the form a render later.
+        The findings are a different matter and stay - the notice above names
+        them, and jumping to the line a finding is about is offered nowhere
+        else - so at full width they run under the buffer instead of beside
+        it.
       */}
-      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
+      <div
+        className={`grid gap-8 ${
+          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18rem]"
+        }`}
+      >
         <div className="rounded border border-slate-200 dark:border-slate-800">
           {/*
             The format bar sits inside the card, above the text it edits, and
@@ -1254,24 +1286,18 @@ function Surface({
             onDocChanged={session.setBuffer}
           />
         </div>
-        <aside className="flex flex-col gap-4">
-          <FrontmatterForm
-            doc={session.buffer}
-            view={view}
-            vocabulary={vocabulary.data ?? null}
-          />
-          <FindingsPanel
-            report={session.report}
-            pending={session.checking}
-            unavailable={session.validationUnavailable}
-            onJump={(line) => {
-              const view = session.viewRef.current;
-              if (view) {
-                jumpToLine(view, line);
-              }
-            }}
-          />
-        </aside>
+        {fullWidth ? (
+          findings
+        ) : (
+          <aside className="flex flex-col gap-4">
+            <FrontmatterForm
+              doc={session.buffer}
+              view={view}
+              vocabulary={vocabulary.data ?? null}
+            />
+            {findings}
+          </aside>
+        )}
       </div>
       {conflict !== null && resolving === conflict && (
         <CollabConflictDialog
