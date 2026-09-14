@@ -2340,7 +2340,16 @@ impl Engine {
         let state_dir = self.journal_state_dir()?;
         let record = EngramRecord {
             path: desc.path.clone(),
-            permalink: desc.permalink.clone(),
+            // The path, not the base row's permalink, and this is forced
+            // rather than chosen: the index holds one permalink per actor per
+            // domain (`idx_engram_permalink_actor`), and a move writes a
+            // tombstone at the source and an entry at the destination, both
+            // inheriting the one permalink the base row carries. A tombstone
+            // is not an engram and answers to no address - every reader finds
+            // it by path and skips it - so the column holds the row's own
+            // identity in this actor's dimension instead. The journal restore
+            // rebuilds a tombstone the same way, so the two shapes stay one.
+            permalink: desc.path.clone(),
             title: desc.title.clone(),
             engram_type: desc.engram_type.clone(),
             status: desc.status.clone(),
@@ -3410,10 +3419,11 @@ impl Engine {
     ///
     /// `scope` is the acting scope every write verb carries; see
     /// [`Engine::write_engram_as`].
-    pub async fn save_engram(&self, p: &SaveParams, _scope: &crate::scope::Scope) -> Result<Value> {
+    pub async fn save_engram(&self, p: &SaveParams, scope: &crate::scope::Scope) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let overlay = self.overlay_for_write(&p.domain, scope)?;
         // A document that is not an engram would poison the index on reindex,
         // so it is refused before anything is written. This is the one hard
         // gate, and it is deliberately narrow: the text must parse (clean
@@ -3437,7 +3447,9 @@ impl Engine {
                     .into(),
             ));
         }
-        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
+        let (desc, source) = self
+            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
+            .await?;
         // A reserved name never resolves to an engram today (sync skips both),
         // so this is defence in depth rather than a reachable branch: the
         // generated `index.md` is derived from its folder and would be
@@ -3453,6 +3465,61 @@ impl Engine {
         // not become a way to write into the attachment folder.
         if is_assets_reserved(&desc.path) {
             return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
+        }
+
+        // The third place a save can land. The whole document goes into this
+        // actor's draft verbatim, checked against the version they read - which
+        // in review mode is their own draft where they hold one, so a second
+        // save does not conflict against the first.
+        if let Some(who) = &overlay {
+            // Written directly rather than through `apply_source_edit`, and
+            // that is the save's own contract rather than an omission: the
+            // shared edit path stamps `generated`, and a save of what was read
+            // has to land byte-identical. The compare and the write are held
+            // apart from a concurrent save of the same draft by the same lock
+            // the edit path takes, keyed on the draft's own mirror path.
+            let state_dir = self.journal_state_dir()?;
+            let mirror = state_dir
+                .join("overlays")
+                .join(&desc.domain)
+                .join(who)
+                .join(&desc.path);
+            let lock = self.write_lock(&mirror);
+            let _guard = lock.lock().await;
+            let current = self
+                .overlay_visible_text(&source, &desc, who)
+                .await?
+                .ok_or_else(|| {
+                    EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        p.identifier, desc.domain
+                    ))
+                })?;
+            let found = sha256_hex(current.as_bytes());
+            if found != p.expected_checksum {
+                return Err(EngineError::Conflict(stale_edit_message(
+                    &p.expected_checksum,
+                    &found,
+                )));
+            }
+            self.write_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path, &p.content)
+                .await?;
+            // Where the draft now answers, derived exactly as the row's own
+            // permalink is: an author who edited the frontmatter's permalink
+            // line has just moved the address, and the receipt has to say so.
+            let permalink = parse_engram(&p.content)
+                .map(|engram| {
+                    EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&p.content))
+                        .permalink
+                })
+                .unwrap_or_else(|_| desc.permalink.clone());
+            return Ok(json!({
+                "domain": desc.domain,
+                "permalink": permalink,
+                "path": desc.path,
+                "checksum": sha256_hex(p.content.as_bytes()),
+                "draft": true,
+            }));
         }
 
         match &source {
@@ -3570,11 +3637,12 @@ impl Engine {
         domain: &str,
         path: &str,
         content: &str,
-        _scope: &crate::scope::Scope,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let overlay = self.overlay_for_write(domain, scope)?;
         let parsed =
             parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
@@ -3600,6 +3668,25 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(path)));
         }
         let (domain_id, source) = self.domain_source(domain).await?;
+        // The third place a restore can land: in review mode the recovered
+        // document is this actor's draft of the path, never a file written
+        // back into what the team reviewed.
+        if let Some(who) = &overlay {
+            self.write_overlay_entry(domain, domain_id, who, path, content)
+                .await?;
+            let permalink = parse_engram(content)
+                .map(|engram| {
+                    EngramRecord::from_engram(&engram, path, virtual_stamp(content)).permalink
+                })
+                .unwrap_or_else(|_| path.trim_end_matches(".md").to_string());
+            return Ok(json!({
+                "domain": domain,
+                "permalink": permalink,
+                "path": path,
+                "checksum": sha256_hex(content.as_bytes()),
+                "draft": true,
+            }));
+        }
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, path);
@@ -4306,7 +4393,7 @@ impl Engine {
         &self,
         p: &RetireParams,
         client: Option<&str>,
-        _scope: &crate::scope::Scope,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -4345,13 +4432,21 @@ impl Engine {
             })
             .transpose()?;
 
-        let actor = self.actor(client);
-        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
+        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let actor = self.actor_for(client, overlay.as_ref());
+        let (desc, source) = self
+            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
+            .await?;
 
         // Resolved before the target is touched: a missing successor must
-        // never leave the target half-retired.
+        // never leave the target half-retired. Through the same view, so a
+        // retirement in review mode can name a successor that only exists as
+        // this actor's draft.
         let successor = match &p.successor {
-            Some(identifier) => Some(self.resolve_in(identifier, &p.domain).await?),
+            Some(identifier) => Some(
+                self.resolve_in_for(identifier, &p.domain, overlay.as_deref())
+                    .await?,
+            ),
             None => None,
         };
         // A successor that resolves to the target itself would append a
@@ -4381,73 +4476,95 @@ impl Engine {
         let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
 
         // -- target: status, optional valid_to, optional superseded_by line --
-        match &source {
-            ContentSource::File { root } => {
-                let abs = join_rel(root, &desc.path);
-                // Held across the read, the retirement edit and the write, for
-                // the reason `edit_engram_as` gives: this is a read-modify-write
-                // with nothing to refuse a concurrent change on, so serializing
-                // is what stops one from being dropped. See `Engine::write_lock`.
-                let lock = self.write_lock(&abs);
-                let _guard = lock.lock().await;
-                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                    path: abs.display().to_string(),
-                    source,
-                })?;
-                let edited = Self::build_retirement_edit(
-                    &current,
-                    &p.status,
-                    valid_to,
-                    successor_permalink.as_deref(),
-                    successor_title.as_deref(),
-                    &actor,
-                );
-                let edited = Self::enforce_temporal(edited)?;
-                write_file(&abs, &edited)?;
-                let store = self.store.lock().await;
-                self.reindex_file(&*store, desc.domain_id, root, &desc.path)
-                    .await?;
-            }
-            ContentSource::Virtual => {
-                let current = {
-                    let store = self.store.lock().await;
-                    store
-                        .engram_content(desc.domain_id, &desc.path)
-                        .await?
-                        .ok_or_else(|| {
-                            EngineError::NotFound(format!(
-                                "no content stored for '{}' in domain '{}'",
-                                desc.permalink, desc.domain
-                            ))
-                        })?
-                };
-                let edited = Self::build_retirement_edit(
-                    &current,
-                    &p.status,
-                    valid_to,
-                    successor_permalink.as_deref(),
-                    successor_title.as_deref(),
-                    &actor,
-                );
-                let edited = Self::enforce_temporal(edited)?;
-                let stamp = virtual_stamp(&edited);
-                let store = self.store.lock().await;
-                self.index_markdown(
-                    &*store,
-                    desc.domain_id,
-                    &desc.path,
-                    &edited,
-                    stamp,
-                    None,
-                    true,
-                )
+        //
+        // In review mode both arms below are replaced by the shared edit path's
+        // overlay arm, which reads this actor's own text, applies the very same
+        // retirement edit and writes it back into their draft. Going through
+        // that one arm rather than a third copy here is what keeps a retired
+        // draft the same shape as an edited one.
+        let retire_target = |current: &str| -> Result<String> {
+            Ok(Self::build_retirement_edit(
+                current,
+                &p.status,
+                valid_to,
+                successor_permalink.as_deref(),
+                successor_title.as_deref(),
+                &actor,
+            ))
+        };
+        if let Some(who) = &overlay {
+            self.apply_source_edit(&desc, &source, Some(who), None, &actor, retire_target)
                 .await?;
+        } else {
+            match &source {
+                ContentSource::File { root } => {
+                    let abs = join_rel(root, &desc.path);
+                    // Held across the read, the retirement edit and the write, for
+                    // the reason `edit_engram_as` gives: this is a read-modify-write
+                    // with nothing to refuse a concurrent change on, so serializing
+                    // is what stops one from being dropped. See `Engine::write_lock`.
+                    let lock = self.write_lock(&abs);
+                    let _guard = lock.lock().await;
+                    let current =
+                        std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        })?;
+                    let edited = Self::build_retirement_edit(
+                        &current,
+                        &p.status,
+                        valid_to,
+                        successor_permalink.as_deref(),
+                        successor_title.as_deref(),
+                        &actor,
+                    );
+                    let edited = Self::enforce_temporal(edited)?;
+                    write_file(&abs, &edited)?;
+                    let store = self.store.lock().await;
+                    self.reindex_file(&*store, desc.domain_id, root, &desc.path)
+                        .await?;
+                }
+                ContentSource::Virtual => {
+                    let current = {
+                        let store = self.store.lock().await;
+                        store
+                            .engram_content(desc.domain_id, &desc.path)
+                            .await?
+                            .ok_or_else(|| {
+                                EngineError::NotFound(format!(
+                                    "no content stored for '{}' in domain '{}'",
+                                    desc.permalink, desc.domain
+                                ))
+                            })?
+                    };
+                    let edited = Self::build_retirement_edit(
+                        &current,
+                        &p.status,
+                        valid_to,
+                        successor_permalink.as_deref(),
+                        successor_title.as_deref(),
+                        &actor,
+                    );
+                    let edited = Self::enforce_temporal(edited)?;
+                    let stamp = virtual_stamp(&edited);
+                    let store = self.store.lock().await;
+                    self.index_markdown(
+                        &*store,
+                        desc.domain_id,
+                        &desc.path,
+                        &edited,
+                        stamp,
+                        None,
+                        true,
+                    )
+                    .await?;
+                }
             }
+            if matches!(source, ContentSource::Virtual) {
+                self.refresh_routing_cache().await;
+            }
+            self.refresh_index_files(&desc.domain).await;
         }
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
-        self.refresh_index_files(&desc.domain).await;
 
         // -- successor: reciprocal supersedes line, appended once --
         if let Some((succ_desc, succ_source)) = &successor {
@@ -4457,73 +4574,104 @@ impl Engine {
             let already = |current: &str| {
                 Self::declares(current, "supersedes", &desc.permalink, Some(&desc.title))
             };
-            match succ_source {
-                ContentSource::File { root } => {
-                    let abs = join_rel(root, &succ_desc.path);
-                    // The successor's own file, under its own lock: appending
-                    // the reciprocal line is another read-modify-write. Taken
-                    // after the target's has been released, never with it, so
-                    // two retirements naming each other cannot deadlock.
-                    let lock = self.write_lock(&abs);
-                    let _guard = lock.lock().await;
-                    let current =
-                        std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        })?;
-                    if !already(&current) {
-                        let edited =
-                            touch_generated(&append_body(&current, &line), &actor, now_offset());
-                        write_file(&abs, &edited)?;
-                        let store = self.store.lock().await;
-                        self.reindex_file(&*store, succ_desc.domain_id, root, &succ_desc.path)
+            // The successor's side of the pair joins the same actor's draft,
+            // for the same reason the target's did: in review mode nothing this
+            // verb writes belongs in the folder the team reviewed.
+            if let Some(who) = &overlay {
+                let current = self
+                    .overlay_visible_text(succ_source, succ_desc, who)
+                    .await?
+                    .ok_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "no engram '{}' in domain '{}'",
+                            succ_desc.permalink, succ_desc.domain
+                        ))
+                    })?;
+                if !already(&current) {
+                    self.apply_source_edit(succ_desc, succ_source, Some(who), None, &actor, |c| {
+                        Ok(append_body(c, &line))
+                    })
+                    .await?;
+                }
+            } else {
+                match succ_source {
+                    ContentSource::File { root } => {
+                        let abs = join_rel(root, &succ_desc.path);
+                        // The successor's own file, under its own lock: appending
+                        // the reciprocal line is another read-modify-write. Taken
+                        // after the target's has been released, never with it, so
+                        // two retirements naming each other cannot deadlock.
+                        let lock = self.write_lock(&abs);
+                        let _guard = lock.lock().await;
+                        let current =
+                            std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                                path: abs.display().to_string(),
+                                source,
+                            })?;
+                        if !already(&current) {
+                            let edited = touch_generated(
+                                &append_body(&current, &line),
+                                &actor,
+                                now_offset(),
+                            );
+                            write_file(&abs, &edited)?;
+                            let store = self.store.lock().await;
+                            self.reindex_file(&*store, succ_desc.domain_id, root, &succ_desc.path)
+                                .await?;
+                        }
+                    }
+                    ContentSource::Virtual => {
+                        let current = {
+                            let store = self.store.lock().await;
+                            store
+                                .engram_content(succ_desc.domain_id, &succ_desc.path)
+                                .await?
+                                .ok_or_else(|| {
+                                    EngineError::NotFound(format!(
+                                        "no content stored for '{}' in domain '{}'",
+                                        succ_desc.permalink, succ_desc.domain
+                                    ))
+                                })?
+                        };
+                        if !already(&current) {
+                            let edited = touch_generated(
+                                &append_body(&current, &line),
+                                &actor,
+                                now_offset(),
+                            );
+                            let stamp = virtual_stamp(&edited);
+                            let store = self.store.lock().await;
+                            self.index_markdown(
+                                &*store,
+                                succ_desc.domain_id,
+                                &succ_desc.path,
+                                &edited,
+                                stamp,
+                                None,
+                                true,
+                            )
                             .await?;
+                        }
                     }
                 }
-                ContentSource::Virtual => {
-                    let current = {
-                        let store = self.store.lock().await;
-                        store
-                            .engram_content(succ_desc.domain_id, &succ_desc.path)
-                            .await?
-                            .ok_or_else(|| {
-                                EngineError::NotFound(format!(
-                                    "no content stored for '{}' in domain '{}'",
-                                    succ_desc.permalink, succ_desc.domain
-                                ))
-                            })?
-                    };
-                    if !already(&current) {
-                        let edited =
-                            touch_generated(&append_body(&current, &line), &actor, now_offset());
-                        let stamp = virtual_stamp(&edited);
-                        let store = self.store.lock().await;
-                        self.index_markdown(
-                            &*store,
-                            succ_desc.domain_id,
-                            &succ_desc.path,
-                            &edited,
-                            stamp,
-                            None,
-                            true,
-                        )
-                        .await?;
-                    }
+                if matches!(succ_source, ContentSource::Virtual) {
+                    self.refresh_routing_cache().await;
                 }
+                self.refresh_index_files(&succ_desc.domain).await;
             }
-            if matches!(succ_source, ContentSource::Virtual) {
-                self.refresh_routing_cache().await;
-            }
-            self.refresh_index_files(&succ_desc.domain).await;
         }
         self.nudge_embed();
 
-        Ok(json!({
+        let mut receipt = json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
             "status": p.status,
             "successor": successor.map(|(d, _)| d.permalink),
-        }))
+        });
+        if overlay.is_some() {
+            receipt["draft"] = json!(true);
+        }
+        Ok(receipt)
     }
 
     /// Build the target engram's retirement edit: set `status`, set
@@ -5757,6 +5905,120 @@ impl Engine {
 
     // --- move ----------------------------------------------------------------
 
+    /// A move inside one actor's draft overlay: a tombstone at the source and
+    /// an entry at the destination.
+    ///
+    /// The shape a rename in review mode has to take, and the shape a later
+    /// convergence pass has to recognize: the reviewed file stays exactly where
+    /// the team put it, and this actor's view of the domain has the engram at
+    /// its new address until the move is reviewed.
+    ///
+    /// A cross-domain move is refused rather than half-performed. A draft
+    /// belongs to the domain it is drafted in - it has no row, no file and no
+    /// reviewer anywhere else - so carrying one across would either write into
+    /// a domain that never reviewed it or leave the engram in two places at
+    /// once, and the refusal names the order that works instead.
+    async fn move_within_overlay(
+        &self,
+        p: &MoveParams,
+        src: &EngramDescriptor,
+        src_source: &ContentSource,
+        dest_rel: &str,
+        cross: bool,
+        actor: &str,
+    ) -> Result<Value> {
+        if cross {
+            return Err(EngineError::Refused(format!(
+                "'{}' reviews changes before they land, so this engram is a draft, and a draft \
+                 moves only inside the domain it is drafted in - share the change first, then \
+                 move the engram the team has",
+                p.domain
+            )));
+        }
+        if dest_rel == src.path {
+            return Err(EngineError::Invalid(
+                "the destination is where the engram already is".into(),
+            ));
+        }
+        // Free in THIS actor's view, which is the only view the move happens
+        // in: a path another actor is drafting at is not taken for this one,
+        // and a base row at the destination is, since the moved engram would
+        // shadow it rather than land beside it.
+        {
+            let store = self.store.lock().await;
+            let taken = store
+                .overlay_entry(src.domain_id, actor, dest_rel)
+                .await?
+                .map(|entry| !entry.tombstone)
+                .unwrap_or(false)
+                || store
+                    .list_engrams(&p.domain, Some(dest_rel), None)
+                    .await?
+                    .iter()
+                    .any(|found| found.path == dest_rel);
+            if taken {
+                return Err(EngineError::Conflict(format!(
+                    "'{dest_rel}' already holds an engram in domain '{}'",
+                    p.domain
+                )));
+            }
+        }
+        let text = self
+            .overlay_visible_text(src_source, src, actor)
+            .await?
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    p.identifier, p.domain
+                ))
+            })?;
+        // The SOURCE first, and the order is forced rather than preferred: one
+        // actor holds one row per permalink per domain, and until the source is
+        // a tombstone (which answers to no permalink) or gone, the engram's own
+        // permalink is still spoken for and the destination cannot take it. The
+        // cost is that a failure between the two writes leaves this actor
+        // seeing the engram at neither address for the moment; the base row and
+        // the reviewed file are untouched either way, and the mirror says what
+        // happened, so nothing is lost and a retry lands the destination.
+        let base = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(&p.domain, Some(&src.path), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == src.path)
+        };
+        match &base {
+            // A draft of a path no file holds was only ever this actor's, so
+            // the move takes it with them; a tombstone over nothing would
+            // leave a deletion of an engram the team never had.
+            None => {
+                self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
+                    .await?
+            }
+            Some(base) => {
+                let base_text = self.load_content(src_source, base).await?;
+                self.write_overlay_tombstone(&p.domain, actor, base, &base_text)
+                    .await?
+            }
+        }
+        self.write_overlay_entry(&p.domain, src.domain_id, actor, dest_rel, &text)
+            .await?;
+        let dest_permalink = parse_engram(&text)
+            .map(|engram| {
+                EngramRecord::from_engram(&engram, dest_rel, virtual_stamp(&text)).permalink
+            })
+            .unwrap_or_else(|_| src.permalink.clone());
+        Ok(json!({
+            "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
+            "to": { "domain": p.domain, "permalink": dest_permalink, "path": dest_rel },
+            "cross_domain": false,
+            "links_rewritten": 0,
+            "attachment_warnings": Vec::<String>::new(),
+            "draft": true,
+        }))
+    }
+
     /// Move an engram to a new path or domain, rewriting inbound bare links on a
     /// cross-domain move. Source and destination may each be a file or virtual
     /// domain, so a move carries content between the two truths: a same-domain
@@ -5782,7 +6044,10 @@ impl Engine {
         // Resolved once, before anything is written, and used twice below: to
         // look the destination up, and to bound the inbound rewrite.
         let hidden = self.hidden_for(scope).await?;
-        let (src, src_source) = self.resolve_in(&p.identifier, &p.domain).await?;
+        let overlay = self.overlay_for_write(&p.domain, scope)?;
+        let (src, src_source) = self
+            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
+            .await?;
         let dest_domain = p
             .destination_domain
             .clone()
@@ -5813,6 +6078,18 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(&dest_rel)));
         }
         let cross = dest_domain != p.domain;
+
+        // The third place a move can land, and it is two writes rather than
+        // one: a tombstone where the team's file is, so this actor stops
+        // seeing the engram there, and an entry at the destination, so they
+        // see it where they moved it to. The folder itself does not move,
+        // which is the whole of review mode - the rename is reviewed like any
+        // other change.
+        if let Some(who) = &overlay {
+            return self
+                .move_within_overlay(p, &src, &src_source, &dest_rel, cross, who)
+                .await;
+        }
 
         // Destination collision check, on disk or in the database.
         self.ensure_dest_free(&dest_source, &dest_domain, &dest_rel)

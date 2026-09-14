@@ -612,7 +612,15 @@ async fn tombstone_record(
     let stamp = virtual_stamp(&content);
     Ok(Some(EngramRecord {
         path: entry.path.clone(),
-        permalink: base.permalink,
+        // The path rather than the base row's permalink, for the reason
+        // `Engine::write_overlay_tombstone` gives: one actor holds one row per
+        // permalink per domain, and a move leaves that actor holding both a
+        // tombstone at the source and an entry at the destination, which
+        // inherit the same one. A tombstone answers to no address, so the
+        // column carries the row's own identity here. Written the same way by
+        // the verb and by this restore, so a deletion means one thing however
+        // it got into the index.
+        permalink: entry.path.clone(),
         title: base.title,
         engram_type: base.engram_type,
         status: base.status,

@@ -1019,3 +1019,139 @@ async fn a_write_receipt_says_draft_and_still_carries_similar() {
         .unwrap();
     assert_eq!(edited["draft"], serde_json::json!(true), "{edited}");
 }
+
+/// The other four write verbs, in one test, because the failure they share is
+/// the one this whole mode exists to prevent: a verb nobody routed writes
+/// straight through the review the domain asked for, and nothing else in the
+/// wave would notice.
+///
+/// Save, retire and restore each join the actor's draft of the path they name;
+/// a move is a tombstone at the source and an entry at the destination, which
+/// is the shape a rename in review mode has to take - the reviewed file stays
+/// where the team put it, and this actor sees the engram at its new address.
+#[tokio::test]
+async fn every_write_verb_lands_in_the_draft_and_none_of_them_touches_the_tree() {
+    let f = review_fixture().await;
+    let before = f.tree("team");
+    let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+
+    // -- save: the whole document, verbatim, against the checksum alice read --
+    let read = f.engine.read_engram(&read("plan"), &alice).await.unwrap();
+    let saved = f
+        .engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                content: PLAN.replace("as the team has it", "as alice saved it"),
+                expected_checksum: read["checksum"].as_str().unwrap().to_string(),
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved["draft"], serde_json::json!(true), "{saved}");
+    assert!(
+        f.reads("plan", &alice)
+            .await
+            .unwrap()
+            .contains("as alice saved it"),
+        "the save joined alice's draft"
+    );
+
+    // -- retire: the guided status edit, on the draft she now holds --
+    let retired = f
+        .engine
+        .retire_engram_as(
+            &crystalline_service::params::RetireParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                status: "archived".to_string(),
+                successor: None,
+                valid_to: None,
+            },
+            who,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retired["draft"], serde_json::json!(true), "{retired}");
+    assert!(
+        f.reads("plan", &alice)
+            .await
+            .unwrap()
+            .contains("status: archived"),
+        "the retirement joined the same draft"
+    );
+
+    // -- move: a tombstone where the team's file is, an entry where alice
+    //    now looks for it --
+    let moved = f
+        .engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                destination: "archive/plan.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(moved["draft"], serde_json::json!(true), "{moved}");
+    let held = f.held("team", "alice").await;
+    let shape: Vec<(&str, bool)> = held
+        .iter()
+        .map(|(path, _, tomb)| (path.as_str(), *tomb))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("archive/plan.md", false), ("plan.md", true)],
+        "a move is a tombstone at the source and an entry at the destination: {held:?}"
+    );
+    assert!(
+        f.reads("plan", &alice).await.is_err(),
+        "alice no longer sees it where the team's file is"
+    );
+    assert!(
+        f.reads("plan", &account("bob"))
+            .await
+            .unwrap()
+            .contains("as the team has it"),
+        "and bob still does"
+    );
+
+    // -- restore: the room-recovery verb, into the draft rather than the tree --
+    f.engine
+        .restore_engram("team", "recovered.md", ALICE_NEW, &alice)
+        .await
+        .unwrap();
+    assert!(
+        f.reads("fresh", &alice).await.is_ok(),
+        "the restored document is alice's draft"
+    );
+
+    assert_eq!(
+        f.tree("team"),
+        before,
+        "and not one of the four moved a single byte on disk"
+    );
+    // Everything alice holds is mirrored, so a wipe brings all of it back.
+    let mirrored: Vec<(String, Option<bool>)> = overlay_journal::journal_entries(&f.state, "team")
+        .entries
+        .into_iter()
+        .map(|e| (e.path, e.content.map(|_| true)))
+        .collect();
+    assert_eq!(
+        mirrored,
+        vec![
+            ("archive/plan.md".to_string(), Some(true)),
+            ("plan.md".to_string(), None),
+            ("recovered.md".to_string(), Some(true)),
+        ],
+        "every draft and the one deletion are mirrored"
+    );
+}
