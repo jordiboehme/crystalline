@@ -692,6 +692,12 @@ pub struct Engine {
     // real `crystalline_core::config::origin_state_dir`, a real machine path
     // no test may touch.
     origins_dir_override: Option<PathBuf>,
+    // Overrides the state directory the overlay journal is read and written
+    // under, for tests: `None` means the real
+    // `crystalline_core::config::state_dir`, a real machine path no test may
+    // touch - and the journal sweeps are recursive deletes under it, so a test
+    // engine that reaches a removal path must set this.
+    state_dir_override: Option<PathBuf>,
     // The `configure` tool's connect actions: production always resolves a
     // fresh `RealConnectAuth`; tests inject a fake so the pending-connect
     // state machine runs with no real device flow or network access.
@@ -1251,6 +1257,7 @@ impl Engine {
             origin_provider_override: None,
             origin_provider_override_login: None,
             origins_dir_override: None,
+            state_dir_override: None,
             connect_auth: Arc::new(RealConnectAuth),
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
@@ -1779,6 +1786,17 @@ impl Engine {
     /// directory.
     pub fn with_origins_dir(mut self, dir: PathBuf) -> Engine {
         self.origins_dir_override = Some(dir);
+        self
+    }
+
+    /// Override the state directory the overlay journal lives under, in place
+    /// of the real `crystalline_core::config::state_dir`. Test-only, and the
+    /// one override a test cannot do without if it reaches a removal path:
+    /// [`crate::overlay_journal::journal_remove_domain`] removes a folder tree,
+    /// and without this it would remove one under the developer's own state
+    /// directory.
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Engine {
+        self.state_dir_override = Some(dir);
         self
     }
 
@@ -8854,6 +8872,78 @@ impl Engine {
 
     // --- sync / reindex (ctl + CLI) ------------------------------------------
 
+    /// Put every draft the overlay journal mirrors for one domain back into the
+    /// index, answering with how many rows were written.
+    ///
+    /// An overlay entry is primary data that no file on disk describes, so an
+    /// index that lost its rows - a `reindex --wipe`, a database restored from
+    /// an older copy, a fresh index file - cannot rebuild them by walking the
+    /// domain. The journal under the state directory is the copy that can, and
+    /// this is where it is read back. It runs in the sync domain pass, so the
+    /// first sync after a rebuild is what heals the drafts; on every other sync
+    /// it finds every row already there and writes nothing.
+    ///
+    /// **Store rows win.** An actor already holding a row at a path keeps it,
+    /// so a restore only ever fills a gap and a live draft is never overwritten
+    /// by an older mirror of itself.
+    ///
+    /// **Refused for a domain nobody registers**, which is the half that keeps
+    /// the two removal paths honest: both of them sweep the journal, but a
+    /// mirror that outlived its sweep (an interrupted removal, a folder no
+    /// process could delete) must not be able to resurrect drafts for a domain
+    /// that no longer exists. Resolved through
+    /// [`Engine::registered_domain_names`], the same set collection keys on.
+    pub async fn restore_overlays(&self, domain: &str) -> Result<u64> {
+        if !self.registered_domain_names().contains(domain) {
+            return Err(EngineError::UnknownDomain {
+                domain: domain.to_string(),
+                registered: self.known_domain_names(),
+            });
+        }
+        let state_dir = self.journal_state_dir()?;
+        // A domain with nothing mirrored never reaches the store: the sync pass
+        // calls this for every domain on every pass, and resolving a domain id
+        // is a write.
+        if crate::overlay_journal::journal_entries(&state_dir, domain).is_empty() {
+            return Ok(0);
+        }
+        let entry = self.domain_entry(domain)?;
+        let kind = if entry.is_virtual() {
+            DomainKind::Virtual
+        } else {
+            DomainKind::File
+        };
+        let path = entry.file_path();
+        let path_str = path.as_ref().map(|p| p.to_string_lossy());
+        let store = self.store.lock().await;
+        let id = store
+            .upsert_domain(domain, path_str.as_deref(), kind)
+            .await?;
+        let restored =
+            crate::overlay_journal::restore_into(&*store, &state_dir, domain, id).await?;
+        Ok(restored)
+    }
+
+    /// [`Engine::restore_overlays`] as the sync pass runs it: best effort, and
+    /// never a reason to fail the sync it rides on. A draft that could not be
+    /// restored is a draft the next sync tries again for; a sync that refused
+    /// because of one would leave the base rows unindexed too.
+    async fn restore_overlays_quietly(&self, domain: &str) {
+        match self.restore_overlays(domain).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                domain = domain,
+                restored = n,
+                "restored {n} mirrored draft(s) into '{domain}' from the overlay journal"
+            ),
+            Err(e) => tracing::warn!(
+                domain = domain,
+                error = format!("{e:#}"),
+                "the overlay journal for '{domain}' could not be restored; the drafts it                  mirrors stay out of the index until the next sync"
+            ),
+        }
+    }
+
     /// Sync one or all registered domains, returning per-domain reports.
     pub async fn sync(&self, only: Option<&str>) -> Result<Value> {
         self.sync_take_over(only, false).await
@@ -8939,6 +9029,9 @@ impl Engine {
             if changed_anything(&report) {
                 self.refresh_index_files(name).await;
             }
+            // The files are in; the drafts no file describes come back from the
+            // journal. A no-op on every sync but the first one after a rebuild.
+            self.restore_overlays_quietly(name).await;
             applied.push((domain, report));
         }
         // Every domain of this run is in now, so the references that pointed
@@ -12199,6 +12292,17 @@ impl Engine {
     /// `state.json`).
     fn origin_state_dir(&self, domain: &str) -> Result<PathBuf> {
         Ok(self.origins_base_dir()?.join(domain))
+    }
+
+    /// The state directory the overlay journal lives under: the test override,
+    /// or the real one. `<state_dir>/overlays/<domain>/<actor>/<path>` is the
+    /// journal's own layout, which [`crate::overlay_journal`] owns.
+    fn journal_state_dir(&self) -> Result<PathBuf> {
+        match &self.state_dir_override {
+            Some(p) => Ok(p.clone()),
+            None => crystalline_core::config::state_dir()
+                .map_err(|e| EngineError::Internal(e.to_string())),
+        }
     }
 
     /// Resolves the provider an origin operation runs its GitHub calls

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 
+mod common;
+
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
@@ -1182,6 +1184,63 @@ fn wipe_rebuilds_from_nothing_and_does_not_combine_with_full() {
     assert!(
         err.contains("cannot be used with"),
         "the parser says why: {err}"
+    );
+}
+
+/// A wipe destroys the database and rebuilds from the files on disk - and an
+/// overlay draft is the one thing on nobody's disk, so the rebuild takes the
+/// drafts back from the overlay journal under the state directory instead.
+///
+/// The journal entry is written by hand here, exactly as the write verbs will:
+/// the mirror is a file, and this is what it looks like. The second run is what
+/// proves the row really landed rather than the counter being invented - by
+/// then the store holds the draft, store rows win, and nothing is restored.
+#[test]
+fn a_wipe_takes_the_drafts_back_from_the_overlay_journal() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    let draft = "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: draft\nrecorded_at: 2026-01-02\n---\n\nGamma is alice's own draft.\n";
+    let mirror = home
+        .join("state/crystalline/overlays/eng/alice")
+        .join("gamma.md");
+    std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    std::fs::write(&mirror, draft).unwrap();
+
+    let mut cmd = bin();
+    common::isolate(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["drafts_restored"],
+        serde_json::json!(1),
+        "the wiped index takes alice's draft back from the journal: {report}"
+    );
+
+    let mut cmd = bin();
+    common::isolate(&mut cmd, &home);
+    let out = cmd
+        .args(["--json", "reindex", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["drafts_restored"],
+        serde_json::json!(0),
+        "the row is in the index now, and a store row is never overwritten by its mirror: {report}"
     );
 }
 

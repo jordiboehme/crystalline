@@ -326,10 +326,20 @@ pub fn journal_remove_domain(state_dir: &Path, domain: &str) -> io::Result<u64> 
 /// ever allowed to fill a gap. That makes it safe to run on every sync, where
 /// almost always it writes nothing at all.
 ///
-/// A tombstone carries no content of its own, so its row is rebuilt from the
-/// base row it deletes. A tombstone whose base is not there is skipped and its
-/// entry left alone: there is nothing to shadow, and clearing it would be
-/// convergence rather than restoration.
+/// **A restored draft stores its full markdown**, frontmatter and all, exactly
+/// as a virtual domain's rows do (`Engine::index_markdown`'s `store_full`): a
+/// draft is on nobody's disk, so the row is the only place its document
+/// survives and a body-only projection would lose the frontmatter for good.
+/// The write verbs that come to journal drafts have to store them the same way.
+///
+/// **A tombstone is rebuilt from the base row it deletes.** Its mirror carries
+/// no content of its own - what it records is that this actor deleted this path
+/// - so the row comes back standing at that path under the base row's own
+/// identity, carrying the base's stored content and none of its child rows: a
+/// deletion contributes no observations and no edges to the actor who made it.
+/// A tombstone whose base is not there is skipped and its entry left alone:
+/// there is nothing to shadow, and clearing it would be convergence rather than
+/// restoration, which is a later task's business.
 pub async fn restore_into(
     store: &dyn Store,
     state_dir: &Path,
@@ -345,32 +355,85 @@ pub async fn restore_into(
         {
             continue;
         }
-        let tombstone = entry.content.is_none();
-        let text = match entry.content {
-            Some(text) => text,
-            None => match store.engram_content(domain, &entry.path).await? {
-                Some(base) => base,
+        let record = match &entry.content {
+            Some(text) => match draft_record(&entry, text) {
+                Some(record) => record,
+                None => continue,
+            },
+            None => match tombstone_record(store, domain_name, domain, &entry).await? {
+                Some(record) => record,
                 None => continue,
             },
         };
-        let engram = match parse_engram(&text) {
-            Ok(engram) => engram,
-            Err(e) => {
-                tracing::warn!(
-                    domain = domain_name,
-                    actor = entry.actor.as_str(),
-                    path = entry.path.as_str(),
-                    "the mirrored draft could not be parsed and was left in the journal: {e}"
-                );
-                continue;
-            }
-        };
-        let mut record = EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&text));
-        record.tombstone = tombstone;
         store.upsert_overlay(domain, &entry.actor, &record).await?;
         restored += 1;
     }
     Ok(restored)
+}
+
+/// The row one mirrored draft comes back as, or `None` when its markdown no
+/// longer parses - which is left in the journal rather than dropped, since the
+/// mirror is the only copy there is.
+fn draft_record(entry: &JournalEntry, text: &str) -> Option<EngramRecord> {
+    let engram = match parse_engram(text) {
+        Ok(engram) => engram,
+        Err(e) => {
+            tracing::warn!(
+                actor = entry.actor.as_str(),
+                path = entry.path.as_str(),
+                "the mirrored draft could not be parsed and was left in the journal: {e}"
+            );
+            return None;
+        }
+    };
+    let mut record = EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(text));
+    // The draft is on nobody's disk, so the row keeps the whole document.
+    record.content = text.to_string();
+    Some(record)
+}
+
+/// The row one mirrored tombstone comes back as: the base row's identity at the
+/// same path, flagged. `None` when no base row stands there any more.
+async fn tombstone_record(
+    store: &dyn Store,
+    domain_name: &str,
+    domain: DomainId,
+    entry: &JournalEntry,
+) -> crystalline_index::Result<Option<EngramRecord>> {
+    let base = store
+        .list_engrams(domain_name, Some(&entry.path), None)
+        .await?
+        .into_iter()
+        .find(|d| d.path == entry.path);
+    let Some(base) = base else {
+        return Ok(None);
+    };
+    let content = store
+        .engram_content(domain, &entry.path)
+        .await?
+        .unwrap_or_default();
+    let stamp = virtual_stamp(&content);
+    Ok(Some(EngramRecord {
+        path: entry.path.clone(),
+        permalink: base.permalink,
+        title: base.title,
+        engram_type: base.engram_type,
+        status: base.status,
+        recorded_at: None,
+        valid_from: None,
+        valid_to: None,
+        timestamp: None,
+        description: None,
+        content,
+        metadata: serde_json::Value::Object(serde_json::Map::new()),
+        tags: Vec::new(),
+        observations: Vec::new(),
+        relations: Vec::new(),
+        links: Vec::new(),
+        stamp,
+        actor: String::new(),
+        tombstone: true,
+    }))
 }
 
 #[cfg(test)]

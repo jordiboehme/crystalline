@@ -1421,10 +1421,24 @@ pub async fn reindex(
     )
     .await?;
 
+    // The rebuilt base rows are in; now the rows no file on disk describes. An
+    // overlay draft is one actor's private version of a path and it lives
+    // nowhere but the index, so a wipe takes it and no walk can bring it back -
+    // the mirror under the state directory is what can, and this is the moment
+    // to read it. Runs on every reindex, not only a wipe: it costs one
+    // directory read per domain when there is nothing to restore, and a
+    // daemonless installation has no other pass that would ever heal a draft.
+    let drafts_restored = restore_overlay_journals(&store, &file_targets).await;
+
     if json {
         println!(
             "{}",
-            serde_json::json!({ "full": full, "wipe": wipe, "reports": reports })
+            serde_json::json!({
+                "full": full,
+                "wipe": wipe,
+                "reports": reports,
+                "drafts_restored": drafts_restored,
+            })
         );
     } else {
         println!(
@@ -1440,6 +1454,9 @@ pub async fn reindex(
         for r in &reports {
             print_report(r);
         }
+        if drafts_restored > 0 {
+            println!("  {drafts_restored} draft(s) restored from the overlay journal");
+        }
     }
 
     // The driver already checkpointed what the rebuild wrote, but the embed
@@ -1454,6 +1471,60 @@ pub async fn reindex(
         store.checkpoint_wal().await?;
     }
     Ok(())
+}
+
+/// Put every mirrored draft back into the rebuilt index, answering with how
+/// many rows were written across every domain.
+///
+/// Best effort, per domain: a journal that could not be read or a row that
+/// could not be written is logged and the rebuild still reports what it
+/// rebuilt. The scope is the domains this run just rebuilt, which is this
+/// path's version of the engine's "never restore into a domain nobody
+/// registers" - the targets came from the configuration.
+async fn restore_overlay_journals(
+    store: &Arc<TokioMutex<dyn Store>>,
+    targets: &[(String, PathBuf)],
+) -> u64 {
+    let state_dir = match crystalline_core::config::state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!("the overlay journal could not be located: {e}");
+            return 0;
+        }
+    };
+    let mut restored = 0u64;
+    for (name, root) in targets {
+        // A domain with nothing mirrored is not touched at all. That keeps the
+        // usual reindex a read of one directory per domain, and - since the
+        // driver has already checkpointed the WAL by the time this runs - keeps
+        // it from dirtying the WAL again with a write nobody needed.
+        if crystalline_service::overlay_journal::journal_entries(&state_dir, name).is_empty() {
+            continue;
+        }
+        let store = store.lock().await;
+        let id = match store
+            .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("the overlay journal for '{name}' was not restored: {e}");
+                continue;
+            }
+        };
+        match crystalline_service::overlay_journal::restore_into(&*store, &state_dir, name, id)
+            .await
+        {
+            Ok(n) => restored += n,
+            Err(e) => tracing::warn!("the overlay journal for '{name}' was not restored: {e}"),
+        }
+        // What the restore wrote must not sit stranded in the WAL either: a
+        // reindex is a snapshot-preparation verb whichever rows it wrote last.
+        if let Err(e) = store.checkpoint_wal().await {
+            tracing::debug!("reindex: the WAL checkpoint after the restore did not run: {e}");
+        }
+    }
+    restored
 }
 
 // --- status ------------------------------------------------------------------
