@@ -10217,8 +10217,8 @@ impl Engine {
         }))
     }
 
-    /// Drop the engram rows of every domain that has been unregistered for
-    /// longer than `grace`, and report every domain considered.
+    /// Drop the engram rows of every domain that is no longer registered, and
+    /// report every domain considered.
     ///
     /// `domain_remove` clears a domain's rows as it unregisters it, so nothing
     /// this instance removes ever becomes an orphan. This is for the rows that
@@ -10228,66 +10228,89 @@ impl Engine {
     /// registered is not a hit, not a count and not a facet value), so this
     /// costs nothing to defer and the grace period is a matter of disk.
     ///
-    /// Two conditions, and both are necessary:
+    /// **`grace` is who is asking**, and it is the only difference between the
+    /// two callers:
     ///
-    /// 1. **Absent from the configuration**, resolved through
-    ///    [`Engine::registered_domain_names_checked`] - the three tiers a
-    ///    *named* lookup resolves through, so a domain the file gained after
-    ///    startup is registered here as it is everywhere else. A configuration
-    ///    that could not be read (unparseable, or not there) is not evidence of
-    ///    absence: the sweep then establishes no registered set, stamps nothing,
-    ///    collects nothing and says so in `skipped`.
-    /// 2. **Last seen registered longer ago than `grace`.** Absence alone never
-    ///    suffices, so a configuration edited by hand at noon does not cost a
-    ///    resync by evening. `last_registered` reading `None` is *never
-    ///    stamped*, not *stamped infinitely long ago*: such a domain has its
-    ///    clock started on this sweep and is collected on no sweep that could
-    ///    not already see its age. Every row an upgrade inherits reads `None`,
-    ///    so the first sweep after one collects nothing.
+    /// - `Some(d)` is the **daemon's unattended sweep**. A domain is collected
+    ///   only when its `last_registered` stamp says it has been gone longer
+    ///   than `d`. `last_registered` reading `None` is *never stamped*, not
+    ///   *stamped infinitely long ago*: such a domain has its clock started on
+    ///   this sweep and is collected on no sweep that could not already see its
+    ///   age, so the first sweep after an upgrade - when every inherited row
+    ///   reads `None` - collects nothing.
+    /// - `None` is **a person asking** (`doctor --fix`, and `doctor`'s report
+    ///   with `dry_run`). Every unregistered domain is collected whatever its
+    ///   stamp says, a `None` stamp included. The grace period exists to wait
+    ///   for exactly this signal, so waiting past it would be waiting for
+    ///   something that has already happened - and an index inherited from a
+    ///   version that stranded its rows has nothing but `None` stamps, which
+    ///   must clear on first contact rather than a week after it.
+    ///
+    /// One condition holds on both paths and is never waived: the domain is
+    /// **absent from the configuration**, resolved through
+    /// [`Engine::registered_domain_names_checked`] - the three tiers a *named*
+    /// lookup resolves through, so a domain the file gained after startup is
+    /// registered here as it is everywhere else. A configuration that could not
+    /// be read (unparseable, or not there) is not evidence of absence: the
+    /// sweep then establishes no registered set, stamps nothing, collects
+    /// nothing and says so in `skipped`.
     ///
     /// Every registered domain is stamped *first*, before anything is
     /// considered, which is what makes a week of the machine being off, or of
     /// this process being read-only, cost nothing.
     ///
-    /// Three domains are reported and never collected. A **virtual** domain's
-    /// engram rows are not a derived copy of files on disk, they are the
-    /// knowledge itself - `domain_remove` already refuses to drop them without
-    /// an explicit purge, and an unattended sweep can obtain no such
-    /// confirmation. A domain with **no engram rows** has nothing to collect. A
-    /// **read-only** instance collects nothing at all, and still answers what
-    /// it would have collected.
+    /// Three domains are reported and never collected, on either path. A
+    /// **virtual** domain's engram rows are not a derived copy of files on
+    /// disk, they are the knowledge itself - `domain_remove` refuses to drop
+    /// them without an explicit purge, and this answers nobody's confirmation,
+    /// so it reports one (`"kept": "virtual"`) and leaves the removal to the
+    /// person and that command. A domain with **no engram rows** has nothing to
+    /// collect. A **read-only** instance collects nothing at all, and still
+    /// answers what it would have collected.
     ///
     /// `dry_run` writes nothing whatsoever - no removal and no stamp - and
-    /// reports the same set a real run would collect.
+    /// reports the same set a real run would collect, on both paths.
     ///
     /// The domain row itself always stays, exactly as `domain_remove` leaves
     /// it, so nothing downstream sees a dangling reference. The routing cache
     /// is deliberately not refreshed: it is built from registered domains, and
-    /// every domain touched here has been unregistered for a week.
+    /// nothing touched here is one.
     ///
     /// The report:
     ///
     /// ```json
     /// {
     ///   "grace_seconds": 604800,
+    ///   "on_demand": false,
     ///   "dry_run": false,
     ///   "read_only": false,
     ///   "stamped": 2,
     ///   "considered": [
     ///     { "domain": "gone", "kind": "file", "engrams": 30,
     ///       "last_registered": "2026-09-01T09:00:00+00:00",
-    ///       "age_seconds": 1123200, "age_days": 13, "collected": true }
+    ///       "age_seconds": 1123200, "age_days": 13, "collected": true },
+    ///     { "domain": "vault", "kind": "virtual", "engrams": 12,
+    ///       "last_registered": null, "age_seconds": null, "age_days": null,
+    ///       "collected": false, "kept": "virtual",
+    ///       "reason": "a virtual domain's engram rows are its only copy ..." }
     ///   ],
     ///   "collected": ["gone"],
     ///   "engrams_removed": 30
     /// }
     /// ```
     ///
-    /// `considered` holds one row per unregistered domain the index knows -
-    /// a registered one is not a candidate and never appears - and a row that
-    /// was kept carries a `reason` saying why. `skipped` is present only when
-    /// the whole sweep declined to collect.
-    pub async fn collect_orphaned_domains(&self, grace: Duration, dry_run: bool) -> Result<Value> {
+    /// `considered` holds one row per unregistered domain the index knows - a
+    /// registered one is not a candidate and never appears. A row that was kept
+    /// carries `kept`, one of `virtual`, `no_rows`, `grace`, `unstamped` or
+    /// `read_only`, for a caller that branches on it, and a `reason` in words
+    /// for one that prints. `grace_seconds` is `null` when a person asked, and
+    /// `on_demand` says the same thing as a boolean. `skipped` is present only
+    /// when the whole sweep declined to collect.
+    pub async fn collect_orphaned_domains(
+        &self,
+        grace: Option<Duration>,
+        dry_run: bool,
+    ) -> Result<Value> {
         let now = Utc::now();
         // A dry run and a read-only instance write nothing at all: not a
         // removal, and not a stamp either, so a preview cannot move a clock
@@ -10296,7 +10319,8 @@ impl Engine {
 
         let Some(registered) = self.registered_domain_names_checked() else {
             return Ok(json!({
-                "grace_seconds": grace.num_seconds(),
+                "grace_seconds": grace.map(|g| g.num_seconds()),
+                "on_demand": grace.is_none(),
                 "dry_run": dry_run,
                 "read_only": self.read_only,
                 "stamped": 0,
@@ -10344,31 +10368,45 @@ impl Engine {
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|seen| now.signed_duration_since(seen.with_timezone(&Utc)));
 
-            let reason: Option<&str> = if self.read_only {
-                Some("this instance is read-only")
+            // Why this domain was kept, as a word a caller can branch on and a
+            // sentence one can print. `None` is the only outcome that deletes.
+            let kept: Option<(&str, &str)> = if self.read_only {
+                Some(("read_only", "this instance is read-only"))
             } else if matches!(row.kind, DomainKind::Virtual) {
-                Some(
-                    "a virtual domain's engram rows are its only copy, and no sweep drops \
-                     knowledge nobody confirmed",
-                )
+                Some((
+                    "virtual",
+                    "a virtual domain's engram rows are its only copy; end it with \
+                     'domain remove --purge', which asks first",
+                ))
             } else if row.engrams == 0 {
-                Some("no engram rows to collect")
+                Some(("no_rows", "no engram rows to collect"))
             } else {
-                match age {
-                    None => {
-                        start_clock.push(row.name.clone());
-                        Some(if writes {
-                            "never seen registered before; its clock starts now"
-                        } else {
-                            "never seen registered before; a real run would start its clock now"
-                        })
-                    }
-                    Some(age) if age < grace => Some("within the grace period"),
-                    Some(_) => None,
+                match grace {
+                    // A person asking is the signal the grace period exists to
+                    // wait for, so there is nothing left to wait for and no
+                    // stamp to consult: an inherited index whose rows all read
+                    // `None` clears on first contact rather than a week after.
+                    None => None,
+                    Some(grace) => match age {
+                        None => {
+                            start_clock.push(row.name.clone());
+                            Some((
+                                "unstamped",
+                                if writes {
+                                    "never seen registered before; its clock starts now"
+                                } else {
+                                    "never seen registered before; a real run would start its \
+                                     clock now"
+                                },
+                            ))
+                        }
+                        Some(age) if age < grace => Some(("grace", "within the grace period")),
+                        Some(_) => None,
+                    },
                 }
             };
 
-            let collect = reason.is_none();
+            let collect = kept.is_none();
             if collect {
                 collected.push(row.name.clone());
                 if writes {
@@ -10382,15 +10420,18 @@ impl Engine {
                     store.clear_domain(id).await?;
                     drop(store);
                     engrams_removed += row.engrams;
-                    let days = age.map_or(0, |a| a.num_days());
+                    let age_text = match age {
+                        Some(age) => format!("last seen registered {} days ago", age.num_days()),
+                        None => "never seen registered".to_string(),
+                    };
                     tracing::info!(
                         domain = row.name.as_str(),
                         engrams = row.engrams,
-                        age_days = days,
-                        "collected {} engram rows of '{}', unregistered for {} days",
+                        age = age_text.as_str(),
+                        "collected {} engram rows of '{}', {}",
                         row.engrams,
                         row.name,
-                        days
+                        age_text
                     );
                 }
             }
@@ -10404,7 +10445,8 @@ impl Engine {
                 "age_days": age.map(|a| a.num_days()),
                 "collected": collect,
             });
-            if let Some(reason) = reason {
+            if let Some((kept, reason)) = kept {
+                entry["kept"] = json!(kept);
                 entry["reason"] = json!(reason);
             }
             considered.push(entry);
@@ -10417,7 +10459,8 @@ impl Engine {
         }
 
         let mut report = json!({
-            "grace_seconds": grace.num_seconds(),
+            "grace_seconds": grace.map(|g| g.num_seconds()),
+            "on_demand": grace.is_none(),
             "dry_run": dry_run,
             "read_only": self.read_only,
             "stamped": stamped,

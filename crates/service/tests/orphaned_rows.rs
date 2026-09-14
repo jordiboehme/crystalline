@@ -932,7 +932,7 @@ async fn a_domain_unregistered_past_the_grace_period_is_collected() {
     assert!(before >= 2, "the orphan starts with its rows: {before}");
 
     let report = engine
-        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
         .await
         .unwrap();
 
@@ -972,7 +972,7 @@ async fn a_domain_unregistered_for_an_hour_is_not_collected() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
         .await
         .unwrap();
 
@@ -999,7 +999,7 @@ async fn a_registered_domain_is_never_collected_whatever_its_stamp() {
     let before = engrams_of(&store, "keep").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
         .await
         .unwrap();
 
@@ -1037,7 +1037,7 @@ async fn a_never_stamped_domain_is_stamped_now_and_not_collected() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = engine
-        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
         .await
         .unwrap();
 
@@ -1065,7 +1065,7 @@ async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let dry = engine
-        .collect_orphaned_domains(chrono::Duration::days(7), true)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), true)
         .await
         .unwrap();
     assert_eq!(dry["dry_run"], true, "the report says which it was: {dry}");
@@ -1090,7 +1090,7 @@ async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
     );
 
     let wet = engine
-        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
         .await
         .unwrap();
     assert_eq!(
@@ -1114,7 +1114,7 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
-        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
         .await
         .unwrap();
 
@@ -1165,7 +1165,7 @@ async fn an_unreadable_configuration_collects_nothing() {
         }
 
         let report = engine
-            .collect_orphaned_domains(chrono::Duration::days(7), false)
+            .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
             .await
             .unwrap();
 
@@ -1189,13 +1189,30 @@ async fn an_unreadable_configuration_collects_nothing() {
             None,
             "{case}: and nothing was stamped, since nothing was known to be registered"
         );
+
+        // A person asking waives the grace period and nothing else. Without a
+        // readable configuration there is still no domain shown absent from
+        // one, so the answer is the same refusal.
+        let asked = engine.collect_orphaned_domains(None, false).await.unwrap();
+        assert!(
+            collected(&asked).is_empty(),
+            "{case}: asking does not make an unreadable file evidence: {asked}"
+        );
+        assert!(
+            asked["skipped"]
+                .as_str()
+                .is_some_and(|s| s.contains("configuration")),
+            "{case}: and it says so on that path too: {asked}"
+        );
+        assert_eq!(engrams_of(&store, "gone").await, Some(before));
     }
 }
 
 /// A virtual domain's rows are not a derived copy of anything: they are the
 /// knowledge. `domain_remove` already refuses to drop them without an explicit
-/// purge, and an unattended sweep can obtain no such confirmation, so it
-/// reports one and collects it never.
+/// purge, and this answers nobody's confirmation, so it reports one - with the
+/// `kept` word a doctor names the purge path from - and collects it never. On
+/// the sweep's path and on the person's alike: asking is not confirming.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_virtual_domains_rows_are_never_collected() {
     let (_tmp, engine, store) = fixture().await;
@@ -1212,7 +1229,7 @@ async fn a_virtual_domains_rows_are_never_collected() {
     assert!(before >= 2, "it has rows to lose: {before}");
 
     let report = engine
-        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
         .await
         .unwrap();
 
@@ -1224,8 +1241,132 @@ async fn a_virtual_domains_rows_are_never_collected() {
     assert_eq!(row["kind"], "virtual", "named as what it is: {report}");
     assert_eq!(row["collected"], false);
     assert_eq!(
+        row["kept"], "virtual",
+        "and kept for the one reason a doctor must word differently: {report}"
+    );
+    assert_eq!(
+        row["engrams"], before,
+        "with the rows at stake counted: {report}"
+    );
+    assert_eq!(
         engrams_of(&store, "gone").await,
         Some(before),
         "and its only copy is still there"
     );
+
+    // A person asking does not make it collectable either: the confirmation a
+    // virtual domain needs is `domain remove --purge`, not this.
+    let asked = engine.collect_orphaned_domains(None, false).await.unwrap();
+    assert!(
+        collected(&asked).is_empty(),
+        "nor does asking for it: {asked}"
+    );
+    assert_eq!(
+        considered(&asked, "gone").expect("still reported")["kept"],
+        "virtual"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "and the rows are still all there"
+    );
+}
+
+/// The on-demand path, and the one rule it waives. A person asking is the
+/// signal the grace period exists to wait for, so `None` waits for nothing: a
+/// never-stamped orphan - which is every row an index inherits from a version
+/// that stranded them - is collected on first contact rather than a week after.
+///
+/// The daemon's own sweep, over the same domain in the same state, keeps it and
+/// starts its clock. Both halves are asserted here because the pair is the
+/// whole decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_person_asking_collects_a_never_stamped_orphan_and_a_sweep_does_not() {
+    let (_tmp, engine, store) = fixture().await;
+    assert_eq!(
+        stamp_of(&store, "gone").await,
+        None,
+        "the inherited row carries no stamp"
+    );
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    // The sweep first, with no grace period at all: an unstamped domain is not
+    // old, it is unmeasured, so even a zero grace keeps it.
+    let swept = engine
+        .collect_orphaned_domains(Some(chrono::Duration::zero()), false)
+        .await
+        .unwrap();
+    assert!(
+        collected(&swept).is_empty(),
+        "no stamp is no evidence, whatever the grace period: {swept}"
+    );
+    assert_eq!(
+        considered(&swept, "gone").expect("reported")["kept"],
+        "unstamped",
+        "and the report says which rule kept it: {swept}"
+    );
+    assert!(
+        stamp_of(&store, "gone").await.is_some(),
+        "the sweep started its clock"
+    );
+    assert_eq!(engrams_of(&store, "gone").await, Some(before));
+
+    // Then the person, whose asking is what the waiting was for.
+    let asked = engine.collect_orphaned_domains(None, false).await.unwrap();
+    assert_eq!(
+        asked["on_demand"], true,
+        "the report says which path it was: {asked}"
+    );
+    assert_eq!(asked["grace_seconds"], serde_json::Value::Null);
+    assert_eq!(
+        collected(&asked),
+        vec!["gone".to_string()],
+        "asked for, and collected: {asked}"
+    );
+    assert_eq!(asked["engrams_removed"], before);
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(0),
+        "its rows are gone and its domain row is not"
+    );
+    assert!(
+        engrams_of(&store, "keep").await.unwrap() >= 2,
+        "and the registered domain is untouched"
+    );
+}
+
+/// The question a person asks before they ask for it: the same set, and not one
+/// row removed to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_on_demand_dry_run_lists_the_orphan_and_removes_nothing() {
+    let (_tmp, engine, store) = fixture().await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let dry = engine.collect_orphaned_domains(None, true).await.unwrap();
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    assert_eq!(dry["on_demand"], true, "{dry}");
+    assert_eq!(
+        collected(&dry),
+        vec!["gone".to_string()],
+        "it names the never-stamped orphan a real ask would collect: {dry}"
+    );
+    assert_eq!(dry["engrams_removed"], 0, "and removed nothing: {dry}");
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "every row is where it was"
+    );
+    assert_eq!(
+        stamp_of(&store, "gone").await,
+        None,
+        "and a preview did not stamp anything either"
+    );
+
+    let asked = engine.collect_orphaned_domains(None, false).await.unwrap();
+    assert_eq!(
+        collected(&asked),
+        collected(&dry),
+        "the ask collects the set the preview named: {asked}"
+    );
+    assert_eq!(engrams_of(&store, "gone").await, Some(0));
 }
