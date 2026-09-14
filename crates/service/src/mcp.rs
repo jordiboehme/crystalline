@@ -3675,7 +3675,8 @@ fn removal_drafts_clause(preview: &Value) -> String {
         .collect();
     let plural = if total == 1 { "" } else { "s" };
     format!(
-        " It also ends {total} private draft{plural} - {} - which live in this index alone and          cannot be brought back.",
+        " It also ends {total} private draft{plural} - {} - which live in this index alone \
+         and cannot be brought back.",
         per_actor.join(", ")
     )
 }
@@ -4425,14 +4426,16 @@ mod tests {
             "drafts_unknown": false,
             "files_kept": true,
         }));
-        assert!(with.contains("3 private draft"), "{with}");
-        assert!(
-            with.contains("alice (2)") && with.contains("bob (1)"),
-            "{with}"
-        );
-        assert!(
-            with.contains("cannot be brought back"),
-            "the drafts are the part that is really lost: {with}"
+        // The whole sentence, byte for byte. This is the text somebody reads
+        // before agreeing to a destructive removal, so it is pinned rather than
+        // probed with substrings: a `contains` on either side of a hole in the
+        // middle of a sentence passes over a sentence with a hole in it.
+        assert_eq!(
+            with,
+            "Unregister the file domain 'kb' holding 4 engrams? Its files stay on disk exactly \
+             as they are, so adding the folder again re-adopts them; the registration and the \
+             search index rows go. It also ends 3 private drafts - alice (2), bob (1) - which \
+             live in this index alone and cannot be brought back."
         );
 
         // Nobody drafting here says nothing at all: the question stays the

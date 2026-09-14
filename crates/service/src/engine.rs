@@ -8945,7 +8945,8 @@ impl Engine {
             Err(e) => tracing::warn!(
                 domain = domain,
                 error = format!("{e:#}"),
-                "the overlay journal for '{domain}' could not be restored; the drafts it                  mirrors stay out of the index until the next sync"
+                "the overlay journal for '{domain}' could not be restored; the drafts it \
+                 mirrors stay out of the index until the next sync"
             ),
         }
     }
@@ -10260,7 +10261,9 @@ impl Engine {
                 tracing::warn!(
                     domain = name,
                     error = format!("{e:#}"),
-                    "the overlay journal for '{name}' could not be swept; the drafts it mirrors                      are unreachable (nothing restores into an unregistered domain) but the                      folder is left on disk"
+                    "the overlay journal for '{name}' could not be swept; the drafts it \
+                     mirrors are unreachable (nothing restores into an unregistered domain) \
+                     but the folder is left on disk"
                 );
                 0
             }
