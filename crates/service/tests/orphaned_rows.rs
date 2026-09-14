@@ -1547,3 +1547,91 @@ async fn a_domain_whose_host_lock_went_stale_is_collected() {
         "its rows are gone and its domain row is not"
     );
 }
+
+// --- the daemon's own sweep --------------------------------------------------
+//
+// The collector above is the what; this is the when. The daemon runs it on a
+// timer beside its other interval tasks, with the grace period supplied, so an
+// always-on instance tidies itself without anybody asking - and without ever
+// taking the on-demand path, which would drop a row the grace period is still
+// holding.
+
+/// Wait until `f` holds, polling on a short interval, and panic after the
+/// deadline with what it saw instead.
+async fn within<F, Fut>(what: &str, f: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{what} did not happen within two seconds");
+}
+
+/// The accumulation defect answered by the daemon: nobody asked, and the rows
+/// of a domain gone a fortnight are collected anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_sweep_collects_a_stale_orphan() {
+    let (_tmp, engine, store) = fixture().await;
+    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    assert!(
+        engrams_of(&store, "gone").await.unwrap() >= 2,
+        "the orphan starts with its rows"
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(crystalline_service::daemon::run_orphan_sweep(
+        engine.clone(),
+        std::time::Duration::from_millis(25),
+        shutdown_rx,
+    ));
+
+    within("the sweep collects the stale orphan", || async {
+        engrams_of(&store, "gone").await == Some(0)
+    })
+    .await;
+    assert!(
+        engrams_of(&store, "keep").await.unwrap() >= 2,
+        "and the registered domain keeps every row"
+    );
+
+    // Shutdown mirrors the other interval tasks: the task exits promptly.
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+        .await
+        .expect("the sweep task exits when shutdown is signaled")
+        .unwrap();
+}
+
+/// The sweep supplies the grace period, and that is the whole difference
+/// between it and a person asking: an hour of absence survives any number of
+/// ticks. A sweep that passed the on-demand path would empty this domain on its
+/// first one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_sweep_keeps_an_orphan_inside_the_grace_period() {
+    let (_tmp, engine, store) = fixture().await;
+    plant_stamp(&store, "gone", chrono::Duration::hours(1)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(crystalline_service::daemon::run_orphan_sweep(
+        engine.clone(),
+        std::time::Duration::from_millis(25),
+        shutdown_rx,
+    ));
+
+    // Several ticks, and the rows are all still there.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "an hour is not a week, on any number of sweeps"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+}

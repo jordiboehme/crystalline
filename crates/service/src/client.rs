@@ -817,6 +817,39 @@ pub async fn domain_export(
     Ok(engine.export_domain(domain, dest, force, dry_run).await?)
 }
 
+/// What the index still holds for domains nobody registers any more, and,
+/// unless `dry_run`, the removal of those rows: over the daemon when one owns
+/// the index, else against a directly opened store.
+///
+/// The grace period is never applied on this route. It exists to wait for a
+/// person to say the domain is really gone, and a person running `crystalline
+/// doctor` has said it - so an index inherited from a version that stranded
+/// its rows clears on first contact rather than a week after it. The daemon's
+/// own timer is the path that waits.
+///
+/// Unlike the orphan *file* rows doctor also reports, this works with a daemon
+/// running: the removal goes through the daemon that owns the index rather
+/// than needing it stopped.
+pub async fn collect_orphaned_domains(
+    dry_run: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "collect_orphaned_domains", "dry_run": dry_run,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
+    Ok(engine.collect_orphaned_domains(None, dry_run).await?)
+}
+
 /// Unregister a domain: over the daemon when one owns the index, else against a
 /// directly opened store.
 ///

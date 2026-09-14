@@ -3,7 +3,8 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! file_stamps, sessions, tool, configure, origin_add, origin_update, origin_status,
+//! file_stamps, collect_orphaned_domains, sessions, tool, configure, origin_add,
+//! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
 //! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -135,6 +136,20 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         "file_stamps" => {
             let domain = req.get("domain").and_then(Value::as_str);
             match shared.engine.domain_file_stamps(domain).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // What the index still holds for domains nobody registers any more,
+        // and, unless `dry_run`, the removal of those rows. The grace period
+        // is never applied here: a person is asking, and the daemon's own
+        // timer is the path that waits the week out. Served from this
+        // daemon's own open store for the reason `file_stamps` is: it holds
+        // the index file, and `crystalline doctor` must not have to stop it
+        // to tidy up.
+        "collect_orphaned_domains" => {
+            let dry_run = req.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+            match shared.engine.collect_orphaned_domains(None, dry_run).await {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -473,7 +488,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
-                 domain_remove, retag, \
+                 domain_remove, retag, collect_orphaned_domains, \
                  configure, origin_add, origin_update, origin_status, origin_share, \
                  origin_withdraw, origin_resolve, provision, forget_domain or shutdown"
             )),

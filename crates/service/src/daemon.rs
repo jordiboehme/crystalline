@@ -441,6 +441,22 @@ pub async fn run_serve(
         });
     }
 
+    // The orphaned-row sweep: drops the engram rows of a domain nobody has
+    // registered for a week, and stamps every registered domain on the way
+    // past so a domain that is still registered can never age into a
+    // candidate. Nothing is served from those rows in the meantime (an
+    // unregistered domain is no hit, no count and no facet value), so this
+    // reclaims disk rather than changing an answer. A read-only instance's
+    // pass collects nothing and says so, which is why the task is spawned
+    // there too.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_orphan_sweep(e, ORPHAN_SWEEP, rx).await;
+        });
+    }
+
     // The HTTP endpoint, which is on unless it was turned off.
     if let Some(addr) = http_addr.clone() {
         let e = engine.clone();
@@ -1689,6 +1705,68 @@ pub async fn run_embed_tick(
                 }
                 Err(err) => tracing::warn!("embed self-heal backlog probe failed: {err}"),
             },
+        }
+    }
+}
+
+/// How often the daemon looks for rows whose domain nobody registers any
+/// more. Hourly, which is nothing beside the seven days a domain must have
+/// been absent before its rows go: the cadence decides only how soon after
+/// that week is up the collection happens, and one pass is a stamp write and
+/// one statistics read.
+const ORPHAN_SWEEP: Duration = Duration::from_secs(3600);
+
+/// How long a domain must have been absent from the configuration before an
+/// unattended sweep collects its rows. A week survives a configuration edited
+/// by hand at noon and a machine left off, and nothing is served from those
+/// rows for a moment of it, so the only cost of the wait is disk.
+const ORPHAN_GRACE_DAYS: i64 = 7;
+
+/// Collect the rows of every domain this instance has had no registration for
+/// longer than [`ORPHAN_GRACE_DAYS`], once per `cadence`, until shutdown.
+///
+/// The grace period is always supplied, which is the whole difference between
+/// this and a person asking: an unattended sweep waits out the week, and
+/// `doctor --fix` does not, because a person asking is the signal the week was
+/// waiting for. Each tick is one call into
+/// [`Engine::collect_orphaned_domains`] and never a loop of them: that call
+/// stamps every registered domain, considers every unregistered one and
+/// reports what it did, so a second call would only find what the first
+/// already settled.
+///
+/// The first tick is not consumed, unlike the heartbeat's and the embed
+/// tick's. Those two guard against racing startup work; this one races
+/// nothing, and stamping early is the point: a domain that is never stamped
+/// never ages, so an instance that is only ever up for minutes at a time must
+/// still record that it saw its domains registered. A tick this early can
+/// collect nothing a later one would not, because absence from the
+/// configuration is what makes a candidate and that does not change while the
+/// process starts.
+///
+/// The cadence is a parameter so a test can drive it fast; production passes
+/// [`ORPHAN_SWEEP`]. Silent on a pass that collects nothing - the engine logs
+/// one line per collection - and a failed pass is a warning, never fatal: the
+/// next tick tries again.
+pub async fn run_orphan_sweep(
+    engine: Arc<Engine>,
+    cadence: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(cadence);
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = ticker.tick() => {
+                if let Err(err) = engine
+                    .collect_orphaned_domains(
+                        Some(chrono::Duration::days(ORPHAN_GRACE_DAYS)),
+                        false,
+                    )
+                    .await
+                {
+                    tracing::warn!("the orphaned-row sweep failed: {err}");
+                }
+            }
         }
     }
 }
