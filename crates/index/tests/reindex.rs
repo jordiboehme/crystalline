@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use crystalline_index::{
     ChunkParams, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE, EmbeddingProvider,
-    NoReindexHooks, Store, TursoStore, apply_scan, reindex_domains, run_embedding_pass,
-    scan_domain,
+    EngramRecord, FileStamp, NoReindexHooks, Store, TursoStore, apply_scan, reindex_domains,
+    run_embedding_pass, scan_domain,
 };
 use tokio::sync::Mutex;
 
@@ -380,6 +380,136 @@ async fn a_completed_rebuild_rereads_what_a_sync_skips(store: Arc<Mutex<dyn Stor
 parity!(
     a_completed_rebuild_replaces_the_index_in_one_step,
     a_completed_rebuild_rereads_what_a_sync_skips
+);
+
+/// A forced resync keeps every overlay row, and proposes no deletion.
+///
+/// `--full` re-reads and re-upserts every file and prunes the rows disk no
+/// longer has, and it derives that prune list by subtracting the walk from
+/// `file_stamps`. A draft is on nobody's disk, so it survives this run for
+/// exactly one reason: that snapshot carries the base predicate. Take the
+/// predicate away and every draft in the index is proposed as a deletion on
+/// every forced run - and on every ordinary sync too. The `deleted == 0` on the
+/// report is the assertion that would have caught it: a draft silently dropped
+/// leaves the same empty overlay as a draft that was never written.
+///
+/// A tombstone is in here beside an ordinary draft because it is the row with
+/// no file behind it in the most literal sense - its base path is on disk and
+/// its own reading of that path says "gone" - so if any shape of overlay row
+/// were going to be mistaken for a stale row, it is this one.
+async fn a_forced_resync_keeps_overlay_rows(store: Arc<Mutex<dyn Store>>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("d");
+    write(&root, "a.md", &engram("A", "a", "base a"));
+    write(&root, "b.md", &engram("B", "b", "base b"));
+    let targets = vec![("d".to_string(), root.clone())];
+    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+        .await
+        .unwrap();
+    let domain = domain_id(&store, "d", &root).await;
+
+    // One draft and one tombstone, in two different actors' dimensions.
+    {
+        let store = store.lock().await;
+        let base = store
+            .all_engram_contents(domain)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path == "a.md")
+            .unwrap();
+        let mut draft = EngramRecord::from_engram(
+            &crystalline_core::parse_engram(&engram("A", "a", "alice's draft")).unwrap(),
+            "a.md",
+            FileStamp {
+                mtime: 0,
+                size: 0,
+                sha256: "draft".to_string(),
+            },
+        );
+        draft.permalink = base.permalink.clone();
+        store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+
+        let mut stone = EngramRecord::from_engram(
+            &crystalline_core::parse_engram(&engram("B", "b", "gone for bob")).unwrap(),
+            "b.md",
+            FileStamp {
+                mtime: 0,
+                size: 0,
+                sha256: "stone".to_string(),
+            },
+        );
+        stone.tombstone = true;
+        store.upsert_overlay(domain, "bob", &stone).await.unwrap();
+
+        // The sharpest one: a wholly new engram that exists only as a draft, so
+        // its path is on nobody's disk at all. This is the row the delete
+        // detection would propose for deletion on every run - the other two sit
+        // at paths the walk does find, which hides the leak.
+        let fresh = EngramRecord::from_engram(
+            &crystalline_core::parse_engram(&engram("C", "c", "alice's new one")).unwrap(),
+            "c.md",
+            FileStamp {
+                mtime: 0,
+                size: 0,
+                sha256: "fresh".to_string(),
+            },
+        );
+        store.upsert_overlay(domain, "alice", &fresh).await.unwrap();
+
+        assert_eq!(
+            store.overlay_counts(domain).await.unwrap(),
+            vec![("alice".to_string(), 2), ("bob".to_string(), 1)],
+        );
+    }
+
+    let reports = reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
+        .await
+        .unwrap();
+    assert_eq!(
+        reports.iter().map(|r| r.deleted).sum::<usize>(),
+        0,
+        "a forced resync proposes no deletion: no overlay row is on disk, and \
+         none of them is a stale row either"
+    );
+
+    let store_guard = store.lock().await;
+    let alice = store_guard
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .expect("alice's draft survived the rebuild");
+    assert!(alice.content.contains("alice's draft"));
+    assert!(!alice.tombstone);
+    let bob = store_guard
+        .overlay_entry(domain, "bob", "b.md")
+        .await
+        .unwrap()
+        .expect("bob's tombstone survived it too");
+    assert!(bob.tombstone, "and is still a tombstone");
+    assert!(
+        store_guard
+            .overlay_entry(domain, "alice", "c.md")
+            .await
+            .unwrap()
+            .is_some(),
+        "and the draft with no file behind it survived, which is the one the \
+         delete detection would have taken"
+    );
+    assert_eq!(
+        store_guard.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 2), ("bob".to_string(), 1)],
+        "both actors still hold exactly what they held"
+    );
+    assert_eq!(
+        store_guard.domain_stats().await.unwrap()[0].engrams,
+        2,
+        "and the base is the two files on disk, as it was"
+    );
+}
+parity!(
+    a_forced_resync_keeps_every_overlay_row,
+    a_forced_resync_keeps_overlay_rows
 );
 
 /// The stored body of one path in a domain.
