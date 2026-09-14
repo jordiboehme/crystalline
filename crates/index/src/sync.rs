@@ -888,7 +888,11 @@ pub async fn reindex_domains(
     for (name, root) in targets {
         let Some((domain, snapshot)) = ({
             let store = store.lock().await;
-            if hooks.before_domain(&*store, name, root).await? {
+            let claimed = hooks
+                .before_domain(&*store, name, root)
+                .await
+                .map_err(|e| in_domain("reindex", name, e))?;
+            if claimed {
                 let domain = store
                     .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
                     .await
@@ -932,13 +936,23 @@ pub async fn reindex_domains(
     // forward-reference problem a full sweep has: the first domain is applied
     // while the last one holds none of its targets yet.
     let store = store.lock().await;
-    resolve_forward_refs(&*store, &mut applied).await?;
+    resolve_forward_refs(&*store, &mut applied)
+        .await
+        .map_err(|e| IndexError::Db(format!("resolving forward references failed: {e}")))?;
     // Any reindex, full or incremental, is a snapshot-preparation verb: a
     // downstream pipeline may ship index.db as a single file (sidecars
     // deleted), so whatever this run just wrote must not sit stranded in the
     // WAL. Merge and shrink it now rather than leaving it to grow until the
     // next natural checkpoint. A no-op on Postgres (no local WAL file).
-    store.checkpoint_wal().await?;
+    //
+    // Best effort, as the trait documents it: every domain has committed by
+    // now, so a checkpoint that could not truncate is a housekeeping miss and
+    // not a reason to report a completed rebuild as failed. It is also new work
+    // for the daemon, which never checkpointed here at all, and a new failure
+    // mode is not what moving it into the shared driver was for.
+    if let Err(e) = store.checkpoint_wal().await {
+        tracing::debug!("reindex: the tail WAL checkpoint did not run: {e}");
+    }
     Ok(applied.into_iter().map(|(_, report)| report).collect())
 }
 

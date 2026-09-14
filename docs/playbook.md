@@ -941,9 +941,13 @@ crystalline reindex --full                          # rebuild the derived index 
 ```
 
 The index is disposable and the files are the truth, so `reindex --full` is never
-a data-loss event - it is the clean-room reset that syncs the index back to the
-engram files, ratio restored (the generated `index.md` files stay outside it, as
-they always are).
+a data-loss event - it re-reads every file and rewrites the index from it, without
+destroying anything on the way: each domain keeps the rows it has until its own
+rebuild commits, and a paragraph whose text did not change keeps the embedding it
+already had (the generated `index.md` files stay outside it, as they always are).
+The clean-room reset is its own flag, `reindex --wipe`, for a database file that
+will not open at all; it throws the index away and re-embeds from scratch, which
+on a large corpus is hours.
 
 ---
 

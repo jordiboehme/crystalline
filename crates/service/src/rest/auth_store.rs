@@ -2,7 +2,7 @@
 //! database beside the index.
 //!
 //! Deliberately separate from the engine's store: credentials are not
-//! knowledge, they must survive a `reindex --full` that discards the index,
+//! knowledge, they must survive a `reindex --wipe` that discards the index,
 //! and the `crystalline users` CLI has to edit them in another process while
 //! the daemon serves. That last point sets the shape here - one connection per
 //! [`AuthStore`], every statement its own short autocommit transaction, and a

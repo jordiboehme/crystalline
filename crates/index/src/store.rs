@@ -1138,9 +1138,10 @@ pub struct DomainStats {
     /// A set value reads as history, not as liveness: nothing clears it when
     /// the process that stamped it is killed, which is exactly what makes it
     /// useful. A reader that also sees a live `reindex` activity may say a
-    /// rebuild is running; one that does not must say a rebuild never finished
-    /// and that this domain's rows are the ones from before it - they are
-    /// complete rows either way, because a rebuild never clears anything.
+    /// rebuild is running, though not that it is this domain's (the activity
+    /// record carries no domain); one that does not must say a rebuild did not
+    /// finish and that this domain's rows are the ones from before it - they
+    /// are complete rows either way, because a rebuild never clears anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebuild_started: Option<String>,
 }

@@ -669,6 +669,10 @@ fn the_daemon_keeps_answering_during_a_full_reindex() {
         if finished {
             break;
         }
+        // Paced rather than spun: two daemon round-trips per lap as fast as
+        // they complete would make the test's own contention part of why the
+        // window is wide enough to observe, which is not a property to rely on.
+        std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
         rebuild.wait().unwrap().success(),

@@ -1836,10 +1836,17 @@ pub fn render_human(report: &DoctorReport) -> String {
         // the rows below are the complete ones from before it - so the finding
         // is a refresh to finish, and the command that finishes it is the one
         // that was interrupted.
+        //
+        // "has not finished" rather than "never finished": doctor sees no
+        // activity snapshot (the markers only reach it on the direct route),
+        // so it has not checked whether a rebuild is running this second and
+        // must not say it is not. The remedy is the same either way - re-run
+        // it - and a re-run while one is in flight waits on the store lock
+        // rather than colliding.
         if let Some(started) = &d.rebuild_started {
             let _ = writeln!(
                 out,
-                "  [problem] a full rebuild started {started} never finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
+                "  [problem] a full rebuild started {started} has not finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
             );
         }
         if d.is_virtual {
@@ -2503,7 +2510,7 @@ mod tests {
         let out = render_human(&report);
         assert!(
             out.contains(
-                "[problem] a full rebuild started 2026-09-14T09:00:00Z never finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
+                "[problem] a full rebuild started 2026-09-14T09:00:00Z has not finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
             ),
             "{out}"
         );
@@ -2520,7 +2527,7 @@ mod tests {
         // Cleared, it is neither a finding nor a caveat.
         report.domains[0].rebuild_started = None;
         let clean = render_human(&report);
-        assert!(!clean.contains("never finished"), "{clean}");
+        assert!(!clean.contains("has not finished"), "{clean}");
         assert!(!clean.contains("unfinished rebuild"), "{clean}");
         assert_eq!(report.remaining_problems(), 0);
     }
