@@ -4,8 +4,8 @@ mod common;
 
 use common::{fixtures_dir, read};
 use crystalline_core::manifest::{
-    ArtifactType, Manifest, ProblemKind, TagAliasProblemKind, append_tag_alias,
-    in_root_artifact_dirs, tag_alias_pairs,
+    ArtifactType, GeneratedIndexes, Manifest, ProblemKind, TagAliasProblemKind, append_tag_alias,
+    generated_indexes_at, in_root_artifact_dirs, tag_alias_pairs,
 };
 use crystalline_core::parse_engram;
 
@@ -634,4 +634,105 @@ fn append_tag_alias_preserves_crlf_endings_and_appends_lf() {
         tag_alias_pairs(&out).contains(&("c".to_string(), "d".to_string())),
         "the appended pair parses from the CRLF source: {out:?}"
     );
+}
+
+// --- generated_indexes: the frontmatter switch ------------------------------
+
+/// A MANIFEST source declaring `generated_indexes` as `declared`, or nothing
+/// at all when `declared` is `None`.
+fn manifest_declaring(declared: Option<&str>) -> String {
+    let line = match declared {
+        Some(value) => format!("generated_indexes: {value}\n"),
+        None => String::new(),
+    };
+    format!(
+        "---\ntype: manifest\ntitle: KB\n{line}---\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n"
+    )
+}
+
+#[test]
+fn a_manifest_declaring_nothing_keeps_its_generated_indexes_local() {
+    // The default, and the one every MANIFEST written before the switch
+    // existed lands on.
+    let m = manifest_from_source(&manifest_declaring(None));
+    assert_eq!(m.declared_generated_indexes(), None);
+    assert_eq!(m.generated_indexes(), GeneratedIndexes::Local);
+    assert_eq!(GeneratedIndexes::default(), GeneratedIndexes::Local);
+}
+
+#[test]
+fn a_manifest_declaring_shared_lets_its_generated_indexes_travel() {
+    let m = manifest_from_source(&manifest_declaring(Some("shared")));
+    assert_eq!(m.declared_generated_indexes(), Some("shared"));
+    assert_eq!(m.generated_indexes(), GeneratedIndexes::Shared);
+}
+
+#[test]
+fn a_manifest_declaring_local_says_so_explicitly() {
+    let m = manifest_from_source(&manifest_declaring(Some("local")));
+    assert_eq!(m.declared_generated_indexes(), Some("local"));
+    assert_eq!(m.generated_indexes(), GeneratedIndexes::Local);
+}
+
+#[test]
+fn a_generated_indexes_value_nobody_recognizes_is_never_read_as_shared() {
+    // The whole point of the two words: a typo, a boolean somebody reached for
+    // out of habit, or a value in the wrong case must never quietly start
+    // publishing files. Every one of these reads as `local` and is reported by
+    // verify rule `M006`; the declaration is still readable verbatim so the
+    // finding can quote it back.
+    for value in ["Shared", "SHARED", "true", "yes", "sharde", "null", "42"] {
+        let m = manifest_from_source(&manifest_declaring(Some(value)));
+        assert_eq!(
+            m.generated_indexes(),
+            GeneratedIndexes::Local,
+            "`{value}` must not be read as shared"
+        );
+        assert!(
+            GeneratedIndexes::parse(m.declared_generated_indexes().expect("declared")).is_none(),
+            "`{value}` must not parse as a policy"
+        );
+    }
+
+    // And a value that is not a scalar at all: named by its shape so the
+    // finding can still say what it found.
+    let listed = manifest_from_source(&manifest_declaring(Some("\n  - shared")));
+    assert_eq!(listed.declared_generated_indexes(), Some("a list"));
+    assert_eq!(listed.generated_indexes(), GeneratedIndexes::Local);
+}
+
+#[test]
+fn generated_indexes_spellings_round_trip() {
+    assert_eq!(GeneratedIndexes::Local.as_str(), "local");
+    assert_eq!(GeneratedIndexes::Shared.as_str(), "shared");
+    assert_eq!(
+        GeneratedIndexes::parse("local"),
+        Some(GeneratedIndexes::Local)
+    );
+    assert_eq!(
+        GeneratedIndexes::parse("shared"),
+        Some(GeneratedIndexes::Shared)
+    );
+    assert_eq!(GeneratedIndexes::parse("elsewhere"), None);
+}
+
+#[test]
+fn generated_indexes_at_reads_the_domain_root_and_falls_back_to_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // No MANIFEST at all.
+    assert_eq!(generated_indexes_at(root), GeneratedIndexes::Local);
+
+    // An unparseable one.
+    std::fs::write(root.join("MANIFEST.md"), "---\nnot: [valid\n").unwrap();
+    assert_eq!(generated_indexes_at(root), GeneratedIndexes::Local);
+
+    // One that declares nothing.
+    std::fs::write(root.join("MANIFEST.md"), manifest_declaring(None)).unwrap();
+    assert_eq!(generated_indexes_at(root), GeneratedIndexes::Local);
+
+    // And one that declares the listings travel.
+    std::fs::write(root.join("MANIFEST.md"), manifest_declaring(Some("shared"))).unwrap();
+    assert_eq!(generated_indexes_at(root), GeneratedIndexes::Shared);
 }

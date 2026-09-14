@@ -53,9 +53,10 @@ pub use index::{
     is_reserved_path, render_index,
 };
 pub use manifest::{
-    ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,
-    ProvisioningSection, TagAliasDecl, TagAliasProblem, TagAliasProblemKind, TagAliasSection,
-    append_tag_alias, in_root_artifact_dirs, manifest_template, tag_alias_pairs,
+    ArtifactType, GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, ProblemKind, ProvisioningDecl,
+    ProvisioningProblem, ProvisioningSection, TagAliasDecl, TagAliasProblem, TagAliasProblemKind,
+    TagAliasSection, append_tag_alias, generated_indexes_at, in_root_artifact_dirs,
+    manifest_template, tag_alias_pairs,
 };
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use path::fold_path_case;

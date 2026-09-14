@@ -6,13 +6,16 @@
 //! filter, the same SHA-256 hex encoding) except that every non-hidden file
 //! is included regardless of extension: assets, `.crystalline.yaml` and any
 //! other file that lives alongside the engrams travels with the domain, not
-//! just markdown. This is pure detection with no side effects; a later task
+//! just markdown. Which paths take part at all is one predicate,
+//! [`participates_in_change_detection`], asked of the walk and of the base
+//! snapshot alike. This is pure detection with no side effects; a later task
 //! decides what to do with the result (open a share proposal, warn about
 //! files too large to share).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crystalline_core::GeneratedIndexes;
 use walkdir::WalkDir;
 
 use crate::error::RemoteError;
@@ -153,8 +156,11 @@ impl LocalChanges {
 ///   itself is never pruned, even if its own name starts with a dot.
 /// - `log.md` is skipped at any depth: an append-only activity log is written
 ///   rather than derived, and sharing one would collide on every line.
-///   `index.md` is NOT skipped - the generated directory index travels with the
-///   domain so the team repository stays browsable (see [`is_excluded_path`]).
+///   `index.md` is skipped too unless the domain declares
+///   [`GeneratedIndexes::Shared`], and when it is skipped it is skipped on
+///   BOTH sides, the walk and the base snapshot (see
+///   [`participates_in_change_detection`], which says why that is not
+///   optional).
 /// - every non-hidden file is included regardless of extension.
 /// - a file larger than [`MAX_SHARED_FILE_BYTES`] is reported in
 ///   `skipped_large` instead of being hashed or classified as a change.
@@ -163,7 +169,9 @@ impl LocalChanges {
 ///   size and digest; content that still matches (a file touched or rewritten
 ///   with identical bytes, whatever its new mtime) is not a change at all,
 ///   and anything else is [`LocalChange::Modified`].
-/// - a base entry with no file on disk is [`LocalChange::Deleted`], unless
+/// - a base entry for a path that takes part in detection and has no file on
+///   disk is [`LocalChange::Deleted`]; a base entry for a path that does not
+///   take part is nothing at all, whether or not the file is there, unless
 ///   another base entry differing from it only in case IS on disk, in which
 ///   case nothing is reported: the two cannot be told apart on a
 ///   case-insensitive filesystem, and offering to delete one of them is
@@ -182,6 +190,17 @@ pub fn detect_local_changes(
     domain_root: &Path,
     base: &BTreeMap<String, BaseStamp>,
 ) -> Result<LocalChanges, RemoteError> {
+    detect_local_changes_with(domain_root, base, GeneratedIndexes::Shared)
+}
+
+/// [`detect_local_changes`] with the domain's generated-index policy supplied
+/// rather than read: the pure half, whose only IO is reading the files it
+/// walks.
+pub fn detect_local_changes_with(
+    domain_root: &Path,
+    base: &BTreeMap<String, BaseStamp>,
+    indexes: GeneratedIndexes,
+) -> Result<LocalChanges, RemoteError> {
     let mut changes = Vec::new();
     let mut skipped_large = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -194,6 +213,26 @@ pub fn detect_local_changes(
     // reported deleted.
     let mut unmatched: Vec<(String, u64, Option<String>)> = Vec::new();
 
+    // The base snapshot, narrowed to the paths that take part in change
+    // detection, and narrowed HERE so every comparison below inherits it: the
+    // exact-match lookup in the walk, the case-folding pass, and above all the
+    // subtraction at the end that turns an unseen base key into a deletion.
+    //
+    // This is the other half of the symmetry
+    // [`participates_in_change_detection`] describes, and it is the half that
+    // is easy to leave out, because filtering the walk alone looks like it
+    // already did the job. It does not: the walk stops seeing the file and the
+    // subtraction keeps expecting it, so every generated index a repository
+    // pulled before the switch existed turns into a proposed deletion of a
+    // file that is right there on disk, on every share, forever. Shadowing the
+    // parameter is deliberate - there is no unfiltered map left in scope to
+    // reach for by accident.
+    let base: BTreeMap<&str, &BaseStamp> = base
+        .iter()
+        .filter(|(rel, _)| participates_in_change_detection(rel, indexes))
+        .map(|(rel, stamp)| (rel.as_str(), stamp))
+        .collect();
+
     for entry in WalkDir::new(domain_root)
         .into_iter()
         .filter_entry(|e| e.depth() == 0 || !is_hidden(e.file_name().to_string_lossy().as_ref()))
@@ -205,27 +244,26 @@ pub fn detect_local_changes(
         if !entry.file_type().is_file() {
             continue;
         }
-        let fname = entry.file_name().to_string_lossy();
-        if is_excluded_name(&fname) {
+        let rel = rel_path(domain_root, entry.path());
+        if !participates_in_change_detection(&rel, indexes) {
             continue;
         }
 
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        let rel = rel_path(domain_root, entry.path());
         let size = meta.len();
         seen.insert(rel.clone());
 
         if size > MAX_SHARED_FILE_BYTES {
-            if !base.contains_key(&rel) {
+            if !base.contains_key(rel.as_str()) {
                 unmatched.push((rel.clone(), size, None));
             }
             skipped_large.push((rel, size));
             continue;
         }
 
-        match base.get(&rel) {
+        match base.get(rel.as_str()) {
             Some(stamp) => {
                 let bytes = std::fs::read(entry.path())?;
                 let sha256 = sha256_hex(&bytes);
@@ -306,7 +344,7 @@ pub fn detect_local_changes(
     // same file and the deliberate case is one rename that has to be made
     // again. A missed change costs a later sync, a phantom deletion costs
     // somebody their work.
-    let mut folded_base: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    let mut folded_base: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for key in base.keys() {
         folded_base.entry(fold_case(key)).or_default().push(key);
     }
@@ -324,11 +362,11 @@ pub fn detect_local_changes(
             .filter(|keys| keys.len() == 1)
             .filter(|_| folded_disk.get(&folded) == Some(&1))
             .map(|keys| keys[0])
-            .filter(|key| !seen.contains(key.as_str()));
+            .filter(|key| !seen.contains(*key));
 
         if let Some(key) = claim {
-            adopted.insert(key.as_str());
-            disk_paths.insert(key.clone(), rel.clone());
+            adopted.insert(key);
+            disk_paths.insert(key.to_string(), rel.clone());
         }
 
         match (claim, sha256) {
@@ -343,10 +381,10 @@ pub fn detect_local_changes(
                 // the spelling that does open, so the share reads the file
                 // that exists while the proposal writes the name the
                 // repository knows.
-                let stamp = &base[key];
+                let stamp = base[key];
                 if stamp.size != *size || stamp.sha256 != *sha256 {
                     changes.push(LocalChange::Modified {
-                        path: key.clone(),
+                        path: key.to_string(),
                         sha256: sha256.clone(),
                     });
                 }
@@ -384,16 +422,15 @@ pub fn detect_local_changes(
     // is indistinguishable from it on this machine is right there.
     let removed_but_for_case: BTreeSet<&str> = folded_base
         .values()
-        .filter(|keys| keys.len() > 1 && keys.iter().any(|k| seen.contains(k.as_str())))
-        .flat_map(|keys| keys.iter().map(|k| k.as_str()))
+        .filter(|keys| keys.len() > 1 && keys.iter().any(|k| seen.contains(*k)))
+        .flat_map(|keys| keys.iter().copied())
         .collect();
 
     for rel in base.keys() {
-        if !seen.contains(rel)
-            && !adopted.contains(rel.as_str())
-            && !removed_but_for_case.contains(rel.as_str())
-        {
-            changes.push(LocalChange::Deleted { path: rel.clone() });
+        if !seen.contains(*rel) && !adopted.contains(rel) && !removed_but_for_case.contains(rel) {
+            changes.push(LocalChange::Deleted {
+                path: (*rel).to_string(),
+            });
         }
     }
 
@@ -484,37 +521,59 @@ pub(crate) fn is_hidden_path(rel_path: &str) -> bool {
     rel_path.split('/').any(is_hidden)
 }
 
-/// The full "never travels with a domain" rule: a hidden path, or the OKF
-/// reserved log file (`log.md`).
+/// The fixed "never travels with a domain, whatever it declares" rule: a
+/// hidden path, or the OKF reserved log file (`log.md`).
 ///
 /// The two reserved names part company here. `log.md` is an append-only
 /// activity log, written rather than derived, and two members appending to
-/// their own copies would collide on every line, so it never travels.
-/// `index.md` is generated from the files it lists, and a team repository whose
-/// folders carry no index is not browsable on the forge at all - so it does
-/// travel, as an ordinary entry in snapshots, share trees and layer records.
-/// What keeps that convergent rather than a tug of war is that the local
-/// generator stays the single authority on its content: a pull records the
-/// origin's copy in the base snapshot and never writes it to disk (see
-/// [`crate::ops::pull`]), so the next share simply carries the locally
-/// generated listing upstream.
+/// their own copies would collide on every line, so it never travels, and no
+/// declaration can make it. `index.md` is generated from the files it lists,
+/// so both answers are defensible and the domain chooses between them in its
+/// MANIFEST: see [`participates_in_change_detection`] for the switch and
+/// [`crystalline_core::GeneratedIndexes`] for the trade.
 ///
-/// Both the walk here (through [`is_excluded_name`], which must agree with
-/// this) and every ingestion boundary apply this same rule, so an excluded
-/// file never lands in a base snapshot the walk cannot see again.
+/// This fixed rule is what every INGESTION boundary applies -
+/// [`crate::archive::extract_tarball`] and [`crate::ops`]'s compare-path
+/// filter - and it deliberately does not consult the switch. A pull records
+/// the origin's copy of an index in the base snapshot either way, and never
+/// writes it over the local file (see [`crate::ops::pull`]): with the switch
+/// at `shared` that is what lets the next share carry the locally generated
+/// listing upstream, and with it at `local` the recorded entry is simply
+/// inert, because detection skips that key on both sides. The two ingestion
+/// paths also have to agree with each other about what belongs to a domain,
+/// and a tarball extraction has no MANIFEST to consult yet in any case.
 pub(crate) fn is_excluded_path(rel_path: &str) -> bool {
     is_hidden_path(rel_path)
         || (crystalline_core::is_reserved_path(rel_path)
             && !crystalline_core::is_index_path(rel_path))
 }
 
-/// [`is_excluded_path`]'s rule stated over a bare filename, for the walk, which
-/// meets each name on its own rather than as a whole path. The two must always
-/// agree: a name this admits and that path rule rejects would be stamped into a
-/// base snapshot the walk can never see again.
-fn is_excluded_name(name: &str) -> bool {
-    is_hidden(name)
-        || (crystalline_core::is_reserved_file(name) && !crystalline_core::is_index_file(name))
+/// **The one rule deciding whether a path takes part in change detection at
+/// all**, for a domain whose generated-index policy is `indexes`. A path this
+/// rejects is never an addition, never a modification and never a deletion: it
+/// is not this domain's business, in either direction.
+///
+/// [`is_excluded_path`] is the fixed half of it - hidden paths and the
+/// activity log, which never travel whatever a domain declares. The switchable
+/// half is the generated directory index: it takes part only when the domain
+/// declares [`GeneratedIndexes::Shared`].
+///
+/// **Both the walk and the base snapshot must go through this, and a reader
+/// who is about to apply it to only one of them should stop.** Deletions are
+/// derived by subtraction: every base-snapshot key the walk did not see is
+/// reported [`LocalChange::Deleted`]. Filter the walk alone and every index
+/// already recorded in a base snapshot - which is every index in every
+/// repository that pulled one before the switch existed - becomes a proposed
+/// deletion, on the first share and on every share after it, forever. That is
+/// the phantom-deletion class: a share one click away from removing files
+/// upstream that are sitting right there on disk. The symmetry is what makes
+/// an upgraded repository quiet instead: the walk skips the index, the base
+/// comparison skips the same key, and nothing is proposed either way.
+pub(crate) fn participates_in_change_detection(rel_path: &str, indexes: GeneratedIndexes) -> bool {
+    if is_excluded_path(rel_path) {
+        return false;
+    }
+    indexes == GeneratedIndexes::Shared || !crystalline_core::is_index_path(rel_path)
 }
 
 /// Two paths' case-insensitive identity: what macOS and Windows treat as one
@@ -550,6 +609,9 @@ mod tests {
     use super::*;
     use crate::state::BaseStamp;
 
+    #[allow(unused_imports)]
+    use crystalline_core::GeneratedIndexes;
+
     fn stamp_for(bytes: &[u8]) -> BaseStamp {
         BaseStamp {
             sha256: crate::state::sha256_hex(bytes),
@@ -563,6 +625,185 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Detection for a domain that keeps its generated indexes local: the
+    /// default, and what every MANIFEST that declares nothing gets.
+    fn local(dir: &Path, base: &BTreeMap<String, BaseStamp>) -> LocalChanges {
+        detect_local_changes_with(dir, base, GeneratedIndexes::Local).unwrap()
+    }
+
+    /// Detection for a domain that lets them travel.
+    fn shared(dir: &Path, base: &BTreeMap<String, BaseStamp>) -> LocalChanges {
+        detect_local_changes_with(dir, base, GeneratedIndexes::Shared).unwrap()
+    }
+
+    /// A base snapshot of `(path, content)` pairs, the content stamped the way
+    /// a pull would have recorded it.
+    fn base_of(entries: &[(&str, &[u8])]) -> BTreeMap<String, BaseStamp> {
+        entries
+            .iter()
+            .map(|(rel, bytes)| ((*rel).to_string(), stamp_for(bytes)))
+            .collect()
+    }
+
+    // --- the generated-index switch ----------------------------------------
+
+    #[test]
+    fn an_upgraded_repository_proposes_nothing_about_an_index_it_already_recorded() {
+        // Day one of every repository that pulled an index before the switch
+        // existed: the base snapshot holds `runbooks/index.md`, the file is on
+        // disk, and the domain declares nothing, so the policy is `local`. The
+        // share must propose NOTHING about it in either direction.
+        //
+        // This is the test that fails loudest when the exclusion is applied to
+        // the walk alone: the walk stops seeing the index, the base-key loop
+        // still expects it, and the difference is reported as a deletion of a
+        // file that is sitting right there.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "runbooks/index.md", b"# Contents");
+        write(dir.path(), "runbooks/a.md", b"alpha");
+        let base = base_of(&[
+            ("runbooks/index.md", b"# Contents"),
+            ("runbooks/a.md", b"alpha"),
+        ]);
+
+        let result = local(dir.path(), &base);
+
+        assert_eq!(
+            result.changes,
+            Vec::new(),
+            "an index recorded in the base snapshot and present on disk is not a change"
+        );
+    }
+
+    #[test]
+    fn a_locally_kept_index_is_not_a_deletion_even_once_it_leaves_the_disk() {
+        // The same subtraction, with the file actually gone. Still nothing:
+        // the path does not take part in detection at all, so there is no
+        // deletion to propose and no upstream copy to chase.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "runbooks/a.md", b"alpha");
+        let base = base_of(&[
+            ("index.md", b"# Contents"),
+            ("runbooks/index.md", b"# Contents"),
+            ("runbooks/a.md", b"alpha"),
+        ]);
+
+        let result = local(dir.path(), &base);
+
+        assert_eq!(result.changes, Vec::new());
+    }
+
+    #[test]
+    fn a_locally_kept_index_is_neither_an_addition_nor_a_modification() {
+        // The other two directions, both with the engram beside the listing
+        // proving detection still works: a freshly generated index with no base
+        // entry, and a regenerated one whose recorded content moved on.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "index.md",
+            b"# Contents\n\n* [A](runbooks/a.md)",
+        );
+        write(dir.path(), "runbooks/index.md", b"# Contents, regenerated");
+        write(dir.path(), "runbooks/a.md", b"alpha, edited");
+        let base = base_of(&[
+            ("runbooks/index.md", b"# Contents"),
+            ("runbooks/a.md", b"alpha"),
+        ]);
+
+        let result = local(dir.path(), &base);
+
+        assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+        assert_eq!(result.changes[0].path(), "runbooks/a.md");
+        assert_eq!(result.index_count(), 0);
+        assert_eq!(result.substantive_count(), 1);
+    }
+
+    #[test]
+    fn detection_is_quiet_about_a_local_index_however_often_it_is_asked() {
+        // "On the first share and on every share after." Detection carries no
+        // state, so the pin is that a second pass over the same tree and the
+        // same base snapshot - which is what a domain sits at once a share
+        // carried its engrams and left the listings behind - says nothing new.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", b"# Contents");
+        write(dir.path(), "a.md", b"alpha");
+        let base = base_of(&[("index.md", b"# Contents, as pulled"), ("a.md", b"alpha")]);
+
+        assert_eq!(local(dir.path(), &base).changes, Vec::new());
+        write(dir.path(), "index.md", b"# Contents, regenerated again");
+        assert_eq!(local(dir.path(), &base).changes, Vec::new());
+    }
+
+    #[test]
+    fn a_shared_index_still_travels_in_every_direction() {
+        // The switch the other way round is today's behaviour exactly: an
+        // index is an ordinary entry, added, modified and deleted like any
+        // other file.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", b"# Contents, regenerated");
+        write(dir.path(), "runbooks/index.md", b"# Contents, new");
+        let base = base_of(&[
+            ("index.md", b"# Contents"),
+            ("archive/index.md", b"# Contents"),
+        ]);
+
+        let result = shared(dir.path(), &base);
+
+        let described: Vec<(&str, &str)> = result
+            .changes
+            .iter()
+            .map(|c| {
+                let kind = match c {
+                    LocalChange::Added { .. } => "added",
+                    LocalChange::Modified { .. } => "modified",
+                    LocalChange::Deleted { .. } => "deleted",
+                };
+                (c.path(), kind)
+            })
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                ("archive/index.md", "deleted"),
+                ("index.md", "modified"),
+                ("runbooks/index.md", "added"),
+            ]
+        );
+    }
+
+    #[test]
+    fn participation_is_the_same_question_for_a_walked_path_and_a_base_key() {
+        // The predicate itself, stated once so a later reader can see both
+        // halves of the switch at a glance.
+        for indexes in [GeneratedIndexes::Local, GeneratedIndexes::Shared] {
+            assert!(participates_in_change_detection("runbooks/a.md", indexes));
+            assert!(participates_in_change_detection(
+                ".crystalline.yaml",
+                indexes
+            ));
+            assert!(!participates_in_change_detection("log.md", indexes));
+            assert!(!participates_in_change_detection(
+                "runbooks/log.md",
+                indexes
+            ));
+            assert!(!participates_in_change_detection(
+                ".github/workflows/ci.yml",
+                indexes
+            ));
+        }
+        for rel in ["index.md", "runbooks/index.md"] {
+            assert!(!participates_in_change_detection(
+                rel,
+                GeneratedIndexes::Local
+            ));
+            assert!(participates_in_change_detection(
+                rel,
+                GeneratedIndexes::Shared
+            ));
+        }
     }
 
     #[test]
@@ -735,15 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn the_walks_name_rule_agrees_with_the_path_rule() {
-        assert!(!is_excluded_name("index.md"));
-        assert!(is_excluded_name("log.md"));
-        assert!(is_excluded_name(".gitignore"));
-        assert!(!is_excluded_name("restart.md"));
-        assert!(!is_excluded_name(".crystalline.yaml"));
-    }
-
-    #[test]
     fn generated_indexes_are_walked_like_any_other_file_and_logs_are_not() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "index.md", b"# Contents");
@@ -751,7 +983,7 @@ mod tests {
         write(dir.path(), "runbooks/log.md", b"* something happened");
         write(dir.path(), "runbooks/restart.md", b"restart it");
 
-        let result = detect_local_changes(dir.path(), &BTreeMap::new()).unwrap();
+        let result = shared(dir.path(), &BTreeMap::new());
         let mut paths: Vec<&str> = result.changes.iter().map(|c| c.path()).collect();
         paths.sort();
         assert_eq!(
@@ -767,7 +999,7 @@ mod tests {
         write(dir.path(), "runbooks/index.md", b"# Contents");
         write(dir.path(), "runbooks/restart.md", b"restart it");
 
-        let result = detect_local_changes(dir.path(), &BTreeMap::new()).unwrap();
+        let result = shared(dir.path(), &BTreeMap::new());
         assert_eq!(result.changes.len(), 3);
         assert_eq!(result.substantive_count(), 1);
         assert_eq!(result.index_count(), 2);
@@ -778,7 +1010,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "index.md", b"# Contents");
 
-        let result = detect_local_changes(dir.path(), &BTreeMap::new()).unwrap();
+        let result = shared(dir.path(), &BTreeMap::new());
         assert_eq!(result.substantive_count(), 0);
         assert_eq!(result.index_count(), 1);
         assert!(result.changes[0].is_generated_index());
