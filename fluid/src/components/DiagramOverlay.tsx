@@ -31,15 +31,16 @@ import {
 } from "lucide-react";
 import type { PanzoomObject } from "@panzoom/panzoom";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type {
-  KeyboardEvent,
-  PointerEvent,
-  ReactElement,
-  RefObject,
-} from "react";
+import type { KeyboardEvent, ReactElement, RefObject } from "react";
 import { createPortal } from "react-dom";
 
 import { FOCUS_RING } from "./primitives";
+
+/**
+ * What Tab may land on inside this layer. Wider than the bar's own buttons,
+ * because the diagram's markup can carry links of its own.
+ */
+const FOCUS_STOPS = 'button, a[href], [tabindex]:not([tabindex="-1"])';
 
 /** How far an arrow key moves the drawing, in pixels of the stage. */
 const ARROW_STEP_PX = 40;
@@ -167,6 +168,28 @@ export default function DiagramOverlay({
         // to the drawing, so a drag anywhere in the empty space pans too.
         canvas: true,
         cursor: "grab",
+        // Where the press is recorded, and it has to be here rather than on a
+        // React `onPointerDown`. With `canvas: true` panzoom binds its own
+        // `pointerdown` on the stage and its default start handler calls
+        // `stopPropagation`, so the event never reaches the delegated listener
+        // React keeps on the portal's container: a React handler would never
+        // run, `pressedAt` would stay null, and the guard below would skip
+        // itself. The two lines after the record are that default handler,
+        // repeated because passing this option replaces it.
+        handleStartEvent: (event: Event) => {
+          const point = event as Partial<MouseEvent>;
+          // Read structurally rather than through `instanceof`: panzoom hands
+          // this whatever start event the browser gave it, and a press whose
+          // position cannot be read records nothing rather than leaving the
+          // previous one standing.
+          pressedAt.current =
+            typeof point.clientX === "number" &&
+            typeof point.clientY === "number"
+              ? { x: point.clientX, y: point.clientY }
+              : null;
+          event.preventDefault();
+          event.stopPropagation();
+        },
       });
       instanceRef.current = instance;
       fit(instance);
@@ -246,20 +269,32 @@ export default function DiagramOverlay({
         return;
       }
       if (event.key === "Tab") {
-        // The trap: everything focusable in here is a button on the bar, so
-        // the two ends of that row are the two places Tab wraps around.
+        // The trap. The stops are not only the bar's buttons: the hosted
+        // markup is mermaid's own output, and a diagram that uses a link or a
+        // click directive puts an `<a href>` inside this dialog. A ring that
+        // knew about buttons alone would let Tab walk out of an `aria-modal`
+        // layer from one of those, which makes the modal promise false.
         const stops = Array.from(
-          overlayRef.current?.querySelectorAll<HTMLElement>("button") ?? [],
+          overlayRef.current?.querySelectorAll<HTMLElement>(FOCUS_STOPS) ?? [],
         );
         const first = stops.at(0);
         const last = stops.at(-1);
         if (first === undefined || last === undefined) {
           return;
         }
-        if (event.shiftKey && document.activeElement === first) {
+        const on = document.activeElement;
+        if (on === null || !stops.includes(on as HTMLElement)) {
+          // Focus is somewhere in here that is not a stop - the dialog itself
+          // after a click on the bar's empty half, say - so Tab goes to an
+          // end rather than to wherever the document would have taken it.
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus();
+          return;
+        }
+        if (event.shiftKey && on === first) {
           event.preventDefault();
           last.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
+        } else if (!event.shiftKey && on === last) {
           event.preventDefault();
           first.focus();
         }
@@ -310,10 +345,6 @@ export default function DiagramOverlay({
     [fit, onClose],
   );
 
-  const onStagePointerDown = useCallback((event: PointerEvent<HTMLElement>) => {
-    pressedAt.current = { x: event.clientX, y: event.clientY };
-  }, []);
-
   /**
    * The empty space around the drawing is the way out, the way a lightbox's
    * backdrop is. Two conditions: the click landed on the stage itself rather
@@ -352,6 +383,11 @@ export default function DiagramOverlay({
       ref={overlayRef}
       role="dialog"
       aria-modal="true"
+      // Focusable itself, so a click on the bar's empty half lands here rather
+      // than on `document.body`: the key handler below is on this element, and
+      // focus outside it would take Escape, the zoom keys and the arrows with
+      // it. -1 keeps it out of the Tab order all the same.
+      tabIndex={-1}
       aria-label="Diagram, full window"
       // Opaque rather than a translucent scrim: what is behind is a page of
       // prose, and a diagram's own thin lines read badly over it.
@@ -424,7 +460,6 @@ export default function DiagramOverlay({
         // `touch-none` hands every touch gesture to the pan-and-zoom instance,
         // pinch included; the browser's own panning here would fight it.
         className="relative flex flex-1 touch-none items-center justify-center overflow-hidden"
-        onPointerDown={onStagePointerDown}
         onClick={onStageClick}
         onDoubleClick={onStageDoubleClick}
       >

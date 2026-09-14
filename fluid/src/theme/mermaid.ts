@@ -88,6 +88,19 @@ const VARIABLES = {
  *
  * `strict` is mermaid's own sanitizing mode: a diagram is drawn from text
  * somebody wrote into the knowledge base, and the labels in it are text.
+ *
+ * `look` and `layout` are here because mermaid 12 moved both defaults, and a
+ * default that moves once will move again. The new `neo` look paints node
+ * strokes with a gradient on a theme that sets `useGradient` - which `base`,
+ * the only theme that honours the variables above, does - so every diagram
+ * already in the knowledge base would have quietly stopped drawing in the
+ * accent border this module names. The new default layout engine is ELK,
+ * which re-lays out flowchart, state, class, ER, requirement and use-case
+ * diagrams: a drawing somebody arranged and then wrote about in the prose
+ * beside it would come back arranged differently, and it would arrive with
+ * ELK's own chunk on the diagram path. Both are named rather than inherited
+ * so what an engram drew yesterday is what it draws today; adopting either
+ * new default is a decision to take deliberately, with the engrams in view.
  */
 export function mermaidConfig(dark: boolean): MermaidConfig {
   return {
@@ -95,6 +108,8 @@ export function mermaidConfig(dark: boolean): MermaidConfig {
     securityLevel: "strict",
     suppressErrorRendering: true,
     theme: "base",
+    look: "classic",
+    layout: "dagre",
     themeVariables: dark ? { ...VARIABLES.dark } : { ...VARIABLES.light },
   };
 }

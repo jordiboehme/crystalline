@@ -20,6 +20,35 @@ import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
 import { unclampDiagram, unclampWideDiagram } from "./wideDiagram";
 
+/**
+ * The scroll container's own classes, the ones that hold whether or not there
+ * is anything to scroll to.
+ *
+ * `max-w-full` is deliberately absent: it is a clamp of the same kind
+ * mermaid's inline `max-width` was, so leaving it on would undo the unclamp
+ * and nothing would change on screen. `shrink-0` is here for the same reason
+ * one step further on: a flex item shrinks to its line by default, which
+ * quietly scales the diagram back down to the column width and leaves the
+ * container with nothing to scroll.
+ *
+ * The rest is the touch contract. A horizontal scroller nested in a scrolling
+ * page is the common case on a phone, where nearly every diagram is wider than
+ * the viewport: `overscroll-x-contain` keeps a fling from walking the page or
+ * firing the browser's back gesture, and the `touch-pan-*` trio keeps both
+ * axes (and pinch zoom) pannable so a swipe that starts over the diagram can
+ * still scroll the page.
+ */
+const SCROLLER =
+  "flex touch-pan-x touch-pan-y touch-pinch-zoom justify-start overflow-x-auto overscroll-x-contain rounded [&_svg]:h-auto [&_svg]:shrink-0";
+
+/**
+ * And the ones that only make sense once it does: the mask that fades the
+ * scrollable edge so a diagram wider than its container reads as scrollable
+ * rather than as cut off, and the focus ring for the tab stop it becomes.
+ */
+const SCROLLABLE =
+  "[mask-image:linear-gradient(to_right,black_calc(100%_-_1.5rem),transparent)] focus-visible:ring-2 focus-visible:ring-accent-600 focus-visible:outline-none dark:focus-visible:ring-accent-400";
+
 export default function MermaidDiagram({ source }: { source: string }) {
   const { resolved } = useTheme();
   // `useId` is stable across renders and unique per instance, which is what
@@ -36,6 +65,8 @@ export default function MermaidDiagram({ source }: { source: string }) {
   const [fullWidth, setFullWidth] = useState(false);
   const [fullWindow, setFullWindow] = useState(false);
   const fullWindowRef = useRef<HTMLButtonElement>(null);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [overflowing, setOverflowing] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -63,6 +94,48 @@ export default function MermaidDiagram({ source }: { source: string }) {
     };
   }, [id, source, resolved]);
 
+  // The markup is mermaid's own output, produced by its sanitizing mode from
+  // the source above; nothing from the document reaches here unparsed.
+  //
+  // Full width forces the path the measurement below chooses on its own past
+  // the threshold: the same unclamp, the same scroll container, asked for by
+  // the reader rather than decided by the drawing's size.
+  const wide = drawn !== null && (fullWidth || drawn.wide);
+  const markup =
+    drawn === null ? "" : fullWidth ? unclampDiagram(drawn.svg) : drawn.svg;
+
+  // Whether the container actually has anything to scroll to, which is the
+  // one thing neither the markup nor the measurement can answer: it depends
+  // on the column, and the column depends on the window, the sidebar and the
+  // frame's own full-width mode. Everything the scroll container says about
+  // itself hangs off this - the region role, the tab stop, the name that
+  // promises sideways scrolling and the mask that fades the scrollable edge -
+  // because a named, focusable landmark that announces a scroll and then does
+  // nothing is worse than no landmark, and a fade over a diagram that ends
+  // where it ends reads as a diagram cut off.
+  //
+  // A pixel of tolerance: both numbers are rounded, so a drawing that fills
+  // its box exactly can report one more than it has.
+  useEffect(() => {
+    const container = scrollerRef.current;
+    if (container === null) {
+      setOverflowing(false);
+      return;
+    }
+    const measure = () => {
+      setOverflowing(container.scrollWidth - container.clientWidth > 1);
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(container);
+    return () => {
+      observer.disconnect();
+    };
+  }, [wide, markup]);
+
   if (drawn === null) {
     return (
       <pre className="overflow-x-auto font-mono text-xs text-slate-500 dark:text-slate-400">
@@ -70,14 +143,6 @@ export default function MermaidDiagram({ source }: { source: string }) {
       </pre>
     );
   }
-  // The markup is mermaid's own output, produced by its sanitizing mode from
-  // the source above; nothing from the document reaches here unparsed.
-  //
-  // Full width forces the path the measurement below chooses on its own past
-  // the threshold: the same unclamp, the same scroll region, asked for by the
-  // reader rather than decided by the drawing's size.
-  const wide = fullWidth || drawn.wide;
-  const markup = fullWidth ? unclampDiagram(drawn.svg) : drawn.svg;
   return (
     // `group` and `relative` are the toolbar's: it floats in this corner and
     // shows itself when the pointer or the keyboard is anywhere in here.
@@ -91,28 +156,12 @@ export default function MermaidDiagram({ source }: { source: string }) {
         // leaves the document. Seeing a huge diagram whole is the thing it
         // does not give, and that is what the full-window overlay is for -
         // opened deliberately, never in the reader's way.
-        //
-        // `max-w-full` is deliberately absent: it is a clamp of the same kind
-        // mermaid's inline `max-width` was, so leaving it on would undo the
-        // unclamp and nothing would change on screen. `shrink-0` is here for
-        // the same reason one step further on: a flex item shrinks to its line
-        // by default, which quietly scales the diagram back down to the column
-        // width and leaves the container with nothing to scroll.
-        //
-        // The rest of the class list is the touch contract. A horizontal
-        // scroller nested in a scrolling page is the common case on a phone,
-        // where nearly every diagram is wider than the viewport:
-        // `overscroll-x-contain` keeps a fling from walking the page or firing
-        // the browser's back gesture, the `touch-pan-*` trio keeps both axes
-        // (and pinch zoom) pannable so a swipe that starts over the diagram can
-        // still scroll the page, and the mask fades the scrollable edge so a
-        // diagram wider than its container reads as scrollable rather than as
-        // cut off.
         <div
-          role="region"
-          aria-label="Diagram, scrollable sideways"
-          tabIndex={0}
-          className="flex touch-pan-x touch-pan-y touch-pinch-zoom justify-start overflow-x-auto overscroll-x-contain rounded [mask-image:linear-gradient(to_right,black_calc(100%_-_1.5rem),transparent)] focus-visible:ring-2 focus-visible:ring-accent-600 focus-visible:outline-none dark:focus-visible:ring-accent-400 [&_svg]:h-auto [&_svg]:shrink-0"
+          ref={scrollerRef}
+          role={overflowing ? "region" : undefined}
+          aria-label={overflowing ? "Diagram, scrollable sideways" : undefined}
+          tabIndex={overflowing ? 0 : undefined}
+          className={`${SCROLLER}${overflowing ? ` ${SCROLLABLE}` : ""}`}
           dangerouslySetInnerHTML={{ __html: markup }}
         />
       ) : (

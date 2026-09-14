@@ -11,10 +11,10 @@
  * that will not parse shows the source the author wrote.
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import mermaid from "mermaid";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
 import MermaidDiagram from "./MermaidDiagram";
@@ -42,6 +42,43 @@ vi.mock("mermaid", () => ({
   },
 }));
 
+/**
+ * Whether the diagram's container overflows is a layout question, and jsdom
+ * answers every layout question with zero. These two make the answer the
+ * test's: the measurements the component reads, and a resize observer whose
+ * callbacks the test can fire, so both states are pinned rather than one.
+ */
+const resizes: (() => void)[] = [];
+
+class TestResizeObserver {
+  constructor(callback: () => void) {
+    resizes.push(callback);
+  }
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+function measuresAt(scrollWidth: number, clientWidth: number) {
+  for (const [name, value] of [
+    ["scrollWidth", scrollWidth],
+    ["clientWidth", clientWidth],
+  ] as const) {
+    Object.defineProperty(HTMLElement.prototype, name, {
+      configurable: true,
+      value,
+    });
+  }
+}
+
+function resized() {
+  act(() => {
+    for (const fire of resizes) {
+      fire();
+    }
+  });
+}
+
 const initialize = vi.mocked(mermaid.initialize);
 const renderDiagram = vi.mocked(mermaid.render);
 
@@ -57,12 +94,29 @@ beforeEach(() => {
   // The theme provider reads its preference out of storage on mount, so each
   // test starts from "system", which resolves to light here.
   localStorage.clear();
+  resizes.length = 0;
+  // Assigned rather than stubbed: the shared setup defines a do-nothing
+  // observer as a writable but non-configurable global, which `stubGlobal`
+  // cannot redefine.
+  globalThis.ResizeObserver =
+    TestResizeObserver as unknown as typeof ResizeObserver;
+  // The default for every test: a container with nothing to scroll to, which
+  // is what jsdom would have said on its own.
+  measuresAt(0, 0);
   initialize.mockClear();
   renderDiagram.mockClear();
   renderDiagram.mockResolvedValue({
     svg: "<svg data-diagram></svg>",
     diagramType: "flowchart-v2",
   });
+});
+
+const sharedResizeObserver = globalThis.ResizeObserver;
+
+afterEach(() => {
+  globalThis.ResizeObserver = sharedResizeObserver;
+  Reflect.deleteProperty(HTMLElement.prototype, "scrollWidth");
+  Reflect.deleteProperty(HTMLElement.prototype, "clientWidth");
 });
 
 describe("MermaidDiagram", () => {
@@ -133,6 +187,7 @@ describe("MermaidDiagram", () => {
   });
 
   it("lets a wide diagram scroll at its own size instead of shrinking", async () => {
+    measuresAt(1600, 654);
     renderDiagram.mockResolvedValue({
       svg: '<svg viewBox="0 0 1600 400" width="100%" style="max-width: 1600px;"><g/></svg>',
       diagramType: "flowchart-v2",
@@ -218,7 +273,46 @@ describe("MermaidDiagram", () => {
       expect(screen.queryByRole("button")).toBeNull();
     });
 
+    it("says nothing about scrolling when there is nothing to scroll to", async () => {
+      // The ruling routes every full-width diagram through the scroll
+      // container, including one narrower than the column. A container that
+      // cannot scroll is a plain box: no region role, no tab stop, no name
+      // promising sideways scrolling, and no mask fading an edge that is
+      // simply where the drawing ends.
+      const { container } = await drawn();
+      await userEvent.click(
+        screen.getByRole("button", { name: "Show at full width" }),
+      );
+      const wrapper = container.querySelector("svg")?.parentElement;
+      expect(wrapper?.getAttribute("role")).toBeNull();
+      expect(wrapper?.getAttribute("tabindex")).toBeNull();
+      expect(wrapper?.getAttribute("aria-label")).toBeNull();
+      expect(wrapper?.className).not.toContain("mask-image");
+      // Still the scroll container, so the moment it does overflow it can.
+      expect(wrapper?.className).toContain("overflow-x-auto");
+    });
+
+    it("becomes a named scroll region as soon as it does overflow", async () => {
+      const { container } = await drawn();
+      await userEvent.click(
+        screen.getByRole("button", { name: "Show at full width" }),
+      );
+      const wrapper = container.querySelector("svg")?.parentElement;
+      expect(wrapper?.getAttribute("role")).toBeNull();
+      // The column narrowed under it, which is the case only a resize can
+      // report: the markup did not change and neither did the measurement.
+      measuresAt(936, 654);
+      resized();
+      expect(wrapper?.getAttribute("role")).toBe("region");
+      expect(wrapper?.getAttribute("tabindex")).toBe("0");
+      expect(wrapper?.getAttribute("aria-label")).toBeTruthy();
+      expect(wrapper?.className).toContain("mask-image");
+    });
+
     it("hands the diagram its own width when full width is asked for", async () => {
+      // Measured as overflowing, because that is what this case is: a diagram
+      // the column cannot hold, in the scroll container that carries it.
+      measuresAt(936, 654);
       const { container } = await drawn();
       // Before: mermaid's scale-to-fit, clamped to the column.
       expect(container.querySelector("svg")?.getAttribute("width")).toBe(

@@ -14,7 +14,7 @@
  * every control is wired to the instance method it names.
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import Panzoom from "@panzoom/panzoom";
 import { useRef, useState } from "react";
@@ -40,6 +40,26 @@ const panzoom = vi.mocked(Panzoom);
 
 const DIAGRAM =
   '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;"><g id="drawing"/></svg>';
+
+/**
+ * A diagram with a link in it. Mermaid writes one wherever a node carries a
+ * `click` directive or a `href`, so the hosted markup can bring its own focus
+ * stops into a layer that promises to be modal.
+ */
+const LINKED =
+  '<svg viewBox="0 0 600 400"><g id="drawing"><a href="https://example.invalid"><text>Go</text></a></g></svg>';
+
+/** The options panzoom was constructed with, for the hooks handed to it. */
+function panzoomOptions(): { handleStartEvent?: (event: Event) => void } {
+  return panzoom.mock.calls[0]?.[1] ?? {};
+}
+
+/** A press, delivered the way panzoom delivers one: through its own start hook. */
+function press(x: number, y: number) {
+  const hook = panzoomOptions().handleStartEvent;
+  expect(hook).toBeTypeOf("function");
+  hook?.(new MouseEvent("pointerdown", { clientX: x, clientY: y }));
+}
 
 /**
  * The overlay as it is really used: a button opens it, the button is what it
@@ -150,6 +170,90 @@ describe("DiagramOverlay", () => {
     expect(drawing).not.toBeNull();
     await userEvent.click(drawing as Element);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  /**
+   * The press has to be recorded through panzoom's own start hook, not through
+   * a React `onPointerDown`. With `canvas: true` panzoom listens on the stage
+   * and its default start handler calls `stopPropagation`, so the event never
+   * reaches the listener React keeps on the portal's container: a React
+   * handler would never run and the guard below would quietly never apply.
+   */
+  it("records the press through the hook it hands panzoom", async () => {
+    await open();
+    expect(panzoomOptions().handleStartEvent).toBeTypeOf("function");
+    const event = new MouseEvent("pointerdown", { clientX: 10, clientY: 10 });
+    const prevented = vi.spyOn(event, "preventDefault");
+    const stopped = vi.spyOn(event, "stopPropagation");
+    panzoomOptions().handleStartEvent?.(event);
+    // The default behaviour panzoom would have done itself, kept.
+    expect(prevented).toHaveBeenCalled();
+    expect(stopped).toHaveBeenCalled();
+  });
+
+  it("stays open on the click that ends a drag", async () => {
+    await open();
+    press(120, 90);
+    fireEvent.click(screen.getByTestId("diagram-overlay-stage"), {
+      clientX: 260,
+      clientY: 150,
+    });
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("closes on a click that stayed where it was pressed", async () => {
+    await open();
+    press(120, 90);
+    fireEvent.click(screen.getByTestId("diagram-overlay-stage"), {
+      clientX: 122,
+      clientY: 91,
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
+
+  it("keeps the keys working when focus is on a link inside the diagram", async () => {
+    await open(LINKED);
+    const link = screen.getByRole("link");
+    link.focus();
+    expect(document.activeElement).toBe(link);
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
+
+  it("wraps Tab around the layer, the diagram's own links included", async () => {
+    await open(LINKED);
+    const link = screen.getByRole("link");
+    // The link is the last stop in document order, after the bar's buttons.
+    link.focus();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Zoom in" }),
+    );
+    await userEvent.tab({ shift: true });
+    expect(document.activeElement).toBe(link);
+  });
+
+  it("pulls focus back in when it is somewhere that is not a stop", async () => {
+    await open();
+    // A click on the bar's empty half lands on the dialog itself, which is
+    // focusable for exactly this reason.
+    const dialog = screen.getByRole("dialog");
+    dialog.focus();
+    expect(document.activeElement).toBe(dialog);
+    await userEvent.tab();
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Zoom in" }),
+    );
+    // And the keys still reach the handler from there.
+    dialog.focus();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
   });
 
   it("wires each control to the instance method it names", async () => {

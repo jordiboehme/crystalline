@@ -75,11 +75,18 @@ export default function DiagramToolbar({
 }: DiagramToolbarProps): ReactElement {
   return (
     <div
+      // `pointer-events-none` until it is revealed: an invisible element is
+      // still a hit target, and two 32px squares over the drawing's top-right
+      // corner would otherwise swallow clicks on whatever is under them - a
+      // node with a link in it, say. The reveal is the container's hover, not
+      // the toolbar's own, so handing the pointer back only once the group is
+      // hovered or focused within costs the reveal nothing.
+      //
       // `print:hidden` belongs with the rest: a printed page has no pointer, so
       // a browser that reads `hover: none` in print media would otherwise put
       // two buttons in the corner of every printed diagram. Chromium does not
       // (measured), and this is what makes that not a question.
-      className="absolute top-1 right-1 flex gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 print:hidden [@media(hover:none)]:opacity-100"
+      className="pointer-events-none absolute top-1 right-1 flex gap-1 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 print:hidden [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100"
       data-testid="diagram-toolbar"
     >
       <Action
