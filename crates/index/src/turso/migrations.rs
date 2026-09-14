@@ -82,6 +82,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain rebuild marker",
         sql: SCHEMA_V12,
     },
+    Migration {
+        version: 13,
+        label: "engram actor dimension",
+        sql: SCHEMA_V13,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -363,6 +368,72 @@ ALTER TABLE domain ADD COLUMN last_registered TEXT;
 // it rather than a half-built set, because a rebuild clears nothing.
 const SCHEMA_V12: &str = r#"
 ALTER TABLE domain ADD COLUMN rebuild_started TEXT;
+"#;
+
+// The actor dimension. Every engram row gains the actor it belongs to and a
+// tombstone flag: `actor = ''` is the base row - the one the domain's files on
+// disk say exists - and any other value is one actor's private draft of that
+// path, a full row in its own right so chunks, embeddings and graph rows key to
+// its id exactly as a base row's do. `tombstone` is that actor's draft deletion
+// of a base row: a row that says "not for me" without touching what is on disk.
+//
+// Both defaults are the base reading, so every row an upgrade finds comes out
+// of this migration as the base row it already was and nothing needs a resync.
+//
+// The two old uniqueness rules have to widen with the table, since one path and
+// one permalink may now carry one row per actor: `UNIQUE(domain_id, permalink)`
+// and `idx_engram_path` give way to `idx_engram_permalink_actor` and
+// `idx_engram_path_actor`. A table-level UNIQUE cannot be dropped in place in
+// this dialect, so the table is rebuilt by create-copy-swap: the copy carries
+// ids across verbatim, which is what keeps `observation`, `relation`, `link`,
+// `engram_tag` and `chunk` pointing at the rows they already point at. Their
+// own `REFERENCES engram(id)` clauses survive the swap by name (the drop
+// happens with foreign-key enforcement off, the default here, and the rename
+// puts the name back), and every index the old table carried is recreated
+// because they all die with the dropped table - the four from v1 and the
+// expression index v5 added, which is the one a reader is most likely to
+// forget, since nothing about the swap mentions it.
+const SCHEMA_V13: &str = r#"
+CREATE TABLE engram_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_id INTEGER NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    permalink TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    engram_type TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    recorded_at TEXT,
+    valid_from TEXT,
+    valid_to TEXT,
+    timestamp TEXT,
+    description TEXT,
+    content TEXT NOT NULL DEFAULT '',
+    metadata TEXT NOT NULL DEFAULT '{}',
+    mtime INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    tombstone INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT INTO engram_new (id, domain_id, path, permalink, title, engram_type, status,
+    recorded_at, valid_from, valid_to, timestamp, description, content, metadata,
+    mtime, size, sha256, actor, tombstone)
+SELECT id, domain_id, path, permalink, title, engram_type, status,
+    recorded_at, valid_from, valid_to, timestamp, description, content, metadata,
+    mtime, size, sha256, '', 0
+FROM engram;
+
+DROP TABLE engram;
+ALTER TABLE engram_new RENAME TO engram;
+
+CREATE UNIQUE INDEX idx_engram_permalink_actor ON engram(domain_id, permalink, actor);
+CREATE UNIQUE INDEX idx_engram_path_actor ON engram(domain_id, path, actor);
+CREATE INDEX idx_engram_current ON engram(status, valid_from, valid_to);
+CREATE INDEX idx_engram_type ON engram(engram_type);
+CREATE INDEX idx_engram_recorded ON engram(recorded_at);
+CREATE INDEX idx_engram_domain ON engram(domain_id);
+CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
 "#;
 
 const SCHEMA_V9: &str = r#"
@@ -791,6 +862,135 @@ mod tests {
         assert_eq!(
             names(&conn).await,
             vec!["foo".to_string(), "bar".to_string()]
+        );
+    }
+
+    /// The v13 widening of `engram`, over a database that already carries both
+    /// of the `domain` columns added since - which is the shape an upgrade
+    /// actually meets, and the one that matters: the swap rebuilds a table
+    /// whose children point at it by name, and a rebuild proven only over a
+    /// fresh schema proves nothing about the database in the field.
+    ///
+    /// Three claims are pinned here. Every base row survives with `actor = ''`
+    /// and `tombstone = 0`, so an upgrade needs no resync to keep reading what
+    /// it read before. The child rows keep pointing at the ids they pointed at,
+    /// because the swap preserves ids rather than reassigning them. And the two
+    /// actor-aware unique indexes replace the two the old table carried: one
+    /// path can now hold one row per actor, while a second row for the same
+    /// actor at that path is still refused.
+    #[tokio::test]
+    async fn v13_widens_engram_over_a_database_carrying_the_domain_columns() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for m in &MIGRATIONS[..12] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[12].version, 13, "the thirteenth migration is v13");
+
+        // A database in the field: the two `domain` columns v11 and v12 added
+        // are already there, and an engram with child rows hangs off it.
+        conn.execute_batch(
+            "INSERT INTO domain(id, name, path, last_registered, rebuild_started) \
+             VALUES (1,'d','/tmp/d','2026-09-14T00:00:00Z',NULL);\n\
+             INSERT INTO engram(id, domain_id, path, permalink, title, sha256) \
+             VALUES (7,1,'a.md','a','A','ff');\n\
+             INSERT INTO observation(engram_id, line, category, content) VALUES (7,1,'note','x');\n\
+             INSERT INTO chunk(engram_id, seq, text) VALUES (7,0,'x');\n",
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[12].sql).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM engram WHERE id=7 AND path='a.md' AND sha256='ff' \
+                 AND actor='' AND tombstone=0"
+            )
+            .await,
+            1,
+            "the row carried over whole, at its own id, as a base row"
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM observation WHERE engram_id=7").await
+                + scalar(&conn, "SELECT COUNT(*) FROM chunk WHERE engram_id=7").await,
+            2,
+            "the child rows still point at the engram they pointed at"
+        );
+        assert!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE name='d' AND last_registered IS NOT NULL"
+            )
+            .await
+                == 1,
+            "and the domain columns the swap did not touch are untouched"
+        );
+
+        // Every index the table carried is back. A swap that forgets one is a
+        // silent full scan later, not an error now, so the set is pinned here
+        // rather than left to whichever query happens to notice.
+        let mut indexes = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='engram' \
+                     AND name IS NOT NULL ORDER BY name",
+                    (),
+                )
+                .await
+                .unwrap();
+            while let Some(r) = rows.next().await.unwrap() {
+                if let Ok(turso::Value::Text(n)) = r.get_value(0) {
+                    indexes.push(n);
+                }
+            }
+        }
+        assert_eq!(
+            indexes,
+            vec![
+                "idx_engram_current".to_string(),
+                "idx_engram_domain".to_string(),
+                "idx_engram_path_actor".to_string(),
+                "idx_engram_permalink_actor".to_string(),
+                "idx_engram_recorded".to_string(),
+                "idx_engram_title_lower".to_string(),
+                "idx_engram_type".to_string(),
+            ],
+            "the swap carries every index across, with the two old uniqueness \
+             rules replaced by their actor-aware successors"
+        );
+
+        // One path, one row per actor.
+        conn.execute(
+            "INSERT INTO engram(domain_id, path, permalink, actor) VALUES (1,'a.md','a','alice')",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM engram WHERE path='a.md'").await,
+            2,
+            "a draft sits beside the base row at the same path"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO engram(domain_id, path, permalink, actor) VALUES (1,'a.md','a2','alice')",
+                (),
+            )
+            .await
+            .is_err(),
+            "but one actor still gets only one row at a path"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO engram(domain_id, path, permalink, actor) VALUES (1,'b.md','a','alice')",
+                (),
+            )
+            .await
+            .is_err(),
+            "and only one row per permalink, per actor"
         );
     }
 }

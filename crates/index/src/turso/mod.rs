@@ -672,7 +672,7 @@ impl Store for TursoStore {
                  recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
                  mtime, size, sha256) \
                  VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
-                 ON CONFLICT(domain_id, path) DO UPDATE SET \
+                 ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
                  permalink=excluded.permalink, title=excluded.title, engram_type=excluded.engram_type, \
                  status=excluded.status, recorded_at=excluded.recorded_at, valid_from=excluded.valid_from, \
                  valid_to=excluded.valid_to, timestamp=excluded.timestamp, description=excluded.description, \

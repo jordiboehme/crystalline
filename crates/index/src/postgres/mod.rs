@@ -797,7 +797,7 @@ impl Store for PostgresStore {
              recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
              mtime, size, sha256) \
              VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16) \
-             ON CONFLICT(domain_id, path) DO UPDATE SET \
+             ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
              permalink=EXCLUDED.permalink, title=EXCLUDED.title, engram_type=EXCLUDED.engram_type, \
              status=EXCLUDED.status, recorded_at=EXCLUDED.recorded_at, valid_from=EXCLUDED.valid_from, \
              valid_to=EXCLUDED.valid_to, timestamp=EXCLUDED.timestamp, description=EXCLUDED.description, \

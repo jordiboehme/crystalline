@@ -40,8 +40,8 @@ async fn store_info_reports_turso_schema_version() {
     // v5 title-lower expression index, v6 link unresolved partial index,
     // v7 case-folded tag identity, v8 tag alias map, v9 engram attachments,
     // v10 raw reference text, v11 domain registration stamp,
-    // v12 domain rebuild marker.
-    assert_eq!(info.schema_version, 12);
+    // v12 domain rebuild marker, v13 engram actor dimension.
+    assert_eq!(info.schema_version, 13);
 }
 
 #[tokio::test]
