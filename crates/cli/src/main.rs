@@ -303,6 +303,10 @@ enum Command {
         /// Run as a background daemon (quiet output).
         #[arg(long)]
         daemon: bool,
+        /// Set by the daemon spawn path, never by a person: marks this daemon
+        /// as one a client started because it found none running.
+        #[arg(long, hide = true)]
+        autostarted: bool,
         /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
@@ -1554,6 +1558,7 @@ fn main() -> anyhow::Result<()> {
             http,
             allowed_host,
             daemon,
+            autostarted,
             read_only,
             take_over,
             config,
@@ -1572,6 +1577,7 @@ fn main() -> anyhow::Result<()> {
             on_runtime(move || {
                 crystalline_service::run_serve(
                     daemon,
+                    autostarted,
                     http,
                     allowed_host,
                     cli.db,

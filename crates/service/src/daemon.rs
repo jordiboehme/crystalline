@@ -169,8 +169,11 @@ impl Shared {
 /// [`resolve_http`]. The effective read-only mode is the explicit flag or
 /// `service.read_only`; `take_over` forces host-lock claims for a deliberate host
 /// migration in a shared database.
+// The daemon's startup switches are flat on purpose, one clap flag each.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
     daemon_flag: bool,
+    autostarted: bool,
     http_flag: Option<String>,
     allowed_host_flag: Vec<String>,
     db: Option<PathBuf>,
@@ -192,6 +195,20 @@ pub async fn run_serve(
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
     let allowed_hosts = resolve_allowed_hosts(&allowed_host_flag, &loaded.effective);
+    // Record what this invocation asked to serve before anything can fail on
+    // the lock: the refusal below needs it, and so do the record and /health.
+    crate::instance::record_serve_intent(crate::instance::ServeIntent {
+        started_by: if autostarted {
+            crate::instance::StartMode::Autostart
+        } else {
+            crate::instance::StartMode::Serve
+        },
+        http: match &http_addr {
+            Some(addr) => crate::instance::HttpBinding::Bound(addr.clone()),
+            None => crate::instance::HttpBinding::Off,
+        },
+        allowed_hosts: allowed_hosts.clone(),
+    });
     // The one-time first-run setup token, drawn once per serve process and only
     // for a bind other machines can reach: on loopback the wizard is authorized
     // by the peer address itself, so there is nothing to hand out and nothing to

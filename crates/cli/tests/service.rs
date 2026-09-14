@@ -189,6 +189,12 @@ impl Env {
         let v: Value = serde_json::from_str(&text).ok()?;
         v.get("pid").and_then(Value::as_u64)
     }
+
+    /// The whole owner record, for the tests that assert on more than the pid.
+    fn lock_record(&self) -> Option<Value> {
+        let text = std::fs::read_to_string(self.info_path()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
 }
 
 impl Drop for Env {
@@ -1920,4 +1926,64 @@ fn evolve_reports_a_planted_finding_over_the_daemon() {
 
     drop(c1);
     let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The owner record says how its daemon was started. A daemon an agent's
+/// `crystalline mcp` connection spawned and one an operator ran are
+/// indistinguishable from the outside today, which is what let a managed unit
+/// restart-loop 277 times behind a healthy-looking localhost probe.
+#[test]
+fn the_owner_record_says_how_the_daemon_was_started() {
+    let env = Env::new("startedby");
+    env.setup_domain("eng");
+
+    // Autostart: the mcp client finds no daemon and spawns one.
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+    let record = env.lock_record().expect("the daemon published a record");
+    assert_eq!(
+        record["started_by"], "autostart",
+        "a daemon spawned by a connecting client records it: {record}"
+    );
+    // This Env turns the endpoint off, so the binding is recorded as off
+    // rather than left unrecorded.
+    assert_eq!(record["http"], "off", "{record}");
+    drop(client);
+    let _ = env.run(&["ctl", "shutdown"]);
+
+    // A deliberate serve on the same state directory records the other mode.
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args([
+            "serve",
+            "--http",
+            &addr,
+            "--allowed-host",
+            "muthur.lan",
+            "--config",
+        ])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_port(&addr);
+    let record = env.lock_record().expect("the daemon published a record");
+    assert_eq!(record["started_by"], "serve", "{record}");
+    assert_eq!(
+        record["http"], addr,
+        "the record names the address it bound: {record}"
+    );
+    assert_eq!(
+        record["allowed_hosts"],
+        serde_json::json!(["muthur.lan"]),
+        "the record carries the Host allow-list too: {record}"
+    );
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.kill();
+    let _ = child.wait();
 }

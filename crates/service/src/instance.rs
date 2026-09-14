@@ -68,6 +68,117 @@ pub struct LockInfo {
     /// `serde(default)` reads it as `false`, which is exactly right.
     #[serde(default)]
     pub mcp_line_options: bool,
+    /// How the owning daemon was started. `None` on a record written before
+    /// 0.18.0, and also on one published by a holder that never served (the
+    /// `hold-lock` test command), so a message reading this must say "did not
+    /// record it" rather than naming a version. Reported, never used to decide
+    /// anything.
+    #[serde(default)]
+    pub started_by: Option<StartMode>,
+    /// What the owning daemon bound its HTTP endpoint to.
+    #[serde(default)]
+    pub http: HttpBinding,
+    /// The `Host` allow-list the owning daemon serves with, on top of
+    /// loopback. Empty means loopback only, and also means "not recorded" on a
+    /// pre-0.18.0 record; the pair with `started_by` tells those apart.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+/// How a daemon process came to be running.
+///
+/// **Recorded and reported, never branched on.** `attach_policy` keeps its one
+/// version axis; this field exists so an operator and a probe can tell a
+/// managed daemon from one an agent's `crystalline mcp` connection spawned,
+/// which is what hid the 2026-09-10 outage for 277 restarts. Arbitrating
+/// between two daemons on it was considered and rejected: part A removes the
+/// reason they differ instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartMode {
+    /// A `crystalline serve` a person, a unit file or a container entrypoint
+    /// invoked.
+    Serve,
+    /// Spawned by a client that found no daemon; see `spawn_daemon`.
+    Autostart,
+}
+
+impl StartMode {
+    /// The wire spelling, for a message or a JSON body.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartMode::Serve => "serve",
+            StartMode::Autostart => "autostart",
+        }
+    }
+}
+
+/// What a daemon bound its HTTP endpoint to.
+///
+/// Three shapes rather than an `Option<String>`, because "the endpoint is
+/// deliberately closed" and "this record predates the field" are different
+/// facts and a refusal that conflates them tells an operator something untrue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpBinding {
+    /// Written by a daemon older than 0.18.0, which recorded nothing here.
+    #[default]
+    Unrecorded,
+    /// The endpoint is off (`service.http: false`, or `serve --http off`).
+    Off,
+    /// Bound at this `host:port`. Serialized as the bare address, so a person
+    /// reading `service.json` sees the address rather than a wrapper.
+    #[serde(untagged)]
+    Bound(String),
+}
+
+impl HttpBinding {
+    /// The address, when there is one.
+    pub fn address(&self) -> Option<&str> {
+        match self {
+            HttpBinding::Bound(addr) => Some(addr),
+            _ => None,
+        }
+    }
+
+    /// One phrase naming this binding inside a sentence.
+    pub fn describe(&self) -> String {
+        match self {
+            HttpBinding::Unrecorded => {
+                "an HTTP address it did not record (its version predates the field)".to_string()
+            }
+            HttpBinding::Off => "no HTTP endpoint".to_string(),
+            HttpBinding::Bound(addr) => addr.clone(),
+        }
+    }
+}
+
+/// What this process asked to serve, recorded by `run_serve` before it takes
+/// the lock.
+///
+/// One place, three readers: the lock record ([`Ownership::publish`]), the
+/// refusal a losing `serve` prints, and the `/health` body. Recording it ahead
+/// of the lock is what lets the refusal name what this invocation wanted, which
+/// is the fact the old message left out.
+#[derive(Debug, Clone)]
+pub struct ServeIntent {
+    pub started_by: StartMode,
+    pub http: HttpBinding,
+    pub allowed_hosts: Vec<String>,
+}
+
+static SERVE_INTENT: std::sync::OnceLock<ServeIntent> = std::sync::OnceLock::new();
+
+/// Record what this process asked to serve. The first call wins; a later one
+/// is ignored, so a record and a `/health` body can never disagree.
+pub fn record_serve_intent(intent: ServeIntent) {
+    let _ = SERVE_INTENT.set(intent);
+}
+
+/// What this process asked to serve, when it is a daemon that recorded it.
+/// `None` in every process that is not serving.
+pub fn serve_intent() -> Option<&'static ServeIntent> {
+    SERVE_INTENT.get()
 }
 
 /// The option token that tells the daemon this stdio session's harness is
@@ -201,6 +312,7 @@ impl Ownership {
     /// the lock file, never into it (mandatory locks on Windows), and renamed
     /// into place so a reader never sees a partial record.
     pub fn publish(&self) -> io::Result<()> {
+        let intent = serve_intent();
         let info = LockInfo {
             pid: std::process::id(),
             socket_path: self.socket_display(),
@@ -209,6 +321,13 @@ impl Ownership {
             // This daemon's `handle_conn` splits the handshake line into a
             // mode and its options, so a bridge may send them.
             mcp_line_options: true,
+            // Absent where a process publishes a record without having gone
+            // through `run_serve`. The one such publisher in this tree is the
+            // `hold-lock` test command, which holds the lock and serves
+            // nothing; a real daemon always records its intent first.
+            started_by: intent.map(|i| i.started_by),
+            http: intent.map(|i| i.http.clone()).unwrap_or_default(),
+            allowed_hosts: intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
         };
         let json = serde_json::to_string(&info).unwrap_or_default();
         let tmp = self.info_path.with_extension("json.tmp");
@@ -998,6 +1117,15 @@ fn spawn_daemon(
         cmd.arg("--db").arg(db);
     }
     cmd.arg("serve").arg("--daemon");
+    // Tell the child it is an autostart rather than an invocation somebody
+    // made. A hidden flag, not the `--daemon` flag: an operator may well run
+    // `serve --daemon` by hand, and systemd and the container image both run
+    // `serve` in the foreground, so `--daemon` answers a different question.
+    // Not an environment variable either: the child inherits this process's
+    // whole environment, and a variable left set in a shell would mislabel a
+    // daemon somebody started deliberately.
+    cmd.arg("--autostarted");
+
     if read_only {
         cmd.arg("--read-only");
     }
@@ -1232,6 +1360,9 @@ mod tests {
             version: crystalline_core::VERSION.to_string(),
             started_at: "2026-08-14T00:00:00Z".to_string(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         })
         .unwrap();
         let info: LockInfo = serde_json::from_str(&current).unwrap();
@@ -1634,6 +1765,9 @@ mod tests {
             version: "0.0.1".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1682,6 +1816,9 @@ mod tests {
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1750,6 +1887,9 @@ mod tests {
             version: "0.8.2".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -1939,6 +2079,9 @@ mod tests {
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(
             config::service_info_path().unwrap(),
@@ -1991,5 +2134,89 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert!(!process_alive(pid), "a reaped child is not alive");
+    }
+
+    // --- the exposure fields of the owner record -----------------------------
+
+    /// A record written before 0.18.0 carries none of the exposure fields, and
+    /// `serde(default)` must read that as "unrecorded" rather than failing the
+    /// parse: a client that cannot read the record cannot displace or diagnose
+    /// the daemon that wrote it.
+    #[test]
+    fn a_pre_exposure_record_reads_as_unrecorded() {
+        let legacy = r#"{"pid":4242,"socket_path":"/tmp/s.sock","version":"0.17.0",
+                         "started_at":"2026-09-10T21:33:04Z","mcp_line_options":true}"#;
+        let info: LockInfo = serde_json::from_str(legacy).expect("a 0.17.0 record still parses");
+        assert_eq!(info.pid, 4242);
+        assert_eq!(
+            info.started_by, None,
+            "an older daemon recorded no start mode"
+        );
+        assert_eq!(info.http, HttpBinding::Unrecorded);
+        assert!(info.allowed_hosts.is_empty());
+    }
+
+    /// The three shapes are distinguishable on the wire, and a bound address is a
+    /// bare string so a human reading service.json sees the address itself.
+    #[test]
+    fn http_binding_round_trips_each_shape() {
+        for binding in [
+            HttpBinding::Unrecorded,
+            HttpBinding::Off,
+            HttpBinding::Bound("0.0.0.0:7411".to_string()),
+        ] {
+            let json = serde_json::to_string(&binding).unwrap();
+            let back: HttpBinding = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, binding, "{json} round trips");
+        }
+        assert_eq!(
+            serde_json::to_string(&HttpBinding::Bound("0.0.0.0:7411".to_string())).unwrap(),
+            "\"0.0.0.0:7411\""
+        );
+        assert_eq!(serde_json::to_string(&HttpBinding::Off).unwrap(), "\"off\"");
+    }
+
+    /// `describe` is what every message in task 2 and task 3 renders, so each
+    /// shape gets a phrase that reads correctly inside a sentence.
+    #[test]
+    fn http_binding_describes_every_shape_in_words() {
+        assert_eq!(
+            HttpBinding::Bound("muthur.lan:7411".into()).describe(),
+            "muthur.lan:7411"
+        );
+        assert_eq!(HttpBinding::Off.describe(), "no HTTP endpoint");
+        assert!(
+            HttpBinding::Unrecorded
+                .describe()
+                .contains("did not record"),
+            "an unrecorded binding says it is unknown rather than pretending it is off"
+        );
+    }
+
+    /// The intent is recorded once per process and the first call wins, so a
+    /// record can never disagree with the `/health` body of the same daemon.
+    ///
+    /// This touches a process-global `OnceLock`. Under `cargo nextest` every
+    /// test gets its own process, so it is isolated for free; under the
+    /// canonical `cargo test --workspace` fallback it shares the process with
+    /// every other test in this module. So it must stay the only test in this
+    /// file that calls `record_serve_intent`, and no test here may call
+    /// `publish()` and then assert on the exposure fields it writes.
+    #[test]
+    fn the_first_recorded_serve_intent_wins() {
+        record_serve_intent(ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Bound("127.0.0.1:7411".into()),
+            allowed_hosts: vec!["muthur.lan".into()],
+        });
+        record_serve_intent(ServeIntent {
+            started_by: StartMode::Autostart,
+            http: HttpBinding::Off,
+            allowed_hosts: vec![],
+        });
+        let intent = serve_intent().expect("recorded");
+        assert_eq!(intent.started_by, StartMode::Serve);
+        assert_eq!(intent.http, HttpBinding::Bound("127.0.0.1:7411".into()));
+        assert_eq!(intent.allowed_hosts, vec!["muthur.lan".to_string()]);
     }
 }
