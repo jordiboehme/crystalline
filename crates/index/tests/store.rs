@@ -593,10 +593,8 @@ async fn late_cross_domain_resolution(store: &dyn Store) {
     // driver upserts each domain row as it reaches it, so `b` has no row at all
     // while `a` is being applied, which is exactly the state that defeats the
     // per-domain batch.
-    let mut reports = vec![
-        sync_domain(store, "a", &a_root).await.unwrap(),
-        sync_domain(store, "b", &b_root).await.unwrap(),
-    ];
+    let a_report = sync_domain(store, "a", &a_root).await.unwrap();
+    let b_report = sync_domain(store, "b", &b_root).await.unwrap();
     // Both rows exist now, so these resolve the ids the driver already held.
     let a_id = store
         .upsert_domain("a", Some(&a_root.to_string_lossy()), DomainKind::File)
@@ -607,28 +605,29 @@ async fn late_cross_domain_resolution(store: &dyn Store) {
         .await
         .unwrap();
     assert_eq!(
-        (reports[0].relations_resolved, reports[0].links_resolved),
+        (a_report.relations_resolved, a_report.links_resolved),
         (0, 0),
         "a's own batch cannot see into b"
     );
 
     // The tail of the same driver, after every domain of the run is indexed.
-    let totals = resolve_forward_refs(store, &[a_id, b_id], &mut reports)
-        .await
-        .unwrap();
+    // The driver carries one structure pairing each applied domain with its own
+    // report, so a count can never land on the wrong report.
+    let mut applied = vec![(a_id, a_report), (b_id, b_report)];
+    let totals = resolve_forward_refs(store, &mut applied).await.unwrap();
     assert_eq!(totals, (1, 1), "the run totals name the late resolutions");
     assert_eq!(
         (
-            reports[0].relations_resolved_late,
-            reports[0].links_resolved_late
+            applied[0].1.relations_resolved_late,
+            applied[0].1.links_resolved_late
         ),
         (1, 1),
         "and they are reported against the domain that carried them"
     );
     assert_eq!(
         (
-            reports[1].relations_resolved_late,
-            reports[1].links_resolved_late
+            applied[1].1.relations_resolved_late,
+            applied[1].1.links_resolved_late
         ),
         (0, 0),
         "b had no forward references of its own"
@@ -650,9 +649,7 @@ async fn late_cross_domain_resolution(store: &dyn Store) {
 
     // The pass is idempotent: a second run over a settled index resolves
     // nothing and does not double-count.
-    let again = resolve_forward_refs(store, &[a_id, b_id], &mut reports)
-        .await
-        .unwrap();
+    let again = resolve_forward_refs(store, &mut applied).await.unwrap();
     assert_eq!(again, (0, 0), "nothing left to resolve");
 }
 parity!(
@@ -676,20 +673,16 @@ async fn single_domain_run_skips_the_late_pass(store: &dyn Store) {
         .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
         .await
         .unwrap();
-    let mut reports = vec![sync_domain(store, "d", root).await.unwrap()];
-    assert_eq!(
-        reports[0].relations_resolved, 1,
-        "resolved in its own batch"
-    );
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.relations_resolved, 1, "resolved in its own batch");
 
-    let totals = resolve_forward_refs(store, &[domain], &mut reports)
-        .await
-        .unwrap();
+    let mut applied = vec![(domain, report)];
+    let totals = resolve_forward_refs(store, &mut applied).await.unwrap();
     assert_eq!(totals, (0, 0));
     assert_eq!(
         (
-            reports[0].relations_resolved_late,
-            reports[0].links_resolved_late
+            applied[0].1.relations_resolved_late,
+            applied[0].1.links_resolved_late
         ),
         (0, 0),
         "the late counters stay at zero on a single-domain run"

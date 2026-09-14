@@ -47,6 +47,22 @@ pub enum IndexError {
     /// An input was malformed.
     #[error("invalid input: {0}")]
     Invalid(String),
+    /// A multi-domain run failed while working on one named domain.
+    ///
+    /// The name is otherwise lost: a driver rebuilding five domains that
+    /// reports only "constraint violation" does not say which domain to look
+    /// at. The underlying error is kept as the source, so a caller matching on
+    /// a specific failure still can.
+    #[error("{operation} of '{domain}' failed: {source}")]
+    InDomain {
+        /// The verb the caller was running, for example `reindex`.
+        operation: String,
+        /// The domain the failure happened in.
+        domain: String,
+        /// The failure itself.
+        #[source]
+        source: Box<IndexError>,
+    },
     /// The embedding model or its inference failed.
     #[error("embedding error: {0}")]
     Embedding(String),

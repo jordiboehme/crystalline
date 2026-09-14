@@ -95,7 +95,7 @@ use crystalline_core::{MAX_ATTACHMENT_BYTES, attachment_mime, validate_asset_pat
 
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
-use crate::store::{AttachmentRow, DomainId, EngramRecord, FileStamp, NewChunk, Store};
+use crate::store::{AttachmentRow, DomainId, DomainKind, EngramRecord, FileStamp, NewChunk, Store};
 
 /// Maximum concurrent hashing or parsing tasks.
 const CONCURRENCY: usize = 8;
@@ -777,6 +777,132 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
     Ok(report)
 }
 
+/// Per-domain callbacks a multi-domain driver runs for its caller.
+///
+/// [`reindex_domains`] owns the loop, and the two callers of it need different
+/// things around each domain: the daemon claims the file-host lock before it
+/// touches a domain in collaboration mode and refreshes the generated index
+/// files after a domain changed, while the daemonless CLI does neither. Both
+/// hooks default to doing nothing, so a caller with no per-domain business
+/// passes [`NoReindexHooks`] and reads the driver as a plain loop.
+///
+/// The `before_domain` hook runs with the store lock held and is handed the
+/// locked store, because the claim it exists for is itself a store write that
+/// belongs in the same window as the domain's upsert; the tokio mutex is not
+/// reentrant, so a hook must never try to take the lock itself. `after_apply`
+/// runs with no lock held, after the domain's transaction has committed.
+#[async_trait::async_trait]
+pub trait ReindexHooks: Send + Sync {
+    /// Called in the first lock window of each domain, before its row is
+    /// resolved. Returning `false` skips the domain entirely: it is neither
+    /// scanned nor applied, and it is not handed to the final cross-domain
+    /// resolution pass.
+    async fn before_domain(&self, _store: &dyn Store, _name: &str, _root: &Path) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Called after a domain's apply committed, with no store lock held.
+    async fn after_apply(&self, _name: &str, _report: &SyncReport) {}
+}
+
+/// The do-nothing [`ReindexHooks`]: every domain is claimed by nobody and
+/// nothing follows an apply. What a daemonless reindex passes.
+pub struct NoReindexHooks;
+
+#[async_trait::async_trait]
+impl ReindexHooks for NoReindexHooks {}
+
+/// Reindex a list of file domains through one loop, the shared driver behind
+/// both `crystalline reindex` and the daemon's `ctl reindex`.
+///
+/// `force` is `reindex --full`: the domain's rows are cleared and resynced from
+/// disk, per domain rather than as a global wipe, so virtual-domain rows, whose
+/// only source of truth is the database, are never destroyed.
+///
+/// The shape per domain is the two-lock-window one the rest of the sync engine
+/// uses - resolve the domain and snapshot its stamps under the lock, walk and
+/// hash with no lock held, apply transactionally in a second window - so a
+/// large domain's rebuild never blocks concurrent readers behind the mutex.
+///
+/// The run ends with [`resolve_forward_refs`] over the domains it applied and
+/// one [`Store::checkpoint_wal`], for both callers: a reindex is a
+/// snapshot-preparation verb whichever process runs it.
+pub async fn reindex_domains(
+    store: &tokio::sync::Mutex<dyn Store>,
+    targets: &[(String, PathBuf)],
+    chunk_params: &ChunkParams,
+    force: bool,
+    hooks: &dyn ReindexHooks,
+) -> Result<Vec<SyncReport>> {
+    // Each domain this run applied, paired with the report its apply produced,
+    // for the final cross-domain resolution pass. A domain a hook skipped wrote
+    // nothing and is not in the list at all.
+    let mut applied: Vec<(DomainId, SyncReport)> = Vec::new();
+
+    for (name, root) in targets {
+        let Some((domain, snapshot)) = ({
+            let store = store.lock().await;
+            if hooks.before_domain(&*store, name, root).await? {
+                let domain = store
+                    .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await
+                    .map_err(|e| in_domain("reindex", name, e))?;
+                if force {
+                    store
+                        .clear_domain(domain)
+                        .await
+                        .map_err(|e| in_domain("reindex", name, e))?;
+                }
+                // Snapshotted AFTER the clear, so a forced run classifies every
+                // file as new against empty stamps.
+                let snapshot = store
+                    .file_stamps(domain)
+                    .await
+                    .map_err(|e| in_domain("reindex", name, e))?;
+                Some((domain, snapshot))
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+        let scan = scan_domain(name, root, snapshot, chunk_params)
+            .await
+            .map_err(|e| in_domain("reindex", name, e))?;
+        let report = {
+            let store = store.lock().await;
+            apply_scan(&*store, domain, scan)
+                .await
+                .map_err(|e| in_domain("reindex", name, e))?
+        };
+        hooks.after_apply(name, &report).await;
+        applied.push((domain, report));
+    }
+
+    // A reindex rebuilds every domain in one run, so it has exactly the
+    // forward-reference problem a full sweep has: the first domain is applied
+    // while the last one holds none of its targets yet.
+    let store = store.lock().await;
+    resolve_forward_refs(&*store, &mut applied).await?;
+    // Any reindex, full or incremental, is a snapshot-preparation verb: a
+    // downstream pipeline may ship index.db as a single file (sidecars
+    // deleted), so whatever this run just wrote must not sit stranded in the
+    // WAL. Merge and shrink it now rather than leaving it to grow until the
+    // next natural checkpoint. A no-op on Postgres (no local WAL file).
+    store.checkpoint_wal().await?;
+    Ok(applied.into_iter().map(|(_, report)| report).collect())
+}
+
+/// Name the domain a multi-domain run failed in, keeping the failure itself as
+/// the source.
+fn in_domain(operation: &str, domain: &str, source: IndexError) -> IndexError {
+    IndexError::InDomain {
+        operation: operation.to_string(),
+        domain: domain.to_string(),
+        source: Box::new(source),
+    }
+}
+
 /// The final cross-domain resolution pass of a multi-domain run: resolve every
 /// forward reference that was still pending when its own domain finished,
 /// because the domain it points into had not been indexed yet.
@@ -790,11 +916,13 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
 /// methods once more, after every domain in the run is indexed, settles them in
 /// the run that created them; order of registration stops mattering.
 ///
-/// `domains` and `reports` are parallel: the counts land in
-/// [`SyncReport::relations_resolved_late`] and [`SyncReport::links_resolved_late`]
-/// of the report at the same index, kept apart from the per-domain counters so
-/// the late pass is visible rather than folded away. Returns the run totals
-/// `(relations, links)`.
+/// `applied` pairs each domain with the report its own apply produced: the
+/// counts land in [`SyncReport::relations_resolved_late`] and
+/// [`SyncReport::links_resolved_late`] of the report beside the domain they were
+/// counted for, kept apart from the per-domain counters so the late pass is
+/// visible rather than folded away. One structure rather than two parallel
+/// slices, so a caller cannot drift the two apart and silently mis-attribute or
+/// drop counts. Returns the run totals `(relations, links)`.
 ///
 /// A run of fewer than two domains is a no-op: a single domain has already had
 /// its references resolved against everything this run indexed, so a second
@@ -805,24 +933,18 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
 /// actually applied, never one that was skipped or failed.
 pub async fn resolve_forward_refs<S: Store + ?Sized>(
     store: &S,
-    domains: &[DomainId],
-    reports: &mut [SyncReport],
+    applied: &mut [(DomainId, SyncReport)],
 ) -> Result<(u64, u64)> {
-    debug_assert_eq!(
-        domains.len(),
-        reports.len(),
-        "resolve_forward_refs takes parallel slices"
-    );
-    if domains.len() < 2 {
+    if applied.len() < 2 {
         return Ok((0, 0));
     }
 
     store.begin().await?;
     let pass = async {
-        let mut counts = Vec::with_capacity(domains.len());
-        for &domain in domains {
-            let relations = store.resolve_pending_relations(domain).await?;
-            let links = store.resolve_pending_links(domain).await?;
+        let mut counts = Vec::with_capacity(applied.len());
+        for (domain, _) in applied.iter() {
+            let relations = store.resolve_pending_relations(*domain).await?;
+            let links = store.resolve_pending_links(*domain).await?;
             counts.push((relations, links));
         }
         Ok::<Vec<(u64, u64)>, IndexError>(counts)
@@ -841,7 +963,7 @@ pub async fn resolve_forward_refs<S: Store + ?Sized>(
 
     let mut total_relations = 0;
     let mut total_links = 0;
-    for (report, (relations, links)) in reports.iter_mut().zip(counts) {
+    for ((_, report), (relations, links)) in applied.iter_mut().zip(counts) {
         report.relations_resolved_late = relations;
         report.links_resolved_late = links;
         total_relations += relations;
@@ -851,7 +973,7 @@ pub async fn resolve_forward_refs<S: Store + ?Sized>(
         tracing::info!(
             relations = total_relations,
             links = total_links,
-            domains = domains.len(),
+            domains = applied.len(),
             "sync: resolved forward references across domains after the last domain was indexed"
         );
     }

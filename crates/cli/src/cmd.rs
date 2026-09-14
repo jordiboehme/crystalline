@@ -14,8 +14,9 @@ use crystalline_core::config::{
     self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
 };
 use crystalline_index::{
-    ChunkParams, DomainKind, Store, apply_scan, configured_model_id, download_local_model,
-    provider_from_config, resolve_forward_refs, run_embedding_pass, scan_domain,
+    ChunkParams, DomainKind, NoReindexHooks, Store, apply_scan, configured_model_id,
+    download_local_model, provider_from_config, reindex_domains, resolve_forward_refs,
+    run_embedding_pass, scan_domain,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -1201,10 +1202,9 @@ pub async fn sync(
     let targets = select_domains(cfg, only)?;
     let params = chunk_params(cfg);
 
-    let mut reports = Vec::new();
-    // The domains this run applied, parallel to `reports`, for the final
-    // cross-domain resolution pass below.
-    let mut applied = Vec::new();
+    // Each domain this run applied, paired with the report its apply produced,
+    // for the final cross-domain resolution pass below.
+    let mut applied: Vec<(crystalline_index::DomainId, crystalline_index::SyncReport)> = Vec::new();
     for (name, entry) in targets {
         // Virtual domains have no files to sync.
         let Some(path) = resolve_domain_path(&entry) else {
@@ -1234,8 +1234,7 @@ pub async fn sync(
                 .await
                 .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?
         };
-        reports.push(report);
-        applied.push(domain);
+        applied.push((domain, report));
     }
 
     // Every domain of this run is in now, so a reference that pointed forward
@@ -1243,10 +1242,12 @@ pub async fn sync(
     // next sync. A single-domain run is a no-op inside the pass.
     {
         let store = store.lock().await;
-        resolve_forward_refs(&*store, &applied, &mut reports)
+        resolve_forward_refs(&*store, &mut applied)
             .await
             .map_err(|e| anyhow!("resolving forward references failed: {e}"))?;
     }
+    let reports: Vec<crystalline_index::SyncReport> =
+        applied.into_iter().map(|(_, report)| report).collect();
 
     if json {
         println!("{}", serde_json::to_string(&reports)?);
@@ -1334,8 +1335,13 @@ pub(crate) fn sync_failure(
 
 // --- reindex -----------------------------------------------------------------
 
-/// Reindex all domains. `--full` wipes the index first (the corruption-recovery
-/// path), opening resiliently so a database that will not open is rebuilt.
+/// Reindex all domains. `--full` clears each file domain and resyncs it from
+/// disk (the corruption-recovery path), opening resiliently so a database that
+/// will not open is rebuilt.
+///
+/// The loop itself is [`crystalline_index::reindex_domains`], shared with the
+/// daemon's `ctl reindex`, so the two paths cannot drift apart in what they
+/// clear, in what order they rebuild or in the passes they end with.
 pub async fn reindex(
     store: Arc<TokioMutex<dyn Store>>,
     cfg: &GlobalConfig,
@@ -1346,68 +1352,14 @@ pub async fn reindex(
     let targets = select_domains(cfg, None)?;
     let params = chunk_params(cfg);
 
-    // Rather than a global wipe, `--full` clears each file domain's rows
-    // per-domain and resyncs, so virtual-domain rows, whose only source of
-    // truth is the database, survive the reindex. The resilient open `--full`
-    // also wants (Turso rebuilds a database that will not open; a no-op for
-    // Postgres) is `OpenAs::Rebuild`, chosen by the dispatch that reached this
-    // store.
-    // Only the file domains have files to (re)index.
+    // Only the file domains have files to (re)index. A virtual domain's rows
+    // are its source of truth and are never rebuilt from anything.
     let file_targets: Vec<(String, PathBuf)> = targets
         .into_iter()
         .filter_map(|(name, entry)| resolve_domain_path(&entry).map(|p| (name, p)))
         .collect();
-    // Clear every file domain up front, before any resync, so cross-domain
-    // forward references resolve in the same order as before the lock split (a
-    // source domain sees the cleared, not the stale, target while resolving).
-    if full {
-        let store = store.lock().await;
-        for (name, path) in &file_targets {
-            let domain_id = store
-                .upsert_domain(name, Some(&path.to_string_lossy()), DomainKind::File)
-                .await
-                .map_err(|e| anyhow!("failed to resolve domain '{name}': {e}"))?;
-            store
-                .clear_domain(domain_id)
-                .await
-                .map_err(|e| anyhow!("failed to clear domain '{name}': {e}"))?;
-        }
-    }
 
-    let mut reports = Vec::new();
-    // The domains this run applied, parallel to `reports`, for the final
-    // cross-domain resolution pass below.
-    let mut applied = Vec::new();
-    for (name, path) in &file_targets {
-        // First lock window: snapshot; scan with no lock held; second: apply.
-        let (domain, snapshot) = {
-            let store = store.lock().await;
-            let domain = store
-                .upsert_domain(name, Some(&path.to_string_lossy()), DomainKind::File)
-                .await?;
-            let snapshot = store.file_stamps(domain).await?;
-            (domain, snapshot)
-        };
-        let scan = scan_domain(name, path, snapshot, &params).await?;
-        let report = {
-            let store = store.lock().await;
-            apply_scan(&*store, domain, scan)
-                .await
-                .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?
-        };
-        reports.push(report);
-        applied.push(domain);
-    }
-
-    // A reindex rebuilds every domain in one run, so it has exactly the same
-    // forward-reference problem a full sync has: the first domain is applied
-    // while the last one holds none of its targets yet.
-    {
-        let store = store.lock().await;
-        resolve_forward_refs(&*store, &applied, &mut reports)
-            .await
-            .map_err(|e| anyhow!("resolving forward references failed: {e}"))?;
-    }
+    let reports = reindex_domains(&*store, &file_targets, &params, full, &NoReindexHooks).await?;
 
     if json {
         println!(
@@ -1429,15 +1381,13 @@ pub async fn reindex(
         embed_pass(&*store, cfg).await?;
     }
 
-    // Any reindex, full or incremental, is a snapshot-preparation verb: a
-    // downstream pipeline may ship index.db as a single file (sidecars
-    // deleted), so whatever this reindex (and the optional embed pass above)
-    // just wrote must not sit stranded in the WAL. Merge and shrink it now
-    // rather than leaving it to grow until the next natural checkpoint. A
-    // no-op on Postgres (no local WAL file); on Turso this replaces the
-    // downstream Docker image build's shell-out to `sqlite3` for the same
+    // The driver already checkpointed what the rebuild wrote; the embed pass
+    // above ran after it, so its vectors need their own merge before a
+    // downstream pipeline ships index.db as a single file with the sidecars
+    // deleted. A no-op on Postgres (no local WAL file); on Turso this replaces
+    // the downstream Docker image build's shell-out to `sqlite3` for the same
     // purpose.
-    {
+    if embed {
         let store = store.lock().await;
         store.checkpoint_wal().await?;
     }

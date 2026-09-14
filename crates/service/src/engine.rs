@@ -39,10 +39,11 @@ use crystalline_index::{
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
     EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
     FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
-    RULES, RecentFilter, SearchMode, SearchQuery, ShareFacts, Store, SweepInput, SweepOptions,
-    SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
-    is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
-    resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    IndexError, RULES, RecentFilter, ReindexHooks, SearchMode, SearchQuery, ShareFacts, Store,
+    SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram,
+    configured_model_id, detect, is_retired_status, order_jobs_for_batching,
+    parse_metadata_filters, provider_from_config, rank, reindex_domains, resolve_forward_refs,
+    retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -8869,11 +8870,11 @@ impl Engine {
         let _activity = ActivityState::begin(&self.activity, "sync", only);
         let targets = self.sync_targets(only)?;
         let collab = !self.instance_id.is_empty();
-        let mut reports = Vec::new();
-        // The domains this run actually applied, parallel to `reports`, for the
-        // final cross-domain resolution pass. A domain that was skipped (hosted
-        // elsewhere) or failed to scan wrote nothing and is not in either list.
-        let mut applied: Vec<DomainId> = Vec::new();
+        // Each domain this run applied, paired with the report its apply
+        // produced, for the final cross-domain resolution pass. A domain that
+        // was skipped (hosted elsewhere) or failed to scan wrote nothing and is
+        // not in the list at all.
+        let mut applied: Vec<(DomainId, SyncReport)> = Vec::new();
         let mut skipped = Vec::new();
         let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
@@ -8938,20 +8939,20 @@ impl Engine {
             if changed_anything(&report) {
                 self.refresh_index_files(name).await;
             }
-            reports.push(report);
-            applied.push(domain);
+            applied.push((domain, report));
         }
         // Every domain of this run is in now, so the references that pointed
         // forward into a domain the loop had not reached yet can resolve. A
         // single-domain run is a no-op inside the pass.
         {
             let store = self.store.lock().await;
-            resolve_forward_refs(&*store, &applied, &mut reports)
+            resolve_forward_refs(&*store, &mut applied)
                 .await
                 .map_err(|e| {
                     EngineError::Internal(format!("resolving forward references failed: {e}"))
                 })?;
         }
+        let reports: Vec<SyncReport> = applied.into_iter().map(|(_, report)| report).collect();
         Ok(json!({
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
             "skipped": skipped,
@@ -9028,71 +9029,20 @@ impl Engine {
     /// collaboration mode a domain hosted by another live instance is left
     /// untouched (neither cleared nor resynced), so a non-host never rebuilds the
     /// host's rows out from under it.
+    ///
+    /// The loop is [`crystalline_index::reindex_domains`], shared with the
+    /// daemonless `crystalline reindex`: this side supplies only what is the
+    /// daemon's own business, the host claim before a domain is touched and the
+    /// generated index files after one changed.
     pub async fn reindex(&self, full: bool) -> Result<Value> {
         let _activity = ActivityState::begin(&self.activity, "reindex", None);
         let targets = self.sync_targets(None)?;
-        let collab = !self.instance_id.is_empty();
-        let mut reports = Vec::new();
-        // The domains this run actually rebuilt, parallel to `reports`, for the
-        // final cross-domain resolution pass. A domain hosted elsewhere was
-        // never touched and is in neither list.
-        let mut applied: Vec<DomainId> = Vec::new();
-        // Two short store-lock windows per domain with the scan in between, the
-        // same shape as `sync_take_over`, so a large domain's walk-and-hash pass
-        // no longer holds the mutex. The first window claims the host, clears the
-        // domain when `full` and snapshots the stamps; the snapshot is taken AFTER
-        // the clear so the scan classifies every file as new against empty stamps -
-        // the correct full-rebuild semantics. In collaboration mode a domain hosted
-        // by another live instance is left untouched (neither cleared nor scanned).
-        for (name, root) in targets {
-            let (domain, snapshot) = {
-                let store = self.store.lock().await;
-                if collab {
-                    match self.claim_file_host(&*store, &name, &root, false).await? {
-                        HostClaim::Acquired => {}
-                        HostClaim::HeldByOther(host) => {
-                            tracing::info!(
-                                "skipping reindex of '{name}' hosted by instance {}",
-                                host.instance_id
-                            );
-                            continue;
-                        }
-                    }
-                }
-                let domain = store
-                    .upsert_domain(&name, Some(&root.to_string_lossy()), DomainKind::File)
-                    .await?;
-                if full {
-                    store.clear_domain(domain).await?;
-                }
-                let snapshot = store.file_stamps(domain).await?;
-                (domain, snapshot)
-            };
-            let scan = scan_domain(&name, &root, snapshot, &self.chunk_params).await?;
-            let report = {
-                let store = self.store.lock().await;
-                apply_scan(&*store, domain, scan).await.map_err(|e| {
-                    EngineError::Internal(format!("reindex of '{name}' failed: {e}"))
-                })?
-            };
-            if changed_anything(&report) {
-                self.refresh_index_files(&name).await;
-            }
-            reports.push(report);
-            applied.push(domain);
-        }
-        // A reindex rebuilds every domain in one run, so it has exactly the
-        // forward-reference problem a full sweep has: the first domain is
-        // applied while the last one holds none of its targets yet - and under
-        // `full` the targets were cleared as well.
-        {
-            let store = self.store.lock().await;
-            resolve_forward_refs(&*store, &applied, &mut reports)
-                .await
-                .map_err(|e| {
-                    EngineError::Internal(format!("resolving forward references failed: {e}"))
-                })?;
-        }
+        let hooks = DaemonReindexHooks {
+            engine: self,
+            collab: !self.instance_id.is_empty(),
+        };
+        let reports =
+            reindex_domains(&*self.store, &targets, &self.chunk_params, full, &hooks).await?;
         Ok(json!({
             "full": full,
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
@@ -15550,6 +15500,64 @@ fn json_to_yaml(v: &Value) -> YamlValue {
                 .map(|(k, v)| (k.clone(), json_to_yaml(v)))
                 .collect(),
         ),
+    }
+}
+
+/// What the daemon adds around each domain of a shared reindex run: the
+/// collaboration host claim before a domain is touched, and a refresh of the
+/// generated index files after one changed.
+///
+/// The daemonless CLI needs neither, which is why they are hooks rather than
+/// part of [`crystalline_index::reindex_domains`] itself.
+struct DaemonReindexHooks<'a> {
+    engine: &'a Engine,
+    collab: bool,
+}
+
+#[async_trait::async_trait]
+impl ReindexHooks for DaemonReindexHooks<'_> {
+    /// Claim the file-host lock in the driver's first lock window, with the
+    /// driver's own store guard, so the claim and the domain's upsert stay in
+    /// one window exactly as they were before the loop was shared. A domain
+    /// held by another live instance is skipped: the driver neither clears nor
+    /// scans it, so a non-host never rebuilds the host's rows out from under
+    /// it.
+    async fn before_domain(
+        &self,
+        store: &dyn Store,
+        name: &str,
+        root: &Path,
+    ) -> crystalline_index::Result<bool> {
+        if !self.collab {
+            return Ok(true);
+        }
+        // The claim reaches the store through the engine's own helper, which
+        // returns the engine's error type; the driver speaks the index crate's,
+        // so a failure crosses over as its text. Every failure this call can
+        // raise is a store failure to begin with.
+        let claim = self
+            .engine
+            .claim_file_host(store, name, root, false)
+            .await
+            .map_err(|e| IndexError::Db(e.to_string()))?;
+        match claim {
+            HostClaim::Acquired => Ok(true),
+            HostClaim::HeldByOther(host) => {
+                tracing::info!(
+                    "skipping reindex of '{name}' hosted by instance {}",
+                    host.instance_id
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Files changed under us, so the generated index files follow. Runs with
+    /// no store lock held, and takes none of its own.
+    async fn after_apply(&self, name: &str, report: &SyncReport) {
+        if changed_anything(report) {
+            self.engine.refresh_index_files(name).await;
+        }
     }
 }
 
