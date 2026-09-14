@@ -1393,6 +1393,72 @@ fn an_occupied_http_address_is_not_fatal_and_says_so() {
     let _ = child.wait();
 }
 
+/// A flag that contradicts configuration says so at startup, naming both
+/// values and the key, and the daemon serves anyway. This Env sets
+/// CRYSTALLINE_SERVICE_HTTP=false, so `--http <port>` is a real difference.
+#[test]
+fn an_exposure_flag_that_contradicts_configuration_says_so() {
+    let env = Env::new("notice");
+    env.setup_domain("eng");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--http", &addr, "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut notice = None;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("service.http") => {
+                notice = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let notice = notice.expect("the daemon names the flag that contradicts its configuration");
+    assert!(
+        notice.contains(&addr),
+        "it names what the flag asked for: {notice}"
+    );
+    assert!(
+        notice.contains("off"),
+        "and what configuration says: {notice}"
+    );
+    assert!(
+        notice.contains("crystalline config set service.http"),
+        "and how to make it permanent: {notice}"
+    );
+
+    // A notice, not a refusal: the daemon is serving.
+    wait_port(&addr);
+    env.wait_ready();
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Parse a JSON-RPC response that may be plain JSON or an SSE `data:` frame.
 fn parse_jsonrpc(body: &str) -> Value {
     for line in body.lines() {

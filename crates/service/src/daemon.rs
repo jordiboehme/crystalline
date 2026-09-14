@@ -195,6 +195,31 @@ pub async fn run_serve(
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
     let allowed_hosts = resolve_allowed_hosts(&allowed_host_flag, &loaded.effective);
+    // A flag that contradicts configuration is said out loud. `tracing::warn!`
+    // rather than the banner's `eprintln!` so the line reaches both a
+    // foreground serve (the subscriber writes to stderr) and a `--daemon` one
+    // (daemon.log), which is where a systemd or container operator reads.
+    if http_flag.is_some() {
+        let from_config = describe_http(resolve_http(None, &loaded.effective).as_ref());
+        let from_flag = describe_http(http_addr.as_ref());
+        let set_value = http_addr.clone().unwrap_or_else(|| "false".to_string());
+        if let Some(line) =
+            exposure_override_notice("service.http", &from_flag, &from_config, &set_value)
+        {
+            tracing::warn!("{line}");
+        }
+    }
+    if !allowed_host_flag.is_empty() {
+        let from_config = describe_hosts(&resolve_allowed_hosts(&[], &loaded.effective));
+        if let Some(line) = exposure_override_notice(
+            "service.allowed_hosts",
+            &describe_hosts(&allowed_hosts),
+            &from_config,
+            &allowed_hosts.join(","),
+        ) {
+            tracing::warn!("{line}");
+        }
+    }
     // Record what this invocation asked to serve before anything can fail on
     // the lock: the refusal below needs it, and so do the record and /health.
     crate::instance::record_serve_intent(crate::instance::ServeIntent {
@@ -2069,6 +2094,52 @@ fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> 
         .unwrap_or_default()
 }
 
+/// The startup notice for an exposure flag that contradicts configuration.
+///
+/// `None` when the flag asks for exactly what configuration already resolves
+/// to, because only a *difference* is worth a line: a container whose command
+/// repeats its own configured address would otherwise print this on every
+/// start.
+///
+/// **A notice, never a refusal.** A one-off `serve` on a different port is a
+/// real thing to want, and the flags keep winning for the invocation that
+/// passes them. What this says is the thing the 2026-09-10 outage turned on:
+/// a flag configures one process, while every other daemon on the machine -
+/// an autostarted one included - binds whatever configuration says.
+fn exposure_override_notice(
+    key: &str,
+    from_flag: &str,
+    from_config: &str,
+    set_value: &str,
+) -> Option<String> {
+    (from_flag != from_config).then(|| {
+        format!(
+            "this serve binds {from_flag} because a flag asked for it, for this invocation only. \
+             {key} says {from_config}, and that is what every other daemon on this machine binds, \
+             including one a connecting agent starts. Make it the machine's answer with: \
+             crystalline config set {key} {set_value}"
+        )
+    })
+}
+
+/// Render an HTTP resolution for the notice above: an address, or the word
+/// for a closed endpoint.
+fn describe_http(resolved: Option<&String>) -> String {
+    resolved
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "off".to_string())
+}
+
+/// Render a `Host` allow-list for the notice above. Empty is loopback only,
+/// which is the secure default rather than an absence.
+fn describe_hosts(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        "loopback only".to_string()
+    } else {
+        hosts.join(", ")
+    }
+}
+
 /// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard
 /// and dropping the SSE priming frame. An empty `allowed_hosts` keeps rmcp's
 /// loopback-only default; a single `*` disables the guard (any Host allowed);
@@ -2418,6 +2489,70 @@ mod tests {
     fn resolve_allowed_hosts_empty_without_flag_or_config() {
         let config = GlobalConfig::default();
         assert!(resolve_allowed_hosts(&[], &config).is_empty());
+    }
+
+    /// A flag that asks for exactly what configuration already says is not an
+    /// override, and a line about it would be noise on every container start.
+    #[test]
+    fn exposure_override_notice_is_silent_when_the_flag_agrees_with_configuration() {
+        assert_eq!(
+            exposure_override_notice(
+                "service.http",
+                "127.0.0.1:7411",
+                "127.0.0.1:7411",
+                "127.0.0.1:7411"
+            ),
+            None
+        );
+    }
+
+    /// The line names both values and the key, and gives the command that makes
+    /// the flag's answer the machine's answer. It is a notice: nothing in it
+    /// refuses, because a one-off serve on another port is a real thing to want.
+    #[test]
+    fn exposure_override_notice_names_both_values_and_the_key() {
+        let line = exposure_override_notice(
+            "service.http",
+            "0.0.0.0:7411",
+            "127.0.0.1:7411",
+            "0.0.0.0:7411",
+        )
+        .expect("a difference is worth a line");
+        assert!(line.contains("0.0.0.0:7411"), "{line}");
+        assert!(line.contains("127.0.0.1:7411"), "{line}");
+        assert!(line.contains("service.http"), "{line}");
+        assert!(
+            line.contains("crystalline config set service.http 0.0.0.0:7411"),
+            "it gives the command that makes it permanent: {line}"
+        );
+        assert!(
+            !line.contains("refus") && !line.contains("Error"),
+            "it is a notice, not a refusal: {line}"
+        );
+        assert!(
+            !line.contains("HTTP endpoint failed on"),
+            "it must not collide with the bind-failure line the e2e smoke script greps for: {line}"
+        );
+    }
+
+    /// The allow-list flag gets the same treatment, with the comma-separated
+    /// spelling the setting takes rather than the flag's repeated form.
+    #[test]
+    fn exposure_override_notice_uses_the_settable_spelling_for_the_allow_list() {
+        let line = exposure_override_notice(
+            "service.allowed_hosts",
+            "muthur.lan, host.docker.internal",
+            "loopback only",
+            "muthur.lan,host.docker.internal",
+        )
+        .expect("a difference is worth a line");
+        assert!(line.contains("loopback only"), "{line}");
+        assert!(
+            line.contains(
+                "crystalline config set service.allowed_hosts muthur.lan,host.docker.internal"
+            ),
+            "{line}"
+        );
     }
 
     #[test]
