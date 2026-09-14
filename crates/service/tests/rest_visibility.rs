@@ -242,7 +242,10 @@ impl RestCtx {
                 // Pinned inside the temp directory: nothing in this suite may
                 // reach the developer's own state directory or credentials.
                 .with_origins_dir(root.join("origins"))
-                .with_token_store_dir(root.join("tokens")),
+                .with_token_store_dir(root.join("tokens"))
+                // The removal route sweeps the overlay journal, which is a
+                // recursive delete under the state directory.
+                .with_state_dir(root.join("state")),
         );
         engine.sync(None).await.unwrap();
         let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());

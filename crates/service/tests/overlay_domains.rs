@@ -45,6 +45,13 @@ struct Fixture {
 /// A file domain `team` (MANIFEST + plan.md), synced, with the state directory
 /// inside the temp dir so no journal write or sweep can reach the real one.
 async fn fixture() -> Fixture {
+    fixture_with_state_dir(true).await
+}
+
+/// The same, with the choice of whether the engine is told where its state
+/// directory is. `false` is only ever used by the test that pins what an engine
+/// without one may do, which is nothing.
+async fn fixture_with_state_dir(pinned: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");
@@ -64,9 +71,12 @@ async fn fixture() -> Fixture {
     let state = root.join("state");
     let store: Arc<Mutex<dyn Store>> =
         Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
-    let engine = Arc::new(
-        Engine::new(store.clone(), cfg, None, Some(config_path)).with_state_dir(state.clone()),
-    );
+    let engine = Engine::new(store.clone(), cfg, None, Some(config_path));
+    let engine = Arc::new(if pinned {
+        engine.with_state_dir(state.clone())
+    } else {
+        engine
+    });
     engine.sync(None).await.unwrap();
     Fixture {
         _tmp: tmp,
@@ -333,6 +343,48 @@ async fn removing_a_domain_sweeps_every_actors_journal_and_names_the_counts() {
     );
 }
 
+/// An engine that was never told where its state directory is reaches no
+/// journal at all in a test build, and says which method to call.
+///
+/// The sweep on the removal path is `std::fs::remove_dir_all` under
+/// `<state_dir>/overlays/<domain>`, so an engine falling back to the real state
+/// directory is a test suite deleting a developer's own drafts by domain name -
+/// silently, since the sweep is best effort, and unrecoverably, since the
+/// journal is the one copy of a draft a rebuild cannot make again. An audit of
+/// the fixtures is not enough (the first one missed three binaries), so the
+/// resolver itself refuses under the test seam and every fixture that touches a
+/// journal has to say where.
+#[tokio::test]
+async fn an_engine_with_no_state_dir_reaches_no_journal_in_a_test_build() {
+    let f = fixture_with_state_dir(false).await;
+
+    let err = f
+        .engine
+        .restore_overlays("team")
+        .await
+        .expect_err("a restore with nowhere to restore from is refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("with_state_dir"),
+        "and the refusal names the method that fixes it: {text}"
+    );
+
+    // The removal paths do not fail - they are best effort by design - but they
+    // sweep nothing and they say the count is unknown rather than zero.
+    let preview = f
+        .engine
+        .domain_remove_preview("team", &Scope::Unrestricted, false)
+        .await
+        .unwrap();
+    assert_eq!(preview["drafts_unknown"], serde_json::json!(true));
+    let report = f
+        .engine
+        .unregister_domain("team", &Scope::Unrestricted, false)
+        .await
+        .unwrap();
+    assert_eq!(report["drafts_swept"], serde_json::json!(0));
+}
+
 /// An empty answer and an unanswerable one are not the same thing, and a
 /// destructive confirmation is the last place to confuse them.
 ///
@@ -369,7 +421,11 @@ async fn an_unreadable_journal_is_never_read_as_nobody_drafting() {
     std::fs::remove_dir_all(f.state.join("overlays/solo")).unwrap();
     std::fs::write(f.state.join("overlays/solo"), "not a folder either").unwrap();
 
-    let report = f.engine.collect_orphaned_domains(None, false).await.unwrap();
+    let report = f
+        .engine
+        .collect_orphaned_domains(None, false)
+        .await
+        .unwrap();
     assert_eq!(
         report["collected"],
         serde_json::json!([]),

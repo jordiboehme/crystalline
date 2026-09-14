@@ -126,7 +126,10 @@ impl Harness {
         let store = TursoStore::open_in_memory().await.unwrap();
         let engine = Arc::new(
             Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
-                .with_token_store_dir(token_store),
+                .with_token_store_dir(token_store)
+                // The removal round sweeps the overlay journal, which is a
+                // recursive delete under the state directory.
+                .with_state_dir(root.join("state")),
         );
         engine.sync(None).await.unwrap();
         Harness {
@@ -178,7 +181,8 @@ impl Harness {
             Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
                 .with_token_store_dir(token_store)
                 .with_origin_provider(mock.clone())
-                .with_origins_dir(root.join("origins")),
+                .with_origins_dir(root.join("origins"))
+                .with_state_dir(root.join("state")),
         );
         let domain_root = root.join("kb");
         engine
@@ -243,7 +247,8 @@ impl Harness {
         self.engine = Arc::new(
             Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
                 .with_token_store_dir(self.root.join("token-store"))
-                .with_origins_dir(self.root.join("origins")),
+                .with_origins_dir(self.root.join("origins"))
+                .with_state_dir(self.root.join("state")),
         );
     }
 

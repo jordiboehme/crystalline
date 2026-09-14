@@ -81,6 +81,10 @@ impl Harness {
         let engine = Arc::new(
             Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
                 .with_token_store_dir(token_store)
+                // `remove_domain` sweeps the overlay journal, and the sweep is a
+                // recursive delete: it belongs inside the temp directory like
+                // everything else this harness writes.
+                .with_state_dir(root.join("state"))
                 .with_read_only(read_only),
         );
         engine.sync(None).await.unwrap();

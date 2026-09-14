@@ -12441,6 +12441,25 @@ impl Engine {
     fn journal_state_dir(&self) -> Result<PathBuf> {
         match &self.state_dir_override {
             Some(p) => Ok(p.clone()),
+            // **Under the test seam this refuses instead of falling back**, and
+            // it is the one resolver in this file that does. Every other one
+            // reaching a real machine path costs a test a read; this one is
+            // reached by `journal_remove_domain`, which is
+            // `std::fs::remove_dir_all` under `<state_dir>/overlays/<domain>`.
+            // A fixture that forgot [`Engine::with_state_dir`] would delete a
+            // developer's own drafts by domain name, silently (the sweep is
+            // best effort) and unrecoverably (the journal is the only copy of a
+            // draft a rebuild cannot make again) - and would read their real
+            // journal into its test index on the way. An audit of the fixtures
+            // is not enough; the resolver has to say no.
+            #[cfg(any(test, feature = "testing"))]
+            None => Err(EngineError::Internal(
+                "this engine was built without a state directory, so it reaches no overlay \
+                 journal: a test that touches drafts, a removal or a sync must say where the \
+                 journal lives with `Engine::with_state_dir`"
+                    .to_string(),
+            )),
+            #[cfg(not(any(test, feature = "testing")))]
             None => crystalline_core::config::state_dir()
                 .map_err(|e| EngineError::Internal(e.to_string())),
         }
