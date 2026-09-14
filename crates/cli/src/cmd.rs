@@ -163,46 +163,21 @@ pub(crate) async fn reach_index(
         .await
     {
         Ok(store) => Ok(IndexRoute::Direct(store)),
-        Err(e) => Ok(IndexRoute::Unreachable(unreachable_words(
-            &location,
-            &e.to_string(),
-            bypassed,
-        ))),
-    }
-}
-
-/// Why the index could not be reached, in words a person can act on. A raw
-/// lock error names no daemon and no remedy, which is how a colleague's agent
-/// spent a session on the wrong diagnosis; every branch here names the holder
-/// it can see and one command to run, and appends the underlying error rather
-/// than leading with it.
-fn unreachable_words(location: &str, error: &str, bypassed: bool) -> String {
-    let holder = crystalline_service::instance::read_lock_info()
-        .filter(|info| crystalline_service::instance::process_alive(info.pid))
-        .map(|info| info.pid);
-    words_for_holder(holder, location, error, bypassed)
-}
-
-/// [`unreachable_words`] with the holder already looked up, so the three
-/// sentences can be read back in a test without a daemon on the machine.
-fn words_for_holder(holder: Option<u32>, location: &str, error: &str, bypassed: bool) -> String {
-    match (holder, bypassed) {
-        (Some(pid), true) => format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {location}, and --db or --config told this command to read that file directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}"
-        ),
-        (Some(pid), false) => format!(
-            "the running Crystalline daemon (pid {pid}) owns the index at {location} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}"
-        ),
-        (None, _) => format!(
-            "the index at {location} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
-        ),
+        Err(e) => Ok(IndexRoute::Unreachable(
+            crystalline_service::instance::index_unreachable_words(
+                &location,
+                &e.to_string(),
+                bypassed,
+            ),
+        )),
     }
 }
 
 /// The words a listing uses when the daemon it asked answered badly: an error
 /// envelope, or a reply that did not arrive whole. Its own sentence rather
-/// than [`words_for_holder`]'s, because nothing here is about a lock: the
-/// daemon is reachable and the answer is not usable.
+/// than the shared lock wording in
+/// [`crystalline_service::instance::words_for_holder`], because nothing here
+/// is about a lock: the daemon is reachable and the answer is not usable.
 fn daemon_answered_badly(what: &str, error: &str) -> String {
     format!(
         "the running Crystalline daemon answered {what} with an error instead of the counts. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The daemon reported: {error}"
@@ -2498,67 +2473,7 @@ fn print_report(r: &crystalline_index::SyncReport) {
 
 #[cfg(test)]
 mod index_reach_words_tests {
-    use super::{daemon_answered_badly, words_for_holder};
-
-    /// The raw backend error is the tail of the sentence, never its head, and
-    /// never the whole of it.
-    fn assert_error_is_only_the_tail(words: &str, raw: &str) {
-        let marker = "The index reported: ";
-        let at = words
-            .find(marker)
-            .unwrap_or_else(|| panic!("no error marker in: {words}"));
-        assert!(
-            !words.starts_with(raw),
-            "a lock error must not lead the sentence: {words}"
-        );
-        assert_eq!(
-            words.match_indices(raw).map(|(i, _)| i).collect::<Vec<_>>(),
-            vec![at + marker.len()],
-            "the raw error appears once, after the marker: {words}"
-        );
-    }
-
-    /// A daemon holds the index and answered nothing: name it by pid, and name
-    /// the two commands that do something about it.
-    #[test]
-    fn a_silent_holder_is_named_with_its_pid_and_a_remedy() {
-        let raw = "Locking error: File is locked by another process";
-        let words = words_for_holder(Some(4242), "/tmp/index.db", raw, false);
-        assert!(words.contains("(pid 4242)"), "{words}");
-        assert!(words.contains("/tmp/index.db"), "{words}");
-        assert!(words.contains("crystalline doctor --fix"), "{words}");
-        assert!(words.contains("crystalline ctl shutdown"), "{words}");
-        assert_error_is_only_the_tail(&words, raw);
-    }
-
-    /// The same holder, reached past by `--db`: the remedy is to stop reaching
-    /// past it, so that is what the sentence says first.
-    #[test]
-    fn a_bypassed_holder_is_told_to_drop_the_override() {
-        let raw = "Locking error: File is locked by another process";
-        let words = words_for_holder(Some(77), "/tmp/index.db", raw, true);
-        assert!(words.contains("(pid 77)"), "{words}");
-        assert!(words.contains("--db or --config"), "{words}");
-        assert!(
-            words.contains("without --db and --config"),
-            "the first remedy is the one that costs nothing: {words}"
-        );
-        assert_error_is_only_the_tail(&words, raw);
-    }
-
-    /// No holder to name, so the sentence says that rather than implying one.
-    #[test]
-    fn with_no_daemon_the_absence_is_stated() {
-        let raw = "unable to open database file";
-        let words = words_for_holder(None, "/tmp/index.db", raw, false);
-        assert!(!words.contains("pid"), "{words}");
-        assert!(
-            words.contains("no Crystalline daemon is running"),
-            "{words}"
-        );
-        assert!(words.contains("crystalline doctor --fix"), "{words}");
-        assert_error_is_only_the_tail(&words, raw);
-    }
+    use super::daemon_answered_badly;
 
     /// A daemon that answered badly is a different state from a locked file,
     /// and says so without borrowing the lock sentence.

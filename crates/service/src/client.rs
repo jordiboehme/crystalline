@@ -680,6 +680,49 @@ where
     Ok(())
 }
 
+/// Open the index in-process for a standalone command, or say why it could
+/// not be opened.
+///
+/// Every verb below falls through to here when no daemon answered, and one of
+/// the states that reaches it is a daemon that is alive, owns the index and
+/// answers nothing on its socket. What a person met there was the backend's
+/// raw lock text, with no daemon named and no command to run; a colleague's
+/// agent spent a session on the wrong diagnosis reading exactly that.
+///
+/// The sentence is [`crate::instance::index_unreachable_words`], the one the
+/// CLI's own opener already uses (`cmd::reach_index`), so the same state reads
+/// the same way whichever crate happened to open the index. The backend's own
+/// words are kept, last, inside it: nothing is hidden, it just stops leading.
+async fn open_standalone_reporting(
+    loaded: overlay::LoadedConfig,
+    db_path: &Path,
+    want_embeddings: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Engine> {
+    // Postgres has no local file, so naming one in a failure would point at a
+    // path nothing lives at.
+    let location = if loaded.effective.database().backend
+        == crystalline_core::config::DatabaseBackend::Turso
+    {
+        db_path.display().to_string()
+    } else {
+        "the configured database".to_string()
+    };
+    // An explicit --db or --config never asked the daemon in the first place,
+    // which changes the remedy rather than the diagnosis.
+    let bypassed = !use_daemon(db, config_path);
+    open_standalone(loaded, db_path, want_embeddings)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(crate::instance::index_unreachable_words(
+                &location,
+                &format!("{e:#}"),
+                bypassed
+            ))
+        })
+}
+
 /// Run a tool by name: over the socket when a daemon is up, else in-process
 /// against a directly opened store.
 pub async fn run_tool(
@@ -705,7 +748,8 @@ pub async fn run_tool(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let want_embeddings = matches!(tool, "search_engrams");
-    let engine = open_standalone(loaded, &db_path, want_embeddings).await?;
+    let engine =
+        open_standalone_reporting(loaded, &db_path, want_embeddings, db, config_path).await?;
     dispatch_engine(&engine, tool, args).await
 }
 
@@ -728,7 +772,7 @@ pub async fn scaffold_virtual_manifest(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine.scaffold_virtual_manifest(domain, markdown).await?)
 }
 
@@ -754,7 +798,7 @@ pub async fn domain_import(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .import_domain(domain, src, overwrite, dry_run)
         .await?)
@@ -785,7 +829,7 @@ pub async fn tags_retag(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .retag(old, new, domain, merge, dry_run, !no_alias)
         .await?)
@@ -813,7 +857,7 @@ pub async fn domain_export(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine.export_domain(domain, dest, force, dry_run).await?)
 }
 
@@ -846,7 +890,7 @@ pub async fn collect_orphaned_domains(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine.collect_orphaned_domains(None, dry_run).await?)
 }
 
@@ -917,7 +961,7 @@ pub async fn domain_remove(
     let loaded = overlay::load(config_path)?;
     let config_file = loaded.path.clone();
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false)
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path)
         .await
         .map_err(|e| {
             anyhow::anyhow!(
@@ -972,7 +1016,7 @@ pub async fn origin_add(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .origin_add(repo, domain, path, branch, folder)
         .await?)
@@ -994,7 +1038,7 @@ pub async fn origin_update(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine.origin_update(domain, &Scope::Unrestricted).await?)
 }
 
@@ -1022,7 +1066,7 @@ pub async fn origin_status(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .origin_status(domain, detail, &Scope::Unrestricted)
         .await?)
@@ -1058,7 +1102,7 @@ pub async fn origin_share(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .origin_share(
             domain,
@@ -1092,7 +1136,7 @@ pub async fn origin_withdraw(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
         .await?)
@@ -1126,7 +1170,7 @@ pub async fn origin_resolve(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .origin_resolve(domain, path, keep, content, ShareActor::Owner)
         .await?)

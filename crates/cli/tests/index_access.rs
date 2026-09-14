@@ -15,6 +15,16 @@
 //! too, because each is a rename away: importing an opener under another name,
 //! constructing a concrete store and so skipping the factory entirely, and
 //! importing either from the index crate at the top of a file.
+//!
+//! It scans `crates/cli/src` and stops at that crate's boundary, which is not
+//! the whole of the tool: the data verbs (`search`, `read`, `context`,
+//! `recent`, `evolve`, `vocabulary`) reach the index through
+//! `crystalline_service::client`, whose standalone fallback opens it there and
+//! is invisible to this scan. That path says the same sentence by calling the
+//! same composer (`instance::index_unreachable_words`) rather than by being
+//! guarded here; a verb moved into the service crate therefore leaves this
+//! guard's sight, and keeping the wording one function is what holds it
+//! together.
 
 use std::path::{Path, PathBuf};
 

@@ -1730,6 +1730,20 @@ impl FakeDaemon {
     /// `None` closes the connection having written nothing, which is the
     /// truncated answer a daemon dying mid-exchange leaves behind.
     fn spawn(env: &Env, reply: Option<&'static str>) -> FakeDaemon {
+        FakeDaemon::publish(env, Some(reply))
+    }
+
+    /// A daemon that is alive and published but whose socket cannot be
+    /// connected to at all: the record names a live pid, and nothing is
+    /// listening. This is the shape that reaches the standalone fallback,
+    /// because that is the one state in which a client gives up on the socket
+    /// and opens the index itself.
+    fn unreachable(env: &Env) -> FakeDaemon {
+        FakeDaemon::publish(env, None)
+    }
+
+    /// `listen` is the reply behaviour, or `None` to bind no socket at all.
+    fn publish(env: &Env, listen: Option<Option<&'static str>>) -> FakeDaemon {
         std::fs::create_dir_all(env.state_dir()).unwrap();
         // A disposable child stands in for the daemon's pid, the same trick
         // `status_notes_an_unreachable_daemon_on_stderr` uses. A far-future
@@ -1753,6 +1767,9 @@ impl FakeDaemon {
         .unwrap();
         let sock = env.sock_path();
         let _ = std::fs::remove_file(&sock);
+        let Some(reply) = listen else {
+            return FakeDaemon { stand_in };
+        };
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -1828,6 +1845,58 @@ fn domain_list_degrades_when_the_daemon_answers_nothing_at_all() {
     assert!(stdout.contains("eng\t"), "{stdout}");
     assert!(stdout.contains("(counts not read)"), "{stdout}");
     assert!(stderr.contains("crystalline doctor --fix"), "{stderr}");
+}
+
+/// A data verb that cannot reach the index says who has it and what to do,
+/// never the backend's lock text on its own.
+///
+/// The state: a daemon is alive, its record is published, it owns the index
+/// and nothing answers on its socket. The data verbs (`search` and its five
+/// siblings) do not open the index through the CLI's own helper - they reach
+/// it in the service crate, whose standalone fallback used to hand the raw
+/// error straight out. A person reading "Locking error: File is locked by
+/// another process" has no way to know a daemon exists, let alone which
+/// command ends it.
+#[test]
+fn search_names_the_daemon_and_the_remedy_when_the_index_cannot_be_opened() {
+    let env = Env::new("search-locked");
+    env.setup_domain("eng");
+    let _fake = FakeDaemon::unreachable(&env);
+    let pid = {
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(env.lock_path()).unwrap()).unwrap();
+        record["pid"].as_u64().unwrap()
+    };
+    // Make the open fail the way a held index does, without needing a real
+    // daemon to hold it: a directory where the database file belongs cannot be
+    // opened by any backend. What is under test is the wording of a failed
+    // open, not which failure produced it.
+    let db = env.state_dir().join("index.db");
+    let _ = std::fs::remove_file(&db);
+    std::fs::create_dir_all(&db).unwrap();
+
+    let (ok, _stdout, stderr) = env.run_full(&["search", "seed"]);
+    assert!(!ok, "search needs the index: {stderr}");
+    assert!(
+        stderr.contains(&format!("(pid {pid})")),
+        "the holder is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("owns the index at"),
+        "and what it holds: {stderr}"
+    );
+    assert!(
+        stderr.contains("crystalline doctor --fix") && stderr.contains("crystalline ctl shutdown"),
+        "with the two commands that do something about it: {stderr}"
+    );
+    let daemon_at = stderr.find("owns the index at").unwrap();
+    let raw_at = stderr
+        .find("The index reported: ")
+        .unwrap_or_else(|| panic!("the backend's own words are kept: {stderr}"));
+    assert!(
+        daemon_at < raw_at,
+        "and they come last, never first: {stderr}"
+    );
 }
 
 /// `status` is the verb a person reaches for when something is broken, and a
