@@ -1413,19 +1413,15 @@ pub async fn reindex(
         }
     }
 
-    if embed {
-        let store = store.lock().await;
-        embed_pass(&*store, cfg).await?;
-    }
-
-    // The driver already checkpointed what the rebuild wrote; the embed pass
-    // above ran after it, so its vectors need their own merge before a
+    // The driver already checkpointed what the rebuild wrote, but the embed
+    // pass runs after it, so its vectors need their own merge before a
     // downstream pipeline ships index.db as a single file with the sidecars
     // deleted. A no-op on Postgres (no local WAL file); on Turso this replaces
     // the downstream Docker image build's shell-out to `sqlite3` for the same
     // purpose.
     if embed {
         let store = store.lock().await;
+        embed_pass(&*store, cfg).await?;
         store.checkpoint_wal().await?;
     }
     Ok(())
