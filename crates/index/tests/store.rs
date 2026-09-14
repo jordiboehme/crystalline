@@ -15,7 +15,7 @@ use crystalline_index::{
     AttachmentRow, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage,
     EmbeddingRow, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage,
     InboundQuery, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode,
-    SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
+    SearchQuery, Store, TursoStore, Vocabulary, resolve_forward_refs, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -551,6 +551,153 @@ async fn link_two_pass_resolution(store: &dyn Store) {
 parity!(
     prose_wikilink_resolves_on_later_sync,
     link_two_pass_resolution
+);
+
+/// A run over several domains settles its forward references before it
+/// finishes. Domain `a` is indexed first and carries both a relation and a
+/// prose wikilink into domain `b`, which does not exist yet - not the engram,
+/// not even the domain row - so `a`'s own resolution batch cannot match either
+/// one. Indexing `b` afterwards does not help `a` either: resolution is scoped
+/// to the domain being applied. Until the final pass existed, both references
+/// read as unresolved for the rest of the run, and the fix for an agent seeing
+/// `"resolved": false` on a link that is not broken was to sync a second time.
+///
+/// The references are written in the cross-domain `[[b:...]]` form on purpose.
+/// A bare `[[B Note]]` resolves only inside the writing domain (the match
+/// scopes to `to_domain`'s row and falls back to the source domain when it is
+/// absent), so it could never reach `b` at all and would pin nothing here.
+async fn late_cross_domain_resolution(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let a_root = dir.path().join("a");
+    let b_root = dir.path().join("b");
+    std::fs::create_dir_all(&a_root).unwrap();
+    std::fs::create_dir_all(&b_root).unwrap();
+    write(
+        &a_root,
+        "a.md",
+        &engram(
+            "A",
+            "a",
+            "engram",
+            "",
+            "- depends_on [[b:B Note]]\n\nProse mentions [[b:B Note]] too.\n",
+        ),
+    );
+    write(
+        &b_root,
+        "b.md",
+        &engram("B Note", "b-note", "engram", "", "body b\n"),
+    );
+
+    // The loop of a multi-domain driver: `a` first, while `b` is unknown - a
+    // driver upserts each domain row as it reaches it, so `b` has no row at all
+    // while `a` is being applied, which is exactly the state that defeats the
+    // per-domain batch.
+    let mut reports = vec![
+        sync_domain(store, "a", &a_root).await.unwrap(),
+        sync_domain(store, "b", &b_root).await.unwrap(),
+    ];
+    // Both rows exist now, so these resolve the ids the driver already held.
+    let a_id = store
+        .upsert_domain("a", Some(&a_root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let b_id = store
+        .upsert_domain("b", Some(&b_root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        (reports[0].relations_resolved, reports[0].links_resolved),
+        (0, 0),
+        "a's own batch cannot see into b"
+    );
+
+    // The tail of the same driver, after every domain of the run is indexed.
+    let totals = resolve_forward_refs(store, &[a_id, b_id], &mut reports)
+        .await
+        .unwrap();
+    assert_eq!(totals, (1, 1), "the run totals name the late resolutions");
+    assert_eq!(
+        (
+            reports[0].relations_resolved_late,
+            reports[0].links_resolved_late
+        ),
+        (1, 1),
+        "and they are reported against the domain that carried them"
+    );
+    assert_eq!(
+        (
+            reports[1].relations_resolved_late,
+            reports[1].links_resolved_late
+        ),
+        (0, 0),
+        "b had no forward references of its own"
+    );
+
+    let stats = store.domain_stats().await.unwrap();
+    let a_stats = stats.iter().find(|d| d.name == "a").expect("domain a");
+    assert_eq!(
+        (a_stats.unresolved_relations, a_stats.unresolved_links),
+        (0, 0),
+        "nothing is left unresolved when the first sync finishes"
+    );
+
+    // The resolved reference is a real edge, not just a filled column.
+    let a = store.lookup_id("a", "a").await.unwrap().unwrap();
+    let slice = store.neighbors(&[a], 1).await.unwrap();
+    let perms: Vec<&str> = slice.nodes.iter().map(|n| n.permalink.as_str()).collect();
+    assert!(perms.contains(&"b-note"), "traversal reaches b's engram");
+
+    // The pass is idempotent: a second run over a settled index resolves
+    // nothing and does not double-count.
+    let again = resolve_forward_refs(store, &[a_id, b_id], &mut reports)
+        .await
+        .unwrap();
+    assert_eq!(again, (0, 0), "nothing left to resolve");
+}
+parity!(
+    a_multi_domain_run_resolves_forward_references_before_it_finishes,
+    late_cross_domain_resolution
+);
+
+/// A single-domain run needs no final pass: its own batch already resolved
+/// everything this run indexed, so the pass short-circuits, leaves the late
+/// counters at zero and does not re-run the statement.
+async fn single_domain_run_skips_the_late_pass(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- depends_on [[b]]\n"),
+    );
+    write(root, "b.md", &engram("B", "b", "engram", "", "body b\n"));
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let mut reports = vec![sync_domain(store, "d", root).await.unwrap()];
+    assert_eq!(
+        reports[0].relations_resolved, 1,
+        "resolved in its own batch"
+    );
+
+    let totals = resolve_forward_refs(store, &[domain], &mut reports)
+        .await
+        .unwrap();
+    assert_eq!(totals, (0, 0));
+    assert_eq!(
+        (
+            reports[0].relations_resolved_late,
+            reports[0].links_resolved_late
+        ),
+        (0, 0),
+        "the late counters stay at zero on a single-domain run"
+    );
+}
+parity!(
+    a_single_domain_run_skips_the_late_pass,
+    single_domain_run_skips_the_late_pass
 );
 
 /// `outbound_refs` reports every relation and prose link leaving an engram, in

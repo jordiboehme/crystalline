@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
-use crystalline_index::TursoStore;
+use crystalline_index::{Store, TursoStore};
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::params::SearchParams;
@@ -176,4 +176,66 @@ async fn sync_paths_on_a_virtual_domain_is_a_noop() {
     assert_eq!(report.updated, 0);
     assert_eq!(report.deleted, 0);
     assert_eq!(report.unchanged, 0);
+}
+
+/// A watcher flush is a single-domain sync, and it still resolves references
+/// that leave its domain. The target-domain lookup inside the resolution
+/// statement is global (it matches the `domain` row named by the `[[b:...]]`
+/// prefix, never the domain being synced), and `sync_paths` goes through the
+/// same `apply_scan` as a full sync, so a relation written into an
+/// already-indexed domain resolves the moment the watcher flushes it - no full
+/// sweep, and no final cross-domain pass, which a one-domain run skips.
+///
+/// This is the half the cross-domain pass must not regress: the pass settles
+/// references a multi-domain run left pending, it is not what makes a
+/// cross-domain reference resolvable in the first place.
+#[tokio::test]
+async fn a_targeted_sync_resolves_a_relation_into_another_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a_dir = tmp.path().join("a");
+    let b_dir = tmp.path().join("b");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::create_dir_all(&b_dir).unwrap();
+    std::fs::write(a_dir.join("seed.md"), engram("Seed", "seed", "seed body")).unwrap();
+    std::fs::write(b_dir.join("b.md"), engram("B Note", "b-note", "body b")).unwrap();
+
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("a".to_string(), DomainEntry::file(a_dir.clone()));
+    cfg.domains
+        .insert("b".to_string(), DomainEntry::file(b_dir.clone()));
+    let store = Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let engine = Engine::new(store.clone(), cfg, None, None);
+    engine.sync(None).await.unwrap();
+
+    // A new file in `a` points into `b`, and only `a` is flushed.
+    std::fs::write(
+        a_dir.join("late.md"),
+        engram(
+            "Late",
+            "late",
+            "- depends_on [[b:B Note]]\n\nProse mentions [[b:B Note]] too.",
+        ),
+    )
+    .unwrap();
+    let report = engine
+        .sync_paths("a", vec!["late.md".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(report.added, 1, "the targeted file is indexed");
+    assert_eq!(
+        report.relations_resolved, 1,
+        "the relation into b resolves in the targeted pass itself"
+    );
+    assert_eq!(report.links_resolved, 1, "and so does the prose wikilink");
+    assert_eq!(
+        (report.relations_resolved_late, report.links_resolved_late),
+        (0, 0),
+        "a single-domain flush runs no cross-domain pass"
+    );
+
+    let stats = store.lock().await.domain_stats().await.unwrap();
+    let a = stats.iter().find(|d| d.name == "a").expect("domain a");
+    assert_eq!((a.unresolved_relations, a.unresolved_links), (0, 0));
 }

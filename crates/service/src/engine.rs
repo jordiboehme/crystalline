@@ -42,7 +42,7 @@ use crystalline_index::{
     RULES, RecentFilter, SearchMode, SearchQuery, ShareFacts, Store, SweepInput, SweepOptions,
     SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
     is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
-    retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -8843,6 +8843,10 @@ impl Engine {
         let targets = self.sync_targets(only)?;
         let collab = !self.instance_id.is_empty();
         let mut reports = Vec::new();
+        // The domains this run actually applied, parallel to `reports`, for the
+        // final cross-domain resolution pass. A domain that was skipped (hosted
+        // elsewhere) or failed to scan wrote nothing and is not in either list.
+        let mut applied: Vec<DomainId> = Vec::new();
         let mut skipped = Vec::new();
         let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
@@ -8908,6 +8912,18 @@ impl Engine {
                 self.refresh_index_files(name).await;
             }
             reports.push(report);
+            applied.push(domain);
+        }
+        // Every domain of this run is in now, so the references that pointed
+        // forward into a domain the loop had not reached yet can resolve. A
+        // single-domain run is a no-op inside the pass.
+        {
+            let store = self.store.lock().await;
+            resolve_forward_refs(&*store, &applied, &mut reports)
+                .await
+                .map_err(|e| {
+                    EngineError::Internal(format!("resolving forward references failed: {e}"))
+                })?;
         }
         Ok(json!({
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
@@ -8990,6 +9006,10 @@ impl Engine {
         let targets = self.sync_targets(None)?;
         let collab = !self.instance_id.is_empty();
         let mut reports = Vec::new();
+        // The domains this run actually rebuilt, parallel to `reports`, for the
+        // final cross-domain resolution pass. A domain hosted elsewhere was
+        // never touched and is in neither list.
+        let mut applied: Vec<DomainId> = Vec::new();
         // Two short store-lock windows per domain with the scan in between, the
         // same shape as `sync_take_over`, so a large domain's walk-and-hash pass
         // no longer holds the mutex. The first window claims the host, clears the
@@ -9032,6 +9052,19 @@ impl Engine {
                 self.refresh_index_files(&name).await;
             }
             reports.push(report);
+            applied.push(domain);
+        }
+        // A reindex rebuilds every domain in one run, so it has exactly the
+        // forward-reference problem a full sweep has: the first domain is
+        // applied while the last one holds none of its targets yet - and under
+        // `full` the targets were cleared as well.
+        {
+            let store = self.store.lock().await;
+            resolve_forward_refs(&*store, &applied, &mut reports)
+                .await
+                .map_err(|e| {
+                    EngineError::Internal(format!("resolving forward references failed: {e}"))
+                })?;
         }
         Ok(json!({
             "full": full,

@@ -15,7 +15,7 @@ use crystalline_core::config::{
 };
 use crystalline_index::{
     ChunkParams, DomainKind, Store, apply_scan, configured_model_id, download_local_model,
-    provider_from_config, run_embedding_pass, scan_domain,
+    provider_from_config, resolve_forward_refs, run_embedding_pass, scan_domain,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -1202,6 +1202,9 @@ pub async fn sync(
     let params = chunk_params(cfg);
 
     let mut reports = Vec::new();
+    // The domains this run applied, parallel to `reports`, for the final
+    // cross-domain resolution pass below.
+    let mut applied = Vec::new();
     for (name, entry) in targets {
         // Virtual domains have no files to sync.
         let Some(path) = resolve_domain_path(&entry) else {
@@ -1232,6 +1235,17 @@ pub async fn sync(
                 .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?
         };
         reports.push(report);
+        applied.push(domain);
+    }
+
+    // Every domain of this run is in now, so a reference that pointed forward
+    // into a domain later in the loop resolves here rather than waiting for the
+    // next sync. A single-domain run is a no-op inside the pass.
+    {
+        let store = store.lock().await;
+        resolve_forward_refs(&*store, &applied, &mut reports)
+            .await
+            .map_err(|e| anyhow!("resolving forward references failed: {e}"))?;
     }
 
     if json {
@@ -1361,6 +1375,9 @@ pub async fn reindex(
     }
 
     let mut reports = Vec::new();
+    // The domains this run applied, parallel to `reports`, for the final
+    // cross-domain resolution pass below.
+    let mut applied = Vec::new();
     for (name, path) in &file_targets {
         // First lock window: snapshot; scan with no lock held; second: apply.
         let (domain, snapshot) = {
@@ -1379,6 +1396,17 @@ pub async fn reindex(
                 .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?
         };
         reports.push(report);
+        applied.push(domain);
+    }
+
+    // A reindex rebuilds every domain in one run, so it has exactly the same
+    // forward-reference problem a full sync has: the first domain is applied
+    // while the last one holds none of its targets yet.
+    {
+        let store = store.lock().await;
+        resolve_forward_refs(&*store, &applied, &mut reports)
+            .await
+            .map_err(|e| anyhow!("resolving forward references failed: {e}"))?;
     }
 
     if json {
@@ -2453,8 +2481,19 @@ fn print_report(r: &crystalline_index::SyncReport) {
     } else {
         String::new()
     };
+    // Likewise the cross-domain pass: silent on a run that had nothing left to
+    // settle, and explicit when references only resolved once every other
+    // domain of the run was indexed.
+    let late = if r.relations_resolved_late > 0 || r.links_resolved_late > 0 {
+        format!(
+            " ({} relations, {} links resolved across domains at the end)",
+            r.relations_resolved_late, r.links_resolved_late
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged{}, {} relations resolved, {} links resolved ({} ms)",
+        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged{}, {} relations resolved, {} links resolved ({} ms){}",
         r.domain,
         r.added,
         r.updated,
@@ -2464,7 +2503,8 @@ fn print_report(r: &crystalline_index::SyncReport) {
         deferred,
         r.relations_resolved,
         r.links_resolved,
-        r.duration_ms
+        r.duration_ms,
+        late
     );
     for (path, err) in &r.failed {
         println!("  failed: {path}: {err}");

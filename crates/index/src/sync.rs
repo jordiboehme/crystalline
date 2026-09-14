@@ -8,6 +8,13 @@
 //! genuinely changed files, applies everything in one transaction and resolves
 //! forward references in a single batch at the end.
 //!
+//! A domain's own batch can only resolve references into domains that are
+//! already indexed, so a run over several domains ends with one more pass:
+//! [`resolve_forward_refs`] re-runs the same two store methods over every
+//! domain the run applied, once all of them are in, and a reference pointing
+//! forward into a domain registered later no longer has to wait for the next
+//! sync to stop reading as unresolved.
+//!
 //! Hashing and parsing run off-thread with bounded concurrency; all database
 //! writes stay on the calling task and commit together.
 //!
@@ -125,6 +132,17 @@ pub struct SyncReport {
     /// Prose wikilinks resolved at the end of this sync.
     #[serde(default)]
     pub links_resolved: u64,
+    /// Forward references this domain only resolved in the final cross-domain
+    /// pass of a multi-domain run, once every other domain was indexed - see
+    /// [`resolve_forward_refs`]. Kept apart from `relations_resolved` rather
+    /// than added into it, so a reader can tell a reference that resolved
+    /// against an already-indexed target from one that had to wait for a
+    /// domain later in the run.
+    #[serde(default)]
+    pub relations_resolved_late: u64,
+    /// Prose wikilinks resolved in the same final cross-domain pass.
+    #[serde(default)]
+    pub links_resolved_late: u64,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
 }
@@ -757,6 +775,87 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
 
     report.duration_ms = duration_ms(started.elapsed());
     Ok(report)
+}
+
+/// The final cross-domain resolution pass of a multi-domain run: resolve every
+/// forward reference that was still pending when its own domain finished,
+/// because the domain it points into had not been indexed yet.
+///
+/// [`apply_scan`] resolves a domain's references as that domain commits, so a
+/// reference into a domain later in the run cannot resolve there: the target
+/// does not exist, and the target domain may have no row at all. Without this
+/// pass such a reference stays unresolved until some later sync happens to
+/// re-run the per-domain resolution, and until then a reader sees
+/// `"resolved": false` on a link that is not broken. Running the same two store
+/// methods once more, after every domain in the run is indexed, settles them in
+/// the run that created them; order of registration stops mattering.
+///
+/// `domains` and `reports` are parallel: the counts land in
+/// [`SyncReport::relations_resolved_late`] and [`SyncReport::links_resolved_late`]
+/// of the report at the same index, kept apart from the per-domain counters so
+/// the late pass is visible rather than folded away. Returns the run totals
+/// `(relations, links)`.
+///
+/// A run of fewer than two domains is a no-op: a single domain has already had
+/// its references resolved against everything this run indexed, so a second
+/// pass could only re-run the same statement over the same rows.
+///
+/// Callers are the multi-domain drivers - the daemon's sweep, `crystalline sync`
+/// and `crystalline reindex` - and all of them pass only the domains they
+/// actually applied, never one that was skipped or failed.
+pub async fn resolve_forward_refs<S: Store + ?Sized>(
+    store: &S,
+    domains: &[DomainId],
+    reports: &mut [SyncReport],
+) -> Result<(u64, u64)> {
+    debug_assert_eq!(
+        domains.len(),
+        reports.len(),
+        "resolve_forward_refs takes parallel slices"
+    );
+    if domains.len() < 2 {
+        return Ok((0, 0));
+    }
+
+    store.begin().await?;
+    let pass = async {
+        let mut counts = Vec::with_capacity(domains.len());
+        for &domain in domains {
+            let relations = store.resolve_pending_relations(domain).await?;
+            let links = store.resolve_pending_links(domain).await?;
+            counts.push((relations, links));
+        }
+        Ok::<Vec<(u64, u64)>, IndexError>(counts)
+    }
+    .await;
+    let counts = match pass {
+        Ok(counts) => {
+            store.commit().await?;
+            counts
+        }
+        Err(e) => {
+            let _ = store.rollback().await;
+            return Err(e);
+        }
+    };
+
+    let mut total_relations = 0;
+    let mut total_links = 0;
+    for (report, (relations, links)) in reports.iter_mut().zip(counts) {
+        report.relations_resolved_late = relations;
+        report.links_resolved_late = links;
+        total_relations += relations;
+        total_links += links;
+    }
+    if total_relations > 0 || total_links > 0 {
+        tracing::info!(
+            relations = total_relations,
+            links = total_links,
+            domains = domains.len(),
+            "sync: resolved forward references across domains after the last domain was indexed"
+        );
+    }
+    Ok((total_relations, total_links))
 }
 
 /// Reconcile a domain's attachment rows with the assets the scan found.
