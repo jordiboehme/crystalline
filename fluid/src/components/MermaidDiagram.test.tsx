@@ -19,6 +19,22 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "../theme/ThemeProvider";
 import MermaidDiagram from "./MermaidDiagram";
 
+// The overlay loads the pan-and-zoom library on first open, and jsdom has no
+// layout for it to work with. What this file is about is what the diagram does
+// when the two buttons are pressed, so the library is a stub here and its own
+// contract is pinned in `DiagramOverlay.test.tsx`.
+vi.mock("@panzoom/panzoom", () => ({
+  default: vi.fn(() => ({
+    zoomIn: vi.fn(),
+    zoomOut: vi.fn(),
+    zoom: vi.fn(),
+    pan: vi.fn(),
+    reset: vi.fn(),
+    zoomWithWheel: vi.fn(),
+    destroy: vi.fn(),
+  })),
+}));
+
 vi.mock("mermaid", () => ({
   default: {
     initialize: vi.fn(),
@@ -167,9 +183,10 @@ describe("MermaidDiagram", () => {
   });
 
   /**
-   * The way out of the reading column. The reader's own decision - nothing
-   * here happens on its own - so it is a button with a name, and the name says
-   * what pressing it will do rather than what state the diagram is in.
+   * The two ways out of the reading column: wider, and out of the page
+   * altogether. Both are the reader's own decision - nothing here happens on
+   * its own - so both are buttons with names, and the names say what pressing
+   * them will do rather than what state the diagram is in.
    */
   describe("the diagram's own actions", () => {
     const CLAMPED =
@@ -184,14 +201,17 @@ describe("MermaidDiagram", () => {
       return view;
     }
 
-    it("offers the action on a diagram it drew", async () => {
+    it("offers both actions on a diagram it drew", async () => {
       await drawn();
       expect(
         screen.getByRole("button", { name: "Show at full width" }),
       ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Open in full window" }),
+      ).toBeInTheDocument();
     });
 
-    it("offers none on a diagram that would not parse", async () => {
+    it("offers neither on a diagram that would not parse", async () => {
       renderDiagram.mockRejectedValue(new Error("no idea what that is"));
       draw("graph TD; A--");
       expect(await screen.findByText(/graph TD; A--/)).toBeInTheDocument();
@@ -231,6 +251,24 @@ describe("MermaidDiagram", () => {
       expect(
         screen.getByRole("button", { name: "Show at full width" }),
       ).toBeInTheDocument();
+    });
+
+    it("opens the full window in a modal dialog and closes it again", async () => {
+      await drawn();
+      expect(screen.queryByRole("dialog")).toBeNull();
+      await userEvent.click(
+        screen.getByRole("button", { name: "Open in full window" }),
+      );
+      const dialog = await screen.findByRole("dialog");
+      expect(dialog.getAttribute("aria-modal")).toBe("true");
+      await userEvent.click(screen.getByRole("button", { name: "Close" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog")).toBeNull();
+      });
+      // The button that opened it is where the keyboard lands again.
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Open in full window" }),
+      );
     });
   });
 });

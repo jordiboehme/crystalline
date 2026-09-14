@@ -1,5 +1,5 @@
 /**
- * What a reader can ask of a diagram, offered on the diagram itself.
+ * The two things a reader can ask of a diagram, offered on the diagram itself.
  *
  * They float in its top-right corner and stay out of the way until they are
  * wanted: hidden by opacity while nobody is near, shown on hover and on focus
@@ -18,8 +18,8 @@
  * full-width button reads "Show at reading width" once the diagram is wide.
  */
 
-import { FoldHorizontal, UnfoldHorizontal } from "lucide-react";
-import type { ComponentType, ReactElement } from "react";
+import { Maximize2, UnfoldHorizontal, FoldHorizontal } from "lucide-react";
+import type { ComponentType, ReactElement, RefObject } from "react";
 
 import { FOCUS_RING } from "./primitives";
 
@@ -34,20 +34,29 @@ export interface DiagramToolbarProps {
   /** Whether the diagram is currently showing at full width. */
   fullWidth: boolean;
   onToggleFullWidth: () => void;
+  onOpenFullWindow: () => void;
+  /**
+   * The full-window button, so the overlay it opens can hand the keyboard
+   * back to it on the way out.
+   */
+  fullWindowRef: RefObject<HTMLButtonElement | null>;
 }
 
 function Action({
   label,
   icon: Icon,
   onClick,
+  buttonRef,
 }: {
   label: string;
   icon: ComponentType<{ size?: number; strokeWidth?: number }>;
   onClick: () => void;
+  buttonRef?: RefObject<HTMLButtonElement | null> | undefined;
 }): ReactElement {
   return (
     <button
       type="button"
+      ref={buttonRef}
       aria-label={label}
       title={label}
       className={ACTION}
@@ -61,16 +70,28 @@ function Action({
 export default function DiagramToolbar({
   fullWidth,
   onToggleFullWidth,
+  onOpenFullWindow,
+  fullWindowRef,
 }: DiagramToolbarProps): ReactElement {
   return (
     <div
-      className="absolute top-1 right-1 flex gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100"
+      // `print:hidden` belongs with the rest: a printed page has no pointer, so
+      // a browser that reads `hover: none` in print media would otherwise put
+      // two buttons in the corner of every printed diagram. Chromium does not
+      // (measured), and this is what makes that not a question.
+      className="absolute top-1 right-1 flex gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 print:hidden [@media(hover:none)]:opacity-100"
       data-testid="diagram-toolbar"
     >
       <Action
         label={fullWidth ? "Show at reading width" : "Show at full width"}
         icon={fullWidth ? FoldHorizontal : UnfoldHorizontal}
         onClick={onToggleFullWidth}
+      />
+      <Action
+        label="Open in full window"
+        icon={Maximize2}
+        onClick={onOpenFullWindow}
+        buttonRef={fullWindowRef}
       />
     </div>
   );

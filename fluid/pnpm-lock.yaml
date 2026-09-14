@@ -41,6 +41,9 @@ importers:
       '@lezer/highlight':
         specifier: 1.2.3
         version: 1.2.3
+      '@panzoom/panzoom':
+        specifier: ^4.6.2
+        version: 4.6.2
       '@tanstack/react-query':
         specifier: ^5.102.8
         version: 5.102.8(react@19.2.8)
@@ -566,6 +569,9 @@ packages:
 
   '@oxc-project/types@0.147.0':
     resolution: {integrity: sha512-IJ3s6ltHLp45S0bh7phkX+gJO7A1Wuz2EaqpAhb8WjqDwbzMiWKHhyyT42tskaWjEYXtHtVCPpnBJVT9+dcRLg==}
+
+  '@panzoom/panzoom@4.6.2':
+    resolution: {integrity: sha512-Zn3B5/hwa6eYIPRSKX0xf2clv8nviTX8AnAU5kU/EugiTDhG41ya2wlBqYrZJYCWQROr/5XkWObZhIkepi89qw==}
 
   '@playwright/test@1.62.1':
     resolution: {integrity: sha512-DTcUc8qii+cpHvtOwggMtBRMjKZHXYWdw8syRYu2vtzuq4Wxphqq4NfCs5Zt44L6mA8rfDfj+PHnxFc/FeK6mQ==}
@@ -4051,6 +4057,8 @@ snapshots:
       '@chevrotain/types': 11.1.2
 
   '@oxc-project/types@0.147.0': {}
+
+  '@panzoom/panzoom@4.6.2': {}
 
   '@playwright/test@1.62.1':
     dependencies:

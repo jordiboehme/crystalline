@@ -12,10 +12,11 @@
  */
 
 import mermaid from "mermaid";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { useTheme } from "../theme/context";
 import { mermaidConfig } from "../theme/mermaid";
+import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
 import { unclampDiagram, unclampWideDiagram } from "./wideDiagram";
 
@@ -28,10 +29,13 @@ export default function MermaidDiagram({ source }: { source: string }) {
   const [drawn, setDrawn] = useState<{ svg: string; wide: boolean } | null>(
     null,
   );
-  // Asked for, never inferred, and not remembered: the width is this reader's
-  // decision about this diagram on this visit, and a diagram that came back
-  // wide because somebody once widened it would be a preference nobody set.
+  // Both asked for, never inferred, and neither of them remembered: the width
+  // is this reader's decision about this diagram on this visit, and a diagram
+  // that came back wide because somebody once widened it would be a preference
+  // nobody set.
   const [fullWidth, setFullWidth] = useState(false);
+  const [fullWindow, setFullWindow] = useState(false);
+  const fullWindowRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let live = true;
@@ -131,7 +135,23 @@ export default function MermaidDiagram({ source }: { source: string }) {
         onToggleFullWidth={() => {
           setFullWidth((on) => !on);
         }}
+        onOpenFullWindow={() => {
+          setFullWindow(true);
+        }}
+        fullWindowRef={fullWindowRef}
       />
+      {fullWindow && (
+        // The diagram as mermaid drew it, not as this column shows it: the
+        // overlay sizes the root itself, and a width this page forced on it
+        // would be one scale factor too many.
+        <DiagramOverlay
+          svg={drawn.svg}
+          returnFocusTo={fullWindowRef}
+          onClose={() => {
+            setFullWindow(false);
+          }}
+        />
+      )}
     </div>
   );
 }
