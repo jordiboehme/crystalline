@@ -3567,8 +3567,12 @@ fn run_prompt(
         PromptFormat::Json => println!("{}", crystalline_core::render_json(&output)),
         PromptFormat::Text => {
             print!("{}", crystalline_core::render_text(&output));
+            // Notices go to stderr, not stdout: this text is meant to be
+            // injected verbatim into an agent's context, and a notice
+            // instructing the reader to ask the user something would either
+            // stall an unattended run or produce a fabricated answer.
             for note in &reconcile_notices {
-                println!("{note}");
+                eprintln!("{note}");
             }
         }
         PromptFormat::Copilot => {

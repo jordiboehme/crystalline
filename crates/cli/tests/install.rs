@@ -1534,9 +1534,14 @@ fn prompt_system_reconciles_an_install_from_another_version() {
         .unwrap();
     assert!(out.status.success(), "the hook path must succeed");
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stdout.contains("[crystalline]"),
-        "a reconcile leaves a notice line: {stdout}"
+        !stdout.contains("[crystalline]"),
+        "the notice never rides on stdout, which an agent reads verbatim: {stdout}"
+    );
+    assert!(
+        stderr.contains("[crystalline]"),
+        "a reconcile leaves a notice line on stderr: {stderr}"
     );
 
     // Old clean copy: updated in place, no backup.
@@ -1601,6 +1606,47 @@ fn prompt_system_reconciles_an_install_from_another_version() {
     assert!(
         !stdout.contains("[crystalline]"),
         "a matching version reconciles nothing: {stdout}"
+    );
+}
+
+/// The text format is meant to be injected into an agent's context: a
+/// reconcile notice belongs on stderr, never mixed into stdout where an
+/// unattended agent would read it as part of the routing prompt and try to
+/// act on an instruction meant for a human.
+#[test]
+fn prompt_system_text_reconcile_notice_goes_to_stderr_not_stdout() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Same upgrade simulation as the reconcile test above: an older
+    // version wrote this install, so the next `prompt system` call has a
+    // notice to emit.
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+    });
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the hook path must succeed");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !stdout.contains("[crystalline]"),
+        "stdout must carry only the routing payload, not the reconcile notice: {stdout}"
+    );
+    assert!(
+        stderr.contains("[crystalline]"),
+        "the reconcile notice must be visible on stderr: {stderr}"
     );
 }
 
