@@ -7382,15 +7382,18 @@ impl Engine {
                 } => similar::write_probe_text(title, description, body),
                 SimilarProbe::Markdown { text } => similar::markdown_probe_text(text),
                 SimilarProbe::Edit { new_text } => {
-                    let title = {
-                        let store = self.store.lock().await;
-                        store
-                            .find_engram(&domain, &permalink)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|d| d.title)
-                    };
+                    // Through this caller's own view of the domain, not the
+                    // base rows alone. An engram that exists only as their
+                    // draft has no base row to read a title off, and a
+                    // base-only lookup answered `None` there - which skipped
+                    // the advisory silently, on exactly the writes a domain in
+                    // review mode is made of.
+                    let overlay = self.overlay_for_read(&domain, scope);
+                    let title = self
+                        .resolve_in_for(&permalink, &domain, overlay.as_deref())
+                        .await
+                        .ok()
+                        .map(|(desc, _)| desc.title);
                     title.and_then(|t| similar::edit_probe_text(&t, new_text))
                 }
             };

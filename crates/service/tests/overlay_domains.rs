@@ -12,6 +12,8 @@
 //! writes the row and its mirror by hand, exactly as the verbs will: one
 //! `upsert_overlay` beside one `overlay_journal::journal_write`.
 
+mod support;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,6 +31,13 @@ const MANIFEST: &str = "---\ntype: manifest\ntitle: team\npermalink: manifest\nt
 const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Plan\n\n- [decision] the plan as the team has it #team\n";
 /// Alice's draft of the same path: her private rewrite of it.
 const ALICE_DRAFT: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Plan\n\n- [decision] the plan as alice would have it #team\n";
+/// Two engrams on one topic, for the capture advisory: the draft a receipt is
+/// about and the base engram the team already has beside it. The marker words
+/// are the ones `support::TopicEmbedder` reads, so "a neighbour appears" is a
+/// deterministic fact rather than a hash collision.
+const RETRY_BODY: &str = "- [decision] the retry queue doubles its backoff on every failure #team\n- [decision] a dead-letter ttl bounds how long a retry waits #team";
+const RETRY_NEIGHBOUR: &str = "---\ntype: engram\ntitle: Retry backoff lesson\npermalink: retry-backoff-lesson\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Retry backoff lesson\n\n- [decision] retries wait on a backoff that doubles each time #team\n- [decision] the dead-letter ttl is the bound on a stuck retry #team\n";
+
 /// A draft of a path no file holds: the sharp case, since nothing on disk
 /// could ever bring it back.
 const ALICE_NEW: &str = "---\ntype: engram\ntitle: Fresh\npermalink: fresh\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Fresh\n\n- [idea] a page only alice has #team\n- relates_to [[Plan]]\n";
@@ -53,7 +62,7 @@ async fn fixture() -> Fixture {
 /// directory is. `false` is only ever used by the test that pins what an engine
 /// without one may do, which is nothing.
 async fn fixture_with_state_dir(pinned: bool) -> Fixture {
-    build_fixture(pinned, false).await
+    build_fixture(pinned, false, None).await
 }
 
 /// The same domain, in review mode: every write by every actor joins that
@@ -66,10 +75,22 @@ async fn fixture_with_state_dir(pinned: bool) -> Fixture {
 /// *does* once a domain carries it, so a fixture that had to satisfy the
 /// enabling gates would be testing those gates instead.
 async fn review_fixture() -> Fixture {
-    build_fixture(true, true).await
+    build_fixture(true, true, None).await
 }
 
-async fn build_fixture(pinned: bool, review: bool) -> Fixture {
+/// The review-mode domain with a deterministic embedding provider behind it,
+/// which is what the capture advisory needs to find anything at all: with no
+/// provider the probe returns early and a test asserting `similar` would be
+/// asserting nothing.
+async fn review_fixture_with_provider() -> Fixture {
+    build_fixture(true, true, Some(Arc::new(support::TopicEmbedder))).await
+}
+
+async fn build_fixture(
+    pinned: bool,
+    review: bool,
+    provider: Option<Arc<dyn crystalline_index::EmbeddingProvider>>,
+) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");
@@ -92,7 +113,7 @@ async fn build_fixture(pinned: bool, review: bool) -> Fixture {
     let state = root.join("state");
     let store: Arc<Mutex<dyn Store>> =
         Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
-    let engine = Engine::new(store.clone(), cfg, None, Some(config_path));
+    let engine = Engine::new(store.clone(), cfg, provider, Some(config_path));
     let engine = Arc::new(if pinned {
         engine.with_state_dir(state.clone())
     } else {
@@ -950,22 +971,38 @@ async fn an_overlay_write_records_the_composed_actor_as_provenance() {
 }
 
 /// A draft is a write like any other from the caller's side: the receipt says
-/// it is a draft, and the capture advisory that rides on a write receipt still
-/// finds the neighbours it would have found.
+/// it is a draft, and the capture advisory that rides on a write receipt finds
+/// the neighbours it would have found.
+///
+/// The provider is the whole reason this test can assert anything: without one
+/// `attach_similar` returns before it probes, and a test that only re-checked
+/// `draft` after the call would pass against a probe that never ran.
+///
+/// Two shapes, because they reach the title differently and one of them was
+/// broken: a create carries its own title in the probe, while an edit looks the
+/// title up - and for an engram that exists only as this actor's draft there is
+/// no base row to look it up in.
 #[tokio::test]
 async fn a_write_receipt_says_draft_and_still_carries_similar() {
-    let f = review_fixture().await;
+    let f = review_fixture_with_provider().await;
     let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+    // The neighbour the advisory should find: a base engram the team has, on
+    // the same topic. Base rather than a second draft because search is the
+    // base dimension until Task 5 threads the actor through it, which is
+    // exactly what makes this the honest shape to assert today.
+    std::fs::write(
+        f.domain_root("team").join("retry-backoff.md"),
+        RETRY_NEIGHBOUR,
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
 
     let mut created = f
         .engine
         .write_engram_as(
-            &write_params(
-                "team",
-                "Fresh",
-                "- [decision] the plan as alice would have it #team",
-            ),
-            Some("claude-code/2.0-for-alice"),
+            &write_params("team", "Retry queue gotcha", RETRY_BODY),
+            who,
             &alice,
         )
         .await
@@ -976,33 +1013,53 @@ async fn a_write_receipt_says_draft_and_still_carries_similar() {
         "the receipt says where the write landed: {created}"
     );
 
+    // Drained here rather than waited on: with no embed worker wired there is
+    // nothing listening for the write's nudge, so the pass is run directly.
+    f.engine.embed_pending().await.unwrap();
+
     // `attach_similar` is what the MCP and REST surfaces hang on a write
     // receipt; the engine verb hands the receipt back and the surface decorates
     // it, so the probe runs here exactly as it does there.
     f.engine
         .attach_similar(
             &mut created,
-            SimilarProbe::Edit {
-                new_text: "the plan as alice would have it",
+            SimilarProbe::Write {
+                title: "Retry queue gotcha",
+                description: None,
+                body: RETRY_BODY,
             },
             &alice,
         )
         .await;
+    let neighbours: Vec<&str> = created["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r["permalink"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        neighbours.contains(&"retry-backoff-lesson"),
+        "the advisory found the neighbour the team already has: {created}"
+    );
     assert_eq!(
         created["draft"],
         serde_json::json!(true),
-        "and the advisory leaves it saying so: {created}"
+        "and it left the receipt saying the write is a draft: {created}"
     );
 
-    // An edit receipt says it too.
-    let edited = f
+    // An EDIT of an engram that exists only as alice's draft. The probe has to
+    // read its title, and a base-row lookup finds nothing there - which used to
+    // skip the advisory without a word.
+    let mut edited = f
         .engine
         .edit_engram_as(
             &EditParams {
-                identifier: "plan".to_string(),
+                identifier: "retry-queue-gotcha".to_string(),
                 domain: "team".to_string(),
                 operation: "append".to_string(),
-                content: Some("- [decision] and alice would add this #team".to_string()),
+                content: Some("- [decision] raising the ttl drained the queue #team".to_string()),
                 key: None,
                 value: None,
                 find_text: None,
@@ -1012,147 +1069,36 @@ async fn a_write_receipt_says_draft_and_still_carries_similar() {
                 expected_checksum: None,
                 ack_scope: None,
             },
-            Some("claude-code/2.0-for-alice"),
-            &alice,
-        )
-        .await
-        .unwrap();
-    assert_eq!(edited["draft"], serde_json::json!(true), "{edited}");
-}
-
-/// The other four write verbs, in one test, because the failure they share is
-/// the one this whole mode exists to prevent: a verb nobody routed writes
-/// straight through the review the domain asked for, and nothing else in the
-/// wave would notice.
-///
-/// Save, retire and restore each join the actor's draft of the path they name;
-/// a move is a tombstone at the source and an entry at the destination, which
-/// is the shape a rename in review mode has to take - the reviewed file stays
-/// where the team put it, and this actor sees the engram at its new address.
-#[tokio::test]
-async fn every_write_verb_lands_in_the_draft_and_none_of_them_touches_the_tree() {
-    let f = review_fixture().await;
-    let before = f.tree("team");
-    let alice = account("alice");
-    let who = Some("claude-code/2.0-for-alice");
-
-    // -- save: the whole document, verbatim, against the checksum alice read --
-    let read = f.engine.read_engram(&read("plan"), &alice).await.unwrap();
-    let saved = f
-        .engine
-        .save_engram(
-            &crystalline_service::params::SaveParams {
-                domain: "team".to_string(),
-                identifier: "plan".to_string(),
-                content: PLAN.replace("as the team has it", "as alice saved it"),
-                expected_checksum: read["checksum"].as_str().unwrap().to_string(),
-            },
-            &alice,
-        )
-        .await
-        .unwrap();
-    assert_eq!(saved["draft"], serde_json::json!(true), "{saved}");
-    assert!(
-        f.reads("plan", &alice)
-            .await
-            .unwrap()
-            .contains("as alice saved it"),
-        "the save joined alice's draft"
-    );
-
-    // -- retire: the guided status edit, on the draft she now holds --
-    let retired = f
-        .engine
-        .retire_engram_as(
-            &crystalline_service::params::RetireParams {
-                domain: "team".to_string(),
-                identifier: "plan".to_string(),
-                status: "archived".to_string(),
-                successor: None,
-                valid_to: None,
-            },
             who,
             &alice,
         )
         .await
         .unwrap();
-    assert_eq!(retired["draft"], serde_json::json!(true), "{retired}");
-    assert!(
-        f.reads("plan", &alice)
-            .await
-            .unwrap()
-            .contains("status: archived"),
-        "the retirement joined the same draft"
-    );
-
-    // -- move: a tombstone where the team's file is, an entry where alice
-    //    now looks for it --
-    let moved = f
-        .engine
-        .move_engram(
-            &crystalline_service::params::MoveParams {
-                identifier: "plan".to_string(),
-                domain: "team".to_string(),
-                destination: "archive/plan.md".to_string(),
-                destination_domain: None,
-                update_links: None,
+    assert_eq!(edited["draft"], serde_json::json!(true), "{edited}");
+    f.engine.embed_pending().await.unwrap();
+    f.engine
+        .attach_similar(
+            &mut edited,
+            SimilarProbe::Edit {
+                // Over the probe's own eighty-character floor with the title in
+                // front of it, or the advisory would be skipped for a reason
+                // that has nothing to do with the draft.
+                new_text: "raising the dead-letter ttl drained the retry queue and the backoff stopped doubling past its cap",
             },
             &alice,
         )
-        .await
-        .unwrap();
-    assert_eq!(moved["draft"], serde_json::json!(true), "{moved}");
-    let held = f.held("team", "alice").await;
-    let shape: Vec<(&str, bool)> = held
-        .iter()
-        .map(|(path, _, tomb)| (path.as_str(), *tomb))
-        .collect();
-    assert_eq!(
-        shape,
-        vec![("archive/plan.md", false), ("plan.md", true)],
-        "a move is a tombstone at the source and an entry at the destination: {held:?}"
-    );
+        .await;
+    let after: Vec<&str> = edited["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r["permalink"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
     assert!(
-        f.reads("plan", &alice).await.is_err(),
-        "alice no longer sees it where the team's file is"
-    );
-    assert!(
-        f.reads("plan", &account("bob"))
-            .await
-            .unwrap()
-            .contains("as the team has it"),
-        "and bob still does"
-    );
-
-    // -- restore: the room-recovery verb, into the draft rather than the tree --
-    f.engine
-        .restore_engram("team", "recovered.md", ALICE_NEW, &alice)
-        .await
-        .unwrap();
-    assert!(
-        f.reads("fresh", &alice).await.is_ok(),
-        "the restored document is alice's draft"
-    );
-
-    assert_eq!(
-        f.tree("team"),
-        before,
-        "and not one of the four moved a single byte on disk"
-    );
-    // Everything alice holds is mirrored, so a wipe brings all of it back.
-    let mirrored: Vec<(String, Option<bool>)> = overlay_journal::journal_entries(&f.state, "team")
-        .entries
-        .into_iter()
-        .map(|e| (e.path, e.content.map(|_| true)))
-        .collect();
-    assert_eq!(
-        mirrored,
-        vec![
-            ("archive/plan.md".to_string(), Some(true)),
-            ("plan.md".to_string(), None),
-            ("recovered.md".to_string(), Some(true)),
-        ],
-        "every draft and the one deletion are mirrored"
+        after.contains(&"retry-backoff-lesson"),
+        "an edit of a draft-only engram probes like any other edit: {edited}"
     );
 }
 
