@@ -143,15 +143,6 @@ impl HttpBinding {
             _ => None,
         }
     }
-
-    /// One phrase naming this binding inside a sentence.
-    pub fn describe(&self) -> String {
-        match self {
-            HttpBinding::Unrecorded => "an HTTP address it did not record".to_string(),
-            HttpBinding::Off => "no HTTP endpoint".to_string(),
-            HttpBinding::Bound(addr) => addr.clone(),
-        }
-    }
 }
 
 /// What this process asked to serve, recorded by `run_serve` before it takes
@@ -2284,27 +2275,6 @@ mod tests {
             "\"0.0.0.0:7411\""
         );
         assert_eq!(serde_json::to_string(&HttpBinding::Off).unwrap(), "\"off\"");
-    }
-
-    /// `describe` is what every message in task 2 and task 3 renders, so each
-    /// shape gets a phrase that reads correctly inside a sentence.
-    #[test]
-    fn http_binding_describes_every_shape_in_words() {
-        assert_eq!(
-            HttpBinding::Bound("muthur.lan:7411".into()).describe(),
-            "muthur.lan:7411"
-        );
-        assert_eq!(HttpBinding::Off.describe(), "no HTTP endpoint");
-        assert!(
-            HttpBinding::Unrecorded
-                .describe()
-                .contains("did not record"),
-            "an unrecorded binding says it is unknown rather than pretending it is off"
-        );
-        assert!(
-            !HttpBinding::Unrecorded.describe().contains("version"),
-            "a holder that recorded nothing is not evidence of an older version"
-        );
     }
 
     /// The intent is recorded once per process and the first call wins, so a

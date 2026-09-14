@@ -2121,10 +2121,13 @@ fn health_and_status_say_how_the_daemon_started_and_what_it_bound() {
     assert_eq!(body["status"], "ok", "{body}");
     assert_eq!(body["started_by"], "serve", "{body}");
     assert_eq!(body["http"], addr, "{body}");
-    assert_eq!(
-        body["allowed_hosts"],
-        serde_json::json!(["muthur.lan"]),
-        "{body}"
+    // The allow-list is the one exposure fact this body must not carry: the
+    // probe route is never Host-guarded, so anything on it is readable by any
+    // unauthenticated caller that can reach the port, and these are internal
+    // hostnames. It rides the local socket instead, asserted below.
+    assert!(
+        body.get("allowed_hosts").is_none(),
+        "an unguarded probe does not publish the Host allow-list: {body}"
     );
 
     let (ok, out) = env.run(&["ctl", "status", "--json"]);

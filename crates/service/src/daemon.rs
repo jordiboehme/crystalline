@@ -1592,6 +1592,14 @@ fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static
 /// daemon was asked for. A process that never ran `run_serve` (a router built
 /// by a test) reports `"unknown"` and `"unrecorded"`: it did not record the
 /// facts, which is not the same as being too old to have them.
+///
+/// Those two and no more. The Host allow-list is the third exposure fact and
+/// it stays off this body deliberately: this route is never Host-guarded (a
+/// probe must keep working from anywhere), so anything here is readable by any
+/// unauthenticated caller that can reach the port, and the allow-list is a
+/// list of internal hostnames. It is reported on the ctl `status` reply, which
+/// is reachable only over the local unix socket, and through
+/// `crystalline status`, which reads that reply.
 async fn health() -> axum::Json<Value> {
     let intent = crate::instance::serve_intent();
     axum::Json(serde_json::json!({
@@ -1605,9 +1613,6 @@ async fn health() -> axum::Json<Value> {
             Some(crate::instance::HttpBinding::Off) => "off",
             _ => "unrecorded",
         },
-        "allowed_hosts": intent
-            .map(|i| i.allowed_hosts.clone())
-            .unwrap_or_default(),
     }))
 }
 

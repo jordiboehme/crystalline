@@ -2033,15 +2033,17 @@ const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// capped at whatever time remains before the deadline, tracked by hand
 /// since there is no thread involved to enforce it from outside. On
 /// success, prints the health body (the `{"status":"ok","version":...}` JSON
-/// that also lands in `docker inspect`, carrying `started_by`, `http` and
-/// `allowed_hosts` beside those two: how the daemon was started, the endpoint
-/// it was asked to bind and the Host allow-list it serves with, so the
-/// container `HEALTHCHECK` surfaces the start mode in `docker inspect` too.
-/// Those three are added keys, so a monitor reading `status` is unaffected)
-/// and returns `Ok`; any failure - connection refused, a timeout, a non-200
-/// status or a malformed response - comes back as a single-line `Err` naming
-/// the address it failed against, so the process exits nonzero through the
-/// normal error path.
+/// that also lands in `docker inspect`, carrying `started_by` and `http`
+/// beside those two: how the daemon was started and the endpoint it was asked
+/// to bind, so the container `HEALTHCHECK` surfaces the start mode in `docker
+/// inspect` too. Both are added keys, so a monitor reading `status` is
+/// unaffected, and the Host allow-list is deliberately not among them - this
+/// route is unguarded, so it carries nothing an unauthenticated caller should
+/// not read. `crystalline status` is where the allow-list is reported) and
+/// returns `Ok`; any failure - connection refused, a timeout, a non-200 status
+/// or a malformed response - comes back as a single-line `Err` naming the
+/// address it failed against, so the process exits nonzero through the normal
+/// error path.
 ///
 /// B14 exemption: unlike the other data verbs, this default output is not given
 /// a human rendering and does not honor `--json`. The line printed here is the
