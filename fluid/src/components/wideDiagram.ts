@@ -49,6 +49,30 @@ export function unclampWideDiagram(svg: string): {
 }
 
 /**
+ * The same unclamp, asked for rather than measured: the diagram gets its own
+ * width back whatever that width is, because the reader has said they want
+ * this one wide and the threshold only ever answered a different question -
+ * whether scaling it down would have made it unreadable on its own.
+ *
+ * A diagram whose natural width cannot be read gets `width="100%"` instead of
+ * being left alone: there is no number to hand back, and filling the column is
+ * still more room than mermaid's clamp allows. Running it twice changes
+ * nothing, so it is safe over markup the measured path has already rewritten.
+ */
+export function unclampDiagram(svg: string): string {
+  const root = findRootTag(svg);
+  if (root === null) {
+    return svg;
+  }
+  const tag = svg.slice(root.start, root.end);
+  const width = naturalWidth(tag);
+  const unclamped = withoutClamp(
+    withWidth(tag, width === null ? "100%" : `${width}px`),
+  );
+  return svg.slice(0, root.start) + unclamped + svg.slice(root.end);
+}
+
+/**
  * The span of the opening `<svg>` tag, quotes respected so an attribute value
  * holding a `>` does not end the tag early. Only the root is ever rewritten:
  * mermaid nests `<svg>` elements for images and icons, and a `<style>` block

@@ -12,6 +12,7 @@
  */
 
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import mermaid from "mermaid";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -163,5 +164,73 @@ describe("MermaidDiagram", () => {
     expect(await screen.findByText(/graph TD; A--/)).toBeInTheDocument();
     // Nothing of mermaid's landed outside the component's own tree.
     expect(document.body.querySelector("svg")).toBeNull();
+  });
+
+  /**
+   * The way out of the reading column. The reader's own decision - nothing
+   * here happens on its own - so it is a button with a name, and the name says
+   * what pressing it will do rather than what state the diagram is in.
+   */
+  describe("the diagram's own actions", () => {
+    const CLAMPED =
+      '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;"><g/></svg>';
+
+    async function drawn(svg: string = CLAMPED) {
+      renderDiagram.mockResolvedValue({ svg, diagramType: "flowchart-v2" });
+      const view = draw("graph TD; A-->B;");
+      await waitFor(() => {
+        expect(view.container.querySelector("svg")).not.toBeNull();
+      });
+      return view;
+    }
+
+    it("offers the action on a diagram it drew", async () => {
+      await drawn();
+      expect(
+        screen.getByRole("button", { name: "Show at full width" }),
+      ).toBeInTheDocument();
+    });
+
+    it("offers none on a diagram that would not parse", async () => {
+      renderDiagram.mockRejectedValue(new Error("no idea what that is"));
+      draw("graph TD; A--");
+      expect(await screen.findByText(/graph TD; A--/)).toBeInTheDocument();
+      expect(screen.queryByRole("button")).toBeNull();
+    });
+
+    it("hands the diagram its own width when full width is asked for", async () => {
+      const { container } = await drawn();
+      // Before: mermaid's scale-to-fit, clamped to the column.
+      expect(container.querySelector("svg")?.getAttribute("width")).toBe(
+        "100%",
+      );
+      await userEvent.click(
+        screen.getByRole("button", { name: "Show at full width" }),
+      );
+      const svg = container.querySelector("svg");
+      expect(svg?.getAttribute("width")).toBe("600px");
+      expect(svg?.getAttribute("style") ?? "").not.toContain("max-width");
+      // The same scroll region the measured wide path uses: a diagram wider
+      // than the column has to be reachable, not merely unclamped.
+      const wrapper = svg?.parentElement;
+      expect(wrapper?.className).toContain("overflow-x-auto");
+      expect(wrapper?.className).not.toContain("max-w-full");
+      expect(wrapper?.getAttribute("tabindex")).toBe("0");
+    });
+
+    it("says how to get back to the reading width once it is wide", async () => {
+      await drawn();
+      await userEvent.click(
+        screen.getByRole("button", { name: "Show at full width" }),
+      );
+      const back = screen.getByRole("button", {
+        name: "Show at reading width",
+      });
+      expect(back).toBeInTheDocument();
+      await userEvent.click(back);
+      expect(
+        screen.getByRole("button", { name: "Show at full width" }),
+      ).toBeInTheDocument();
+    });
   });
 });

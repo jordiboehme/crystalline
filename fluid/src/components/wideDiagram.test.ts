@@ -11,7 +11,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import { unclampWideDiagram, WIDE_DIAGRAM_PX } from "./wideDiagram";
+import {
+  unclampDiagram,
+  unclampWideDiagram,
+  WIDE_DIAGRAM_PX,
+} from "./wideDiagram";
 
 function rootTag(markup: string): string {
   return /<svg[^>]*>/.exec(markup)?.[0] ?? "";
@@ -103,5 +107,54 @@ describe("unclampWideDiagram", () => {
     const { svg } = unclampWideDiagram(source);
     expect(rootTag(svg)).toContain("background-color: transparent");
     expect(rootTag(svg)).not.toContain("max-width");
+  });
+});
+
+/**
+ * The same unclamp with the measurement taken out of it.
+ *
+ * The measured form answers "is this diagram too wide to read scaled down";
+ * this one answers a reader who said "show me this one wide" about a diagram
+ * that was never too wide for anything. So the threshold has no part in it:
+ * whatever the natural width is, the diagram gets it back.
+ */
+describe("unclampDiagram", () => {
+  it("hands a narrow diagram its own width, threshold or no threshold", () => {
+    const source =
+      '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;"><g/></svg>';
+    const svg = unclampDiagram(source);
+    expect(rootTag(svg)).toContain('width="600px"');
+    expect(rootTag(svg)).not.toContain("max-width");
+    // The measured form leaves exactly this markup alone, which is the whole
+    // difference between the two.
+    expect(unclampWideDiagram(source)).toEqual({ svg: source, wide: false });
+  });
+
+  it("falls back to the full column when the natural width cannot be read", () => {
+    // Nothing here says how wide the drawing is, so there is no number to
+    // hand back; filling the column is what "wide" can still mean.
+    const source = '<svg width="100%" style="max-width: 600px;"><g/></svg>';
+    const svg = unclampDiagram(source);
+    expect(rootTag(svg)).toContain('width="100%"');
+    expect(rootTag(svg)).not.toContain("max-width");
+  });
+
+  it("replaces the width rather than adding a second one", () => {
+    const source =
+      '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;"></svg>';
+    expect(widthAttributes(unclampDiagram(source))).toHaveLength(1);
+  });
+
+  it("is idempotent, so a wide diagram unclamped twice is unchanged", () => {
+    // The toggle runs over markup the measured path may already have rewritten.
+    const once = unclampWideDiagram(
+      '<svg viewBox="0 0 1600 400" width="100%" style="max-width: 1600px;"></svg>',
+    ).svg;
+    expect(unclampDiagram(once)).toBe(once);
+  });
+
+  it("leaves markup with no root svg exactly as it found it", () => {
+    expect(unclampDiagram("")).toBe("");
+    expect(unclampDiagram("<p>not a diagram</p>")).toBe("<p>not a diagram</p>");
   });
 });
