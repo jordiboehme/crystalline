@@ -3557,8 +3557,8 @@ fn run_prompt(
     // Session-start auto-update: a binary upgraded since the last install
     // refreshes the installed hooks and skills before this session's routing
     // prompt goes out. Cheap when versions match (one small-file read) and
-    // best-effort always; outcomes surface only as trailing notice lines on
-    // the text output.
+    // best-effort always; outcomes surface only as notice lines on stderr,
+    // never in the payload an agent reads.
     let mut reconcile_notices = install::auto_reconcile(
         env!("CARGO_PKG_VERSION"),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -3631,31 +3631,31 @@ fn run_prompt(
         eprintln!("crystalline prompt system: warning: {w}");
     }
 
+    // Notices go to stderr in every format, and they go there for the same
+    // reason each time: what stdout carries is an agent's context, and a
+    // notice telling the reader to ask a human something would either stall an
+    // unattended run or be answered by invention. A person reading a session
+    // hook's output still sees them, because a hook's stderr is where a
+    // harness shows them.
     match format {
         PromptFormat::Json => println!("{}", crystalline_core::render_json(&output)),
-        PromptFormat::Text => {
-            print!("{}", crystalline_core::render_text(&output));
-            // Notices go to stderr, not stdout: this text is meant to be
-            // injected verbatim into an agent's context, and a notice
-            // instructing the reader to ask the user something would either
-            // stall an unattended run or produce a fabricated answer.
-            for note in &reconcile_notices {
-                eprintln!("{note}");
-            }
-        }
+        PromptFormat::Text => print!("{}", crystalline_core::render_text(&output)),
         PromptFormat::Copilot => {
-            // The notices ride inside the envelope: Copilot parses stdout as
-            // one JSON document, so a bare trailing line would corrupt it.
-            let mut text = crystalline_core::render_text(&output);
-            for note in &reconcile_notices {
-                text.push_str(note);
-                text.push('\n');
-            }
+            // Copilot parses stdout as one JSON document, so a bare line
+            // printed beside the envelope would corrupt it - which is why the
+            // notices went inside the envelope, and why they no longer do:
+            // inside is the agent's context, and that is the one place an
+            // instruction to ask a human who is not there must never reach.
             println!(
                 "{}",
-                serde_json::to_string(&serde_json::json!({ "additionalContext": text }))?
+                serde_json::to_string(&serde_json::json!({
+                    "additionalContext": crystalline_core::render_text(&output),
+                }))?
             );
         }
+    }
+    for note in &reconcile_notices {
+        eprintln!("{note}");
     }
     Ok(())
 }

@@ -922,6 +922,7 @@ fn prompt_json_format_stays_notice_free() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     let _: Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("the json prompt must parse: {e}\n{stdout}"));
     assert!(
@@ -935,5 +936,82 @@ fn prompt_json_format_stays_notice_free() {
     assert!(
         !stdout.contains("Refreshed"),
         "no reconcile summary leaks into json: {stdout}"
+    );
+    // Not in the payload, and not lost either: a person running the hook by
+    // hand is the only reader who can act on a pending decision, and stderr is
+    // where they read it.
+    assert!(
+        stderr.contains("provision allow cove"),
+        "the pending decision reaches stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refreshed"),
+        "and so does the reconcile summary: {stderr}"
+    );
+}
+
+/// The same rule for the copilot envelope, which is the format an agent reads
+/// most literally: `additionalContext` is the agent's context, so a notice
+/// asking a human for a decision must not be inside it. The envelope still
+/// has to be the only thing on stdout, so the notices go to stderr rather than
+/// beside it.
+#[test]
+fn prompt_copilot_format_keeps_notices_out_of_the_context() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-copilot-notice");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    // The same two notice sources the json case uses: an undecided domain and
+    // a changed artifact source.
+    let cove_dir = work.path().join("kb-cove");
+    write_harbor(&cove_dir);
+    provision_cmd(&home, &bin_dir)
+        .args(["domain", "add", "cove"])
+        .arg(&cove_dir)
+        .arg("--no-sync")
+        .assert()
+        .success();
+    write(
+        &harbor_dir,
+        "agents/quartermaster.md",
+        "# Quartermaster\n\nChanged for this session with a longer body than before.\n",
+    );
+
+    let out = provision_cmd(&home, &bin_dir)
+        .args(["prompt", "system", "--format", "copilot"])
+        .write_stdin(r#"{"source":"startup"}"#)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the copilot envelope must parse: {e}\n{stdout}"));
+    let context = parsed["additionalContext"].as_str().unwrap();
+    assert!(
+        context.contains("CRYSTALLINE KNOWLEDGE ROUTING"),
+        "the routing block is still carried: {context}"
+    );
+    assert!(
+        !context.contains("ships artifacts to provision"),
+        "no pending block rides in the agent's context: {context}"
+    );
+    assert!(
+        !context.contains("Refreshed"),
+        "no reconcile summary rides in the agent's context: {context}"
+    );
+    assert!(
+        stderr.contains("provision allow cove"),
+        "the pending decision reaches stderr instead: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refreshed"),
+        "and so does the reconcile summary: {stderr}"
     );
 }

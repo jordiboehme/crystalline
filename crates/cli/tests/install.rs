@@ -1823,8 +1823,9 @@ fn copilot_receipt_entry_records_harness_copilot() {
 
 /// The copilot flavor of the reconcile test doubles as the notice-flow test
 /// for the copilot prompt format: an upgrade replays the hooks part (the
-/// deleted owned file comes back in the managed shape) and the reconcile
-/// notice rides inside the single JSON document, never beside it.
+/// deleted owned file comes back in the managed shape), stdout stays one JSON
+/// document with nothing beside it, and the reconcile notice reaches the
+/// person on stderr rather than the agent's context.
 #[test]
 fn prompt_system_reconciles_a_copilot_install_from_another_version() {
     let work = tempfile::tempdir().unwrap();
@@ -1852,15 +1853,22 @@ fn prompt_system_reconciles_a_copilot_install_from_another_version() {
         .unwrap();
     assert!(out.status.success(), "the hook path must succeed");
 
-    // The whole stdout is one JSON document; the reconcile notice sits
-    // inside the envelope.
+    // The whole stdout is one JSON document, and what it carries is the
+    // routing block alone: `additionalContext` is read as the agent's own
+    // context, and a notice about this machine's install belongs to the person
+    // running the hook.
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
     let parsed: Value = serde_json::from_str(stdout.trim())
         .expect("copilot hook stdout must be a single JSON document");
     let context = parsed["additionalContext"].as_str().unwrap();
     assert!(
-        context.contains("[crystalline]"),
-        "the reconcile notice rides inside the envelope: {context}"
+        !context.contains("[crystalline]"),
+        "no reconcile notice rides in the agent's context: {context}"
+    );
+    assert!(
+        stderr.contains("[crystalline]"),
+        "the reconcile notice reaches stderr instead: {stderr}"
     );
 
     // The owned hooks file is back in the managed shape and the receipt is
