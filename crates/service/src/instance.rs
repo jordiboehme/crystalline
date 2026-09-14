@@ -1210,6 +1210,12 @@ impl std::error::Error for LockHeld {}
 /// same way. So the wording stays with what was asked for and what the record
 /// says, and a holder that recorded nothing is reported as having recorded
 /// nothing rather than as an older version or as an endpoint that is off.
+///
+/// The exposure half is earned rather than always printed. A caller that
+/// recorded no intent at all asked to bind nothing, and one whose exposure
+/// already matches the holder's has nothing to reconcile; both get the shorter
+/// message, because advice that does not apply is noise wherever this string
+/// travels - and it travels into an agent's `status` payload.
 pub fn lock_held_message(intent: Option<&ServeIntent>, holder: Option<&LockInfo>) -> String {
     let asked = match intent.map(|i| &i.http) {
         Some(HttpBinding::Bound(addr)) => format!("this serve asked to bind {addr}"),
@@ -1244,28 +1250,54 @@ pub fn lock_held_message(intent: Option<&ServeIntent>, holder: Option<&LockInfo>
                  pid nor its address can be read from here"
             .to_string(),
     };
-    let mut remedy = String::from(
-        "Only one daemon can own the index, so this invocation is serving nothing. Exposure \
-         belongs to configuration, where every daemon on this machine reads it however it was \
-         started",
+    // Two callers record no intent: the embedded MCP stack and the `hold-lock`
+    // test command. Neither asked to bind anything, so exposure advice would be
+    // a non sequitur - and the embedded stack copies this string into the
+    // `status` payload and, in the no-record case, the `instructions` an agent
+    // reads. What applies to that caller is the holder itself: it is a daemon
+    // this process can talk to.
+    let Some(intent) = intent else {
+        return format!(
+            "{asked}{hosts_asked}, but {held}. Only one daemon can own the index. Stop the holder \
+             with crystalline ctl shutdown, or attach over the socket."
+        );
+    };
+    // Exposure advice is for two sides that disagree. When this invocation and
+    // the holder asked for the same binding and the same allow-list, writing
+    // that down changes nothing, so the message says only that the index is
+    // owned and by whom. An unrecorded binding on either side is ignorance
+    // rather than agreement, and keeps the advice.
+    let agreed = holder.is_some_and(|h| {
+        intent.http != HttpBinding::Unrecorded
+            && h.http != HttpBinding::Unrecorded
+            && intent.http == h.http
+            && intent.allowed_hosts == h.allowed_hosts
+    });
+    let mut remedy =
+        String::from("Only one daemon can own the index, so this invocation is serving nothing.");
+    if agreed {
+        remedy.push_str(" Stop the holder with crystalline ctl shutdown and start again.");
+        return format!("{asked}{hosts_asked}, but {held}. {remedy}");
+    }
+    remedy.push_str(
+        " Exposure belongs to configuration, where every daemon on this machine reads it however \
+         it was started",
     );
-    match intent.map(|i| &i.http) {
-        Some(HttpBinding::Bound(addr)) => {
+    match &intent.http {
+        HttpBinding::Bound(addr) => {
             remedy.push_str(&format!(": crystalline config set service.http {addr}"));
         }
         // An invocation that asked for no endpoint is reconciled by writing
         // that down, not by being told to invent a host and port.
-        Some(HttpBinding::Off) => remedy.push_str(": crystalline config set service.http false"),
-        Some(HttpBinding::Unrecorded) | None => {
+        HttpBinding::Off => remedy.push_str(": crystalline config set service.http false"),
+        HttpBinding::Unrecorded => {
             remedy.push_str(": crystalline config set service.http <host:port>");
         }
     }
-    if let Some(i) = intent
-        && !i.allowed_hosts.is_empty()
-    {
+    if !intent.allowed_hosts.is_empty() {
         remedy.push_str(&format!(
             " and crystalline config set service.allowed_hosts {}",
-            i.allowed_hosts.join(",")
+            intent.allowed_hosts.join(",")
         ));
     }
     remedy.push_str(". Then stop the holder with crystalline ctl shutdown and start again.");
@@ -2333,7 +2365,7 @@ mod tests {
         let intent = ServeIntent {
             started_by: StartMode::Serve,
             http: HttpBinding::Bound("0.0.0.0:7411".into()),
-            allowed_hosts: vec!["muthur.lan".into()],
+            allowed_hosts: vec!["muthur.lan".into(), "nostromo.lan".into()],
         };
         let held = holder(
             856,
@@ -2363,6 +2395,17 @@ mod tests {
         assert!(
             msg.contains("muthur.lan"),
             "the allow-list this invocation asked for: {msg}"
+        );
+        // The prose join and the command join differ on purpose: a space in
+        // the command form would split argv, and `parse_allowed_hosts` rejects
+        // an entry carrying whitespace, so a pasted command would fail.
+        assert!(
+            msg.contains("service.allowed_hosts muthur.lan,nostromo.lan"),
+            "the command form joins the hosts with no space, the spelling the setting takes: {msg}"
+        );
+        assert!(
+            msg.contains("Host values muthur.lan, nostromo.lan"),
+            "while the prose reads as prose: {msg}"
         );
     }
 
@@ -2422,5 +2465,93 @@ mod tests {
         let msg = lock_held_message(None, Some(&held));
         assert!(msg.contains("856"), "{msg}");
         assert!(msg.contains("127.0.0.1:7411"), "{msg}");
+        // A caller with no intent asked to bind nothing, so exposure advice is
+        // a non sequitur for it: the embedded MCP stack and `hold-lock` reach
+        // this shape, and the embedded stack copies the string into the
+        // `status` payload an agent reads. What it gets back is the advice
+        // that applies to it.
+        assert!(
+            !msg.contains("Exposure belongs to configuration"),
+            "no exposure lecture for a caller that asked to bind nothing: {msg}"
+        );
+        assert!(
+            !msg.contains("config set service.http"),
+            "and no command to reconcile a binding it never asked for: {msg}"
+        );
+        assert!(
+            msg.contains("attach over the socket"),
+            "the advice that does apply: the holder is a daemon this caller can use: {msg}"
+        );
+    }
+
+    /// An invocation whose exposure is exactly the holder's. Telling an
+    /// operator to write down what both sides already asked for is advice that
+    /// changes nothing, so the message says only that the index is owned and
+    /// by whom. The Windows second-serve test is this shape, and so is every
+    /// restart of a unit against its own autostarted daemon.
+    #[test]
+    fn the_refusal_skips_the_exposure_advice_when_both_sides_asked_the_same() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Off,
+            allowed_hosts: vec![],
+        };
+        let held = holder(856, "0.18.0", HttpBinding::Off, Some(StartMode::Autostart));
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(
+            !msg.contains("Exposure belongs to configuration"),
+            "the two sides agree, so there is nothing to reconcile: {msg}"
+        );
+        assert!(
+            !msg.contains("config set service.http"),
+            "and no command that would change nothing: {msg}"
+        );
+        assert!(msg.contains("856"), "it still names the holder: {msg}");
+        assert!(
+            msg.contains("crystalline ctl shutdown"),
+            "and still gives the one thing that helps: {msg}"
+        );
+    }
+
+    /// Two holders that recorded nothing are not two holders that agree. An
+    /// unrecorded binding is ignorance, and suppressing the advice on it would
+    /// hide the key from the very operator who cannot read the holder's.
+    #[test]
+    fn an_unrecorded_binding_on_both_sides_is_not_agreement() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: vec![],
+        };
+        let held = holder(4242, "0.17.0", HttpBinding::Unrecorded, None);
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(
+            msg.contains("Exposure belongs to configuration"),
+            "neither side is known, so the key is still worth naming: {msg}"
+        );
+        assert!(msg.contains("config set service.http <host:port>"), "{msg}");
+    }
+
+    /// The addresses agree but the allow-lists do not, which is still a
+    /// difference an operator has to write down somewhere.
+    #[test]
+    fn the_refusal_keeps_the_advice_when_only_the_allow_lists_differ() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Bound("0.0.0.0:7411".into()),
+            allowed_hosts: vec!["muthur.lan".into()],
+        };
+        let mut held = holder(
+            856,
+            "0.18.0",
+            HttpBinding::Bound("0.0.0.0:7411".into()),
+            Some(StartMode::Autostart),
+        );
+        held.allowed_hosts = vec![];
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(
+            msg.contains("service.allowed_hosts muthur.lan"),
+            "the half that differs is still named: {msg}"
+        );
     }
 }

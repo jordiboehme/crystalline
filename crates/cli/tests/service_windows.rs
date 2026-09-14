@@ -284,9 +284,14 @@ fn daemon_publishes_a_readable_record_and_serves_mcp_over_the_pipe() {
 /// A second serve must fail fast and name the live owner's real pid: before the
 /// split it could not even read who owned the lock, so it reported pid 0. It
 /// must also exit on the lock's own code (3, so a unit file can set
-/// RestartPreventExitStatus) and name the key that reconciles the two
-/// bindings. The unix leg of the same contract lives in service.rs, as
+/// RestartPreventExitStatus) and name the keys that reconcile the two
+/// exposures. The unix leg of the same contract lives in service.rs, as
 /// `a_serve_that_loses_the_lock_exits_three_and_says_what_was_lost`.
+///
+/// The second serve asks for an allow-list this env's daemon never had, which
+/// is what makes the exposure advice apply: a refusal only names the keys when
+/// the two sides actually differ, and both daemons here take the same
+/// `CRYSTALLINE_SERVICE_HTTP=false` endpoint.
 #[test]
 fn a_second_serve_fails_fast_naming_the_owner() {
     let env = Env::new("win-second");
@@ -297,7 +302,7 @@ fn a_second_serve_fails_fast_naming_the_owner() {
     let mut second = Command::new(bin());
     env.apply(&mut second);
     let out = second
-        .args(["serve"])
+        .args(["serve", "--allowed-host", "muthur.lan"])
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -314,6 +319,10 @@ fn a_second_serve_fails_fast_naming_the_owner() {
     assert!(
         stderr.contains("service.http"),
         "and the key that makes every daemon here bind the same way: {stderr}"
+    );
+    assert!(
+        stderr.contains("service.allowed_hosts muthur.lan"),
+        "and the allow-list key, in the spelling the setting takes: {stderr}"
     );
 
     drop(daemon);
