@@ -1464,7 +1464,11 @@ pub(crate) async fn dispatch_engine(
         // the CLI process; `identity.actor` still wins when it is set.
         "write_engram" => {
             engine
-                .write_engram_as(&decode::<WriteParams>(args)?, Some(CLI_ACTOR))
+                .write_engram_as(
+                    &decode::<WriteParams>(args)?,
+                    Some(CLI_ACTOR),
+                    &Scope::Unrestricted,
+                )
                 .await?
         }
         "read_engram" => {
@@ -1474,7 +1478,11 @@ pub(crate) async fn dispatch_engine(
         }
         "edit_engram" => {
             engine
-                .edit_engram_as(&decode::<EditParams>(args)?, Some(CLI_ACTOR))
+                .edit_engram_as(
+                    &decode::<EditParams>(args)?,
+                    Some(CLI_ACTOR),
+                    &Scope::Unrestricted,
+                )
                 .await?
         }
         "move_engram" => {
@@ -1484,10 +1492,22 @@ pub(crate) async fn dispatch_engine(
         }
         "split_engram" => {
             engine
-                .split_engram_as(&decode::<SplitParams>(args)?, Some(CLI_ACTOR))
+                .split_engram_as(
+                    &decode::<SplitParams>(args)?,
+                    Some(CLI_ACTOR),
+                    &Scope::Unrestricted,
+                )
                 .await?
         }
-        "delete_engram" => engine.delete_engram(&decode::<DeleteParams>(args)?).await?,
+        "delete_engram" => {
+            engine
+                .delete_engram_as(
+                    &decode::<DeleteParams>(args)?,
+                    Some(CLI_ACTOR),
+                    &Scope::Unrestricted,
+                )
+                .await?
+        }
         "search_engrams" => {
             engine
                 .search_engrams(&decode::<SearchParams>(args)?, &Scope::Unrestricted)

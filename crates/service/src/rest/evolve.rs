@@ -439,6 +439,7 @@ pub async fn acknowledge(
             body.note.as_deref(),
             body.scope.as_deref(),
             Some(&format!("human:{}", caller.name())),
+            &identity.scope(),
         )
         .await?;
     Ok(Json(entry))

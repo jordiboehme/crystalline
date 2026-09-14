@@ -907,12 +907,19 @@ impl CollabSession {
         state.last_attempt = Some(now);
         let receipt = self
             .engine
-            .save_engram(&crate::params::SaveParams {
-                domain: self.domain.clone(),
-                identifier: state.permalink.clone(),
-                content: file.clone(),
-                expected_checksum: state.checksum.clone(),
-            })
+            .save_engram(
+                &crate::params::SaveParams {
+                    domain: self.domain.clone(),
+                    identifier: state.permalink.clone(),
+                    content: file.clone(),
+                    expected_checksum: state.checksum.clone(),
+                },
+                // The room saves as the machine owner for now. A room is one
+                // shared document rather than one actor's draft, so the scope
+                // that belongs here is the editing participant's, and wiring
+                // that up is the co-editing half of the overlay work.
+                &crate::scope::Scope::Unrestricted,
+            )
             .await;
         match receipt {
             Ok(receipt) => {
@@ -1219,7 +1226,12 @@ impl CollabSession {
         let file = Self::file_text_locked(state);
         match self
             .engine
-            .restore_engram(&self.domain, &state.path, &file)
+            .restore_engram(
+                &self.domain,
+                &state.path,
+                &file,
+                &crate::scope::Scope::Unrestricted,
+            )
             .await
         {
             Ok(receipt) => {

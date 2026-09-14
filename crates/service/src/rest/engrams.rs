@@ -738,7 +738,7 @@ pub async fn create(
     };
     let mut written = state
         .engine
-        .write_engram_as(&params, Some(&actor))
+        .write_engram_as(&params, Some(&actor), &identity.scope())
         .await
         // The engine reports a taken permalink as a conflict, which this
         // surface answers 409 rather than the 422 its generic classification
@@ -969,7 +969,7 @@ pub async fn save(
         expected_checksum: token,
     };
     let scope = identity.scope();
-    match state.engine.save_engram(&params).await {
+    match state.engine.save_engram(&params, &scope).await {
         // Read back from the receipt rather than reusing the URL's permalink:
         // the text landed verbatim, so an author who edited the `permalink`
         // line has moved the address, and the detail read has to follow it or
@@ -1142,6 +1142,7 @@ pub async fn retire(
                 valid_to: body.valid_to,
             },
             Some(&format!("human:{}", caller.name())),
+            &identity.scope(),
         )
         .await
         // Classified 409 like `create`'s collision, for parity across this
@@ -1580,7 +1581,7 @@ pub async fn remove(
     headers: HeaderMap,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
-    require_domain_write(&state, &identity, &domain).await?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     // Before the If-Match parse, not after: the same reasoning as `save`'s
     // own read-only check, repeated here rather than shared, since the two
     // handlers are not yet worth abstracting over.
@@ -1592,11 +1593,18 @@ pub async fn remove(
     let token = if_match(&headers)?;
     match state
         .engine
-        .delete_engram(&DeleteParams {
-            identifier: permalink.clone(),
-            domain: domain.clone(),
-            expected_checksum: Some(token),
-        })
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: permalink.clone(),
+                domain: domain.clone(),
+                expected_checksum: Some(token),
+            },
+            // The same `human:` provenance the create and the retire stamp,
+            // for the same reason: whose removal this is, in the spelling
+            // those two write into `generated.by`.
+            Some(&format!("human:{}", caller.name())),
+            &identity.scope(),
+        )
         .await
     {
         Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),

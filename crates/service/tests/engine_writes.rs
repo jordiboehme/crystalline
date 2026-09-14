@@ -76,12 +76,15 @@ async fn save_writes_the_exact_bytes_and_moves_the_checksum() {
 
     let edited = content.replace("A rule about alpha.", "A sharper rule about alpha.");
     let saved = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: edited.clone(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: edited.clone(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(saved["permalink"], "alpha");
@@ -102,12 +105,15 @@ async fn a_zero_edit_save_is_byte_identical() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, content) = checksum_of(&engine, "eng", "alpha").await;
     engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content,
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content,
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -169,13 +175,16 @@ async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
 async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
     let (_tmp, engine) = engine_fixture().await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: ALPHA.replace("stable", "draft"),
-            expected_checksum: "0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: ALPHA.replace("stable", "draft"),
+                expected_checksum:
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stale edit"), "{err}");
@@ -197,12 +206,15 @@ async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
         .unwrap();
     let (_, content) = checksum_of(&engine, "scratch", "note").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "scratch".to_string(),
-            identifier: "note".to_string(),
-            content,
-            expected_checksum: "not-the-checksum".to_string(),
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "scratch".to_string(),
+                identifier: "note".to_string(),
+                content,
+                expected_checksum: "not-the-checksum".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stale edit"), "{err}");
@@ -292,12 +304,15 @@ async fn a_save_with_unparseable_frontmatter_is_refused_without_writing() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: "---\ntitle: [unclosed\n---\n\n# Alpha\n".to_string(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: "---\ntitle: [unclosed\n---\n\n# Alpha\n".to_string(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -320,12 +335,15 @@ async fn a_save_with_an_empty_frontmatter_block_is_refused_without_writing() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: "---\n---\n\n# Alpha\n\nA rule about alpha.\n".to_string(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: "---\n---\n\n# Alpha\n\nA rule about alpha.\n".to_string(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -347,12 +365,15 @@ async fn a_save_that_only_violates_a_verify_rule_still_lands() {
     let (checksum, content) = checksum_of(&engine, "eng", "alpha").await;
     let untagged = content.replace("tags:\n  - eng\n", "");
     engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: untagged.clone(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: untagged.clone(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -367,12 +388,15 @@ async fn a_save_that_does_not_parse_is_refused_without_writing() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: "not an engram at all".to_string(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: "not an engram at all".to_string(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -962,7 +986,7 @@ async fn restore_puts_the_exact_bytes_back_and_reindexes() {
     engine.sync(None).await.unwrap();
 
     let receipt = engine
-        .restore_engram("eng", "alpha.md", ALPHA)
+        .restore_engram("eng", "alpha.md", ALPHA, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(receipt["permalink"], "alpha");
@@ -975,7 +999,7 @@ async fn restore_puts_the_exact_bytes_back_and_reindexes() {
     assert_eq!(content, ALPHA);
 
     let refused = engine
-        .restore_engram("eng", "alpha.md", "no frontmatter")
+        .restore_engram("eng", "alpha.md", "no frontmatter", &Scope::Unrestricted)
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("frontmatter"), "{refused}");
@@ -1582,4 +1606,158 @@ async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_o
             .is_err(),
         "the new engram was taken back out"
     );
+}
+
+/// Every write verb takes the acting scope, and taking it changes nothing.
+///
+/// The scope is threaded so a later change has one place to route a write to
+/// an actor's draft overlay from; no verb consults it yet, and this is what
+/// pins that. The equality is not vacuous: every write receipt is a pure
+/// function of what the caller passed in - domain, permalink, path, title,
+/// type, status, action, operation, the moved counts - and the two checksums
+/// hash the caller's own document rather than anything the engine stamps. So
+/// two identical archives driven through the same sequence of verbs, one as
+/// the machine owner and one as a signed-in account, owe the same receipts
+/// word for word.
+#[tokio::test]
+async fn write_verbs_accept_a_scope_and_behave_as_before() {
+    let owner = every_write_verb(&Scope::Unrestricted).await;
+    let user = every_write_verb(&Scope::User {
+        account: "mira".to_string(),
+        admin: false,
+    })
+    .await;
+    assert_eq!(
+        owner, user,
+        "a signed-in account's writes answer what the machine owner's answer"
+    );
+}
+
+/// One fresh archive driven through every write verb under `scope`, answering
+/// the receipts in the order they were earned.
+async fn every_write_verb(scope: &Scope) -> Vec<(&'static str, serde_json::Value)> {
+    const ACTOR: &str = "tester/1.0";
+    let (_tmp, engine) = engine_fixture().await;
+    let mut receipts: Vec<(&'static str, serde_json::Value)> = Vec::new();
+
+    receipts.push((
+        "write",
+        engine
+            .write_engram_as(
+                &crystalline_service::params::WriteParams {
+                    domain: "eng".to_string(),
+                    title: "Gamma".to_string(),
+                    content: "# Gamma\n\nWhat the garden did this week.\n\n- [fact] The beans went in on Tuesday\n- [fact] The compost bin was turned\n- [decision] The tomatoes stay under glass\n".to_string(),
+                    folder: None,
+                    engram_type: None,
+                    tags: vec!["eng".to_string()],
+                    status: None,
+                    metadata: None,
+                    overwrite: false,
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    let (checksum, content) = checksum_of(&engine, "eng", "alpha").await;
+    receipts.push((
+        "save",
+        engine
+            .save_engram(
+                &SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    content: content.replace("A rule about alpha.", "A sharper rule."),
+                    expected_checksum: checksum,
+                },
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    let append: crystalline_service::params::EditParams =
+        serde_json::from_value(serde_json::json!({
+            "identifier": "alpha",
+            "domain": "eng",
+            "operation": "append",
+            "content": "A later thought.",
+        }))
+        .unwrap();
+    receipts.push((
+        "edit",
+        engine
+            .edit_engram_as(&append, Some(ACTOR), scope)
+            .await
+            .unwrap(),
+    ));
+
+    let lines = observation_lines(&engine, "gamma", &["beans went in"]).await;
+    let (gamma, _) = checksum_of(&engine, "eng", "gamma").await;
+    receipts.push((
+        "split",
+        engine
+            .split_engram_as(
+                &SplitParams {
+                    domain: "eng".to_string(),
+                    identifier: "gamma".to_string(),
+                    title: "Sowing".to_string(),
+                    folder: None,
+                    observations: lines,
+                    sections: Vec::new(),
+                    expected_checksum: Some(gamma),
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    receipts.push((
+        "retire",
+        engine
+            .retire_engram_as(
+                &RetireParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    status: "deprecated".to_string(),
+                    successor: None,
+                    valid_to: Some("2026-01-31".to_string()),
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    receipts.push((
+        "delete",
+        engine
+            .delete_engram_as(
+                &DeleteParams {
+                    identifier: "alpha".to_string(),
+                    domain: "eng".to_string(),
+                    expected_checksum: None,
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    receipts.push((
+        "restore",
+        engine
+            .restore_engram("eng", "alpha.md", ALPHA, scope)
+            .await
+            .unwrap(),
+    ));
+
+    receipts
 }

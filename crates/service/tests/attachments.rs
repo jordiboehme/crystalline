@@ -529,7 +529,7 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
     }
 
     let err = engine
-        .restore_engram("eng", "assets/alpha.md", ALPHA)
+        .restore_engram("eng", "assets/alpha.md", ALPHA, &Scope::Unrestricted)
         .await
         .unwrap_err();
     assert!(
@@ -538,7 +538,7 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
         "a restore into assets/ must be refused, got: {err}"
     );
     let err = engine
-        .restore_engram("eng", "a/../assets/alpha.md", ALPHA)
+        .restore_engram("eng", "a/../assets/alpha.md", ALPHA, &Scope::Unrestricted)
         .await
         .unwrap_err();
     assert!(
@@ -563,7 +563,7 @@ async fn an_engram_path_with_a_colon_still_moves_and_restores() {
         .replace("title: Alpha", "title: Plan v2")
         .replace("permalink: alpha", "permalink: plan-v2");
     engine
-        .restore_engram("eng", "notes/plan: v2.md", &plan)
+        .restore_engram("eng", "notes/plan: v2.md", &plan, &Scope::Unrestricted)
         .await
         .unwrap();
     assert!(root.join("notes").join("plan: v2.md").exists());
@@ -710,6 +710,7 @@ async fn a_cross_domain_move_carries_a_sole_referent_attachment() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -756,6 +757,7 @@ async fn a_same_domain_move_leaves_the_attachments_where_they_are() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -792,6 +794,7 @@ async fn an_attachment_another_source_engram_references_is_copied_not_moved() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -800,6 +803,7 @@ async fn an_attachment_another_source_engram_references_is_copied_not_moved() {
             "from",
             "keeper.md",
             &engram_source("Keeper", "keeper", "", "See [the shot](assets/shot.png)."),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -840,6 +844,7 @@ async fn a_retired_referent_in_the_source_forces_a_copy() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -849,6 +854,7 @@ async fn a_retired_referent_in_the_source_forces_a_copy() {
             "old.md",
             &engram_source("Old", "old", "", "![shot](assets/shot.png)")
                 .replace("status: stable", "status: archived"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -887,6 +893,7 @@ async fn a_claimed_attachment_travels_with_no_body_reference_at_all() {
                 "analyzes: assets/deck.pptx\nanalyzed_hash: nope\n",
                 "What the deck said.",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -922,6 +929,7 @@ async fn a_destination_holding_the_identical_file_reuses_it() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -975,6 +983,7 @@ async fn a_destination_collision_with_other_bytes_suffixes_and_rewrites_the_engr
                 "analyzes: assets/shot.png\n",
                 "![shot](assets/shot.png#right) and again [here](./assets/shot.png).",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1037,6 +1046,7 @@ async fn a_reference_to_a_missing_file_never_fails_the_move() {
                 "analyzes: assets/also-gone.pdf\n",
                 "![gone](assets/gone.png)",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1066,6 +1076,7 @@ async fn a_carry_that_cannot_land_surfaces_a_warning_in_the_move_result() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![ghost](assets/ghost.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1101,6 +1112,7 @@ async fn an_exhausted_rename_warns_and_leaves_the_file_in_the_source() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1173,6 +1185,7 @@ async fn a_move_accumulates_every_carry_warning() {
                 "",
                 "![clean](assets/clean.png) ![ghost](assets/ghost.png) ![shot](assets/shot.png)",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1262,6 +1275,7 @@ async fn a_clean_move_reports_an_empty_warnings_array() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1301,6 +1315,7 @@ async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1352,6 +1367,7 @@ async fn a_case_variant_claim_in_the_source_still_forces_a_copy() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1369,6 +1385,7 @@ async fn a_case_variant_claim_in_the_source_still_forces_a_copy() {
                 "analyzes: Assets/shot.png\n",
                 "What the shot showed.",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1417,6 +1434,7 @@ async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", &format!("![shot]({long_path})")),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1471,6 +1489,7 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "A rule about note."),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1635,6 +1654,7 @@ async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_ref
                 "",
                 "![solo](assets/solo.png) ![both](assets/both.png) ![gone](assets/gone.png)",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1643,6 +1663,7 @@ async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_ref
             "preview-eng",
             "peer.md",
             &engram_source("Peer", "peer", "", "![both](assets/both.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();

@@ -1017,6 +1017,7 @@ async fn ack_edit(engine: &Engine, permalink: &str, value: &str) -> Result<Value
                 ..Default::default()
             },
             Some("agent:test"),
+            &Scope::Unrestricted,
         )
         .await
         .map_err(|e| e.to_string())
@@ -1132,6 +1133,7 @@ async fn an_unknown_rule_is_refused() {
                 ..Default::default()
             },
             None,
+            &Scope::Unrestricted,
         )
         .await
         .unwrap_err()
@@ -1432,6 +1434,7 @@ async fn an_ack_refuses_an_engram_that_no_longer_parses() {
                 ..Default::default()
             },
             Some("agent:test"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap_err()
@@ -1479,6 +1482,7 @@ async fn an_edit_and_an_ack_both_survive_a_block_form_generated_mapping() {
                 ..Default::default()
             },
             Some("agent:test"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();

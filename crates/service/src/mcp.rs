@@ -1493,7 +1493,10 @@ impl McpServer {
             return refuse(COLLISION_REFUSAL).map(CallToolResponse::from);
         }
 
-        let written = self.engine.write_engram_as(&p, actor.as_deref()).await;
+        let written = self
+            .engine
+            .write_engram_as(&p, actor.as_deref(), &scope)
+            .await;
 
         // A permalink collision is the one failure here with a real choice
         // behind it, so a peer that can put that choice to its user is offered
@@ -1538,7 +1541,7 @@ impl McpServer {
                 retry.overwrite = true;
                 let receipt = self
                     .engine
-                    .write_engram_as(&retry, actor.as_deref())
+                    .write_engram_as(&retry, actor.as_deref(), &scope)
                     .await
                     .map_err(to_error)?;
                 let receipt = self
@@ -1618,7 +1621,7 @@ impl McpServer {
         }
         let receipt = self
             .engine
-            .edit_engram_as(&p, acting_actor(&ctx).as_deref())
+            .edit_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
             .await
             .map_err(to_error)?;
         // `for_edit` is `None` for `set_frontmatter` and for any operation that
@@ -1695,14 +1698,12 @@ impl McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         // One domain, because a split writes twice inside it: the new engram
         // lands in the source's domain, so the source's gate is the whole gate.
-        if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
-            .await?
-        {
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
             return refuse(refusal);
         }
         self.engine
-            .split_engram_as(&p, acting_actor(&ctx).as_deref())
+            .split_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
             .await
             .map_err(to_error)
             .and_then(ok_split)
@@ -1726,10 +1727,8 @@ impl McpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         // Before the confirmation round, for the reason `edit_engram` states.
-        if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
-            .await?
-        {
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
             return refuse(refusal).map(CallToolResponse::from);
         }
         // The whole confirmation flow lives inside this gate, so a peer that
@@ -1751,7 +1750,7 @@ impl McpServer {
             }
         }
         self.engine
-            .delete_engram(&p)
+            .delete_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
             .await
             .map_err(to_error)
             .and_then(ok)

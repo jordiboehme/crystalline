@@ -2441,8 +2441,9 @@ impl Engine {
     /// of a private domain into a readable one, a superseded pair written into
     /// a private engram's file, an `evolve_ack` stamped into one. The reads
     /// are safe because they resolve through the scoped resolver and a hidden
-    /// domain is simply absent from it; the writes have no scope to resolve
-    /// with, and this is the boundary that makes one not needed.
+    /// domain is simply absent from it; the writes carry the acting scope but
+    /// resolve nothing with it, and this is the boundary that makes that
+    /// unnecessary.
     ///
     /// So the rule is the narrow one that costs nothing legitimate: on a call
     /// that names a domain, an absolute identifier naming a DIFFERENT one is
@@ -2764,7 +2765,8 @@ impl Engine {
     /// virtual domain builds the markdown in memory and indexes it straight into
     /// the database, touching no filesystem.
     pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
-        self.write_engram_as(p, None).await
+        self.write_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// [`Engine::write_engram`] with the writer's identity: `client` is the
@@ -2772,7 +2774,21 @@ impl Engine {
     /// `clientname/version` from the initialize handshake, or the CLI's process
     /// actor), which [`Engine::actor`] resolves against the `identity.actor`
     /// setting before it lands in the engram's `generated.by`.
-    pub async fn write_engram_as(&self, p: &WriteParams, client: Option<&str>) -> Result<Value> {
+    ///
+    /// `scope` is who is acting, resolved once by whichever surface took the
+    /// request (see [`crate::scope::Scope`]). Every write verb carries it, so
+    /// that routing a write to one actor's own draft overlay has a single
+    /// place to happen rather than one per surface. No verb consults it yet:
+    /// the wrappers with no `_as` suffix pass
+    /// [`Unrestricted`](crate::scope::Scope::Unrestricted), which is what the
+    /// CLI and the control socket are, and what every caller acted with before
+    /// the parameter existed.
+    pub async fn write_engram_as(
+        &self,
+        p: &WriteParams,
+        client: Option<&str>,
+        _scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -2892,7 +2908,10 @@ impl Engine {
     /// document verbatim means an author may have edited the `permalink` line
     /// in the frontmatter, and the index takes the permalink from the file. A
     /// caller that saved a rename is told where its engram went.
-    pub async fn save_engram(&self, p: &SaveParams) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn save_engram(&self, p: &SaveParams, _scope: &crate::scope::Scope) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -3044,7 +3063,16 @@ impl Engine {
     /// PATH rather than by identifier: the engram is gone from the index, so
     /// there is nothing left to resolve. No CAS token either, for the same
     /// reason - there is no stored version to compare against.
-    pub async fn restore_engram(&self, domain: &str, path: &str, content: &str) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn restore_engram(
+        &self,
+        domain: &str,
+        path: &str,
+        content: &str,
+        _scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -3749,7 +3777,8 @@ impl Engine {
     /// relations so verify's T005 and the evolve sweep see a reciprocal link
     /// rather than a dangling one.
     pub async fn retire_engram(&self, p: &RetireParams) -> Result<Value> {
-        self.retire_engram_as(p, None).await
+        self.retire_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// [`Engine::retire_engram`] with the retiring identity, resolved by
@@ -3771,7 +3800,15 @@ impl Engine {
     /// retired with a one-sided pair; nothing here rolls that back, since the
     /// evolve sweep already flags a `superseded_by` with no matching
     /// `supersedes` as its own finding.
-    pub async fn retire_engram_as(&self, p: &RetireParams, client: Option<&str>) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn retire_engram_as(
+        &self,
+        p: &RetireParams,
+        client: Option<&str>,
+        _scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -4052,7 +4089,8 @@ impl Engine {
     /// sequence as one call, and `V010` is the sweep rule that finds the
     /// engrams needing it.
     pub async fn split_engram(&self, p: &SplitParams) -> Result<Value> {
-        self.split_engram_as(p, None).await
+        self.split_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// [`Engine::split_engram`] with the splitting identity, resolved by
@@ -4102,7 +4140,15 @@ impl Engine {
     /// lifecycle does not: the new engram is `stable` with no validity window,
     /// since the facts being moved out are the ones that still hold. Nothing
     /// else from the source's frontmatter follows it.
-    pub async fn split_engram_as(&self, p: &SplitParams, client: Option<&str>) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn split_engram_as(
+        &self,
+        p: &SplitParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -4145,6 +4191,9 @@ impl Engine {
                     overwrite: false,
                 },
                 client,
+                // The splitter's own scope: the new engram is written by
+                // whoever asked for the split, wherever their writes land.
+                scope,
             )
             .await?;
         // Where the capture path put it, which is also what the rollback below
@@ -4624,14 +4673,23 @@ impl Engine {
     /// a compare-and-swap guard so a stale edit is refused rather than silently
     /// clobbering a concurrent change (see `expected_checksum`).
     pub async fn edit_engram(&self, p: &EditParams) -> Result<Value> {
-        self.edit_engram_as(p, None).await
+        self.edit_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// [`Engine::edit_engram`] with the editor's identity, resolved by
     /// [`Engine::actor`] and written into the engram's `generated` block. An
     /// engram that still carries the legacy `timestamp` key migrates to
     /// `generated` here, on its next edit.
-    pub async fn edit_engram_as(&self, p: &EditParams, client: Option<&str>) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn edit_engram_as(
+        &self,
+        p: &EditParams,
+        client: Option<&str>,
+        _scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -5697,6 +5755,23 @@ impl Engine {
     /// the domain"), and the identifier says which thing without ambiguity: an
     /// engram can never live under the reserved `assets/` folder.
     pub async fn delete_engram(&self, p: &DeleteParams) -> Result<Value> {
+        self.delete_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::delete_engram`] with the deleting identity and the acting
+    /// scope, the pair every other write verb takes.
+    ///
+    /// Neither is read here. A delete stamps no `generated` block - there is
+    /// no document left to stamp - so `client` is carried for the same reason
+    /// `scope` is: a removal that lands in one actor's overlay has to know
+    /// whose it is, and the surfaces that know are the ones calling this.
+    pub async fn delete_engram_as(
+        &self,
+        p: &DeleteParams,
+        _client: Option<&str>,
+        _scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -7872,6 +7947,16 @@ impl Engine {
     /// of; it is ignored for every other rule and checked rather than trusted
     /// for that one (see [`Engine::named_scope`]). `None` leaves the choice to
     /// the server, which is what an agent's `set_frontmatter` does.
+    ///
+    /// `acting` is who is asking, and it is a different thing entirely from
+    /// the `scope` above: this recording is an [`Engine::edit_engram_as`] in
+    /// the end, and every write verb takes the acting scope (see
+    /// [`Engine::write_engram_as`]), so the surface's answer is passed through
+    /// rather than a stand-in invented here.
+    // Eight, and the eighth is the acting scope every write verb now takes.
+    // Bundling the six the caller supplies into a struct would put a type
+    // between the REST handler and its one call for no reader's benefit.
+    #[allow(clippy::too_many_arguments)]
     pub async fn acknowledge_finding_as(
         &self,
         domain: &str,
@@ -7880,6 +7965,7 @@ impl Engine {
         note: Option<&str>,
         scope: Option<&str>,
         client: Option<&str>,
+        acting: &crate::scope::Scope,
     ) -> Result<Value> {
         let screened = rule.trim().to_ascii_uppercase();
         if rule_info(&screened).is_none() {
@@ -7898,7 +7984,7 @@ impl Engine {
             ack_scope: scope.map(str::to_string),
             ..EditParams::default()
         };
-        let result = self.edit_engram_as(&params, client).await?;
+        let result = self.edit_engram_as(&params, client, acting).await?;
         Ok(result.get("evolve_ack").cloned().unwrap_or(Value::Null))
     }
 
@@ -16250,12 +16336,15 @@ mod lock_tests {
 
         let renamed = original.replace("permalink: alpha", "permalink: renamed");
         let receipt = engine
-            .save_engram(&SaveParams {
-                domain: "eng".to_string(),
-                identifier: "alpha".to_string(),
-                content: renamed.clone(),
-                expected_checksum: sha256_hex(original.as_bytes()),
-            })
+            .save_engram(
+                &SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    content: renamed.clone(),
+                    expected_checksum: sha256_hex(original.as_bytes()),
+                },
+                &crate::scope::Scope::Unrestricted,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -16272,12 +16361,15 @@ mod lock_tests {
         // An ordinary save still reports the address it was given.
         let plain = renamed.replace("The body.", "A sharper body.");
         let receipt = engine
-            .save_engram(&SaveParams {
-                domain: "eng".to_string(),
-                identifier: "renamed".to_string(),
-                content: plain.clone(),
-                expected_checksum: sha256_hex(renamed.as_bytes()),
-            })
+            .save_engram(
+                &SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "renamed".to_string(),
+                    content: plain.clone(),
+                    expected_checksum: sha256_hex(renamed.as_bytes()),
+                },
+                &crate::scope::Scope::Unrestricted,
+            )
             .await
             .unwrap();
         assert_eq!(receipt["permalink"], "renamed");
@@ -16322,12 +16414,15 @@ mod lock_tests {
         let expected = sha256_hex(original.as_bytes());
         let task = tokio::spawn(async move {
             saver
-                .save_engram(&SaveParams {
-                    domain: "eng".to_string(),
-                    identifier: "alpha".to_string(),
-                    content: mine,
-                    expected_checksum: expected,
-                })
+                .save_engram(
+                    &SaveParams {
+                        domain: "eng".to_string(),
+                        identifier: "alpha".to_string(),
+                        content: mine,
+                        expected_checksum: expected,
+                    },
+                    &crate::scope::Scope::Unrestricted,
+                )
                 .await
         });
 

@@ -396,6 +396,7 @@ async fn an_acknowledgment_is_given_for_the_pair_the_caller_names() {
             Some("distinct, linked"),
             Some(&second_pair),
             None,
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -432,6 +433,7 @@ async fn a_pair_the_sweep_does_not_see_is_refused() {
             None,
             Some("crystalline://notes/nobody, crystalline://notes/nothing"),
             None,
+            &Scope::Unrestricted,
         )
         .await
         .unwrap_err();
@@ -452,7 +454,15 @@ async fn withdrawing_one_pair_leaves_the_other_acknowledged() {
     let rows = pairs_on(&before, &hub);
     for (pair, _) in &rows {
         engine
-            .acknowledge_finding_as("notes", &hub, "V301", Some("linked"), Some(pair), None)
+            .acknowledge_finding_as(
+                "notes",
+                &hub,
+                "V301",
+                Some("linked"),
+                Some(pair),
+                None,
+                &Scope::Unrestricted,
+            )
             .await
             .unwrap();
         engine.embed_pending().await.unwrap();
