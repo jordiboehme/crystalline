@@ -939,6 +939,43 @@ mod tests {
             "and the domain columns the swap did not touch are untouched"
         );
 
+        // `WIPE_TABLES` names `engram` as a table, and the swap dropped the
+        // table that name pointed at. It is only still a valid name because the
+        // rename put it back, so every name in that list is checked against the
+        // swapped database rather than assumed - `wipe_clears_everything` runs
+        // on a store where v13 was part of the initial chain and would not
+        // notice a name the swap had orphaned.
+        for table in WIPE_TABLES {
+            let found = scalar(
+                &conn,
+                &format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+                ),
+            )
+            .await;
+            assert_eq!(
+                found, 1,
+                "wipe names a table that exists after the swap: {table}"
+            );
+            conn.execute_batch(&format!("DELETE FROM {table};"))
+                .await
+                .unwrap_or_else(|e| panic!("wipe can clear {table} after the swap: {e}"));
+        }
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM engram").await,
+            0,
+            "and the wipe it drives empties the swapped table"
+        );
+
+        // Restore the two rows the wipe above just took, so the uniqueness
+        // assertions below still have a base row to sit beside.
+        conn.execute_batch(
+            "INSERT INTO domain(id, name, path) VALUES (1,'d','/tmp/d');\n\
+             INSERT INTO engram(id, domain_id, path, permalink) VALUES (7,1,'a.md','a');\n",
+        )
+        .await
+        .unwrap();
+
         // Every index the table carried is back. A swap that forgets one is a
         // silent full scan later, not an error now, so the set is pinned here
         // rather than left to whichever query happens to notice.

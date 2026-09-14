@@ -229,17 +229,22 @@ async fn the_folder_derivation_is_served_by_the_path_index() {
     );
     sync_domain(&store, "d", dir.path()).await.unwrap();
 
+    // The statement `browse_level` issues, base predicate and all. The index it
+    // has to be served by is the actor-aware one v13 put in place of
+    // `idx_engram_path`, and it is named in full here: a substring test would
+    // pass on either of the two, which is exactly the distinction this guard
+    // exists to make.
     let plan = store
         .explain_query_plan(
             "SELECT DISTINCT substr(e.path, 1, instr(substr(e.path, 1), '/') - 1) \
              FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE d.name='d' AND instr(substr(e.path, 1), '/') > 0",
+             WHERE e.actor = '' AND d.name='d' AND instr(substr(e.path, 1), '/') > 0",
         )
         .await
         .unwrap();
     let joined = plan.join(" | ");
     assert!(
-        joined.contains("idx_engram_path"),
+        joined.contains("idx_engram_path_actor"),
         "the folder derivation should read the path index, plan was: {joined}"
     );
     assert!(
