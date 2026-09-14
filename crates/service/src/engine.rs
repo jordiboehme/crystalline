@@ -11226,6 +11226,7 @@ impl Engine {
                         poll_secs: None,
                     }),
                     provision: None,
+                    review: None,
                 },
             );
             self.persist_config(&file)?;

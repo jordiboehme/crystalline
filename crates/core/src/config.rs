@@ -386,6 +386,27 @@ pub struct DomainEntry {
     /// decision but nothing installs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provision: Option<bool>,
+    /// How this domain takes changes. Absent is the direct domain everybody
+    /// has always had: a write lands in the folder or the database straight
+    /// away. [`ReviewMode::Overlay`] is review mode, where every write joins
+    /// the writing actor's own private draft instead, and the folder goes on
+    /// saying what the team reviewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewMode>,
+}
+
+/// How a domain takes changes.
+///
+/// One value today, and it is still an enum rather than a flag: "does this
+/// domain review changes" is a question about the shape of the workflow, and a
+/// later shape (a queue, a maintainer approval) is a second value here rather
+/// than a second boolean beside the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewMode {
+    /// Every actor writes into their own draft overlay and the folder on disk
+    /// only ever moves when reviewed work is pulled into it.
+    Overlay,
 }
 
 impl DomainEntry {
@@ -396,6 +417,7 @@ impl DomainEntry {
             path: Some(path.into()),
             origin: None,
             provision: None,
+            review: None,
         }
     }
 
@@ -406,12 +428,24 @@ impl DomainEntry {
             path: None,
             origin: None,
             provision: None,
+            review: None,
         }
     }
 
     /// Whether this domain keeps its engrams in the database rather than on disk.
     pub fn is_virtual(&self) -> bool {
         matches!(self.kind, DomainKind::Virtual)
+    }
+
+    /// Whether this domain reviews changes before they land: every write joins
+    /// the writing actor's own draft overlay and the folder on disk stays equal
+    /// to what the team reviewed.
+    ///
+    /// The one question every write and every read asks, so it is asked here
+    /// rather than matched on the mode at each call site - a second mode later
+    /// answers it without moving any of them.
+    pub fn is_overlay(&self) -> bool {
+        matches!(self.review, Some(ReviewMode::Overlay))
     }
 
     /// The tilde-expanded filesystem root for a file domain, or `None` for a
@@ -1731,6 +1765,37 @@ mod tests {
             "no provision line for a pre-existing entry: {out}"
         );
         assert_eq!(out, yaml);
+    }
+
+    #[test]
+    fn review_mode_round_trips_and_is_absent_from_a_direct_domain() {
+        // A domain in review mode says so in one line, and a domain that is
+        // not in review mode writes nothing at all - the same rule `kind` and
+        // `provision` follow, so a configuration written before review mode
+        // existed stays byte-identical.
+        let mut domains = IndexMap::new();
+        let mut reviewed = DomainEntry::file("/knowledge/team");
+        reviewed.review = Some(ReviewMode::Overlay);
+        domains.insert("team".to_string(), reviewed);
+        domains.insert("solo".to_string(), DomainEntry::file("/knowledge/solo"));
+        let cfg = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(yaml.contains("review: overlay"), "{yaml}");
+        assert_eq!(
+            yaml.matches("review").count(),
+            1,
+            "only the reviewed domain says so: {yaml}"
+        );
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back, cfg);
+        assert!(back.domains.get("team").unwrap().is_overlay());
+        assert!(!back.domains.get("solo").unwrap().is_overlay());
+        assert_eq!(DomainEntry::file("/knowledge/eng").review, None);
+        assert_eq!(DomainEntry::virtual_domain().review, None);
     }
 
     #[test]

@@ -47,6 +47,32 @@ pub enum Scope {
     Anonymous,
 }
 
+/// Whose draft overlay a caller acts in on a domain that reviews changes
+/// before they land, or `None` when the caller has no identity for a draft to
+/// belong to.
+///
+/// One function, so every write verb and every read verb asks the same
+/// question the same way. The mapping is the whole of the policy:
+///
+/// * the machine owner drafts as [`crate::engine::OWNER_IDENTITY_NAME`]. Whoever runs
+///   the CLI, the control socket or a local stdio session is one actor with
+///   one name, and naming them makes the owner's own work reviewable beside
+///   everybody else's rather than a special case that bypasses review;
+/// * a signed-in account drafts under its own login name, which is the key the
+///   membership rows and the overlay rows already share. The instance admin
+///   flag is deliberately not read: a role widens what an account may reach,
+///   never whose draft its writing is;
+/// * nobody in particular holds nothing. There is no identity for a draft to
+///   belong to, so there is no draft, and the write verbs turn this into a
+///   refusal that teaches how to connect rather than into a silent write.
+pub fn overlay_actor(scope: &Scope) -> Option<String> {
+    match scope {
+        Scope::Unrestricted => Some(crate::engine::OWNER_IDENTITY_NAME.to_string()),
+        Scope::User { account, .. } => Some(account.clone()),
+        Scope::Anonymous => None,
+    }
+}
+
 /// What a scope may do on one domain. Ordered least to most privileged, so a
 /// caller writes `right >= DomainRight::Write` rather than matching every arm.
 ///
@@ -773,6 +799,36 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Whose draft a write joins, per scope. The machine owner is one actor
+    /// like any other and drafts under the owner key; a signed-in account
+    /// drafts under its own name; nobody in particular holds no draft at all,
+    /// because there is no identity for one to belong to.
+    #[test]
+    fn overlay_actor_names_the_owner_the_account_and_nobody() {
+        assert_eq!(
+            overlay_actor(&Scope::Unrestricted).as_deref(),
+            Some(crate::engine::OWNER_IDENTITY_NAME)
+        );
+        assert_eq!(
+            overlay_actor(&Scope::User {
+                account: "ada".into(),
+                admin: false
+            })
+            .as_deref(),
+            Some("ada")
+        );
+        assert_eq!(
+            overlay_actor(&Scope::User {
+                account: "boss".into(),
+                admin: true
+            })
+            .as_deref(),
+            Some("boss"),
+            "an admin drafts as itself; the role widens what it may reach, never whose draft it is"
+        );
+        assert_eq!(overlay_actor(&Scope::Anonymous), None);
     }
 
     #[tokio::test]

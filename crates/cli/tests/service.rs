@@ -1149,6 +1149,7 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
             path: None,
             origin: None,
             provision: None,
+            review: None,
         },
     );
     config::save_yaml(&env.config_path(), &cfg).unwrap();
