@@ -78,7 +78,16 @@ use crystalline_service::maintenance::{self, MAINTENANCE_FILE, MaintenanceState}
 /// to a task. It carries the reconcile half too: a correction that makes an
 /// already captured engram wrong is an edit or a supersession, not a second
 /// engram written beside the first.
-pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+///
+/// Jordi, 2026-09-14: the earlier wording defined durable only by positive
+/// example, and in practice that prompted captures of what no future
+/// session would ever reach for - what this session did and the state it
+/// left behind, temporary paths and outputs, a one-off bug's error text,
+/// steps that will not recur, and facts any model already knows. The
+/// definition now names what a future session would reach for, and the
+/// exclusion list names those five things explicitly so a later rewrite
+/// cannot drop them without a test noticing.
+pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what a future session would reach for: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
 
 /// The one plain sentence a person sees when the nudge fires under Claude
 /// Code, which renders it as `Stop says: <text>` on its own notice line.
@@ -1242,6 +1251,24 @@ mod tests {
             NUDGE_REASON,
             "no ask means the capture nudge alone, byte for byte"
         );
+    }
+
+    #[test]
+    fn the_nudge_names_what_is_not_durable() {
+        let lower = NUDGE_REASON.to_lowercase();
+        for phrase in [
+            "future session",
+            "this session did",
+            "temporary",
+            "one-off",
+            "will not recur",
+            "already knows",
+        ] {
+            assert!(
+                lower.contains(phrase),
+                "the nudge names what is not durable, missing {phrase:?}: {NUDGE_REASON}"
+            );
+        }
     }
 
     // --- the sharing ride-along ------------------------------------------------
