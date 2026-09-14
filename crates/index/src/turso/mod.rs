@@ -82,11 +82,23 @@ impl TursoStore {
     /// and starting fresh. Files on disk are the source of truth, so the index
     /// is always rebuildable; this is the `reindex --wipe` recovery path when the
     /// database will not open or fails a sanity check.
+    ///
+    /// A file another process holds is the one failure this must not treat as
+    /// damage. `reindex --wipe` is daemonless by construction, so it meets a
+    /// running daemon's index as an open that fails - and discarding the files
+    /// then would delete a healthy index out from under a process still
+    /// serving it, which is the opposite of recovery. Such an error is
+    /// returned untouched, and the caller turns it into the usual sentence
+    /// naming the holder.
     pub async fn open_resilient(path: &Path) -> Result<TursoStore> {
-        if let Ok(store) = TursoStore::open(path).await
-            && store.store_info().await.is_ok()
-        {
-            return Ok(store);
+        match TursoStore::open(path).await {
+            Ok(store) => match store.store_info().await {
+                Ok(_) => return Ok(store),
+                Err(e) if is_locked_by_another_process(&e) => return Err(e),
+                Err(_) => {}
+            },
+            Err(e) if is_locked_by_another_process(&e) => return Err(e),
+            Err(_) => {}
         }
         for suffix in ["", "-wal", "-shm"] {
             let sidecar = if suffix.is_empty() {
@@ -505,6 +517,19 @@ fn observation_insert_sql(count: usize) -> String {
 }
 
 /// The stored discriminator string for a domain kind.
+/// Whether a failure is another process holding the database file rather than a
+/// damaged one.
+///
+/// turso raises the lock failure through its catch-all string variant rather
+/// than a typed one, so the `Locking error:` prefix its own message carries is
+/// the only handle there is; the same test the web-auth store already makes.
+/// Read conservatively: a message this does not recognize is treated as damage,
+/// which is the existing behaviour, and the one message it does recognize is
+/// the one that must never lead to a delete.
+fn is_locked_by_another_process(err: &IndexError) -> bool {
+    err.to_string().contains("Locking error")
+}
+
 fn kind_str(kind: DomainKind) -> &'static str {
     match kind {
         DomainKind::File => "file",

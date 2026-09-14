@@ -695,6 +695,45 @@ fn the_daemon_keeps_answering_during_a_full_reindex() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// `reindex --wipe` is the one verb that still destroys the index, and it needs
+/// the file to itself. A running daemon is holding it, so the wipe must refuse
+/// and name the holder - never discard a healthy index out from under a process
+/// that is still serving from it.
+///
+/// The failure mode this pins is specific: the wipe opens resiliently, and a
+/// resilient open discards a database it cannot open. A file held by another
+/// process is exactly such a database, so without the lock check the wipe would
+/// delete a live index and report success.
+#[test]
+fn reindex_wipe_refuses_while_a_daemon_holds_the_index() {
+    let env = Env::new("wipe");
+    env.setup_domain("eng");
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    let db = env.state_dir().join("index.db");
+    let size_before = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    assert!(size_before > 0, "the daemon's index exists");
+
+    let (ok, _out, err) = env.run_full(&["reindex", "--wipe"]);
+    assert!(!ok, "the wipe refuses while the daemon holds the index");
+    assert!(
+        err.contains("crystalline") && err.to_lowercase().contains("daemon"),
+        "the refusal names the holder and what to do: {err}"
+    );
+
+    // The index file is still there and the daemon still answers from it.
+    assert!(db.exists(), "the held index file was not discarded");
+    let (ok, out) = env.run(&["--json", "search", "seed"]);
+    assert!(ok, "the daemon still serves: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["total"].as_u64().unwrap_or(0) >= 1, "{v}");
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The hit count for the corpus token, through whatever route the environment
 /// resolves - a running daemon, here.
 fn search_total(env: &Env) -> u64 {
