@@ -15,7 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use crystalline_index::{
     ChunkParams, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE, EmbeddingProvider,
-    NoReindexHooks, Store, TursoStore, reindex_domains, run_embedding_pass,
+    NoReindexHooks, Store, TursoStore, apply_scan, reindex_domains, run_embedding_pass,
+    scan_domain,
 };
 use tokio::sync::Mutex;
 
@@ -115,29 +116,37 @@ async fn domain_id(store: &Arc<Mutex<dyn Store>>, name: &str, root: &Path) -> Do
 }
 
 /// Everything a reader of this index can see, for a before-and-after compare:
-/// per-domain engram counts plus the index-wide chunk and embedding totals.
-async fn visible(
-    store: &Arc<Mutex<dyn Store>>,
-    names: &[&str],
-) -> Vec<(String, i64, usize, usize)> {
+/// the named domains' engram counts, and the index-wide chunk and embedding
+/// totals once, beside them rather than repeated into every row. The chunk and
+/// coverage figures are not per-domain and must not read as though they were.
+#[derive(Debug, PartialEq)]
+struct Visible {
+    /// `(domain, engrams)` for the domains asked about, in that order.
+    domains: Vec<(String, i64)>,
+    /// Chunk rows across the whole index.
+    chunks: usize,
+    /// Chunks carrying an embedding for the test model, across the whole index.
+    embedded: usize,
+}
+
+async fn visible(store: &Arc<Mutex<dyn Store>>, names: &[&str]) -> Visible {
     let store = store.lock().await;
     let stats = store.domain_stats().await.unwrap();
     let coverage = store.embedding_coverage().await.unwrap();
-    names
-        .iter()
-        .map(|name| {
-            let d = stats
-                .iter()
-                .find(|d| &d.name == name)
-                .unwrap_or_else(|| panic!("no stats for domain '{name}'"));
-            (
-                d.name.clone(),
-                d.engrams,
-                coverage.total_chunks,
-                coverage.embedded_for(MODEL),
-            )
-        })
-        .collect()
+    Visible {
+        domains: names
+            .iter()
+            .map(|name| {
+                let d = stats
+                    .iter()
+                    .find(|d| &d.name == name)
+                    .unwrap_or_else(|| panic!("no stats for domain '{name}'"));
+                (d.name.clone(), d.engrams)
+            })
+            .collect(),
+        chunks: coverage.total_chunks,
+        embedded: coverage.embedded_for(MODEL),
+    }
 }
 
 /// The vectors of every engram's lead chunk in a domain, ordered by engram id:
@@ -265,7 +274,10 @@ async fn interrupted_rebuild_leaves_the_old_index_serving(store: Arc<Mutex<dyn S
     embed_everything(&store).await;
 
     let before = visible(&store, &["a", "b"]).await;
-    assert_eq!(before[0].3, before[0].2, "the corpus starts fully embedded");
+    assert_eq!(
+        before.embedded, before.chunks,
+        "the corpus starts fully embedded"
+    );
 
     // The interruption: domain b cannot be scanned any more.
     std::fs::remove_dir_all(&b_root).unwrap();
@@ -492,3 +504,145 @@ parity!(
     deletes_are_pruned_by_a_forced_reindex,
     a_forced_reindex_still_prunes_deletes
 );
+
+// --- the marker is cleared by the apply's own transaction --------------------
+
+/// Where `end_rebuild` runs is the whole design, and this is what holds it: an
+/// apply that fails must leave the marker standing, because the rebuild it was
+/// stamped for did not land.
+///
+/// The failure is injected inside `apply_scan` rather than in the scan before
+/// it, which is what the interruption tests above do: a transaction is already
+/// open when the apply starts, so its own `begin` fails and it returns without
+/// writing. Move `store.end_rebuild(domain)` above `store.begin()` - out of the
+/// transaction on the near side - and this goes red, because the marker would
+/// be cleared by a rebuild that never committed a row.
+///
+/// The test *commits* its own transaction afterwards rather than rolling it
+/// back, and that is the whole point of the shape: a rollback would undo a
+/// misplaced `end_rebuild` along with everything else and hide exactly the
+/// defect under test. Committing keeps whatever the apply wrote before it
+/// failed, which is what a reader would have seen.
+///
+/// What no injection here can distinguish: moving the call to *after*
+/// `store.commit()` behaves identically to every observer, because the only
+/// thing separating the two is a commit that fails, and nothing a test can do
+/// to a `Store` through its public surface makes one fail. That direction is
+/// held by `end_rebuild_is_called_inside_the_applys_transaction` below.
+async fn a_failed_apply_leaves_the_marker_standing(store: Arc<Mutex<dyn Store>>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("d");
+    write(&root, "a.md", &engram("A", "a", "alpha payload"));
+    write(&root, "b.md", &engram("B", "b", "beta payload"));
+
+    let targets = vec![("d".to_string(), root.clone())];
+    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+        .await
+        .unwrap();
+    embed_everything(&store).await;
+    let domain = domain_id(&store, "d", &root).await;
+    let before = visible(&store, &["d"]).await;
+
+    // The first lock window of a forced rebuild: stamp the marker, snapshot the
+    // stamps, scan with no lock held. Exactly what the driver does.
+    let now = "2026-09-14T10:00:00Z";
+    let snapshot = {
+        let store = store.lock().await;
+        store.begin_rebuild(domain, now).await.unwrap();
+        store.file_stamps(domain).await.unwrap()
+    };
+    let scan = scan_domain("d", &root, snapshot, &params(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        stats_of(&store, "d").await.rebuild_started.as_deref(),
+        Some(now),
+        "the rebuild is stamped before its apply runs"
+    );
+
+    // The injection: the apply cannot open its transaction.
+    {
+        let store = store.lock().await;
+        store.begin().await.unwrap();
+    }
+    let err = {
+        let store = store.lock().await;
+        apply_scan(&*store, domain, scan)
+            .await
+            .expect_err("the apply fails with a transaction already open")
+    };
+    assert!(!err.to_string().is_empty());
+    {
+        // Commit, not roll back: a rollback would revert a misplaced
+        // `end_rebuild` too and the assertion below could never fail.
+        let store = store.lock().await;
+        store.commit().await.unwrap();
+    }
+
+    assert_eq!(
+        stats_of(&store, "d").await.rebuild_started.as_deref(),
+        Some(now),
+        "an apply that did not commit leaves the marker standing"
+    );
+    assert_eq!(
+        visible(&store, &["d"]).await,
+        before,
+        "and leaves every row and embedding exactly as it was"
+    );
+
+    // The rebuild that does land clears it, in the transaction that commits it.
+    reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
+        .await
+        .unwrap();
+    assert!(
+        stats_of(&store, "d").await.rebuild_started.is_none(),
+        "a committed rebuild clears the marker"
+    );
+    assert_eq!(
+        visible(&store, &["d"]).await,
+        before,
+        "and it re-read everything without destroying any of it"
+    );
+}
+parity!(
+    a_failed_apply_leaves_the_rebuild_marker_standing,
+    a_failed_apply_leaves_the_marker_standing
+);
+
+/// The other half of the placement, which no runtime injection can reach: the
+/// clear must also sit *before* the commit, and the only thing that would tell
+/// the two apart at runtime is a commit that fails.
+///
+/// So this reads the source, the way the backend-collation guard in this
+/// workspace does. It is a guard against a future edit moving a call whose
+/// whole meaning is where it sits, in a function where nothing else would
+/// complain.
+#[test]
+fn end_rebuild_is_called_inside_the_applys_transaction() {
+    const SYNC_SRC: &str = include_str!("../src/sync.rs");
+    let start = SYNC_SRC
+        .find("pub async fn apply_scan_with_slab")
+        .expect("apply_scan_with_slab is where the rebuild marker is cleared");
+    let body = &SYNC_SRC[start..];
+    let end = body.find("\n}\n").expect("the function ends");
+    let body = &body[..end];
+
+    let begin = body
+        .find("store.begin().await?")
+        .expect("the apply opens its transaction");
+    let clear = body
+        .find("store.end_rebuild(domain)")
+        .expect("the apply clears the rebuild marker");
+    let commit = body
+        .find("store.commit().await?")
+        .expect("the apply commits its transaction");
+
+    assert!(
+        begin < clear,
+        "end_rebuild must run after the transaction is open, or a rebuild that never commits still clears its marker"
+    );
+    assert!(
+        clear < commit,
+        "end_rebuild must run before the commit, or the clear is a separate autocommitted write and a crash between the two leaves a finished rebuild marked forever"
+    );
+}
