@@ -1124,6 +1124,33 @@ pub(crate) struct EmbedGate {
     again: bool,
 }
 
+/// What a request for an embedding pass did.
+///
+/// The two are worth telling apart wherever a caller reports the result to a
+/// person: a turned-away request is work in progress, not an empty backlog, and
+/// rendering it as "0 chunks embedded" is the silently-successful answer this
+/// whole area has been fixing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedOutcome {
+    /// This call walked the backlog and embedded that many chunks.
+    Embedded(usize),
+    /// A pass was already walking the backlog, so this request was folded into
+    /// it: that pass walks the backlog again and covers whatever this caller
+    /// had just written. Nothing was dropped and nothing needs re-asking.
+    AlreadyRunning,
+}
+
+impl EmbedOutcome {
+    /// The count for a caller that only wants a number, a turned-away request
+    /// reading as zero.
+    pub fn embedded(self) -> usize {
+        match self {
+            EmbedOutcome::Embedded(n) => n,
+            EmbedOutcome::AlreadyRunning => 0,
+        }
+    }
+}
+
 /// Holds the claim on the embedding pass, releasing it on drop so a store
 /// error, a panic or a dropped future cannot strand it.
 pub(crate) struct EmbedPass {
@@ -9272,14 +9299,28 @@ impl Engine {
 
     /// Embed outstanding chunks for the active model in bounded batches, locking
     /// the store only to pull jobs and to store vectors so long embeds do not
-    /// block searches. Returns the number of chunks embedded.
+    /// block searches. Returns the number of chunks embedded, which is `0` both
+    /// when there was nothing to embed and when another pass was already
+    /// walking the backlog; [`Self::embed_pending_outcome`] tells those apart
+    /// and is what a caller reporting a count to a person wants.
     pub async fn embed_pending(&self) -> Result<usize> {
         self.embed_pending_with_page(EMBED_PAGE_SIZE).await
+    }
+
+    /// [`Self::embed_pending`], saying which of the two things happened rather
+    /// than folding a turned-away request into a zero.
+    pub async fn embed_pending_outcome(&self) -> Result<EmbedOutcome> {
+        self.embed_pass_with_page(EMBED_PAGE_SIZE).await
     }
 
     /// [`Self::embed_pending`] with an explicit backlog page size. Production
     /// callers take [`EMBED_PAGE_SIZE`] through the wrapper; the parameter lets
     /// a test drive several pages over a small corpus.
+    pub async fn embed_pending_with_page(&self, page_size: usize) -> Result<usize> {
+        Ok(self.embed_pass_with_page(page_size).await?.embedded())
+    }
+
+    /// The pass itself, reporting its outcome.
     ///
     /// A batch the provider rejects is logged and skipped, not fatal: its chunks
     /// keep no embedding and stay in the backlog, visible in `status`, for a
@@ -9287,20 +9328,18 @@ impl Engine {
     /// store errors abort the pass.
     ///
     /// One pass runs at a time. A caller that arrives while another pass is
-    /// walking the backlog returns `Ok(0)` at once instead of walking it a
+    /// walking the backlog is turned away at once instead of walking it a
     /// second time with its own cursor: two passes do not share a backlog, they
     /// shadow each other. Nothing is dropped by that - the running pass is told
     /// to walk again, and a walk starts at the head of the backlog, so it picks
-    /// up whatever the second caller had just written. `Ok(0)` from a skipped
-    /// call therefore means "another pass is doing this", not "there was
-    /// nothing to do"; [`Engine::embed_in_flight`] tells the two apart.
-    pub async fn embed_pending_with_page(&self, page_size: usize) -> Result<usize> {
+    /// up whatever the second caller had just written.
+    async fn embed_pass_with_page(&self, page_size: usize) -> Result<EmbedOutcome> {
         if self.provider().is_none() {
-            return Ok(0);
+            return Ok(EmbedOutcome::Embedded(0));
         }
         let Some(mut pass) = EmbedPass::claim(&self.embed_gate) else {
             tracing::debug!("an embed pass is already running; it walks the backlog again");
-            return Ok(0);
+            return Ok(EmbedOutcome::AlreadyRunning);
         };
         let page_size = page_size.max(1);
         let mut embedded = 0usize;
@@ -9311,10 +9350,10 @@ impl Engine {
                 break;
             }
         }
-        Ok(embedded)
+        Ok(EmbedOutcome::Embedded(embedded))
     }
 
-    /// One walk of the backlog, head to tail, for [`Self::embed_pending_with_page`].
+    /// One walk of the backlog, head to tail, for [`Self::embed_pass_with_page`].
     /// The activity is the caller's so a pass that walks twice stays one
     /// operation in `status`.
     async fn embed_one_walk(

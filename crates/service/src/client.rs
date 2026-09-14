@@ -631,7 +631,16 @@ async fn build_embedded(
         let _ = bg.sync(None).await;
         if let Some(provider) = crate::engine::build_provider(&bg_config).await {
             bg.set_provider(provider);
-            let _ = bg.embed_pending().await;
+            // Schedule on the worker spawned just above rather than embedding
+            // inline beside it, the same shape the daemon's startup task uses:
+            // two passes over one backlog shadow each other instead of sharing
+            // it. The inline fallback is for an engine with no worker wired,
+            // which this stack never is.
+            if !bg.request_embed()
+                && let Err(err) = bg.embed_pending().await
+            {
+                tracing::warn!("initial embed failed: {err}");
+            }
         }
     });
 

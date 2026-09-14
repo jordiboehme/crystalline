@@ -317,25 +317,37 @@ async fn a_rejected_batch_never_starves_the_backlog() {
 
 // --- one pass at a time ------------------------------------------------------
 
-/// An embedder that holds every batch until the test opens the gate and records
-/// each text it was handed. Blocking the provider is what makes a pass
-/// observably in flight, and the recorded texts are what prove no chunk was
-/// embedded twice.
+/// An embedder that holds every batch until the test opens the gate, says when
+/// a batch has arrived and records each text it was handed.
+///
+/// The arrival signal is what makes these tests exact rather than
+/// timing-tolerant: a batch in the provider's hands means a pass has claimed
+/// the gate and is inside it, so a second caller made after that signal is
+/// provably racing a running pass. The recorded texts are what prove no chunk
+/// was embedded twice.
 struct GatedEmbedder {
-    open: std::sync::atomic::AtomicBool,
+    arrived: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
     seen: std::sync::Mutex<Vec<String>>,
 }
 
 impl GatedEmbedder {
     fn closed() -> Self {
         Self {
-            open: std::sync::atomic::AtomicBool::new(false),
+            arrived: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
             seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 
+    /// Wait until a pass is inside the provider, holding a batch.
+    async fn wait_for_a_batch(&self) {
+        self.arrived.acquire().await.unwrap().forget();
+    }
+
+    /// Let every held batch through, and every later one.
     fn open(&self) {
-        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release.close();
     }
 
     fn seen(&self) -> Vec<String> {
@@ -346,9 +358,9 @@ impl GatedEmbedder {
 #[async_trait::async_trait]
 impl crystalline_index::EmbeddingProvider for GatedEmbedder {
     async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
-        while !self.open.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        self.arrived.add_permits(1);
+        // Err once the test closes the semaphore, which is the open gate.
+        let _ = self.release.acquire().await;
         self.seen.lock().unwrap().extend(texts.iter().cloned());
         Ok(vec![vec![0.1_f32; 4]; texts.len()])
     }
@@ -396,38 +408,32 @@ async fn two_embed_requests_during_a_pass_run_one_activity_and_then_none() {
     let backlog = engine.embedding_backlog().await.unwrap();
     assert_eq!(backlog, 6, "one chunk per note is outstanding");
 
-    // The worker, and beside it an inline caller: the two pass sources the
-    // daemon had.
+    // The worker takes the queued signals and starts a pass, which the
+    // provider then holds. Waiting on that arrival is what makes the race
+    // below exact: from here the gate is provably claimed.
     tokio::spawn(crystalline_service::engine::run_embed_worker(
         engine.clone(),
         embed_rx,
     ));
-    let inline = tokio::spawn({
-        let e = engine.clone();
-        async move { e.embed_pending().await }
-    });
+    embedder.wait_for_a_batch().await;
+    assert!(engine.embed_in_flight(), "the worker's pass holds the gate");
+
+    // Now the two triggers the daemon had beside the worker: more requests on
+    // the channel, and a caller going straight to the engine the way the
+    // startup task did. The direct caller is turned away rather than starting
+    // a second walk of the same backlog.
     assert!(engine.request_embed(), "the wired channel takes a request");
     assert!(engine.request_embed(), "and a second one");
-
-    // A pass is in flight (the provider is holding its first batch).
-    let mut live = 0;
-    for _ in 0..400 {
-        live = embed_activities(&engine.status_report().await.unwrap());
-        if live > 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(live > 0, "a pass opened an embed activity");
-    // Hold there a while: a second pass would have opened its own record by now.
-    for _ in 0..20 {
-        assert_eq!(
-            embed_activities(&engine.status_report().await.unwrap()),
-            1,
-            "exactly one embed activity runs, whatever asks"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    assert_eq!(
+        engine.embed_pending().await.unwrap(),
+        0,
+        "a caller that races the running pass does not walk the backlog too"
+    );
+    assert_eq!(
+        embed_activities(&engine.status_report().await.unwrap()),
+        1,
+        "exactly one embed activity runs, whatever asks"
+    );
 
     // Drain.
     embedder.open();
@@ -447,7 +453,6 @@ async fn two_embed_requests_during_a_pass_run_one_activity_and_then_none() {
         report["activity"]["last"]["kind"], "embed",
         "the finished pass is the last recorded operation"
     );
-    let _ = tokio::time::timeout(Duration::from_secs(5), inline).await;
 
     // Every chunk was handed to the provider exactly once.
     let mut seen = embedder.seen();
@@ -487,12 +492,7 @@ async fn tick_stays_silent_while_a_pass_is_in_flight() {
         let e = engine.clone();
         async move { e.embed_pending().await }
     });
-    for _ in 0..400 {
-        if engine.embed_in_flight() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    embedder.wait_for_a_batch().await;
     assert!(engine.embed_in_flight(), "a pass is in flight");
     assert!(
         engine.embedding_backlog().await.unwrap() > 0,
@@ -542,12 +542,7 @@ async fn a_request_made_during_a_pass_is_served_by_a_follow_up_walk() {
         let e = engine.clone();
         async move { e.embed_pending().await }
     });
-    for _ in 0..400 {
-        if engine.embed_in_flight() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    embedder.wait_for_a_batch().await;
     assert!(engine.embed_in_flight(), "a pass is in flight");
 
     // A write lands mid-pass, below or above the running walk's cursor, and

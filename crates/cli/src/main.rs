@@ -1657,6 +1657,25 @@ fn print_value(value: &serde_json::Value, json: bool) {
     }
 }
 
+/// Say in words what `embed_scheduled` on a daemon response means.
+///
+/// The daemon embeds one pass at a time. A `--embed` that arrives while a pass
+/// is already walking the backlog is folded into that pass rather than starting
+/// a second one, and the response says so with this flag instead of a count.
+/// Without a line for it a person reads the raw JSON and sees no
+/// `embedded_chunks` at all, which is the same confusion a `0` would cause. The
+/// `--json` consumer has the flag itself and needs no prose.
+fn print_embed_scheduled(data: &serde_json::Value, json: bool) {
+    if !json
+        && data
+            .get("embed_scheduled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        println!("embedding continues in the daemon: a pass was already running and covers this");
+    }
+}
+
 /// Read a body from an option or stdin when the option is absent.
 fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
     match content {
@@ -1883,6 +1902,7 @@ async fn sync_dispatch(
     .await?;
     if let cmd::IndexRoute::Daemon(data) = route {
         print_value(&data, json);
+        print_embed_scheduled(&data, json);
         // Two failure classes ride inside the daemon's JSON as ordinary
         // fields, so the ctl envelope around either is still `ok`: the
         // daemon path needs its own check, the same one `cmd::sync` runs on
@@ -1957,6 +1977,7 @@ async fn reindex_dispatch(
     match route {
         cmd::IndexRoute::Daemon(data) => {
             print_value(&data, json);
+            print_embed_scheduled(&data, json);
             Ok(())
         }
         other => cmd::reindex(cmd::local_store(other, "reindex")?, &cfg, full, embed, json).await,

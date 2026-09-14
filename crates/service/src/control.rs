@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::daemon::Shared;
-use crate::engine::{ConfigureAction, ShareActor};
+use crate::engine::{ConfigureAction, EmbedOutcome, Engine, ShareActor};
 
 /// The protocol version carried on every ctl envelope.
 pub const CTL_VERSION: u64 = 1;
@@ -499,19 +499,35 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
 
 /// Run a background-equivalent embed pass and record the count on the response.
 async fn maybe_embed(shared: &Arc<Shared>, embed: bool, data: &mut Value) {
+    embed_onto_response(&shared.engine, embed, data).await;
+}
+
+/// The body of [`maybe_embed`], against the engine alone so it can be tested
+/// without a daemon around it.
+///
+/// One pass walks the backlog at a time, so a `--embed` that arrives while the
+/// daemon is already embedding is folded into the running pass rather than
+/// starting a second one. That is reported as `embed_scheduled`, never as
+/// `embedded_chunks: 0`: the zero would tell a person on a large first index -
+/// exactly the case `--embed` is passed for - that nothing was embedded, when
+/// the running pass is in fact covering their request.
+async fn embed_onto_response(engine: &Engine, embed: bool, data: &mut Value) {
     if !embed {
         return;
     }
-    match shared.engine.embed_pending().await {
-        Ok(n) => {
-            if let Value::Object(map) = data {
-                map.insert("embedded_chunks".to_string(), json!(n));
-            }
+    let outcome = engine.embed_pending_outcome().await;
+    let Value::Object(map) = data else {
+        return;
+    };
+    match outcome {
+        Ok(EmbedOutcome::Embedded(n)) => {
+            map.insert("embedded_chunks".to_string(), json!(n));
+        }
+        Ok(EmbedOutcome::AlreadyRunning) => {
+            map.insert("embed_scheduled".to_string(), json!(true));
         }
         Err(e) => {
-            if let Value::Object(map) = data {
-                map.insert("embed_error".to_string(), json!(e.to_string()));
-            }
+            map.insert("embed_error".to_string(), json!(e.to_string()));
         }
     }
 }
@@ -718,5 +734,147 @@ mod tests {
                 "{arm} must not read its proposal as a bare as_u64"
             );
         }
+    }
+
+    // --- the embed field on a daemon response -------------------------------
+
+    /// A provider that holds every batch until the test opens it, and says so
+    /// when a batch arrives, so a pass can be put in flight without polling.
+    struct HeldEmbedder {
+        arrived: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl HeldEmbedder {
+        fn new() -> Self {
+            Self {
+                arrived: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+        /// Wait until the provider is holding a batch, which is to say until a
+        /// pass has claimed the gate and is inside it.
+        async fn wait_for_a_batch(&self) {
+            self.arrived.acquire().await.unwrap().forget();
+        }
+        /// Let every held batch through, and every later one.
+        fn open(&self) {
+            self.release.close();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crystalline_index::EmbeddingProvider for HeldEmbedder {
+        async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+            self.arrived.add_permits(1);
+            // Err once the test closes the semaphore, which is the open gate.
+            let _ = self.release.acquire().await;
+            Ok(vec![vec![0.1_f32; 4]; texts.len()])
+        }
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+        fn dims(&self) -> usize {
+            4
+        }
+        fn max_input_tokens(&self) -> usize {
+            512
+        }
+    }
+
+    fn virtual_engine(
+        store: std::sync::Arc<tokio::sync::Mutex<dyn crystalline_index::Store>>,
+    ) -> Engine {
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains.insert(
+            "notes".to_string(),
+            crystalline_core::config::DomainEntry::virtual_domain(),
+        );
+        Engine::new(store, cfg, None, None)
+    }
+
+    fn a_note(title: &str) -> crate::params::WriteParams {
+        crate::params::WriteParams {
+            domain: "notes".to_string(),
+            title: title.to_string(),
+            content: format!("the body of {title}, long enough to make a chunk"),
+            folder: None,
+            engram_type: None,
+            tags: Vec::new(),
+            status: None,
+            metadata: None,
+            overwrite: false,
+        }
+    }
+
+    /// `sync --embed` and `reindex --embed` through a running daemon report a
+    /// count. One pass walks the backlog at a time, so a request that arrives
+    /// while the daemon is already embedding is folded into the running pass -
+    /// and reporting that as `embedded_chunks: 0` would tell a person on a
+    /// large first index, exactly the case `--embed` is for, that nothing
+    /// happened. It says `embed_scheduled` instead, and the count is reported
+    /// only when this call actually walked the backlog.
+    #[tokio::test]
+    async fn a_turned_away_embed_reports_scheduled_rather_than_a_zero_count() {
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let store: std::sync::Arc<tokio::sync::Mutex<dyn crystalline_index::Store>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(store));
+        let engine = std::sync::Arc::new(virtual_engine(store));
+        let embedder = std::sync::Arc::new(HeldEmbedder::new());
+        engine.set_provider(embedder.clone());
+        for i in 0..3 {
+            engine
+                .write_engram(&a_note(&format!("Note {i}")))
+                .await
+                .unwrap();
+        }
+
+        // A pass is walking the backlog, held at its first batch.
+        let pass = tokio::spawn({
+            let e = engine.clone();
+            async move { e.embed_pending().await }
+        });
+        embedder.wait_for_a_batch().await;
+        assert!(engine.embed_in_flight(), "a pass holds the gate");
+
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, true, &mut data).await;
+        assert_eq!(
+            data["embed_scheduled"], true,
+            "the running pass covers this request: {data}"
+        );
+        assert!(
+            data.get("embedded_chunks").is_none(),
+            "and no count is reported for work another pass is doing: {data}"
+        );
+
+        // Let the pass finish, then a request that really does walk the backlog
+        // reports its count and no schedule flag.
+        embedder.open();
+        pass.await.unwrap().unwrap();
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, true, &mut data).await;
+        assert_eq!(
+            data["embedded_chunks"], 0,
+            "the backlog was drained by the pass: {data}"
+        );
+        assert!(
+            data.get("embed_scheduled").is_none(),
+            "nothing was folded into another pass: {data}"
+        );
+
+        // A pass that embeds reports the count it embedded.
+        engine.write_engram(&a_note("Note 3")).await.unwrap();
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, true, &mut data).await;
+        assert_eq!(data["embedded_chunks"], 1, "{data}");
+
+        // And `embed: false` writes no embed field at all.
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, false, &mut data).await;
+        assert!(data.get("embedded_chunks").is_none(), "{data}");
+        assert!(data.get("embed_scheduled").is_none(), "{data}");
     }
 }
