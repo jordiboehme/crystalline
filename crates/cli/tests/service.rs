@@ -1442,8 +1442,9 @@ fn an_exposure_flag_that_contradicts_configuration_says_so() {
         "it names what the flag asked for: {notice}"
     );
     assert!(
-        notice.contains("off"),
-        "and what configuration says: {notice}"
+        notice.contains("service.http says no HTTP endpoint"),
+        "and what configuration says, as the absence it is rather than a value \
+         the other daemons bind: {notice}"
     );
     assert!(
         notice.contains("crystalline config set service.http"),

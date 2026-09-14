@@ -205,7 +205,7 @@ pub async fn run_serve(
         let set_value = http_addr.clone().unwrap_or_else(|| "false".to_string());
         if let Some(line) = exposure_override_notice(
             "service.http",
-            "binds",
+            &http_clause(http_addr.as_ref()),
             "binds",
             &from_flag,
             &from_config,
@@ -218,7 +218,7 @@ pub async fn run_serve(
         let from_config = describe_hosts(&resolve_allowed_hosts(&[], &loaded.effective));
         if let Some(line) = exposure_override_notice(
             "service.allowed_hosts",
-            "accepts the Host values",
+            &format!("accepts the Host values {}", describe_hosts(&allowed_hosts)),
             "accepts",
             &describe_hosts(&allowed_hosts),
             &from_config,
@@ -1779,28 +1779,72 @@ const ORPHAN_GRACE_DAYS: i64 = 7;
 /// [`ORPHAN_SWEEP`]. Silent on a pass that collects nothing - the engine logs
 /// one line per collection - and a failed pass is a warning, never fatal: the
 /// next tick tries again.
+///
+/// A pass that collected nothing *by declining* is the one other thing worth
+/// saying out loud, once. The engine declines when the configuration file
+/// cannot be read, and a container configured entirely through
+/// `CRYSTALLINE_DOMAIN_*` has no such file at all: there the sweep is inert
+/// for the life of the process, and nothing says so short of somebody running
+/// `doctor`. A read-only instance declines the removal half the same way, and
+/// is told the same once. Once, because the alternative is the same sentence
+/// every hour about a state that cannot change while the process runs.
 pub async fn run_orphan_sweep(
     engine: Arc<Engine>,
     cadence: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(cadence);
+    // The task's flag rather than a process-wide static: a daemon runs exactly
+    // one sweep task, so this is once per process where it matters, and a test
+    // that drives several sweeps still sees each one say its piece.
+    let said = AtomicBool::new(false);
     loop {
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
-                if let Err(err) = engine
+                match engine
                     .collect_orphaned_domains(
                         Some(chrono::Duration::days(ORPHAN_GRACE_DAYS)),
                         false,
                     )
                     .await
                 {
-                    tracing::warn!("the orphaned-row sweep failed: {err}");
+                    Ok(report) => {
+                        if let Some(why) = declined_sweep(&report) {
+                            let line =
+                                format!("the orphaned-row sweep collected nothing: {why}");
+                            if first_time(&said) {
+                                tracing::warn!("{line}");
+                            } else {
+                                tracing::debug!("{line}");
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!("the orphaned-row sweep failed: {err}"),
                 }
             }
         }
     }
+}
+
+/// Why a sweep pass declined, or `None` for a pass that ran.
+///
+/// The engine says so in the report's `skipped` sentence rather than in an
+/// error, because declining is not a failure: a caller asking what is
+/// collectable still gets an answer. Read through one function so the key this
+/// depends on is named in one place.
+fn declined_sweep(report: &Value) -> Option<&str> {
+    report.get("skipped").and_then(Value::as_str)
+}
+
+/// Whether this is the first time the flag has been asked, flipping it as it
+/// answers.
+///
+/// A [`std::sync::Once`] would say the same thing and could never be asked
+/// twice in one test process, which is the whole of what there is to check
+/// here: the first caller gets the warning and every later one does not.
+fn first_time(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
 }
 
 // --- shutdown + watcher helpers ---------------------------------------------
@@ -2117,13 +2161,16 @@ fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> 
 /// One template, two keys, so the verb comes from the caller: an address is
 /// *bound* and a `Host` allow-list is *accepted*, and a line that told an
 /// operator their serve "binds muthur.lan" would be describing something the
-/// daemon does not do. `verb_phrase` opens the sentence ("binds", "accepts the
-/// Host values") and `verb` repeats it for the other daemons ("binds",
-/// "accepts"); the repo's own wording for an allow-list lives in
-/// `lock_held_message`, in `instance.rs`.
+/// daemon does not do. `asked` is the whole opening clause, verb included
+/// ("binds 0.0.0.0:7411", "turns the HTTP endpoint off", "accepts the Host
+/// values muthur.lan"), because one value does not take the key's verb at all:
+/// `--http off` asks for no endpoint, and "binds off" describes nothing. `verb`
+/// repeats the key's verb for the other daemons ("binds", "accepts"); the
+/// repo's own wording for an allow-list lives in `lock_held_message`, in
+/// `instance.rs`.
 fn exposure_override_notice(
     key: &str,
-    verb_phrase: &str,
+    asked: &str,
     verb: &str,
     from_flag: &str,
     from_config: &str,
@@ -2131,20 +2178,32 @@ fn exposure_override_notice(
 ) -> Option<String> {
     (from_flag != from_config).then(|| {
         format!(
-            "this serve {verb_phrase} {from_flag} because a flag asked for it, for this \
-             invocation only. {key} says {from_config}, and that is what every other daemon on \
-             this machine {verb}, including one a connecting agent starts. Make it the machine's \
-             answer with: crystalline config set {key} {set_value}"
+            "this serve {asked} because a flag asked for it, for this invocation only. {key} says \
+             {from_config}, and that is what every other daemon on this machine {verb}, including \
+             one a connecting agent starts. Make it the machine's answer with: crystalline config \
+             set {key} {set_value}"
         )
     })
 }
 
-/// Render an HTTP resolution for the notice above: an address, or the word
-/// for a closed endpoint.
+/// Render an HTTP resolution for the notice above: an address, or the words
+/// for a closed endpoint. Not the bare word "off", which reads as a value the
+/// other daemons bind ("that is what every other daemon on this machine
+/// binds") rather than as the absence it is.
 fn describe_http(resolved: Option<&String>) -> String {
     resolved
         .map(|a| a.to_string())
-        .unwrap_or_else(|| "off".to_string())
+        .unwrap_or_else(|| "no HTTP endpoint".to_string())
+}
+
+/// What this invocation did about the endpoint, as the clause that opens the
+/// notice. An address is bound; a closed endpoint is turned off, because
+/// nothing is bound when there is no endpoint to bind.
+fn http_clause(resolved: Option<&String>) -> String {
+    match resolved {
+        Some(addr) => format!("binds {addr}"),
+        None => "turns the HTTP endpoint off".to_string(),
+    }
 }
 
 /// Render a `Host` allow-list for the notice above. Empty is loopback only,
@@ -2509,6 +2568,85 @@ mod tests {
         assert!(resolve_allowed_hosts(&[], &config).is_empty());
     }
 
+    /// The sweep says a declined pass once and then stops saying it: an
+    /// environment-only container declines every pass for the life of the
+    /// process, and an hourly warning about a state that cannot change is
+    /// noise rather than news.
+    #[test]
+    fn a_declined_sweep_is_announced_once_and_then_kept_quiet() {
+        let said = AtomicBool::new(false);
+        assert!(first_time(&said), "the first pass warns");
+        assert!(!first_time(&said), "the second does not");
+        assert!(!first_time(&said), "and neither does any after it");
+    }
+
+    /// What the sweep reads to know a pass declined, and what it reads on a
+    /// pass that ran: the engine states the reason in words, and there is no
+    /// reason at all when there is nothing to explain.
+    #[test]
+    fn a_declined_sweep_is_read_from_the_reason_the_engine_gave() {
+        let declined = serde_json::json!({
+            "stamped": 0,
+            "collected": [],
+            "skipped": "the configuration could not be read",
+        });
+        assert_eq!(
+            declined_sweep(&declined),
+            Some("the configuration could not be read")
+        );
+        let ran = serde_json::json!({ "stamped": 3, "collected": [] });
+        assert_eq!(
+            declined_sweep(&ran),
+            None,
+            "a pass that ran explains nothing"
+        );
+    }
+
+    /// `--http off` asks for no endpoint, and nothing is bound when there is
+    /// no endpoint to bind. The old line said "this serve binds off", which
+    /// describes nothing a daemon does; the value has to carry its own verb
+    /// wherever it appears in the sentence.
+    #[test]
+    fn exposure_override_notice_turns_the_endpoint_off_rather_than_binding_off() {
+        let line = exposure_override_notice(
+            "service.http",
+            &http_clause(None),
+            "binds",
+            &describe_http(None),
+            "127.0.0.1:7411",
+            "false",
+        )
+        .expect("a difference is worth a line");
+        assert!(
+            line.contains("this serve turns the HTTP endpoint off"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("binds off"),
+            "nothing anywhere in the line binds a value that is an absence: {line}"
+        );
+        assert!(
+            line.contains("crystalline config set service.http false"),
+            "and the command is the one that writes that down: {line}"
+        );
+
+        // The other direction: configuration is the side that is off.
+        let reverse = exposure_override_notice(
+            "service.http",
+            &http_clause(Some(&"0.0.0.0:7411".to_string())),
+            "binds",
+            "0.0.0.0:7411",
+            &describe_http(None),
+            "0.0.0.0:7411",
+        )
+        .expect("a difference is worth a line");
+        assert!(
+            reverse.contains("service.http says no HTTP endpoint"),
+            "an absent endpoint is named as one on that side too: {reverse}"
+        );
+        assert!(!reverse.contains("binds off"), "{reverse}");
+    }
+
     /// A flag that asks for exactly what configuration already says is not an
     /// override, and a line about it would be noise on every container start.
     #[test]
@@ -2516,7 +2654,7 @@ mod tests {
         assert_eq!(
             exposure_override_notice(
                 "service.http",
-                "binds",
+                "binds 127.0.0.1:7411",
                 "binds",
                 "127.0.0.1:7411",
                 "127.0.0.1:7411",
@@ -2533,7 +2671,7 @@ mod tests {
     fn exposure_override_notice_names_both_values_and_the_key() {
         let line = exposure_override_notice(
             "service.http",
-            "binds",
+            "binds 0.0.0.0:7411",
             "binds",
             "0.0.0.0:7411",
             "127.0.0.1:7411",
@@ -2563,7 +2701,7 @@ mod tests {
     fn exposure_override_notice_uses_the_settable_spelling_for_the_allow_list() {
         let line = exposure_override_notice(
             "service.allowed_hosts",
-            "accepts the Host values",
+            "accepts the Host values muthur.lan, host.docker.internal",
             "accepts",
             "muthur.lan, host.docker.internal",
             "loopback only",
