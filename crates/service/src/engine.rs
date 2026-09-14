@@ -10535,8 +10535,10 @@ impl Engine {
             "engrams_removed": engrams_removed,
         });
         if self.read_only {
-            report["skipped"] =
-                json!("this instance is read-only; nothing was stamped and nothing collected");
+            report["skipped"] = json!(
+                "this instance is read-only; the registered domains were stamped and nothing \
+                 was collected"
+            );
         }
         Ok(report)
     }

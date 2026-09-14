@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
+use crystalline_core::config::{self, DatabaseBackend, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
@@ -459,8 +459,13 @@ pub struct OrphanedDomainDoctor {
     pub collectable: bool,
     /// Whether this run actually collected them.
     pub collected: bool,
-    /// Why a row that was kept was kept, one of `virtual` or `read_only` on
-    /// this path. `None` when it was collected or would be.
+    /// Why a row that was kept was kept, in the engine's own word:
+    /// `virtual`, `no_rows`, `grace`, `unstamped`, `read_only` or
+    /// `hosted_elsewhere`. `None` when it was collected or would be. Only
+    /// `virtual`, `read_only` and `hosted_elsewhere` can reach a `doctor`
+    /// run, which asks on the on-demand path and consults no stamp, but the
+    /// word is carried verbatim rather than narrowed: the render reads it
+    /// through [`KeptReason`], whose vocabulary is the whole of the engine's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kept: Option<String>,
 }
@@ -482,6 +487,50 @@ pub struct OrphanedRowsDoctor {
     /// cannot be shown absent from a file nobody can read).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+    /// What went wrong when the check could not be made at all: the daemon
+    /// refused the request, or the index failed under it. Reported rather
+    /// than swallowed, because an empty section and a section that could not
+    /// be filled look identical to a reader and mean opposite things.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The engine's word for why a kept row was kept, as a closed set.
+///
+/// The render matches this exhaustively, so a word added here without a line
+/// to print for it does not compile. A word the engine grows and this build
+/// does not know parses as `None` and gets a sentence that stays true whatever
+/// it turns out to mean - the one thing a render must never do is assert
+/// something about a reason it cannot read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptReason {
+    /// A virtual domain's rows are its only copy.
+    Virtual,
+    /// Nothing left to collect.
+    NoRows,
+    /// Absent from the configuration, but not for long enough yet.
+    Grace,
+    /// Absent, and never recorded as registered, so its clock starts now.
+    Unstamped,
+    /// This instance is read-only.
+    ReadOnly,
+    /// Another instance holds this domain's host lock and is still serving it.
+    HostedElsewhere,
+}
+
+impl KeptReason {
+    /// The engine's word, or `None` for one this build does not know.
+    fn from_word(word: &str) -> Option<KeptReason> {
+        match word {
+            "virtual" => Some(KeptReason::Virtual),
+            "no_rows" => Some(KeptReason::NoRows),
+            "grace" => Some(KeptReason::Grace),
+            "unstamped" => Some(KeptReason::Unstamped),
+            "read_only" => Some(KeptReason::ReadOnly),
+            "hosted_elsewhere" => Some(KeptReason::HostedElsewhere),
+            _ => None,
+        }
+    }
 }
 
 /// Advisory tag-hygiene diagnostics: near-duplicate tag clusters across the
@@ -639,8 +688,15 @@ pub async fn run(
     // it while doctor holds its own handle (and its own lock, taken a few
     // lines below and held to the end of the pass) would be a second opener
     // of the same file waiting on the first.
-    let orphaned_rows =
-        check_orphaned_rows(domain_filter, fix, config_override, db_override, &db).await;
+    let orphaned_rows = check_orphaned_rows(
+        domain_filter,
+        fix,
+        config_override,
+        db_override,
+        &db,
+        cfg.database().backend,
+    )
+    .await;
 
     // The index read, socket-first, in the same shape `sync_dispatch` uses. A
     // healthy daemon holds the index file, so asking it for the stamps is the
@@ -748,6 +804,7 @@ async fn check_orphaned_rows(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
     db: &Path,
+    backend: DatabaseBackend,
 ) -> Option<OrphanedRowsDoctor> {
     // A `--domain` run answers about the domain it names, and an unregistered
     // one can never be that: `select_domains` resolves registered names only.
@@ -755,14 +812,31 @@ async fn check_orphaned_rows(
     if domain_filter.is_some() {
         return None;
     }
-    // No index file: on a machine that has never synced there is nothing to
-    // read, and the direct route would create the file to find that out.
-    if !db.is_file() {
+    let daemon_may_answer = crystalline_service::use_daemon(db_override, config_override)
+        && instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
+    if !orphan_check_has_a_route(
+        daemon_may_answer,
+        matches!(backend, DatabaseBackend::Turso),
+        db.is_file(),
+    ) {
         return None;
     }
-    let report = crystalline_service::collect_orphaned_domains(!fix, db_override, config_override)
-        .await
-        .ok()?;
+    let report =
+        match crystalline_service::collect_orphaned_domains(!fix, db_override, config_override)
+            .await
+        {
+            Ok(report) => report,
+            // Said out loud rather than dropped. A daemon that refused the
+            // request and an index that failed under it both land here, and
+            // an absent section would be indistinguishable from a machine
+            // with nothing to report.
+            Err(e) => {
+                return Some(OrphanedRowsDoctor {
+                    error: Some(format!("{e:#}")),
+                    ..OrphanedRowsDoctor::default()
+                });
+            }
+        };
     let dry_run = report.get("dry_run").and_then(serde_json::Value::as_bool) != Some(false);
     let mut domains = Vec::new();
     for row in report
@@ -809,7 +883,21 @@ async fn check_orphaned_rows(
             .get("skipped")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        error: None,
     })
+}
+
+/// Whether the orphan check has any route to the index worth trying.
+///
+/// The file question is the narrow one it looks like: a Turso install that has
+/// never synced has no index file, and the direct route would create an empty
+/// one to discover that a machine with no knowledge in it has no orphaned
+/// rows. It says nothing about the other two shapes. A daemon answers over its
+/// socket whatever backend it serves, and a Postgres install keeps its index
+/// in a server rather than in that file, so gating either on the file would
+/// suppress the section on an install that has plenty to report.
+fn orphan_check_has_a_route(daemon_may_answer: bool, file_backed: bool, db_exists: bool) -> bool {
+    daemon_may_answer || !file_backed || db_exists
 }
 
 /// The per-domain file stamps a running daemon serves over its ctl socket,
@@ -1808,46 +1896,30 @@ pub fn render_human(report: &DoctorReport) -> String {
     // from them: an "orphan row" there is one indexed file whose file is
     // gone, and these are whole domains. The one thing every line must say is
     // what 0.17.0's message did not, which is that the rows answer nothing
-    // any more and that there is a proportionate way to end them.
-    if let Some(o) = &report.orphaned_rows
-        && (!o.domains.is_empty() || o.skipped.is_some())
-    {
-        let _ = writeln!(out, "domains no longer registered:");
-        for d in &o.domains {
-            let age = match d.age_days {
-                Some(days) => format!("last seen registered {days} day(s) ago"),
-                // Not an age of zero: an index inherited from a version that
-                // never recorded a registration has no evidence either way.
-                None => "never seen registered by this version".to_string(),
-            };
-            if d.collected {
-                let _ = writeln!(
-                    out,
-                    "  collected {} engram row(s) of '{}' ({age}); the files on disk are untouched",
-                    d.engrams, d.name
-                );
-            } else if d.collectable {
-                let _ = writeln!(
-                    out,
-                    "  [problem] {}: {} engram row(s), {age}. They are not served any more and will be collected; to clear them now run: crystalline doctor --fix",
-                    d.name, d.engrams
-                );
-            } else if d.kept.as_deref() == Some("virtual") {
-                let _ = writeln!(
-                    out,
-                    "  {}: {} engram row(s) in a virtual domain, {age}. They are not served any more, and a virtual domain's rows are its only copy, so nothing collects them on its own: end it with `crystalline domain remove {} --purge`, which asks first",
-                    d.name, d.engrams, d.name
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "  {}: {} engram row(s), {age}. They are not served any more and will be collected",
-                    d.name, d.engrams
-                );
+    // any more and that there is a proportionate way to end them - and the
+    // one thing no line may do is promise a collection that will not happen,
+    // which is why the kept reasons are matched rather than defaulted.
+    if let Some(o) = &report.orphaned_rows {
+        if let Some(err) = &o.error {
+            // A header naming domains would claim the check found some.
+            let _ = writeln!(out, "rows whose domain is gone:");
+            let _ = writeln!(out, "  not checked: {err}");
+        } else if o.domains.is_empty() {
+            // Nothing was considered, so nothing may be called deregistered:
+            // an unreadable configuration is exactly the state in which no
+            // domain can be shown absent from anything.
+            if let Some(skipped) = &o.skipped {
+                let _ = writeln!(out, "rows whose domain is gone:");
+                let _ = writeln!(out, "  not checked: {skipped}");
             }
-        }
-        if let Some(skipped) = &o.skipped {
-            let _ = writeln!(out, "  nothing was collected: {skipped}");
+        } else {
+            let _ = writeln!(out, "domains no longer registered:");
+            for d in &o.domains {
+                let _ = writeln!(out, "{}", orphaned_domain_line(d));
+            }
+            if let Some(skipped) = &o.skipped {
+                let _ = writeln!(out, "  nothing was collected: {skipped}");
+            }
         }
     }
 
@@ -2151,6 +2223,68 @@ pub fn render_human(report: &DoctorReport) -> String {
 /// artifacts"` when empty - the doctor-local twin of `cmd::format_counts`,
 /// operating on the typed map `provision::status` returns rather than a JSON
 /// value.
+/// One line for one domain the index holds rows for and nobody registers.
+///
+/// Every branch is written to stay true of the state it describes: only a row
+/// something will actually collect is promised a collection, and a reason this
+/// build cannot read gets a sentence that asserts nothing about it.
+fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
+    let name = &d.name;
+    let engrams = d.engrams;
+    let age = match d.age_days {
+        Some(days) => format!("last seen registered {days} day(s) ago"),
+        // Not an age of zero: an index inherited from a version that never
+        // recorded a registration has no evidence either way.
+        None => "never seen registered by this version".to_string(),
+    };
+    if d.collected {
+        return format!(
+            "  collected {engrams} engram row(s) of '{name}' ({age}); the files on disk are untouched"
+        );
+    }
+    if d.collectable {
+        return format!(
+            "  [problem] {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected; to clear them now run: crystalline doctor --fix"
+        );
+    }
+    match d.kept.as_deref().and_then(KeptReason::from_word) {
+        Some(KeptReason::Virtual) => format!(
+            "  {name}: {engrams} engram row(s) in a virtual domain, {age}. They are not served any more, and a virtual domain's rows are its only copy, so nothing collects them on its own: end it with `crystalline domain remove {name} --purge`, which asks first"
+        ),
+        // The live peer is serving these rows. Nothing here will ever collect
+        // them, on either path, so nothing here may say it will.
+        Some(KeptReason::HostedElsewhere) => format!(
+            "  {name}: {engrams} engram row(s), {age}. Another instance hosts this domain over the shared database and is still serving those rows, so they are not this instance's to collect"
+        ),
+        // A read-only instance collects nothing at all. The skipped line below
+        // says the same thing about the run; this says it about the rows,
+        // without promising a collection that needs a writable instance.
+        Some(KeptReason::ReadOnly) => format!(
+            "  {name}: {engrams} engram row(s), {age}. This instance is read-only and collects nothing: they stay until a writable instance sweeps them, or until `crystalline doctor --fix` is run against one"
+        ),
+        // Neither reaches a `doctor` run (both need a grace period, and both
+        // doctor routes ask on the on-demand path), but both are honest about
+        // a domain that is only waiting.
+        Some(KeptReason::Grace) | Some(KeptReason::Unstamped) => format!(
+            "  {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected"
+        ),
+        // Filtered out before the render; a line that claims nothing is the
+        // right answer if one ever arrives here anyway.
+        Some(KeptReason::NoRows) => {
+            format!("  {name}: no engram rows left, {age}. There is nothing here to collect")
+        }
+        // A reason this build does not know. Say only what is true of every
+        // kept row: this instance is not serving them and is not collecting
+        // them, and name the word so the reader can look it up.
+        None => {
+            let word = d.kept.as_deref().unwrap_or("no reason given");
+            format!(
+                "  {name}: {engrams} engram row(s), {age}. They are not served any more, and this instance is not collecting them ({word})"
+            )
+        }
+    }
+}
+
 fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
     if counts.is_empty() {
         return "no artifacts".to_string();
@@ -2445,7 +2579,11 @@ mod tests {
         fix: bool,
     ) -> DoctorReport {
         DoctorReport {
-            orphaned_rows: Some(OrphanedRowsDoctor { domains, skipped }),
+            orphaned_rows: Some(OrphanedRowsDoctor {
+                domains,
+                skipped,
+                error: None,
+            }),
             fix,
             ..DoctorReport::default()
         }
@@ -2548,16 +2686,153 @@ mod tests {
         let report = orphan_report(
             vec![row],
             Some(
-                "this instance is read-only; nothing was stamped and nothing collected".to_string(),
+                "this instance is read-only; the registered domains were stamped and nothing was \
+                 collected"
+                    .to_string(),
             ),
             false,
         );
         let out = render_human(&report);
         assert!(out.contains("gone: 30 engram row(s)"), "{out}");
         assert!(
+            out.contains("This instance is read-only and collects nothing"),
+            "the row says what will happen to it: {out}"
+        );
+        assert!(
+            out.contains("until a writable instance sweeps them")
+                && out.contains("`crystalline doctor --fix` is run against one"),
+            "and where a collection can be had: {out}"
+        );
+        assert!(
+            !out.contains("will be collected;"),
+            "never a collection this instance will not make: {out}"
+        );
+        assert!(
             out.contains("nothing was collected: this instance is read-only"),
-            "{out}"
+            "and the run's own line agrees with the row's: {out}"
         );
         assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A domain another instance hosts over a shared database is being served
+    /// by that instance right now, and the engine guards its rows on both
+    /// paths, so the two things the old fallthrough said about it - not served,
+    /// and due for collection - were both false.
+    #[test]
+    fn a_domain_hosted_by_another_instance_is_its_peers_to_serve() {
+        let row = OrphanedDomainDoctor {
+            collectable: false,
+            kept: Some("hosted_elsewhere".to_string()),
+            ..orphan("shared", 30, Some(13))
+        };
+        let report = orphan_report(vec![row], None, false);
+        let out = render_human(&report);
+        assert!(
+            out.contains("Another instance hosts this domain over the shared database"),
+            "the reason is named: {out}"
+        );
+        assert!(
+            out.contains("not this instance's to collect"),
+            "and the consequence: {out}"
+        );
+        assert!(
+            !out.contains("will be collected"),
+            "nothing promises a collection that will never happen: {out}"
+        );
+        assert!(
+            !out.contains("not served any more"),
+            "and nothing claims the peer stopped serving them: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A reason this build does not know must not borrow the sentence of one
+    /// it does. The line says only what is true of every kept row and names
+    /// the word.
+    #[test]
+    fn a_kept_reason_this_build_does_not_know_claims_nothing() {
+        let row = OrphanedDomainDoctor {
+            collectable: false,
+            kept: Some("some_future_reason".to_string()),
+            ..orphan("gone", 30, Some(13))
+        };
+        let out = render_human(&orphan_report(vec![row], None, false));
+        assert!(
+            out.contains("this instance is not collecting them (some_future_reason)"),
+            "{out}"
+        );
+        assert!(!out.contains("will be collected"), "{out}");
+    }
+
+    /// The state Task 3 left for a container configured entirely by
+    /// environment variables: nothing could be considered, so nothing may be
+    /// called deregistered.
+    #[test]
+    fn an_unreadable_configuration_is_not_reported_as_a_deregistration() {
+        let report = orphan_report(
+            Vec::new(),
+            Some(
+                "the configuration could not be read, and a domain cannot be shown absent from a \
+                 file nobody can read; nothing was stamped and nothing collected"
+                    .to_string(),
+            ),
+            false,
+        );
+        let out = render_human(&report);
+        assert!(
+            !out.contains("domains no longer registered"),
+            "a header that asserts a deregistration nobody established: {out}"
+        );
+        assert!(
+            out.contains("not checked: the configuration could not be read"),
+            "the reader is told why instead: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A daemon that refused the request, or an index that failed under it,
+    /// reads as a check that did not happen rather than as a clean bill.
+    #[test]
+    fn an_engine_failure_is_said_out_loud_rather_than_left_blank() {
+        let report = DoctorReport {
+            orphaned_rows: Some(OrphanedRowsDoctor {
+                error: Some("unknown ctl command 'collect_orphaned_domains'".to_string()),
+                ..OrphanedRowsDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("not checked: unknown ctl command"),
+            "the failure is in the report: {out}"
+        );
+        assert!(
+            !out.contains("domains no longer registered"),
+            "and it claims nothing about what is there: {out}"
+        );
+    }
+
+    /// The route gate is a question about a Turso file, and only a Turso file.
+    /// A Postgres install keeps its index in a server and a daemon answers
+    /// over a socket, so gating either on that file suppressed the section on
+    /// an install with plenty to report.
+    #[test]
+    fn the_route_gate_only_asks_about_a_turso_file() {
+        // Turso, no daemon: the file is the whole question.
+        assert!(orphan_check_has_a_route(false, true, true));
+        assert!(
+            !orphan_check_has_a_route(false, true, false),
+            "a machine that never synced is not given an index to prove it has no orphans"
+        );
+        // Postgres, no daemon: there is no file to ask about.
+        assert!(
+            orphan_check_has_a_route(false, false, false),
+            "a Postgres install is checked over its own backend"
+        );
+        // A daemon answers whatever it serves.
+        assert!(
+            orphan_check_has_a_route(true, true, false),
+            "a daemon answers over its socket, file or no file"
+        );
     }
 }
