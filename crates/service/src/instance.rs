@@ -1304,6 +1304,16 @@ pub fn lock_held_message(intent: Option<&ServeIntent>, holder: Option<&LockInfo>
     format!("{asked}{hosts_asked}, but {held}. {remedy}")
 }
 
+/// The sentence an overridden command owes for taking the direct path:
+/// `--db` or `--config` named an exact config and index the daemon may not
+/// serve, so it read the file itself rather than asking. `status` prints this
+/// on stdout as its report (behind the `Daemon: ` label every one of its
+/// notes carries); every standalone fallback in [`crate::client`] prints it
+/// on stderr instead, since an empty answer from the wrong index must never
+/// read as a genuine miss. One constant so the two crates say it the same
+/// way.
+pub const BYPASS_NOTE: &str = "bypassed (--db/--config override); reading the index directly";
+
 /// Why the index could not be reached, in words a person can act on, with the
 /// holder looked up here.
 ///

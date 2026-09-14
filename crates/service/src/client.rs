@@ -693,6 +693,11 @@ where
 /// CLI's own opener already uses (`cmd::reach_index`), so the same state reads
 /// the same way whichever crate happened to open the index. The backend's own
 /// words are kept, last, inside it: nothing is hidden, it just stops leading.
+///
+/// An override that took this path at all - whether the open below succeeds
+/// or fails - gets [`crate::instance::BYPASS_NOTE`] on stderr first, the same
+/// sentence `status` prints for a bypass: a read verb's empty answer from a
+/// deliberately different index must never be mistaken for a genuine miss.
 async fn open_standalone_reporting(
     loaded: overlay::LoadedConfig,
     db_path: &Path,
@@ -712,6 +717,9 @@ async fn open_standalone_reporting(
     // An explicit --db or --config never asked the daemon in the first place,
     // which changes the remedy rather than the diagnosis.
     let bypassed = !use_daemon(db, config_path);
+    if bypassed {
+        eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
+    }
     open_standalone(loaded, db_path, want_embeddings)
         .await
         .map_err(|e| {

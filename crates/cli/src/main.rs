@@ -1836,7 +1836,7 @@ async fn status_dispatch(
         }
     }
     let note = if bypassed {
-        "bypassed (--db/--config override); reading the index directly"
+        crystalline_service::instance::BYPASS_NOTE
     } else {
         "not running; reading the index directly"
     };

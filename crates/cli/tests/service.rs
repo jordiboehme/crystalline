@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -236,6 +236,33 @@ impl Mcp {
         cmd.env("CRYSTALLINE_SERVICE_READ_ONLY", "true");
         cmd.arg("mcp");
         cmd.arg("--config").arg(env.config_path());
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Mcp {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
+    /// Spawn an `mcp` daemon that owns a config and index other than the
+    /// environment's own defaults, `--db` given ahead of the subcommand the
+    /// way the global flag is placed, `--config` after it. Used to prove a
+    /// bypassing command reads the untouched default index rather than
+    /// colliding with a daemon that never held it in the first place.
+    fn spawn_with_db(env: &Env, config: &Path, db: &Path) -> Mcp {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.arg("--db").arg(db);
+        cmd.arg("mcp");
+        cmd.arg("--config").arg(config);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1094,6 +1121,132 @@ fn explicit_overrides_bypass_a_running_daemon() {
         hits["total"].as_u64().unwrap_or(0),
         0,
         "the daemon's index holds none of the side domain's content: {hits}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A data verb that took the direct path because of `--db`/`--config` says so
+/// on stderr, the same sentence `status` prints for the same reason
+/// (`status_with_an_override_says_bypassed`), so an empty answer from the
+/// wrong index is never mistaken for a genuine miss - field finding 3.
+///
+/// The daemon here owns a separate config and index of its own, never the
+/// plain default: `search --config <other>` (no `--db`) then reads that
+/// untouched default directly, which is empty rather than locked, so the
+/// command succeeds and the note is the only sign anything was bypassed.
+/// `--json` carries no such note; its stdout is the same empty result either
+/// way.
+#[test]
+fn search_with_an_override_notes_the_bypass_on_stderr() {
+    let env = Env::new("search-bypass-note");
+
+    let side_db = env.dir.join("side.db");
+    let side_config = env.dir.join("side.yaml");
+    let side_domain = env.dir.join("kb-side");
+    std::fs::create_dir_all(&side_domain).unwrap();
+    std::fs::write(
+        side_domain.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: side\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# side\n\n## Scope\n\n- side\n\n## When to Use\n\n- Route here for side\n",
+    )
+    .unwrap();
+    std::fs::write(
+        side_domain.join("seed.md"),
+        "---\ntype: engram\ntitle: Seed\npermalink: seed\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nseed body token\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let ok = cmd
+        .arg("--db")
+        .arg(&side_db)
+        .arg("domain")
+        .arg("add")
+        .arg("side")
+        .arg(&side_domain)
+        .arg("--config")
+        .arg(&side_config)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "domain add into the side config/index");
+
+    // The daemon serves that side index, never the plain default one that
+    // `search --config <other>` (no `--db`) is about to read directly.
+    let mut c1 = Mcp::spawn_with_db(&env, &side_config, &side_db);
+    c1.initialize();
+
+    let other_config = env.dir.join("other.yaml");
+    let (ok, stdout, stderr) =
+        env.run_full(&["search", "seed", "--config", other_config.to_str().unwrap()]);
+    assert!(ok, "search --config <other> must succeed: {stderr}");
+    assert_eq!(stdout, "no results\n", "stdout carries no daemon note");
+    assert!(
+        stderr.contains("Daemon: bypassed (--db/--config override); reading the index directly"),
+        "the same sentence status prints for a bypass: {stderr}"
+    );
+
+    let (ok, json_stdout) = env.run(&[
+        "--json",
+        "search",
+        "seed",
+        "--config",
+        other_config.to_str().unwrap(),
+    ]);
+    assert!(ok, "search --json --config <other> must succeed");
+    assert_eq!(
+        json_stdout,
+        "{\"count\":0,\"hits\":[],\"limit\":10,\"mode\":\"text\",\"page\":1,\"total\":0}\n",
+        "--json stdout is byte-identical to today"
+    );
+
+    drop(c1);
+    let _ = Command::new(bin())
+        .args(["--db"])
+        .arg(&side_db)
+        .arg("ctl")
+        .arg("shutdown")
+        .output();
+}
+
+/// A `--db` client pointed straight at a daemon's own index meets the same
+/// named-holder composer the non-override standalone fallback already uses
+/// (`search_names_the_daemon_and_the_remedy_when_the_index_cannot_be_opened`),
+/// never the raw backend lock text leading - field finding 5.
+#[test]
+fn search_with_a_db_override_names_the_holder_on_a_held_lock() {
+    let env = Env::new("search-db-override-locked");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+    let pid = env.lock_pid().expect("the daemon published its pid");
+
+    let db = env.state_dir().join("index.db");
+    let (ok, stdout, stderr) = env.run_full(&["search", "seed", "--db", db.to_str().unwrap()]);
+    assert!(
+        !ok,
+        "a --db pointed at the daemon's own held index must fail: {stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("(pid {pid})")),
+        "the holder is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("--db or --config"),
+        "the override remedy is given: {stderr}"
+    );
+    let holder_at = stderr
+        .find("owns the index at")
+        .unwrap_or_else(|| panic!("the holder is named: {stderr}"));
+    let raw_at = stderr
+        .find("The index reported: ")
+        .unwrap_or_else(|| panic!("the backend's own words are kept: {stderr}"));
+    assert!(
+        holder_at < raw_at,
+        "the holder is named before the raw lock text, which never leads: {stderr}"
     );
 
     drop(c1);
