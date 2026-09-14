@@ -67,6 +67,10 @@ Outdated knowledge earns its place only when the outdatedness is the point: a de
 
 Engrams whose topic is inherently historical carry history as structured current content, still not as an append log: a registry row holds its current status and one last-checked value, not a per-check trail; a decision engram tracks its current lifecycle status and is superseded when replaced; a meeting note records one meeting on one date - a new meeting gets a new engram, not an update block on the old one.
 
+## Ingesting a source
+
+A source read into the knowledge earns one record engram in a `sources/` folder with `type: ingestion`, titled after the source and carrying `resource`, `source_date` where the source has one, `verified`, and a `source_version` key holding a commit, a version, a revision or a content hash - distinct from `type: source`, which holds the source's own verbatim material. Its body says what was extracted, which engrams it landed in as `[[links]]`, and what was deliberately left out and why. Before ingesting, search `type: ingestion` for the source's `resource`. If a record already exists, fetch only what changed since its `source_version`, fold each change into the linked engrams per "Reconcile in place, not as an append log", then update `source_version` and stamp `verified`. If none exists, ingest the source and write the record afterward. The record is never a change log - its body is always the current state of the relationship between the source and the knowledge it fed.
+
 ## Reuse the vocabulary
 
 Before coining a new tag, observation category or relation type, call `vocabulary` (scoped with `domain`) and reuse an existing term rather than a near-synonym. A `clusters` entry flags near-duplicate tags that drifted apart - surface it to the user rather than acting; `crystalline tags rename` and `tags merge` are CLI cleanups they can run.
