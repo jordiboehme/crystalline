@@ -8917,7 +8917,7 @@ impl Engine {
                 let snapshot = store.file_stamps(domain).await?;
                 (domain, snapshot)
             };
-            let scan = match scan_domain(name, root, snapshot, &self.chunk_params).await {
+            let scan = match scan_domain(name, root, snapshot, &self.chunk_params, false).await {
                 Ok(scan) => scan,
                 Err(e) if only.is_none() => {
                     // One denied domain must not block the rest of the
@@ -9023,12 +9023,19 @@ impl Engine {
         Ok(report)
     }
 
-    /// Reindex all file domains. `full` clears each file domain's rows first
-    /// (per-domain, not a global wipe) and resyncs from disk, so virtual-domain
-    /// rows, whose only source of truth is the database, are never destroyed. In
-    /// collaboration mode a domain hosted by another live instance is left
-    /// untouched (neither cleared nor resynced), so a non-host never rebuilds the
-    /// host's rows out from under it.
+    /// Reindex all file domains. `full` re-reads, re-parses and re-upserts every
+    /// file rather than only the ones whose modification time or size moved, and
+    /// destroys nothing on the way: each domain serves its previous complete
+    /// rows until its own rebuild commits, files gone from disk are pruned as a
+    /// sync prunes them, and a chunk whose text is unchanged keeps its
+    /// embedding. Virtual-domain rows are never touched at all - they have no
+    /// files to rebuild from. In collaboration mode a domain hosted by another
+    /// live instance is left untouched, so a non-host never rebuilds the host's
+    /// rows out from under it.
+    ///
+    /// The true wipe is not here: it needs the index file to itself, which the
+    /// daemon is holding, so it lives on the daemonless
+    /// `crystalline reindex --wipe`.
     ///
     /// The loop is [`crystalline_index::reindex_domains`], shared with the
     /// daemonless `crystalline reindex`: this side supplies only what is the

@@ -197,7 +197,9 @@ async fn concurrent_write_defers(store: &dyn Store) {
     let domain = upsert_domain(store, "d", root).await;
     let snapshot = store.file_stamps(domain).await.unwrap();
     assert!(snapshot.is_empty(), "nothing indexed yet");
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
 
     // A concurrent writer indexes the same path with different content between
     // the snapshot and the apply.
@@ -247,7 +249,9 @@ async fn concurrent_rewrite_skips_delete(store: &dyn Store) {
     std::fs::remove_file(root.join("a.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
     assert!(snapshot.contains_key("a.md"), "a.md still recorded");
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
 
     // A concurrent writer rewrites the row (a new stamp) mid-window.
     store
@@ -286,7 +290,9 @@ async fn recreated_file_skips_delete(store: &dyn Store) {
     // can catch this.
     std::fs::remove_file(root.join("a.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
     write(root, "a.md", &engram("A", "a", "recreated body"));
 
     let report = apply_scan(store, domain, scan).await.unwrap();
@@ -316,7 +322,9 @@ async fn move_with_moved_end_defers(store: &dyn Store) {
     // move.
     std::fs::rename(root.join("old.md"), root.join("new.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
 
     // A concurrent writer mutates the move's `from` end mid-window.
     store

@@ -2124,6 +2124,31 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    /// Runs on [`PostgresStore::acquire`]'s connection, which is the pinned
+    /// transaction connection when one is open - the same reason `record_sync`
+    /// does, and the reason clearing the marker inside the apply's transaction
+    /// is atomic with it here as it is on Turso.
+    async fn begin_rebuild(&self, domain: DomainId, when: &str) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET rebuild_started=$1 WHERE id=$2")
+            .bind(when)
+            .bind(domain.0)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET rebuild_started=NULL WHERE id=$1")
+            .bind(domain.0)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
     async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
         // An empty configuration is a legitimate one; stamping nothing runs no
         // statement, matching the Turso backend, where `IN ()` is a syntax
@@ -2164,7 +2189,7 @@ impl Store for PostgresStore {
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
-             d.last_registered \
+             d.last_registered, d.rebuild_started \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
         )
         .fetch_all(conn.as_mut())
@@ -2187,6 +2212,7 @@ impl Store for PostgresStore {
                 host_label: cell_text(r, 12),
                 host_heartbeat_at: cell_text(r, 13),
                 last_registered: cell_text(r, 14),
+                rebuild_started: cell_text(r, 15),
             })
             .collect())
     }

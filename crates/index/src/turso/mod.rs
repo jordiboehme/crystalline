@@ -80,7 +80,7 @@ impl TursoStore {
 
     /// Open a store, recovering from a corrupt database file by discarding it
     /// and starting fresh. Files on disk are the source of truth, so the index
-    /// is always rebuildable; this is the `reindex --full` recovery path when the
+    /// is always rebuildable; this is the `reindex --wipe` recovery path when the
     /// database will not open or fails a sanity check.
     pub async fn open_resilient(path: &Path) -> Result<TursoStore> {
         if let Ok(store) = TursoStore::open(path).await
@@ -117,7 +117,7 @@ impl TursoStore {
         //   handler (`Connection::set_busy_timeout`). Set below.
         // - wal_checkpoint(TRUNCATE): honored. In the probe it shrank a
         //   populated WAL file from over 1 MiB to 0 bytes. Used in `wipe()`
-        //   and by the CLI's `reindex --full` path (see
+        //   and by every sync and reindex (see
         //   `Store::checkpoint_wal`), covering the same need the downstream
         //   Docker image build met by shelling out to `sqlite3`.
         // - synchronous: honored (round-tripped OFF and FULL in the probe)
@@ -1867,6 +1867,26 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn begin_rebuild(&self, domain: DomainId, when: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain SET rebuild_started=?1 WHERE id=?2",
+                vec![Value::Text(when.to_string()), Value::Integer(domain.0)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain SET rebuild_started=NULL WHERE id=?1",
+                vec![Value::Integer(domain.0)],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn store_info(&self) -> Result<StoreInfo> {
         // The active full-text path in this milestone is always the candidate
         // scan. `fts_native` records the probe outcome for diagnostics; when a
@@ -1896,7 +1916,7 @@ impl Store for TursoStore {
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
-             d.last_registered \
+             d.last_registered, d.rebuild_started \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
             vec![],
         )
@@ -1918,6 +1938,7 @@ impl Store for TursoStore {
                 host_label: cell_text(r, 12),
                 host_heartbeat_at: cell_text(r, 13),
                 last_registered: cell_text(r, 14),
+                rebuild_started: cell_text(r, 15),
             })
             .collect())
     }

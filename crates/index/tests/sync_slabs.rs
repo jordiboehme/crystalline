@@ -132,7 +132,9 @@ async fn sync_with_slab(
         .await
         .unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
     let report = apply_scan_with_slab(store, domain, scan, slab_files)
         .await
         .unwrap();

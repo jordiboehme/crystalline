@@ -500,7 +500,9 @@ fn init_add_sync_status_end_to_end() {
     assert_eq!(list["domains"][0]["name"], serde_json::json!("eng"));
     assert_eq!(list["domains"][0]["engrams"], serde_json::json!(2));
 
-    // reindex --full rebuilds and still reports two engrams.
+    // reindex --full re-reads and re-upserts both engrams. They come back as
+    // updates, not additions: nothing is cleared first any more, so the rows
+    // they replace are their own previous rows rather than nothing.
     let out = bin()
         .args(["--json", "reindex", "--full", "--config"])
         .arg(&config)
@@ -510,7 +512,9 @@ fn init_add_sync_status_end_to_end() {
         .unwrap();
     assert!(out.status.success());
     let reindex: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(reindex["reports"][0]["added"], serde_json::json!(2));
+    assert_eq!(reindex["reports"][0]["updated"], serde_json::json!(2));
+    assert_eq!(reindex["reports"][0]["added"], serde_json::json!(0));
+    assert_eq!(reindex["reports"][0]["deleted"], serde_json::json!(0));
 
     // domain remove drops it from the config but leaves files.
     bin()
@@ -987,5 +991,196 @@ fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
     assert!(
         source_content.contains("- [decision] Run the coolant loop on glycol mix B"),
         "{source_content}"
+    );
+}
+
+/// The marker outlives the process that set it, which is the whole reason it is
+/// a column rather than an in-memory activity record: the incident was a
+/// daemonless `reindex --full` killed partway, and nothing in that process was
+/// left to say so.
+///
+/// A second domain whose folder has gone makes the run fail after it stamped
+/// that domain and before its rebuild could commit - the same window a SIGTERM
+/// lands in. Afterwards a fresh `status` process reads the stamp off disk and
+/// says the rebuild never finished, while the domain's rows are still all
+/// there.
+#[test]
+fn an_interrupted_full_reindex_leaves_a_marker_a_later_status_reports() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    // A second domain, so the run has something to fail on after a first
+    // domain has already finished its rebuild cleanly.
+    let second = work.path().join("kb2");
+    bin()
+        .args(["domain", "init"])
+        .arg(&second)
+        .args(["--name", "two"])
+        .assert()
+        .success();
+    write(
+        &second,
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nGamma body mentions zephyrtoken.\n",
+    );
+    bin()
+        .args(["domain", "add", "two"])
+        .arg(&second)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    // The interruption: the second domain cannot be scanned any more.
+    std::fs::remove_dir_all(&second).unwrap();
+    let out = bin()
+        .args(["reindex", "--full", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the interrupted run fails");
+
+    // A new process, reading the stamp the dead one left behind.
+    let out = bin()
+        .args(["--json", "status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let two = status["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == serde_json::json!("two"))
+        .expect("domain two is in the report");
+    assert!(
+        two["rebuild_started"].is_string(),
+        "the marker survived the process that set it: {status}"
+    );
+    assert_eq!(
+        two["engrams"],
+        serde_json::json!(2),
+        "and its rows are the complete ones from before the rebuild: {status}"
+    );
+    let one = status["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == serde_json::json!("eng"))
+        .expect("domain eng is in the report");
+    assert!(
+        one["rebuild_started"].is_null(),
+        "the domain that finished its rebuild carries no marker: {status}"
+    );
+
+    // The human report says what it means and how to finish it.
+    let out = bin()
+        .args(["status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        human.contains("a full rebuild of 'two' started")
+            && human.contains("never finished")
+            && human.contains("Run: crystalline reindex --full"),
+        "{human}"
+    );
+
+    // Re-running it once the folder is back clears the marker.
+    write(
+        &second,
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nGamma body mentions zephyrtoken.\n",
+    );
+    write(
+        &second,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: two\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# two\n\n## Scope\n\n- two\n\n## When to Use\n\n- two\n",
+    );
+    bin()
+        .args(["reindex", "--full", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    let out = bin()
+        .args(["--json", "status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        status["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["rebuild_started"].is_null()),
+        "a completed rebuild clears every marker: {status}"
+    );
+}
+
+/// The two flags are different operations and say so. `--wipe` destroys the
+/// index and rebuilds it from disk, which is visible in the report: every
+/// engram comes back as an addition because there was nothing left to update.
+/// `--full` re-reads the same files into the rows they already have. Asking for
+/// both is refused by the parser rather than silently picking one.
+#[test]
+fn wipe_rebuilds_from_nothing_and_does_not_combine_with_full() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    let out = bin()
+        .args(["--json", "reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["wipe"], serde_json::json!(true));
+    assert_eq!(
+        report["reports"][0]["added"],
+        serde_json::json!(3),
+        "a wipe leaves nothing to update (two engrams and the MANIFEST): {report}"
+    );
+
+    // The search still works afterwards, so the rebuild actually landed.
+    let out = bin()
+        .args(["--json", "search", "zephyrtoken", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(search["total"], serde_json::json!(2));
+
+    let out = bin()
+        .args(["reindex", "--full", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the two flags do not combine");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot be used with"),
+        "the parser says why: {err}"
     );
 }

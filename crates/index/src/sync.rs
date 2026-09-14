@@ -207,7 +207,7 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
         )
         .await?;
     let stamps = store.file_stamps(domain).await?;
-    let scan = scan_domain(name, root, stamps, chunk_params).await?;
+    let scan = scan_domain(name, root, stamps, chunk_params, false).await?;
     apply_scan(store, domain, scan).await
 }
 
@@ -246,6 +246,11 @@ pub struct DomainScan {
     /// Whether `assets` is every attachable file in the domain (a full walk),
     /// so the apply may delete every row it did not see.
     assets_complete: bool,
+    /// Whether this scan is the disk half of a forced rebuild, so the apply's
+    /// transaction also clears the domain's rebuild marker. Only a forced
+    /// [`scan_domain`] sets it: a targeted watcher pass landing during someone
+    /// else's rebuild must not clear a marker whose rebuild never finished.
+    ends_rebuild: bool,
     /// `unchanged` and `failed` from the scan; the apply fills in the rest.
     report: SyncReport,
     /// When the scan began, so the apply can report the total duration.
@@ -260,11 +265,21 @@ pub struct DomainScan {
 /// it and hands it back inside the [`DomainScan`] so the apply can re-check it.
 /// The walk and hash phases run off-thread and never fail fatally: a file that
 /// cannot be read lands in `report.failed`, not an error.
+///
+/// `force` is `reindex --full`: the modification-time and size prefilter is
+/// skipped, so every file on disk is hashed, and a file whose content is
+/// identical to the recorded one is classified as changed rather than
+/// unchanged. Everything else is untouched - a new file is still new, a
+/// vanished path is still a delete, and a rename is still detected and applied
+/// in place rather than re-parsed and re-embedded. The scan also records that
+/// it is the disk half of a rebuild, so the apply's transaction clears the
+/// domain's rebuild marker as it commits.
 pub async fn scan_domain(
     name: &str,
     root: &Path,
     stamps: HashMap<String, FileStamp>,
     chunk_params: &ChunkParams,
+    force: bool,
 ) -> Result<DomainScan> {
     let started = Instant::now();
 
@@ -368,12 +383,14 @@ pub async fn scan_domain(
         Vec::new(),
         chunk_params,
         started,
+        force,
     )
     .await;
     // A full walk saw every file under `assets/`, so the apply may delete any
     // attachment row it did not see.
     scan.assets = assets;
     scan.assets_complete = true;
+    scan.ends_rebuild = force;
     Ok(scan)
 }
 
@@ -527,6 +544,7 @@ pub async fn scan_paths(
         unreadable,
         chunk_params,
         started,
+        false,
     )
     .await;
     // A targeted pass saw only the given paths, so the apply reconciles exactly
@@ -562,6 +580,7 @@ async fn classify_changes(
     unreadable: Vec<(String, String)>,
     chunk_params: &ChunkParams,
     started: Instant,
+    force: bool,
 ) -> DomainScan {
     // Prefilter: unchanged files (same mtime and size) are skipped entirely.
     let mut report = SyncReport {
@@ -576,7 +595,9 @@ async fn classify_changes(
     let mut to_hash: Vec<Scanned> = Vec::new();
     for (rel, scanned) in &current {
         match stamps.get(rel) {
-            Some(stamp) if stamp.mtime == scanned.mtime && stamp.size == scanned.size => {
+            // A forced pass skips the prefilter entirely: the whole point is to
+            // catch a file whose content moved without its stamp moving with it.
+            Some(stamp) if !force && stamp.mtime == scanned.mtime && stamp.size == scanned.size => {
                 report.unchanged += 1;
             }
             _ => to_hash.push(Scanned {
@@ -630,8 +651,11 @@ async fn classify_changes(
         } else {
             let stamp = stamps.get(&scanned.rel);
             let same = stamp.map(|s| s.sha256 == sha256).unwrap_or(false);
-            if same {
-                // Touched but identical content: nothing to reindex.
+            if same && !force {
+                // Touched but identical content: nothing to reindex. A forced
+                // pass re-upserts it anyway, which is what backfills a column a
+                // migration added, and costs no embedding work: the chunk text
+                // is unchanged, so `replace_chunks` carries every vector over.
                 report.unchanged += 1;
             } else {
                 changed.push(PendingChange {
@@ -654,6 +678,8 @@ async fn classify_changes(
         assets: Vec::new(),
         asset_deletes: Vec::new(),
         assets_complete: false,
+        // The caller decides: only a forced full scan ends a rebuild.
+        ends_rebuild: false,
         report,
         started,
     }
@@ -702,6 +728,7 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         assets,
         asset_deletes,
         assets_complete,
+        ends_rebuild,
         mut report,
         started,
     } = scan;
@@ -766,6 +793,15 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         return Err(e);
     }
 
+    // The rebuild this scan was the disk half of is complete: clear its marker
+    // in the same transaction that commits its rows, so the marker is set
+    // exactly while the rebuild is unfinished and a run that died before this
+    // point leaves it standing.
+    if ends_rebuild && let Err(e) = store.end_rebuild(domain).await {
+        let _ = store.rollback().await;
+        return Err(e);
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(e) = store.record_sync(domain, &now).await {
         let _ = store.rollback().await;
@@ -815,14 +851,24 @@ impl ReindexHooks for NoReindexHooks {}
 /// Reindex a list of file domains through one loop, the shared driver behind
 /// both `crystalline reindex` and the daemon's `ctl reindex`.
 ///
-/// `force` is `reindex --full`: the domain's rows are cleared and resynced from
-/// disk, per domain rather than as a global wipe, so virtual-domain rows, whose
-/// only source of truth is the database, are never destroyed.
+/// `force` is `reindex --full`: every file is re-read, re-parsed and
+/// re-upserted rather than prefiltered against its recorded stamp, so a file
+/// whose content changed without its modification time or size moving is
+/// rewritten too, and a column a migration added is backfilled on every row.
+/// Nothing is cleared first, on either path. A domain keeps its previous
+/// complete rows until its own rebuild commits, so an interruption anywhere
+/// leaves a valid index rather than an empty one, stale rows are pruned by the
+/// scan's own delete detection exactly as a plain sync prunes them, and every
+/// chunk whose text is unchanged keeps the embedding it already had instead of
+/// being re-embedded from scratch.
 ///
 /// The shape per domain is the two-lock-window one the rest of the sync engine
 /// uses - resolve the domain and snapshot its stamps under the lock, walk and
 /// hash with no lock held, apply transactionally in a second window - so a
 /// large domain's rebuild never blocks concurrent readers behind the mutex.
+/// Under `force` the first window also stamps the domain's rebuild marker,
+/// which the apply's own transaction clears, so a rebuild that never finished
+/// says so afterwards instead of reporting its rows as freshly rebuilt ones.
 ///
 /// The run ends with [`resolve_forward_refs`] over the domains it applied and
 /// one [`Store::checkpoint_wal`], for both callers: a reindex is a
@@ -848,13 +894,16 @@ pub async fn reindex_domains(
                     .await
                     .map_err(|e| in_domain("reindex", name, e))?;
                 if force {
+                    let now = chrono::Utc::now().to_rfc3339();
                     store
-                        .clear_domain(domain)
+                        .begin_rebuild(domain, &now)
                         .await
                         .map_err(|e| in_domain("reindex", name, e))?;
                 }
-                // Snapshotted AFTER the clear, so a forced run classifies every
-                // file as new against empty stamps.
+                // The real stamps, not an empty map: delete detection is the
+                // recorded paths absent from the walk, so a forced run that
+                // cleared first could not prune anything at all - it would see
+                // nothing recorded and call every file on disk new.
                 let snapshot = store
                     .file_stamps(domain)
                     .await
@@ -866,7 +915,7 @@ pub async fn reindex_domains(
         }) else {
             continue;
         };
-        let scan = scan_domain(name, root, snapshot, chunk_params)
+        let scan = scan_domain(name, root, snapshot, chunk_params, force)
             .await
             .map_err(|e| in_domain("reindex", name, e))?;
         let report = {

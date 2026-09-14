@@ -600,6 +600,129 @@ fn watcher_indexes_external_write_without_duplicates() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// A full reindex is no longer a window in which the index is empty: the daemon
+/// keeps answering the whole time, from the rows it had before the rebuild
+/// started, and says out loud that a rebuild is in flight.
+///
+/// The corpus is deliberately large enough that the rebuild takes long enough to
+/// be observed from another process. The "never an empty page" assertion holds
+/// at every instant regardless of scheduling, so it cannot flake, only
+/// under-sample; the two observation flags are what the corpus size buys.
+#[test]
+fn the_daemon_keeps_answering_during_a_full_reindex() {
+    let env = Env::new("rbld");
+    env.setup_domain("eng");
+
+    // Seed the corpus before the daemon exists, so the watcher has nothing to
+    // race and the sync below is one plain direct pass.
+    const ENGRAMS: usize = 600;
+    for i in 0..ENGRAMS {
+        std::fs::write(
+            env.dir.join(format!("kb-eng/e{i}.md")),
+            format!(
+                "---\ntype: engram\ntitle: E {i}\npermalink: e{i}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nrebuildtoken payload number {i}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let (ok, _) = env.run(&["sync"]);
+    assert!(ok, "seed sync");
+
+    let total_before = search_total(&env);
+    assert_eq!(total_before, ENGRAMS as u64, "the corpus is indexed");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // The rebuild runs in its own process against the live daemon.
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut rebuild = cmd
+        .args(["ctl", "reindex", "--full"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut saw_live_activity = false;
+    let mut saw_marker = false;
+    loop {
+        let finished = rebuild.try_wait().unwrap().is_some();
+        // One read and one status per lap, both through the daemon that is
+        // rebuilding.
+        assert_eq!(
+            search_total(&env),
+            total_before,
+            "the daemon answers from the rows it already had, never an empty page"
+        );
+        let status = status_json(&env);
+        if status["activity"]["now"]
+            .as_array()
+            .is_some_and(|now| now.iter().any(|a| a["kind"] == json!("reindex")))
+        {
+            saw_live_activity = true;
+        }
+        if domains_rebuilding(&status).contains(&"eng".to_string()) {
+            saw_marker = true;
+        }
+        if finished {
+            break;
+        }
+    }
+    assert!(
+        rebuild.wait().unwrap().success(),
+        "the full reindex succeeded"
+    );
+    assert!(
+        saw_live_activity,
+        "ctl status reported the reindex while it ran"
+    );
+    assert!(
+        saw_marker,
+        "ctl status reported the domain's rebuild marker while it ran"
+    );
+
+    // And afterwards: the marker is gone and the rows are all still there.
+    let status = status_json(&env);
+    assert!(
+        domains_rebuilding(&status).is_empty(),
+        "a finished rebuild leaves no marker: {status}"
+    );
+    assert_eq!(search_total(&env), total_before);
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The hit count for the corpus token, through whatever route the environment
+/// resolves - a running daemon, here.
+fn search_total(env: &Env) -> u64 {
+    let (ok, out) = env.run(&["--json", "search", "rebuildtoken"]);
+    assert!(ok, "search failed: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("search json: {e}: {out}"));
+    v["total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no total: {v}"))
+}
+
+fn status_json(env: &Env) -> Value {
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "ctl status failed: {out}");
+    serde_json::from_str(&out).unwrap_or_else(|e| panic!("status json: {e}: {out}"))
+}
+
+/// The domains whose rows the status report says are mid-rebuild.
+fn domains_rebuilding(status: &Value) -> Vec<String> {
+    status["domains"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["rebuild_started"].is_string())
+        .filter_map(|d| d["name"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// The daemon gap this covers: a domain registered by `domain add` after the
 /// daemon started is not in its startup config snapshot, so its watcher never
 /// knew the root existed either. `domain add` must still route its own sync

@@ -1130,6 +1130,19 @@ pub struct DomainStats {
     /// reads `None`, so a fresh upgrade must find nothing collectable on its
     /// first sweep.
     pub last_registered: Option<String>,
+    /// When a forced rebuild of this domain was stamped as started, RFC 3339,
+    /// or `None` when no rebuild is in flight. Written by
+    /// [`Store::begin_rebuild`] and cleared by [`Store::end_rebuild`] inside
+    /// the transaction that commits the rebuild.
+    ///
+    /// A set value reads as history, not as liveness: nothing clears it when
+    /// the process that stamped it is killed, which is exactly what makes it
+    /// useful. A reader that also sees a live `reindex` activity may say a
+    /// rebuild is running; one that does not must say a rebuild never finished
+    /// and that this domain's rows are the ones from before it - they are
+    /// complete rows either way, because a rebuild never clears anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild_started: Option<String>,
 }
 
 /// The instance currently holding a file domain's host lock in a shared
@@ -1414,10 +1427,14 @@ pub trait Store: Send + Sync {
     async fn all_engram_contents(&self, domain: DomainId) -> Result<Vec<StoredEngram>>;
 
     /// Delete every engram (and its child and chunk rows) in a single domain,
-    /// keeping the domain row itself. This is the scoped clear the full reindex
-    /// uses per file domain so virtual-domain rows, whose only source of truth is
-    /// the database, are never destroyed. Contrast [`Store::wipe`], which clears
+    /// keeping the domain row itself. The scoped clear behind `domain remove`
+    /// and the orphaned-row sweep. Contrast [`Store::wipe`], which clears
     /// everything.
+    ///
+    /// A reindex does not use this, and deliberately: `--full` re-reads and
+    /// re-upserts instead, so rows a reader is using are never absent between
+    /// a clear and the rebuild that would have refilled them, and an unchanged
+    /// chunk keeps its embedding.
     async fn clear_domain(&self, domain: DomainId) -> Result<()>;
 
     /// Delete the engram at a domain-relative path and all its child rows.
@@ -1691,8 +1708,11 @@ pub trait Store: Send + Sync {
     /// assume this returns everything.
     async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>>;
 
-    /// Delete all indexed data, keeping the schema. The corruption-recovery and
-    /// full-reindex path.
+    /// Delete all indexed data, keeping the schema. The corruption-recovery
+    /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary
+    /// rebuild (`--full`) never comes here, because destroying every embedding
+    /// to re-read files that mostly did not change costs hours and buys
+    /// nothing.
     async fn wipe(&self) -> Result<()>;
 
     /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file
@@ -1733,6 +1753,23 @@ pub trait Store: Send + Sync {
     /// first sweep after an upgrade, when every pre-existing row reads `None`,
     /// collects nothing.
     async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()>;
+
+    /// Stamp a domain as having a forced rebuild in flight, `when` being an RFC
+    /// 3339 instant. Written in the first lock window of the domain's rebuild,
+    /// before anything is read from disk.
+    ///
+    /// The stamp is durable on purpose. The in-memory activity record the
+    /// daemon keeps dies with the process, and the incident this exists for was
+    /// on the daemonless path, which has no activity record at all: whatever
+    /// runs, the fact that a rebuild started has to outlive the process that
+    /// started it, so an interrupted run is never read as a normal one.
+    async fn begin_rebuild(&self, domain: DomainId, when: &str) -> Result<()>;
+
+    /// Clear a domain's rebuild stamp. Called from inside the transaction that
+    /// commits the rebuild's apply, so the marker is set exactly while that
+    /// domain's rebuild is unfinished and is never cleared by a run that did
+    /// not finish one.
+    async fn end_rebuild(&self, domain: DomainId) -> Result<()>;
 
     /// Diagnostics about the open store.
     async fn store_info(&self) -> Result<StoreInfo>;

@@ -76,6 +76,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain registration stamp",
         sql: SCHEMA_V10,
     },
+    Migration {
+        version: 11,
+        label: "domain rebuild marker",
+        sql: SCHEMA_V11,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -331,6 +336,14 @@ const SCHEMA_V10: &str = r#"
 ALTER TABLE domain ADD COLUMN IF NOT EXISTS last_registered TEXT;
 "#;
 
+// The Turso v12 column, same meaning: when a forced rebuild of this domain was
+// stamped as started, RFC 3339, NULL when none is in flight. Nullable, no
+// default, no backfill - a row written before this migration reads NULL, which
+// is the truth for every one of them.
+const SCHEMA_V11: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS rebuild_started TEXT;
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -410,4 +423,84 @@ async fn current_version(conn: &mut PgConnection) -> Result<i64> {
         .await
         .map_err(|e| IndexError::Migration(e.to_string()))?;
     Ok(row.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Connection;
+
+    /// The v11 column against a database written before it, which is the case
+    /// an upgrade actually meets: a schema raised to v10, domain rows already
+    /// in it, then v11 applied over the top.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate the
+    /// parity suite uses; without it there is no server to migrate and the test
+    /// is a silent no-op rather than a failure. It talks to sqlx directly
+    /// rather than through `PostgresStore`, because opening a store applies
+    /// every migration at once and there would be no pre-existing database
+    /// left to migrate.
+    #[tokio::test]
+    async fn v11_leaves_a_domain_row_written_before_it_unmarked() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // A database at v10: everything up to but not including the marker.
+        for m in &MIGRATIONS[..10] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[10].version, 11, "the eleventh migration is v11");
+        sqlx::raw_sql(
+            "INSERT INTO domain(name, path) VALUES ('old','/tmp/old'),('busy','/tmp/busy')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATIONS[10].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let unmarked: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_started IS NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            unmarked.0, 2,
+            "no backfill: both pre-existing rows read NULL, meaning no rebuild in flight"
+        );
+
+        sqlx::raw_sql("UPDATE domain SET rebuild_started='2026-09-14T00:00:00Z' WHERE name='busy'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let marked: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_started IS NOT NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            marked.0, 1,
+            "the stamped row carries a value and the row beside it still does not"
+        );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
 }

@@ -28,7 +28,7 @@ use crate::turso::TursoStore;
 ///   comes from `database.url`.
 /// - `resilient` selects the corruption-recovery open for the Turso backend
 ///   (discard an unreadable database file and start fresh); it is the
-///   `reindex --full` recovery path and has no effect on Postgres.
+///   `reindex --wipe` recovery path and has no effect on Postgres.
 ///
 /// The backend/url combination is validated here (never at config parse time),
 /// so `verify` and `prompt` never trip on a database block they do not use.

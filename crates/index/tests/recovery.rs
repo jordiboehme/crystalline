@@ -21,7 +21,7 @@ fn engram(title: &str, permalink: &str, body: &str) -> String {
 }
 
 #[tokio::test]
-async fn corrupt_database_recovers_via_full_reindex() {
+async fn corrupt_database_recovers_via_reindex_wipe() {
     let corpus = tempfile::tempdir().unwrap();
     let root = corpus.path();
     for i in 0..12 {
@@ -71,10 +71,13 @@ async fn corrupt_database_recovers_via_full_reindex() {
         f.flush().unwrap();
     }
 
-    // reindex --full recovery path: open resiliently (discarding the corrupt
-    // file), then resync from the files on disk.
+    // The `reindex --wipe` recovery path: open resiliently (discarding the
+    // corrupt file), wipe what a readable-but-wrong database would still hold,
+    // then resync from the files on disk. This is the one verb that still
+    // destroys the index, and the only case that needs it - `reindex --full`
+    // re-reads every file without a wipe and could not open this file at all.
     let store = TursoStore::open_resilient(&db_path).await.unwrap();
-    let _ = store.wipe().await; // harmless on a fresh db, part of the reindex path
+    let _ = store.wipe().await; // harmless on a fresh db, part of the wipe path
     let report = sync_domain(&store, "d", root).await.unwrap();
     assert_eq!(report.added, 12, "rebuilt from disk");
 

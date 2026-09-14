@@ -94,7 +94,7 @@ pub(crate) enum OpenAs {
     Read,
     /// A write. The index is created when it is not there yet.
     Write,
-    /// `reindex --full`'s corruption-recovery open, which rebuilds a Turso
+    /// `reindex --wipe`'s corruption-recovery open, which rebuilds a Turso
     /// database that will not open at all. Creates like [`OpenAs::Write`],
     /// and a no-op distinction on Postgres, which has no local file.
     Rebuild,
@@ -451,7 +451,7 @@ pub(crate) async fn sync_domain_direct(
         let snapshot = store.file_stamps(domain).await?;
         (domain, snapshot)
     };
-    let scan = scan_domain(name, root, snapshot, &params).await?;
+    let scan = scan_domain(name, root, snapshot, &params, false).await?;
     let store = store.lock().await;
     apply_scan(&*store, domain, scan)
         .await
@@ -1227,7 +1227,7 @@ pub async fn sync(
             let snapshot = store.file_stamps(domain).await?;
             (domain, snapshot)
         };
-        let scan = scan_domain(&name, &path, snapshot, &params).await?;
+        let scan = scan_domain(&name, &path, snapshot, &params, false).await?;
         let report = {
             let store = store.lock().await;
             apply_scan(&*store, domain, scan)
@@ -1335,22 +1335,43 @@ pub(crate) fn sync_failure(
 
 // --- reindex -----------------------------------------------------------------
 
-/// Reindex all domains. `--full` clears each file domain and resyncs it from
-/// disk (the corruption-recovery path), opening resiliently so a database that
-/// will not open is rebuilt.
+/// Reindex all domains: `full` re-reads every file rather than only the ones
+/// whose stamp moved, `wipe` destroys the index first and rebuilds it from
+/// scratch.
+///
+/// The two are different operations and the flags do not combine. A forced
+/// reindex destroys nothing - every domain serves its previous complete rows
+/// until its own rebuild commits, and an unchanged chunk keeps its embedding -
+/// so an interruption costs a re-run rather than an hour of re-embedding. A
+/// wipe is for the case nothing else can fix, a database file that will not
+/// open, and its cost is the whole embedding corpus; its store was opened
+/// resiliently by the dispatch above, which is what discards an unopenable
+/// file.
 ///
 /// The loop itself is [`crystalline_index::reindex_domains`], shared with the
 /// daemon's `ctl reindex`, so the two paths cannot drift apart in what they
-/// clear, in what order they rebuild or in the passes they end with.
+/// re-read, in what order they rebuild or in the passes they end with.
 pub async fn reindex(
     store: Arc<TokioMutex<dyn Store>>,
     cfg: &GlobalConfig,
     full: bool,
+    wipe: bool,
     embed: bool,
     json: bool,
 ) -> Result<()> {
     let targets = select_domains(cfg, None)?;
     let params = chunk_params(cfg);
+
+    // Everything goes, including the virtual domains whose only source of truth
+    // is the database: a wipe is the explicit "this index cannot be trusted"
+    // verb, and the rebuild below can only restore what is on disk.
+    if wipe {
+        let store = store.lock().await;
+        store
+            .wipe()
+            .await
+            .map_err(|e| anyhow!("wiping the index failed: {e}"))?;
+    }
 
     // Only the file domains have files to (re)index. A virtual domain's rows
     // are its source of truth and are never rebuilt from anything.
@@ -1359,17 +1380,33 @@ pub async fn reindex(
         .filter_map(|(name, entry)| resolve_domain_path(&entry).map(|p| (name, p)))
         .collect();
 
-    let reports = reindex_domains(&*store, &file_targets, &params, full, &NoReindexHooks).await?;
+    // A wipe left nothing to compare against, so its rebuild is forced too:
+    // every file is read, and the prefilter has no stamps to skip against
+    // anyway.
+    let reports = reindex_domains(
+        &*store,
+        &file_targets,
+        &params,
+        full || wipe,
+        &NoReindexHooks,
+    )
+    .await?;
 
     if json {
         println!(
             "{}",
-            serde_json::json!({ "full": full, "reports": reports })
+            serde_json::json!({ "full": full, "wipe": wipe, "reports": reports })
         );
     } else {
         println!(
             "Reindex ({}) complete",
-            if full { "full" } else { "incremental" }
+            if wipe {
+                "wiped and rebuilt"
+            } else if full {
+                "full"
+            } else {
+                "incremental"
+            }
         );
         for r in &reports {
             print_report(r);
@@ -1531,6 +1568,36 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
             "text"
         }
     );
+
+    // The rebuild markers, printed directly under the coverage figure they
+    // qualify: a number read as normal in the middle of a rebuild is the
+    // incident this exists for, so the caveat travels with it rather than
+    // sitting somewhere else in the report.
+    //
+    // The marker is durable and nothing clears it when a process is killed, so
+    // it says history, not liveness. Only a live `reindex` in the daemon's own
+    // activity snapshot - which a direct read has none of - turns it into a
+    // "running now" line; without one it reads as a rebuild that never
+    // finished. Either way the domain's rows are complete, because a rebuild
+    // clears nothing and coverage can only go up across one.
+    let rebuild_is_live = data["activity"]["now"]
+        .as_array()
+        .is_some_and(|now| now.iter().any(|a| a["kind"].as_str() == Some("reindex")));
+    for d in data["domains"].as_array().into_iter().flatten() {
+        let Some(started) = d["rebuild_started"].as_str() else {
+            continue;
+        };
+        let name = d["name"].as_str().unwrap_or("");
+        if rebuild_is_live {
+            println!(
+                "  rebuilding '{name}' since {started}; the numbers above are its rows from before it"
+            );
+        } else {
+            println!(
+                "  a full rebuild of '{name}' started {started} never finished; that domain's rows are the ones from before it. Run: crystalline reindex --full"
+            );
+        }
+    }
 
     // What the daemon is doing right now; only its report carries this.
     if let Some(activity) = data.get("activity") {

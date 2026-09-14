@@ -3,7 +3,7 @@
 //!
 //! The accounts live in their own small database in the state directory
 //! (`web-auth.db`), never in the index: credentials are not knowledge and must
-//! survive a `reindex --full`. Every command here opens that file directly
+//! survive a `reindex --wipe`. Every command here opens that file directly
 //! rather than going through the daemon, which is safe by construction - the
 //! store serializes its writers across processes - so account management works
 //! whether or not a daemon is running, and a running daemon picks the change

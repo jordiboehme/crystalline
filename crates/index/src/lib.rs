@@ -12,7 +12,8 @@
 //!
 //! Files are the source of truth and the index is fully rebuildable, so a
 //! corrupt or stale index is never a data-loss risk: [`Store::wipe`] followed by
-//! a resync (the `reindex --full` path) recreates it from disk.
+//! a resync (the `reindex --wipe` path) recreates it from disk, and the ordinary
+//! `reindex --full` re-reads every file without destroying anything first.
 
 mod alias;
 pub mod embed;

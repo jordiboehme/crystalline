@@ -146,6 +146,15 @@ pub struct DomainDoctor {
     /// The host's last heartbeat, RFC 3339, when hosted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_heartbeat_at: Option<String>,
+    /// When a forced rebuild of this domain was stamped as started, RFC 3339,
+    /// or `None` when none is in flight. Read from the index, so a run served
+    /// by the daemon leaves it absent rather than claiming there is none.
+    ///
+    /// A rebuild clears nothing, so a domain carrying this still holds its
+    /// previous complete rows: the finding is that the refresh did not land,
+    /// never that the data is gone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_started: Option<String>,
 }
 
 /// One `E006` encoding finding, reported by `doctor`, fixed by `verify`.
@@ -595,6 +604,13 @@ impl DoctorReport {
             if !d.path_exists || !d.manifest_present {
                 n += 1;
             }
+            // A rebuild that never finished is a problem a person finishes by
+            // re-running it: the domain is serving complete rows, but they are
+            // the ones from before the rebuild, and nothing clears the marker
+            // on its own.
+            if d.rebuild_started.is_some() {
+                n += 1;
+            }
             n += d.orphans.len().saturating_sub(d.orphans_removed);
             n += d.unindexed.len();
             n += d.unsyncable.len();
@@ -738,6 +754,21 @@ pub async fn run(
     };
     let store_ref: Option<&dyn Store> = guard.as_ref().map(|g| &**g as &dyn Store);
 
+    // The rebuild markers, read once for the whole run rather than per domain.
+    // Only the direct route can read them: the daemon's doctor answer carries
+    // file stamps and nothing else, so a daemon-served run leaves the field
+    // absent rather than reporting a rebuild that is not there.
+    let mut rebuild_markers: HashMap<String, String> = HashMap::new();
+    if let Some(store) = store_ref
+        && let Ok(stats) = store.domain_stats().await
+    {
+        for d in stats {
+            if let Some(started) = d.rebuild_started {
+                rebuild_markers.insert(d.name, started);
+            }
+        }
+    }
+
     let mut domains = Vec::with_capacity(targets.len());
     for (name, entry) in &targets {
         // Taken out of the daemon's answer rather than borrowed, so each
@@ -747,7 +778,17 @@ pub async fn run(
         let stamps = daemon_stamps
             .as_mut()
             .map(|by_domain| by_domain.remove(name).unwrap_or_default());
-        domains.push(check_domain(name, entry, store_ref, stamps, fix).await?);
+        domains.push(
+            check_domain(
+                name,
+                entry,
+                store_ref,
+                stamps,
+                rebuild_markers.get(name).cloned(),
+                fix,
+            )
+            .await?,
+        );
     }
 
     let environment = check_environment(&loaded.overlay);
@@ -985,6 +1026,7 @@ async fn check_domain(
     entry: &DomainEntry,
     store: Option<&dyn Store>,
     daemon_stamps: Option<HashMap<String, FileStamp>>,
+    rebuild_started: Option<String>,
     fix: bool,
 ) -> Result<DomainDoctor> {
     // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
@@ -1142,6 +1184,7 @@ async fn check_domain(
         }
     }
 
+    d.rebuild_started = rebuild_started;
     Ok(d)
 }
 
@@ -1789,6 +1832,16 @@ pub fn render_human(report: &DoctorReport) -> String {
                 .unwrap_or_default();
             let _ = writeln!(out, "  hosted by instance {host}{hb}");
         }
+        // A rebuild that was stamped and never cleared. Nothing was destroyed -
+        // the rows below are the complete ones from before it - so the finding
+        // is a refresh to finish, and the command that finishes it is the one
+        // that was interrupted.
+        if let Some(started) = &d.rebuild_started {
+            let _ = writeln!(
+                out,
+                "  [problem] a full rebuild started {started} never finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
+            );
+        }
         if d.is_virtual {
             match d.engrams {
                 Some(n) => {
@@ -2064,6 +2117,24 @@ pub fn render_human(report: &DoctorReport) -> String {
             e["configured_model"].as_str().unwrap_or_default(),
             e["stale_chunks"]
         );
+        // The coverage figure never goes out bare while a rebuild is
+        // unfinished: the incident was a coverage number read as normal when it
+        // was the middle of something. Coverage can only ever rise across a
+        // rebuild now, and saying so is what stops the number being misread in
+        // the other direction too.
+        let unfinished: Vec<&str> = report
+            .domains
+            .iter()
+            .filter(|d| d.rebuild_started.is_some())
+            .map(|d| d.name.as_str())
+            .collect();
+        if !unfinished.is_empty() {
+            let _ = writeln!(
+                out,
+                "  counted while an unfinished rebuild of {} stands; nothing was destroyed, so this figure is the one from before it",
+                unfinished.join(", ")
+            );
+        }
     } else {
         // Absent for three different reasons, and a person acts on each of
         // them differently, so none of them may print as "no index yet".
@@ -2411,6 +2482,47 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// A rebuild marker that outlived the run that set it: the finding names
+    /// the instant and the command that finishes it, says plainly that the
+    /// rows are still there, counts toward the exit code, and puts the caveat
+    /// on the embedding coverage figure rather than letting it go out bare -
+    /// the number read as normal mid-rebuild is the incident this exists for.
+    #[test]
+    fn an_unfinished_rebuild_is_a_problem_that_qualifies_the_coverage_figure() {
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.domains[0].rebuild_started = Some("2026-09-14T09:00:00Z".to_string());
+        report.embeddings = Some(serde_json::json!({
+            "embedded_with_configured_model": 768,
+            "total_chunks": 23598,
+            "configured_model": "m",
+            "stale_chunks": 0,
+        }));
+
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "[problem] a full rebuild started 2026-09-14T09:00:00Z never finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("counted while an unfinished rebuild of eng stands"),
+            "the coverage figure never goes out bare while a rebuild is unfinished: {out}"
+        );
+        assert_eq!(
+            report.remaining_problems(),
+            1,
+            "an unfinished rebuild is one problem, so doctor exits non-zero"
+        );
+
+        // Cleared, it is neither a finding nor a caveat.
+        report.domains[0].rebuild_started = None;
+        let clean = render_human(&report);
+        assert!(!clean.contains("never finished"), "{clean}");
+        assert!(!clean.contains("unfinished rebuild"), "{clean}");
+        assert_eq!(report.remaining_problems(), 0);
     }
 
     /// Over a daemon the doctor reads the index through a read verb, so

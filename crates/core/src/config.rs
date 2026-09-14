@@ -1164,7 +1164,7 @@ pub fn index_db_path() -> Result<PathBuf, ConfigError> {
 /// The web API's users and sessions database, `<state_dir>/web-auth.db`.
 ///
 /// Deliberately not derived from the index database path: credentials are not
-/// knowledge, they must survive a `reindex --full` that discards the index,
+/// knowledge, they must survive a `reindex --wipe` that discards the index,
 /// and `--db` names a scratch index rather than a second set of accounts. The
 /// `crystalline users` CLI and the daemon both resolve the file here, so the
 /// two always meet on one path.

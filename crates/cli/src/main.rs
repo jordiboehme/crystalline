@@ -205,11 +205,24 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Rebuild the index. `--full` wipes it first, the corruption-recovery path.
+    /// Rebuild the index from the files on disk. `--full` re-reads every file
+    /// and destroys nothing; `--wipe` is the corruption-recovery path.
     Reindex {
-        /// Wipe the index (rebuilding the file if it will not open) then resync.
+        /// Re-read, re-parse and re-index every file instead of only the ones
+        /// whose modification time or size moved. Destroys nothing: each domain
+        /// keeps its rows until its own rebuild commits, files gone from disk
+        /// are pruned as a sync prunes them, and a chunk whose text is
+        /// unchanged keeps the embedding it already has.
         #[arg(long)]
         full: bool,
+        /// Destroy the index and rebuild it from disk: every row and every
+        /// embedding is deleted first, and a database file that will not open
+        /// at all is discarded and recreated. The corruption-recovery path, and
+        /// the only one that loses work - re-embedding a large corpus takes
+        /// hours. Needs exclusive access to the index, so stop the daemon
+        /// first.
+        #[arg(long, conflicts_with = "full")]
+        wipe: bool,
         /// After reindexing, embed any chunks that need it for the active model.
         #[arg(long)]
         embed: bool,
@@ -361,7 +374,7 @@ enum Command {
     /// created in the browser on the first visit; these commands are the
     /// scripted and recovery path to the same accounts, which live in their own
     /// small database in the state directory, beside the index but never inside it, so a
-    /// `reindex --full` cannot take them with it. Safe to run while a daemon
+    /// `reindex --wipe` cannot take them with it. Safe to run while a daemon
     /// is serving: it picks the change up without a restart.
     Users {
         #[command(subcommand)]
@@ -762,9 +775,11 @@ enum CtlCommand {
         #[arg(long)]
         take_over: bool,
     },
-    /// Ask the daemon to reindex. `--full` wipes first.
+    /// Ask the daemon to reindex. `--full` re-reads every file and destroys
+    /// nothing; the wipe is a daemonless command (`crystalline reindex --wipe`),
+    /// since it needs exclusive access to the index file.
     Reindex {
-        /// Wipe the index before reindexing.
+        /// Re-read and re-index every file, not only the ones whose stamp moved.
         #[arg(long)]
         full: bool,
         /// Embed new chunks after reindexing.
@@ -1518,9 +1533,10 @@ fn main() -> anyhow::Result<()> {
         }) => on_runtime(move || sync_dispatch(domain, embed, take_over, config, cli.db, cli.json)),
         Some(Command::Reindex {
             full,
+            wipe,
             embed,
             config,
-        }) => on_runtime(move || reindex_dispatch(full, embed, config, cli.db, cli.json)),
+        }) => on_runtime(move || reindex_dispatch(full, wipe, embed, config, cli.db, cli.json)),
         Some(Command::Status { config }) => {
             on_runtime_current_thread(move || status_dispatch(config, cli.db, cli.json))
         }
@@ -1953,6 +1969,7 @@ async fn sync_dispatch(
 /// always takes the direct path (see [`crystalline_service::use_daemon`]).
 async fn reindex_dispatch(
     full: bool,
+    wipe: bool,
     embed: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
@@ -1960,14 +1977,24 @@ async fn reindex_dispatch(
 ) -> anyhow::Result<()> {
     use serde_json::json;
     let cfg = cmd::load(config.as_deref())?.effective;
-    // `--full` is the corruption-recovery path, so its direct open is the
-    // resilient one that rebuilds a Turso database which will not open.
+    // `--wipe` is the corruption-recovery path and the only one that needs the
+    // resilient open, which discards a Turso database that will not open at
+    // all. It is also the only one a running daemon cannot do for us: it needs
+    // the index file to itself, and the daemon is holding it. So it sends no
+    // ctl request and always takes the direct path, where a daemon still
+    // holding the file surfaces as the usual "who holds it and what to do"
+    // sentence rather than as a wipe that half happened.
+    //
+    // `--full` no longer destroys anything, so it keeps the ordinary write
+    // open and routes to the daemon exactly like an incremental reindex.
+    let request =
+        (!wipe).then(|| json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }));
     let route = cmd::reach_index(
-        Some(json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed })),
+        request,
         &cfg,
         config.as_deref(),
         db.as_deref(),
-        if full {
+        if wipe {
             cmd::OpenAs::Rebuild
         } else {
             cmd::OpenAs::Write
@@ -1980,7 +2007,17 @@ async fn reindex_dispatch(
             print_embed_scheduled(&data, json);
             Ok(())
         }
-        other => cmd::reindex(cmd::local_store(other, "reindex")?, &cfg, full, embed, json).await,
+        other => {
+            cmd::reindex(
+                cmd::local_store(other, "reindex")?,
+                &cfg,
+                full,
+                wipe,
+                embed,
+                json,
+            )
+            .await
+        }
     }
 }
 

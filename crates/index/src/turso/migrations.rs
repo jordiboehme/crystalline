@@ -77,6 +77,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain registration stamp",
         sql: SCHEMA_V11,
     },
+    Migration {
+        version: 12,
+        label: "domain rebuild marker",
+        sql: SCHEMA_V12,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -344,6 +349,22 @@ const SCHEMA_V11: &str = r#"
 ALTER TABLE domain ADD COLUMN last_registered TEXT;
 "#;
 
+// When a forced rebuild of this domain was stamped as started, RFC 3339, the
+// same text convention `last_sync` and `last_registered` use.
+//
+// Nullable with no default and no backfill: NULL means no rebuild is in flight,
+// and every row that predates this migration reads NULL, which is the truth for
+// all of them - a rebuild that ran before the column existed cannot have been
+// interrupted into it. The stamp is written before the rebuild reads a file and
+// cleared inside the transaction that commits it, so it is set exactly while a
+// domain's rebuild is unfinished. Nothing clears it when the process dies, and
+// that is the point: a reader that finds it set after the fact knows the run
+// never finished, and that the domain's rows are the complete ones from before
+// it rather than a half-built set, because a rebuild clears nothing.
+const SCHEMA_V12: &str = r#"
+ALTER TABLE domain ADD COLUMN rebuild_started TEXT;
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -457,6 +478,74 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The v12 column against a domain row that predates it.
+    ///
+    /// A row written before the marker existed comes out of the migration with
+    /// `rebuild_started` NULL, which is the truth for every one of them: a
+    /// rebuild that ran before the column existed cannot have been interrupted
+    /// into it. Nothing backfills it, so the first `status` after an upgrade
+    /// reports no rebuild in flight anywhere. The stamped row beside it is the
+    /// control that proves the column accepts a value and clears back to NULL.
+    #[tokio::test]
+    async fn v12_leaves_a_domain_row_written_before_it_unmarked() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for m in &MIGRATIONS[..11] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[11].version, 12, "the twelfth migration is v12");
+
+        conn.execute_batch(
+            "INSERT INTO domain(id, name, path) VALUES (1,'old','/tmp/old'),(2,'busy','/tmp/busy');",
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[11].sql).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE rebuild_started IS NULL"
+            )
+            .await,
+            2,
+            "no backfill: both pre-existing rows read NULL, meaning no rebuild in flight"
+        );
+
+        conn.execute(
+            "UPDATE domain SET rebuild_started='2026-09-14T00:00:00Z' WHERE name='busy'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE rebuild_started IS NOT NULL"
+            )
+            .await,
+            1,
+            "the stamped row carries a value and the row beside it still does not"
+        );
+
+        conn.execute(
+            "UPDATE domain SET rebuild_started=NULL WHERE name='busy'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE rebuild_started IS NULL"
+            )
+            .await,
+            2,
+            "and the finished rebuild clears back to NULL"
+        );
     }
 
     /// The v11 column against a domain row that predates it.
