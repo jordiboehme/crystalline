@@ -1104,6 +1104,11 @@ async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
 
 /// A read-only instance collects nothing and says so, rather than refusing: a
 /// caller asking what is collectable still gets the answer.
+///
+/// It does stamp, though, and that is not a detail. Stamping is index
+/// maintenance rather than a content write, and on a shared database a
+/// read-only instance that never stamped would watch a peer's sweep age out and
+/// collect the very domains it is serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_only_instance_collects_nothing_and_says_so() {
     let (tmp, _engine, store) = fixture().await;
@@ -1111,6 +1116,7 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
     let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
     let read_only = Engine::new(store.clone(), cfg, None, Some(config_path)).with_read_only(true);
     plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
     let report = read_only
@@ -1134,10 +1140,10 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
         Some(before),
         "the rows are untouched"
     );
-    assert_eq!(
-        stamp_of(&store, "keep").await,
-        None,
-        "and nothing was stamped either"
+    assert_ne!(
+        stamp_of(&store, "keep").await.expect("it is stamped"),
+        ancient,
+        "and the domains it serves were defended: their stamp moved"
     );
 }
 
@@ -1369,4 +1375,175 @@ async fn an_on_demand_dry_run_lists_the_orphan_and_removes_nothing() {
         "the ask collects the set the preview named: {asked}"
     );
     assert_eq!(engrams_of(&store, "gone").await, Some(0));
+}
+
+/// Give `name`'s domain row a host lock held by another instance, heartbeating
+/// `ago` before now, the way a peer over a shared database leaves one. Returns
+/// nothing: the lock is read back through `domain_stats` like any other column.
+async fn plant_host_lock(
+    store: &Arc<Mutex<dyn Store>>,
+    name: &str,
+    root: &std::path::Path,
+    ago: chrono::Duration,
+) {
+    let store = store.lock().await;
+    let id = store
+        .upsert_domain(
+            name,
+            Some(&root.to_string_lossy()),
+            crystalline_core::config::DomainKind::File,
+        )
+        .await
+        .unwrap();
+    let beat = (chrono::Utc::now() - ago).to_rfc3339();
+    let stale_before = (chrono::Utc::now() - chrono::Duration::seconds(90)).to_rfc3339();
+    store
+        .claim_domain_host(id, "peer-instance", "a peer", &beat, &stale_before, false)
+        .await
+        .unwrap();
+}
+
+/// The single most dangerous line item in this plan, pinned rather than
+/// read-verified: a domain registered in the configuration **file** and named
+/// through this engine by nothing at all.
+///
+/// It is absent from the startup snapshot and absent from the discovered
+/// overlay, so a collector keyed on those two tiers would see an orphan, and on
+/// the person's path would delete a registered domain's rows on the spot. The
+/// third tier - the file re-read - is the only thing between it and that, so
+/// this test fails the moment anyone swaps the checked helper for
+/// `known_domain_names()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_registered_only_in_the_config_file_is_stamped_and_never_collected() {
+    let (tmp, engine, store) = fixture().await;
+    let root = tmp.path().to_path_buf();
+    let later = write_domain(
+        &root,
+        "later",
+        &GONE_MANIFEST.replace("gone", "later"),
+        &GONE_NOTE
+            .replace("Gone Note", "Later Note")
+            .replace("permalink: gone-note", "permalink: later-note"),
+    );
+
+    // Its rows land through a throwaway engine over the same store, so the
+    // engine under test is never told the name by anything but the file.
+    let config_path = root.join("config.yaml");
+    let mut with_later: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    with_later
+        .domains
+        .insert("later".to_string(), DomainEntry::file(later));
+    let indexer = Engine::new(
+        store.clone(),
+        with_later.clone(),
+        None,
+        Some(config_path.clone()),
+    );
+    indexer.sync(Some("later")).await.unwrap();
+    drop(indexer);
+    crystalline_core::config::save_yaml(&config_path, &with_later).unwrap();
+
+    // As stale as a stamp gets. Only the registration saves it.
+    let ancient = plant_stamp(&store, "later", chrono::Duration::days(400)).await;
+    let before = engrams_of(&store, "later").await.unwrap();
+    assert!(before >= 2, "it has rows to lose: {before}");
+
+    for (label, grace) in [
+        ("the sweep", Some(chrono::Duration::days(7))),
+        ("the person", None),
+    ] {
+        let report = engine.collect_orphaned_domains(grace, false).await.unwrap();
+        assert!(
+            !collected(&report).contains(&"later".to_string()),
+            "{label}: a domain the file registers is not collected: {report}"
+        );
+        assert!(
+            considered(&report, "later").is_none(),
+            "{label}: it is not even a candidate: {report}"
+        );
+        assert_eq!(
+            engrams_of(&store, "later").await,
+            Some(before),
+            "{label}: and it keeps every row"
+        );
+    }
+    assert_ne!(
+        stamp_of(&store, "later").await.expect("it is stamped"),
+        ancient,
+        "the sweep stamped it as the registration it is"
+    );
+}
+
+/// A shared database: several instances registering different domains against
+/// one index. A domain this instance has no registration for may be another
+/// instance's current work, and another instance's live registration is a
+/// registration - so a live host lock keeps the rows on the sweep's path and on
+/// the person's alike, because neither of them is the peer that would know.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_a_live_peer_hosts_is_kept_on_both_paths() {
+    let (tmp, engine, store) = fixture().await;
+    plant_host_lock(
+        &store,
+        "gone",
+        &tmp.path().join("gone"),
+        chrono::Duration::seconds(5),
+    )
+    .await;
+    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    for (label, grace) in [
+        ("the sweep", Some(chrono::Duration::days(7))),
+        ("the person", None),
+    ] {
+        let report = engine.collect_orphaned_domains(grace, false).await.unwrap();
+        assert!(
+            collected(&report).is_empty(),
+            "{label}: a live peer's domain is not this instance's to collect: {report}"
+        );
+        assert_eq!(
+            considered(&report, "gone").expect("it is reported")["kept"],
+            "hosted_elsewhere",
+            "{label}: and the report says which rule kept it: {report}"
+        );
+        assert_eq!(
+            engrams_of(&store, "gone").await,
+            Some(before),
+            "{label}: every row survives"
+        );
+    }
+}
+
+/// The other half of the same rule: a host lock nobody has heartbeated within
+/// the stale threshold is a lock a claim would take over, so it defends
+/// nothing. With no registration here either, the usual rules apply and the
+/// rows go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_whose_host_lock_went_stale_is_collected() {
+    let (tmp, engine, store) = fixture().await;
+    plant_host_lock(
+        &store,
+        "gone",
+        &tmp.path().join("gone"),
+        chrono::Duration::days(1),
+    )
+    .await;
+    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    assert!(engrams_of(&store, "gone").await.unwrap() >= 2);
+
+    let report = engine
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collected(&report),
+        vec!["gone".to_string()],
+        "a dead peer's lock keeps nothing alive: {report}"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(0),
+        "its rows are gone and its domain row is not"
+    );
 }

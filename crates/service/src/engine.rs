@@ -36,10 +36,10 @@ use crystalline_core::{
 };
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind,
-    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, FactObservation,
-    Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES,
-    RecentFilter, SearchMode, SearchQuery, ShareFacts, Store, SweepInput, SweepOptions,
+    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
+    EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
+    FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
+    RULES, RecentFilter, SearchMode, SearchQuery, ShareFacts, Store, SweepInput, SweepOptions,
     SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
     is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
     retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
@@ -1852,6 +1852,39 @@ impl Engine {
             }
         }
         Ok(claim)
+    }
+
+    /// Whether another instance holds this domain's host lock and is still
+    /// heartbeating on it, as of `now`.
+    ///
+    /// The liveness rule is [`Engine::claim_file_host`]'s, not a second one:
+    /// a heartbeat older than `stale_secs` is stale, and a takeover is exactly
+    /// what a claim would be allowed to do at that point. Read through the
+    /// threshold rather than through a lexical `stale_before` string because
+    /// this compares one instant rather than filtering a query, and a parse
+    /// that fails is read as live - the direction that keeps rows.
+    ///
+    /// Only [`Engine::collect_orphaned_domains`] asks. On a shared database
+    /// several instances register different domains against one index, so a
+    /// domain this instance has no registration for may be another's current
+    /// work, and another instance's live registration is a registration.
+    fn hosted_elsewhere(&self, row: &DomainStats, now: DateTime<Utc>) -> bool {
+        let Some(holder) = row.host_instance_id.as_deref().filter(|h| !h.is_empty()) else {
+            return false;
+        };
+        if holder == self.instance_id {
+            return false;
+        }
+        let Some(beat) = row.host_heartbeat_at.as_deref() else {
+            return false;
+        };
+        match DateTime::parse_from_rfc3339(beat) {
+            Ok(beat) => {
+                now.signed_duration_since(beat.with_timezone(&Utc))
+                    <= Duration::seconds(self.stale_secs)
+            }
+            Err(_) => true,
+        }
     }
 
     /// Claim the host lock for a file domain by name (resolving its root and
@@ -10246,7 +10279,12 @@ impl Engine {
     ///   version that stranded its rows has nothing but `None` stamps, which
     ///   must clear on first contact rather than a week after it.
     ///
-    /// One condition holds on both paths and is never waived: the domain is
+    /// Two conditions hold on both paths and are never waived. The domain is
+    /// **not hosted by a live peer**: on a shared database several instances
+    /// register different domains against one index, so a domain with another
+    /// instance's host lock on it and a heartbeat inside the stale threshold is
+    /// another instance's current work, and its registration is a registration
+    /// (`kept: "hosted_elsewhere"`). And the domain is
     /// **absent from the configuration**, resolved through
     /// [`Engine::registered_domain_names_checked`] - the three tiers a *named*
     /// lookup resolves through, so a domain the file gained after startup is
@@ -10259,17 +10297,32 @@ impl Engine {
     /// considered, which is what makes a week of the machine being off, or of
     /// this process being read-only, cost nothing.
     ///
-    /// Three domains are reported and never collected, on either path. A
+    /// Domains that are reported and never collected, on either path. A
     /// **virtual** domain's engram rows are not a derived copy of files on
     /// disk, they are the knowledge itself - `domain_remove` refuses to drop
     /// them without an explicit purge, and this answers nobody's confirmation,
     /// so it reports one (`"kept": "virtual"`) and leaves the removal to the
-    /// person and that command. A domain with **no engram rows** has nothing to
-    /// collect. A **read-only** instance collects nothing at all, and still
-    /// answers what it would have collected.
+    /// person and that command. A domain **hosted by a live peer** belongs to
+    /// that peer. A domain with **no engram rows** has nothing to collect.
+    ///
+    /// A **read-only** instance keeps every candidate, each reading
+    /// `kept: "read_only"`: it reports the age of each one, and deliberately
+    /// not a judgement about it, since the judgement is a decision it could not
+    /// carry out. It does stamp its registered domains, which is index
+    /// maintenance rather than a content write, and on a shared database is the
+    /// only thing standing between the domains it serves and a peer's sweep.
+    ///
+    /// The virtual guard reads `DomainStats::kind`, which is the index's own
+    /// column and the only workable source (an orphan is by definition absent
+    /// from the configuration). `DomainKind::from_stored` resolves an
+    /// unrecognized string to `File`, which for a caller that deletes is the
+    /// unsafe direction; it is unreachable while both backends pin the column
+    /// `NOT NULL DEFAULT 'file'`, and this is the caller that would notice
+    /// first if that ever changed.
     ///
     /// `dry_run` writes nothing whatsoever - no removal and no stamp - and
-    /// reports the same set a real run would collect, on both paths.
+    /// reports the same set a real run would collect, on both paths. It is the
+    /// only argument that silences the stamp.
     ///
     /// The domain row itself always stays, exactly as `domain_remove` leaves
     /// it, so nothing downstream sees a dangling reference. The routing cache
@@ -10301,8 +10354,9 @@ impl Engine {
     ///
     /// `considered` holds one row per unregistered domain the index knows - a
     /// registered one is not a candidate and never appears. A row that was kept
-    /// carries `kept`, one of `virtual`, `no_rows`, `grace`, `unstamped` or
-    /// `read_only`, for a caller that branches on it, and a `reason` in words
+    /// carries `kept`, one of `virtual`, `hosted_elsewhere`, `no_rows`,
+    /// `grace`, `unstamped` or `read_only`, for a caller that branches on it,
+    /// and a `reason` in words
     /// for one that prints. `grace_seconds` is `null` when a person asked, and
     /// `on_demand` says the same thing as a boolean. `skipped` is present only
     /// when the whole sweep declined to collect.
@@ -10312,10 +10366,16 @@ impl Engine {
         dry_run: bool,
     ) -> Result<Value> {
         let now = Utc::now();
-        // A dry run and a read-only instance write nothing at all: not a
-        // removal, and not a stamp either, so a preview cannot move a clock
-        // the caller is only asking about.
-        let writes = !dry_run && !self.read_only;
+        // A dry run writes nothing at all: not a removal, and not a stamp
+        // either, so a preview cannot move a clock the caller is only asking
+        // about. A read-only instance is the other way round: it stamps and it
+        // never removes. Stamping is index maintenance, which read-only mode
+        // does not gate (see the field's own comment, and the host-lock rows a
+        // read-only instance already writes) - and on a shared database it is
+        // the only defence a read-only peer has for the domains it registers,
+        // since another instance's sweep ages them out otherwise.
+        let stamps = !dry_run;
+        let removes = !dry_run && !self.read_only;
 
         let Some(registered) = self.registered_domain_names_checked() else {
             return Ok(json!({
@@ -10337,7 +10397,7 @@ impl Engine {
         // considered. A registered domain that went unstamped would age like
         // a removed one, and for a caller that collects on the stamp that is
         // data loss.
-        let stamped = if writes {
+        let stamped = if stamps {
             let names: Vec<&str> = registered.iter().map(String::as_str).collect();
             let store = self.store.lock().await;
             store.stamp_registered(&names, &now.to_rfc3339()).await?;
@@ -10378,6 +10438,12 @@ impl Engine {
                     "a virtual domain's engram rows are its only copy; end it with \
                      'domain remove --purge', which asks first",
                 ))
+            } else if self.hosted_elsewhere(row, now) {
+                Some((
+                    "hosted_elsewhere",
+                    "another instance holds this domain's host lock and is still \
+                     heartbeating; its registration is a registration",
+                ))
             } else if row.engrams == 0 {
                 Some(("no_rows", "no engram rows to collect"))
             } else {
@@ -10392,7 +10458,7 @@ impl Engine {
                             start_clock.push(row.name.clone());
                             Some((
                                 "unstamped",
-                                if writes {
+                                if stamps {
                                     "never seen registered before; its clock starts now"
                                 } else {
                                     "never seen registered before; a real run would start its \
@@ -10409,7 +10475,7 @@ impl Engine {
             let collect = kept.is_none();
             if collect {
                 collected.push(row.name.clone());
-                if writes {
+                if removes {
                     // The id the way `domain_remove` resolves it, with the
                     // row's own path and kind so the upsert updates nothing:
                     // the domain row must come through this exactly as it
@@ -10452,7 +10518,7 @@ impl Engine {
             considered.push(entry);
         }
 
-        if writes && !start_clock.is_empty() {
+        if stamps && !start_clock.is_empty() {
             let names: Vec<&str> = start_clock.iter().map(String::as_str).collect();
             let store = self.store.lock().await;
             store.stamp_registered(&names, &now.to_rfc3339()).await?;
