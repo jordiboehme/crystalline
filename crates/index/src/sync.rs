@@ -919,6 +919,13 @@ pub async fn reindex_domains(
         }) else {
             continue;
         };
+        // The marker is stamped and the lock is released: this is the state a
+        // reader sees for most of a rebuild, and the only state in which the
+        // marker is observable at all. Held open on request so a test can
+        // observe it instead of racing it - see `rebuild_hold`.
+        if force && let Some(hold) = rebuild_hold() {
+            tokio::time::sleep(hold).await;
+        }
         let scan = scan_domain(name, root, snapshot, chunk_params, force)
             .await
             .map_err(|e| in_domain("reindex", name, e))?;
@@ -954,6 +961,36 @@ pub async fn reindex_domains(
         tracing::debug!("reindex: the tail WAL checkpoint did not run: {e}");
     }
     Ok(applied.into_iter().map(|(_, report)| report).collect())
+}
+
+/// How long a forced rebuild holds between stamping a domain's marker and
+/// walking its files, from `CRYSTALLINE_TEST_REBUILD_HOLD_MS`, or `None`.
+///
+/// A test-only seam, named `TEST` for the same reason
+/// `CRYSTALLINE_TEST_POSTGRES_URL` is: it is not a knob an install is meant to
+/// set and nothing documents it as one. It exists because the window this
+/// opens - the marker stamped, the store lock released, the walk not yet
+/// finished - is the whole point of the design and is invisible from outside
+/// the process that is rebuilding. The test that proves a daemon keeps
+/// answering during a rebuild, and that `ctl status` shows the marker while it
+/// does, has to observe that window from a third process; without a hold it
+/// samples a window that a small corpus can close inside one polling lap, and
+/// a test that observes a race is a test that flakes.
+///
+/// Read once per process and cached, so the ordinary path pays one relaxed
+/// load and no environment lookup per domain. An unset, empty or unparsable
+/// value is `None`, so a malformed knob holds nothing rather than failing a
+/// rebuild, and a hold only ever happens under `force`, where a marker exists
+/// to be observed.
+fn rebuild_hold() -> Option<Duration> {
+    static HOLD: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::env::var("CRYSTALLINE_TEST_REBUILD_HOLD_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
 }
 
 /// Name the domain a multi-domain run failed in, keeping the failure itself as

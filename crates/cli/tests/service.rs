@@ -279,9 +279,27 @@ impl Mcp {
         }
     }
 
+    /// Spawn an `mcp` client, and with it the daemon it starts, carrying one
+    /// extra environment variable.
+    ///
+    /// The daemon inherits this process's environment, so a knob the *daemon*
+    /// has to see has to be set here, where it is started, and not on the `ctl`
+    /// client that later asks it to do the work. The only user is the rebuild
+    /// hold, below.
+    fn spawn_with_env(env: &Env, key: &str, value: &str) -> Mcp {
+        Mcp::spawn_configured(env, false, Some((key, value)))
+    }
+
     fn spawn_inner(env: &Env, read_only: bool) -> Mcp {
+        Mcp::spawn_configured(env, read_only, None)
+    }
+
+    fn spawn_configured(env: &Env, read_only: bool, extra: Option<(&str, &str)>) -> Mcp {
         let mut cmd = Command::new(bin());
         env.apply(&mut cmd);
+        if let Some((key, value)) = extra {
+            cmd.env(key, value);
+        }
         cmd.arg("mcp");
         if read_only {
             cmd.arg("--read-only");
@@ -604,10 +622,19 @@ fn watcher_indexes_external_write_without_duplicates() {
 /// keeps answering the whole time, from the rows it had before the rebuild
 /// started, and says out loud that a rebuild is in flight.
 ///
-/// The corpus is deliberately large enough that the rebuild takes long enough to
-/// be observed from another process. The "never an empty page" assertion holds
-/// at every instant regardless of scheduling, so it cannot flake, only
-/// under-sample; the two observation flags are what the corpus size buys.
+/// The window is made deterministic rather than raced for. The daemon is
+/// started with `CRYSTALLINE_TEST_REBUILD_HOLD_MS`, which the shared reindex
+/// driver honours after it stamps a domain's marker and before it walks the
+/// domain's files - exactly the state the two observation flags below are
+/// looking for. The knob goes on the *daemon*, not on the `ctl` client that
+/// asks for the rebuild, because the daemon is the process that runs the
+/// driver. Without it the flags sample a window a 600-engram rebuild can close
+/// inside one polling lap, which is a race, and a test that observes a race is
+/// a test that flakes.
+///
+/// The corpus stays large, because the "never an empty page" assertion wants
+/// laps to sample and that one is about what a reader sees at every instant,
+/// not about the hold.
 #[test]
 fn the_daemon_keeps_answering_during_a_full_reindex() {
     let env = Env::new("rbld");
@@ -631,7 +658,10 @@ fn the_daemon_keeps_answering_during_a_full_reindex() {
     let total_before = search_total(&env);
     assert_eq!(total_before, ENGRAMS as u64, "the corpus is indexed");
 
-    let mut c1 = Mcp::spawn(&env);
+    // The daemon runs the driver, so the hold is set here, where the daemon is
+    // started. Comfortably above two polling laps, so the state the flags are
+    // looking for cannot close between two samples of it.
+    let mut c1 = Mcp::spawn_with_env(&env, "CRYSTALLINE_TEST_REBUILD_HOLD_MS", "800");
     c1.initialize();
     env.wait_ready();
 
@@ -647,6 +677,7 @@ fn the_daemon_keeps_answering_during_a_full_reindex() {
 
     let mut saw_live_activity = false;
     let mut saw_marker = false;
+    let started = Instant::now();
     loop {
         let finished = rebuild.try_wait().unwrap().is_some();
         // One read and one status per lap, both through the daemon that is
@@ -685,6 +716,11 @@ fn the_daemon_keeps_answering_during_a_full_reindex() {
     assert!(
         saw_marker,
         "ctl status reported the domain's rebuild marker while it ran"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "the daemon honoured the hold, so the window above was held open rather than caught: {:?}",
+        started.elapsed()
     );
 
     // And afterwards: the marker is gone and the rows are all still there.
