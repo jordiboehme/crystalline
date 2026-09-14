@@ -2340,8 +2340,8 @@ impl Engine {
     /// The row is chunkless, which is the same shape the journal restore
     /// writes, so the two paths produce one thing rather than two: a deletion's
     /// text does not belong in the embedding backlog, and an actor who deletes
-    /// a draft they had been writing must not leave that draft's chunks behind
-    /// - [`Store::upsert_overlay`] keeps the row id stable across rewrites, so
+    /// a draft they had been writing must not leave that draft's chunks behind.
+    /// [`Store::upsert_overlay`] keeps the row id stable across rewrites, so
     /// the chunks are cleared explicitly rather than left keyed to it.
     async fn write_overlay_tombstone(
         &self,
