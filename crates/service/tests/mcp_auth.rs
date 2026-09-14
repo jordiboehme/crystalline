@@ -90,12 +90,12 @@ async fn build_engine_with(
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
-    let engine = Arc::new(Engine::new(
-        Arc::new(Mutex::new(store)),
-        cfg,
-        None,
-        Some(config_path),
-    ));
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            // `remove_domain` sweeps the overlay journal under the state
+            // directory, and that sweep removes a folder tree.
+            .with_state_dir(root.join("state")),
+    );
     engine.sync(None).await.unwrap();
     (tmp, engine)
 }

@@ -10198,6 +10198,69 @@ impl Engine {
         Ok(counted)
     }
 
+    /// What private drafts a removal would end, as `[{ actor, entries }]`
+    /// ordered by actor, plus whether the count could be read at all.
+    ///
+    /// **Counted from the overlay journal, not from the index rows**, and the
+    /// reason is what a preview is allowed to do rather than what is most
+    /// authoritative. `Store::overlay_counts` takes a `DomainId`, and the only
+    /// way to resolve one is `upsert_domain` - a write, in a verb that answers
+    /// a question and must stay answerable on a read-only instance. The mirror
+    /// is written with every draft row and swept with them, so the two agree
+    /// wherever it matters; where they do not, the mirror is the copy that
+    /// would have survived the removal, which is the loss worth naming.
+    ///
+    /// An empty list means nobody is drafting here. A journal that could not
+    /// even be located answers `(empty, true)`, and the caller says which.
+    fn removal_drafts(&self, name: &str) -> (Vec<Value>, bool) {
+        let Ok(state_dir) = self.journal_state_dir() else {
+            return (Vec::new(), true);
+        };
+        let mut per_actor: BTreeMap<String, u64> = BTreeMap::new();
+        for entry in crate::overlay_journal::journal_entries(&state_dir, name) {
+            *per_actor.entry(entry.actor).or_default() += 1;
+        }
+        let rows = per_actor
+            .into_iter()
+            .map(|(actor, entries)| json!({ "actor": actor, "entries": entries }))
+            .collect();
+        (rows, false)
+    }
+
+    /// Sweep a domain's overlay journal as part of ending it, answering with
+    /// how many mirrored drafts went.
+    ///
+    /// Best effort, like [`Engine::forget_domain_records`] beside it and for
+    /// the same reason: by the time this runs the rows are already cleared, and
+    /// answering with an error would tell the caller their removal did not
+    /// happen when it did. A journal that could not be removed is logged, and
+    /// nothing restores from it either way - [`Engine::restore_overlays`]
+    /// refuses a domain nobody registers.
+    async fn sweep_domain_journal(&self, name: &str) -> u64 {
+        let state_dir = match self.journal_state_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    error = format!("{e:#}"),
+                    "the overlay journal for '{name}' could not be located and was not swept"
+                );
+                return 0;
+            }
+        };
+        match crate::overlay_journal::journal_remove_domain(&state_dir, name) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    error = format!("{e:#}"),
+                    "the overlay journal for '{name}' could not be swept; the drafts it mirrors                      are unreachable (nothing restores into an unregistered domain) but the                      folder is left on disk"
+                );
+                0
+            }
+        }
+    }
+
     /// Whether `name` is a domain the environment defines, as the conflict both
     /// surfaces answer with.
     ///
@@ -10277,9 +10340,16 @@ impl Engine {
         }
         let entry = self.domain_entry(name)?;
         let engrams = self.removal_engrams(name, &entry, purge).await?;
+        let (drafts, drafts_unknown) = self.removal_drafts(name);
         Ok(json!({
             "domain": name,
             "kind": Engine::removal_kind(&entry),
+            "drafts": drafts,
+            // The same distinction `engrams_unknown` draws, for the same
+            // reason: nobody drafting here and "the journal could not be
+            // located" are different answers to a question about somebody's
+            // unshared work.
+            "drafts_unknown": drafts_unknown,
             "engrams": engrams.as_json(),
             // Why the count is absent, so the question can say which: an index
             // that could not be read is a number that exists and is
@@ -10357,8 +10427,14 @@ impl Engine {
         };
         let mut report = self.domain_remove(name).await?;
         self.forget_domain_records(name).await;
+        // The rows are cleared; the mirror that would bring them back goes with
+        // them. A domain's removal takes every actor's drafts with it, and
+        // leaving the journal behind would mean a domain re-added under this
+        // name resurrecting somebody's old private drafts into it.
+        let drafts_swept = self.sweep_domain_journal(name).await;
         if let Value::Object(map) = &mut report {
             map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
+            map.insert("drafts_swept".to_string(), Value::from(drafts_swept));
         }
         Ok(report)
     }
@@ -10672,6 +10748,19 @@ impl Engine {
         // clock starting, not a claim that they are registered.
         let mut start_clock: Vec<String> = Vec::new();
 
+        // How many drafts the journal mirrors for one domain. `None` from the
+        // state directory reads as nothing mirrored, which is the narrow answer:
+        // a sweep that cannot see the journal keeps a domain rather than
+        // collecting one.
+        let journal_dir = self.journal_state_dir().ok();
+        let mirrored = |name: &str| -> u64 {
+            journal_dir
+                .as_deref()
+                .map(|dir| crate::overlay_journal::journal_entries(dir, name).len() as u64)
+                .unwrap_or(0)
+        };
+
+        let mut drafts_swept: u64 = 0;
         for row in stats.iter().filter(|d| !registered.contains(&d.name)) {
             let age = row
                 .last_registered
@@ -10702,7 +10791,15 @@ impl Engine {
                     "another instance holds this domain's host lock and is still \
                      heartbeating; its registration is a registration",
                 ))
-            } else if row.engrams == 0 {
+            } else if row.engrams == 0 && mirrored(&row.name) == 0 {
+                // `DomainStats::engrams` counts base rows only, so a domain
+                // holding nothing but one actor's private drafts reads as empty
+                // here. It is not: it holds rows the removal would clear and a
+                // mirror that would restore them, so it goes down the same age
+                // ladder as any other domain rather than being kept forever as
+                // having nothing to collect. Counted from the journal because
+                // the row count is the one thing a candidate's id cannot be
+                // resolved for without writing, and a dry run writes nothing.
                 Some(("no_rows", "no engram rows to collect"))
             } else {
                 match grace {
@@ -10744,6 +10841,12 @@ impl Engine {
                     store.clear_domain(id).await?;
                     drop(store);
                     engrams_removed += row.engrams;
+                    // This path never goes through `unregister_domain`, so the
+                    // journal sweep is repeated here rather than inherited. A
+                    // mirror left behind for a collected domain is worse than a
+                    // leak: the drafts would come back on the next sync for a
+                    // domain nobody registers.
+                    drafts_swept += self.sweep_domain_journal(&row.name).await;
                     let age_text = match age {
                         Some(age) => format!("last seen registered {} days ago", age.num_days()),
                         None => "never seen registered".to_string(),
@@ -10764,6 +10867,11 @@ impl Engine {
                 "domain": row.name,
                 "kind": if matches!(row.kind, DomainKind::Virtual) { "virtual" } else { "file" },
                 "engrams": row.engrams,
+                // Beside the engram count rather than folded into it: they are
+                // different knowledge. `engrams` is what the domain's files
+                // say, `drafts` is what people hold privately on top of it, and
+                // a domain can have none of the first and some of the second.
+                "drafts": mirrored(&row.name),
                 "last_registered": row.last_registered,
                 "age_seconds": age.map(|a| a.num_seconds()),
                 "age_days": age.map(|a| a.num_days()),
@@ -10791,6 +10899,7 @@ impl Engine {
             "considered": considered,
             "collected": collected,
             "engrams_removed": engrams_removed,
+            "drafts_swept": drafts_swept,
         });
         if self.read_only {
             // Each path says exactly what it did. A read-only instance stamps

@@ -333,8 +333,8 @@ pub fn journal_remove_domain(state_dir: &Path, domain: &str) -> io::Result<u64> 
 /// The write verbs that come to journal drafts have to store them the same way.
 ///
 /// **A tombstone is rebuilt from the base row it deletes.** Its mirror carries
-/// no content of its own - what it records is that this actor deleted this path
-/// - so the row comes back standing at that path under the base row's own
+/// no content of its own (what it records is that this actor deleted this
+/// path), so the row comes back standing at that path under the base row's own
 /// identity, carrying the base's stored content and none of its child rows: a
 /// deletion contributes no observations and no edges to the actor who made it.
 /// A tombstone whose base is not there is skipped and its entry left alone:

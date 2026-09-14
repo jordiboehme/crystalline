@@ -3637,7 +3637,47 @@ fn remove_domain_question(preview: &Value) -> String {
              them; the registration and the search index rows go."
         }
     };
-    format!("Unregister the {kind} domain '{domain}'{held}? {consequence}")
+    format!(
+        "Unregister the {kind} domain '{domain}'{held}? {consequence}{}",
+        removal_drafts_clause(preview)
+    )
+}
+
+/// What the removal question says about the private drafts it would end, or
+/// nothing at all when there are none.
+///
+/// The drafts are the half of a removal that is really lost. A file domain's
+/// markdown stays on disk and a team domain's repository is never touched, but
+/// an actor's draft of a path lives in the index and in its mirror under the
+/// state directory and nowhere else, so ending the domain ends the drafts -
+/// including other people's, which is why the sentence names them per actor
+/// rather than as one number.
+fn removal_drafts_clause(preview: &Value) -> String {
+    if preview["drafts_unknown"].as_bool().unwrap_or(false) {
+        return " Whether anyone holds private drafts here could not be read.".to_string();
+    }
+    let Some(rows) = preview["drafts"].as_array().filter(|r| !r.is_empty()) else {
+        return String::new();
+    };
+    let total: u64 = rows
+        .iter()
+        .map(|r| r["entries"].as_u64().unwrap_or_default())
+        .sum();
+    let per_actor: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{} ({})",
+                r["actor"].as_str().unwrap_or("someone"),
+                r["entries"].as_u64().unwrap_or_default()
+            )
+        })
+        .collect();
+    let plural = if total == 1 { "" } else { "s" };
+    format!(
+        " It also ends {total} private draft{plural} - {} - which live in this index alone and          cannot be brought back.",
+        per_actor.join(", ")
+    )
 }
 
 /// Whether a share plan has to be confirmed before it runs, given the plan's
@@ -4365,6 +4405,61 @@ mod tests {
             "and it still spells out what the removal costs: {unreadable}"
         );
         assert!(!unreadable.contains("holding"), "{unreadable}");
+    }
+
+    /// Private drafts are the half of a removal nobody can get back: a file
+    /// domain's markdown stays on disk and a team's repository is untouched,
+    /// but an actor's draft lives in the index and its mirror alone, and the
+    /// removal takes both. So the question names them, per actor, before
+    /// anybody answers it.
+    #[test]
+    fn the_removal_question_names_the_private_drafts_it_would_end() {
+        let with = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "file",
+            "engrams": 4,
+            "drafts": [
+                { "actor": "alice", "entries": 2 },
+                { "actor": "bob", "entries": 1 },
+            ],
+            "drafts_unknown": false,
+            "files_kept": true,
+        }));
+        assert!(with.contains("3 private draft"), "{with}");
+        assert!(
+            with.contains("alice (2)") && with.contains("bob (1)"),
+            "{with}"
+        );
+        assert!(
+            with.contains("cannot be brought back"),
+            "the drafts are the part that is really lost: {with}"
+        );
+
+        // Nobody drafting here says nothing at all: the question stays the
+        // sentence it was.
+        let without = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "file",
+            "engrams": 4,
+            "drafts": [],
+            "drafts_unknown": false,
+            "files_kept": true,
+        }));
+        assert!(!without.contains("draft"), "{without}");
+
+        // And a journal that could not be read is said, not guessed at.
+        let unknown = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "file",
+            "engrams": 4,
+            "drafts": [],
+            "drafts_unknown": true,
+            "files_kept": true,
+        }));
+        assert!(
+            unknown.contains("could not be read"),
+            "an unreadable journal is not the same answer as nobody drafting: {unknown}"
+        );
     }
 
     #[test]

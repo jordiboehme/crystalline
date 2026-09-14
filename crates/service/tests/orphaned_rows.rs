@@ -82,7 +82,8 @@ async fn fixture() -> (tempfile::TempDir, Arc<Engine>, Arc<Mutex<dyn Store>>) {
 
     let store: Arc<Mutex<dyn Store>> =
         Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
-    let indexed = Engine::new(store.clone(), both.clone(), None, Some(config_path.clone()));
+    let indexed = Engine::new(store.clone(), both.clone(), None, Some(config_path.clone()))
+        .with_state_dir(root.join("state"));
     indexed.sync(None).await.unwrap();
     drop(indexed);
 
@@ -91,12 +92,13 @@ async fn fixture() -> (tempfile::TempDir, Arc<Engine>, Arc<Mutex<dyn Store>>) {
     only_keep.domains.shift_remove("gone");
     crystalline_core::config::save_yaml(&config_path, &only_keep).unwrap();
 
-    let engine = Arc::new(Engine::new(
-        store.clone(),
-        only_keep,
-        None,
-        Some(config_path),
-    ));
+    let engine = Arc::new(
+        Engine::new(store.clone(), only_keep, None, Some(config_path))
+            // A collection sweeps the overlay journal under the state
+            // directory, and that sweep removes a folder tree: without this
+            // every test here would be deleting under the developer's own.
+            .with_state_dir(root.join("state")),
+    );
     (tmp, engine, store)
 }
 
@@ -125,7 +127,9 @@ async fn clean_fixture() -> (tempfile::TempDir, Arc<Engine>) {
 
     let store: Arc<Mutex<dyn Store>> =
         Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
-    let engine = Arc::new(Engine::new(store, cfg, None, Some(config_path)));
+    let engine = Arc::new(
+        Engine::new(store, cfg, None, Some(config_path)).with_state_dir(root.join("state")),
+    );
     engine.sync(None).await.unwrap();
     (tmp, engine)
 }
@@ -798,7 +802,8 @@ async fn a_domain_the_config_file_gains_is_registered_and_served() {
         with_later.clone(),
         None,
         Some(config_path.clone()),
-    );
+    )
+    .with_state_dir(root.join("state"));
     indexer.sync(Some("later")).await.unwrap();
     drop(indexer);
 
@@ -1114,7 +1119,9 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
     let (tmp, _engine, store) = fixture().await;
     let config_path = tmp.path().join("config.yaml");
     let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path)).with_read_only(true);
+    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path))
+        .with_read_only(true)
+        .with_state_dir(tmp.path().join("state"));
     plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
     let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
@@ -1160,7 +1167,9 @@ async fn a_read_only_preview_says_nothing_was_changed() {
     let (tmp, _engine, store) = fixture().await;
     let config_path = tmp.path().join("config.yaml");
     let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path)).with_read_only(true);
+    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path))
+        .with_read_only(true)
+        .with_state_dir(tmp.path().join("state"));
     let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
     let before = engrams_of(&store, "gone").await.unwrap();
 
@@ -1342,7 +1351,9 @@ async fn a_virtual_orphan_is_virtual_even_on_a_read_only_instance() {
     let (tmp, _engine, store) = fixture().await;
     let config_path = tmp.path().join("config.yaml");
     let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path)).with_read_only(true);
+    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path))
+        .with_read_only(true)
+        .with_state_dir(tmp.path().join("state"));
     store
         .lock()
         .await
@@ -1534,7 +1545,8 @@ async fn a_domain_registered_only_in_the_config_file_is_stamped_and_never_collec
         with_later.clone(),
         None,
         Some(config_path.clone()),
-    );
+    )
+    .with_state_dir(root.join("state"));
     indexer.sync(Some("later")).await.unwrap();
     drop(indexer);
     crystalline_core::config::save_yaml(&config_path, &with_later).unwrap();

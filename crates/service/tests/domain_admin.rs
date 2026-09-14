@@ -48,12 +48,13 @@ async fn engine() -> (tempfile::TempDir, Arc<Engine>) {
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
-    let engine = Arc::new(Engine::new(
-        Arc::new(Mutex::new(store)),
-        cfg,
-        None,
-        Some(config_path),
-    ));
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            // The removal verbs sweep the overlay journal under the state
+            // directory, and that sweep removes a folder tree: without this
+            // every test here would be deleting under the developer's own.
+            .with_state_dir(root.join("state")),
+    );
     engine.sync(None).await.unwrap();
     (tmp, engine)
 }
@@ -538,7 +539,8 @@ async fn engine_with_github() -> (tempfile::TempDir, Arc<Engine>) {
     let engine = Arc::new(
         Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
             .with_token_store_dir(root.join("tokens"))
-            .with_connect_auth(Arc::new(support::StubConnectAuth::accepting("octo"))),
+            .with_connect_auth(Arc::new(support::StubConnectAuth::accepting("octo")))
+            .with_state_dir(root.join("state")),
     );
     engine.sync(None).await.unwrap();
     (tmp, engine)
@@ -617,12 +619,10 @@ async fn the_domain_listing_is_sorted_by_name() {
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
-    let engine = Arc::new(Engine::new(
-        Arc::new(Mutex::new(store)),
-        cfg,
-        None,
-        Some(config_path),
-    ));
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
 
     let listing = engine
         .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
@@ -669,12 +669,10 @@ async fn engine_over(
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open(path).await.unwrap();
-    Arc::new(Engine::new(
-        Arc::new(Mutex::new(store)),
-        cfg,
-        None,
-        Some(config_path),
-    ))
+    Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    )
 }
 
 /// Break `domain_stats` on an already-migrated database, leaving every other
