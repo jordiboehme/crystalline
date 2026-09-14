@@ -843,3 +843,389 @@ async fn a_domain_the_config_file_gains_is_registered_and_served() {
         "and still not for the removed one: {hits}"
     );
 }
+
+// --- collection after the grace period ---------------------------------------
+//
+// Part A stops serving an orphan's rows; it never removes one. This is the
+// half that removes them, and it is the only code in this file that deletes
+// anything, so every test below asserts what SURVIVED as well as what went.
+//
+// The rule in one line: a domain the configuration does not name, whose stamp
+// says it has been gone longer than the grace period, loses its engram rows and
+// keeps its domain row. Absence from the configuration is necessary and never
+// sufficient - the stamp has to be stale too - and a configuration that could
+// not be read proves no absence at all.
+
+/// Stamp `name` as last seen registered `ago` before now, the way a daemon
+/// sweep that ran then would have left it. Returns the instant written.
+async fn plant_stamp(store: &Arc<Mutex<dyn Store>>, name: &str, ago: chrono::Duration) -> String {
+    let when = (chrono::Utc::now() - ago).to_rfc3339();
+    store
+        .lock()
+        .await
+        .stamp_registered(&[name], &when)
+        .await
+        .unwrap();
+    when
+}
+
+/// The engram count the index holds for `name`, and `None` when the domain has
+/// no row at all - the difference between "cleared" and "gone", which
+/// collection must never blur.
+async fn engrams_of(store: &Arc<Mutex<dyn Store>>, name: &str) -> Option<i64> {
+    store
+        .lock()
+        .await
+        .domain_stats()
+        .await
+        .unwrap()
+        .iter()
+        .find(|d| d.name == name)
+        .map(|d| d.engrams)
+}
+
+/// The `last_registered` stamp the index holds for `name`.
+async fn stamp_of(store: &Arc<Mutex<dyn Store>>, name: &str) -> Option<String> {
+    store
+        .lock()
+        .await
+        .domain_stats()
+        .await
+        .unwrap()
+        .iter()
+        .find(|d| d.name == name)
+        .and_then(|d| d.last_registered.clone())
+}
+
+/// The names in a report's `collected` list.
+fn collected(report: &serde_json::Value) -> Vec<String> {
+    report["collected"]
+        .as_array()
+        .unwrap_or_else(|| panic!("'collected' is an array here: {report}"))
+        .iter()
+        .map(|n| {
+            n.as_str()
+                .expect("a collected name is a string")
+                .to_string()
+        })
+        .collect()
+}
+
+/// The `considered` row for one domain, or `None` when the sweep did not
+/// consider it.
+fn considered<'a>(report: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    report["considered"]
+        .as_array()
+        .unwrap_or_else(|| panic!("'considered' is an array here: {report}"))
+        .iter()
+        .find(|row| row["domain"] == name)
+}
+
+/// The case the accumulation defect is: rows whose domain nobody has named in
+/// the configuration for longer than the grace period, and which nothing short
+/// of a full reindex would ever have removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_unregistered_past_the_grace_period_is_collected() {
+    let (_tmp, engine, store) = fixture().await;
+    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+    assert!(before >= 2, "the orphan starts with its rows: {before}");
+
+    let report = engine
+        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collected(&report),
+        vec!["gone".to_string()],
+        "the stale orphan is the one collected: {report}"
+    );
+    assert_eq!(
+        report["engrams_removed"], before,
+        "and the report counts the rows it removed: {report}"
+    );
+    let row = considered(&report, "gone").expect("the orphan is reported");
+    assert_eq!(row["collected"], true, "reported as collected: {report}");
+    assert!(
+        row["age_days"].as_i64().unwrap() >= 13,
+        "with the age that justified it: {report}"
+    );
+
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(0),
+        "its engram rows are gone and its domain row is not"
+    );
+    assert!(
+        engrams_of(&store, "keep").await.unwrap() >= 2,
+        "the registered domain is untouched"
+    );
+}
+
+/// Absence from the configuration is necessary and never sufficient: a domain
+/// unregistered by hand at noon does not cost a resync by evening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_unregistered_for_an_hour_is_not_collected() {
+    let (_tmp, engine, store) = fixture().await;
+    plant_stamp(&store, "gone", chrono::Duration::hours(1)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let report = engine
+        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .await
+        .unwrap();
+
+    assert!(
+        collected(&report).is_empty(),
+        "an hour is not a week: {report}"
+    );
+    let row = considered(&report, "gone").expect("it is still reported as considered");
+    assert_eq!(row["collected"], false, "and reported as kept: {report}");
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "its rows are all still there"
+    );
+}
+
+/// A registered domain is never a candidate, whatever its stamp says - and the
+/// stamp is refreshed before anything is considered, which is what makes a week
+/// of a machine being off, or of a read-only instance, safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registered_domain_is_never_collected_whatever_its_stamp() {
+    let (_tmp, engine, store) = fixture().await;
+    let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
+    let before = engrams_of(&store, "keep").await.unwrap();
+
+    let report = engine
+        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .await
+        .unwrap();
+
+    assert!(
+        !collected(&report).contains(&"keep".to_string()),
+        "a registered domain is not collected: {report}"
+    );
+    assert!(
+        considered(&report, "keep").is_none(),
+        "it is not even a candidate: {report}"
+    );
+    assert_eq!(
+        engrams_of(&store, "keep").await,
+        Some(before),
+        "and it keeps every row"
+    );
+    let now = stamp_of(&store, "keep").await.expect("it is stamped");
+    assert_ne!(
+        now, ancient,
+        "the sweep stamped it before it considered anything"
+    );
+}
+
+/// `None` means never stamped, not stamped infinitely long ago. Every row an
+/// upgrade inherits reads `None`, so the first sweep after one starts the clock
+/// and collects nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_never_stamped_domain_is_stamped_now_and_not_collected() {
+    let (_tmp, engine, store) = fixture().await;
+    assert_eq!(
+        stamp_of(&store, "gone").await,
+        None,
+        "the inherited row carries no stamp"
+    );
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let report = engine
+        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .await
+        .unwrap();
+
+    assert!(
+        collected(&report).is_empty(),
+        "no evidence of age is no licence to delete: {report}"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "its rows survive the sweep"
+    );
+    assert!(
+        stamp_of(&store, "gone").await.is_some(),
+        "and it leaves the sweep with a clock running, or it would be immortal"
+    );
+}
+
+/// A dry run answers the question and writes nothing at all: not a removal, not
+/// a stamp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dry_run_reports_the_same_set_and_removes_nothing() {
+    let (_tmp, engine, store) = fixture().await;
+    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let dry = engine
+        .collect_orphaned_domains(chrono::Duration::days(7), true)
+        .await
+        .unwrap();
+    assert_eq!(dry["dry_run"], true, "the report says which it was: {dry}");
+    assert_eq!(
+        collected(&dry),
+        vec!["gone".to_string()],
+        "it names what a real run would collect: {dry}"
+    );
+    assert_eq!(
+        dry["engrams_removed"], 0,
+        "and removed nothing to say it: {dry}"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "the rows are where they were"
+    );
+    assert_eq!(
+        stamp_of(&store, "keep").await,
+        None,
+        "and a preview did not stamp the registered domain either"
+    );
+
+    let wet = engine
+        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        collected(&wet),
+        collected(&dry),
+        "the real run collects the set the preview named: {wet}"
+    );
+    assert_eq!(wet["engrams_removed"], before, "this time for real: {wet}");
+    assert_eq!(engrams_of(&store, "gone").await, Some(0));
+}
+
+/// A read-only instance collects nothing and says so, rather than refusing: a
+/// caller asking what is collectable still gets the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_collects_nothing_and_says_so() {
+    let (tmp, _engine, store) = fixture().await;
+    let config_path = tmp.path().join("config.yaml");
+    let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path)).with_read_only(true);
+    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let report = read_only
+        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .await
+        .unwrap();
+
+    assert_eq!(report["read_only"], true, "it says which it is: {report}");
+    assert!(
+        report["skipped"]
+            .as_str()
+            .is_some_and(|s| s.contains("read-only")),
+        "in words, and with the reason: {report}"
+    );
+    assert!(
+        collected(&report).is_empty(),
+        "and collects nothing: {report}"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "the rows are untouched"
+    );
+    assert_eq!(
+        stamp_of(&store, "keep").await,
+        None,
+        "and nothing was stamped either"
+    );
+}
+
+/// The configuration is the evidence of absence. When it cannot be read there
+/// is no such evidence, so the sweep establishes no registered set, collects
+/// nothing, stamps nothing and names the reason - both when the file is
+/// unparseable and when it is not there at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_configuration_collects_nothing() {
+    let (tmp, engine, store) = fixture().await;
+    let config_path = tmp.path().join("config.yaml");
+    plant_stamp(&store, "gone", chrono::Duration::days(13)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    for (case, prepare) in [
+        ("unparseable", 0u8),
+        // Absent counts too: a configuration that is not there is
+        // indistinguishable from one in which every domain was just removed.
+        ("absent", 1u8),
+    ] {
+        if prepare == 0 {
+            std::fs::write(&config_path, "domains: [this is not: yaml\n  - at all\n").unwrap();
+        } else {
+            std::fs::remove_file(&config_path).unwrap();
+        }
+
+        let report = engine
+            .collect_orphaned_domains(chrono::Duration::days(7), false)
+            .await
+            .unwrap();
+
+        assert!(
+            collected(&report).is_empty(),
+            "{case}: an unreadable configuration proves no absence: {report}"
+        );
+        assert!(
+            report["skipped"]
+                .as_str()
+                .is_some_and(|s| s.contains("configuration")),
+            "{case}: and the report names it: {report}"
+        );
+        assert_eq!(
+            engrams_of(&store, "gone").await,
+            Some(before),
+            "{case}: every row survives"
+        );
+        assert_eq!(
+            stamp_of(&store, "keep").await,
+            None,
+            "{case}: and nothing was stamped, since nothing was known to be registered"
+        );
+    }
+}
+
+/// A virtual domain's rows are not a derived copy of anything: they are the
+/// knowledge. `domain_remove` already refuses to drop them without an explicit
+/// purge, and an unattended sweep can obtain no such confirmation, so it
+/// reports one and collects it never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_domains_rows_are_never_collected() {
+    let (_tmp, engine, store) = fixture().await;
+    // The orphan, with its kind flipped in the index: rows whose only copy is
+    // the database, and no registration anywhere.
+    store
+        .lock()
+        .await
+        .upsert_domain("gone", None, crystalline_core::config::DomainKind::Virtual)
+        .await
+        .unwrap();
+    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+    assert!(before >= 2, "it has rows to lose: {before}");
+
+    let report = engine
+        .collect_orphaned_domains(chrono::Duration::days(7), false)
+        .await
+        .unwrap();
+
+    assert!(
+        collected(&report).is_empty(),
+        "no age makes a virtual domain collectable: {report}"
+    );
+    let row = considered(&report, "gone").expect("it is reported rather than hidden");
+    assert_eq!(row["kind"], "virtual", "named as what it is: {report}");
+    assert_eq!(row["collected"], false);
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "and its only copy is still there"
+    );
+}

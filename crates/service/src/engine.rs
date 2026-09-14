@@ -2092,12 +2092,23 @@ impl Engine {
     /// deliberately does neither. Keep the two together: they read the same
     /// file the same way and only differ in what they do with the answer.
     fn reread_config(&self) -> Option<GlobalConfig> {
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
-            None => crystalline_core::config::global_config_path().ok()?,
-        };
+        let path = self.config_file_path()?;
         let file = overlay::load_file(&path).ok()?;
         Some(self.overlay.apply(&file))
+    }
+
+    /// The configuration file this engine reads and persists to: its
+    /// `--config` override, else the default global path. `None` when the
+    /// default path cannot be resolved at all (no home directory to put it
+    /// in), which is the one case where there is no file to speak of.
+    ///
+    /// Says nothing about whether the file exists or parses; a caller that
+    /// needs to know reads it.
+    fn config_file_path(&self) -> Option<PathBuf> {
+        match &self.config_path {
+            Some(p) => Some(p.clone()),
+            None => crystalline_core::config::global_config_path().ok(),
+        }
     }
 
     /// The file domains a diagnostic read covers, as `(name, root)` pairs:
@@ -2170,6 +2181,37 @@ impl Engine {
             names.extend(fresh.domains.keys().cloned());
         }
         names
+    }
+
+    /// [`Engine::registered_domain_names`] for the one caller that may not
+    /// accept a narrowed answer: `None` when the configuration file could not
+    /// be read, `Some` of the same three-tier union when it could.
+    ///
+    /// The difference is the whole point. Serving narrows on an unreadable
+    /// file and is right to: the worst it costs is a domain that is not
+    /// answered for until the file is readable again. A caller that DELETES on
+    /// absence cannot narrow, because a file it could not read is not evidence
+    /// that anything is absent from it - and a file that is not there at all
+    /// is indistinguishable from one in which every domain was just removed.
+    /// So a missing file is `None` here as surely as an unparseable one, even
+    /// though [`overlay::load_file`] reads a missing file as an empty
+    /// configuration (which is the right answer for every other caller: an
+    /// installation configured entirely by environment variables has no file
+    /// and is not misconfigured).
+    ///
+    /// Still the union of all three tiers, never the file alone: the file is
+    /// not a superset of the startup snapshot, and a domain registered in the
+    /// snapshot is registered.
+    fn registered_domain_names_checked(&self) -> Option<HashSet<String>> {
+        let path = self.config_file_path()?;
+        if !path.is_file() {
+            return None;
+        }
+        let file = overlay::load_file(&path).ok()?;
+        let fresh = self.overlay.apply(&file);
+        let mut names: HashSet<String> = self.known_domain_names().into_iter().collect();
+        names.extend(fresh.domains.keys().cloned());
+        Some(names)
     }
 
     /// Every domain name this engine has been *told* about: the startup
@@ -10173,6 +10215,221 @@ impl Engine {
             "files_kept": files_kept,
             "index_cleared": true,
         }))
+    }
+
+    /// Drop the engram rows of every domain that has been unregistered for
+    /// longer than `grace`, and report every domain considered.
+    ///
+    /// `domain_remove` clears a domain's rows as it unregisters it, so nothing
+    /// this instance removes ever becomes an orphan. This is for the rows that
+    /// got past that: a removal on a version that left them behind, a
+    /// configuration hand-edited or restored from a backup, an index carried
+    /// between machines. They are already unserved (a row whose domain nobody
+    /// registered is not a hit, not a count and not a facet value), so this
+    /// costs nothing to defer and the grace period is a matter of disk.
+    ///
+    /// Two conditions, and both are necessary:
+    ///
+    /// 1. **Absent from the configuration**, resolved through
+    ///    [`Engine::registered_domain_names_checked`] - the three tiers a
+    ///    *named* lookup resolves through, so a domain the file gained after
+    ///    startup is registered here as it is everywhere else. A configuration
+    ///    that could not be read (unparseable, or not there) is not evidence of
+    ///    absence: the sweep then establishes no registered set, stamps nothing,
+    ///    collects nothing and says so in `skipped`.
+    /// 2. **Last seen registered longer ago than `grace`.** Absence alone never
+    ///    suffices, so a configuration edited by hand at noon does not cost a
+    ///    resync by evening. `last_registered` reading `None` is *never
+    ///    stamped*, not *stamped infinitely long ago*: such a domain has its
+    ///    clock started on this sweep and is collected on no sweep that could
+    ///    not already see its age. Every row an upgrade inherits reads `None`,
+    ///    so the first sweep after one collects nothing.
+    ///
+    /// Every registered domain is stamped *first*, before anything is
+    /// considered, which is what makes a week of the machine being off, or of
+    /// this process being read-only, cost nothing.
+    ///
+    /// Three domains are reported and never collected. A **virtual** domain's
+    /// engram rows are not a derived copy of files on disk, they are the
+    /// knowledge itself - `domain_remove` already refuses to drop them without
+    /// an explicit purge, and an unattended sweep can obtain no such
+    /// confirmation. A domain with **no engram rows** has nothing to collect. A
+    /// **read-only** instance collects nothing at all, and still answers what
+    /// it would have collected.
+    ///
+    /// `dry_run` writes nothing whatsoever - no removal and no stamp - and
+    /// reports the same set a real run would collect.
+    ///
+    /// The domain row itself always stays, exactly as `domain_remove` leaves
+    /// it, so nothing downstream sees a dangling reference. The routing cache
+    /// is deliberately not refreshed: it is built from registered domains, and
+    /// every domain touched here has been unregistered for a week.
+    ///
+    /// The report:
+    ///
+    /// ```json
+    /// {
+    ///   "grace_seconds": 604800,
+    ///   "dry_run": false,
+    ///   "read_only": false,
+    ///   "stamped": 2,
+    ///   "considered": [
+    ///     { "domain": "gone", "kind": "file", "engrams": 30,
+    ///       "last_registered": "2026-09-01T09:00:00+00:00",
+    ///       "age_seconds": 1123200, "age_days": 13, "collected": true }
+    ///   ],
+    ///   "collected": ["gone"],
+    ///   "engrams_removed": 30
+    /// }
+    /// ```
+    ///
+    /// `considered` holds one row per unregistered domain the index knows -
+    /// a registered one is not a candidate and never appears - and a row that
+    /// was kept carries a `reason` saying why. `skipped` is present only when
+    /// the whole sweep declined to collect.
+    pub async fn collect_orphaned_domains(&self, grace: Duration, dry_run: bool) -> Result<Value> {
+        let now = Utc::now();
+        // A dry run and a read-only instance write nothing at all: not a
+        // removal, and not a stamp either, so a preview cannot move a clock
+        // the caller is only asking about.
+        let writes = !dry_run && !self.read_only;
+
+        let Some(registered) = self.registered_domain_names_checked() else {
+            return Ok(json!({
+                "grace_seconds": grace.num_seconds(),
+                "dry_run": dry_run,
+                "read_only": self.read_only,
+                "stamped": 0,
+                "considered": [],
+                "collected": [],
+                "engrams_removed": 0,
+                "skipped": "the configuration could not be read, and a domain cannot be shown \
+                            absent from a file nobody can read; nothing was stamped and nothing \
+                            collected",
+            }));
+        };
+
+        // The registered set is stamped FIRST, before a single domain is
+        // considered. A registered domain that went unstamped would age like
+        // a removed one, and for a caller that collects on the stamp that is
+        // data loss.
+        let stamped = if writes {
+            let names: Vec<&str> = registered.iter().map(String::as_str).collect();
+            let store = self.store.lock().await;
+            store.stamp_registered(&names, &now.to_rfc3339()).await?;
+            names.len()
+        } else {
+            0
+        };
+
+        let stats = {
+            let store = self.store.lock().await;
+            store.domain_stats().await?
+        };
+
+        let mut considered: Vec<Value> = Vec::new();
+        let mut collected: Vec<String> = Vec::new();
+        let mut engrams_removed: i64 = 0;
+        // Unregistered domains that have never been stamped. They are not in
+        // the registered set, so the call above cannot reach them, and without
+        // a second one they would read `None` forever and never age at all -
+        // which would leave every row an upgrade inherits immortal. This is a
+        // clock starting, not a claim that they are registered.
+        let mut start_clock: Vec<String> = Vec::new();
+
+        for row in stats.iter().filter(|d| !registered.contains(&d.name)) {
+            let age = row
+                .last_registered
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|seen| now.signed_duration_since(seen.with_timezone(&Utc)));
+
+            let reason: Option<&str> = if self.read_only {
+                Some("this instance is read-only")
+            } else if matches!(row.kind, DomainKind::Virtual) {
+                Some(
+                    "a virtual domain's engram rows are its only copy, and no sweep drops \
+                     knowledge nobody confirmed",
+                )
+            } else if row.engrams == 0 {
+                Some("no engram rows to collect")
+            } else {
+                match age {
+                    None => {
+                        start_clock.push(row.name.clone());
+                        Some(if writes {
+                            "never seen registered before; its clock starts now"
+                        } else {
+                            "never seen registered before; a real run would start its clock now"
+                        })
+                    }
+                    Some(age) if age < grace => Some("within the grace period"),
+                    Some(_) => None,
+                }
+            };
+
+            let collect = reason.is_none();
+            if collect {
+                collected.push(row.name.clone());
+                if writes {
+                    // The id the way `domain_remove` resolves it, with the
+                    // row's own path and kind so the upsert updates nothing:
+                    // the domain row must come through this exactly as it
+                    // went in.
+                    let path = Some(row.path.as_str()).filter(|p| !p.is_empty());
+                    let store = self.store.lock().await;
+                    let id = store.upsert_domain(&row.name, path, row.kind).await?;
+                    store.clear_domain(id).await?;
+                    drop(store);
+                    engrams_removed += row.engrams;
+                    let days = age.map_or(0, |a| a.num_days());
+                    tracing::info!(
+                        domain = row.name.as_str(),
+                        engrams = row.engrams,
+                        age_days = days,
+                        "collected {} engram rows of '{}', unregistered for {} days",
+                        row.engrams,
+                        row.name,
+                        days
+                    );
+                }
+            }
+
+            let mut entry = json!({
+                "domain": row.name,
+                "kind": if matches!(row.kind, DomainKind::Virtual) { "virtual" } else { "file" },
+                "engrams": row.engrams,
+                "last_registered": row.last_registered,
+                "age_seconds": age.map(|a| a.num_seconds()),
+                "age_days": age.map(|a| a.num_days()),
+                "collected": collect,
+            });
+            if let Some(reason) = reason {
+                entry["reason"] = json!(reason);
+            }
+            considered.push(entry);
+        }
+
+        if writes && !start_clock.is_empty() {
+            let names: Vec<&str> = start_clock.iter().map(String::as_str).collect();
+            let store = self.store.lock().await;
+            store.stamp_registered(&names, &now.to_rfc3339()).await?;
+        }
+
+        let mut report = json!({
+            "grace_seconds": grace.num_seconds(),
+            "dry_run": dry_run,
+            "read_only": self.read_only,
+            "stamped": stamped,
+            "considered": considered,
+            "collected": collected,
+            "engrams_removed": engrams_removed,
+        });
+        if self.read_only {
+            report["skipped"] =
+                json!("this instance is read-only; nothing was stamped and nothing collected");
+        }
+        Ok(report)
     }
 
     // --- origin (GitHub collaboration) ----------------------------------------
