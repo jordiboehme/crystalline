@@ -862,22 +862,60 @@ mod tests {
         )
     }
 
-    /// A domain root and an origin state directory whose base snapshot is
-    /// empty, so every file written into the root reads as unshared work.
+    /// A MANIFEST declaring `generated_indexes: {declared}`, or declaring
+    /// nothing when `declared` is `None`.
+    fn manifest_source(declared: Option<&str>) -> String {
+        let line = match declared {
+            Some(value) => format!("generated_indexes: {value}\n"),
+            None => String::new(),
+        };
+        format!(
+            "---\ntype: manifest\ntitle: KB\npermalink: manifest\nstatus: stable\n{line}---\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n"
+        )
+    }
+
+    /// A domain root and an origin state directory whose base snapshot holds
+    /// nothing but the domain's own MANIFEST, so every other file written into
+    /// the root reads as unshared work and the MANIFEST itself reads as no
+    /// change at all. The MANIFEST is there because the generated-index policy
+    /// is read from it: a domain without one keeps its listings local, which is
+    /// the default these tests are measured against.
     fn tracked_domain() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        tracked_domain_declaring(None)
+    }
+
+    /// [`tracked_domain`] whose MANIFEST declares `generated_indexes: shared`.
+    fn tracked_domain_sharing_indexes() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        tracked_domain_declaring(Some("shared"))
+    }
+
+    fn tracked_domain_declaring(declared: Option<&str>) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("domain");
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&root).unwrap();
-        OriginState::new("acme/kb".to_string(), "main".to_string())
-            .save(&state_dir)
-            .unwrap();
+        let manifest = manifest_source(declared);
+        std::fs::write(root.join("MANIFEST.md"), &manifest).unwrap();
+        let mut state = OriginState::new("acme/kb".to_string(), "main".to_string());
+        state.files.insert(
+            "MANIFEST.md".to_string(),
+            crystalline_remote::state::BaseStamp {
+                sha256: {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(manifest.as_bytes());
+                    crystalline_index::hex_lower(&hasher.finalize())
+                },
+                size: manifest.len() as u64,
+            },
+        );
+        state.save(&state_dir).unwrap();
         (dir, root, state_dir)
     }
 
     #[test]
     fn unshared_work_counts_real_work_and_leaves_the_listings_out() {
-        let (_dir, root, state_dir) = tracked_domain();
+        let (_dir, root, state_dir) = tracked_domain_sharing_indexes();
         std::fs::write(root.join("alpha.md"), engram_source("Alpha", None)).unwrap();
         std::fs::create_dir_all(root.join("runbooks")).unwrap();
         std::fs::write(root.join("index.md"), "# listing\n").unwrap();
@@ -987,7 +1025,7 @@ mod tests {
     /// change kind a caller cannot find any other way.
     #[test]
     fn local_change_detail_names_each_change_in_its_own_bucket() {
-        let (_dir, root, state_dir) = tracked_domain();
+        let (_dir, root, state_dir) = tracked_domain_sharing_indexes();
         std::fs::create_dir_all(root.join("runbooks")).unwrap();
         std::fs::write(root.join("added.md"), engram_source("Added", None)).unwrap();
         std::fs::write(root.join("modified.md"), engram_source("Modified", None)).unwrap();
@@ -1028,6 +1066,26 @@ mod tests {
             "naming the work and counting it are one measurement: {detail}"
         );
         assert_eq!(named, 3);
+    }
+
+    /// A domain that declares nothing keeps its listings at home, and "at
+    /// home" reaches every surface at once: they are not work, they are not
+    /// named, and they are not even counted as riding along, because with the
+    /// switch at `local` there is no change there to count.
+    #[test]
+    fn a_domain_that_keeps_its_listings_local_never_counts_them_at_all() {
+        let (_dir, root, state_dir) = tracked_domain();
+        std::fs::create_dir_all(root.join("runbooks")).unwrap();
+        std::fs::write(root.join("alpha.md"), engram_source("Alpha", None)).unwrap();
+        std::fs::write(root.join("index.md"), "# listing\n").unwrap();
+        std::fs::write(root.join("runbooks/index.md"), "# listing\n").unwrap();
+
+        let work = unshared_work(&root, &state_dir).expect("the domain has origin state");
+        assert_eq!(work.paths, vec!["alpha.md".to_string()]);
+
+        let detail = local_change_detail(&root, &state_dir).expect("the domain has origin state");
+        assert_eq!(detail["added"], json!(["alpha.md"]));
+        assert_eq!(detail["generated_indexes"], json!(0));
     }
 
     /// A domain whose tree matches its origin says so in three empty arrays,

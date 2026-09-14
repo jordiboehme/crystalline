@@ -93,6 +93,14 @@ fn manifest() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
+/// The same MANIFEST, declaring that this domain's generated folder listings
+/// travel with it. The default is `local`, so a scenario whose subject needs a
+/// listing in a share has to say so, the way a real team says it once in the
+/// file all of its members hold.
+fn manifest_sharing_indexes() -> Vec<u8> {
+    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+}
+
 fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
     format!(
         "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
@@ -1357,7 +1365,7 @@ async fn origin_status_detail_names_the_changes_and_the_default_still_only_count
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let commit = mock.add_commit(commit_files(&[
-        ("MANIFEST.md", manifest()),
+        ("MANIFEST.md", manifest_sharing_indexes()),
         ("notes/edit.md", engram("Edit", "edit", "the team's copy")),
         ("notes/gone.md", engram("Gone", "gone", "the team's copy")),
     ]));
@@ -1730,10 +1738,10 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
         .await
         .unwrap();
     assert_eq!(result["outcome"], "proposed");
-    assert_eq!(
-        result["added"],
-        serde_json::json!(["index.md", "notes/new.md"])
-    );
+    // The engram, and only the engram. The domain declares nothing, so its
+    // generated `index.md` - which the engine regenerated when the engram
+    // landed - stays on this machine.
+    assert_eq!(result["added"], serde_json::json!(["notes/new.md"]));
     assert!(
         result["url"].as_str().unwrap().starts_with("https://"),
         "{result}"
@@ -1760,6 +1768,49 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
 
     // Nothing local changed: a share never touches the working tree.
     assert!(root.join("notes/new.md").exists());
+}
+
+/// The same share for a domain that declares `generated_indexes: shared`: the
+/// listing the engine regenerated travels with the engram, which is what keeps
+/// a repository browsable on the forge for a team that wants that.
+#[tokio::test]
+async fn a_domain_that_declares_shared_listings_carries_its_index_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_indexes())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed");
+    assert_eq!(
+        result["added"],
+        serde_json::json!(["index.md", "notes/new.md"]),
+        "the declared policy is what puts the listing in the share: {result}"
+    );
 }
 
 /// The join the whole feature hangs on: the login `resolve_share_provider`
@@ -1874,7 +1925,7 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
 async fn a_preview_and_a_share_index_what_their_pull_applied() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
-    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_indexes())]));
     mock.set_branch("main", &c1);
 
     let config_path = tmp.path().join("config.yaml");
@@ -1910,7 +1961,7 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
 
     // Upstream gains a file. The preview's pull applies it.
     let c2 = mock.add_commit(commit_files(&[
-        ("MANIFEST.md", manifest()),
+        ("MANIFEST.md", manifest_sharing_indexes()),
         (
             "notes/upstream-one.md",
             engram("Upstream One", "upstream-one", "first upstream arrival"),
@@ -1955,7 +2006,7 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
 
     // And again for a share, whose own pull applies a second one.
     let c3 = mock.add_commit(commit_files(&[
-        ("MANIFEST.md", manifest()),
+        ("MANIFEST.md", manifest_sharing_indexes()),
         (
             "notes/upstream-one.md",
             engram("Upstream One", "upstream-one", "first upstream arrival"),

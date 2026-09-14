@@ -607,3 +607,55 @@ fn report_files(root: &Path) -> usize {
         .summary
         .files_scanned
 }
+
+// --- The generated_indexes frontmatter switch (M006) -------------------------
+
+/// A structurally valid harbor MANIFEST declaring `generated_indexes: value`,
+/// so the switch's rule fires in isolation from the other M-rules.
+fn manifest_declaring_indexes(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_unrecognized_generated_indexes_value_is_m006_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_indexes("true"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m006 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M006")
+        .expect("M006 present");
+    assert_eq!(m006.severity, Severity::Error);
+    assert!(m006.message.contains("generated_indexes: true"), "{m006:?}");
+    // The finding says which way the value was read, since reading it the
+    // other way is what a domain must never do by accident.
+    let help = m006.fix.clone().expect("fix");
+    assert!(help.contains("local"), "{help}");
+    assert!(help.contains("shared"), "{help}");
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn both_recognized_generated_indexes_values_are_clean() {
+    for value in ["local", "shared"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_indexes(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M006"),
+            "`{value}` is a policy, not a finding: {:?}",
+            report.issues
+        );
+    }
+}

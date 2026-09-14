@@ -8,9 +8,10 @@
 //! other file that lives alongside the engrams travels with the domain, not
 //! just markdown. Which paths take part at all is one predicate,
 //! [`participates_in_change_detection`], asked of the walk and of the base
-//! snapshot alike. This is pure detection with no side effects; a later task
-//! decides what to do with the result (open a share proposal, warn about
-//! files too large to share).
+//! snapshot alike. Detection has no side effects and reads nothing but the
+//! files it walks and, for the domain's own generated-index policy, its
+//! `MANIFEST.md`; a later task decides what to do with the result (open a
+//! share proposal, warn about files too large to share).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -150,6 +151,13 @@ impl LocalChanges {
 /// Detects local changes in `domain_root` relative to `base`, the base
 /// snapshot manifest from [`crate::state::OriginState::files`].
 ///
+/// The domain's generated-index policy is read from its own `MANIFEST.md`
+/// rather than passed in, and that is the point: a repository is shared by
+/// people who must not disagree about what a share contains, so no caller gets
+/// to choose. A domain that declares nothing keeps its indexes local. Pass the
+/// policy explicitly with [`detect_local_changes_with`] only where it is
+/// already known.
+///
 /// Walk rules, mirroring `crystalline_index::sync`'s conventions:
 ///
 /// - dot-files and dot-directories are skipped at any depth; the domain root
@@ -190,7 +198,11 @@ pub fn detect_local_changes(
     domain_root: &Path,
     base: &BTreeMap<String, BaseStamp>,
 ) -> Result<LocalChanges, RemoteError> {
-    detect_local_changes_with(domain_root, base, GeneratedIndexes::Shared)
+    detect_local_changes_with(
+        domain_root,
+        base,
+        crystalline_core::generated_indexes_at(domain_root),
+    )
 }
 
 /// [`detect_local_changes`] with the domain's generated-index policy supplied
@@ -963,9 +975,12 @@ mod tests {
 
     #[test]
     fn is_excluded_path_covers_hidden_paths_and_the_activity_log_but_not_the_index() {
-        // The generated directory index travels with a domain, at the root and
-        // anywhere below it, so the team repository stays browsable; the
-        // activity log never does, and neither does anything hidden.
+        // The fixed ingestion rule, the one a pull applies whatever the domain
+        // declares: a generated directory index comes down and is recorded,
+        // at the root and anywhere below it, so a domain that shares its
+        // listings has a base entry to measure the next one against and a
+        // domain that keeps them local has an inert row. The activity log
+        // never comes down, and neither does anything hidden.
         assert!(!is_excluded_path("index.md"));
         assert!(!is_excluded_path("runbooks/index.md"));
         assert!(is_excluded_path("log.md"));

@@ -1929,7 +1929,9 @@ async fn share_changes_tool_wires_through_to_origin_share() {
         .await
         .unwrap();
     assert_eq!(out["outcome"], json!("proposed"));
-    assert_eq!(out["added"], json!(["index.md", "notes/new.md"]));
+    // The engram alone: the domain declares nothing, so the regenerated
+    // folder listing stays on this machine.
+    assert_eq!(out["added"], json!(["notes/new.md"]));
     assert!(out["url"].as_str().unwrap().starts_with("https://"));
 }
 
@@ -2078,7 +2080,7 @@ async fn an_http_share_proceeds_on_the_configured_agent_identity() {
         .await
         .unwrap();
     assert_eq!(out["outcome"], json!("proposed"), "{out}");
-    assert_eq!(out["added"], json!(["index.md", "notes/new.md"]), "{out}");
+    assert_eq!(out["added"], json!(["notes/new.md"]), "{out}");
 }
 
 /// The `proposal` argument reaches the engine rather than being decoration on

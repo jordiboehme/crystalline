@@ -4423,8 +4423,18 @@ fn proposed(outcome: ProposeOutcome) -> crystalline_remote::ops::ProposeReport {
 async fn stacked_bottom_layer(
     mock: &MockProvider,
 ) -> (Subscribed, crystalline_remote::ops::ProposeReport) {
+    stacked_bottom_layer_with_manifest(mock, b"# Manifest").await
+}
+
+/// [`stacked_bottom_layer`] for a domain whose MANIFEST is `manifest`, so a
+/// scenario that needs a declared policy can have one without moving every
+/// other stack test onto it.
+async fn stacked_bottom_layer_with_manifest(
+    mock: &MockProvider,
+    manifest: &[u8],
+) -> (Subscribed, crystalline_remote::ops::ProposeReport) {
     let c1 = mock.add_commit(
-        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        commit_files(&[("MANIFEST.md", manifest), ("notes/a.md", b"alpha\n")]),
         None,
     );
     let (sub, _) = subscribe_at(mock, &c1).await;
@@ -7990,19 +8000,32 @@ async fn an_owed_link_to_a_dissolved_stack_recreates_it() {
 
 // --- generated folder indexes ------------------------------------------------
 //
-// A generated `index.md` travels with a domain so a team repository stays
-// browsable on the forge, and the local generator stays the single authority on
-// what it says. The five tests below pin both halves of that: an index is
-// detected, shared and stamped like any other file, and a pull records the
-// origin's copy without ever writing it over the local one - which is also what
-// makes an index structurally incapable of raising a conflict.
+// A generated `index.md` travels with a domain that asks for it, so a team
+// repository stays browsable on the forge, and the local generator stays the
+// single authority on what it says. Asking for it is
+// `generated_indexes: shared` in the MANIFEST every member shares; the default
+// is `local`, and the tests further down pin that side. The tests below pin
+// both halves of the `shared` side: an index is detected, shared and stamped
+// like any other file, and a pull records the origin's copy without ever
+// writing it over the local one - which is also what makes an index
+// structurally incapable of raising a conflict. A pull behaves that way under
+// either policy, which is why those two tests need no declaration at all.
+
+/// A MANIFEST declaring that this domain's generated folder listings travel
+/// with it. The default is `local`, so a scenario that pins an index being
+/// shared has to say so, exactly the way a real team says it once in the file
+/// all of its members hold.
+const SHARED_INDEXES_MANIFEST: &[u8] = b"---\ntype: manifest\ntitle: Knowledge\npermalink: manifest\nstatus: stable\ngenerated_indexes: shared\n---\n\n## Scope\n\n- The knowledge this domain holds\n\n## When to Use\n\n- When a question is about this domain\n";
 
 #[tokio::test]
 async fn a_generated_index_is_detected_and_shared_like_any_other_file() {
     let mock = MockProvider::new();
     let spec = share_spec();
     let c1 = mock.add_commit(
-        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        sub_commit_files(&[
+            ("MANIFEST.md", SHARED_INDEXES_MANIFEST),
+            ("notes/keep.md", b"keep\n"),
+        ]),
         None,
     );
     let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
@@ -8058,6 +8081,147 @@ async fn a_generated_index_is_detected_and_shared_like_any_other_file() {
     assert_eq!(recorded.change, ProposedChange::Added);
     assert_eq!(recorded.blob_sha, Some(sha256_hex(b"# Contents\n")));
     assert_eq!(recorded.size, Some(b"# Contents\n".len() as u64));
+}
+
+#[tokio::test]
+async fn an_upgraded_repository_proposes_nothing_about_the_indexes_it_already_carries() {
+    // Day one for every existing team repository: it carries index files
+    // committed before the switch existed, its MANIFEST declares nothing, so
+    // the policy is `local` and every one of those paths drops out of change
+    // detection on both sides at once.
+    //
+    // The listings stay in the repository and stay on disk. That is deliberate
+    // and somebody's to clean up by hand: a share must not offer to delete
+    // them, which is exactly what a one-sided exclusion would have done.
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", b"# Contents\n"),
+            ("notes/index.md", b"# Contents\n"),
+            ("notes/a.md", b"alpha\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The base snapshot really does record them: this is the shape the hazard
+    // needs, not a repository where the listings were never there.
+    let st = load_state(&sub.state_dir);
+    assert!(st.files.contains_key("index.md"));
+    assert!(st.files.contains_key("notes/index.md"));
+    assert_eq!(
+        read(&sub.domain_root.join("notes/index.md")),
+        b"# Contents\n"
+    );
+
+    // A local generator refreshes one listing, somebody deletes the other, and
+    // one engram is real work.
+    write(
+        &sub.domain_root.join("notes/index.md"),
+        b"# Contents, regenerated\n",
+    );
+    std::fs::remove_file(sub.domain_root.join("index.md")).unwrap();
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+
+    let standing = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(standing.local_changes, 1, "the engram is the only work");
+
+    let report = proposed(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(report.added, vec!["notes/b.md".to_string()]);
+    assert!(report.updated.is_empty(), "{:?}", report.updated);
+    assert!(
+        report.deleted.is_empty(),
+        "a listing that left the disk is not a deletion to propose: {:?}",
+        report.deleted
+    );
+    assert!(
+        !mock.proposal_request(1).unwrap().body.contains("index.md"),
+        "no listing is named in the proposal body"
+    );
+
+    // And the origin's copies are untouched in the proposed tree.
+    let branch_commit = mock.branch_commit(&report.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert_eq!(tree.get("index.md"), Some(&b"# Contents\n".to_vec()));
+    assert_eq!(tree.get("notes/index.md"), Some(&b"# Contents\n".to_vec()));
+}
+
+#[tokio::test]
+async fn a_locally_kept_index_stays_quiet_on_every_share_after_the_first() {
+    // The hazard is a standing one: an exclusion applied to the walk alone
+    // reports the same phantom deletion every time anybody asks, not once. So
+    // ask again, after a share has moved the base snapshot on.
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/index.md", b"# Contents\n"),
+            ("notes/a.md", b"alpha\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents, v2\n");
+    let first = proposed(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(first.updated, vec!["notes/a.md".to_string()]);
+    assert!(first.deleted.is_empty());
+
+    // The second share amends the proposal the first one opened, which is the
+    // point: it is measured against a base snapshot that has moved on.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents, v3\n");
+    let second = match propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap()
+    {
+        ProposeOutcome::Updated(r) => r,
+        other => panic!("expected Updated, got {other:?}"),
+    };
+    assert_eq!(second.updated, vec!["notes/a.md".to_string()]);
+    assert!(
+        second.deleted.is_empty(),
+        "still nothing to delete on the second share: {:?}",
+        second.deleted
+    );
+    assert_eq!(
+        recorded_paths(&sub.state_dir, second.number),
+        vec!["notes/a.md".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -8173,7 +8337,10 @@ async fn an_index_only_share_still_opens_a_proposal() {
     let mock = MockProvider::new();
     let spec = share_spec();
     let c1 = mock.add_commit(
-        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        sub_commit_files(&[
+            ("MANIFEST.md", SHARED_INDEXES_MANIFEST),
+            ("notes/keep.md", b"keep\n"),
+        ]),
         None,
     );
     let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
@@ -8228,7 +8395,10 @@ async fn a_shares_title_names_the_engrams_and_never_the_listings_beside_them() {
     let mock = MockProvider::new();
     let spec = share_spec();
     let c1 = mock.add_commit(
-        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        sub_commit_files(&[
+            ("MANIFEST.md", SHARED_INDEXES_MANIFEST),
+            ("notes/keep.md", b"keep\n"),
+        ]),
         None,
     );
     let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
@@ -8269,7 +8439,10 @@ async fn a_shares_title_names_the_engrams_and_never_the_listings_beside_them() {
 async fn a_status_counts_real_work_and_leaves_index_refreshes_out() {
     let mock = MockProvider::new();
     let c1 = mock.add_commit(
-        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        commit_files(&[
+            ("MANIFEST.md", SHARED_INDEXES_MANIFEST),
+            ("notes/a.md", b"alpha\n"),
+        ]),
         None,
     );
     let (sub, _) = subscribe_at(&mock, &c1).await;
@@ -8307,7 +8480,7 @@ async fn a_status_counts_real_work_and_leaves_index_refreshes_out() {
 async fn a_generated_index_replays_with_its_layer_like_any_other_file() {
     let mock = MockProvider::new();
     mock.enable_stacks();
-    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let (sub, first) = stacked_bottom_layer_with_manifest(&mock, SHARED_INDEXES_MANIFEST).await;
 
     // The top layer carries an engram and the folder listing that came with
     // it, so its record holds an index entry a replay has to rebuild from.
@@ -8573,7 +8746,7 @@ fn ops_signatures_carry_no_identity_types() {
 async fn two_folders_all_edited(mock: &MockProvider) -> Subscribed {
     let c1 = mock.add_commit(
         commit_files(&[
-            ("MANIFEST.md", b"# Manifest"),
+            ("MANIFEST.md", SHARED_INDEXES_MANIFEST),
             ("notes/a.md", b"alpha\n"),
             ("notes/index.md", b"# notes\n"),
             ("guides/g.md", b"guide\n"),
