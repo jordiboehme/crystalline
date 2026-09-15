@@ -934,6 +934,45 @@ pub enum PreviewCredential {
 /// --personal` with no `--as` writes exactly this slot.
 pub const OWNER_IDENTITY_NAME: &str = "owner";
 
+/// What one actor's drafts become when their domain stops reviewing changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldChoice {
+    /// Write them into the folder the team shares: a rewrite becomes the file,
+    /// a page only they had becomes a file the team has, and a deletion takes
+    /// the file away.
+    Fold,
+    /// End them where they are. The folder never hears about them, and nothing
+    /// brings them back.
+    Discard,
+}
+
+/// Whether a change of review mode is being asked about or made.
+///
+/// Leaving review mode is the direction that needs an answer per actor, so the
+/// two halves are not symmetric: a disable with no choices is the question, and
+/// turning review ON carries no choices at all, since there are no drafts yet
+/// for anybody to decide about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewModeConfirm {
+    /// Answer what this would do, and write nothing.
+    Preview,
+    /// Make the change, with one [`FoldChoice`] per actor holding drafts.
+    Confirmed {
+        /// Each actor holding drafts, and what happens to them. Every actor the
+        /// plan names has to be here, and nobody else.
+        folds: Vec<(String, FoldChoice)>,
+    },
+}
+
+/// One actor's drafts in a domain: the per-actor view the fold plan and the
+/// removal gate are both drawn from.
+pub(crate) struct ActorDrafts {
+    /// Whose drafts these are.
+    pub(crate) actor: String,
+    /// Their rows in this domain, ordered by path, tombstones included.
+    pub(crate) entries: Vec<crystalline_index::StoredEngram>,
+}
+
 /// What a write is told when it reaches a domain that reviews changes before
 /// they land and nobody can say whose draft it would join.
 ///
@@ -12341,6 +12380,543 @@ impl Engine {
         Ok(report)
     }
 
+    // --- review mode -------------------------------------------------------
+
+    /// Every actor's drafts in one domain, ordered by actor and by path.
+    ///
+    /// The one place a per-actor view of an overlay is derived, so the fold
+    /// plan below and Task 8's removal gate answer from the same rows rather
+    /// than each deriving their own. The rows are the authority and the journal
+    /// is their mirror: a draft whose mirror failed to land is still a draft its
+    /// author is holding (`write_overlay_entry` reports that as a warning and
+    /// keeps the row), and a plan read from the journal would quietly drop
+    /// exactly those.
+    pub(crate) async fn overlay_actor_drafts(
+        &self,
+        domain_id: DomainId,
+    ) -> Result<Vec<ActorDrafts>> {
+        let store = self.store.lock().await;
+        let mut out = Vec::new();
+        for (actor, _) in store.overlay_counts(domain_id).await? {
+            let entries = store.overlay_entries(domain_id, &actor).await?;
+            if entries.is_empty() {
+                continue;
+            }
+            out.push(ActorDrafts { actor, entries });
+        }
+        Ok(out)
+    }
+
+    /// Turn review mode on for a domain, or take it off and settle every
+    /// actor's drafts on the way out.
+    ///
+    /// **Turning it on** is a promise: from here on, a change to this domain
+    /// joins its author's own draft and reaches the folder the team shares only
+    /// through a reviewed proposal. Three things have to be true for that
+    /// promise to be keepable, and each refusal says which one is not:
+    ///
+    /// 1. **A GitHub origin.** Review with no proposal flow behind it is a gate
+    ///    with no door: the drafts would have nowhere to go and the mode would
+    ///    only stop people writing.
+    /// 2. **A folder, so not a virtual domain.** A virtual domain's engrams ARE
+    ///    its rows, so a fold would have nothing to land in.
+    /// 3. **Nothing unshared in the folder already.** Work already sitting in
+    ///    the tree went round no review at all, and turning the mode on over it
+    ///    would bless it silently. The refusal names the paths and says to share
+    ///    or revert them first. [`crate::origin::unshared_work`] answering
+    ///    `None` - no origin state recorded yet, or a tree that cannot be walked
+    ///    - is "nothing KNOWN to be unshared" rather than "clean", and it is
+    ///    read as permission: a domain connected but never pulled has no
+    ///    snapshot to compare against, and refusing every one of those would
+    ///    make the mode unreachable exactly where it is wanted.
+    ///
+    /// **Taking it off** ends every actor's private drafts, so it is never
+    /// decided by omission. [`ReviewModeConfirm::Preview`] answers the plan -
+    /// who holds what, which drafts are deletions, which paths more than one
+    /// actor is drafting and which drafts could not land - and writes nothing.
+    /// [`ReviewModeConfirm::Confirmed`] carries one [`FoldChoice`] per actor
+    /// holding drafts: an actor left out refuses naming them, and an actor named
+    /// who holds nothing refuses too, because both are somebody meaning a
+    /// different domain or a different moment.
+    ///
+    /// The order of the confirmed path is not free to rearrange, and it is the
+    /// removal's order with the same argument made about a different pair:
+    ///
+    /// 1. Every refusal is decided **inside** the domain-admin lock and the join
+    ///    fence, including the collision check, so nothing is written at all by
+    ///    a call that is going to refuse.
+    /// 2. The key comes off, and only then are the co-editing rooms swept
+    ///    ([`crate::collab::session::CollabSessions::dispose_domain`]). **That
+    ///    pair is the reason this step exists at all**: a room saves through
+    ///    [`Engine::save_engram`] as the machine owner, so a room swept while
+    ///    the domain is still reviewing lands its unsaved text in the OWNER's
+    ///    draft - a draft created after the plan was drawn, which no answer
+    ///    covers and which the fold would leave stranded in a domain that no
+    ///    longer reviews anything. Swept one instant later, the same save lands
+    ///    in the file, which is exactly what the removal path means by sweeping
+    ///    while the domain is still registered.
+    /// 3. The folds land as ordinary file writes and deletions, over the files
+    ///    those saves just landed in. Where a fold and a room are about the same
+    ///    path the fold is the last word, which is the answer the plan was
+    ///    confirmed for. Nothing writes an index row here: the sync at the end
+    ///    reads the tree the way it reads every other change to it.
+    /// 4. Every actor's rows and mirror go, folded and discarded alike, before
+    ///    the sync - both because the restore runs in every sync pass and would
+    ///    put a missed mirror straight back, and because a draft row still
+    ///    holding an address would meet the base row the fold just gave it to.
+    ///    They go over the overlay as it stands then, not as the plan found it,
+    ///    so a draft written into the window between the two is dropped rather
+    ///    than stranded.
+    /// 5. Then the domain syncs, which is what puts the folds in the index.
+    ///
+    /// A failure in the middle of step 3 leaves the domain taking changes
+    /// directly with part of its overlay folded, and the recovery is the same
+    /// call again: leaving review mode does not require the domain to be in it,
+    /// so a repeat picks up the drafts that are left and finishes.
+    ///
+    /// `folds` naming the same actor twice is refused rather than resolved:
+    /// two answers about one person's unshared work is a caller that does not
+    /// know what it is asking for.
+    pub async fn set_review_mode(
+        &self,
+        domain: &str,
+        mode: Option<crystalline_core::config::ReviewMode>,
+        confirm: ReviewModeConfirm,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let previewing = matches!(confirm, ReviewModeConfirm::Preview);
+        // Ahead of the guards, and only this one: its answer is the same for
+        // every caller and every name, so it discloses nothing. A preview is a
+        // read and is served on a read-only instance like every other read.
+        if self.read_only && !previewing {
+            return Err(EngineError::ReadOnly);
+        }
+        let _admin = self.domain_admin().await;
+        let _fence = self.fence_joins().await;
+        self.require_domain_owner(domain, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(domain) {
+            return Err(conflict);
+        }
+        let entry = self.domain_entry(domain)?;
+        match mode {
+            Some(crystalline_core::config::ReviewMode::Overlay) => {
+                self.enable_review_mode(domain, &entry, previewing).await
+            }
+            None => self.leave_review_mode(domain, &entry, confirm).await,
+        }
+    }
+
+    /// The enable half of [`Engine::set_review_mode`]: the three gates, then
+    /// the config key.
+    async fn enable_review_mode(
+        &self,
+        domain: &str,
+        entry: &DomainEntry,
+        previewing: bool,
+    ) -> Result<Value> {
+        let receipt = |applied: bool| {
+            json!({
+                "domain": domain,
+                "mode": "overlay",
+                "review": "overlay",
+                "applied": applied,
+            })
+        };
+        if entry.is_overlay() {
+            // Already what was asked for. Answered rather than refused, the way
+            // privatizing an already-private domain is: a PUT states a mode,
+            // and this one already holds.
+            return Ok(receipt(!previewing));
+        }
+        if entry.is_virtual() {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' is a virtual domain: its engrams live in the database and it \
+                 has no folder for a reviewed change to land in, so it cannot review changes. \
+                 Register the knowledge as a file domain connected to a GitHub repository first"
+            )));
+        }
+        if entry.origin.is_none() {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' has no GitHub origin, and review mode with nothing to propose \
+                 a reviewed change to is a gate with no door: connect it to a GitHub repository \
+                 first, then enable review"
+            )));
+        }
+        let Some(root) = entry.file_path() else {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' has no folder on this machine, so there is nothing here to \
+                 review changes to"
+            )));
+        };
+        let state_dir = self.origin_state_dir(domain)?;
+        if let Some(unshared) = crate::origin::unshared_work(&root, &state_dir)
+            && !unshared.paths.is_empty()
+        {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' has {} unshared change(s) in its folder that the team has not \
+                 reviewed: {}. Review mode is the promise that every change is reviewed before it \
+                 lands, and this work went round it, so share or revert these first, then enable \
+                 review",
+                unshared.paths.len(),
+                unshared.paths.join(", ")
+            )));
+        }
+        if previewing {
+            return Ok(receipt(false));
+        }
+        self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+        Ok(receipt(true))
+    }
+
+    /// The disable half of [`Engine::set_review_mode`]: the per-actor plan, and
+    /// the folds and discards that carry it out.
+    async fn leave_review_mode(
+        &self,
+        domain: &str,
+        entry: &DomainEntry,
+        confirm: ReviewModeConfirm,
+    ) -> Result<Value> {
+        let root = entry.file_path();
+        let domain_id = {
+            let store = self.store.lock().await;
+            store
+                .upsert_domain(
+                    domain,
+                    root.as_ref().map(|r| r.to_string_lossy()).as_deref(),
+                    if entry.is_virtual() {
+                        DomainKind::Virtual
+                    } else {
+                        DomainKind::File
+                    },
+                )
+                .await?
+        };
+        let drafts = self.overlay_actor_drafts(domain_id).await?;
+        let base = {
+            let store = self.store.lock().await;
+            store.list_engrams(domain, None, None).await?
+        };
+
+        let choices = match &confirm {
+            ReviewModeConfirm::Preview => {
+                return Ok(self.review_plan_json(domain, entry, &drafts, &base));
+            }
+            ReviewModeConfirm::Confirmed { folds } => folds,
+        };
+        let choices = Self::review_choices(domain, &drafts, choices)?;
+        let folding: Vec<&ActorDrafts> = drafts
+            .iter()
+            .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
+            .collect();
+        if let Some(refusal) = Self::fold_collision(domain, &folding, &base) {
+            return Err(refusal);
+        }
+
+        // The key comes off first, and then the rooms go, and that pair is the
+        // whole of step 2: see the ordering on [`Engine::set_review_mode`].
+        self.write_review_key(domain, None)?;
+        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
+            Some(sessions) => sessions.dispose_domain(domain).await,
+            None => 0,
+        };
+
+        let mut folded = Vec::new();
+        let mut discarded = Vec::new();
+        for held in &drafts {
+            match choices.get(&held.actor) {
+                Some(FoldChoice::Fold) => {
+                    let (mut written, mut deleted) = (0u64, 0u64);
+                    if let Some(root) = &root {
+                        for draft in &held.entries {
+                            let abs = join_rel(root, &draft.path);
+                            if draft.tombstone {
+                                match std::fs::remove_file(&abs) {
+                                    Ok(()) => deleted += 1,
+                                    // A deletion of a file that is already gone
+                                    // is the state the deletion asked for.
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(source) => {
+                                        return Err(EngineError::Io {
+                                            path: abs.display().to_string(),
+                                            source,
+                                        });
+                                    }
+                                }
+                            } else {
+                                write_file(&abs, &draft.content)?;
+                                written += 1;
+                            }
+                        }
+                    }
+                    folded.push(json!({
+                        "actor": held.actor,
+                        "written": written,
+                        "deleted": deleted,
+                    }));
+                }
+                _ => discarded.push(json!({
+                    "actor": held.actor,
+                    "entries": held.entries.len(),
+                })),
+            }
+        }
+
+        // Rows and mirror together, for every actor, and over the overlay as it
+        // stands NOW rather than as the plan found it: see step 4 of the
+        // ordering.
+        for held in self.overlay_actor_drafts(domain_id).await? {
+            for draft in &held.entries {
+                self.drop_overlay_entry(domain, domain_id, &held.actor, &draft.path)
+                    .await?;
+            }
+        }
+
+        // The folds are ordinary file writes, so the ordinary sync is what puts
+        // them in the index - and it refreshes the generated folder indexes on
+        // the way. The routing cache is not its job, and a folded MANIFEST is
+        // the domain's routing, so that one is refreshed here.
+        self.sync(Some(domain)).await?;
+        self.refresh_routing_cache().await;
+        self.nudge_embed();
+
+        Ok(json!({
+            "domain": domain,
+            "mode": "direct",
+            "review": Value::Null,
+            "applied": true,
+            "folded": folded,
+            "discarded": discarded,
+            "rooms_closed": rooms_closed,
+        }))
+    }
+
+    /// The plan a preview answers with, and the shape Task 8's removal gate
+    /// reads the same rows through.
+    ///
+    /// `conflict` on a draft is the choice-independent half: an address another
+    /// path already answers to, which no fold of that draft alone can avoid.
+    /// `contested_paths` is the other half, which depends on the answers: a path
+    /// two actors are drafting refuses only if both of them fold.
+    fn review_plan_json(
+        &self,
+        domain: &str,
+        entry: &DomainEntry,
+        drafts: &[ActorDrafts],
+        base: &[EngramDescriptor],
+    ) -> Value {
+        let mut by_path: HashMap<&str, Vec<&str>> = HashMap::new();
+        for held in drafts {
+            for draft in &held.entries {
+                by_path
+                    .entry(draft.path.as_str())
+                    .or_default()
+                    .push(held.actor.as_str());
+            }
+        }
+        let actors: Vec<Value> = drafts
+            .iter()
+            .map(|held| {
+                let rows: Vec<Value> = held
+                    .entries
+                    .iter()
+                    .map(|draft| {
+                        let conflict = (!draft.tombstone)
+                            .then(|| Self::address_held_elsewhere(draft, base))
+                            .flatten();
+                        json!({
+                            "path": draft.path,
+                            "permalink": draft.permalink,
+                            "tombstone": draft.tombstone,
+                            "conflict": conflict,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "actor": held.actor,
+                    "entries": held.entries.len(),
+                    "drafts": rows,
+                })
+            })
+            .collect();
+        let mut contested: Vec<Value> = by_path
+            .into_iter()
+            .filter(|(_, actors)| actors.len() > 1)
+            .map(|(path, mut actors)| {
+                actors.sort_unstable();
+                json!({ "path": path, "actors": actors })
+            })
+            .collect();
+        contested.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        json!({
+            "domain": domain,
+            "mode": "direct",
+            // What the domain says today, so a plan for a domain that has
+            // already stopped reviewing does not claim it still does.
+            "review": entry.is_overlay().then_some("overlay"),
+            "applied": false,
+            "actors": actors,
+            "contested_paths": contested,
+        })
+    }
+
+    /// The base engram, if any, that already answers to this draft's address at
+    /// a different path - the collision a fold of this draft alone cannot avoid.
+    fn address_held_elsewhere(
+        draft: &crystalline_index::StoredEngram,
+        base: &[EngramDescriptor],
+    ) -> Option<String> {
+        base.iter()
+            .find(|row| row.permalink == draft.permalink && row.path != draft.path)
+            .map(|row| {
+                format!(
+                    "the address '{}' already belongs to {} in the folder the team shares",
+                    draft.permalink, row.path
+                )
+            })
+    }
+
+    /// One choice per actor holding drafts, refusing an actor left out and an
+    /// actor named who holds nothing here.
+    fn review_choices(
+        domain: &str,
+        drafts: &[ActorDrafts],
+        folds: &[(String, FoldChoice)],
+    ) -> Result<HashMap<String, FoldChoice>> {
+        let mut chosen: HashMap<String, FoldChoice> = HashMap::new();
+        for (actor, choice) in folds {
+            if chosen.insert(actor.clone(), *choice).is_some() {
+                return Err(EngineError::Conflict(format!(
+                    "'{actor}' is named twice in this answer, once for each of two different \
+                     things to do with the same drafts; say what happens to them once"
+                )));
+            }
+        }
+        let holding: BTreeSet<&str> = drafts.iter().map(|d| d.actor.as_str()).collect();
+        let missing: Vec<&str> = holding
+            .iter()
+            .filter(|actor| !chosen.contains_key(**actor))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return Err(EngineError::ConfirmationRequired(format!(
+                "leaving review mode ends every private draft in domain '{domain}', and nothing \
+                 here says what happens to {}: their drafts live in this index alone. Say fold \
+                 (write them into the folder the team shares) or discard (end them) for each of \
+                 them, then answer again",
+                missing.join(", ")
+            )));
+        }
+        let strangers: Vec<&str> = chosen
+            .keys()
+            .map(String::as_str)
+            .filter(|actor| !holding.contains(actor))
+            .collect();
+        if !strangers.is_empty() {
+            let mut strangers = strangers;
+            strangers.sort_unstable();
+            return Err(EngineError::Conflict(format!(
+                "nobody is drafting in domain '{domain}' as {}, so there is nothing there to fold \
+                 or discard; ask for the plan again and answer the actors it names",
+                strangers.join(", ")
+            )));
+        }
+        Ok(chosen)
+    }
+
+    /// The one address rule of a fold, asked once over the whole batch: what the
+    /// folder would hold if every fold in this answer landed, refused at the
+    /// first path or address two engrams would share.
+    ///
+    /// Deliberately not [`Engine::refuse_permalink_held_elsewhere`], whose
+    /// tombstone exception is "a path THIS actor has deleted is free": that
+    /// holds for a draft written into one actor's own dimension and does not
+    /// transfer to a fold, where alice's deletion frees an address for bob only
+    /// if alice's deletion is being folded too. Here the deletions being folded
+    /// are exactly the ones that free anything.
+    fn fold_collision(
+        domain: &str,
+        folding: &[&ActorDrafts],
+        base: &[EngramDescriptor],
+    ) -> Option<EngineError> {
+        // Two actors folding one path: whoever went second would be the file,
+        // which is not an answer either of them gave.
+        let mut owner: HashMap<&str, &str> = HashMap::new();
+        for held in folding {
+            for draft in &held.entries {
+                if let Some(first) = owner.insert(draft.path.as_str(), held.actor.as_str()) {
+                    return Some(EngineError::Conflict(format!(
+                        "'{first}' and '{}' are both drafting {} in domain '{domain}', and only \
+                         one of them can be the file: fold one of them and discard the other, or \
+                         let them settle it between themselves first",
+                        held.actor, draft.path
+                    )));
+                }
+            }
+        }
+        // What the folder would answer to afterwards: the base rows, minus what
+        // a folded deletion takes away, plus every folded draft.
+        let mut address: HashMap<&str, &str> = HashMap::new();
+        for row in base {
+            let deleted = folding.iter().any(|held| {
+                held.entries
+                    .iter()
+                    .any(|draft| draft.tombstone && draft.path == row.path)
+            });
+            if !deleted {
+                address.insert(row.permalink.as_str(), row.path.as_str());
+            }
+        }
+        for held in folding {
+            for draft in &held.entries {
+                if draft.tombstone {
+                    continue;
+                }
+                match address.insert(draft.permalink.as_str(), draft.path.as_str()) {
+                    Some(other) if other != draft.path => {
+                        return Some(EngineError::Conflict(format!(
+                            "folding '{}' drafted by {} into domain '{domain}' would give the \
+                             address '{}' to a second engram: {other} already answers to it. One \
+                             engram answers to one address, so give the draft an address of its \
+                             own, or discard it",
+                            draft.path, held.actor, draft.permalink
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Write a domain's `review` key through the file config and into the
+    /// effective one, the write-lock-first order every config mutation here
+    /// follows so no env value bakes into the saved file.
+    fn write_review_key(
+        &self,
+        domain: &str,
+        review: Option<crystalline_core::config::ReviewMode>,
+    ) -> Result<()> {
+        let mut file_guard = self.file_config.write().unwrap();
+        let mut file = file_guard.clone();
+        let Some(entry) = file.domains.get_mut(domain) else {
+            return Err(EngineError::UnknownDomain {
+                domain: domain.to_string(),
+                registered: self.known_domain_names(),
+            });
+        };
+        entry.review = review;
+        self.persist_config(&file)?;
+        let effective = self.overlay.apply(&file);
+        *file_guard = file;
+        *self.config.write().unwrap() = effective;
+        // A domain discovered after this engine started keeps its own cached
+        // entry, and that cache is what `domain_entry` answers from first.
+        if let Some(found) = self.discovered_domains.write().unwrap().get_mut(domain) {
+            found.review = review;
+        }
+        Ok(())
+    }
+
     /// Retire the visibility and membership records of a domain that is no
     /// longer registered.
     ///
@@ -13451,13 +14027,32 @@ impl Engine {
                 .then(|| origin::local_change_detail(&root, &state_dir))
                 .flatten()
         };
+        // In review mode every legitimate change joins its author's draft, so
+        // anything the working tree holds that the origin does not got there
+        // some other way: an editor, a script, a restored backup. It is
+        // reported rather than blocked - the folder belongs to whoever holds
+        // the machine - and the key is absent on a domain that takes changes
+        // directly, where a local change is ordinary unshared work and
+        // `local_changes` already says so.
+        let out_of_band = entry
+            .is_overlay()
+            .then(|| origin::unshared_work(&root, &state_dir).map(|work| work.paths))
+            .flatten();
+        let with_out_of_band = |mut value: Value| {
+            if let Some(paths) = &out_of_band
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("out_of_band".to_string(), json!(paths));
+            }
+            value
+        };
         match ops::status(&spec, &root, &state_dir, probe.as_deref(), settle_owed_link).await {
-            Ok(report) => Ok(origin::status_report_json(
+            Ok(report) => Ok(with_out_of_band(origin::status_report_json(
                 name,
                 &report,
                 None,
                 change_detail(),
-            )),
+            ))),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
                 // (see `origin::is_probe_transport_error`), so a probe that
@@ -13466,12 +14061,12 @@ impl Engine {
                 // status still comes back offline.
                 self.drop_github_credential_on_auth(&e);
                 let report = ops::status(&spec, &root, &state_dir, None, settle_owed_link).await?;
-                Ok(origin::status_report_json(
+                Ok(with_out_of_band(origin::status_report_json(
                     name,
                     &report,
                     Some(e.to_string()),
                     change_detail(),
-                ))
+                )))
             }
             Err(e) => Err(e.into()),
         }

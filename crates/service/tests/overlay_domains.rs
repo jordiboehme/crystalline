@@ -18,17 +18,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GlobalConfig, ResponseFormat, ReviewMode, ServiceConfig,
+    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, OriginConfig, ResponseFormat, ReviewMode,
+    ServiceConfig,
 };
 use crystalline_core::parse_engram;
 use crystalline_index::{DomainKind, EngramRecord, FileStamp, Store, TursoStore};
 use crystalline_service::daemon::http_router;
 use crystalline_service::engine::ConfigureAction;
+use crystalline_service::engine::{FoldChoice, ReviewModeConfirm};
 use crystalline_service::overlay_journal;
 use crystalline_service::params::{DeleteParams, EditParams, ReadParams, WriteParams};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{Engine, Scope, SimilarProbe};
 use tokio::sync::Mutex;
+use yrs::sync::{Message, MessageReader, SyncMessage};
+use yrs::updates::decoder::{Decode, DecoderV1};
+use yrs::updates::encoder::Encode;
+use yrs::{Doc, ReadTxn, Text, Transact, Update};
 
 const MANIFEST: &str = "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
 /// The base engram: what the domain's files on disk say exists.
@@ -58,6 +64,9 @@ struct Fixture {
     engine: Arc<Engine>,
     store: Arc<Mutex<dyn Store>>,
     state: PathBuf,
+    /// Where this engine keeps its per-domain origin state, so a test can
+    /// record a base snapshot the way a first pull would have.
+    origins: PathBuf,
 }
 
 /// A file domain `team` (MANIFEST + plan.md), synced, with the state directory
@@ -70,7 +79,7 @@ async fn fixture() -> Fixture {
 /// directory is. `false` is only ever used by the test that pins what an engine
 /// without one may do, which is nothing.
 async fn fixture_with_state_dir(pinned: bool) -> Fixture {
-    build_fixture(pinned, false, None, false).await
+    build_fixture(pinned, false, None, false, false).await
 }
 
 /// The same domain, in review mode: every write by every actor joins that
@@ -83,7 +92,20 @@ async fn fixture_with_state_dir(pinned: bool) -> Fixture {
 /// *does* once a domain carries it, so a fixture that had to satisfy the
 /// enabling gates would be testing those gates instead.
 async fn review_fixture() -> Fixture {
-    build_fixture(true, true, None, false).await
+    build_fixture(true, true, None, false, false).await
+}
+
+/// A team domain with a GitHub origin and a base snapshot that says exactly
+/// what is on disk: the state enabling review mode insists on. Not in review
+/// mode yet - turning it on is what the tests built on this do.
+async fn origin_fixture() -> Fixture {
+    build_fixture(true, false, None, false, true).await
+}
+
+/// The same team domain, already in review mode, for the tests that ask what a
+/// domain in review mode reports about its own working tree.
+async fn reviewed_origin_fixture() -> Fixture {
+    build_fixture(true, true, None, false, true).await
 }
 
 /// The review-mode domain with a deterministic embedding provider behind it,
@@ -91,7 +113,14 @@ async fn review_fixture() -> Fixture {
 /// provider the probe returns early and a test asserting `similar` would be
 /// asserting nothing.
 async fn review_fixture_with_provider() -> Fixture {
-    build_fixture(true, true, Some(Arc::new(support::TopicEmbedder)), false).await
+    build_fixture(
+        true,
+        true,
+        Some(Arc::new(support::TopicEmbedder)),
+        false,
+        false,
+    )
+    .await
 }
 
 /// The review-mode domain served over the production HTTP router with the MCP
@@ -104,7 +133,7 @@ async fn review_fixture_with_provider() -> Fixture {
 /// address and the auth store, so a test can mint a personal token against the
 /// very store the gate reads.
 async fn served_review_instance() -> (Fixture, std::net::SocketAddr, Arc<AuthStore>) {
-    let f = build_fixture(true, true, None, true).await;
+    let f = build_fixture(true, true, None, true, false).await;
     let auth = Arc::new(AuthStore::open(&f.root.join("web-auth.db")).await.unwrap());
     let router = http_router(
         f.engine.clone(),
@@ -132,6 +161,7 @@ async fn build_fixture(
     review: bool,
     provider: Option<Arc<dyn crystalline_index::EmbeddingProvider>>,
     auth: bool,
+    origin: bool,
 ) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -147,6 +177,21 @@ async fn build_fixture(
     let mut entry = DomainEntry::file(dir);
     if review {
         entry.review = Some(ReviewMode::Overlay);
+    }
+    if origin {
+        // A team domain: enabling review mode needs one, because review with
+        // no proposal flow behind it is a gate with no door. `github.enabled`
+        // rides along so `origin_status` answers rather than refusing.
+        entry.origin = Some(OriginConfig {
+            repo: "acme/team".to_string(),
+            path: None,
+            branch: Some("main".to_string()),
+            poll_secs: None,
+        });
+        cfg.github = Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        });
     }
     cfg.domains.insert("team".to_string(), entry);
     if auth {
@@ -170,19 +215,39 @@ async fn build_fixture(
     let store: Arc<Mutex<dyn Store>> =
         Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
     let engine = Engine::new(store.clone(), cfg, provider, Some(config_path));
-    let engine = Arc::new(if pinned {
+    let engine = if pinned {
         engine.with_state_dir(state.clone())
     } else {
         engine
-    });
+    };
+    let origins = root.join("origins");
+    let mut engine = engine.with_origins_dir(origins.clone());
+    // The forge is injected wherever this fixture carries an origin, so no
+    // status read here ever reaches this machine's own keychain or the network.
+    let mut commit = String::new();
+    if origin {
+        let mock = Arc::new(support::MockProvider::new());
+        commit = mock.add_commit(std::collections::BTreeMap::from([(
+            "MANIFEST.md".to_string(),
+            MANIFEST.as_bytes().to_vec(),
+        )]));
+        mock.set_branch("main", &commit);
+        engine = engine.with_origin_provider(mock);
+    }
+    let engine = Arc::new(engine);
     engine.sync(None).await.unwrap();
-    Fixture {
+    let f = Fixture {
         _tmp: tmp,
         root,
         engine,
         store,
         state,
+        origins,
+    };
+    if origin {
+        f.snapshot_origin_at("team", &commit);
     }
+    f
 }
 
 /// A record the way a write verb builds one for a draft that is on nobody's
@@ -256,6 +321,50 @@ impl Fixture {
             .into_iter()
             .map(|e| (e.path, e.content, e.tombstone))
             .collect()
+    }
+
+    /// Record the domain's working tree as its origin base snapshot, the way a
+    /// first pull would have: every file it holds, at the bytes it holds them
+    /// at. A domain whose snapshot says exactly what is on disk has nothing
+    /// unshared, which is the state enabling review mode insists on.
+    fn snapshot_origin(&self, domain: &str) {
+        let commit = std::fs::read_to_string(self.origins.join(domain).join("state.json"))
+            .ok()
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text).ok()?["base_commit"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        self.snapshot_origin_at(domain, &commit);
+    }
+
+    /// The same, at an explicit base commit - what the first snapshot uses,
+    /// since there is no earlier state to read the commit back out of.
+    fn snapshot_origin_at(&self, domain: &str, commit: &str) {
+        let root = self.domain_root(domain);
+        let mut state = crystalline_remote::state::OriginState::new("acme/team", "main");
+        state.base_commit = commit.to_string();
+        for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path()).unwrap();
+            let rel = entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            state.files.insert(
+                rel,
+                crystalline_remote::state::BaseStamp {
+                    sha256: support::sha256_hex(&bytes),
+                    size: bytes.len() as u64,
+                },
+            );
+        }
+        state.save(&self.origins.join(domain)).unwrap();
     }
 }
 
@@ -2687,5 +2796,707 @@ async fn a_drafts_own_relations_are_what_its_author_reads() {
     assert!(
         theirs["relations"].as_array().unwrap().is_empty(),
         "and the engram the team reviewed has no relation at all: {theirs}"
+    );
+}
+
+// --- Task 7: turning review mode on, and folding it off ---------------------
+
+/// The confirm a test means when it names one actor's choice.
+fn folds(pairs: &[(&str, FoldChoice)]) -> ReviewModeConfirm {
+    ReviewModeConfirm::Confirmed {
+        folds: pairs
+            .iter()
+            .map(|(actor, choice)| ((*actor).to_string(), *choice))
+            .collect(),
+    }
+}
+
+/// The permalinks one actor's plan entry names, with the conflict each carries.
+fn plan_entries(plan: &serde_json::Value, actor: &str) -> Vec<(String, bool, bool)> {
+    plan["actors"]
+        .as_array()
+        .expect("the plan lists actors")
+        .iter()
+        .find(|row| row["actor"] == serde_json::json!(actor))
+        .map(|row| {
+            row["drafts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| {
+                    (
+                        d["path"].as_str().unwrap().to_string(),
+                        d["tombstone"].as_bool().unwrap(),
+                        !d["conflict"].is_null(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `review` key the config file on disk carries for a domain, as a string.
+fn review_key(f: &Fixture, domain: &str) -> Option<String> {
+    let text = std::fs::read_to_string(f.root.join("config.yaml")).unwrap();
+    let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+    cfg.domains
+        .get(domain)
+        .and_then(|e| e.review.as_ref())
+        .map(|_| "overlay".to_string())
+}
+
+/// Review mode is a promise that every change is reviewed before it lands, and
+/// a domain that already has unshared work in its folder cannot make it: the
+/// work in the tree went round no review at all, and turning the mode on would
+/// bless it silently. So the refusal names the paths and says what to do with
+/// them.
+#[tokio::test]
+async fn enabling_review_on_a_dirty_domain_refuses_naming_the_paths() {
+    let f = origin_fixture().await;
+    std::fs::write(
+        f.domain_root("team").join("notes.md"),
+        PLAN.replace("permalink: plan", "permalink: notes")
+            .replace("Plan", "Notes"),
+    )
+    .unwrap();
+
+    let refused = f
+        .engine
+        .set_review_mode(
+            "team",
+            Some(ReviewMode::Overlay),
+            ReviewModeConfirm::Confirmed { folds: Vec::new() },
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("a folder with unshared work in it cannot start reviewing");
+    let words = refused.to_string();
+    assert!(
+        words.contains("share or revert these first, then enable review"),
+        "the refusal says what to do with them: {words}"
+    );
+    assert!(
+        words.contains("notes.md"),
+        "and names the path that is in the way: {words}"
+    );
+    assert_eq!(
+        review_key(&f, "team"),
+        None,
+        "and the configuration was not written on the way to refusing"
+    );
+}
+
+/// Two shapes a domain can be in that review mode has no answer for: a domain
+/// with no GitHub origin, where a reviewed change has nowhere to be proposed,
+/// and a virtual domain, whose engrams live in the database with no folder for
+/// a fold to land in.
+#[tokio::test]
+async fn enabling_review_needs_an_origin_and_refuses_a_virtual_domain() {
+    let f = fixture().await;
+
+    let refused = f
+        .engine
+        .set_review_mode(
+            "team",
+            Some(ReviewMode::Overlay),
+            ReviewModeConfirm::Confirmed { folds: Vec::new() },
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("a domain with nowhere to propose a change reviews nothing");
+    assert!(
+        refused
+            .to_string()
+            .contains("connect it to a GitHub repository"),
+        "the refusal names the missing half: {refused}"
+    );
+
+    f.engine.domain_add_virtual("scratch").await.unwrap();
+    let refused = f
+        .engine
+        .set_review_mode(
+            "scratch",
+            Some(ReviewMode::Overlay),
+            ReviewModeConfirm::Confirmed { folds: Vec::new() },
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("a virtual domain has no folder a fold could land in");
+    assert!(
+        refused.to_string().contains("virtual domain"),
+        "the refusal says which kind of domain this is: {refused}"
+    );
+    assert_eq!(review_key(&f, "team"), None);
+    assert_eq!(review_key(&f, "scratch"), None);
+}
+
+/// The clean case: the key lands in the config file AND the mode is live in
+/// this engine straight away, which is the half a config write alone would not
+/// prove.
+#[tokio::test]
+async fn enabling_review_on_a_clean_domain_writes_the_config() {
+    let f = origin_fixture().await;
+    let alice = account("alice");
+
+    // Before: the domain takes changes directly, and alice's write is in the
+    // folder the team shares.
+    f.engine
+        .write_engram_as(
+            &write_params("team", "Direct", "- [fact] written before review #team"),
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.domain_root("team").join("direct.md").exists(),
+        "a direct domain takes a write into its own folder"
+    );
+    f.snapshot_origin("team");
+
+    let preview = f
+        .engine
+        .set_review_mode(
+            "team",
+            Some(ReviewMode::Overlay),
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["applied"], serde_json::json!(false));
+    assert_eq!(
+        review_key(&f, "team"),
+        None,
+        "a preview answers the question and writes nothing"
+    );
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            Some(ReviewMode::Overlay),
+            ReviewModeConfirm::Confirmed { folds: Vec::new() },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["applied"], serde_json::json!(true));
+    assert_eq!(receipt["review"], serde_json::json!("overlay"));
+    assert_eq!(
+        review_key(&f, "team"),
+        Some("overlay".to_string()),
+        "the configuration on disk says the domain reviews changes"
+    );
+
+    let now = f
+        .engine
+        .write_engram_as(
+            &write_params("team", "Reviewed", "- [fact] written after review #team"),
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        now["draft"],
+        serde_json::json!(true),
+        "and the very next write joins her draft rather than the folder: {now}"
+    );
+    assert!(
+        !f.domain_root("team").join("reviewed.md").exists(),
+        "the folder still says what the team reviewed"
+    );
+}
+
+/// Leaving review mode ends every actor's private drafts one way or the other,
+/// so the plan is put before anybody answers: who holds what, which of their
+/// drafts are deletions, and which paths more than one of them is drafting.
+#[tokio::test]
+async fn disable_preview_lists_every_actors_entries() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    f.tombstone("team", "bob", "plan.md").await;
+
+    let plan = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan["applied"], serde_json::json!(false));
+    assert_eq!(plan["domain"], serde_json::json!("team"));
+    assert_eq!(plan["mode"], serde_json::json!("direct"));
+    assert_eq!(
+        plan["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (
+                row["actor"].as_str().unwrap().to_string(),
+                row["entries"].as_u64().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("alice".to_string(), 2), ("bob".to_string(), 1)],
+        "every actor holding anything is named, in order: {plan}"
+    );
+    assert_eq!(
+        plan_entries(&plan, "alice"),
+        vec![
+            ("fresh.md".to_string(), false, false),
+            ("plan.md".to_string(), false, false),
+        ],
+        "her drafts, by path, neither of them a deletion: {plan}"
+    );
+    assert_eq!(
+        plan_entries(&plan, "bob"),
+        vec![("plan.md".to_string(), true, false)],
+        "and his one deletion says it is one: {plan}"
+    );
+    assert_eq!(
+        plan["contested_paths"],
+        serde_json::json!([{ "path": "plan.md", "actors": ["alice", "bob"] }]),
+        "a path two of them are drafting is named before either is folded: {plan}"
+    );
+
+    assert_eq!(
+        f.held("team", "alice").await.len(),
+        2,
+        "a preview changes nothing at all"
+    );
+    assert_eq!(review_key(&f, "team"), Some("overlay".to_string()));
+}
+
+/// A fold is the drafts landing in the folder the team shares: a rewrite
+/// becomes the file, a new page becomes a new file, a deletion takes the file
+/// away - and the overlay is empty afterwards, mirror included, so the next
+/// sync has nothing to bring back.
+#[tokio::test]
+async fn a_confirmed_fold_lands_on_disk_and_empties_the_overlay() {
+    let f = review_fixture().await;
+    std::fs::write(
+        f.domain_root("team").join("notes.md"),
+        PLAN.replace("permalink: plan", "permalink: notes")
+            .replace("Plan", "Notes"),
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "notes".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &account("alice"),
+        )
+        .await
+        .unwrap();
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["applied"], serde_json::json!(true));
+    assert_eq!(
+        receipt["folded"],
+        serde_json::json!([{ "actor": "alice", "written": 2, "deleted": 1 }]),
+        "the receipt says what landed and what went: {receipt}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap(),
+        ALICE_DRAFT,
+        "her rewrite is the file now"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("fresh.md")).unwrap(),
+        ALICE_NEW,
+        "and the page only she had is a file the team has"
+    );
+    assert!(
+        !f.domain_root("team").join("notes.md").exists(),
+        "and the page she deleted is gone from the folder"
+    );
+
+    assert!(
+        f.held("team", "alice").await.is_empty(),
+        "nothing of hers is left in the overlay"
+    );
+    assert_eq!(
+        review_key(&f, "team"),
+        None,
+        "and the domain takes changes directly again"
+    );
+
+    // The index followed the tree: her rewrite is what everybody reads, and the
+    // engram she deleted is not there for anybody.
+    let read = f.reads("plan", &account("bob")).await.unwrap();
+    assert!(
+        read.contains("alice would have it"),
+        "the folded text is the team's plan now: {read}"
+    );
+    assert!(
+        f.reads("notes", &account("bob")).await.is_err(),
+        "and the engram she deleted is gone for everybody"
+    );
+
+    // The journal went with the rows. A second sync is what proves it: the
+    // restore runs in every sync pass, so a mirror left behind would put the
+    // drafts straight back.
+    f.engine.sync(None).await.unwrap();
+    assert!(
+        f.held("team", "alice").await.is_empty(),
+        "a sync after the fold brings nothing back"
+    );
+}
+
+/// A discard is the other answer: the drafts end and the folder never hears
+/// about them.
+#[tokio::test]
+async fn a_discard_drops_without_touching_disk() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    let before = f.tree("team");
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Discard)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["discarded"],
+        serde_json::json!([{ "actor": "alice", "entries": 2 }]),
+        "the receipt says how much was dropped: {receipt}"
+    );
+
+    assert_eq!(
+        f.tree("team"),
+        before,
+        "the folder is byte for byte as it was"
+    );
+    assert!(
+        f.held("team", "alice").await.is_empty(),
+        "and her rows are gone"
+    );
+    f.engine.sync(None).await.unwrap();
+    assert!(
+        f.held("team", "alice").await.is_empty(),
+        "a sync after the discard brings nothing back either"
+    );
+}
+
+/// Leaving review mode decides the fate of somebody's unshared work, so it is
+/// never decided by omission: a confirm that does not say what to do with an
+/// actor's drafts refuses and names them.
+#[tokio::test]
+async fn a_confirm_missing_an_actor_refuses() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "bob", "fresh.md", ALICE_NEW).await;
+    let before = f.tree("team");
+
+    let refused = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("bob's drafts were not spoken for");
+    assert!(
+        refused.to_string().contains("bob"),
+        "the refusal names who is unaccounted for: {refused}"
+    );
+
+    let refused = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[
+                ("alice", FoldChoice::Fold),
+                ("bob", FoldChoice::Discard),
+                ("carol", FoldChoice::Fold),
+            ]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("carol holds nothing here, so naming her is a mistake worth saying");
+    assert!(
+        refused.to_string().contains("carol"),
+        "the refusal names the actor who holds nothing: {refused}"
+    );
+
+    assert_eq!(f.tree("team"), before, "neither refusal touched the folder");
+    assert_eq!(f.held("team", "alice").await.len(), 1);
+    assert_eq!(f.held("team", "bob").await.len(), 1);
+    assert_eq!(review_key(&f, "team"), Some("overlay".to_string()));
+}
+
+/// One engram answers to one address, and a fold is where two of them can meet:
+/// two actors folding the same path, and a draft whose address the team took
+/// while it was being drafted. Both refuse before anything is written, and the
+/// preview flags the second one ahead of the confirm.
+#[tokio::test]
+async fn a_fold_that_would_collide_refuses_and_the_preview_flags_it() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "bob", "plan.md", ALICE_DRAFT).await;
+    let before = f.tree("team");
+
+    let refused = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("two folds cannot both be the file at one path");
+    assert!(
+        refused.to_string().contains("plan.md")
+            && refused.to_string().contains("alice")
+            && refused.to_string().contains("bob"),
+        "the refusal names the path and both actors: {refused}"
+    );
+    assert_eq!(f.tree("team"), before, "and nothing was written on the way");
+
+    // One of them folding and the other discarding is not a collision at all.
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Discard)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap(),
+        ALICE_DRAFT
+    );
+
+    // The second shape: the team takes an address while somebody is drafting
+    // under it. Nothing converges that today, so the fold is where it is caught.
+    let g = review_fixture().await;
+    let alice = account("alice");
+    g.engine
+        .write_engram_as(
+            &write_params("team", "Rota", "- [decision] alice takes the rota #team"),
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    std::fs::write(
+        g.domain_root("team").join("other.md"),
+        PLAN.replace("permalink: plan", "permalink: rota")
+            .replace("Plan", "Rota"),
+    )
+    .unwrap();
+    g.engine.sync(None).await.unwrap();
+
+    let plan = g
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan_entries(&plan, "alice"),
+        vec![("rota.md".to_string(), false, true)],
+        "the preview flags the draft that cannot land: {plan}"
+    );
+
+    let refused = g
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("the address is spoken for, so her draft has nowhere to land");
+    assert!(
+        refused.to_string().contains("rota.md")
+            && refused.to_string().contains("alice")
+            && refused.to_string().contains("other.md"),
+        "the refusal names her path, her name and the engram that holds the address: {refused}"
+    );
+    assert_eq!(
+        g.held("team", "alice").await.len(),
+        1,
+        "and her draft is still hers to fix"
+    );
+}
+
+/// A fold writes the files of a domain somebody may be co-editing right now, so
+/// the rooms are closed first: a room closed afterwards would land its own
+/// stale text over the fold and the drafts would be gone with nothing to redo
+/// them from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fold_closes_open_rooms_first() {
+    let f = review_fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+
+    // A room over a path in the same domain, with text in it that has never
+    // been saved. Not the path being folded: there the fold and the room's
+    // final save both write the same file and the last one wins whichever
+    // order they run in, which says nothing about the order. Here the room's
+    // save is its own change to the tree, and the question the assertion asks
+    // is whether the sync at the end of the fold saw it.
+    let joined = sessions.join("team", "plan").await.unwrap();
+    let doc = Doc::with_options(yrs::Options {
+        offset_kind: yrs::OffsetKind::Utf16,
+        ..yrs::Options::default()
+    });
+    let replies = joined
+        .session
+        .handle_frame(
+            joined.conn,
+            &Message::Sync(SyncMessage::SyncStep1(doc.transact().state_vector())).encode_v1(),
+        )
+        .await;
+    for reply in replies {
+        let mut decoder = DecoderV1::from(reply.as_slice());
+        for message in MessageReader::new(&mut decoder).flatten() {
+            if let Message::Sync(SyncMessage::SyncStep2(update)) = message {
+                doc.transact_mut()
+                    .apply_update(Update::decode_v1(&update).unwrap())
+                    .unwrap();
+            }
+        }
+    }
+    let update = {
+        let text = doc.get_or_insert_text("content");
+        let mut txn = doc.transact_mut();
+        let end = text.len(&txn);
+        text.insert(&mut txn, end, "typed but never flushed\n");
+        txn.encode_update_v1()
+    };
+    joined
+        .session
+        .handle_frame(
+            joined.conn,
+            &Message::Sync(SyncMessage::Update(update)).encode_v1(),
+        )
+        .await;
+    assert_eq!(sessions.session_count().await, 1, "the room is open");
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["rooms_closed"],
+        serde_json::json!(1),
+        "the room was swept: {receipt}"
+    );
+    assert_eq!(sessions.session_count().await, 0, "and it is not there now");
+    assert!(
+        std::fs::read_to_string(f.domain_root("team").join("plan.md"))
+            .unwrap()
+            .contains("typed but never flushed"),
+        "the room's final save landed in the folder the domain keeps"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("fresh.md")).unwrap(),
+        ALICE_NEW,
+        "and the fold landed beside it"
+    );
+    let read = f.reads("plan", &account("bob")).await.unwrap();
+    assert!(
+        read.contains("typed but never flushed"),
+        "and the sync at the end of the fold saw both, because the room was \
+         closed before it ran rather than after: {read}"
+    );
+    assert!(
+        f.held("team", "owner").await.is_empty(),
+        "and the room's save is in the file rather than in a draft nobody \
+         planned for: a room saves as the machine owner, so a sweep one step \
+         earlier would have left one behind"
+    );
+}
+
+/// In review mode every legitimate write joins a draft, so anything the working
+/// tree has that the origin does not got there some other way. It is reported
+/// rather than blocked - the folder is the operator's - and a domain that is
+/// not reviewing says nothing at all, because for it a local change is
+/// ordinary unshared work.
+#[tokio::test]
+async fn a_review_domain_reports_its_out_of_band_tree_edits() {
+    let f = reviewed_origin_fixture().await;
+    std::fs::write(
+        f.domain_root("team").join("smuggled.md"),
+        PLAN.replace("permalink: plan", "permalink: smuggled")
+            .replace("Plan", "Smuggled"),
+    )
+    .unwrap();
+
+    let status = f
+        .engine
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["out_of_band"],
+        serde_json::json!(["smuggled.md"]),
+        "a reviewed domain names what appeared in its folder without review: {status}"
+    );
+
+    let g = origin_fixture().await;
+    std::fs::write(
+        g.domain_root("team").join("ordinary.md"),
+        PLAN.replace("permalink: plan", "permalink: ordinary")
+            .replace("Plan", "Ordinary"),
+    )
+    .unwrap();
+    let status = g
+        .engine
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        status["domains"][0].get("out_of_band").is_none(),
+        "and a domain taking changes directly says nothing about out-of-band work: {status}"
     );
 }
