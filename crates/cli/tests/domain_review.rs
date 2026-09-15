@@ -244,18 +244,21 @@ fn domain_remove_ends_the_owners_own_drafts_and_refuses_a_stranger() {
         &config,
     ]);
 
+    // A name nobody here drafts under. `carol` rather than `nobody`, because
+    // the refusal sentence carries the word "nobody" on its own and an
+    // assertion over that word would pass with the name dropped entirely.
     let refused = fx.fails(&[
         "domain",
         "remove",
         "team",
         "--end-drafts",
-        "nobody",
+        "carol",
         "--config",
         &config,
     ]);
     assert!(
-        refused.contains("nobody"),
-        "the refusal says who nobody is: {refused}"
+        refused.contains("carol"),
+        "the refusal names who nobody is: {refused}"
     );
 
     let report = fx.ok(&["--json", "domain", "remove", "team", "--config", &config]);

@@ -537,7 +537,9 @@ pub struct RemoveDomainParams {
     /// Required when anybody but you is drafting here: a removal ends their
     /// unshared work and nothing brings it back, so it is named rather than
     /// assumed. The refusal says who, and how many drafts each of them holds.
-    /// Your own drafts need no naming.
+    /// Your own drafts need no naming, and naming yourself as well is taken
+    /// and changes nothing - so the actor list a removal preview or a
+    /// refusal reports can be sent back as it stands.
     #[serde(default)]
     pub end_drafts: Vec<String>,
 }

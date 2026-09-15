@@ -408,14 +408,19 @@ impl DraftView {
 
     /// Every actor's count, for a caller who may see it; `None` for one who
     /// may not, so the key is absent rather than empty.
+    ///
+    /// Absent too when the index could not be counted, rather than a null where
+    /// a list belongs: the count beside it is already null and says so in
+    /// words, and a reader that has to tell "not sent to you" from "there is
+    /// nothing here" should never also have to tell either from "this key is
+    /// sometimes not a list".
     pub(crate) fn everyone(&self) -> Option<Value> {
         if !self.everyone {
             return None;
         }
-        Some(match &self.counts {
-            Some(counts) => json!(counts_json(counts)),
-            None => Value::Null,
-        })
+        self.counts
+            .as_ref()
+            .map(|counts| json!(counts_json(counts)))
     }
 }
 
@@ -424,7 +429,10 @@ impl DraftView {
 /// Leaving review mode asks what happens to each actor's drafts; a removal has
 /// no fold to offer, so the only answer left is that they are being ended, and
 /// naming each actor IS the answer. The caller's own drafts are left out of the
-/// question: they are the one person in the room who already knows.
+/// question - they are the one person in the room who already knows - but not
+/// out of the answer: naming yourself is taken and changes nothing, because the
+/// preview and the confirmation question both list you among the actors holding
+/// drafts, and an answer read off that list must not be refused.
 ///
 /// `counts` is `None` when the index could not be asked, which refuses on its
 /// own. An unreadable count is not an empty one, and the branch deciding
@@ -450,7 +458,15 @@ pub(crate) fn removal_choices(
     let named: BTreeSet<&str> = end_drafts.iter().map(String::as_str).collect();
     let strangers: Vec<&str> = named
         .iter()
-        .filter(|actor| !others.iter().any(|(who, _)| who == *actor))
+        // The caller's own name is never a stranger, whether they hold drafts
+        // here or not. The preview lists every actor holding drafts, the caller
+        // among them, and the confirmation question reads that list out - so an
+        // answer that echoes the list back has to be served, or the refusal
+        // would instruct the very thing it refuses. It is also what leaving
+        // review mode asks for, and one verb telling an agent to name itself
+        // while its neighbour refuses the same answer is two rules for one
+        // question.
+        .filter(|actor| Some(**actor) != own && !others.iter().any(|(who, _)| who == *actor))
         .copied()
         .collect();
     if !strangers.is_empty() {
@@ -474,7 +490,9 @@ pub(crate) fn removal_choices(
             "domain '{domain}' holds private drafts that are not yours: {}. Unregistering it \
              ends them, and their work lives in this index alone, so nothing brings it back. \
              Repeat the removal naming each of them, once per person - 'end_drafts' over MCP, \
-             '?end_drafts=' on the JSON API, '--end-drafts' at the command line",
+             '?end_drafts=' on the JSON API, '--end-drafts' at the command line. Your own \
+             drafts go with the domain either way: naming yourself as well is taken and \
+             changes nothing",
             missing.join(", ")
         )));
     }
@@ -514,6 +532,46 @@ mod tests {
                 "and it says why: {err}"
             );
         }
+    }
+
+    /// Your own name is an answer, never a question.
+    ///
+    /// The preview lists every actor holding drafts, the caller included, and
+    /// the MCP confirmation question reads that list out. An answer that echoes
+    /// it back has to be accepted, or the refusal would instruct the very thing
+    /// it refuses; and leaving review mode, which this mirrors, wants the caller
+    /// named. Both shapes are good.
+    #[test]
+    fn naming_yourself_is_accepted_and_never_required() {
+        let held = counts(&[("ada", 2), ("owner", 1)]);
+        for answer in [
+            vec!["ada".to_string()],
+            vec!["ada".to_string(), "owner".to_string()],
+        ] {
+            removal_choices("eng", Some(&held), Some("owner"), &answer)
+                .expect("both shapes of the answer name every actor but the caller");
+        }
+        // Even where the caller holds nothing here: a client that names the
+        // session's own actor out of habit is not asking about a stranger.
+        removal_choices(
+            "eng",
+            Some(&counts(&[("ada", 1)])),
+            Some("owner"),
+            &["ada".to_string(), "owner".to_string()],
+        )
+        .expect("your own name is never the stranger");
+    }
+
+    /// An owner whose index could not be counted is sent no per-actor list at
+    /// all, rather than a null where an array belongs.
+    #[test]
+    fn an_uncountable_index_sends_no_per_actor_list() {
+        let view = DraftView::new(None, Some("owner".to_string()), true);
+        assert_eq!(view.mine(), Value::Null, "the count says it is unknown");
+        assert!(
+            view.everyone().is_none(),
+            "and the key that would carry a list is absent, not null"
+        );
     }
 
     /// Nobody is asked about their own drafts, and everybody else is.

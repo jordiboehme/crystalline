@@ -3764,7 +3764,8 @@ export interface operations {
                  *     (`?end_drafts=ada,bob`). Required when anybody but the caller is
                  *     drafting in this domain: unregistering it ends their unshared work for
                  *     good, so it is named rather than assumed. The 409 says who, and how many
-                 *     drafts each of them holds. The caller's own drafts need no naming.
+                 *     drafts each of them holds. The caller's own drafts need no naming,
+                 *     and naming them as well is taken and changes nothing.
                  * @example ada,bob
                  */
                 end_drafts?: string;

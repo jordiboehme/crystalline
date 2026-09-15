@@ -1123,7 +1123,7 @@
           {
             "name": "end_drafts",
             "in": "query",
-            "description": "Every OTHER actor holding private drafts here, comma separated\n(`?end_drafts=ada,bob`). Required when anybody but the caller is\ndrafting in this domain: unregistering it ends their unshared work for\ngood, so it is named rather than assumed. The 409 says who, and how many\ndrafts each of them holds. The caller's own drafts need no naming.",
+            "description": "Every OTHER actor holding private drafts here, comma separated\n(`?end_drafts=ada,bob`). Required when anybody but the caller is\ndrafting in this domain: unregistering it ends their unshared work for\ngood, so it is named rather than assumed. The 409 says who, and how many\ndrafts each of them holds. The caller's own drafts need no naming,\nand naming them as well is taken and changes nothing.",
             "required": false,
             "schema": {
               "type": "string"

@@ -846,6 +846,85 @@ async fn a_removal_asks_nothing_about_the_callers_own_drafts() {
     assert_eq!(report["drafts_swept"], serde_json::json!(1));
 }
 
+/// Naming yourself is an answer a removal takes, and never one it asks for.
+///
+/// The preview lists every actor holding drafts, the caller among them, and the
+/// MCP confirmation question reads that list out. A client that answers with the
+/// list it was shown has to be served, or the refusal would instruct the very
+/// thing it refuses - and the verb this one mirrors, leaving review mode, wants
+/// the caller named. So both answers are good: with your own name in the list,
+/// and without it.
+#[tokio::test]
+async fn a_removal_accepts_the_callers_own_name_and_never_asks_for_it() {
+    let f = fixture().await;
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+
+    // The list the preview shows, answered back verbatim.
+    let preview = f
+        .engine
+        .domain_remove_preview(
+            "team",
+            &Scope::Unrestricted,
+            false,
+            &named(&["alice", "owner"]),
+        )
+        .await
+        .expect("the answer a client reads off the preview is an answer");
+    assert_eq!(
+        preview["drafts"],
+        serde_json::json!([
+            { "actor": "alice", "entries": 1 },
+            { "actor": "owner", "entries": 1 },
+        ]),
+        "and the preview does list the caller, which is why: {preview}"
+    );
+
+    // And the shorter answer, which is the one the refusal asks for.
+    f.engine
+        .domain_remove_preview("team", &Scope::Unrestricted, false, &named(&["alice"]))
+        .await
+        .expect("your own drafts need no naming");
+
+    let report = f
+        .engine
+        .unregister_domain(
+            "team",
+            &Scope::Unrestricted,
+            false,
+            &named(&["owner", "alice"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report["drafts_swept"], serde_json::json!(2));
+}
+
+/// A removal that is going to refuse closes nobody's co-editing room.
+///
+/// The rows and the journal surviving say nothing about this: the sweep runs
+/// before either of them is touched, so a gate decided after it would refuse
+/// with somebody's unsaved room already closed. The claim is written into
+/// `unregister_domain`'s ordering comment, and this is what holds it there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_removal_closes_no_co_editing_room() {
+    let f = fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    let _joined = sessions.join("team", "plan").await.unwrap();
+    assert_eq!(sessions.session_count().await, 1, "the room is open");
+
+    f.engine
+        .unregister_domain("team", &Scope::Unrestricted, false, &[])
+        .await
+        .expect_err("alice's drafts are not ended by omission");
+    assert_eq!(
+        sessions.session_count().await,
+        1,
+        "and the room somebody is typing in is still open"
+    );
+}
+
 /// An engine that was never told where its state directory is reaches no
 /// journal at all in a test build, and says which method to call.
 ///
