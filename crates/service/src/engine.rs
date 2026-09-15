@@ -13923,15 +13923,46 @@ impl Engine {
             // exists nowhere else in the engine. The counts are a read of rows
             // nobody else in this call touches, so taking them first costs
             // nothing and orders nothing.
-            let view = crate::review::DraftView::new(
-                self.overlay_counts_by_actor(&name).await,
-                actor.clone(),
+            //
+            // Only for a domain that reviews changes, and only because the body
+            // reports these keys for no other kind: a domain taking changes
+            // directly would pay a store lock and two queries per status call
+            // for an answer nothing reads, and the instance-wide `/sync`
+            // overview asks this of every team domain at once.
+            let view = if entry.is_overlay() {
                 // Whoever owns the domain sees who else is drafting in it. One
                 // comparison covers the whole rule: an instance admin owns
                 // every domain, a private domain's owner owns theirs, and
                 // nobody else ever reaches `Own`.
-                self.domain_right(scope, &name).await? >= crate::scope::DomainRight::Own,
-            );
+                //
+                // A membership that cannot be read is answered "no" rather than
+                // propagated, and both halves of that are deliberate. A
+                // permission question with no answer is not a yes, and this
+                // function is documented never to fail a whole report over one
+                // domain - a `?` here would abort every other domain's status
+                // over one unreadable acl row.
+                let everyone = match self.domain_right(scope, &name).await {
+                    Ok(right) => right >= crate::scope::DomainRight::Own,
+                    Err(e) => {
+                        tracing::warn!(
+                            domain = %name,
+                            error = format!("{e:#}"),
+                            "who holds domain '{name}' could not be read, so its status says \
+                             nothing about who else is drafting there"
+                        );
+                        false
+                    }
+                };
+                crate::review::DraftView::new(
+                    self.overlay_counts_by_actor(&name).await,
+                    actor.clone(),
+                    everyone,
+                )
+            } else {
+                // Never read: the per-domain body reports the draft keys only
+                // for a reviewing domain, which this is not.
+                crate::review::DraftView::new(None, actor.clone(), false)
+            };
             match self.origin_status_one(&name, &entry, detail, &view).await {
                 Ok(v) => domains.push(v),
                 Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
