@@ -6441,6 +6441,19 @@ impl Engine {
                 .await;
         }
 
+        // After the overlay branch, so a move OUT of a reviewing domain keeps
+        // its own refusal ("share the change first"), and before anything is
+        // read or written, so a refusal costs nothing. This is the move INTO
+        // one: the view above is the SOURCE domain's, so a move from a domain
+        // that takes changes directly would otherwise write the destination's
+        // folder - the engram and every attachment it carries.
+        if cross {
+            self.refuse_write_into_reviewed_folder(
+                &dest_domain,
+                "a move from another domain cannot land there",
+            )?;
+        }
+
         // Destination collision check, on disk or in the database.
         self.ensure_dest_free(&dest_source, &dest_domain, &dest_rel)
             .await?;
@@ -10241,6 +10254,16 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // An import writes the folder the team shares under an admin's hand,
+        // and a domain that reviews changes has no answer for whose draft that
+        // would be. The preview is exempt because it writes nothing: a question
+        // about a refusal is not the refusal.
+        if !dry_run {
+            self.refuse_write_into_reviewed_folder(
+                domain,
+                "an imported archive cannot land there",
+            )?;
+        }
         // Delta 2 vs `import_domain`: a file domain is served too, so the source
         // decides how a write lands rather than being refused outright.
         let source = self.content_source(domain)?;
@@ -12099,6 +12122,32 @@ impl Engine {
                 0
             }
         }
+    }
+
+    /// The one refusal for a write that would land in the folder of a domain
+    /// that reviews changes, wherever it comes from.
+    ///
+    /// Review mode rests on one rule: the folder the team shares changes only
+    /// by a pull, and everything else joins its author's own draft. Two verbs
+    /// can still reach that folder sideways, and neither has an answer for
+    /// "whose draft is this" - a cross-domain move builds its view from the
+    /// SOURCE domain, and an archive import is an admin handing a domain a zip
+    /// that belongs to nobody in particular. So both are refused here, in one
+    /// sentence, which teaches the rule and names the way in: write it there,
+    /// as a draft, and share it.
+    ///
+    /// `what` is what the caller was doing, so the refusal reads as an answer
+    /// to their own request rather than as a fact about the domain.
+    pub(crate) fn refuse_write_into_reviewed_folder(&self, domain: &str, what: &str) -> Result<()> {
+        if !self.reviews_changes(domain) {
+            return Ok(());
+        }
+        Err(EngineError::Refused(format!(
+            "domain '{domain}' reviews changes before they land, so its folder changes only \
+             through a reviewed proposal and {what} has nowhere to go: a draft belongs to one \
+             domain's overlay. Write it there - the write joins your own draft - and share it, \
+             or take review mode off first"
+        )))
     }
 
     /// Whether `name` is a domain the environment defines, as the conflict both

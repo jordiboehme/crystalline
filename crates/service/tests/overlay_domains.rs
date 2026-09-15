@@ -1055,6 +1055,58 @@ async fn a_refused_removal_closes_no_co_editing_room() {
     );
 }
 
+/// An archive import writes the folder the team shares, so a domain that
+/// reviews changes refuses one - and the preview, which writes nothing, goes on
+/// answering.
+///
+/// It is the same rule the cross-domain move is refused by: the folder changes
+/// only by a pull, and an import is a write of the folder under an admin's
+/// hand. A domain in review mode has no answer for "import this as whose
+/// draft", because an import is not anybody's draft.
+#[tokio::test]
+async fn an_archive_import_into_a_reviewing_domain_is_refused_with_the_folder_rule() {
+    let f = review_fixture().await;
+    let files = vec![(
+        "fresh.md".to_string(),
+        ALICE_NEW.replace("permalink: fresh", "permalink: imported"),
+    )];
+
+    // The preview still answers: it writes nothing, and a question about a
+    // refusal is not the refusal.
+    let preview = f
+        .engine
+        .import_domain_files("team", &files, false, true)
+        .await
+        .unwrap();
+    assert_eq!(preview["dry_run"], serde_json::json!(true), "{preview}");
+
+    let refused = f
+        .engine
+        .import_domain_files("team", &files, false, false)
+        .await
+        .expect_err("an import writes the folder, and this domain's folder changes by a pull");
+    let text = refused.to_string();
+    assert!(
+        matches!(
+            &refused,
+            crystalline_service::engine::EngineError::Refused(_)
+        ),
+        "it is a refusal, not an invalid request: {refused:?}"
+    );
+    assert!(
+        text.contains("team") && text.contains("reviews changes"),
+        "the refusal names the domain and why: {text}"
+    );
+    assert!(
+        text.contains("Write it there"),
+        "and says what to do instead: {text}"
+    );
+    assert!(
+        !f.domain_root("team").join("fresh.md").exists(),
+        "and nothing landed in the folder"
+    );
+}
+
 /// A PNG stand-in: it never has to decode, only to travel unchanged, so it is
 /// a short blob carrying the NUL a text-shaped path would lose.
 const DECK_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00a deck somebody drafted";

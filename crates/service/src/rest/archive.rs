@@ -678,6 +678,17 @@ async fn run_archive(
         .engine
         .require_domain(domain, &identity.scope())
         .await?;
+    // Before the decompression and well before the attachment arm below, which
+    // writes through the engine's own upload seam: a domain that reviews
+    // changes refuses an import, and a refusal that arrived after half the zip
+    // had landed would be a rule enforced too late to mean anything. The
+    // preview is exempt for the reason the engine's own check states - it
+    // writes nothing.
+    if !dry_run {
+        state
+            .engine
+            .refuse_write_into_reviewed_folder(domain, "an imported archive cannot land there")?;
+    }
     // On the blocking pool, like `build_zip` on the way out: inflating an
     // archive is synchronous CPU work bounded by MAX_TOTAL_BYTES, and running
     // it inline would park a runtime worker for the whole of it. `Bytes` is

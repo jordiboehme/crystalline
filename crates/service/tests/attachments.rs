@@ -2485,6 +2485,62 @@ async fn an_engine_with_no_state_dir_reaches_no_files_overlay_in_a_test_build() 
     drop(scratch);
 }
 
+/// **A move INTO a reviewing domain is refused too, and the refusal teaches
+/// the rule rather than the mechanism.**
+///
+/// A draft belongs to one domain's overlay, and the folder the team shares
+/// changes only by a pull. A cross-domain move builds its view from the SOURCE
+/// domain, so a move out of a domain that takes changes directly into one that
+/// reviews them would take the non-overlay branch and write the destination's
+/// folder - the engram and the attachments it carries alike, going round the
+/// review the destination exists to require.
+#[tokio::test]
+async fn a_move_into_a_reviewing_domain_is_refused_with_the_folder_rule() {
+    let (_tmp, engine, review_dir, direct_dir, _state, _scratch) =
+        review_fixture("rev-into", "plain-into").await;
+    std::fs::write(
+        direct_dir.join("beta.md"),
+        ALPHA.replace("Alpha", "Beta").replace("alpha", "beta"),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let refused = engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "beta".to_string(),
+                domain: "plain-into".to_string(),
+                destination: "beta.md".to_string(),
+                destination_domain: Some("rev-into".to_string()),
+                update_links: None,
+            },
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    let text = refused.to_string();
+    assert!(
+        matches!(&refused, EngineError::Refused(_)),
+        "it is a refusal, not an invalid request: {refused:?}"
+    );
+    assert!(
+        text.contains("rev-into") && text.contains("reviews changes"),
+        "the refusal names the domain and why: {text}"
+    );
+    assert!(
+        text.contains("Write it there"),
+        "and says what to do instead: {text}"
+    );
+    assert!(
+        !review_dir.join("beta.md").exists(),
+        "nothing was written into the folder the team reviewed"
+    );
+    assert!(
+        direct_dir.join("beta.md").is_file(),
+        "and the engram is still where it was"
+    );
+}
+
 /// **A move out of a reviewing domain is refused before anything is carried.**
 ///
 /// Which is why the cross-domain carry goes on reading and writing the
