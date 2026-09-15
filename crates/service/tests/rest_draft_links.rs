@@ -34,6 +34,10 @@ const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - 
 struct Fixture {
     addr: std::net::SocketAddr,
     engine: Arc<Engine>,
+    /// The accounts database the router reads, so a test can change what an
+    /// account may see without going through an admin screen this fixture has
+    /// no admin for.
+    auth: Arc<AuthStore>,
     /// Held for the test's duration: every successful write marks its domain
     /// pending under the state directory, which this redirects into a scratch
     /// home. See `support::ScratchStateDir`.
@@ -108,6 +112,7 @@ async fn serve() -> Fixture {
     Fixture {
         addr,
         engine,
+        auth,
         _state: state,
         _tmp: tmp,
     }
@@ -1093,5 +1098,76 @@ async fn a_grant_whose_draft_is_gone_stops_refusing_the_grantees_own_write() {
         200,
         "a link to a draft that is gone refuses nothing: {:?}",
         written.text().await
+    );
+}
+
+/// A link is the author's word about one draft and never about a domain, so it
+/// must not outlive the grantee's access to the domain that draft is in.
+///
+/// The case that would otherwise be a hole: a grant redeemed while the domain
+/// was open to everybody, and then the domain is made private with the grantee
+/// no member of it. Every other read they make answers as though the domain
+/// were not there, and this one has to as well - a widening that survived the
+/// authorization behind it would be one page of a private domain still open to
+/// somebody who was removed from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_does_not_outlive_the_grantees_access_to_the_domain() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200, "bob holds the grant");
+    let read = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200, "and reads the draft while he may");
+
+    // The domain becomes alice's private one, and bob is nobody in it.
+    f.auth
+        .set_domain_visibility("team", true, "alice")
+        .await
+        .unwrap();
+
+    let after = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        404,
+        "the grant widens nothing in a domain he can no longer see"
+    );
+    let reopened = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.status(),
+        404,
+        "and the link itself opens nothing either"
     );
 }

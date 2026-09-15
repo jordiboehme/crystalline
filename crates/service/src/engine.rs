@@ -5955,6 +5955,17 @@ impl Engine {
     /// * **nothing points at it.** A draft has no inbound references, because
     ///   nobody can write a reference to a page only its author can read.
     ///
+    /// **It is asked before the resolution, so the granted draft stands OVER
+    /// the base row at that path**, and that is a decision rather than an
+    /// artefact of where the call sits: a draft always stands over the base for
+    /// whoever may see it, which is the rule this whole mode runs on, and the
+    /// link is what says the grantee may. The alternative - the team's page
+    /// wins and a grant only ever adds a page no file holds - would mean a
+    /// redraft of a shared page stayed invisible to the grantee's agent while
+    /// its person was reading it on screen. Moving the call in
+    /// [`Engine::read_engram`] into the `NotFound` arm is the whole of the
+    /// flip, if that is ever the wanted answer.
+    ///
     /// `None` - the ordinary answer, for every caller and every identifier -
     /// short-circuits before any store read when the caller has no account, so
     /// the common path costs nothing.
@@ -5981,7 +5992,19 @@ impl Engine {
                 None => return Ok(None),
             },
         };
-        if hidden.contains(&domain) {
+        // **The registered-set screen, the same one every other read makes.**
+        // A grant is the author's word about one draft and never about a
+        // domain, so it must not outlive the grantee's access to the domain
+        // that draft is in: an account whose membership was taken away, or a
+        // domain that has since been made private, is answered here exactly as
+        // it is answered everywhere else - there is no grant to widen with.
+        // `domain_entry_scoped` rather than the bare `hidden` set, so this is
+        // the identical check `Engine::require_domain` makes (it covers a
+        // domain nobody registered too), and its refusal is turned into `None`
+        // rather than raised: the ordinary read path below is what answers a
+        // caller who named a domain they may not see, and it already answers
+        // it without saying the domain exists.
+        if self.domain_entry_scoped(&domain, hidden).is_err() {
             return Ok(None);
         }
         let held = access
