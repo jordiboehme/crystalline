@@ -3112,7 +3112,7 @@ impl Engine {
             // domain - see the doc above.
             let view = DomainView::for_read(self, &desc.domain, hidden, scope)?;
             if let Some(actor) = view.actor() {
-                if !view.exists(desc.domain_id, &desc.path).await? {
+                if view.deletes(desc.domain_id, &desc.path).await? {
                     return Err(EngineError::NotFound(format!(
                         "no engram matches '{identifier}'"
                     )));
@@ -3128,7 +3128,7 @@ impl Engine {
         let name = view.domain().to_string();
         match self.resolve_scoped(identifier, domain, hidden).await {
             Ok((desc, source)) => {
-                if !view.exists(desc.domain_id, &desc.path).await? {
+                if view.deletes(desc.domain_id, &desc.path).await? {
                     return Err(EngineError::NotFound(format!(
                         "no engram '{identifier}' in domain '{name}'"
                     )));

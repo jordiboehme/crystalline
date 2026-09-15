@@ -1297,16 +1297,21 @@ impl<'a> DomainView<'a> {
         }))
     }
 
-    /// Whether this reader still sees something at a path the base holds:
-    /// `false` when their own tombstone deletes it, which is the one edit a
-    /// resolver has to make once the base row is already in hand.
-    pub(crate) async fn exists(&self, domain_id: DomainId, path: &str) -> Result<bool> {
+    /// Whether this reader has deleted the path: `true` only when their own
+    /// tombstone stands there.
+    ///
+    /// The whole of what a resolver has to ask once the base row is already in
+    /// hand - a deletion is a deletion for its author, however the engram was
+    /// addressed - and named for what it answers rather than as an `exists`,
+    /// which would read as a question about the path and is not one: the base
+    /// view deletes nothing and says so without a lookup.
+    pub(crate) async fn deletes(&self, domain_id: DomainId, path: &str) -> Result<bool> {
         let Some(actor) = self.actor.as_deref() else {
-            return Ok(true);
+            return Ok(false);
         };
         let store = self.engine.store();
         let store = store.lock().await;
-        Ok(!store
+        Ok(store
             .overlay_entry(domain_id, actor, path)
             .await?
             .is_some_and(|entry| entry.tombstone))
