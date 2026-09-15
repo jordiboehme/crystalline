@@ -1460,6 +1460,53 @@ async fn a_draft_in_a_hidden_domain_is_invisible_to_a_reader_who_cannot_see_the_
             "and it is the miss an engram nobody wrote produces: {miss}"
         );
     }
+
+    // The same question through the two graph verbs, anchored at the
+    // stranger's OWN draft, because that is the anchor the screen has to
+    // survive: the base lookup finds nothing there whoever asks, so a verb
+    // that asked whose draft it is before asking whether the domain is
+    // readable would resolve the anchor out of the stranger's own overlay and
+    // answer with a slice. Visibility is a property of the reader on every
+    // read surface, not on the ones that happen to have a base row to miss on.
+    let anchor = "crystalline://team/fresh";
+    let context = async |scope: Scope| {
+        f.engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(1),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                &scope,
+            )
+            .await
+    };
+    let graph = async |scope: Scope| f.engine.graph_neighborhood(anchor, 1, 50, &scope).await;
+
+    // Reachable for the member whose draft it is, so the misses below are the
+    // screen answering rather than an anchor that was never there.
+    assert!(
+        context(alice.clone()).await.is_ok(),
+        "alice, who is a member, anchors on her own draft"
+    );
+    assert!(graph(alice).await.is_ok(), "and draws it as a graph");
+
+    for (verb, answer) in [
+        ("build_context", context(stranger.clone()).await),
+        ("graph_neighborhood", graph(stranger).await),
+    ] {
+        let miss = answer.err().unwrap_or_else(|| {
+            panic!("{verb} answered a stranger about a domain they may not see")
+        });
+        assert!(
+            miss.to_string()
+                .contains("no engram 'fresh' in domain 'team'"),
+            "{verb} gives the miss an engram nobody wrote produces, never an \
+             empty slice: {miss}"
+        );
+    }
 }
 
 /// The other half of the same screen. A domain this instance has no
