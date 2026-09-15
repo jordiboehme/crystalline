@@ -3655,9 +3655,13 @@ async fn a_shared_draft_is_still_a_draft() {
     };
     assert_eq!(after, before, "the share cleared nothing");
 
-    // The mock forge serves no stacks, so a second share updates the one open
-    // proposal - and it carries the same paths, because the drafts are still
-    // the actor's and the base has not moved.
+    // The assertion above is the design's own requirement: the rows survive.
+    // What a second share then ANSWERS is a property of the forge shape - this
+    // mock serves no stacks, so the share is detected against the trunk and
+    // updates the one open proposal with the same paths. On a forge that serves
+    // stacks the same untouched drafts would be nothing new to stack, because a
+    // layer is detected against the chain tip; that is the question Task 11
+    // owns, and either answer is the same surviving rows.
     let second = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
         .await

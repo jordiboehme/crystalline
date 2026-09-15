@@ -273,12 +273,22 @@ impl Provider for PinnedHead<'_> {
     async fn branch_head(
         &self,
         origin: &OriginSpec,
-        etag: Option<&str>,
+        _etag: Option<&str>,
     ) -> Result<HeadProbe, RemoteError> {
-        match self.inner.branch_head(origin, etag).await? {
-            // Nothing has moved since the etag the engine's own pull settled on,
-            // which is the answer this whole wrapper exists to produce.
+        // Probed unconditionally, ignoring the caller's stored etag on purpose.
+        // A conditional probe answers "unchanged since the etag you gave me",
+        // which is only the same question as "still at the commit this tree was
+        // staged over" while the stored etag is known to track the base commit.
+        // It does track it today, but that invariant is kept in
+        // `crystalline_remote` and this screen is the one thing that must not
+        // depend on it: the cost of asking outright is one non-conditional
+        // request per share, and the cost of being wrong is a merge landing in a
+        // folder that is about to be deleted.
+        match self.inner.branch_head(origin, None).await? {
             HeadProbe::Unchanged => Ok(HeadProbe::Unchanged),
+            // Still where the engine's own pull left it, so the inline pull has
+            // nothing to do: this is the short-circuit it takes before it writes
+            // a single file.
             HeadProbe::Changed { head, .. } if head == self.pinned => Ok(HeadProbe::Unchanged),
             HeadProbe::Changed { .. } => Err(RemoteError::Refused(SHARE_HEAD_MOVED.to_string())),
         }
