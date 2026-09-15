@@ -1032,7 +1032,12 @@ function Surface({
               see the `<aside>` below. A control only half the app's readers
               can reach is not a control.
             */}
-            {engram.draft && engram.path && (
+            {engram.draftOwner && (
+              <span className="rounded bg-amber-100 px-2 py-1 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+                {engram.draftOwner}&apos;s draft
+              </span>
+            )}
+            {engram.draft && !engram.draftOwner && engram.path && (
               <Tooltip label="Share this draft with one person">
                 <button
                   type="button"

@@ -1955,6 +1955,31 @@ describe("the engram editor", () => {
       expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     });
   });
+
+  // Sharing is for your own unfolded work, and a granted draft is not that.
+  it("offers Share on an own draft and names the owner on a granted one", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": () => detailResponse({ draft: true }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(
+      await screen.findByRole("button", { name: "Share draft" }),
+    ).toBeVisible();
+  });
+
+  it("names whose draft a granted one is, and offers no Share on it", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    // The editor must say whose work is in the buffer: it is the one screen
+    // that would otherwise show somebody else's text as though it were yours.
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Share draft" }),
+    ).not.toBeInTheDocument();
+  });
 });
 
 describe("the engram editor in a session", () => {

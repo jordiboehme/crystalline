@@ -39,6 +39,24 @@ import {
 } from "../api/draftLinks";
 import type { AcceptedDraft } from "../api/model";
 
+/**
+ * Whether a held join is a join to THIS draft.
+ *
+ * All three parts, not the path alone: two domains can hold a page at the same
+ * path, and a window joined to `team/plan.md` opening a link to
+ * `other/plan.md` would otherwise draw the second as editable and save the
+ * first - which the checksum usually turns into a conflict about a page
+ * nobody is looking at, and which lands silently when the two texts happen to
+ * match.
+ */
+function sameDraft(held: HeldJoin, draft: AcceptedDraft): boolean {
+  return (
+    held.domain === draft.domain &&
+    held.path === draft.path &&
+    held.permalink === draft.permalink
+  );
+}
+
 const BUTTON_CLASSES =
   "rounded border border-slate-300 px-3 py-1 text-sm hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:hover:bg-slate-800";
 
@@ -55,7 +73,7 @@ export default function GrantedDraft(): ReactElement {
   // write the wrong page. So the join is compared against the draft on screen
   // rather than merely counted.
   const [held, setHeld] = useState<HeldJoin | null>(() => heldJoin());
-  const joined = held !== null && draft !== null && held.path === draft.path;
+  const joined = held !== null && draft !== null && sameDraft(held, draft);
 
   // The same event the frame's bar fires on, because the bar is where Leave
   // lives: a screen that did not listen would keep an editable buffer and a
@@ -123,7 +141,7 @@ export default function GrantedDraft(): ReactElement {
       // aimed at a join that has ended must fail here rather than at the
       // server with a sentence about somebody else's page.
       const now = heldJoin();
-      if (!now || !draft || now.path !== draft.path) {
+      if (!now || !draft || !sameDraft(now, draft)) {
         throw new Error("this window is not inside that draft any more");
       }
       return saveJoinedDraft(now, buffer, checksum);

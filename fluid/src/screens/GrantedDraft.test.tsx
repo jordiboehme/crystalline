@@ -154,6 +154,27 @@ describe.each([
     ).toBeVisible();
   });
 
+  it("stays read-only for another domain's page at the same path", async () => {
+    // The same path in a different domain is a different draft, and a window
+    // joined to that one saving this one would write the wrong page.
+    sessionStorage.setItem(
+      JOIN_KEY_STORAGE,
+      JSON.stringify({
+        key: "keyA",
+        domain: "other",
+        path: "plan.md",
+        owner: "carol",
+        permalink: "plan",
+      }),
+    );
+    apiMock.mockResolvedValue(DRAFT);
+    draw(fullWidth);
+    await screen.findByLabelText("alice's draft of plan.md");
+    expect(
+      screen.queryByRole("button", { name: "Save" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("goes read-only again when the join ends somewhere else", async () => {
     apiMock.mockImplementation((path: string) => {
       if (path === "/draft-links/accept")

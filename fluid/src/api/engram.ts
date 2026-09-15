@@ -141,6 +141,16 @@ export interface EngramDetail {
    * not seen and there is nothing to hand over about a page they all read.
    */
   draft: boolean;
+  /**
+   * Whose draft this is, when it is not the reader's own: the one payload key
+   * that names another account, and it is only ever present at a path the
+   * reader holds a share-link to.
+   *
+   * Null for everything else, which is nearly everything. What reads it is the
+   * editor: a granted draft opened there must say whose work it is, and must
+   * not offer to share a page the reader does not own.
+   */
+  draftOwner: string | null;
 }
 
 /** One neighbour a write or save found itself close to. */
@@ -351,6 +361,7 @@ export function readEngramDetail(
       .filter((entry): entry is SimilarEngram => entry !== null),
     guidance: asString(record?.guidance),
     draft: record?.draft === true,
+    draftOwner: asString(record?.draft_owner),
   };
 }
 
