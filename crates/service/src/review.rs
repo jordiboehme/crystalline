@@ -63,6 +63,30 @@ pub(crate) struct ActorDrafts {
     pub(crate) actor: String,
     /// Their rows in this domain, ordered by path, tombstones included.
     pub(crate) entries: Vec<crystalline_index::StoredEngram>,
+    /// Their files in this domain, ordered by path, deletion markers included.
+    ///
+    /// Beside the rows rather than folded into them, because the two are not
+    /// one kind of thing wearing two hats: a row carries an address and a
+    /// document, a file carries bytes and answers to nothing. Everything that
+    /// counts draft changes counts both; everything that reasons about
+    /// addresses reads [`ActorDrafts::entries`] alone.
+    pub(crate) files: Vec<crate::overlay_files::FileEntry>,
+    /// Whether this actor's files could all be listed.
+    ///
+    /// A files overlay nobody can read is not an empty one - the bytes are the
+    /// only copy there is - so a fold of this actor refuses rather than
+    /// silently folding the half that could be seen.
+    pub(crate) files_unreadable: bool,
+}
+
+impl ActorDrafts {
+    /// How many draft changes this actor is holding: rows plus files.
+    ///
+    /// The one arithmetic behind "3 draft changes, 1 of them a file", so the
+    /// plan, the receipt and the removal gate cannot count differently.
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len() + self.files.len()
+    }
 }
 
 /// The receipt of a domain that takes changes directly now, whether this
@@ -99,11 +123,16 @@ pub(crate) fn plan_json(
 ) -> Value {
     let mut by_path: HashMap<&str, Vec<&str>> = HashMap::new();
     for held in drafts {
-        for draft in &held.entries {
-            by_path
-                .entry(draft.path.as_str())
-                .or_default()
-                .push(held.actor.as_str());
+        // Files are in here beside the rows because the question is the same
+        // one: at most one person can be the thing standing at a path, and a
+        // PNG two people drafted is as contested as a page two people drafted.
+        for path in held
+            .entries
+            .iter()
+            .map(|draft| draft.path.as_str())
+            .chain(held.files.iter().map(|file| file.path.as_str()))
+        {
+            by_path.entry(path).or_default().push(held.actor.as_str());
         }
     }
     let actors: Vec<Value> = drafts
@@ -113,7 +142,7 @@ pub(crate) fn plan_json(
             // else did, which is the only address question a plan can
             // answer before the answers are in.
             let surviving = DomainView::address_map(&[held], base);
-            let rows: Vec<Value> = held
+            let mut rows: Vec<Value> = held
                 .entries
                 .iter()
                 .map(|draft| {
@@ -128,9 +157,23 @@ pub(crate) fn plan_json(
                     })
                 })
                 .collect();
+            // After the engram rows, and told apart by `kind` rather than by
+            // position: an engram row keeps its exact shape, so a reader that
+            // knows the old one goes on reading it, and a file carries no
+            // `permalink` at all because it answers to no address. `conflict`
+            // is null for the same reason - the only thing a plan can say is
+            // in another draft's way is an address.
+            rows.extend(held.files.iter().map(|file| {
+                json!({
+                    "path": file.path,
+                    "kind": "file",
+                    "tombstone": file.tombstone,
+                    "conflict": Value::Null,
+                })
+            }));
             json!({
                 "actor": held.actor,
-                "entries": held.entries.len(),
+                "entries": held.entry_count(),
                 "drafts": rows,
             })
         })
@@ -275,13 +318,22 @@ pub(crate) fn collision(
     // which is not an answer either of them gave.
     let mut owner: HashMap<&str, &str> = HashMap::new();
     for held in folding {
-        for draft in &held.entries {
-            if let Some(first) = owner.insert(draft.path.as_str(), held.actor.as_str()) {
+        // The rows and the files share one map, so one path two actors are
+        // folding is refused in one sentence whichever kind of thing stands
+        // there - and a page and a file can never collide with each other,
+        // since an attachment path is never an engram path.
+        for path in held
+            .entries
+            .iter()
+            .map(|draft| draft.path.as_str())
+            .chain(held.files.iter().map(|file| file.path.as_str()))
+        {
+            if let Some(first) = owner.insert(path, held.actor.as_str()) {
                 return Some(format!(
-                    "'{first}' and '{}' are both drafting {} in domain '{domain}', and only \
+                    "'{first}' and '{}' are both drafting {path} in domain '{domain}', and only \
                      one of them can be the file: fold one of them and discard the other, or \
                      let them settle it between themselves first",
-                    held.actor, draft.path
+                    held.actor
                 ));
             }
         }

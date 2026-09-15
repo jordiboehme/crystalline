@@ -1058,6 +1058,22 @@ async fn a_refused_removal_closes_no_co_editing_room() {
 /// A PNG stand-in: it never has to decode, only to travel unchanged, so it is
 /// a short blob carrying the NUL a text-shaped path would lose.
 const DECK_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00a deck somebody drafted";
+/// A file the team already has, so a draft can delete one.
+const OLD_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00the team's old deck";
+
+/// Every attachment path the domain's own rows hold, ordered.
+async fn attachment_paths(f: &Fixture) -> Vec<String> {
+    let mut out: Vec<String> = f
+        .engine
+        .attachment_list("team")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    out.sort();
+    out
+}
 
 /// A file somebody drafted is unshared work exactly as a drafted page is, so
 /// the removal counts it and asks about it by name - and a files overlay that
@@ -3870,6 +3886,206 @@ async fn a_confirmed_fold_lands_on_disk_and_empties_the_overlay() {
     assert!(
         f.held("team", "alice").await.is_empty(),
         "a sync after the fold brings nothing back"
+    );
+}
+
+/// The file rows one actor's plan entry names, as `(path, tombstone)` pairs.
+/// A file row is told apart from an engram row by its `kind`, which is the one
+/// key an engram row does not carry.
+fn plan_file_rows(plan: &serde_json::Value, actor: &str) -> Vec<(String, bool)> {
+    plan["actors"]
+        .as_array()
+        .expect("the plan lists actors")
+        .iter()
+        .find(|row| row["actor"] == serde_json::json!(actor))
+        .map(|row| {
+            row["drafts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|d| d["kind"] == serde_json::json!("file"))
+                .map(|d| {
+                    assert!(
+                        d.get("permalink").is_none(),
+                        "a file answers to no address, so it carries no permalink: {d}"
+                    );
+                    assert!(
+                        d["conflict"].is_null(),
+                        "and an address cannot be in its way: {d}"
+                    );
+                    (
+                        d["path"].as_str().unwrap().to_string(),
+                        d["tombstone"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A file somebody drafted is a draft change like any other, so the plan counts
+/// it and names it - and says which of the rows is a file, because what happens
+/// to a file when it folds is not what happens to a page.
+#[tokio::test]
+async fn the_fold_plan_counts_a_file_as_an_entry_and_lists_it_as_kind_file() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    f.file("team", "alice", "assets/deck.png", DECK_PNG).await;
+
+    let plan = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan["actors"][0]["entries"],
+        serde_json::json!(3),
+        "two pages and one file are three draft changes: {plan}"
+    );
+    assert_eq!(
+        plan_entries(&plan, "alice"),
+        vec![
+            ("fresh.md".to_string(), false, false),
+            ("plan.md".to_string(), false, false),
+            ("assets/deck.png".to_string(), false, false),
+        ],
+        "the engram rows are exactly what they were, and the file row is after \
+         them: {plan}"
+    );
+    assert_eq!(
+        plan_file_rows(&plan, "alice"),
+        vec![("assets/deck.png".to_string(), false)],
+        "and the file is the one row marked as one: {plan}"
+    );
+    for row in plan["actors"][0]["drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(2)
+    {
+        assert!(
+            row.get("kind").is_none(),
+            "an engram row keeps its exact shape, `kind` included by absence: {row}"
+        );
+        assert!(row["permalink"].is_string(), "{row}");
+    }
+}
+
+/// A fold takes the files with the pages: a file somebody drafted becomes a
+/// file the team has, a file they deleted goes, and both the bytes and the row
+/// that describes them move together.
+#[tokio::test]
+async fn a_confirmed_fold_lands_the_files_and_applies_the_sidecars() {
+    let f = review_fixture().await;
+    std::fs::create_dir_all(f.domain_root("team").join("assets")).unwrap();
+    std::fs::write(f.domain_root("team").join("assets/old.png"), OLD_PNG).unwrap();
+    f.engine.sync(None).await.unwrap();
+    assert_eq!(
+        attachment_paths(&f).await,
+        vec!["assets/old.png".to_string()],
+        "the team's own file is the one the domain holds to start with"
+    );
+
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "alice", "assets/deck.png", DECK_PNG).await;
+    f.delete_file("team", "alice", "assets/old.png").await;
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["folded"],
+        serde_json::json!([{ "actor": "alice", "written": 2, "deleted": 1 }]),
+        "the page and the file both landed, and the deletion counts as one: {receipt}"
+    );
+
+    assert_eq!(
+        std::fs::read(f.domain_root("team").join("assets/deck.png")).unwrap(),
+        DECK_PNG,
+        "her file is the team's file now, byte for byte"
+    );
+    assert!(
+        !f.domain_root("team").join("assets/old.png").exists(),
+        "and the one she deleted is gone from the folder"
+    );
+    assert_eq!(
+        attachment_paths(&f).await,
+        vec!["assets/deck.png".to_string()],
+        "the rows followed the files, both ways"
+    );
+    assert!(
+        f.files_held("team", "alice").is_empty(),
+        "and nothing of hers is left in the files overlay"
+    );
+    assert!(
+        !f.state.join("overlays/team/alice/files").exists(),
+        "the folder itself went with them"
+    );
+}
+
+/// A discard is the other answer for a file too: the bytes end with the
+/// directory and the folder never hears about any of it.
+#[tokio::test]
+async fn a_discard_removes_the_files_folder_and_leaves_the_tree_alone() {
+    let f = review_fixture().await;
+    std::fs::create_dir_all(f.domain_root("team").join("assets")).unwrap();
+    std::fs::write(f.domain_root("team").join("assets/old.png"), OLD_PNG).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let before = f.tree("team");
+
+    f.file("team", "alice", "assets/deck.png", DECK_PNG).await;
+    f.delete_file("team", "alice", "assets/old.png").await;
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Discard)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["discarded"],
+        serde_json::json!([{ "actor": "alice", "entries": 2 }]),
+        "her file and her deletion are the two things that ended: {receipt}"
+    );
+
+    assert_eq!(
+        f.tree("team"),
+        before,
+        "the folder is byte for byte as it was"
+    );
+    assert!(
+        f.domain_root("team").join("assets/old.png").exists(),
+        "the file she deleted in her draft is still the team's"
+    );
+    assert!(
+        !f.domain_root("team").join("assets/deck.png").exists(),
+        "and the one she added never became anybody's"
+    );
+    assert_eq!(
+        attachment_paths(&f).await,
+        vec!["assets/old.png".to_string()],
+        "the rows say the same"
+    );
+    assert!(
+        !f.state.join("overlays/team/alice/files").exists(),
+        "her files overlay went with her drafts"
     );
 }
 

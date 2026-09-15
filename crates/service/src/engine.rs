@@ -12297,18 +12297,86 @@ impl Engine {
     /// exactly those.
     pub(crate) async fn overlay_actor_drafts(
         &self,
+        domain: &str,
         domain_id: DomainId,
     ) -> Result<Vec<ActorDrafts>> {
-        let store = self.store.lock().await;
-        let mut out = Vec::new();
-        for (actor, _) in store.overlay_counts(domain_id).await? {
-            let entries = store.overlay_entries(domain_id, &actor).await?;
-            if entries.is_empty() {
-                continue;
+        // The actor set is the UNION of the two, and that is load bearing
+        // rather than tidy: an actor holding only files appears in neither
+        // `overlay_counts` nor `overlay_entries`, so a list drawn from the rows
+        // alone would leave them out of the plan - `review::choices` would
+        // never ask what happens to their files, and the sweep that ends every
+        // actor's work would never reach them. Their bytes would survive into a
+        // domain that no longer reviews anything, belonging to nobody.
+        let files = self.overlay_files_by_actor(domain);
+        let mut actors: BTreeSet<String> = files
+            .as_ref()
+            .map(|read| read.keys().cloned().collect())
+            .unwrap_or_default();
+        let held = {
+            let store = self.store.lock().await;
+            let mut held: BTreeMap<String, Vec<StoredEngram>> = BTreeMap::new();
+            for (actor, _) in store.overlay_counts(domain_id).await? {
+                let entries = store.overlay_entries(domain_id, &actor).await?;
+                if entries.is_empty() {
+                    continue;
+                }
+                actors.insert(actor.clone());
+                held.insert(actor, entries);
             }
-            out.push(ActorDrafts { actor, entries });
+            held
+        };
+        let mut out = Vec::new();
+        for actor in actors {
+            let entries = held.get(&actor).cloned().unwrap_or_default();
+            let own = files.as_ref().and_then(|read| read.get(&actor));
+            out.push(ActorDrafts {
+                entries,
+                files: own.map(|read| read.entries.clone()).unwrap_or_default(),
+                // A files overlay that could not be listed at all is unknown
+                // for everybody in the domain, so it is carried on every actor
+                // rather than on none: whichever of them a fold is about, the
+                // fold refuses.
+                files_unreadable: files.is_none() || own.is_some_and(|read| read.unreadable),
+                actor,
+            });
         }
         Ok(out)
+    }
+
+    /// Every actor's files-overlay entries in one domain, or `None` when the
+    /// domain's own overlay folder could not be enumerated.
+    ///
+    /// The listing twin of [`Engine::overlay_file_counts`], and gated the same
+    /// way: only a domain that reviews changes is walked, because nothing
+    /// writes a files overlay outside review mode.
+    fn overlay_files_by_actor(
+        &self,
+        domain: &str,
+    ) -> Option<BTreeMap<String, crate::overlay_files::FileRead>> {
+        if !self.reviews_changes(domain) {
+            return Some(BTreeMap::new());
+        }
+        let Ok(state_dir) = self.journal_state_dir() else {
+            tracing::warn!(
+                domain,
+                "the files overlay of '{domain}' could not be located, so what anybody has \
+                 drafted there is unknown"
+            );
+            return None;
+        };
+        let (per_actor, unreadable) = crate::overlay_files::counts(&state_dir, domain);
+        if unreadable {
+            return None;
+        }
+        Some(
+            per_actor
+                .into_keys()
+                .map(|actor| {
+                    let read = crate::overlay_files::entries(&state_dir, domain, &actor);
+                    (actor, read)
+                })
+                .collect(),
+        )
     }
 
     /// Turn review mode on for a domain, or take it off and settle every
@@ -12508,7 +12576,7 @@ impl Engine {
                 )
                 .await?
         };
-        let drafts = self.overlay_actor_drafts(domain_id).await?;
+        let drafts = self.overlay_actor_drafts(domain, domain_id).await?;
         let base = {
             let store = self.store.lock().await;
             store.list_engrams(domain, None, None).await?
@@ -12527,6 +12595,21 @@ impl Engine {
             .collect();
         if let Some(refusal) = review::collision(domain, &folding, &base) {
             return Err(EngineError::Conflict(refusal));
+        }
+        // Beside the collision check and for the same reason: every refusal is
+        // decided before the review key comes off, so a call that cannot finish
+        // has not half-left review mode on its way to saying so. A files
+        // overlay that cannot be listed is the same class of problem an index
+        // that cannot be counted is - the bytes are the only copy there is, so
+        // folding the half that could be read would land an incomplete answer
+        // and then drop the rest.
+        if let Some(held) = folding.iter().find(|held| held.files_unreadable) {
+            return Err(EngineError::Conflict(format!(
+                "the files '{}' has drafted in domain '{domain}' could not be read, so a fold \
+                 of them would land some and lose the rest. Nothing was folded and the domain \
+                 reviews changes still; answer again once the state directory can be read",
+                held.actor
+            )));
         }
 
         // Nothing to do, said as nothing done. The conjunction is the point:
@@ -12602,6 +12685,15 @@ impl Engine {
                             }
                         }
                     }
+                    // And the files, after the rows. A page folds as a file
+                    // write and the sync at the end indexes it; an attachment
+                    // has no sync pass of its own, so each one goes through the
+                    // same pair the upload verb uses - the bytes under this
+                    // file's own write lock, and the row built from those bytes
+                    // with the modification instant read back off the file.
+                    let (wrote, removed) = self.fold_files(domain, held).await?;
+                    written += wrote;
+                    deleted += removed;
                     folded.push(json!({
                         "actor": held.actor,
                         "written": written,
@@ -12610,7 +12702,7 @@ impl Engine {
                 }
                 _ => discarded.push(json!({
                     "actor": held.actor,
-                    "entries": held.entries.len(),
+                    "entries": held.entry_count(),
                 })),
             }
         }
@@ -12618,12 +12710,22 @@ impl Engine {
         // Rows and mirror together, for every actor, and over the overlay as it
         // stands NOW rather than as the plan found it: see step 4 of the
         // ordering.
-        for held in self.overlay_actor_drafts(domain_id).await? {
+        for held in self.overlay_actor_drafts(domain, domain_id).await? {
             let view = DomainView::for_actor(self, domain, &HashSet::new(), &held.actor)?;
             for draft in &held.entries {
                 view.drop(domain_id, &draft.path).await?;
             }
         }
+        // The files go with the rows, folded and discarded alike: whichever
+        // answer each actor gave, drafting in this domain is over, and a files
+        // overlay left behind would be bytes belonging to nobody in a domain
+        // that reviews nothing.
+        //
+        // Swept over the tree itself rather than over the loop above, because
+        // the review key came off in step 2: an actor holding only files is not
+        // in a listing that asks a domain whether it reviews changes any more,
+        // and theirs are exactly the bytes nothing else would ever reach.
+        self.sweep_every_actors_files(domain);
 
         // The folds are ordinary file writes, so the ordinary sync is what puts
         // them in the index - and it refreshes the generated folder indexes on
@@ -12646,6 +12748,114 @@ impl Engine {
         synced?;
 
         Ok(review::left_json(domain, folded, discarded, rooms_closed))
+    }
+
+    /// Land one folding actor's files in the folder the team shares, answering
+    /// `(written, deleted)`.
+    ///
+    /// Each write is the upload verb's own pair: the bytes under this file's
+    /// per-file [`Engine::write_lock`], and the row built from those bytes with
+    /// the modification instant read back off the file, so the folded file
+    /// costs the next sync walk no re-hash. Each deletion is
+    /// [`Engine::attachment_delete`]'s pair the same way - the file and the
+    /// row - and a path that is already gone is the state the deletion asked
+    /// for rather than a failure, exactly as the engram arm above treats one.
+    ///
+    /// A virtual domain never reaches this: review mode refuses one, and a
+    /// domain with no folder has nowhere for a file to land.
+    async fn fold_files(&self, domain: &str, held: &ActorDrafts) -> Result<(u64, u64)> {
+        if held.files.is_empty() {
+            return Ok((0, 0));
+        }
+        let state_dir = self.journal_state_dir()?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let ContentSource::File { root } = &source else {
+            return Ok((0, 0));
+        };
+        let (mut written, mut deleted) = (0u64, 0u64);
+        for file in &held.files {
+            let abs = contained_asset_path(root, &file.path)?;
+            if file.tombstone {
+                let lock = self.write_lock(&abs);
+                let guard = lock.lock().await;
+                match std::fs::remove_file(&abs) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+                let store = self.store.lock().await;
+                store.delete_attachment(domain_id, &file.path).await?;
+                drop(store);
+                drop(guard);
+                deleted += 1;
+                continue;
+            }
+            let bytes = crate::overlay_files::read(&state_dir, domain, &held.actor, &file.path)
+                .map_err(|source| EngineError::Io {
+                    path: format!("the files overlay of '{domain}' at '{}'", file.path),
+                    source,
+                })?
+                .ok_or_else(|| {
+                    EngineError::Conflict(format!(
+                        "'{}' drafted {} in domain '{domain}' and its bytes are no longer \
+                         there, so the fold has nothing to land",
+                        held.actor, file.path
+                    ))
+                })?;
+            // The file lock before the store lock, like every other writer
+            // here. See `Engine::write_lock`.
+            let lock = self.write_lock(&abs);
+            let _guard = lock.lock().await;
+            write_bytes(&abs, &bytes)?;
+            let row = attachment_row(&file.path, &bytes, asset_modified(&abs))?;
+            let store = self.store.lock().await;
+            store.upsert_attachment(domain_id, &row).await?;
+            written += 1;
+        }
+        Ok((written, deleted))
+    }
+
+    /// Drop every actor's files overlay in one domain, as the last half of
+    /// leaving review mode.
+    ///
+    /// Read off the tree rather than through [`Engine::overlay_files_by_actor`]
+    /// on purpose: that one answers for a domain that reviews changes, and by
+    /// the time this runs the key is off. What is swept is every actor the tree
+    /// still names, which is exactly the set that would otherwise be left.
+    ///
+    /// Best effort, like the journal sweep on the removal path and for the same
+    /// reason: by the time this runs the answer has been carried out - the
+    /// files are in the folder, or the actor said to end them - and failing
+    /// here would report a fold that happened as one that did not. What is left
+    /// behind is logged, and a domain's removal sweeps the whole tree anyway.
+    fn sweep_every_actors_files(&self, domain: &str) {
+        let Ok(state_dir) = self.journal_state_dir() else {
+            return;
+        };
+        let (per_actor, unreadable) = crate::overlay_files::counts(&state_dir, domain);
+        if unreadable {
+            tracing::warn!(
+                domain,
+                "the files overlay of '{domain}' could not be fully read while leaving review \
+                 mode; what is left there is readable by nobody now and goes with the domain if \
+                 it is ever unregistered"
+            );
+        }
+        for actor in per_actor.keys() {
+            if let Err(e) = crate::overlay_files::remove_actor(&state_dir, domain, actor) {
+                tracing::warn!(
+                    domain,
+                    actor = actor.as_str(),
+                    "the files '{actor}' drafted in '{domain}' could not be removed after \
+                     leaving review mode: {e}"
+                );
+            }
+        }
     }
 
     /// Write a domain's `review` key through the file config and into the
