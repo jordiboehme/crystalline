@@ -7934,7 +7934,7 @@ impl Engine {
                 if filter
                     .engram_types
                     .as_ref()
-                    .is_some_and(|types| !types.iter().any(|t| *t == record.engram_type))
+                    .is_some_and(|types| !types.contains(&record.engram_type))
                 {
                     continue;
                 }
