@@ -1852,15 +1852,25 @@ impl Store for TursoStore {
         Ok(cov)
     }
 
-    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>> {
+    async fn lead_vectors(
+        &self,
+        domain: DomainId,
+        model: &str,
+        actor: Option<&str>,
+    ) -> Result<Vec<LeadVector>> {
+        let mut params = vec![Value::Integer(domain.0), Value::Text(model.to_string())];
+        let mut n = 3usize;
+        let actor_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
         let rows = query_all(
             &self.conn,
-            "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
-             JOIN engram e ON e.id=c.engram_id \
-             WHERE e.actor = '' AND e.domain_id=?1 AND c.seq=0 AND c.model=?2 \
-               AND c.embedding IS NOT NULL \
-             ORDER BY c.engram_id ASC",
-            vec![Value::Integer(domain.0), Value::Text(model.to_string())],
+            &format!(
+                "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
+                 JOIN engram e ON e.id=c.engram_id \
+                 WHERE {actor_screen} AND e.domain_id=?1 AND c.seq=0 AND c.model=?2 \
+                   AND c.embedding IS NOT NULL \
+                 ORDER BY c.engram_id ASC"
+            ),
+            params,
         )
         .await?;
         let mut out = Vec::with_capacity(rows.len());

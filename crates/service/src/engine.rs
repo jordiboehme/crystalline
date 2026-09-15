@@ -9656,7 +9656,7 @@ impl Engine {
         // sweep on a machine that never embeds never speaks about meaning.
         let mut lead_vectors: HashMap<i64, Vec<f32>> = if embedded {
             store
-                .lead_vectors(domain_id, &self.model_id)
+                .lead_vectors(domain_id, &self.model_id, None)
                 .await?
                 .into_iter()
                 .map(|lv| (lv.engram_id.0, lv.vector))

@@ -1745,6 +1745,18 @@ pub trait Store: Send + Sync {
     /// width disagrees with its `dims` column is skipped rather than
     /// returned mis-sized.
     ///
+    /// `actor` says whose view of the domain the vectors are, the same
+    /// dimension [`SearchQuery::actor`] names: `None` is the base rows alone -
+    /// what the domain's files say exists, and byte for byte the statement
+    /// this method ran before the dimension existed - and `Some(a)` is that
+    /// actor's shadowed view, their own drafts standing in for the base rows
+    /// they are drafts of, their deletions taking a path away, and nobody
+    /// else's drafts ever in range. The dimension is explicit in what this
+    /// takes rather than in what it returns: the caller already knows whose
+    /// view it asked for, and a [`LeadVector`] is the widest row the index
+    /// hands out, so stamping an actor on each one would pay per vector for a
+    /// fact that is constant across the call.
+    ///
     /// Unbounded on purpose, and the cost is the caller's to bound: every
     /// matching engram in the domain comes back, so this materializes
     /// `dims * 4` bytes of payload per engram plus per-vector heap overhead,
@@ -1762,7 +1774,12 @@ pub trait Store: Send + Sync {
     /// down so a run that cannot emit `V301` never asks, is the named follow-up
     /// in the backlog. Until it lands, a new caller with a ceiling should
     /// assume this returns everything.
-    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>>;
+    async fn lead_vectors(
+        &self,
+        domain: DomainId,
+        model: &str,
+        actor: Option<&str>,
+    ) -> Result<Vec<LeadVector>>;
 
     /// Delete all indexed data, keeping the schema. The corruption-recovery
     /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary

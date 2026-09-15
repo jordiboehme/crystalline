@@ -155,15 +155,29 @@ async fn attach_tags(conn: &Connection, hits: &mut [(i64, SearchHit)]) -> Result
 /// permalink is its own path, so a permalink anti-join would shadow nothing it
 /// was written to shadow.
 fn actor_screen(actor: Option<&str>, params: &mut Vec<Value>, n: &mut usize) -> String {
+    actor_screen_on("e", actor, params, n)
+}
+
+/// [`actor_screen`] over a named alias of the `engram` table, for a statement
+/// that screens more than one of them at once: the graph frontier joins the
+/// table twice, once at each end of an edge, and each end is its own screen
+/// with its own placeholder. `o` stays the anti-join's own alias in every copy,
+/// which is legal because each `NOT EXISTS` opens a scope of its own.
+pub(super) fn actor_screen_on(
+    alias: &str,
+    actor: Option<&str>,
+    params: &mut Vec<Value>,
+    n: &mut usize,
+) -> String {
     let Some(actor) = actor else {
-        return "e.actor = ''".to_string();
+        return format!("{alias}.actor = ''");
     };
     let ph = *n;
     params.push(Value::Text(actor.to_string()));
     *n += 1;
     format!(
-        "e.tombstone = 0 AND (e.actor = ?{ph} OR (e.actor = '' AND NOT EXISTS (\
-         SELECT 1 FROM engram o WHERE o.domain_id = e.domain_id AND o.path = e.path \
+        "{alias}.tombstone = 0 AND ({alias}.actor = ?{ph} OR ({alias}.actor = '' AND NOT EXISTS (\
+         SELECT 1 FROM engram o WHERE o.domain_id = {alias}.domain_id AND o.path = {alias}.path \
          AND o.actor = ?{ph})))"
     )
 }

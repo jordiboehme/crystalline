@@ -9,6 +9,7 @@
 //! assertions (Turso schema version, the query-plan index seek, the on-disk file)
 //! live in `turso_only.rs`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crystalline_index::{
@@ -5852,6 +5853,197 @@ async fn a_tombstoned_path_leaves_its_authors_search(store: &dyn Store) {
 parity!(
     a_tombstoned_path_is_absent_for_its_author_and_present_for_base,
     a_tombstoned_path_leaves_its_authors_search
+);
+
+/// The lead vectors `V301` compares are one actor's view of the domain, never
+/// everybody's rows at once.
+///
+/// The sweep asks for meaning, so the rows it measures have to be the rows that
+/// reader sees: their own draft where they hold one, the team's file where they
+/// do not, and nothing at all at a path they have deleted. `None` is the base
+/// dimension alone, byte for byte the answer this method gave before the actor
+/// was a parameter, which is what an unauthenticated sweep and every
+/// pre-overlay caller gets.
+///
+/// Asserted as id sets rather than as vectors: the vector is the payload, the
+/// row set is the claim.
+async fn lead_vectors_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates the rollout #t\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram(
+            "Field notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook stays open #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base: HashMap<String, EngramId> = store
+        .list_engrams("d", None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| (d.path, d.id))
+        .collect();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates nothing any more #t\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- [idea] an audit of the audit itself #t\n",
+        ),
+    )
+    .await;
+    let bob_notes = draft(
+        store,
+        domain,
+        "bob",
+        "notes.md",
+        &engram(
+            "Bob's notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook, bob's own copy #t\n",
+        ),
+    )
+    .await;
+    // Alice deleted the field notes. The tombstone carries the base row's own
+    // text, so a screen that only excluded the row would still hand the sweep
+    // the base row's meaning at a path she says is gone.
+    let mut stone = record(
+        "notes.md",
+        "notes.md",
+        "- [fact] the audit notebook stays open #t\n",
+        "alice-notes",
+    );
+    stone.title = "Field notes".to_string();
+    stone.tombstone = true;
+    let alice_stone = store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    // Every row gets a lead chunk and an embedding, the tombstone included, so
+    // nothing below is quiet for want of a vector.
+    for (id, text) in [
+        (base["plan.md"], "the audit gates the rollout"),
+        (base["notes.md"], "the audit notebook stays open"),
+        (alice_plan, "the audit gates nothing any more"),
+        (alice_fresh, "an audit of the audit itself"),
+        (bob_notes, "the audit notebook, bob's own copy"),
+        (alice_stone, "the audit notebook stays open"),
+    ] {
+        store
+            .replace_chunks(
+                id,
+                &[NewChunk {
+                    seq: 0,
+                    text: text.to_string(),
+                    text_hash: format!("hash-{}", id.0),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let embedded: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&embedded, "m8").await.unwrap();
+
+    let ids = |vectors: Vec<crystalline_index::LeadVector>| {
+        let mut out: Vec<i64> = vectors.into_iter().map(|lv| lv.engram_id.0).collect();
+        out.sort();
+        out
+    };
+    let sorted = |v: Vec<EngramId>| {
+        let mut out: Vec<i64> = v.into_iter().map(|id| id.0).collect();
+        out.sort();
+        out
+    };
+
+    for (actor, want) in [
+        (None, sorted(vec![base["plan.md"], base["notes.md"]])),
+        // Her draft stands in for the plan, her fresh idea joins, and the path
+        // she deleted contributes nothing - not the base row and not the
+        // tombstone's inherited text.
+        (Some("alice"), sorted(vec![alice_plan, alice_fresh])),
+        (Some("bob"), sorted(vec![bob_notes, base["plan.md"]])),
+        // An account that drafted nothing here reads the files, like nobody.
+        (
+            Some("carol"),
+            sorted(vec![base["plan.md"], base["notes.md"]]),
+        ),
+    ] {
+        let got = store.lead_vectors(domain, "m8", actor).await.unwrap();
+        assert_eq!(ids(got), want, "the lead vectors, as {actor:?}");
+    }
+
+    // The vectors themselves still arrive intact, and they are the drafted
+    // text rather than the file's.
+    let alices = store
+        .lead_vectors(domain, "m8", Some("alice"))
+        .await
+        .unwrap();
+    let revised = alices
+        .iter()
+        .find(|lv| lv.engram_id == alice_plan)
+        .expect("her draft of the plan carries a vector");
+    assert_eq!(revised.dims, 8);
+    assert_eq!(
+        revised.vector,
+        embed_one("the audit gates nothing any more", 8),
+        "the vector is the one her draft's lead chunk was embedded as"
+    );
+}
+parity!(
+    lead_vectors_answer_the_actors_shadowed_view,
+    lead_vectors_across_the_actor_dimension
 );
 
 /// Every statement that reads the `engram` table says which actor's rows it

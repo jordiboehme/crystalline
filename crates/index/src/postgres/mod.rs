@@ -1903,7 +1903,12 @@ impl Store for PostgresStore {
         Ok(cov)
     }
 
-    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>> {
+    async fn lead_vectors(
+        &self,
+        domain: DomainId,
+        model: &str,
+        actor: Option<&str>,
+    ) -> Result<Vec<LeadVector>> {
         let mut conn = self.acquire().await?;
         // This selects the raw `embedding` column, whose type includes the
         // column's typmod, so it is the second of the two statements in this
@@ -1915,19 +1920,17 @@ impl Store for PostgresStore {
         // against the current column shape instead of raising "cached plan
         // must not change result type".
         let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let mut params = vec![Param::Int(domain.0), Param::Text(model.to_string())];
+        let mut n = 3usize;
+        let actor_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
         let sql = format!(
             "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
              JOIN engram e ON e.id=c.engram_id \
-             WHERE e.actor = '' AND e.domain_id=$1 AND c.seq=0 AND c.model=$2 \
+             WHERE {actor_screen} AND e.domain_id=$1 AND c.seq=0 AND c.model=$2 \
                AND c.embedding IS NOT NULL \
              ORDER BY c.engram_id ASC /* w{generation} */"
         );
-        let rows = query_all(
-            conn.as_mut(),
-            &sql,
-            vec![Param::Int(domain.0), Param::Text(model.to_string())],
-        )
-        .await?;
+        let rows = query_all(conn.as_mut(), &sql, params).await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let (Some(id), Some(dims)) = (cell_i64(r, 0), cell_i64(r, 1)) else {

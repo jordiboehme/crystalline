@@ -219,7 +219,7 @@ async fn lead_vectors_are_one_per_engram_for_the_active_model(store: &dyn Store)
         .await
         .unwrap();
 
-    let rows = store.lead_vectors(domain, "fake").await.unwrap();
+    let rows = store.lead_vectors(domain, "fake", None).await.unwrap();
     assert_eq!(rows.len(), 2, "alpha and beta, retired included: {rows:?}");
     assert!(
         rows.windows(2).all(|w| w[0].engram_id.0 < w[1].engram_id.0),
@@ -245,7 +245,7 @@ async fn lead_vectors_are_one_per_engram_for_the_active_model(store: &dyn Store)
 
     assert!(
         store
-            .lead_vectors(domain, "other-model")
+            .lead_vectors(domain, "other-model", None)
             .await
             .unwrap()
             .is_empty(),
@@ -253,7 +253,7 @@ async fn lead_vectors_are_one_per_engram_for_the_active_model(store: &dyn Store)
     );
     assert!(
         store
-            .lead_vectors(DomainId(9999), "fake")
+            .lead_vectors(DomainId(9999), "fake", None)
             .await
             .unwrap()
             .is_empty(),
@@ -309,7 +309,7 @@ async fn lead_vectors_are_one_per_engram_and_skip_the_unembedded(store: &dyn Sto
         .unwrap();
     let delta = store.find_engram("notes", "delta").await.unwrap().unwrap();
 
-    let rows = store.lead_vectors(domain, "fake").await.unwrap();
+    let rows = store.lead_vectors(domain, "fake", None).await.unwrap();
     assert_eq!(
         rows.iter().filter(|r| r.engram_id == gamma.id).count(),
         1,
@@ -363,8 +363,8 @@ async fn lead_vectors_survive_a_width_flip(store: &dyn Store) {
 
     // Warm the statement on more than one pooled connection.
     let (a, b) = tokio::join!(
-        store.lead_vectors(domain, "m8"),
-        store.lead_vectors(domain, "m8")
+        store.lead_vectors(domain, "m8", None),
+        store.lead_vectors(domain, "m8", None)
     );
     assert_eq!(a.unwrap().len(), 2, "both engrams at the first width");
     assert_eq!(b.unwrap().len(), 2);
@@ -372,8 +372,8 @@ async fn lead_vectors_survive_a_width_flip(store: &dyn Store) {
     // 8 -> 16: the first ALTER.
     embed_all_by_hand(store, "m16", 16).await;
     let (c, d) = tokio::join!(
-        store.lead_vectors(domain, "m16"),
-        store.lead_vectors(domain, "m16")
+        store.lead_vectors(domain, "m16", None),
+        store.lead_vectors(domain, "m16", None)
     );
     let c = c.expect("the lead-vector statement survives a width flip");
     let d = d.expect("it survives on every pooled connection, not just the one that resized");
@@ -387,8 +387,8 @@ async fn lead_vectors_survive_a_width_flip(store: &dyn Store) {
     // 16 -> 8 again: a second, independent chance for a stale plan to surface.
     embed_all_by_hand(store, "m8-again", 8).await;
     let (e, f) = tokio::join!(
-        store.lead_vectors(domain, "m8-again"),
-        store.lead_vectors(domain, "m8-again")
+        store.lead_vectors(domain, "m8-again", None),
+        store.lead_vectors(domain, "m8-again", None)
     );
     let e = e.expect("the lead-vector statement survives a second width flip");
     let f = f.expect("on every pooled connection");
@@ -456,10 +456,10 @@ async fn lead_vectors_select_only_the_named_model(store: &dyn Store) {
     store.store_embeddings(&rows(&mine), "one").await.unwrap();
     store.store_embeddings(&rows(&theirs), "two").await.unwrap();
 
-    let ones = store.lead_vectors(domain, "one").await.unwrap();
+    let ones = store.lead_vectors(domain, "one", None).await.unwrap();
     assert_eq!(ones.len(), 1, "only the engram embedded by `one`: {ones:?}");
     assert_eq!(ones[0].engram_id, alpha.id);
-    let twos = store.lead_vectors(domain, "two").await.unwrap();
+    let twos = store.lead_vectors(domain, "two", None).await.unwrap();
     assert_eq!(twos.len(), 1, "only the engram embedded by `two`: {twos:?}");
     assert_eq!(twos[0].engram_id, beta.id);
 }

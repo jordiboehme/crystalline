@@ -155,7 +155,7 @@ async fn visible(store: &Arc<Mutex<dyn Store>>, names: &[&str]) -> Visible {
 async fn lead_vectors(store: &Arc<Mutex<dyn Store>>, domain: DomainId) -> Vec<(i64, Vec<f32>)> {
     let store = store.lock().await;
     store
-        .lead_vectors(domain, MODEL)
+        .lead_vectors(domain, MODEL, None)
         .await
         .unwrap()
         .into_iter()
