@@ -5466,44 +5466,22 @@ async fn a_write_with_no_identity_still_refuses_and_a_read_still_answers_the_bas
     );
 }
 
-/// Another actor's view is buildable, because the fold, a withdrawal, a
-/// conflict resolution, a share and the convergence a pull runs all
-/// legitimately name somebody who is not the caller - and it is reachable from
-/// those surfaces alone.
+/// Every function in this crate's `src` that calls `needle`, as
+/// `(file, enclosing fn)`, sorted and deduplicated.
+///
+/// The mechanism both allow-list guards below share, rather than two copies of
+/// it: they pin two different seams onto another actor's rows and they have to
+/// pin them the same way, or the newer one drifts into being weaker than the
+/// older.
 ///
 /// A source scan rather than a behavioural assertion, for the reason the index
-/// census guard is one: the failure this pins is a call site added later in the
-/// wrong place, which no read request can be written to provoke in advance. And
-/// it names the ENCLOSING FUNCTION rather than the file, because every read
-/// verb lives in `engine.rs` too: a file-level allow-list would let
-/// `read_engram` reach another actor's drafts and stay green.
-#[test]
-fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
+/// census guard is one: the failure these pin is a call site added later in the
+/// wrong place, which no request can be written to provoke in advance. And they
+/// name the ENCLOSING FUNCTION rather than the file, because every read verb
+/// lives in `engine.rs` too: a file-level allow-list would let `read_engram`
+/// reach another actor's drafts and stay green.
+fn call_sites(needle: &str) -> Vec<(String, String)> {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let allowed = [
-        // The constructor itself.
-        ("domain_view.rs", "for_actor"),
-        // The convergence pass a pull runs, which walks every actor's entries.
-        ("engine.rs", "converge_pulled_overlays"),
-        // ...and the rename it performs when the base carried the draft along.
-        ("engine.rs", "move_draft_with_the_base"),
-        // The fold, which ends every actor's drafts on the way out.
-        ("engine.rs", "leave_review_mode"),
-        // A withdrawal, which takes back what one actor proposed.
-        ("engine.rs", "revert_into_overlay"),
-        // A conflict resolution inside one actor's own draft.
-        ("engine.rs", "resolve_in_overlay"),
-        // A share resolved through `ShareActor`.
-        ("engine.rs", "stage_overlay_share"),
-        // A write made INSIDE somebody else's draft: the one write-side
-        // caller, and the only one there will be. A join is not something a
-        // request asserts - it is a record this process minted, for an account
-        // that presented a share-link the draft's own author minted on that
-        // draft - so the owner it names is the store's word rather than the
-        // caller's. See `DomainView::for_write_joined`, which spells out the
-        // three checks that still stand between a join and a write.
-        ("domain_view.rs", "for_write_joined"),
-    ];
     /// The name a line declares a function under, if it declares one.
     fn declared_fn(line: &str) -> Option<&str> {
         let rest = line.trim_start();
@@ -5530,7 +5508,7 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         let text = std::fs::read_to_string(entry.path()).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            if !line.contains("for_actor(") {
+            if !line.contains(needle) {
                 continue;
             }
             // The nearest `fn` at or above the call site: whose code this is.
@@ -5544,15 +5522,108 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
     }
     found.sort();
     found.dedup();
+    found
+}
+
+/// Assert that `needle` is called from exactly `allowed`, and say what strayed.
+fn only_these_reach(needle: &str, allowed: &[(&str, &str)], complaint: &str) {
     let mut expected: Vec<(String, String)> = allowed
         .iter()
         .map(|(f, n)| ((*f).to_string(), (*n).to_string()))
         .collect();
     expected.sort();
-    assert_eq!(
-        found, expected,
+    assert_eq!(call_sites(needle), expected, "{complaint}");
+}
+
+/// Another actor's view is buildable, because the fold, a withdrawal, a
+/// conflict resolution, a share and the convergence a pull runs all
+/// legitimately name somebody who is not the caller - and it is reachable from
+/// those surfaces alone.
+///
+/// A source scan rather than a behavioural assertion, for the reason the index
+/// census guard is one: the failure this pins is a call site added later in the
+/// wrong place, which no read request can be written to provoke in advance. And
+/// it names the ENCLOSING FUNCTION rather than the file, because every read
+/// verb lives in `engine.rs` too: a file-level allow-list would let
+/// `read_engram` reach another actor's drafts and stay green.
+#[test]
+fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
+    let allowed = [
+        // The constructor itself.
+        ("domain_view.rs", "for_actor"),
+        // The convergence pass a pull runs, which walks every actor's entries.
+        ("engine.rs", "converge_pulled_overlays"),
+        // ...and the rename it performs when the base carried the draft along.
+        ("engine.rs", "move_draft_with_the_base"),
+        // The fold, which ends every actor's drafts on the way out.
+        ("engine.rs", "leave_review_mode"),
+        // A withdrawal, which takes back what one actor proposed.
+        ("engine.rs", "revert_into_overlay"),
+        // A conflict resolution inside one actor's own draft.
+        ("engine.rs", "resolve_in_overlay"),
+        // A share resolved through `ShareActor`.
+        ("engine.rs", "stage_overlay_share"),
+        // A write made INSIDE somebody else's draft: the one write-side
+        // caller, and the only one there will be. A join is not something a
+        // request asserts - it is a record this process minted, for an account
+        // that presented a share-link the draft's own author minted on that
+        // draft - so the owner it names is the store's word rather than the
+        // caller's. See `DomainView::for_write_joined`, which spells out the
+        // three checks that still stand between a join and a write.
+        ("domain_view.rs", "for_write_joined"),
+    ];
+    only_these_reach(
+        "for_actor(",
+        &allowed,
         "somebody else's view is reachable from a function that is not one of the owner-gated \
-         surfaces; a read verb that reaches it answers one reader with another reader's drafts"
+         surfaces; a read verb that reaches it answers one reader with another reader's drafts",
+    );
+}
+
+/// The OTHER seam onto another actor's rows, held to the same rule by the same
+/// mechanism.
+///
+/// `Engine::overlay_draft_at` reads one named actor's draft at one path without
+/// building a view at all, so the `for_actor` guard above says nothing about
+/// it - and it is the door the share-link surface actually goes through. Left
+/// to a doc comment it would be one call site away from answering a reader with
+/// another reader's unshared work, which is the single worst failure this mode
+/// can have.
+///
+/// What makes each caller safe is the same thing in two forms: the actor it
+/// names comes from the caller's OWN identity (the author surfaces) or from a
+/// grant row this instance minted (the grantee surfaces). No caller takes an
+/// actor from a request, and a caller that did would have to be added here.
+#[test]
+fn another_actors_draft_is_read_only_by_the_grant_surface() {
+    let allowed = [
+        // The seam itself.
+        ("engine.rs", "overlay_draft_at"),
+        // Minting a link and listing the links on a draft, both of which name
+        // the CALLER's own account - so these read nobody else's rows at all,
+        // and are here because the scan cannot tell that from the outside.
+        ("draft_links.rs", "mint"),
+        ("draft_links.rs", "list"),
+        // Redeeming a link and joining the draft it opens: the actor is the
+        // grant row's `owner`, written when its author minted the link.
+        ("draft_links.rs", "open_link"),
+        // The read a grant widens, at the one path the grant names.
+        ("engine.rs", "granted_read"),
+        // The teaching refusal for a write that named a granted draft the
+        // caller's own view cannot resolve.
+        ("engine.rs", "teach_granted_miss"),
+        // The freshness check in front of that refusal: a link whose draft has
+        // gone refuses nothing.
+        ("engine.rs", "screen_granted_path"),
+        // Which of the owner's files a join carries: the references are read
+        // off the granted draft itself.
+        ("engine.rs", "screen_joined_attachment"),
+    ];
+    only_these_reach(
+        "overlay_draft_at(",
+        &allowed,
+        "another actor's draft is read from a function that is not one of the share-link \
+         surfaces; a read that reaches it answers one reader with another reader's unshared work",
     );
 }
 

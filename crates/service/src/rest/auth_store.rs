@@ -391,7 +391,7 @@ impl OverlayGrant {
     /// an RFC 3339 instant carries its offset and two spellings of one moment
     /// do not sort. An `expires_at` that cannot be parsed is treated as past:
     /// a grant nobody can date is one nobody should be able to redeem.
-    fn is_live(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         if self.revoked_at.is_some() {
             return false;
         }
@@ -2908,6 +2908,33 @@ impl AuthStore {
         Ok(None)
     }
 
+    /// Which domain a link is for, without binding it to anybody. `None` for
+    /// every way the link opens nothing.
+    ///
+    /// The one read that exists so the bind can happen LAST. Redeeming binds a
+    /// link to its first presenter for good, so an account that turns out not
+    /// to be allowed to read the domain the draft is in would otherwise burn
+    /// the link permanently - and be told nothing, since the refusal is the
+    /// same 404 an invented token gets - leaving the person it was meant for
+    /// unable to open it at all. Asking first costs one row read and makes the
+    /// screen come before the irreversible half.
+    pub async fn overlay_grant_domain(&self, token: &str) -> Result<Option<String>> {
+        let hash = token_hash(token);
+        let _guard = self.guard.lock().await;
+        let row = self
+            .query_first(
+                "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
+                 FROM overlay_grant WHERE token_hash = ?1",
+                vec![Value::Text(hash)],
+            )
+            .await?;
+        Ok(row
+            .as_ref()
+            .map(grant_from_row)
+            .filter(OverlayGrant::is_live)
+            .map(|grant| grant.domain))
+    }
+
     /// Every live link `account` holds in one domain.
     ///
     /// The plural of [`AuthStore::overlay_grant_for`], and it exists for one
@@ -2952,15 +2979,41 @@ impl AuthStore {
         Ok(out)
     }
 
+    /// End every link standing on ONE draft, because that draft has ended.
+    /// Answers how many were standing.
+    ///
+    /// A grant lasts exactly as long as the thing it grants, and "ends" has to
+    /// mean ended rather than dormant: a row left live merely looks dead while
+    /// nothing stands at the path, and springs back onto whatever its author
+    /// drafts there next - a different text, written after they took the first
+    /// one back, handed to somebody neither of them would have told.
+    pub async fn end_overlay_grants(&self, domain: &str, owner: &str, path: &str) -> Result<u64> {
+        let owner = normalize_account_name(owner)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE overlay_grant SET revoked_at = ?1
+                 WHERE domain = ?2 AND owner = ?3 AND path = ?4 AND revoked_at IS NULL",
+                vec![
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(domain.to_string()),
+                    Value::Text(owner.clone()),
+                    Value::Text(path.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("ending the draft share-links of '{owner}'"))?;
+        Ok(changed)
+    }
+
     /// End every link on every draft in one domain, because the domain has
     /// stopped reviewing changes and no draft in it survived that.
     ///
-    /// Called when a domain leaves review mode, which is the one moment that
-    /// ends every draft in it at once. A draft that ends on its own - deleted,
-    /// moved, renamed - needs no row of its own ended: every surface that
-    /// reads a grant checks that the draft is still there first, so a link to
-    /// a draft that is gone already opens nothing and refuses nothing.
-    /// Answers how many were standing.
+    /// Called when a domain leaves review mode and when one is unregistered,
+    /// the two moments that end every draft in it at once. The per-draft half
+    /// is [`AuthStore::end_overlay_grants`] above. Answers how many were
+    /// standing.
     pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
         let _guard = self.guard.lock().await;
         let changed = self

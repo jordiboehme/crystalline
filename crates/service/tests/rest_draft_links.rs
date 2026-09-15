@@ -18,7 +18,7 @@ use crystalline_core::config::{
 };
 use crystalline_index::TursoStore;
 use crystalline_service::daemon::http_router;
-use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::rest::{AuthStore, MemberLevel, Role};
 use crystalline_service::{Engine, Scope};
 use tokio::sync::Mutex;
 
@@ -1411,4 +1411,270 @@ async fn a_joined_delete_of_an_unreferenced_file_refuses_and_leaves_no_tombstone
         .await
         .unwrap();
     assert_eq!(bytes.status(), 200, "the file is still there for her");
+}
+
+/// A grant ends when the draft ends, and "ends" has to mean ended rather than
+/// dormant.
+///
+/// The freshness check makes a link to a discarded draft look dead, which is
+/// the right answer while nothing stands at that path. But a link that was only
+/// dormant springs back onto whatever its author drafts there NEXT - a
+/// different text, written after they took the first one back - and neither
+/// side would be told. So a discard ends the row, and a redraft at the same
+/// path revives nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discarded_draft_ends_its_grant_and_a_redraft_revives_nothing() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    let path = f
+        .draft("alice", "Fresh", "The first thing alice wrote.")
+        .await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200, "bob holds the link");
+
+    // Alice takes her draft back. It was hers alone, so nothing of it remains.
+    let hers = f.reads(&alice, "fresh").await;
+    let discarded = alice
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", hers["checksum"].as_str().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(discarded.status(), 204, "{:?}", discarded.text().await);
+
+    // And then writes a different page at the same path.
+    f.draft("alice", "Fresh", "A second thing, written later.")
+        .await;
+
+    let dead = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dead.status(),
+        404,
+        "the link ended with the draft it was for: {:?}",
+        dead.text().await
+    );
+    let read = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        read.status(),
+        404,
+        "and her second page is hers alone, exactly as her first was"
+    );
+}
+
+/// Removing a domain ends every link in it, for the reason the fold does: the
+/// drafts it was reviewing are over, whichever way they ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_domain_ends_the_links_in_it() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200);
+
+    // The machine owner unregisters the domain, ending every draft in it.
+    f.engine
+        .unregister_domain("team", &Scope::Unrestricted, false, &["alice".to_string()])
+        .await
+        .expect("the domain goes, and alice's one draft with it");
+
+    assert!(
+        f.auth
+            .overlay_grants_held("bob", "team")
+            .await
+            .unwrap()
+            .is_empty(),
+        "and bob holds no live link into a domain that is not there"
+    );
+}
+
+/// A grant is not a reason to hide somebody's own unfolded work from them.
+///
+/// Bob is redrafting the team's page and holds a link to alice's redraft of the
+/// same one. The precedence is the mode's own: his own draft first, then what a
+/// grant widens, then the page the team holds - so every ordinary read answers
+/// HIS text, and alice's is where it was put, on the screen the link lands on.
+/// A write while joined still lands in her overlay, because that is what the
+/// join decided and the read order says nothing about it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grantees_own_draft_at_the_granted_path_wins_for_reads() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    // Both redraft the team's page, each in their own overlay.
+    let base = f.reads(&alice, "plan").await;
+    let checksum = base["checksum"].as_str().unwrap().to_string();
+    for (who, phrase) in [
+        (&alice, "what alice would rather"),
+        (&bob, "bobs own marmalade"),
+    ] {
+        let redrafted = base["content"]
+            .as_str()
+            .unwrap()
+            .replace("What the team agreed", phrase);
+        let saved = who
+            .request(
+                f.addr,
+                reqwest::Method::PUT,
+                "/api/v1/domains/team/engrams/plan",
+            )
+            .header("if-match", format!("\"{checksum}\""))
+            .json(&serde_json::json!({"content": redrafted}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 200, "{:?}", saved.text().await);
+    }
+
+    let token = f.mint(&alice, "plan.md").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        accepted["content"]
+            .as_str()
+            .unwrap()
+            .contains("what alice would rather"),
+        "the link hands over HER draft, which is what it is for: {accepted}"
+    );
+
+    // And every ordinary read of his answers his own work.
+    let his = f.reads(&bob, "plan").await;
+    assert!(
+        his["content"]
+            .as_str()
+            .unwrap()
+            .contains("bobs own marmalade"),
+        "his own draft is what he reads at that path: {his}"
+    );
+    assert!(
+        his.get("draft_owner").is_none(),
+        "and it is not marked as anybody else's: {his}"
+    );
+
+    let found: serde_json::Value = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/search?q=marmalade&mode=text",
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        found["hits"].as_array().map(|hits| hits.len()),
+        Some(1),
+        "and his search finds it, as it did before any link existed: {found}"
+    );
+}
+
+/// Somebody who may not read the domain cannot burn the link on their way to
+/// being refused.
+///
+/// Redeeming binds a link to its first presenter for good. If the domain screen
+/// ran after that bind, a stranger who found the link - and who is told nothing,
+/// since the refusal is the same 404 an invented token gets - would have spent
+/// it, and the person it was meant for could never open it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_of_no_such_domain_does_not_burn_the_link() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let carol = login(f.addr, "carol").await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The domain becomes alice's private one. Carol, who is nobody in it,
+    // finds the link and presents it.
+    f.auth
+        .set_domain_visibility("team", true, "alice")
+        .await
+        .unwrap();
+    let refused = carol
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 404, "she is told what a stranger is told");
+
+    // Bob is made a member, and the link is still his to open.
+    f.auth
+        .upsert_domain_member("team", "bob", MemberLevel::Editor, "alice")
+        .await
+        .unwrap();
+    let accepted: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted["owner"],
+        serde_json::json!("alice"),
+        "nobody spent it on the way past: {accepted}"
+    );
 }

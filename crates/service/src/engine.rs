@@ -1070,9 +1070,26 @@ pub fn joined_files_are_the_drafts(owner: &str, draft: &str, path: &str) -> Stri
 
 pub fn granted_needs_join(owner: &str, path: &str) -> String {
     format!(
-        "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step.          Join the draft and your changes land in {owner}'s copy, where {owner} reviews them; or          draft your own copy in your own overlay and leave theirs as it stands."
+        "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step. \
+         Join the draft and your changes land in {owner}'s copy, where {owner} reviews them; or \
+         draft your own copy in your own overlay and leave theirs as it stands."
     )
 }
+
+/// What somebody inside a join is told when the draft they joined is no longer
+/// there - its author renamed it, folded it, or took it back.
+///
+/// Without this the refusal for a write at any other path names the draft they
+/// joined, which is a sentence about a page that has moved and no way to tell
+/// that from a mistyped address.
+pub fn joined_draft_is_gone(owner: &str, draft: &str) -> String {
+    format!(
+        "the draft you joined - {owner}'s '{draft}' - is not there any more: it was renamed, \
+         folded into the domain, or taken back. Leave it, and ask {owner} for a fresh link if \
+         there is still work to do together."
+    )
+}
+
 /// What a share hears when its OWN proposal is already open in a domain that
 /// reviews changes.
 ///
@@ -4448,6 +4465,20 @@ impl Engine {
     ) -> Result<()> {
         if let Some(join) = join {
             if join.path != path {
+                // A join whose own draft has gone is not a join to a different
+                // path, it is a join to nothing: its author renamed it, folded
+                // it or took it back, and a refusal naming the page they joined
+                // would be a sentence about somewhere that is not there.
+                if self
+                    .overlay_draft_at(domain, &join.owner, &join.path)
+                    .await?
+                    .is_none()
+                {
+                    return Err(EngineError::Refused(joined_draft_is_gone(
+                        &join.owner,
+                        &join.path,
+                    )));
+                }
                 return Err(EngineError::Refused(format!(
                     "this session is working inside {}'s draft of '{}', so a write to '{}' has \
                      nowhere to land: leave that draft first, and the write goes back to being \
@@ -6138,9 +6169,21 @@ impl Engine {
             .overlay_grants_held(&account, &domain)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
+        if held.is_empty() {
+            return Ok(None);
+        }
         let bare = CrystallineUrl::parse(&p.identifier)
             .map(|url| url.permalink)
             .unwrap_or_else(|| p.identifier.clone());
+        // This reader's own view of the domain, for the one question below
+        // that is about THEM rather than about the grant. The read-only id
+        // lookup, never an upserting one: asking about a domain this index has
+        // never seen must not register it.
+        let own = DomainView::for_read(self, &domain, hidden, scope)?;
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(&domain).await?
+        };
         for (path, owner) in held {
             if owner == account {
                 continue;
@@ -6156,6 +6199,19 @@ impl Engine {
                 path.trim_end_matches(".md"),
             ];
             if !names.contains(&bare.as_str()) {
+                continue;
+            }
+            // **The reader's own row at that path wins.** A link handed to
+            // somebody is not a reason to hide their own unfolded work from
+            // them: the precedence is the mode's own - your own draft, then
+            // what a grant widens, then the page the team holds - and the
+            // granted draft is still exactly where the link put it, on the
+            // surface that opened it. A deletion of their own counts here too:
+            // it is their decision about that path, and standing somebody
+            // else's draft on top of it would answer around it.
+            if let Some(domain_id) = domain_id
+                && own.holds_own_entry(domain_id, &path).await?
+            {
                 continue;
             }
             return Ok(Some(granted_draft_json(&domain, &owner, &draft)?));
@@ -7745,6 +7801,10 @@ impl Engine {
                         .await?;
                 }
             }
+            // Either way the draft that stood here is over - dropped outright,
+            // or replaced by this actor's deletion of the team's page - so
+            // every link on it and every session inside it ends with it.
+            self.end_draft_grants(&desc.domain, who, &desc.path).await;
             let mut receipt = json!({
                 "domain": desc.domain,
                 "permalink": desc.permalink,
@@ -13046,6 +13106,11 @@ impl Engine {
         };
         let mut report = self.domain_remove(name).await?;
         self.forget_domain_records(name).await;
+        // Every draft in this domain has just ended, whichever way each one
+        // ended, so every link on one and every session inside one ends with
+        // them - the same call, for the same reason, that leaving review mode
+        // makes.
+        self.end_domain_grants(name).await;
         // The rows are cleared; the mirror that would bring them back goes with
         // them. A domain's removal takes every actor's drafts with it, and
         // leaving the journal behind would mean a domain re-added under this
@@ -13078,9 +13143,20 @@ impl Engine {
     /// It is not a [`DomainView`] and deliberately cannot become one: it takes
     /// a path rather than an identifier, so it can never resolve a name onto
     /// somebody else's draft, and it answers one row rather than a listing, so
-    /// it can never be folded into a search. Its callers are the routes in
-    /// `rest::draft_links` and the write routing that checks a join against
-    /// the draft it was opened for.
+    /// it can never be folded into a search.
+    ///
+    /// **Its callers, by name and exhaustively**, and
+    /// `another_actors_draft_is_read_only_by_the_grant_surface` in
+    /// crates/service/tests/overlay_domains.rs scans for any other:
+    /// `rest::draft_links`'s `mint` and `list`, which name the CALLER's own
+    /// account and so read nobody else's rows at all; `rest::draft_links`'s
+    /// `open_link`, which names the grant row's `owner`; and, on the engine
+    /// side, [`Engine::granted_read`], [`Engine::teach_granted_miss`],
+    /// [`Engine::screen_granted_path`] and
+    /// [`Engine::screen_joined_attachment`], each of which names an owner that
+    /// came out of a grant row this instance minted. **No caller takes an
+    /// actor from a request**, and one that did would be answering one reader
+    /// with another reader's unshared work.
     ///
     /// `None` for a domain that takes changes directly, for one this index has
     /// never been told about, and for an actor holding nothing there - three
@@ -13143,6 +13219,35 @@ impl Engine {
             .overlay_grant_for(account, domain, path)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// End every share-link and every join into ONE draft, because that draft
+    /// has just ended.
+    ///
+    /// Called where an actor's own draft is taken away - discarded outright
+    /// when nothing in the folder stands under it, or replaced by their
+    /// deletion of the page the team holds. A grant lasts exactly as long as
+    /// the thing it grants, and a row that merely LOOKED dead while nothing
+    /// stood at the path would spring back onto whatever its author drafted
+    /// there next. The freshness check every grant surface makes stays where
+    /// it is, as the belt to this.
+    ///
+    /// Reported rather than propagated, for the reason
+    /// [`Engine::end_domain_grants`] gives: a delete that happened is not
+    /// unsaid by a link that outlived it.
+    pub(crate) async fn end_draft_grants(&self, domain: &str, owner: &str, path: &str) {
+        self.joins.end_draft(domain, owner, path);
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.end_overlay_grants(domain, owner, path).await {
+            tracing::warn!(
+                domain = %domain,
+                path = %path,
+                error = %e,
+                "could not end the draft share-links of a draft that was taken away"
+            );
+        }
     }
 
     /// End every share-link and every join into one domain, because every

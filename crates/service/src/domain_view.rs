@@ -1301,6 +1301,29 @@ impl<'a> DomainView<'a> {
             .filter(|entry| !entry.tombstone))
     }
 
+    /// Whether this reader holds ANY row of their own at `path`, a deletion
+    /// included.
+    ///
+    /// [`DomainView::draft_at`] beside it filters tombstones out, because it
+    /// answers "is there a draft to show". This one answers a different
+    /// question - "has this reader made this path their own" - and a deletion
+    /// is as much an answer to that as a redraft is. The one caller is
+    /// [`crate::engine::Engine::granted_read`], which must not put somebody
+    /// else's draft where a reader has put their own decision, whichever
+    /// decision it was.
+    ///
+    /// Reads this view's OWN actor and nobody else's, which is what makes it a
+    /// question about the caller rather than a second seam onto another
+    /// reader's rows.
+    pub(crate) async fn holds_own_entry(&self, domain_id: DomainId, path: &str) -> Result<bool> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(false);
+        };
+        let store = self.engine.store();
+        let store = store.lock().await;
+        Ok(store.overlay_entry(domain_id, actor, path).await?.is_some())
+    }
+
     /// One engram's exact text and identity, as this view sees it: what the
     /// collab session layer loads at open and probes with on its idle
     /// external-change check.

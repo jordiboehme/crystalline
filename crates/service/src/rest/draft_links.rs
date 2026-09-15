@@ -51,7 +51,7 @@ use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, require_domain_read,
     require_domain_write,
 };
-use crate::join::Join;
+use crate::join::{Join, JoinRefusal};
 use crate::scope::DomainRight;
 
 /// The header a request carries its join key in.
@@ -95,7 +95,7 @@ pub struct MintBody {
 }
 
 /// The one moment a link is readable. Never sent again.
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 #[schema(description = "A freshly minted share-link. The token is readable \
                         exactly once, in this reply: only its hash is stored, \
                         so the listing can never hand it back.")]
@@ -108,6 +108,20 @@ pub struct MintedLinkResponse {
     pub path: String,
 }
 
+/// Hand-written for the reason `MintedGrant`'s is, and the reason
+/// [`super::github_settings::TokenBody`]'s is: the one unhashed copy of a live
+/// credential must never be one `tracing::debug!` away from a log file, while
+/// the id and the path - the parts that make such a line useful - still print.
+impl std::fmt::Debug for MintedLinkResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedLinkResponse")
+            .field("id", &self.id)
+            .field("token", &"dl_[redacted]")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
 /// Which draft a listing is about.
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 pub struct LinksQuery {
@@ -116,11 +130,22 @@ pub struct LinksQuery {
 }
 
 /// What presenting a link asks for, and what leaving a draft asks for.
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[derive(serde::Deserialize, utoipa::ToSchema)]
 #[schema(description = "A share-link, as it was handed over.")]
 pub struct TokenBody {
     /// The link, `dl_` plus 64 hex characters.
     pub token: String,
+}
+
+/// The type that RECEIVES the link, so leaving the derive on it would make the
+/// store's redaction the exception rather than the rule. Nothing but the
+/// redaction prints, because nothing else is here.
+impl std::fmt::Debug for TokenBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenBody")
+            .field("token", &"dl_[redacted]")
+            .finish()
+    }
 }
 
 /// What ending a join asks for.
@@ -132,7 +157,7 @@ pub struct LeaveBody {
 }
 
 /// A granted draft, as the account that redeemed the link receives it.
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 #[schema(
     description = "One draft, handed over by its author: where it stands, \
                         whose it is, whether this account may edit it, and the \
@@ -171,6 +196,28 @@ pub struct AcceptedDraft {
     /// shape: a save that landed answers the draft as it now stands, plus the
     /// sentence saying whose work it changed.
     pub joined: Option<String>,
+}
+
+/// Hand-written for the `join_key`, which is the credential this session sends
+/// back with every write it makes inside somebody else's draft. The rest of the
+/// record prints: where the draft is, whose it is and whether it is editable
+/// are exactly what makes a debug line about this shape worth having, and the
+/// content is elided for length rather than for secrecy.
+impl std::fmt::Debug for AcceptedDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptedDraft")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("owner", &self.owner)
+            .field("permalink", &self.permalink)
+            .field("editable", &self.editable)
+            .field("reason", &self.reason)
+            .field("content", &format_args!("<{} bytes>", self.content.len()))
+            .field("checksum", &self.checksum)
+            .field("join_key", &self.join_key.as_ref().map(|_| "<redacted>"))
+            .field("joined", &self.joined)
+            .finish()
+    }
 }
 
 /// `POST /domains/{domain}/draft-links` - mint a link on one of the caller's
@@ -456,8 +503,9 @@ pub async fn accept(
         ),
         (
             status = 409,
-            description = "This instance is already holding as many joins as \
-                           it will hold at once.",
+            description = "This account, or this instance, is already holding \
+                           as many drafts open at once as it keeps. The \
+                           refusal says which and what to do.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -484,11 +532,16 @@ pub async fn join(
             path: opened.path.clone(),
             owner: opened.owner.clone(),
         })
-        .ok_or_else(|| {
-            ApiError::conflict(
-                "this instance is already holding as many drafts open as it will hold at \
-                 once: leave one and try again",
-            )
+        .map_err(|refusal| match refusal {
+            JoinRefusal::AccountFull => ApiError::conflict(
+                "you are already working inside as many drafts as this instance keeps open for \
+                 one account: leave one of them - the bar at the top of the screen has the \
+                 button - and this one will open",
+            ),
+            JoinRefusal::InstanceFull => ApiError::conflict(
+                "this instance is already holding as many drafts open as it will hold at once, \
+                 across everybody: leave one of yours, or try again shortly",
+            ),
         })?;
     opened.join_key = Some(key);
     Ok(Json(opened))
@@ -551,20 +604,32 @@ async fn open_link(
     if !token.starts_with(DRAFT_LINK_PREFIX) {
         return Err(dead_link());
     }
+    // The domain screen, on the grantee rather than on the author: a link is
+    // the author's word about one draft, never about a domain, so a private
+    // domain this account is not a member of stays a domain it has never heard
+    // of. Answered as the dead link below, for the reason every hidden-domain
+    // answer on this surface is a 404.
+    //
+    // **Before the bind, not after**, and the order is the whole reason this
+    // reads the row twice. Redeeming binds the link to its first presenter for
+    // good, so screening afterwards would let somebody who may not read the
+    // domain burn the link permanently while being told nothing - and the
+    // person it was actually meant for could then never open it.
+    let named = state
+        .auth
+        .overlay_grant_domain(token)
+        .await
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?
+        .ok_or_else(dead_link)?;
+    require_domain_read(state, identity, &named)
+        .await
+        .map_err(|_| dead_link())?;
     let grant = state
         .auth
         .redeem_overlay_grant(token, &user.name)
         .await
         .map_err(|e| ApiError::internal(format!("{e:#}")))?
         .ok_or_else(dead_link)?;
-    // The domain screen, on the grantee rather than on the author: a link is
-    // the author's word about one draft, never about a domain, so a private
-    // domain this account is not a member of stays a domain it has never heard
-    // of. Answered as the dead link above, for the reason every hidden-domain
-    // answer on this surface is a 404.
-    require_domain_read(state, identity, &grant.domain)
-        .await
-        .map_err(|_| dead_link())?;
     let draft = state
         .engine
         .overlay_draft_at(&grant.domain, &grant.owner, &grant.path)
@@ -625,4 +690,54 @@ fn dead_link() -> ApiError {
          already belong to somebody else, or the draft it was for may have been folded or \
          discarded. Ask whoever shared it for a fresh one.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three shapes on this surface that carry a live credential, each
+    /// asserted on the secret itself rather than on the whole value: the
+    /// redaction keeps the `dl_` prefix, so a check for the absence of the
+    /// token would pass even if the secret leaked in pieces.
+    #[test]
+    fn nothing_on_this_surface_prints_a_live_credential() {
+        let presented = TokenBody {
+            token: "dl_thesecrethalf".to_string(),
+        };
+        let text = format!("{presented:?}");
+        assert!(!text.contains("thesecrethalf"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
+
+        let minted = MintedLinkResponse {
+            id: 7,
+            token: "dl_thesecrethalf".to_string(),
+            path: "plan.md".to_string(),
+        };
+        let text = format!("{minted:?}");
+        assert!(!text.contains("thesecrethalf"), "{text}");
+        assert!(
+            text.contains("7") && text.contains("plan.md"),
+            "while the parts that make a log line useful still print: {text}"
+        );
+
+        let opened = AcceptedDraft {
+            domain: "team".to_string(),
+            path: "plan.md".to_string(),
+            owner: "alice".to_string(),
+            permalink: "plan".to_string(),
+            editable: true,
+            reason: None,
+            content: "the draft".to_string(),
+            checksum: "abc".to_string(),
+            join_key: Some("thejoinkey".to_string()),
+            joined: None,
+        };
+        let text = format!("{opened:?}");
+        assert!(!text.contains("thejoinkey"), "{text}");
+        assert!(
+            text.contains("alice") && text.contains("plan.md"),
+            "while where the draft is and whose it is still print: {text}"
+        );
+    }
 }

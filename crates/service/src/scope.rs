@@ -269,6 +269,12 @@ impl DomainAccess {
             .collect())
     }
 
+    /// End every share-link standing on one draft, because that draft has
+    /// ended. Answers how many were standing.
+    pub async fn end_overlay_grants(&self, domain: &str, owner: &str, path: &str) -> Result<u64> {
+        self.auth.end_overlay_grants(domain, owner, path).await
+    }
+
     /// End every share-link in one domain, because every draft in it has
     /// ended. Answers how many were standing.
     pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
