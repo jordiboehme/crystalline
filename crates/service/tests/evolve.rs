@@ -17,7 +17,7 @@ use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
-use crystalline_service::params::EvolveParams;
+use crystalline_service::params::{EditParams, EvolveParams};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -1860,5 +1860,226 @@ async fn v009_comes_out_of_a_real_team_domains_unshared_work() {
     assert!(
         !rules(&fresh).contains(&"V009".to_string()),
         "a day-old delta is not stale: {fresh}"
+    );
+}
+
+// --- Task 9: the sweep runs in the invoking actor's dimension ---------------
+
+/// One engram of a reviewed domain, as the team's own files hold it.
+fn reviewed(title: &str, permalink: &str, body: &str) -> String {
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\n{body}\n"
+    )
+}
+
+/// A file domain `team` in review mode, with a state directory of its own so a
+/// draft can be mirrored.
+///
+/// Two engrams the team reviewed: `charter` carries a prose link that answers
+/// to no permalink and no title anywhere (ledger L308 - a fixture target has to
+/// fail both readings or the index resolves it), so it is a `V102` finding for
+/// everybody; `runbook` is whole, so it is a finding for nobody until somebody
+/// drafts one into it.
+async fn review_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("charter.md"),
+        reviewed(
+            "Charter",
+            "charter",
+            "How the team works, and what [[Nobody Ever Wrote This Down]] would have said.",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("runbook.md"),
+        reviewed("Runbook", "runbook", "How the team restarts the importer."),
+    )
+    .unwrap();
+
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(tmp.path().join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// One account, as an authenticated surface resolves it.
+fn account(name: &str) -> Scope {
+    Scope::User {
+        account: name.to_string(),
+        admin: false,
+    }
+}
+
+/// The permalinks `V102` fires on for one actor, sorted so the assertion is
+/// about which engrams carry a dangling reference rather than about rank.
+async fn dangling_for(engine: &Engine, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec!["V102".to_string()],
+                limit: Some(50),
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    let mut out: Vec<String> = v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["permalink"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Append one line to an engram as somebody, which in a reviewed domain lands
+/// as that person's own draft.
+async fn append_as(engine: &Engine, permalink: &str, line: &str, scope: &Scope) {
+    let value = engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: permalink.to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some(line.to_string()),
+                ..EditParams::default()
+            },
+            None,
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["draft"], Value::Bool(true), "{value}");
+}
+
+/// A reference that dangles in a draft is a finding for the person drafting it
+/// and for nobody else: the sweep reads the domain the way its caller reads it,
+/// so the text under review is the author's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drafts_unresolved_link_is_its_authors_finding_only() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "the reviewed files carry exactly one dangling reference"
+    );
+
+    // Alice writes a link nothing answers to into her own draft of the runbook.
+    append_as(
+        &engine,
+        "runbook",
+        "See [[How Alice Would Restart It]] for the rewrite.",
+        &alice,
+    )
+    .await;
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string(), "runbook".to_string()],
+        "her own draft's broken reference is hers to fix"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and nobody else is told about a reference in text they cannot read"
+    );
+
+    // An acknowledgment is resolved and recorded in the acknowledger's own
+    // dimension, so ruling her draft's reference intentional silences it for
+    // her and says nothing to anybody else.
+    engine
+        .acknowledge_finding_as(
+            "team",
+            "runbook",
+            "V102",
+            Some("the rewrite lands with the target"),
+            None,
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "her own ruling silences her own finding"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and the team's sweep never saw it either way"
+    );
+}
+
+/// A finding about the text the team reviewed is everybody's, whatever anybody
+/// is drafting elsewhere - and one actor's acknowledgment of it is their own,
+/// because the ack is written into their draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_finding_shows_for_every_actor() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    let charter = vec!["charter".to_string()];
+    assert_eq!(dangling_for(&engine, &alice).await, charter);
+    assert_eq!(dangling_for(&engine, &bob).await, charter);
+    assert_eq!(
+        dangling_for(&engine, &Scope::Unrestricted).await,
+        charter,
+        "and so does the machine owner, who is drafting nothing"
+    );
+
+    // A draft somewhere else changes nothing about a finding on the file.
+    append_as(&engine, "runbook", "The importer restarts cleanly.", &alice).await;
+    assert_eq!(dangling_for(&engine, &alice).await, charter);
+    assert_eq!(dangling_for(&engine, &bob).await, charter);
+
+    // Alice rules the dangling reference intentional. In a reviewed domain that
+    // ruling lands in her draft of the charter, so it speaks for her alone.
+    engine
+        .acknowledge_finding_as(
+            "team",
+            "charter",
+            "V102",
+            Some("the target lives outside the archive"),
+            None,
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(
+        dangling_for(&engine, &alice).await.is_empty(),
+        "her own ruling silences the finding for her"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        charter,
+        "and never for somebody who has not read it"
     );
 }

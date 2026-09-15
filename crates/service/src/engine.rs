@@ -9871,6 +9871,20 @@ impl Engine {
     /// path, which needs the same verdict about one engram before it can record
     /// what a finding was acknowledged for.
     ///
+    /// **Run in the caller's own dimension**, which is what makes a draft's
+    /// findings its author's: on a domain that reviews changes, the listing,
+    /// the text behind each fact, the graph the degrees are counted over, the
+    /// lead vectors and the dangling references are all taken as that actor
+    /// reads them, and the acknowledgments a fact carries are the ones written
+    /// into the document they are reading. Base findings stay everybody's,
+    /// because a base row nobody has redrafted is in everybody's listing.
+    /// Outside review mode - and for a caller with no identity - every one of
+    /// those is the base answer, unchanged.
+    ///
+    /// What is deliberately NOT per actor is the run recorder in
+    /// [`Engine::evolve_engrams`]: a sweep having run is a fact about the
+    /// machine's maintenance backlog, whoever asked for it.
+    ///
     /// `Ok(None)` for a domain with no engrams: no domain row to query against
     /// and nothing to detect. An empty domain is quiet, not an error.
     async fn sweep_domain(
@@ -9885,15 +9899,53 @@ impl Engine {
         let source = self.content_source(name)?;
         let overlay = self.overlay_for_read(name, scope);
         let store = self.store.lock().await;
-        let descs = store.list_engrams(name, None, None).await?;
+        let base = store.list_engrams(name, None, None).await?;
         drop(store);
+        // The sweep looks at exactly what its caller reads, through the same
+        // helper every read verb shadows a listing with: a path this caller is
+        // drafting is their own row, a path they have deleted is absent, and a
+        // draft at a path no file holds is a row like any other. `None` - a
+        // domain that takes changes directly, or a caller with no identity -
+        // hands the base listing straight back, so a sweep outside review mode
+        // is byte for byte the one that was there before.
+        //
+        // Shadowed rather than additive, and that is the whole ruling: a
+        // finding about a base row its author has already redrafted is a
+        // finding about text they no longer see. The lock is dropped first
+        // because the helper takes it itself.
+        let descs = self.shadow_seeds(name, overlay.as_deref(), base).await?;
         // No engrams means no domain row to query against and nothing to
-        // detect. An empty domain is quiet, not an error.
+        // detect. An empty domain is quiet, not an error. Read off the listing
+        // rather than the registration, so a domain whose only rows are one
+        // actor's drafts still sweeps for that actor.
         let Some(domain_id) = descs.first().map(|d| d.domain_id) else {
             return Ok(None);
         };
 
-        let graph = self.sweep_graph(&descs).await?;
+        // The text at each path in this caller's dimension, read once from the
+        // same overlay rows the listing was shadowed with. `overlay_visible_text`
+        // is the per-path form of the same answer and is what a single-engram
+        // verb uses; a sweep asks about every path at once, so it reads the set.
+        // Tombstones are dropped here because they are dropped from the listing
+        // above: a deletion is not an engram to assemble facts from.
+        let drafts: HashMap<String, String> = match overlay.as_deref() {
+            Some(actor) => {
+                let store = self.store.lock().await;
+                store
+                    .overlay_entries(domain_id, actor)
+                    .await?
+                    .into_iter()
+                    .filter(|entry| !entry.tombstone)
+                    .map(|entry| (entry.path, entry.content))
+                    .collect()
+            }
+            None => HashMap::new(),
+        };
+
+        // Traversed in the caller's dimension too, or every draft would come
+        // back with no edges at all and `V104` would report the engrams
+        // somebody is working on hardest as orphans.
+        let graph = self.sweep_graph(&descs, overlay.as_deref()).await?;
         let mut inbound: HashMap<i64, usize> = HashMap::new();
         let mut outbound: HashMap<i64, usize> = HashMap::new();
         for edge in &graph.edges {
@@ -9906,7 +9958,57 @@ impl Engine {
         let embedded = self.provider().is_some();
 
         let store = self.store.lock().await;
-        let unresolved = store.unresolved_refs(domain_id).await?;
+        let mut unresolved = store.unresolved_refs(domain_id).await?;
+        // That query answers for the rows the team reviewed, which is the base
+        // half of this caller's view. The other half is their own drafts, whose
+        // references hang off their own rows: read the same way `read_engram`
+        // reads a draft's outbound edges, and kept to the drafts this listing
+        // already shadowed in, so nothing speaks for a path this caller does
+        // not hold.
+        //
+        // A base row that a draft stands over needs no removal here: the rule
+        // only speaks about a reference whose engram is among the facts, and
+        // that row is not - its draft took its place.
+        //
+        // Ordered the way both backends order the base rows - by path, then
+        // line, then kind, then target - so one queue is the same queue twice.
+        // `outbound_refs` orders by line alone, which leaves two references on
+        // one line (a relation and a wikilink, or two wikilinks in one
+        // sentence) to the union's own arm order, and a queue whose rows swap
+        // between sweeps is a page boundary that moves under a reader.
+        if !drafts.is_empty() {
+            let mut held: Vec<&EngramDescriptor> = descs
+                .iter()
+                .filter(|d| drafts.contains_key(&d.path))
+                .collect();
+            held.sort_by(|a, b| a.path.cmp(&b.path));
+            for d in held {
+                let mut refs: Vec<crystalline_index::UnresolvedRef> = store
+                    .outbound_refs(d.id)
+                    .await?
+                    .into_iter()
+                    .filter(|reference| !reference.resolved)
+                    .map(|reference| crystalline_index::UnresolvedRef {
+                        from: d.id,
+                        // A prose wikilink carries no relation type, and the
+                        // backends report `links_to` for one - the same type
+                        // the graph gives a wikilink edge.
+                        rel_type: reference.rel_type.unwrap_or_else(|| "links_to".to_string()),
+                        kind: reference.kind,
+                        target_domain: reference.to_domain,
+                        target: reference.to_target,
+                        line: Some(reference.line),
+                    })
+                    .collect();
+                refs.sort_by(|a, b| {
+                    a.line
+                        .cmp(&b.line)
+                        .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
+                        .then_with(|| a.target.cmp(&b.target))
+                });
+                unresolved.extend(refs);
+            }
+        }
         let vocab = store.vocabulary(Some(name)).await?;
         // Metadata only, one query: the attachment rules compare paths,
         // sizes and hashes and never read a byte of any file.
@@ -9921,9 +10023,8 @@ impl Engine {
         // contributes THEIR row's vector rather than the reviewed file's - so
         // `V301` never tells an author their own rewrite is a twin of the
         // version they are rewriting, and never speaks about a version they are
-        // not reading. Until the sweep's engram listing is shadowed too, a
-        // drafted path therefore has no fact to attach a vector to and the rule
-        // is simply quiet about it for that author.
+        // not reading. The listing above is shadowed with the same rows, so the
+        // vector and the fact it attaches to are one engram's.
         let mut lead_vectors: HashMap<i64, Vec<f32>> = if embedded {
             store
                 .lead_vectors(domain_id, &self.model_id, overlay.as_deref())
@@ -9939,11 +10040,21 @@ impl Engine {
         let verify_config = domain_verify_config(&source);
         let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
         for d in &descs {
-            // Files-are-truth for a file domain, the stored content for a
-            // virtual one. An engram that no longer parses is counted and
-            // skipped rather than failing the whole sweep, since one broken
-            // file must not hide every finding behind it.
-            let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
+            // This caller's own draft of the path when they hold one, and
+            // otherwise files-are-truth for a file domain, the stored content
+            // for a virtual one. Assembling the reviewed file's text under a
+            // draft's row would be the quietest way to get this wrong: every
+            // rule would then speak about text its author is not reading.
+            //
+            // An engram that no longer parses is counted and skipped rather
+            // than failing the whole sweep, since one broken file must not hide
+            // every finding behind it.
+            let held = drafts.get(&d.path);
+            let parsed = match held {
+                Some(text) => parse_engram(text).ok(),
+                None => self.load_engram(&source, d.domain_id, &d.path).await,
+            };
+            let Some(engram) = parsed else {
                 unparsed += 1;
                 continue;
             };
@@ -9969,12 +10080,14 @@ impl Engine {
                 permalink: d.permalink.clone(),
                 title,
                 path: d.path.clone(),
-                // The base listing is what the facts are assembled from, so
-                // every fact here is a base row and says so. A fact that is
-                // one actor's own draft arrives with the sweep's shadowed
-                // listing; this field is what carries the answer then, and
-                // what `V301`'s path skip reads the dimension out of.
-                actor: String::new(),
+                // Which dimension this fact came out of: the empty string for a
+                // row the domain's files or its database hold, and the caller's
+                // own actor key for their draft standing at that path. What
+                // `V301`'s path skip reads the dimension out of.
+                actor: match held {
+                    Some(_) => overlay.clone().unwrap_or_default(),
+                    None => String::new(),
+                },
                 status,
                 engram_type: fm.engram_type.trim().to_ascii_lowercase(),
                 tags: fm.tags.clone(),
@@ -10069,13 +10182,19 @@ impl Engine {
     /// The resolved graph around a whole domain, at depth 1 so every
     /// cross-domain target carries a status.
     ///
-    /// Base rows alone. The sweep's engram list is the domain's files, so a
-    /// graph in any other dimension would count edges against nodes that are
-    /// not in the fact list; the sweep's own actor view arrives with that
-    /// listing.
-    async fn sweep_graph(&self, descs: &[EngramDescriptor]) -> Result<GraphSlice> {
+    /// In one caller's dimension, the same one their engram list was shadowed
+    /// in: `None` for a domain that takes changes directly, and that actor's
+    /// key for one that reviews them. The two have to agree or the degrees are
+    /// counted against nodes that are not in the fact list - a draft seeded
+    /// into a base-only traversal comes back with no edges at all, which reads
+    /// as an orphan on exactly the engram somebody is working on.
+    async fn sweep_graph(
+        &self,
+        descs: &[EngramDescriptor],
+        actor: Option<&str>,
+    ) -> Result<GraphSlice> {
         let ids: Vec<EngramId> = descs.iter().map(|d| d.id).collect();
-        self.sweep_neighbors(&ids, 1, None).await
+        self.sweep_neighbors(&ids, 1, actor).await
     }
 
     /// [`Store::neighbors`] over a seed list of any size, merged into one slice.

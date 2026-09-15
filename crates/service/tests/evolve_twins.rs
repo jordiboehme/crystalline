@@ -589,11 +589,11 @@ async fn sweep_team(engine: &Engine, scope: &Scope) -> Value {
 /// vectors in the reader's own dimension: at a path this reader is drafting,
 /// the vector that comes back is their row's, never the reviewed file's.
 ///
-/// What that costs while the sweep's engram listing is still the base one:
-/// a drafted path has no fact for its vector to attach to, so `V301` is simply
-/// quiet about that path for its author, and loud as ever for everybody else.
-/// The pair comes back for the author as their draft against the other engram
-/// once the listing is shadowed too.
+/// The listing is shadowed the same way, so her draft stands where the row it
+/// is a draft of stood: the pair she is shown is her own text against the other
+/// engram, and the pair the rule must never report cannot even form, because
+/// the row she is drafting over is not in her listing at all. The path skip in
+/// the rule stays as the second line of that defence.
 #[tokio::test]
 async fn a_draft_is_never_its_base_rows_twin() {
     let (_tmp, engine) = review_engine().await;
@@ -642,11 +642,12 @@ async fn a_draft_is_never_its_base_rows_twin() {
     assert_eq!(edited["draft"], Value::Bool(true), "{edited}");
     engine.embed_pending().await.unwrap();
 
-    assert!(
-        pairs(&sweep_team(&engine, &alice).await).is_empty(),
-        "the path she is drafting is her own row, and the sweep never pairs it \
-         with the engram it is a draft of: {:?}",
-        pairs(&sweep_team(&engine, &alice).await)
+    let hers = pairs(&sweep_team(&engine, &alice).await);
+    assert_eq!(
+        hers, team_pair,
+        "the path she is drafting is her own row: the one pair she is shown is \
+         her draft against the other engram, never against the engram it is a \
+         draft of"
     );
     assert_eq!(
         pairs(&sweep_team(&engine, &bob).await),
