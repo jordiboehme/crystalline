@@ -38,6 +38,13 @@ export interface DomainSummary {
    * not in the listing at all, so a row is never withheld here, only marked.
    */
   private: boolean;
+  /**
+   * `"overlay"` while this domain reviews changes before they land - every
+   * write joins its author's own draft and the folder changes only through a
+   * reviewed proposal - and null while it takes changes directly, which is how
+   * a domain starts out and what an older server says about every domain.
+   */
+  review: string | null;
 }
 
 /** Everything `GET /domains` says. */
@@ -61,6 +68,7 @@ function readDomain(value: unknown): DomainSummary | null {
     lastSync: typeof record?.last_sync === "string" ? record.last_sync : null,
     whenToUse: asStrings(record?.when_to_use),
     private: record?.private === true,
+    review: typeof record?.review === "string" ? record.review : null,
   };
 }
 

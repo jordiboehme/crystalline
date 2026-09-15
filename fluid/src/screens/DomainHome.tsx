@@ -44,6 +44,7 @@ import { FilterFields, TagChips } from "../components/FilterControls";
 import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
 import { MembersCard } from "../components/MembersCard";
 import { ProposalsCard } from "../components/ProposalsCard";
+import { ReviewModeCard } from "../components/ReviewModeCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
@@ -275,6 +276,19 @@ export default function DomainHome() {
         see its own module doc.
       */}
       <MembersCard domain={domain} />
+
+      {/*
+        Which way a write in this domain goes, and the control that changes it.
+        Only where the domain has a GitHub origin, because review mode needs one
+        (a reviewed change has to have somewhere to be proposed) - the same gate
+        the two share cards above are under, and the same read, so a domain that
+        could never take the mode is never offered it. Whether the CALLER may
+        press is the server's answer rather than this side's arithmetic; see the
+        card's own module doc.
+      */}
+      {capabilities.canShare && summary !== undefined && (
+        <ReviewModeCard domain={domain} reviewing={summary.review !== null} />
+      )}
 
       <section aria-labelledby="domain-manifest">
         <h2 id="domain-manifest" className="mb-2 text-section">
