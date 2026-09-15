@@ -182,7 +182,7 @@ async fn full_sync_counts(store: &dyn Store) {
 
     // The resolved prose wikilink is a `links_to` edge in graph traversal.
     let alpha = store.lookup_id("eng", "alpha").await.unwrap().unwrap();
-    let slice = store.neighbors(&[alpha], 1).await.unwrap();
+    let slice = store.neighbors(&[alpha], 1, None).await.unwrap();
     assert!(
         slice
             .edges
@@ -540,7 +540,7 @@ async fn link_two_pass_resolution(store: &dyn Store) {
 
     // The resolved wikilink is a `links_to` edge from A to Gamma.
     let a = store.lookup_id("d", "a").await.unwrap().unwrap();
-    let slice = store.neighbors(&[a], 1).await.unwrap();
+    let slice = store.neighbors(&[a], 1, None).await.unwrap();
     assert!(
         slice
             .edges
@@ -646,7 +646,7 @@ async fn late_cross_domain_resolution(store: &dyn Store) {
 
     // The resolved reference is a real edge, not just a filled column.
     let a = store.lookup_id("a", "a").await.unwrap().unwrap();
-    let slice = store.neighbors(&[a], 1).await.unwrap();
+    let slice = store.neighbors(&[a], 1, None).await.unwrap();
     let perms: Vec<&str> = slice.nodes.iter().map(|n| n.permalink.as_str()).collect();
     assert!(perms.contains(&"b-note"), "traversal reaches b's engram");
 
@@ -2567,7 +2567,7 @@ async fn neighbors_cross_domain(store: &dyn Store) {
 
     let a = store.lookup_id("domain1", "a").await.unwrap().unwrap();
 
-    let d1_slice = store.neighbors(&[a], 1).await.unwrap();
+    let d1_slice = store.neighbors(&[a], 1, None).await.unwrap();
     let perms1: Vec<&str> = d1_slice
         .nodes
         .iter()
@@ -2577,7 +2577,7 @@ async fn neighbors_cross_domain(store: &dyn Store) {
     assert!(perms1.contains(&"b"), "depth 1 reaches B");
     assert!(!perms1.contains(&"c"), "depth 1 does not reach C");
 
-    let d2_slice = store.neighbors(&[a], 2).await.unwrap();
+    let d2_slice = store.neighbors(&[a], 2, None).await.unwrap();
     let perms2: Vec<&str> = d2_slice
         .nodes
         .iter()
@@ -2642,7 +2642,7 @@ async fn neighbors_carries_salience(store: &dyn Store) {
     assert_eq!(report.relations_resolved, 3, "all three relations resolve");
 
     let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
-    let slice = store.neighbors(&[seed], 1).await.unwrap();
+    let slice = store.neighbors(&[seed], 1, None).await.unwrap();
 
     let numeric = slice
         .nodes
@@ -2706,7 +2706,7 @@ async fn neighbors_carries_status(store: &dyn Store) {
     assert_eq!(report.relations_resolved, 2, "both relations resolve");
 
     let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
-    let slice = store.neighbors(&[seed], 1).await.unwrap();
+    let slice = store.neighbors(&[seed], 1, None).await.unwrap();
 
     let current = slice
         .nodes
@@ -6046,6 +6046,236 @@ parity!(
     lead_vectors_across_the_actor_dimension
 );
 
+/// The graph a reader walks is their own view of the domain: their drafts'
+/// edges, the team's edges everywhere they hold no draft, and nothing of
+/// anybody else's.
+///
+/// Both ends of every edge are screened, not just the node hydrate, because an
+/// edge reaching INTO a draft is as far outside that reader's graph as one
+/// leaving it - and a frontier that walked it would push the draft's id into
+/// the visited set and pull base engrams into the neighbourhood through
+/// somebody else's private draft.
+///
+/// `None` is the base graph alone, the answer this traversal gave before the
+/// dimension existed, which is what every unauthenticated reader gets.
+async fn neighbors_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram("Field notes", "notes", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "audit.md",
+        &engram("Audit", "audit", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+    let base_notes = store.lookup_id("d", "notes").await.unwrap().unwrap();
+
+    // Her draft of the plan points somewhere else than the file does, so the
+    // base edge and the drafted edge are distinguishable rather than equal.
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[audit]]\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    )
+    .await;
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram(
+            "Bob's own",
+            "bobs",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    )
+    .await;
+    // Setup, not assertion: a draft's references settle onto real ids exactly
+    // as a base row's do, and without this every edge below would be skipped
+    // for a reason that has nothing to do with the actor.
+    store.resolve_pending_relations(domain).await.unwrap();
+    store.resolve_pending_links(domain).await.unwrap();
+
+    /// The slice as `(node permalinks, edges as permalink pairs)`, both sorted.
+    fn shape(slice: &crystalline_index::GraphSlice) -> (Vec<String>, Vec<(String, String)>) {
+        let by_id: HashMap<i64, String> = slice
+            .nodes
+            .iter()
+            .map(|n| (n.id.0, n.permalink.clone()))
+            .collect();
+        let mut names: Vec<String> = by_id.values().cloned().collect();
+        names.sort();
+        let mut edges: Vec<(String, String)> = slice
+            .edges
+            .iter()
+            .map(|e| {
+                (
+                    by_id
+                        .get(&e.from.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("no node {}", e.from.0)),
+                    by_id
+                        .get(&e.to.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("no node {}", e.to.0)),
+                )
+            })
+            .collect();
+        edges.sort();
+        (names, edges)
+    }
+
+    let plan_to_notes = (
+        vec!["notes".to_string(), "plan".to_string()],
+        vec![("plan".to_string(), "notes".to_string())],
+    );
+    // Seeded at the plan, from each end of the dimension.
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, None).await.unwrap()),
+        plan_to_notes,
+        "the base graph is what the files say, for a reader who names no actor"
+    );
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, Some("bob")).await.unwrap()),
+        plan_to_notes,
+        "and for an actor who holds no draft at that path"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[alice_plan], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["audit".to_string(), "plan".to_string()],
+            vec![("plan".to_string(), "audit".to_string())]
+        ),
+        "her own draft's edge is the edge she walks, not the file's"
+    );
+
+    // Seeded at the other end, which is the half a screen on one endpoint
+    // alone gets wrong.
+    assert_eq!(
+        shape(&store.neighbors(&[base_notes], 1, None).await.unwrap()),
+        plan_to_notes,
+        "nobody's draft points at the field notes as far as the files know"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[base_notes], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["fresh".to_string(), "notes".to_string()],
+            vec![("fresh".to_string(), "notes".to_string())]
+        ),
+        "her draft-only engram reaches the notes, and the plan she is drafting \
+         over does not: her view of that path is her own draft, which points \
+         elsewhere"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[base_notes], 1, Some("bob"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["bobs".to_string(), "notes".to_string(), "plan".to_string()],
+            vec![
+                ("bobs".to_string(), "notes".to_string()),
+                ("plan".to_string(), "notes".to_string())
+            ]
+        ),
+        "bob walks his own draft and the team's plan, and never hers"
+    );
+    assert!(
+        !shape(
+            &store
+                .neighbors(&[base_notes], 2, Some("bob"))
+                .await
+                .unwrap()
+        )
+        .0
+        .contains(&"fresh".to_string()),
+        "and no depth reaches another actor's draft"
+    );
+    let _ = (alice_fresh, bob_own);
+
+    // A path its author deleted is not in that author's graph, so an edge into
+    // it is never walked and leaves no node behind.
+    let mut stone = record("audit.md", "audit.md", "plain\n", "alice-audit");
+    stone.title = "Audit".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[alice_plan], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (vec!["plan".to_string()], Vec::new()),
+        "her draft stands alone once she has deleted what it points at"
+    );
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, None).await.unwrap()),
+        plan_to_notes,
+        "and the team's graph never moved"
+    );
+}
+parity!(
+    neighbors_answer_the_actors_shadowed_graph,
+    neighbors_across_the_actor_dimension
+);
+
 /// Every statement that reads the `engram` table says which actor's rows it
 /// means, or says in as many words that it means all of them.
 ///
@@ -6101,6 +6331,14 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         // this census too, and it is the one that carries the bound `actor =`
         // spellings for both dialects.
         "{actor_screen}",
+        // The graph frontier screens TWO ends of the `engram` table in one
+        // statement - the row an edge leaves and the row it reaches - so it
+        // names two composed screens rather than one, and the node hydrate
+        // that follows names a third. All three are built by the same
+        // `actor_screen` the search legs use, through its alias-taking form.
+        "{src_screen}",
+        "{dst_screen}",
+        "{node_screen}",
     ];
     const WAIVER: &str = "-- actor: all";
     // How far around a statement its predicate or waiver may sit. A statement
@@ -6153,8 +6391,9 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         "the engram statement census moved; every new one needs a predicate or a waiver. \
          54 per backend in mod.rs, 11 per backend in search.rs, 4 in the shared \
          reference-resolution expression. The eleventh per backend is the \
-         anti-join inside `actor_screen`, which asks whether the reader holds a \
-         row of their own at a base row's path"
+         anti-join inside `actor_screen_on`, which asks whether the reader holds \
+         a row of their own at a base row's path - one site however many \
+         statements compose the screen"
     );
     assert_eq!(
         waived, 14,
@@ -6228,7 +6467,7 @@ async fn a_draft_reaches_no_base_answer_through_its_children(store: &dyn Store) 
     let before = base_stats().await;
     let vocab_before = store.vocabulary(None).await.unwrap();
     let scoped_before = store.vocabulary(Some("d")).await.unwrap();
-    let graph_before = store.neighbors(&[a], 2).await.unwrap();
+    let graph_before = store.neighbors(&[a], 2, None).await.unwrap();
 
     // One draft, carrying every kind of child row a base row can carry: a
     // relation and a prose link that both resolve onto base engrams, an
@@ -6323,7 +6562,7 @@ async fn a_draft_reaches_no_base_answer_through_its_children(store: &dyn Store) 
 
     // The graph. The seeds are base rows, so nothing the traversal returns may
     // name the draft - and every edge it does return must have a node.
-    let graph = store.neighbors(&[a], 2).await.unwrap();
+    let graph = store.neighbors(&[a], 2, None).await.unwrap();
     assert_eq!(
         graph.edges.len(),
         graph_before.edges.len(),
@@ -6341,7 +6580,7 @@ async fn a_draft_reaches_no_base_answer_through_its_children(store: &dyn Store) 
     }
     // And the same from the other end: seeding on the draft's target must not
     // drag the draft in either.
-    let from_b = store.neighbors(&[b], 2).await.unwrap();
+    let from_b = store.neighbors(&[b], 2, None).await.unwrap();
     let from_b_ids: Vec<i64> = from_b.nodes.iter().map(|n| n.id.0).collect();
     for edge in &from_b.edges {
         assert!(

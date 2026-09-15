@@ -2448,3 +2448,128 @@ async fn a_draft_never_takes_a_permalink_another_path_holds() {
          over a draft that is gone: {held:?}"
     );
 }
+
+// --- Task 6: the actor reaches the graph ------------------------------------
+
+/// A draft's relation is in its author's own neighbourhood and in nobody
+/// else's, seeded from either end.
+///
+/// The graph is where a leak is hardest to see and hardest to undo: an edge is
+/// a fact about the engram at each of its ends, so a frontier that walked
+/// somebody else's draft would tell a reader that a private page exists AND
+/// pull the team's engrams into a neighbourhood through it. Seeded from both
+/// ends because a screen applied at one endpoint only passes the test from the
+/// side it screens.
+#[tokio::test]
+async fn a_drafts_relation_reaches_its_authors_context_and_nobody_elses() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    for (scope, title, body) in [
+        (
+            &alice,
+            "Fresh",
+            "- [idea] a page only alice has #team\n\n- relates_to [[Plan]]",
+        ),
+        (
+            &bob,
+            "Bobs idea",
+            "- [idea] a page only bob has #team\n\n- relates_to [[Plan]]",
+        ),
+    ] {
+        let receipt = f
+            .engine
+            .write_engram_as(&write_params("team", title, body), None, scope)
+            .await
+            .unwrap();
+        assert_eq!(receipt["draft"], serde_json::json!(true), "{receipt}");
+    }
+
+    let context = async |anchor: &str, scope: &Scope| {
+        f.engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(1),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                scope,
+            )
+            .await
+    };
+    /// The permalinks of a slice's nodes, sorted.
+    fn nodes(value: &serde_json::Value) -> Vec<String> {
+        let mut out: Vec<String> = value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["permalink"].as_str().unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    }
+
+    // Seeded at the base engram both drafts point at.
+    assert_eq!(
+        nodes(&context("crystalline://team/plan", &alice).await.unwrap()),
+        vec!["fresh".to_string(), "plan".to_string()],
+        "her own draft is in her neighbourhood of the plan, and his is not"
+    );
+    assert_eq!(
+        nodes(&context("crystalline://team/plan", &bob).await.unwrap()),
+        vec!["bobs-idea".to_string(), "plan".to_string()],
+        "and his in his"
+    );
+    assert_eq!(
+        nodes(
+            &context("crystalline://team/plan", &account("carol"))
+                .await
+                .unwrap()
+        ),
+        vec!["plan".to_string()],
+        "an account drafting nothing here sees the graph the team's files draw"
+    );
+
+    // Seeded at the draft itself, which only its author can anchor on at all.
+    assert_eq!(
+        nodes(&context("crystalline://team/fresh", &alice).await.unwrap()),
+        vec!["fresh".to_string(), "plan".to_string()],
+        "her draft is an anchor of her own"
+    );
+    assert!(
+        context("crystalline://team/fresh", &bob).await.is_err(),
+        "and for anybody else it is the miss an engram nobody wrote produces"
+    );
+
+    // A path its author deleted anchors nothing for them and is out of their
+    // graph, while the team's neighbourhood is untouched.
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(
+        context("crystalline://team/plan", &alice).await.is_err(),
+        "she deleted it, so there is nothing there to anchor on"
+    );
+    assert_eq!(
+        nodes(&context("crystalline://team/fresh", &alice).await.unwrap()),
+        vec!["fresh".to_string()],
+        "and her draft stands alone, its relation reaching a path she took away"
+    );
+    assert_eq!(
+        nodes(&context("crystalline://team/plan", &bob).await.unwrap()),
+        vec!["bobs-idea".to_string(), "plan".to_string()],
+        "her deletion is hers: the team's plan is where it was for everybody else"
+    );
+}

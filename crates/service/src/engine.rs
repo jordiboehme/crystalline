@@ -3148,6 +3148,94 @@ impl Engine {
         Ok(None)
     }
 
+    /// The seeds of a graph traversal, in one reader's own view of the domain.
+    ///
+    /// Three edits, the same three [`Engine::shadow_level`] makes to a browse
+    /// level: a path this reader has deleted seeds nothing, a path they are
+    /// drafting seeds from their own row - so the traversal walks the edges
+    /// they wrote rather than the ones the reviewed file carries - and a draft
+    /// at a path no file holds is a seed like any other. `None` hands the base
+    /// seeds back untouched, which is what a reader with no identity gets and
+    /// what every caller got before the dimension existed.
+    ///
+    /// The registered-set screen composes ahead of this, never behind it: a
+    /// caller passes `None` for a domain the reader may not see, so a draft of
+    /// their own is no way back into a domain that is hidden from them.
+    async fn shadow_seeds(
+        &self,
+        domain: &str,
+        overlay: Option<&str>,
+        base: Vec<EngramDescriptor>,
+    ) -> Result<Vec<EngramDescriptor>> {
+        let Some(actor) = overlay else {
+            return Ok(base);
+        };
+        let (domain_id, _) = self.domain_source(domain).await?;
+        let entries = {
+            let store = self.store.lock().await;
+            store.overlay_entries(domain_id, actor).await?
+        };
+        let held: HashMap<&str, &crystalline_index::StoredEngram> = entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect();
+        let mut seeds: Vec<EngramDescriptor> = Vec::with_capacity(base.len());
+        let mut base_paths: HashSet<String> = HashSet::new();
+        for d in base {
+            base_paths.insert(d.path.clone());
+            match held.get(d.path.as_str()) {
+                // Deleted: this reader anchors on nothing here, and nothing
+                // reaches them through it either.
+                Some(entry) if entry.tombstone => {}
+                Some(entry) => seeds.extend(overlay_descriptor(domain, domain_id, entry)),
+                None => seeds.push(d),
+            }
+        }
+        for entry in &entries {
+            if !base_paths.contains(&entry.path) {
+                seeds.extend(overlay_descriptor(domain, domain_id, entry));
+            }
+        }
+        Ok(seeds)
+    }
+
+    /// [`Engine::shadow_seeds`] for a single named anchor: the base row this
+    /// reader sees at that address, their own draft of it when they hold one,
+    /// nothing at all when they have deleted it, and their draft-only engram
+    /// when no file holds that address at all.
+    async fn shadow_anchor(
+        &self,
+        domain: &str,
+        overlay: Option<&str>,
+        base: Option<EngramDescriptor>,
+        permalink: &str,
+    ) -> Result<Option<EngramDescriptor>> {
+        let Some(actor) = overlay else {
+            return Ok(base);
+        };
+        match base {
+            // One path, so one targeted lookup rather than a scan of this
+            // actor's whole overlay: the question is only ever "does this
+            // reader hold a row at the path the base row stands at".
+            Some(d) => {
+                let (domain_id, _) = self.domain_source(domain).await?;
+                let entry = {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, actor, &d.path).await?
+                };
+                Ok(match entry {
+                    Some(entry) if entry.tombstone => None,
+                    Some(entry) => overlay_descriptor(domain, domain_id, &entry),
+                    None => Some(d),
+                })
+            }
+            None => Ok(self
+                .resolve_draft(domain, actor, permalink)
+                .await?
+                .map(|(desc, _)| desc)),
+        }
+    }
+
     /// [`Engine::resolve`] with the domains the caller may not see subtracted.
     ///
     /// A hidden domain resolves as an empty one rather than as a refusal: the
@@ -7683,31 +7771,41 @@ impl Engine {
         let domain_filter = Some(p.domains.clone()).filter(|d| !d.is_empty());
         let hidden = self.hidden_for(scope).await?;
 
-        let store = self.store.lock().await;
         // A hidden domain skips the lookup and keeps the branch: a glob over one
         // falls into the same "matched no engrams" an empty glob produces, and a
         // named anchor into the same not-found a missing engram produces. Both
         // are reached by the same lines a visible domain reaches, which is what
         // makes the two indistinguishable.
         let visible_anchor = !hidden.contains(&url.domain);
+        // The registered-set screen composes ahead of the actor dimension: the
+        // overlay question is asked only about a domain this reader may see, so
+        // a draft of their own is no way into one they may not.
+        let overlay = visible_anchor
+            .then(|| self.overlay_for_read(&url.domain, scope))
+            .flatten();
         let seeds: Vec<EngramDescriptor> = if url.glob {
-            if visible_anchor {
-                store
-                    .list_engrams(&url.domain, None, None)
-                    .await?
-                    .into_iter()
-                    .filter(|d| url.matches(&d.domain, &d.permalink))
-                    .collect()
+            let base = if visible_anchor {
+                let store = self.store.lock().await;
+                store.list_engrams(&url.domain, None, None).await?
             } else {
                 Vec::new()
-            }
+            };
+            self.shadow_seeds(&url.domain, overlay.as_deref(), base)
+                .await?
+                .into_iter()
+                .filter(|d| url.matches(&d.domain, &d.permalink))
+                .collect()
         } else {
             let found = if visible_anchor {
+                let store = self.store.lock().await;
                 store.find_engram(&url.domain, &url.permalink).await?
             } else {
                 None
             };
-            match found {
+            match self
+                .shadow_anchor(&url.domain, overlay.as_deref(), found, &url.permalink)
+                .await?
+            {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -7725,7 +7823,14 @@ impl Engine {
         }
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let mut slice = store.neighbors(&ids, depth).await?;
+        // The traversal is asked as this caller, not as the anchor domain's
+        // overlay: a slice crosses domains, so whose rows it may walk is one
+        // question about the reader - the same one a search asks - rather than
+        // one domain's mode deciding what another domain's edges say.
+        let store = self.store.lock().await;
+        let mut slice = store
+            .neighbors(&ids, depth, crate::scope::overlay_actor(scope).as_deref())
+            .await?;
         // Cut before the ranking, not at output selection like the caller's own
         // `domains` filter below. The two look alike and are not: a presentation
         // filter leaves a node in the graph so it still conducts mass as a
@@ -7860,24 +7965,42 @@ impl Engine {
         // with the same miss a visible domain with nothing in it answers with.
         // See [`Engine::build_context`], which seeds the same way.
         let visible_anchor = !hidden.contains(&url.domain);
-        let seeds: Vec<EngramDescriptor> = if url.glob {
+        let overlay = visible_anchor
+            .then(|| self.overlay_for_read(&url.domain, scope))
+            .flatten();
+        let base: Vec<EngramDescriptor> = if url.glob {
             if visible_anchor {
-                store
-                    .list_engrams(&url.domain, None, None)
-                    .await?
-                    .into_iter()
-                    .filter(|d| url.matches(&d.domain, &d.permalink))
-                    .collect()
+                store.list_engrams(&url.domain, None, None).await?
             } else {
                 Vec::new()
             }
         } else {
-            let found = if visible_anchor {
-                store.find_engram(&url.domain, &url.permalink).await?
-            } else {
-                None
-            };
-            match found {
+            match visible_anchor {
+                true => store
+                    .find_engram(&url.domain, &url.permalink)
+                    .await?
+                    .into_iter()
+                    .collect(),
+                false => Vec::new(),
+            }
+        };
+        drop(store);
+        let seeds: Vec<EngramDescriptor> = if url.glob {
+            self.shadow_seeds(&url.domain, overlay.as_deref(), base)
+                .await?
+                .into_iter()
+                .filter(|d| url.matches(&d.domain, &d.permalink))
+                .collect()
+        } else {
+            match self
+                .shadow_anchor(
+                    &url.domain,
+                    overlay.as_deref(),
+                    base.into_iter().next(),
+                    &url.permalink,
+                )
+                .await?
+            {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -7887,7 +8010,6 @@ impl Engine {
                 }
             }
         };
-        drop(store);
         if seeds.is_empty() {
             return Err(EngineError::NotFound(format!(
                 "anchor '{anchor}' matched no engrams"
@@ -7896,7 +8018,9 @@ impl Engine {
 
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let mut slice = self.sweep_neighbors(&ids, depth).await?;
+        let mut slice = self
+            .sweep_neighbors(&ids, depth, crate::scope::overlay_actor(scope).as_deref())
+            .await?;
         // Before the ranking and before the cap, so a hidden neighbour is
         // neither drawn nor counted in `hidden` - that number reports what the
         // cap cut, and a node this caller may not see was never in the picture.
@@ -9792,9 +9916,14 @@ impl Engine {
 
     /// The resolved graph around a whole domain, at depth 1 so every
     /// cross-domain target carries a status.
+    ///
+    /// Base rows alone. The sweep's engram list is the domain's files, so a
+    /// graph in any other dimension would count edges against nodes that are
+    /// not in the fact list; the sweep's own actor view arrives with that
+    /// listing.
     async fn sweep_graph(&self, descs: &[EngramDescriptor]) -> Result<GraphSlice> {
         let ids: Vec<EngramId> = descs.iter().map(|d| d.id).collect();
-        self.sweep_neighbors(&ids, 1).await
+        self.sweep_neighbors(&ids, 1, None).await
     }
 
     /// [`Store::neighbors`] over a seed list of any size, merged into one slice.
@@ -9814,13 +9943,18 @@ impl Engine {
     /// consolidation ranking and the orphan rule read. The merged nodes are
     /// sorted by id, so a chunked sweep answers in the same ascending order a
     /// single-chunk one does and every caller's ordering holds either way.
-    async fn sweep_neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
+    async fn sweep_neighbors(
+        &self,
+        ids: &[EngramId],
+        depth: u8,
+        actor: Option<&str>,
+    ) -> Result<GraphSlice> {
         let mut graph = GraphSlice::default();
         let mut seen_nodes: HashSet<i64> = HashSet::new();
         let mut seen_edges: HashSet<(i64, i64, String, u8)> = HashSet::new();
         for chunk in ids.chunks(NEIGHBOR_CHUNK) {
             let store = self.store.lock().await;
-            let slice = store.neighbors(chunk, depth).await?;
+            let slice = store.neighbors(chunk, depth, actor).await?;
             drop(store);
             for node in slice.nodes {
                 if seen_nodes.insert(node.id.0) {
@@ -17291,6 +17425,36 @@ fn folder_slash_lower(prefix: &str) -> String {
         out.push('/');
     }
     out
+}
+
+/// The descriptor of one overlay entry, read out of the document the row
+/// carries.
+///
+/// `None` for a tombstone, which is a deletion rather than an engram, and for a
+/// row whose markdown no longer parses - a draft nobody can read is a draft
+/// nothing can traverse either. The `id` is the draft row's OWN id, which is
+/// the whole point: it is the key its observations, relations, links and chunks
+/// hang off, so a traversal seeded with it walks the edges its author wrote.
+fn overlay_descriptor(
+    domain: &str,
+    domain_id: crystalline_index::DomainId,
+    entry: &crystalline_index::StoredEngram,
+) -> Option<EngramDescriptor> {
+    if entry.tombstone {
+        return None;
+    }
+    let engram = parse_engram(&entry.content).ok()?;
+    let record = EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
+    Some(EngramDescriptor {
+        id: entry.id,
+        domain_id,
+        domain: domain.to_string(),
+        path: entry.path.clone(),
+        permalink: entry.permalink.clone(),
+        title: record.title,
+        engram_type: record.engram_type,
+        status: record.status,
+    })
 }
 
 /// Describe a browse row by the draft standing at its path: the permalink,

@@ -1577,8 +1577,13 @@ impl Store for TursoStore {
         .await
     }
 
-    async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
-        search::neighbors(&self.conn, ids, depth).await
+    async fn neighbors(
+        &self,
+        ids: &[EngramId],
+        depth: u8,
+        actor: Option<&str>,
+    ) -> Result<GraphSlice> {
+        search::neighbors(&self.conn, ids, depth, actor).await
     }
 
     async fn recent(&self, filter: &RecentFilter) -> Result<Vec<EngramSummary>> {

@@ -1597,9 +1597,14 @@ impl Store for PostgresStore {
         .await
     }
 
-    async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
+    async fn neighbors(
+        &self,
+        ids: &[EngramId],
+        depth: u8,
+        actor: Option<&str>,
+    ) -> Result<GraphSlice> {
         let mut conn = self.acquire().await?;
-        search::neighbors(conn.as_mut(), ids, depth).await
+        search::neighbors(conn.as_mut(), ids, depth, actor).await
     }
 
     async fn recent(&self, filter: &RecentFilter) -> Result<Vec<EngramSummary>> {

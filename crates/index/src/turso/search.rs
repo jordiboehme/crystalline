@@ -1154,11 +1154,16 @@ async fn matching_observation(
     query_first(conn, &sql, params).await
 }
 
-/// Traverse the neighborhood of the seed engrams up to `depth` hops.
+/// Traverse the neighborhood of the seed engrams up to `depth` hops, in
+/// `actor`'s view of the index: `None` walks the base rows alone and
+/// `Some(a)` walks that actor's shadowed view, their own drafts standing in
+/// for the rows they are drafts of and a path they have deleted reachable
+/// from nothing.
 pub(super) async fn neighbors(
     conn: &Connection,
     ids: &[EngramId],
     depth: u8,
+    actor: Option<&str>,
 ) -> Result<GraphSlice> {
     let depth = depth.clamp(1, 3);
     let mut visited: HashSet<i64> = ids.iter().map(|e| e.0).collect();
@@ -1177,26 +1182,30 @@ pub(super) async fn neighbors(
             .join(",");
         let mut next: Vec<i64> = Vec::new();
 
+        let mut rel_params: Vec<Value> = Vec::new();
+        let mut rel_n = 1usize;
+        let src_screen = actor_screen_on("src", actor, &mut rel_params, &mut rel_n);
+        let dst_screen = actor_screen_on("dst", actor, &mut rel_params, &mut rel_n);
         let rel_rows = query_all(
             conn,
             &format!(
                 // A draft's relation and link rows are written exactly as a
                 // base row's, so a frontier that stops at those tables walks
                 // them without ever naming the table that knows whose they are:
-                // the traversal would push a draft's id into the visited set
-                // and the node hydrate below - which does carry the predicate -
-                // would then drop it, leaving an edge with no node and base
-                // engrams pulled into the neighbourhood through somebody else's
+                // the traversal would push a row's id into the visited set and
+                // the node hydrate below - which does carry the screen - would
+                // then drop it, leaving an edge with no node and engrams
+                // pulled into the neighbourhood through somebody else's
                 // private draft. Both endpoints are screened, because an edge
-                // reaching INTO a draft is as far outside the base graph as one
-                // leaving it.
+                // reaching INTO a row this reader may not see is as far
+                // outside their graph as one leaving it.
                 "SELECT r.engram_id, r.to_id, r.rel_type FROM relation r \
-                 JOIN engram src ON src.id=r.engram_id AND src.actor = '' \
-                 JOIN engram dst ON dst.id=r.to_id AND dst.actor = '' \
+                 JOIN engram src ON src.id=r.engram_id AND {src_screen} \
+                 JOIN engram dst ON dst.id=r.to_id AND {dst_screen} \
                  WHERE r.to_id IS NOT NULL \
                    AND (r.engram_id IN ({list}) OR r.to_id IN ({list}))"
             ),
-            vec![],
+            rel_params,
         )
         .await?;
         for r in &rel_rows {
@@ -1215,18 +1224,22 @@ pub(super) async fn neighbors(
             );
         }
 
+        let mut link_params: Vec<Value> = Vec::new();
+        let mut link_n = 1usize;
+        let src_screen = actor_screen_on("src", actor, &mut link_params, &mut link_n);
+        let dst_screen = actor_screen_on("dst", actor, &mut link_params, &mut link_n);
         let link_rows = query_all(
             conn,
             &format!(
                 // The prose-link twin of the relation frontier above, and
                 // screened for the same reason.
                 "SELECT l.engram_id, l.to_id FROM link l \
-                 JOIN engram src ON src.id=l.engram_id AND src.actor = '' \
-                 JOIN engram dst ON dst.id=l.to_id AND dst.actor = '' \
+                 JOIN engram src ON src.id=l.engram_id AND {src_screen} \
+                 JOIN engram dst ON dst.id=l.to_id AND {dst_screen} \
                  WHERE l.to_id IS NOT NULL \
                    AND (l.engram_id IN ({list}) OR l.to_id IN ({list}))"
             ),
-            vec![],
+            link_params,
         )
         .await?;
         for r in &link_rows {
@@ -1254,15 +1267,18 @@ pub(super) async fn neighbors(
             .map(i64::to_string)
             .collect::<Vec<_>>()
             .join(",");
+        let mut node_params: Vec<Value> = Vec::new();
+        let mut node_n = 1usize;
+        let node_screen = actor_screen_on("e", actor, &mut node_params, &mut node_n);
         let rows = query_all(
             conn,
             &format!(
                 "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
                  CAST(json_extract(e.metadata, '$.salience') AS REAL), e.status \
                  FROM engram e JOIN domain d ON d.id=e.domain_id \
-                 WHERE e.actor = '' AND e.id IN ({list}) ORDER BY e.id"
+                 WHERE {node_screen} AND e.id IN ({list}) ORDER BY e.id"
             ),
-            vec![],
+            node_params,
         )
         .await?;
         for r in &rows {

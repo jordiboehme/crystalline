@@ -1694,7 +1694,20 @@ pub trait Store: Send + Sync {
 
     /// Return the neighborhood of a set of seed engrams up to `depth` hops
     /// (`1..=3`), following relations and links across domain boundaries.
-    async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice>;
+    ///
+    /// `actor` is the same dimension [`SearchQuery::actor`] names: `None` walks
+    /// the base rows alone - the graph the domains' files describe, and the
+    /// traversal this ran before the dimension existed - and `Some(a)` walks
+    /// that actor's shadowed view. Both ends of every edge are screened, so an
+    /// edge into a row the reader may not see is not walked at all rather than
+    /// walked and then dropped at the hydrate, which would leave an edge with
+    /// no node and pull engrams in through somebody else's private draft.
+    async fn neighbors(
+        &self,
+        ids: &[EngramId],
+        depth: u8,
+        actor: Option<&str>,
+    ) -> Result<GraphSlice>;
 
     /// Return recent engrams matching a filter, newest first.
     async fn recent(&self, filter: &RecentFilter) -> Result<Vec<EngramSummary>>;
