@@ -4088,6 +4088,224 @@ async fn a_confirmed_fold_lands_the_files_and_applies_the_sidecars() {
     );
 }
 
+/// **Leaving review mode with any actor's files unreadable refuses outright**,
+/// whatever anybody answered, and nothing of anybody's is touched.
+///
+/// The sweep at the end of the fold is a walk of the tree, not of the plan. So
+/// an unreadable listing that merely dropped an actor out of the plan left the
+/// sweep removing every actor it could still count - which with no folding
+/// actor at all is somebody's only copy of their work deleted after the plan
+/// said there was nothing to decide. The decision is keyed off the listing
+/// itself for that reason, and the plan reports the actor it could not read
+/// rather than omitting them.
+///
+/// The unreadable state is a plain file where a directory belongs, not a
+/// permission bit: it is portable, deterministic, and it binds for root too.
+#[tokio::test]
+async fn leaving_review_mode_with_an_unreadable_files_folder_refuses_and_keeps_every_actors_files()
+{
+    let f = review_fixture().await;
+    f.file("team", "alice", "assets/deck.png", DECK_PNG).await;
+    // Bob's files folder is not a folder. He holds no rows either, so nothing
+    // but this listing could ever have named him.
+    let bob = f.state.join("overlays/team/bob");
+    std::fs::create_dir_all(&bob).unwrap();
+    std::fs::write(bob.join("files"), "not a folder").unwrap();
+
+    // The plan reports him rather than leaving him out, because an actor a plan
+    // does not name is an actor nobody can answer for.
+    let plan = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let bobs = plan["actors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["actor"] == serde_json::json!("bob"))
+        .cloned()
+        .expect("the actor whose files could not be read is in the plan");
+    assert_eq!(
+        bobs["files_unreadable"],
+        serde_json::json!(true),
+        "and the plan says why there is nothing to decide about him: {plan}"
+    );
+
+    // Both shapes of answer refuse, and the one with no folding actor at all is
+    // the one that used to destroy alice's work.
+    for answer in [
+        folds(&[]),
+        folds(&[("alice", FoldChoice::Fold)]),
+        folds(&[("alice", FoldChoice::Discard)]),
+    ] {
+        let refused = f
+            .engine
+            .set_review_mode("team", None, answer, &Scope::Unrestricted)
+            .await
+            .expect_err("a files overlay nobody can list is not one anybody can answer for");
+        let text = refused.to_string();
+        assert!(
+            text.contains("bob") && text.contains("could not be read"),
+            "the refusal names the actor and why: {text}"
+        );
+        assert_eq!(
+            f.files_held("team", "alice"),
+            vec![("assets/deck.png".to_string(), false)],
+            "and her only copy of her work is where she put it"
+        );
+        assert!(
+            bob.join("files").is_file(),
+            "as is whatever is standing in his way"
+        );
+        assert_eq!(
+            review_key(&f, "team"),
+            Some("overlay".to_string()),
+            "the domain reviews changes still, so the same call works later"
+        );
+    }
+
+    // Readable again - he holds nothing, so nothing names him - and the same
+    // call goes through.
+    std::fs::remove_file(bob.join("files")).unwrap();
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect("once the tree can be read, the answer can be carried out");
+    assert_eq!(
+        std::fs::read(f.domain_root("team").join("assets/deck.png")).unwrap(),
+        DECK_PNG,
+        "her file is the team's file now"
+    );
+}
+
+/// **A fold that failed part way folds the leftover file on the next call.**
+///
+/// The review key comes off in the middle of the verb, so everything after it
+/// has to work with the key already off: the second call reads the overlay
+/// whatever the key says, folds what is left and only then sweeps. If that read
+/// ever asked the key again, the fold would find no files, and the sweep - a
+/// walk of the tree - would delete exactly the ones it had just been unable to
+/// see.
+#[tokio::test]
+async fn a_fold_that_failed_part_way_folds_the_leftover_file_on_the_next_call() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "alice", "assets/deck.png", DECK_PNG).await;
+    // The folder's `assets` is not a folder, so the file half of the fold fails
+    // where the page half has already landed. Deterministic and portable: no
+    // permission bit is involved.
+    std::fs::write(f.domain_root("team").join("assets"), "not a folder").unwrap();
+
+    let failed = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("the file could not be written into the folder");
+    assert!(
+        failed.to_string().contains("assets"),
+        "the failure names the path it could not write: {failed}"
+    );
+    // The half-state the recovery starts from: the key is off, her page landed,
+    // her rows are still there and her file is still hers.
+    assert_eq!(review_key(&f, "team"), None);
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap(),
+        ALICE_DRAFT,
+        "the page half of the fold landed before the file half failed"
+    );
+    assert_eq!(
+        f.files_held("team", "alice"),
+        vec![("assets/deck.png".to_string(), false)],
+        "and her file is untouched in the overlay"
+    );
+
+    // The same call again, once the way is clear.
+    std::fs::remove_file(f.domain_root("team").join("assets")).unwrap();
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect("leaving review mode does not require the domain to be in it");
+
+    assert_eq!(
+        std::fs::read(f.domain_root("team").join("assets/deck.png")).unwrap(),
+        DECK_PNG,
+        "the leftover file folded on the repeat"
+    );
+    assert_eq!(
+        attachment_paths(&f).await,
+        vec!["assets/deck.png".to_string()],
+        "with its row beside it"
+    );
+    assert!(
+        f.files_held("team", "alice").is_empty(),
+        "and the overlay is empty"
+    );
+}
+
+/// One actor's fold is one actor's files, and nobody else's travel with them.
+#[tokio::test]
+async fn a_fold_carries_only_the_folding_actors_files() {
+    let f = review_fixture().await;
+    f.file("team", "alice", "assets/hers.png", DECK_PNG).await;
+    f.file("team", "bob", "assets/his.png", OLD_PNG).await;
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Discard)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["folded"],
+        serde_json::json!([{ "actor": "alice", "written": 1, "deleted": 0 }]),
+        "one file folded, and it is hers: {receipt}"
+    );
+    assert_eq!(
+        receipt["discarded"],
+        serde_json::json!([{ "actor": "bob", "entries": 1 }]),
+        "and his ended where it stood: {receipt}"
+    );
+
+    assert_eq!(
+        attachment_paths(&f).await,
+        vec!["assets/hers.png".to_string()],
+        "the folder gained hers and nothing of his"
+    );
+    assert!(
+        !f.domain_root("team").join("assets/his.png").exists(),
+        "his bytes never reached the folder"
+    );
+    assert!(
+        f.files_held("team", "alice").is_empty() && f.files_held("team", "bob").is_empty(),
+        "and both overlays are empty, whichever answer each of them gave"
+    );
+}
+
 /// A discard is the other answer for a file too: the bytes end with the
 /// directory and the folder never hears about any of it.
 #[tokio::test]

@@ -2528,9 +2528,10 @@ impl Engine {
         // pass leaves those actors' files exactly where they stand rather than
         // reporting them settled; the rows still converge, and the next pull
         // looks again.
-        if let Some(files) = self.overlay_files_by_actor(domain) {
-            for (actor, read) in files {
-                if read.unreadable {
+        {
+            let files = self.overlay_domain_files(domain);
+            for (actor, read) in files.per_actor {
+                if files.unreadable || read.unreadable {
                     tracing::warn!(
                         domain,
                         actor = actor.as_str(),
@@ -12124,6 +12125,13 @@ impl Engine {
     /// A state directory that cannot be resolved is unknown rather than empty:
     /// this tree is the only place a draft file's bytes exist, so "nowhere to
     /// look" is not "nothing there".
+    ///
+    /// The one corner where a direct domain is not byte for byte what it was:
+    /// it is not this function (gated, so a direct domain never reaches the
+    /// tree) but its ungated listing twin, which flags every actor of a direct
+    /// domain whose `<state>/overlays/<domain>` is damaged - so a mid-fold
+    /// recovery there refuses where it used to fold. That is the more correct
+    /// answer and it is named here rather than discovered.
     fn overlay_file_counts(&self, name: &str) -> Option<Option<BTreeMap<String, u64>>> {
         if !self.reviews_changes(name) {
             return Some(None);
@@ -12136,11 +12144,11 @@ impl Engine {
             );
             return None;
         };
-        let (per_actor, unreadable) = crate::overlay_files::counts(&state_dir, name);
-        if unreadable {
+        let held = crate::overlay_files::by_actor(&state_dir, name);
+        if held.unlistable().is_some() {
             return None;
         }
-        Some(Some(per_actor))
+        Some(Some(held.counts()))
     }
 
     /// Sweep a domain's overlay journal as part of ending it, answering with
@@ -12357,11 +12365,13 @@ impl Engine {
             // The same distinction `engrams_unknown` draws, for the same
             // reason: nobody drafting here and "the index could not be asked"
             // are different answers to a question about somebody's unshared
-            // work. The counts come from the rows now
-            // ([`Engine::overlay_counts_by_actor`]), so this is set by an index
-            // that could not answer and by nothing else - a journal that cannot
-            // be read no longer makes a count unknown, because the count was
-            // never the journal's to give.
+            // work. Two things can set it now
+            // ([`Engine::overlay_counts_by_actor`]): an index that could not
+            // answer, and a files overlay that could not be listed. The journal
+            // mirror beside them still sets nothing, because the count was
+            // never the mirror's to give - but the files under the same
+            // `overlays/<domain>` root are not a mirror, they are the only copy
+            // of what they hold, so they do.
             "drafts_unknown": drafts_unknown,
             "engrams": engrams.as_json(),
             // Why the count is absent, so the question can say which: an index
@@ -12507,11 +12517,8 @@ impl Engine {
         // never ask what happens to their files, and the sweep that ends every
         // actor's work would never reach them. Their bytes would survive into a
         // domain that no longer reviews anything, belonging to nobody.
-        let files = self.overlay_files_by_actor(domain);
-        let mut actors: BTreeSet<String> = files
-            .as_ref()
-            .map(|read| read.keys().cloned().collect())
-            .unwrap_or_default();
+        let files = self.overlay_domain_files(domain);
+        let mut actors: BTreeSet<String> = files.per_actor.keys().cloned().collect();
         let held = {
             let store = self.store.lock().await;
             let mut held: BTreeMap<String, Vec<StoredEngram>> = BTreeMap::new();
@@ -12528,23 +12535,26 @@ impl Engine {
         let mut out = Vec::new();
         for actor in actors {
             let entries = held.get(&actor).cloned().unwrap_or_default();
-            let own = files.as_ref().and_then(|read| read.get(&actor));
+            let own = files.per_actor.get(&actor);
             out.push(ActorDrafts {
                 entries,
                 files: own.map(|read| read.entries.clone()).unwrap_or_default(),
-                // A files overlay that could not be listed at all is unknown
-                // for everybody in the domain, so it is carried on every actor
-                // rather than on none: whichever of them a fold is about, the
-                // fold refuses.
-                files_unreadable: files.is_none() || own.is_some_and(|read| read.unreadable),
+                // An actor whose own folder could not be enumerated is flagged
+                // and **listed**: the plan reports them and says their files
+                // could not be read, where dropping them made a plan claim
+                // there was nothing to decide over somebody's only copy of
+                // their work. The domain's own folder failing is unknown for
+                // everybody in it, so it is carried on every actor rather than
+                // on none.
+                files_unreadable: files.unreadable || own.is_some_and(|read| read.unreadable),
                 actor,
             });
         }
         Ok(out)
     }
 
-    /// Every actor's files-overlay entries in one domain, or `None` when the
-    /// domain's own overlay folder could not be enumerated.
+    /// Every actor's files-overlay entries in one domain, with the honesty
+    /// flags beside them.
     ///
     /// The listing twin of [`Engine::overlay_file_counts`], and **deliberately
     /// not gated the way that one is**: the tree is walked whatever mode the
@@ -12557,31 +12567,57 @@ impl Engine {
     /// would sweep files it had never folded. The count beside this one is
     /// gated because its callers are listings of every domain, where a direct
     /// domain must answer byte for byte what it always did.
-    fn overlay_files_by_actor(
-        &self,
-        domain: &str,
-    ) -> Option<BTreeMap<String, crate::overlay_files::FileRead>> {
+    fn overlay_domain_files(&self, domain: &str) -> crate::overlay_files::DomainFiles {
         let Ok(state_dir) = self.journal_state_dir() else {
+            // **Nothing rather than unknown, and only here.** A process that
+            // cannot resolve its own state directory has never written an
+            // overlay file either - every write goes through this same resolver
+            // - so for this reader there is nothing it is failing to see, and
+            // the fold it feeds would refuse every domain on a machine whose
+            // state directory has gone missing rather than folding the rows it
+            // can still reach. The counting twin asks the resolver itself and
+            // answers `unknown` there, which is the right answer for a removal
+            // gate: that one is about what a person is being asked to end.
             tracing::warn!(
                 domain,
-                "the files overlay of '{domain}' could not be located, so what anybody has \
-                 drafted there is unknown"
+                "the files overlay of '{domain}' could not be located; no file can have been \
+                 written there by this process, so this reads as nothing rather than as an \
+                 unknown"
             );
-            return None;
+            return crate::overlay_files::DomainFiles {
+                per_actor: BTreeMap::new(),
+                unreadable: false,
+            };
         };
-        let (per_actor, unreadable) = crate::overlay_files::counts(&state_dir, domain);
-        if unreadable {
-            return None;
-        }
-        Some(
-            per_actor
-                .into_keys()
-                .map(|actor| {
-                    let read = crate::overlay_files::entries(&state_dir, domain, &actor);
-                    (actor, read)
-                })
-                .collect(),
-        )
+        crate::overlay_files::by_actor(&state_dir, domain)
+    }
+
+    /// The refusal leaving review mode owes when any part of this domain's
+    /// files overlay cannot be listed, or [`None`] when all of it can.
+    ///
+    /// **Whatever anybody answered, and whether or not that actor is listed.**
+    /// An unreadable listing used to drop a file-only actor out of the plan
+    /// entirely while the sweep at the end - a walk of the tree, not of the
+    /// plan - went on removing every actor it could reach. So a confirm with no
+    /// folding actor at all destroyed a readable actor's only copy of their
+    /// work after the plan had said there was nothing to decide. The decision
+    /// is keyed off the listing itself for that reason, never off who is
+    /// folding.
+    ///
+    /// It is the same class of refusal an unreadable row count raises on a
+    /// removal without purge: the branch that decides whether somebody's only
+    /// copy of their work ends must never read a failure as "there was nothing
+    /// there".
+    fn refuse_unlistable_files(&self, domain: &str) -> Option<EngineError> {
+        let whose = match self.overlay_domain_files(domain).unlistable()? {
+            Some(actor) => format!("the files '{actor}' has drafted"),
+            None => format!("the files overlay of domain '{domain}'"),
+        };
+        Some(EngineError::Conflict(format!(
+            "{whose} in domain '{domain}' could not be read, and leaving review mode ends every \
+             draft in it one way or the other. Nothing was folded, nothing was ended and the \
+             domain reviews changes still; answer again once the state directory can be read"
+        )))
     }
 
     /// Turn review mode on for a domain, or take it off and settle every
@@ -12793,6 +12829,16 @@ impl Engine {
             }
             ReviewModeConfirm::Confirmed { folds } => folds,
         };
+        // **Before the choices are even read**, and whatever they say. Leaving
+        // review mode ends every draft in the domain one way or the other, so a
+        // part of the overlay nobody can list is a part of the answer nobody
+        // can give - and asking somebody to decide about drafts this machine
+        // cannot enumerate is putting a question it could not honour. The plan
+        // above still answers and reports the actor whose files could not be
+        // read, so the refusal here is never the first the caller hears of it.
+        if let Some(refusal) = self.refuse_unlistable_files(domain) {
+            return Err(refusal);
+        }
         let choices = review::choices(domain, &drafts, choices)?;
         let folding: Vec<&ActorDrafts> = drafts
             .iter()
@@ -12800,21 +12846,6 @@ impl Engine {
             .collect();
         if let Some(refusal) = review::collision(domain, &folding, &base) {
             return Err(EngineError::Conflict(refusal));
-        }
-        // Beside the collision check and for the same reason: every refusal is
-        // decided before the review key comes off, so a call that cannot finish
-        // has not half-left review mode on its way to saying so. A files
-        // overlay that cannot be listed is the same class of problem an index
-        // that cannot be counted is - the bytes are the only copy there is, so
-        // folding the half that could be read would land an incomplete answer
-        // and then drop the rest.
-        if let Some(held) = folding.iter().find(|held| held.files_unreadable) {
-            return Err(EngineError::Conflict(format!(
-                "the files '{}' has drafted in domain '{domain}' could not be read, so a fold \
-                 of them would land some and lose the rest. Nothing was folded and the domain \
-                 reviews changes still; answer again once the state directory can be read",
-                held.actor
-            )));
         }
 
         // Nothing to do, said as nothing done. The conjunction is the point:
@@ -13028,30 +13059,45 @@ impl Engine {
     /// Drop every actor's files overlay in one domain, as the last half of
     /// leaving review mode.
     ///
-    /// Read off the tree rather than through [`Engine::overlay_files_by_actor`]
-    /// on purpose: that one answers for a domain that reviews changes, and by
-    /// the time this runs the key is off. What is swept is every actor the tree
-    /// still names, which is exactly the set that would otherwise be left.
+    /// Read off the tree itself rather than off the plan, because the plan was
+    /// drawn before the key came off: what is swept is every actor the tree
+    /// still names, which is exactly the set that would otherwise be left. The
+    /// cost of that is the same one the row drop loop already documents - a
+    /// file uploaded between the plan and this line is not in anybody's fold
+    /// and goes here - and it is sharper for a file than for a row: a dropped
+    /// row is still mirrored in the journal, and these bytes are the only copy
+    /// there is. The window is the tail of one verb, behind the domain-admin
+    /// lock and the join fence.
     ///
-    /// Best effort, like the journal sweep on the removal path and for the same
-    /// reason: by the time this runs the answer has been carried out - the
-    /// files are in the folder, or the actor said to end them - and failing
-    /// here would report a fold that happened as one that did not. What is left
-    /// behind is logged, and a domain's removal sweeps the whole tree anyway.
+    /// **Nothing at all is swept when any part of the listing could not be
+    /// read.** A partial sweep would end exactly the actors whose work could
+    /// still be seen while leaving the unreadable one, which is the wrong half
+    /// of an answer nobody gave; leaving everything lets a repeat do the whole
+    /// thing once the tree can be read. `leave_review_mode` refuses long before
+    /// this line in that case ([`Engine::refuse_unlistable_files`]), so this is
+    /// the second lock on the same door rather than the first.
+    ///
+    /// Best effort otherwise, like the journal sweep on the removal path and
+    /// for the same reason: by the time this runs the answer has been carried
+    /// out - the files are in the folder, or the actor said to end them - and
+    /// failing here would report a fold that happened as one that did not. What
+    /// is left behind is logged, and a domain's removal sweeps the whole tree
+    /// anyway.
     fn sweep_every_actors_files(&self, domain: &str) {
         let Ok(state_dir) = self.journal_state_dir() else {
             return;
         };
-        let (per_actor, unreadable) = crate::overlay_files::counts(&state_dir, domain);
-        if unreadable {
+        let held = crate::overlay_files::by_actor(&state_dir, domain);
+        if held.unlistable().is_some() {
             tracing::warn!(
                 domain,
                 "the files overlay of '{domain}' could not be fully read while leaving review \
-                 mode; what is left there is readable by nobody now and goes with the domain if \
-                 it is ever unregistered"
+                 mode, so none of it was swept; what is there is nobody's draft now and goes \
+                 with the domain if it is ever unregistered"
             );
+            return;
         }
-        for actor in per_actor.keys() {
+        for actor in held.per_actor.keys() {
             if let Err(e) = crate::overlay_files::remove_actor(&state_dir, domain, actor) {
                 tracing::warn!(
                     domain,
@@ -19181,7 +19227,7 @@ fn settle_overlay_file(
     }
 }
 
-/// The addresses the base files a pull applied answer to, permalink to path./// The addresses the base files a pull applied answer to, permalink to path.
+/// The addresses the base files a pull applied answer to, permalink to path.
 ///
 /// Read from the base snapshot's own copies rather than the index rows, because
 /// this runs before the sync that refreshes those rows - in a share it runs

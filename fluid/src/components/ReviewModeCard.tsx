@@ -166,6 +166,12 @@ export function ReviewModeCard({
                         <legend className="text-sm font-medium">
                           {row.actor} ({countOf(row)})
                         </legend>
+                        {row.files_unreadable === true && (
+                          <p className="text-sm text-red-700 dark:text-red-300">
+                            The files {row.actor} has drafted could not be read,
+                            so review mode cannot be taken off until they can.
+                          </p>
+                        )}
                         <ul className="ml-4 list-disc text-sm text-slate-600 dark:text-slate-400">
                           {row.drafts.map((draft) => (
                             <li key={draft.path}>

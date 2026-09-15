@@ -171,11 +171,24 @@ pub(crate) fn plan_json(
                     "conflict": Value::Null,
                 })
             }));
-            json!({
+            let mut actor = json!({
                 "actor": held.actor,
                 "entries": held.entry_count(),
                 "drafts": rows,
-            })
+            });
+            // Present only when it is true, so an actor whose whole overlay
+            // could be read is exactly the shape they always were. An actor
+            // whose files could not be listed is REPORTED rather than left out:
+            // a plan that omitted them said there was nothing to decide over
+            // work nobody could see, and leaving review mode then ended it. The
+            // count beside it is what could be read, which is why the flag is a
+            // fact of its own rather than a number.
+            if held.files_unreadable
+                && let Some(object) = actor.as_object_mut()
+            {
+                object.insert("files_unreadable".to_string(), json!(true));
+            }
+            actor
         })
         .collect();
     let mut contested: Vec<Value> = by_path

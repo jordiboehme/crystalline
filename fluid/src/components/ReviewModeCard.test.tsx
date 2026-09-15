@@ -212,6 +212,39 @@ describe("ReviewModeCard", () => {
     });
   });
 
+  it("names an actor whose files could not be read", async () => {
+    serve({
+      "/domains/eng/review": (_path, init) =>
+        sent(init).folds === undefined
+          ? planResponse({
+              actors: [
+                {
+                  actor: "ada",
+                  entries: 0,
+                  files_unreadable: true,
+                  drafts: [],
+                },
+              ],
+            })
+          : {},
+    });
+    renderApp("/d/eng");
+
+    const region = await screen.findByRole("region", { name: "Review mode" });
+    await userEvent.click(
+      within(region).getByRole("button", { name: "Take review mode off" }),
+    );
+
+    // She is in the plan rather than left out of it, and the plan says what
+    // could not be read: taking review mode off is refused until it can be.
+    await screen.findByText(/The files ada has drafted could not be read/);
+    expect(
+      within(region).getByText(
+        /review mode cannot be taken off until they can/,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("says which of the draft changes is a file", async () => {
     serve({
       "/domains/eng/review": (_path, init) =>

@@ -51,6 +51,16 @@ export interface PlannedActor {
   /** How many draft changes they are holding: pages plus files. */
   entries: number;
   drafts: PlannedDraft[];
+  /**
+   * Whether the files this actor drafted could not be listed at all, absent
+   * when they could.
+   *
+   * They are in the plan anyway, and that is the point of the key: a plan that
+   * left them out would say there is nothing to decide about work nobody can
+   * see. Leaving review mode refuses outright while this is true of anybody, so
+   * `entries` here counts only what could be read.
+   */
+  files_unreadable?: boolean;
 }
 
 /** A path more than one actor is drafting: at most one of them may be folded. */

@@ -1003,6 +1003,16 @@ fn review_plan_lines(plan: &serde_json::Value) -> Vec<String> {
             1 => format!("  {actor} ({entries} draft changes, 1 of them a file)"),
             n => format!("  {actor} ({entries} draft changes, {n} of them files)"),
         });
+        // Said before their rows, because it is about all of them: an actor
+        // whose files could not be listed is in the plan so somebody knows they
+        // are there, and leaving review mode refuses until the tree can be
+        // read.
+        if row["files_unreadable"].as_bool().unwrap_or(false) {
+            out.push(format!(
+                "    the files {actor} has drafted could not be read, so review mode cannot be \
+                 taken off until they can"
+            ));
+        }
         for draft in drafts {
             let path = draft["path"].as_str().unwrap_or("?");
             let what = if draft["tombstone"].as_bool().unwrap_or(false) {
@@ -2774,6 +2784,32 @@ fn print_report(r: &crystalline_index::SyncReport) {
 #[cfg(test)]
 mod review_plan_tests {
     use super::review_plan_lines;
+
+    /// An actor whose files could not be listed is in the plan, and the plan
+    /// says so.
+    ///
+    /// Leaving review mode refuses outright while any part of the overlay
+    /// cannot be read, so the person answering the plan has to learn it from
+    /// the plan rather than from a refusal they did not expect.
+    #[test]
+    fn the_plan_names_an_actor_whose_files_could_not_be_read() {
+        let plan = serde_json::json!({
+            "actors": [
+                { "actor": "ada", "entries": 0, "files_unreadable": true, "drafts": [] },
+            ],
+            "contested_paths": [],
+            "contested_addresses": [],
+        });
+        let lines = review_plan_lines(&plan).join("\n");
+        assert!(
+            lines.contains("the files ada has drafted could not be read"),
+            "the plan names them and says what could not be read: {lines}"
+        );
+        assert!(
+            lines.contains("review mode cannot be taken off until they can"),
+            "and what that means for the answer being asked for: {lines}"
+        );
+    }
 
     /// A file in the plan is named as one, on the actor's own line and on its
     /// own row.

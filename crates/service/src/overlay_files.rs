@@ -277,30 +277,86 @@ pub(crate) fn entries(state_dir: &Path, domain: &str, actor: &str) -> FileRead {
 /// How many entries each actor holds in one domain's files overlay, files and
 /// sidecars alike, with the honesty flag beside them.
 ///
-/// The counting twin of [`entries`], for the callers that only ever needed a
-/// number: the removal gate and the per-actor draft counts, which are the
-/// lifecycle's and land with it. Note what it is NOT twinned with:
-/// [`crate::overlay_journal::journal_counts`] counts drafts only, so a domain's
-/// journal count today under-reports what its removal actually sweeps by
-/// exactly what this function answers.
-#[allow(dead_code)]
-pub(crate) fn counts(state_dir: &Path, domain: &str) -> (BTreeMap<String, u64>, bool) {
-    let mut per_actor: BTreeMap<String, u64> = BTreeMap::new();
-    let mut unreadable = false;
+/// What one domain's whole files overlay holds, per actor, with the honesty
+/// flag for the domain's own folder beside it.
+///
+/// The listing every lifecycle caller reads: the removal gate counts it, the
+/// fold plan names it, the fold folds it and the sweep ends it. Note what it is
+/// NOT twinned with: [`crate::overlay_journal::journal_counts`] counts drafts
+/// only, so a domain's journal count under-reports what its removal actually
+/// sweeps by exactly what this answers.
+pub(crate) struct DomainFiles {
+    /// Every actor who has a files overlay folder in this domain, and what it
+    /// holds - **including an actor whose folder could not be enumerated**,
+    /// whose [`FileRead`] is empty and flagged. Leaving them out is what made a
+    /// plan report "nothing to decide" over somebody's only copy of their work.
+    pub(crate) per_actor: BTreeMap<String, FileRead>,
+    /// Whether the domain's own overlay folder could be enumerated. `false`
+    /// with an empty map is a domain nobody has drafted in.
+    pub(crate) unreadable: bool,
+}
+
+impl DomainFiles {
+    /// How many entries each actor holds, for the callers that only ever needed
+    /// a number. An actor whose folder could not be read counts zero here and
+    /// is caught by [`DomainFiles::unlistable`] instead.
+    pub(crate) fn counts(&self) -> BTreeMap<String, u64> {
+        self.per_actor
+            .iter()
+            .filter(|(_, read)| !read.entries.is_empty())
+            .map(|(actor, read)| (actor.clone(), read.entries.len() as u64))
+            .collect()
+    }
+
+    /// The first actor whose files could not be listed, or [`None`] when every
+    /// one of them could.
+    ///
+    /// The domain's own folder failing is reported as an actor of `None`
+    /// alongside: `Some(None)` is "this domain's overlay folder could not be
+    /// read", `Some(Some(actor))` is "that actor's could not".
+    pub(crate) fn unlistable(&self) -> Option<Option<&str>> {
+        if self.unreadable {
+            return Some(None);
+        }
+        self.per_actor
+            .iter()
+            .find(|(_, read)| read.unreadable)
+            .map(|(actor, _)| Some(actor.as_str()))
+    }
+}
+
+/// Read one domain's whole files overlay: one walk, one answer.
+///
+/// One walk is the point rather than an optimization: the pass that counted and
+/// the pass that listed used to walk every actor's tree twice and could
+/// disagree about what was there in between.
+pub(crate) fn by_actor(state_dir: &Path, domain: &str) -> DomainFiles {
+    let mut per_actor: BTreeMap<String, FileRead> = BTreeMap::new();
     let Ok(dir) = crate::overlay_journal::domain_dir(state_dir, domain) else {
-        return (per_actor, true);
+        return DomainFiles {
+            per_actor,
+            unreadable: true,
+        };
     };
     let actors = match std::fs::read_dir(&dir) {
         Ok(actors) => actors,
         // A domain nobody has drafted in has no folder, and that is a certain
         // answer rather than an unknown one.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return (per_actor, false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return DomainFiles {
+                per_actor,
+                unreadable: false,
+            };
+        }
         Err(e) => {
             tracing::warn!(
                 domain = domain,
                 "the files overlay folder could not be read: {e}"
             );
-            return (per_actor, true);
+            return DomainFiles {
+                per_actor,
+                unreadable: true,
+            };
         }
     };
     for actor in actors.flatten() {
@@ -313,13 +369,22 @@ pub(crate) fn counts(state_dir: &Path, domain: &str) -> (BTreeMap<String, u64>, 
         if one_segment(&name, "actor").is_err() {
             continue;
         }
-        let read = entries(state_dir, domain, &name);
-        unreadable |= read.unreadable;
-        if !read.entries.is_empty() {
-            per_actor.insert(name, read.entries.len() as u64);
+        // An actor with no files folder at all takes no part in this; one whose
+        // folder exists is listed whatever is in it, empty and unreadable
+        // alike. An empty folder listed is what lets the sweep end it, and an
+        // unreadable one listed is what lets the fold refuse by name.
+        let Ok(files) = files_dir(state_dir, domain, &name) else {
+            continue;
+        };
+        if !files.exists() {
+            continue;
         }
+        per_actor.insert(name.clone(), entries(state_dir, domain, &name));
     }
-    (per_actor, unreadable)
+    DomainFiles {
+        per_actor,
+        unreadable: false,
+    }
 }
 
 /// Drop one actor's whole files overlay, answering how many entries it held.
@@ -329,7 +394,6 @@ pub(crate) fn counts(state_dir: &Path, domain: &str) -> (BTreeMap<String, u64>, 
 /// actor's rows. A whole domain's files go with its journal folder already, by
 /// construction - this tree stands inside it, which is why there is a per-actor
 /// sweep here and no per-domain one.
-#[allow(dead_code)]
 pub(crate) fn remove_actor(state_dir: &Path, domain: &str, actor: &str) -> io::Result<u64> {
     let dir = files_dir(state_dir, domain, actor)?;
     let held = entries(state_dir, domain, actor).entries.len() as u64;
@@ -588,10 +652,11 @@ mod tests {
         );
         assert!(!read.unreadable);
 
-        let (per_actor, unreadable) = counts(state, "team");
-        assert_eq!(per_actor.get("alice"), Some(&2));
-        assert_eq!(per_actor.get("bob"), Some(&1));
-        assert!(!unreadable, "nothing failed to enumerate");
+        let held = by_actor(state, "team");
+        assert_eq!(held.counts().get("alice"), Some(&2));
+        assert_eq!(held.counts().get("bob"), Some(&1));
+        assert!(!held.unreadable, "nothing failed to enumerate");
+        assert!(held.unlistable().is_none(), "and every actor answered");
 
         // A files folder that is not a folder: nothing can be enumerated, and
         // an empty answer must not read as `this actor holds nothing`.
@@ -600,8 +665,18 @@ mod tests {
         let read = entries(state, "team", "bob");
         assert!(read.entries.is_empty());
         assert!(read.unreadable, "an unreadable overlay is not an empty one");
-        let (_, unreadable) = counts(state, "team");
-        assert!(unreadable);
+        let held = by_actor(state, "team");
+        assert_eq!(
+            held.unlistable(),
+            Some(Some("bob")),
+            "the actor whose files could not be listed is named, not dropped"
+        );
+        assert!(
+            held.per_actor.contains_key("bob"),
+            "and he is still in the listing, or a plan would report nothing to \
+             decide over work nobody can see"
+        );
+        assert_eq!(held.counts().get("bob"), None, "with no count to give");
 
         // An actor who has written nothing is a different answer: empty and
         // certain.
