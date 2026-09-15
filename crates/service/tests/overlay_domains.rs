@@ -374,6 +374,74 @@ impl Fixture {
     }
 }
 
+/// **A wipe and rebuild leaves the files overlay exactly where it was, and
+/// never reads one of its files back as a draft.**
+///
+/// The two substrates share an actor folder, and the restore walks that folder.
+/// What keeps them apart is one fact - the walk keeps only `.md` and
+/// `.md.tombstone`, and a validated attachment path can never end in `.md` -
+/// and this is where that fact has to hold or a wipe turns a screenshot into an
+/// engram row. Planted adversarially: the actor holds a draft, an overlay file
+/// and a deletion marker at once.
+#[tokio::test]
+async fn an_index_wipe_leaves_the_files_overlay_alone() {
+    let f = review_fixture().await;
+    let alice = Scope::User {
+        account: "alice".to_string(),
+        admin: false,
+    };
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.engine
+        .attachment_write_as("team", "assets/deck.png", b"deck bytes".to_vec(), &alice)
+        .await
+        .unwrap();
+    // A file the team reviewed, so alice's delete of it is a marker rather than
+    // a removal - the shape the walk must also pass over.
+    let assets = f.domain_root("team").join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("gone.png"), b"gone bytes").unwrap();
+    f.engine.sync(None).await.unwrap();
+    f.engine
+        .attachment_delete_as("team", "assets/gone.png", &alice)
+        .await
+        .unwrap();
+
+    let file = f.state.join("overlays/team/alice/files/assets/deck.png");
+    let marker = f
+        .state
+        .join("overlays/team/alice/files/assets/gone.png.tombstone");
+    assert!(
+        file.is_file() && marker.is_file(),
+        "both shapes are planted"
+    );
+    let before = std::fs::read(&file).unwrap();
+
+    {
+        let store = f.store.lock().await;
+        store.wipe().await.unwrap();
+    }
+    f.engine.sync(None).await.unwrap();
+
+    assert_eq!(
+        f.held("team", "alice").await,
+        vec![("plan.md".to_string(), ALICE_DRAFT.to_string(), false)],
+        "the draft came back and neither the overlay file nor its marker became a row"
+    );
+    assert!(
+        file.is_file() && marker.is_file(),
+        "and both are still on disk, untouched by the rebuild"
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), before, "byte for byte");
+
+    // And they are still hers to read, which is the whole reason they survived.
+    let (bytes, _) = f
+        .engine
+        .attachment_read_as("team", "assets/deck.png", &alice)
+        .await
+        .unwrap();
+    assert_eq!(bytes, before);
+}
+
 /// The whole point of the journal: an index destroyed and rebuilt from the
 /// files on disk has nothing to rebuild a draft from, so the drafts come back
 /// from the mirror instead.

@@ -63,6 +63,7 @@ pub use client::{
 pub use daemon::run_serve;
 pub use engine::{
     ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, ShareActor,
+    WrittenAttachment,
 };
 pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,

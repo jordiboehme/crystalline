@@ -156,6 +156,12 @@ async fn serve(opts: Options) -> Fixture {
     auth.add_user("eddy", "Eddy", None, Role::Editor, "eddypw")
         .await
         .unwrap();
+    // A second admin, because the archive routes are admin only and the one
+    // thing worth asking there is what two different accounts are told about
+    // one path.
+    auth.add_user("ada", "Ada", None, Role::Admin, "adapw")
+        .await
+        .unwrap();
     auth.add_user("vera", "Vera", None, Role::Viewer, "verapw")
         .await
         .unwrap();
@@ -1003,4 +1009,155 @@ async fn an_upload_into_a_direct_domain_carries_no_draft_key() {
         vec!["mime", "path", "sha256", "size"],
         "no `draft` key on a direct domain's upload: {body}"
     );
+}
+
+/// **The validator on a draft file describes exactly the bytes that went out.**
+///
+/// A strong `ETag` is a promise about the body it rides with, and a client that
+/// caches on it will serve those bytes again without asking. The reviewed arm
+/// hashes the bytes it just read and says so in its own doc; the overlay arm
+/// has to make the same promise, so the checksum is compared against an
+/// independent derivation - the same bytes uploaded to a domain that takes
+/// changes directly, whose receipt hashes them through the base path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_files_etag_describes_exactly_the_bytes_it_served() {
+    let fx = serve(Options {
+        review: true,
+        ..Options::default()
+    })
+    .await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    // The same bytes through the base path, for the checksum they really have.
+    let direct = put(
+        fx.addr,
+        &eddy,
+        "/api/v1/domains/eng/files/assets/twin.pptx",
+        PPTX,
+    )
+    .await;
+    assert_eq!(direct.status(), 200);
+    let direct: serde_json::Value = direct.json().await.unwrap();
+    let sha = direct["sha256"].as_str().unwrap().to_string();
+    assert!(direct.get("draft").is_none(), "the twin is not a draft");
+
+    let resp = put(
+        fx.addr,
+        &eddy,
+        "/api/v1/domains/rev/files/assets/twin.pptx",
+        PPTX,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["draft"], serde_json::json!(true));
+    assert_eq!(
+        body["sha256"].as_str(),
+        Some(sha.as_str()),
+        "an upload's receipt hashes the same bytes the same way on both kinds of domain"
+    );
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/rev/files/assets/twin.pptx",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let etag = header(&resp, "etag");
+    let served = resp.bytes().await.unwrap();
+    assert_eq!(served.as_ref(), PPTX, "the bytes are the ones that went up");
+    assert_eq!(
+        etag,
+        format!("\"{sha}\""),
+        "and the validator is the checksum of exactly those bytes"
+    );
+}
+
+/// Build a zip in memory, for the archive preview below.
+fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+/// **An import preview compares an archive against what the person running it
+/// sees, their own draft files included.**
+///
+/// The collision screen is the archive's one attachment question, and in review
+/// mode the answer differs by account: a file root has drafted is already there
+/// for root, and is not there at all for ada. Saying otherwise in either
+/// direction would have an importer replace bytes they cannot see, or be told a
+/// path is free that their own next read would answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_preview_reports_a_collision_on_the_importers_own_draft_file_alone() {
+    let fx = serve(Options {
+        review: true,
+        ..Options::default()
+    })
+    .await;
+    let root = login(fx.addr, "root", "rootpw").await;
+    let ada = login(fx.addr, "ada", "adapw").await;
+
+    let resp = put(
+        fx.addr,
+        &root,
+        "/api/v1/domains/rev/files/assets/mine.png",
+        PNG,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["draft"], serde_json::json!(true));
+
+    let archive = zip_of(&[("assets/mine.png", PDF), ("assets/shot.png", PDF)]);
+    for (session, who, mine) in [(&root, "root", "collides"), (&ada, "ada", "new")] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::POST,
+            "/api/v1/domains/rev/archive/preview",
+            session,
+        )
+        .header("content-type", "application/zip")
+        .body(archive.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        let report: serde_json::Value = resp.json().await.unwrap();
+        let status = |path: &str| -> String {
+            report["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["path"] == path)
+                .unwrap_or_else(|| panic!("no entry for {path}: {report}"))["status"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            status("assets/mine.png"),
+            mine,
+            "the draft file is root's own and nobody else's, for {who}"
+        );
+        assert_eq!(
+            status("assets/shot.png"),
+            "collides",
+            "and the file the team reviewed collides for both, for {who}"
+        );
+    }
 }

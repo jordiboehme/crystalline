@@ -2567,3 +2567,86 @@ async fn v203_reads_the_tags_the_author_sees() {
         );
     }
 }
+
+/// The attachment paths `V107` calls dangling for one actor, sorted. The
+/// finding carries the path it could not find as its `fix`.
+async fn dangling_attachments_for(engine: &Engine, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec!["V107".to_string()],
+                limit: Some(50),
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    let mut out: Vec<String> = v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["fix"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// **A file somebody has drafted answers their own reference to it.**
+///
+/// The sweep reads every other input in the caller's own dimension; its
+/// attachment set has to be read there too, or review mode's whole reason for
+/// existing - work on something privately before the team sees it - hands the
+/// author a finding about a file they are looking at. The stranger's sweep is
+/// the other half of the sentence: the team really does not have this file, so
+/// the team's own reference to it really is dangling, and nothing about alice's
+/// overlay may quiet that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_only_attachment_answers_its_authors_reference_in_the_sweep() {
+    let (tmp, engine) = review_fixture().await;
+    let dir = tmp.path().join("team");
+    let alice = account("alice");
+    let bob = account("bob");
+
+    // A reviewed engram pointing at a file nobody has uploaded: dangling for
+    // everybody, which is what the team's own sweep should go on saying.
+    reviewed_file(
+        &engine,
+        &dir,
+        "shot.md",
+        &reviewed(
+            "Shot",
+            "shot",
+            "The dashboard as it looked:\n\n![Shot](assets/shot.png)",
+        ),
+    )
+    .await;
+
+    let missing = vec!["assets/shot.png".to_string()];
+    assert_eq!(dangling_attachments_for(&engine, &alice).await, missing);
+    assert_eq!(dangling_attachments_for(&engine, &bob).await, missing);
+
+    // Alice drafts the file. It is hers alone until the change is shared.
+    let written = engine
+        .attachment_write_as(
+            "team",
+            "assets/shot.png",
+            b"PNG bytes of shot".to_vec(),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(written.draft, "the upload landed as alice's draft");
+
+    assert!(
+        dangling_attachments_for(&engine, &alice).await.is_empty(),
+        "the reference she can follow is not a dangling one for her"
+    );
+    assert_eq!(
+        dangling_attachments_for(&engine, &bob).await,
+        missing,
+        "and the team's reference goes on dangling, because the team has no such file"
+    );
+}

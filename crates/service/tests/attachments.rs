@@ -2515,3 +2515,68 @@ async fn a_move_out_of_a_reviewing_domain_is_refused_before_any_attachment_is_ca
     assert!(review_dir.join("alpha.md").is_file());
     assert!(!direct_dir.join("alpha.md").exists());
 }
+
+/// **What a delete of a draft file would take away is read off the file's
+/// metadata, never out of its bytes.**
+///
+/// The size question is a stat question, and asking it by reading the whole
+/// file is both a wasted read and a stricter answer than the act it previews:
+/// a file whose bytes this process cannot read still has a size, and deleting
+/// it would still take that many bytes away. Pinned by taking the read
+/// permission away and leaving the metadata: the preview answers and the read
+/// does not.
+///
+/// Unix only - the permission bits are the discriminator, and Windows has no
+/// equivalent that leaves `metadata` working. Skipped in the one environment
+/// where the bits do not bind (a run as root), with a note rather than a
+/// silent pass.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_size_of_a_draft_file_is_read_from_its_metadata_and_never_from_its_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_tmp, engine, _review_dir, _direct, state, _scratch) =
+        review_fixture("rev-stat", "plain-stat").await;
+
+    engine
+        .attachment_write_as("rev-stat", "assets/locked.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    let file = state.join("overlays/rev-stat/alice/files/assets/locked.png");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&file).is_ok() {
+        eprintln!(
+            "skipped: this process reads a mode-000 file, so the permission bits cannot \
+             discriminate here (a run as root)"
+        );
+        return;
+    }
+
+    let preview = engine
+        .delete_preview_as(
+            &DeleteParams {
+                identifier: "assets/locked.png".to_string(),
+                domain: "rev-stat".to_string(),
+                expected_checksum: None,
+            },
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["size"],
+        serde_json::json!(PNG.len()),
+        "the preview answers from the file's own metadata: {preview}"
+    );
+
+    // The read is the one that needs the bytes, and it is the one that fails.
+    assert!(
+        engine
+            .attachment_read_as("rev-stat", "assets/locked.png", &alice())
+            .await
+            .is_err(),
+        "the bytes really are unreadable, so the preview above read none"
+    );
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+}

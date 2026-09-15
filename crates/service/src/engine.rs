@@ -4062,23 +4062,6 @@ impl Engine {
     /// That keeps the sha a caller caches on describing exactly what it
     /// received. The match itself is the walker's stat prefilter, so the common
     /// case costs no hashing at all.
-    /// [`Engine::attachment_read`] as this caller sees it: their own bytes
-    /// where they hold some, a miss where they have deleted the path, and the
-    /// folder's answer otherwise. The projection to
-    /// [`Engine::attachment_read`]'s substrate, as
-    /// [`Engine::attachment_list_as`] is to [`Engine::attachment_list`].
-    pub async fn attachment_read_as(
-        &self,
-        domain: &str,
-        path: &str,
-        scope: &crate::scope::Scope,
-    ) -> Result<(Vec<u8>, AttachmentRow)> {
-        let hidden = self.hidden_for(scope).await?;
-        DomainView::for_read(self, domain, &hidden, scope)?
-            .attachment_bytes(path)
-            .await
-    }
-
     pub async fn attachment_read(
         &self,
         domain: &str,
@@ -4155,6 +4138,23 @@ impl Engine {
                 Ok((bytes, row))
             }
         }
+    }
+
+    /// [`Engine::attachment_read`] as this caller sees it: their own bytes
+    /// where they hold some, a miss where they have deleted the path, and the
+    /// folder's answer otherwise. The projection to
+    /// [`Engine::attachment_read`]'s substrate, as
+    /// [`Engine::attachment_list_as`] is to [`Engine::attachment_list`].
+    pub async fn attachment_read_as(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<(Vec<u8>, AttachmentRow)> {
+        let hidden = self.hidden_for(scope).await?;
+        DomainView::for_read(self, domain, &hidden, scope)?
+            .attachment_bytes(path)
+            .await
     }
 
     /// Create or replace one attachment, returning the row that now describes
@@ -9629,12 +9629,22 @@ impl Engine {
         // team's list told them their own new word was already established, or
         // said nothing at all about the one beside it.
         let vocab = view.vocabulary().await?;
-        // Both of those ask the view, which takes the store lock itself, so the
-        // lock is taken here rather than above them.
+        // The attachment set in the caller's own dimension, like every other
+        // input on this path. A file this caller drafted is one they can see, so
+        // `V107` must not call their own reference to it dangling; a file they
+        // have deleted reads absent for them. On a domain that takes changes
+        // directly the view has no actor and this is the base listing, byte for
+        // byte the query that was here before.
+        //
+        // **This is also `V108`'s input**, so the orphan rule reads the actor
+        // view from here on: a file only this actor holds is theirs to be
+        // orphaned or referenced. The union rule that keeps a reference dropped
+        // in a draft from orphaning a shared file is `shadowed_asset_refs`'
+        // above and is untouched by this.
+        let attachments = view.attachments().await?;
+        // Asked before the store lock, like the two above it: the view takes
+        // the lock itself.
         let store = self.store.lock().await;
-        // Metadata only, one query: the attachment rules compare paths,
-        // sizes and hashes and never read a byte of any file.
-        let attachments = store.list_attachments(domain_id).await?;
         // Lead vectors for V301, only with a provider installed: without one
         // the rule stays silent whatever a previous run left embedded, so a
         // sweep on a machine that never embeds never speaks about meaning.

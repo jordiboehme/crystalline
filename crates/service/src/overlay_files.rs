@@ -213,6 +213,29 @@ pub(crate) fn read(
     }
 }
 
+/// How many bytes one actor's copy of `path` holds, or [`None`] when they hold
+/// no bytes there.
+///
+/// A stat, never a read: the size of a file is a question its metadata answers,
+/// and reading the whole file to ask it would be both a wasted read and a
+/// stricter answer than the act it previews - a file whose bytes this process
+/// cannot read still has a size, and deleting it still takes that many bytes
+/// away. The same reading `Engine::attachment_delete_size` already applies to
+/// the folder.
+pub(crate) fn size(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<Option<u64>> {
+    let abs = file(state_dir, domain, actor, path)?;
+    match std::fs::metadata(&abs) {
+        Ok(meta) => Ok(Some(meta.len())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// What one actor holds at `path`. Bytes win over a sidecar, which is the
 /// crash window the two writers above document resolved the same way
 /// [`crate::overlay_journal`] resolves it.
@@ -440,6 +463,23 @@ mod tests {
         assert_eq!(
             held(state, "team", "alice", "assets/deck.png").unwrap(),
             Held::Bytes
+        );
+
+        // The size is the file's own length, answered off its metadata, and
+        // absent wherever there are no bytes to measure.
+        assert_eq!(
+            size(state, "team", "alice", "assets/deck.png").unwrap(),
+            Some(PNG.len() as u64)
+        );
+        assert_eq!(
+            size(state, "team", "alice", "assets/never.png").unwrap(),
+            None
+        );
+        tombstone(state, "team", "alice", "assets/deck.png").unwrap();
+        assert_eq!(
+            size(state, "team", "alice", "assets/deck.png").unwrap(),
+            None,
+            "a deletion holds no bytes, so it has no size"
         );
     }
 

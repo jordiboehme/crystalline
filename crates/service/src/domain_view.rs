@@ -1392,6 +1392,18 @@ impl<'a> DomainView<'a> {
             return Ok(base);
         };
         let held = self.files()?;
+        if held.unreadable {
+            // A listing short by an unknown number is still the best answer
+            // there is - the alternative is refusing a read because one file
+            // could not be enumerated - but it is never passed off as complete.
+            tracing::warn!(
+                domain = self.domain.as_str(),
+                actor = actor,
+                "part of this actor's files overlay could not be read; their attachment listing \
+                 is short by what could not be reached"
+            );
+        }
+        let held = held.entries;
         if held.is_empty() {
             return Ok(base);
         }
@@ -1411,6 +1423,13 @@ impl<'a> DomainView<'a> {
     /// The row describing one of this actor's own overlay files: the bytes it
     /// holds and the file's own modification instant, through the same builder
     /// the folder's rows are built with.
+    ///
+    /// **This one does read the file**, because a row carries a checksum and a
+    /// checksum is a fact about bytes. It is the listing's builder for that
+    /// reason and nothing else's: a read hashes the bytes it is about to return
+    /// ([`DomainView::own_attachment`]) and a size question is answered by a
+    /// stat ([`DomainView::attachment_delete_size`]), so neither of them comes
+    /// through here.
     fn overlay_attachment_row(
         &self,
         state_dir: &Path,
@@ -1452,7 +1471,16 @@ impl<'a> DomainView<'a> {
             Some(crate::overlay_files::Held::Bytes) => {
                 let state_dir = self.files_state_dir()?;
                 let actor = self.actor.as_deref().unwrap_or_default();
-                Ok(self.overlay_attachment_row(&state_dir, actor, path)?.size)
+                // A stat, never a read - see [`crate::overlay_files::size`].
+                // The path was there a moment ago and can be gone now, which is
+                // the race the folder arm answers by falling through to the
+                // recorded row; there is no row here, so a file that vanished
+                // under the preview is a miss.
+                crate::overlay_files::size(&state_dir, &self.domain, actor, path)
+                    .map_err(|e| self.files_io(path, e))?
+                    .ok_or_else(|| {
+                        EngineError::NotFound(crate::engine::missing_attachment(&self.domain, path))
+                    })
             }
             Some(crate::overlay_files::Held::Tombstone) => Err(EngineError::NotFound(
                 crate::engine::missing_attachment(&self.domain, path),
@@ -1496,12 +1524,26 @@ impl<'a> DomainView<'a> {
             Some(crate::overlay_files::Held::Bytes) => {
                 let state_dir = self.files_state_dir()?;
                 let actor = self.actor.as_deref().unwrap_or_default();
-                let row = self.overlay_attachment_row(&state_dir, actor, path)?;
+                // **One read, and the row describes what it returned.** A
+                // strong `ETag` is built off `row.sha256` and promises the body
+                // it rides with, so hashing a second read would let a replace
+                // between the two hand this caller a validator for bytes they
+                // never received. It is the hazard `put_file` already avoids on
+                // the write side, and it is what the folder arm's own doc
+                // promises when it says the sha describes exactly what was
+                // received.
                 let bytes = crate::overlay_files::read(&state_dir, &self.domain, actor, path)
                     .map_err(|e| self.files_io(path, e))?
                     .ok_or_else(|| {
                         EngineError::NotFound(crate::engine::missing_attachment(&self.domain, path))
                     })?;
+                let abs = crate::overlay_files::file(&state_dir, &self.domain, actor, path)
+                    .map_err(|e| self.files_io(path, e))?;
+                let row = crate::engine::attachment_row(
+                    path,
+                    &bytes,
+                    crate::engine::asset_modified(&abs),
+                )?;
                 Ok(Some((bytes, row)))
             }
         }
@@ -1609,27 +1651,25 @@ impl<'a> DomainView<'a> {
     }
 
     /// This actor's own files overlay entries, files and deletions alike,
-    /// ordered by path. Empty on the base view, which holds none by
-    /// definition.
+    /// ordered by path, **with the honesty flag beside them**. Empty and
+    /// certain on the base view, which holds none by definition.
     ///
     /// The seam the lifecycle reads: a share stages these over the base
     /// snapshot, the fold applies them to the folder, the counts name them
-    /// beside the drafted rows.
-    pub(crate) fn files(&self) -> Result<Vec<crate::overlay_files::FileEntry>> {
+    /// beside the drafted rows. The flag travels with them because a removal
+    /// gate has to tell "this actor holds nothing" from "nothing could be
+    /// read", and a seam that had already thrown it away would force its
+    /// callers back to the substrate to get it.
+    pub(crate) fn files(&self) -> Result<crate::overlay_files::FileRead> {
         let Some(actor) = self.actor.as_deref() else {
-            return Ok(Vec::new());
+            return Ok(crate::overlay_files::FileRead::default());
         };
         let state_dir = self.files_state_dir()?;
-        let read = crate::overlay_files::entries(&state_dir, &self.domain, actor);
-        if read.unreadable {
-            tracing::warn!(
-                domain = self.domain.as_str(),
-                actor = actor,
-                "part of this actor's files overlay could not be read; what it holds there is \
-                 listed short"
-            );
-        }
-        Ok(read.entries)
+        Ok(crate::overlay_files::entries(
+            &state_dir,
+            &self.domain,
+            actor,
+        ))
     }
 
     /// The addresses the folder would still answer to once the deletions in
