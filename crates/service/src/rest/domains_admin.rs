@@ -1973,7 +1973,6 @@ fn github_off_conflict() -> ApiError {
     )
 }
 
-/// What `PUT /domains/{domain}/visibility` takes.
 /// The mode `PUT /domains/{domain}/review` puts a domain in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -2144,7 +2143,10 @@ pub async fn set_review_mode(
     // (401) rather than that it is forbidden (403).
     identity.require_account()?;
     let (mode, confirm) = match (body.mode, body.folds) {
-        (ReviewModeArg::Overlay, Some(folds)) if !folds.is_empty() => {
+        // Any `folds` key at all, not only a non-empty one: the rule a client
+        // reads is "folds are a question about leaving", and an empty map
+        // waved through would make it "folds with something in them are".
+        (ReviewModeArg::Overlay, Some(_)) => {
             return Err(ApiError::unprocessable(
                 "folds say what happens to each actor's private drafts, which is a question about \
                  LEAVING review mode: a domain on its way in has none yet. Send mode 'overlay' on \
@@ -2154,7 +2156,7 @@ pub async fn set_review_mode(
         }
         // Turning review on carries no choices, so an absent `folds` is the
         // change rather than a question about it: there is nothing to ask.
-        (ReviewModeArg::Overlay, _) => (
+        (ReviewModeArg::Overlay, None) => (
             Some(crystalline_core::config::ReviewMode::Overlay),
             ReviewModeConfirm::Confirmed { folds: Vec::new() },
         ),
@@ -2191,6 +2193,7 @@ pub async fn set_review_mode(
     Ok(Json(report))
 }
 
+/// What `PUT /domains/{domain}/visibility` takes.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[schema(description = "Whether the domain is private. `true` closes it to \
                         its owner and the people invited into it; `false` \

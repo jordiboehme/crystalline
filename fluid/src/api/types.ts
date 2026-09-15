@@ -2508,8 +2508,7 @@ export interface components {
             mode: components["schemas"]["ReviewModeArg"];
         };
         /**
-         * @description What `PUT /domains/{domain}/visibility` takes.
-         *     The mode `PUT /domains/{domain}/review` puts a domain in.
+         * @description The mode `PUT /domains/{domain}/review` puts a domain in.
          * @enum {string}
          */
         ReviewModeArg: "overlay" | "direct";

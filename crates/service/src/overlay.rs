@@ -1250,11 +1250,7 @@ mod tests {
         let err = overlay(&[("CRYSTALLINE_DOMAIN_CODE_REVIEW", "/k/code-review")]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("CRYSTALLINE_DOMAIN_CODE_REVIEW"), "{msg}");
-        assert!(
-            overlay(&[("CRYSTALLINE_DOMAIN_CODE_REVIEW", "/k/code-review")])
-                .err()
-                .is_some()
-        );
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_CODE"), "{msg}");
     }
 
     #[test]

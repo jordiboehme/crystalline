@@ -2552,6 +2552,20 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
         "and the refusal teaches the way in: {problem}"
     );
 
+    // A `folds` key on the way IN is refused, empty or not: folds are a question
+    // about leaving, and a domain on its way in holds no drafts.
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "overlay", "folds": {}}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422);
+
     // The other direction with no `folds` key is the question rather than the
     // change: the plan comes back and nothing moves.
     let plan = as_session(

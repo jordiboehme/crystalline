@@ -8701,7 +8701,7 @@
       },
       "ReviewModeArg": {
         "type": "string",
-        "description": "What `PUT /domains/{domain}/visibility` takes.\nThe mode `PUT /domains/{domain}/review` puts a domain in.",
+        "description": "The mode `PUT /domains/{domain}/review` puts a domain in.",
         "enum": [
           "overlay",
           "direct"

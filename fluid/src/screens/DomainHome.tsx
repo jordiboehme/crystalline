@@ -279,12 +279,14 @@ export default function DomainHome() {
 
       {/*
         Which way a write in this domain goes, and the control that changes it.
-        Only where the domain has a GitHub origin, because review mode needs one
-        (a reviewed change has to have somewhere to be proposed) - the same gate
-        the two share cards above are under, and the same read, so a domain that
-        could never take the mode is never offered it. Whether the CALLER may
-        press is the server's answer rather than this side's arithmetic; see the
-        card's own module doc.
+        Under the same instance-wide capability the two share cards above are
+        under, because review mode is about proposing changes to a team and an
+        instance that shares with nobody has no use for it. That is all this
+        condition is: it is NOT a per-domain gate, so the card is drawn on a
+        virtual or origin-less domain too, where the button answers 409 in the
+        server's own words. Whether the CALLER may press is the server's answer
+        rather than this side's arithmetic, for the reason the card's own module
+        doc gives.
       */}
       {capabilities.canShare && summary !== undefined && (
         <ReviewModeCard domain={domain} reviewing={summary.review !== null} />

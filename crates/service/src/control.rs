@@ -304,6 +304,25 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let overlay = req.get("mode").and_then(Value::as_str) == Some("overlay");
             let preview = req.get("preview").and_then(Value::as_bool).unwrap_or(false);
+            // The same rule the JSON API states and the CLI bails on, so the
+            // three surfaces answer one malformed request one way: folds say
+            // what happens to each actor's drafts, which is a question about
+            // leaving review mode.
+            if overlay
+                && req
+                    .get("folds")
+                    .and_then(Value::as_object)
+                    .is_some_and(|folds| !folds.is_empty())
+            {
+                return (
+                    envelope_err(
+                        "folds say what happens to each actor's private drafts, which is a \
+                         question about LEAVING review mode: a domain on its way in has none yet"
+                            .to_string(),
+                    ),
+                    false,
+                );
+            }
             let confirm = if preview {
                 crate::engine::ReviewModeConfirm::Preview
             } else {

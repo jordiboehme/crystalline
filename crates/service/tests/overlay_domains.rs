@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 use yrs::sync::{Message, MessageReader, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, ReadTxn, Text, Transact, Update};
+use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update};
 
 const MANIFEST: &str = "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
 /// The base engram: what the domain's files on disk say exists.
@@ -3465,6 +3465,22 @@ async fn a_fold_closes_open_rooms_first() {
 #[tokio::test]
 async fn a_review_domain_reports_its_out_of_band_tree_edits() {
     let f = reviewed_origin_fixture().await;
+
+    // A reviewing domain says so with an empty list before it has anything to
+    // name: the key's presence is what tells a client which mode this domain is
+    // in, so an absent key on a clean folder would read as "takes changes
+    // directly" rather than as "nothing has gone round review".
+    let status = f
+        .engine
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["out_of_band"],
+        serde_json::json!([]),
+        "a reviewing domain with a clean folder says so rather than saying nothing: {status}"
+    );
+
     std::fs::write(
         f.domain_root("team").join("smuggled.md"),
         PLAN.replace("permalink: plan", "permalink: smuggled")
@@ -3499,4 +3515,313 @@ async fn a_review_domain_reports_its_out_of_band_tree_edits() {
         status["domains"][0].get("out_of_band").is_none(),
         "and a domain taking changes directly says nothing about out-of-band work: {status}"
     );
+}
+
+/// The plan and the fold answer one question, so the ordinary rename previews
+/// the way it folds.
+///
+/// A rename inside an overlay is a PAIR: a tombstone at the old path and an
+/// entry at the new one carrying the same address (`move_within_overlay`, and
+/// Task 4's deviation 3 says why it has to be that shape). A preview that asked
+/// only "does a base row hold this address" would call every rename a
+/// collision, in red, on the one flow an author is most likely to have used -
+/// and then fold it without complaint.
+#[tokio::test]
+async fn a_rename_inside_one_overlay_previews_clean_and_folds_clean() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+
+    f.engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                destination: "archive/plan.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    let plan = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan_entries(&plan, "alice"),
+        vec![
+            ("archive/plan.md".to_string(), false, false),
+            ("plan.md".to_string(), true, false),
+        ],
+        "her own deletion of the old path is what frees the address for the new one: {plan}"
+    );
+
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect("and the fold agrees with the plan that showed no conflict");
+    assert!(
+        !f.domain_root("team").join("plan.md").exists(),
+        "the engram moved: the old path is gone"
+    );
+    assert!(
+        f.domain_root("team").join("archive/plan.md").exists(),
+        "and the new one is the file"
+    );
+}
+
+/// One address claimed at two paths by two people is a collision the plan has
+/// to name, because neither draft is in the folder for the other one's
+/// `conflict` to find and neither path is contested.
+#[tokio::test]
+async fn one_address_claimed_at_two_paths_is_flagged_in_the_plan_and_refused() {
+    let f = review_fixture().await;
+    // Written straight into the store, because the write path lets this state
+    // happen and no verb produces it in one call: the permalink rule screens a
+    // draft against the base rows and against its OWN author's drafts, never
+    // against somebody else's, so alice may point alpha.md at 'shared' and bob
+    // may point beta.md at the same address a moment later.
+    let alpha = ALICE_NEW
+        .replace("permalink: fresh", "permalink: shared")
+        .replace("Fresh", "Alpha");
+    let beta = ALICE_NEW
+        .replace("permalink: fresh", "permalink: shared")
+        .replace("Fresh", "Beta");
+    f.draft("team", "alice", "alpha.md", &alpha).await;
+    f.draft("team", "bob", "beta.md", &beta).await;
+    let before = f.tree("team");
+
+    let plan = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan["contested_addresses"],
+        serde_json::json!([{
+            "permalink": "shared",
+            "paths": ["alpha.md", "beta.md"],
+            "actors": ["alice", "bob"],
+        }]),
+        "the plan names the address before either of them answers: {plan}"
+    );
+
+    let refused = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("one engram answers to one address, so both cannot land");
+    let words = refused.to_string();
+    assert!(
+        words.contains("shared") && words.contains("alpha.md") && words.contains("beta.md"),
+        "the refusal names the address and both paths: {words}"
+    );
+    assert_eq!(f.tree("team"), before, "and nothing was written on the way");
+    assert_eq!(review_key(&f, "team"), Some("overlay".to_string()));
+
+    // One of them folding is no collision at all.
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Discard)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(f.domain_root("team").join("alpha.md").exists());
+    assert!(!f.domain_root("team").join("beta.md").exists());
+}
+
+/// The rooms are swept before the folds, so what they save is part of the
+/// folder the folds have to fit into - and the check that decides whether they
+/// fit has to be asked of the folder as it stands THEN.
+///
+/// A room whose author edited the frontmatter's permalink line moves a base
+/// engram's address. If the fold validated against the folder as it was before
+/// the sweep, it would write a second engram at that address and the first
+/// thing to notice would be the sync at the end - by which time the key is off,
+/// the files are written and every actor's rows have been dropped, with the
+/// domain's sync failing the same way for ever after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_room_that_takes_an_address_while_it_closes_refuses_with_nothing_folded() {
+    let f = review_fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    // Her draft answers to 'fresh', which nothing in the folder holds yet.
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+
+    let joined = sessions.join("team", "plan").await.unwrap();
+    let doc = Doc::with_options(yrs::Options {
+        offset_kind: yrs::OffsetKind::Utf16,
+        ..yrs::Options::default()
+    });
+    let replies = joined
+        .session
+        .handle_frame(
+            joined.conn,
+            &Message::Sync(SyncMessage::SyncStep1(doc.transact().state_vector())).encode_v1(),
+        )
+        .await;
+    for reply in replies {
+        let mut decoder = DecoderV1::from(reply.as_slice());
+        for message in MessageReader::new(&mut decoder).flatten() {
+            if let Message::Sync(SyncMessage::SyncStep2(update)) = message {
+                doc.transact_mut()
+                    .apply_update(Update::decode_v1(&update).unwrap())
+                    .unwrap();
+            }
+        }
+    }
+    // The one edit that moves an address: the frontmatter's permalink line,
+    // retyped onto the address her draft already answers to.
+    let update = {
+        let text = doc.get_or_insert_text("content");
+        let full = {
+            let txn = doc.transact();
+            text.get_string(&txn)
+        };
+        let at = full
+            .find("permalink: plan")
+            .expect("the base engram's own line")
+            + "permalink: ".len();
+        let mut txn = doc.transact_mut();
+        text.remove_range(&mut txn, at as u32, 4);
+        text.insert(&mut txn, at as u32, "fresh");
+        txn.encode_update_v1()
+    };
+    joined
+        .session
+        .handle_frame(
+            joined.conn,
+            &Message::Sync(SyncMessage::Update(update)).encode_v1(),
+        )
+        .await;
+
+    let refused = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .expect_err("the folder took her address while its rooms were closing");
+    let words = refused.to_string();
+    assert!(
+        words.contains("fresh.md") && words.contains("alice"),
+        "the refusal names her path and her name: {words}"
+    );
+
+    // Nothing was folded, and the domain is reviewing again: the same call
+    // works once somebody has given one of the two engrams an address of its
+    // own.
+    assert_eq!(review_key(&f, "team"), Some("overlay".to_string()));
+    assert_eq!(
+        f.held("team", "alice")
+            .await
+            .into_iter()
+            .map(|(path, _, tomb)| (path, tomb))
+            .collect::<Vec<_>>(),
+        vec![("fresh.md".to_string(), false)],
+        "her draft is where it was"
+    );
+    assert!(
+        !f.domain_root("team").join("fresh.md").exists(),
+        "and no fold reached the folder"
+    );
+    // The room's own save DID land - it is an out-of-band edit of the tree now,
+    // which `origin status` names for a reviewing domain - and the index takes
+    // it without complaint, which is the wedge this refusal exists to prevent.
+    assert!(
+        std::fs::read_to_string(f.domain_root("team").join("plan.md"))
+            .unwrap()
+            .contains("permalink: fresh"),
+        "the room's save is what the file says"
+    );
+    f.engine
+        .sync(None)
+        .await
+        .expect("and the domain still syncs, which a wedged fold would have ended");
+}
+
+/// A `direct` on a domain that already takes changes directly is a statement of
+/// what holds, not a verb: it closes nobody's co-editing room and syncs
+/// nothing.
+///
+/// The conjunction behind it is what keeps the mid-fold recovery alive - a
+/// domain whose key has already come off but whose overlay is not empty still
+/// has to fold - so both halves are asserted here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaving_a_domain_that_never_reviewed_changes_nothing() {
+    let f = fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    let _joined = sessions.join("team", "plan").await.unwrap();
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Confirmed { folds: Vec::new() },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["applied"], serde_json::json!(true));
+    assert_eq!(
+        receipt["rooms_closed"],
+        serde_json::json!(0),
+        "nobody's editor was closed to state what already held: {receipt}"
+    );
+    assert_eq!(
+        sessions.session_count().await,
+        1,
+        "and the room is still open"
+    );
+
+    // The other half of the conjunction: a domain the key has already come off
+    // but whose overlay is not empty is the recovery path, and it runs.
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["folded"],
+        serde_json::json!([{ "actor": "alice", "written": 1, "deleted": 0 }]),
+        "the fold a half-finished call left behind still lands: {receipt}"
+    );
+    assert!(f.domain_root("team").join("fresh.md").exists());
 }

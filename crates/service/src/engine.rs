@@ -12463,9 +12463,14 @@ impl Engine {
     ///    while the domain is still registered.
     /// 3. The folds land as ordinary file writes and deletions, over the files
     ///    those saves just landed in. Where a fold and a room are about the same
-    ///    path the fold is the last word, which is the answer the plan was
-    ///    confirmed for. Nothing writes an index row here: the sync at the end
-    ///    reads the tree the way it reads every other change to it.
+    ///    path the fold is the last word - which is the answer the plan was
+    ///    confirmed for, and is worth being exact about: the draft row is that
+    ///    room's last AUTOSAVE, so a delta typed since it and flushed by the
+    ///    sweep a moment ago is superseded by slightly older text. The other
+    ///    order loses the same bytes (the fold would be overwritten instead),
+    ///    so this is the cost of folding a path somebody is editing rather than
+    ///    a cost of the ordering. Nothing writes an index row here: the sync at
+    ///    the end reads the tree the way it reads every other change to it.
     /// 4. Every actor's rows and mirror go, folded and discarded alike, before
     ///    the sync - both because the restore runs in every sync pass and would
     ///    put a missed mirror straight back, and because a draft row still
@@ -12623,7 +12628,19 @@ impl Engine {
             .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
             .collect();
         if let Some(refusal) = Self::fold_collision(domain, &folding, &base) {
-            return Err(refusal);
+            return Err(EngineError::Conflict(refusal));
+        }
+
+        // Nothing to do, said as nothing done. The conjunction is the point:
+        // a domain that is not reviewing AND holds no drafts is a `PUT
+        // {"mode":"direct"}` that states what already holds, and closing every
+        // co-editing room in it, syncing it and refreshing the routing cache
+        // would be a lot of consequence for a statement. A domain the key has
+        // already come off but whose overlay is not empty is the mid-fold
+        // recovery [`Engine::set_review_mode`] documents, and that one has to
+        // run.
+        if !entry.is_overlay() && drafts.is_empty() {
+            return Ok(Self::left_review_json(domain, Vec::new(), Vec::new(), 0));
         }
 
         // The key comes off first, and then the rooms go, and that pair is the
@@ -12633,6 +12650,31 @@ impl Engine {
             Some(sessions) => sessions.dispose_domain(domain).await,
             None => 0,
         };
+
+        // **And the same question again, of the folder those rooms just wrote
+        // into.** A room saves through `save_engram`, so a participant who
+        // edited the frontmatter's permalink line has moved a base engram's
+        // address between the check above and this line; a fold validated
+        // against the older folder would write a second engram at that address
+        // and the first thing to notice would be the `sync` at the end - by
+        // which time the files are written, every actor's rows are dropped and
+        // every later sync of this domain fails the same way, with nothing left
+        // to undo it from. Asked here instead, the refusal costs the rooms
+        // their sockets and nothing else: the key goes back on, no file is
+        // written and no row is dropped, so the same call works once one of the
+        // two engrams has an address of its own.
+        let base = {
+            let store = self.store.lock().await;
+            store.list_engrams(domain, None, None).await?
+        };
+        if let Some(refusal) = Self::fold_collision(domain, &folding, &base) {
+            self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+            return Err(EngineError::Conflict(format!(
+                "{refusal}. The folder changed while this domain's co-editing rooms were being \
+                 closed, so nothing was folded and the domain reviews changes again; what those \
+                 rooms saved is in the folder now, which `origin status` lists as out-of-band work"
+            )));
+        }
 
         let mut folded = Vec::new();
         let mut discarded = Vec::new();
@@ -12693,7 +12735,23 @@ impl Engine {
         self.refresh_routing_cache().await;
         self.nudge_embed();
 
-        Ok(json!({
+        Ok(Self::left_review_json(
+            domain,
+            folded,
+            discarded,
+            rooms_closed,
+        ))
+    }
+
+    /// The receipt of a domain that takes changes directly now, whether this
+    /// call is what made it so or found it that way.
+    fn left_review_json(
+        domain: &str,
+        folded: Vec<Value>,
+        discarded: Vec<Value>,
+        rooms_closed: usize,
+    ) -> Value {
+        json!({
             "domain": domain,
             "mode": "direct",
             "review": Value::Null,
@@ -12701,7 +12759,7 @@ impl Engine {
             "folded": folded,
             "discarded": discarded,
             "rooms_closed": rooms_closed,
-        }))
+        })
     }
 
     /// The plan a preview answers with, and the shape Task 8's removal gate
@@ -12730,12 +12788,16 @@ impl Engine {
         let actors: Vec<Value> = drafts
             .iter()
             .map(|held| {
+                // The folder as it would be if THIS actor folded and nobody
+                // else did, which is the only address question a plan can
+                // answer before the answers are in.
+                let surviving = Self::surviving_base(&[held], base);
                 let rows: Vec<Value> = held
                     .entries
                     .iter()
                     .map(|draft| {
                         let conflict = (!draft.tombstone)
-                            .then(|| Self::address_held_elsewhere(draft, base))
+                            .then(|| Self::address_held_elsewhere(draft, &surviving))
                             .flatten();
                         json!({
                             "path": draft.path,
@@ -12770,23 +12832,89 @@ impl Engine {
             "applied": false,
             "actors": actors,
             "contested_paths": contested,
+            "contested_addresses": Self::contested_addresses(drafts),
         })
     }
 
-    /// The base engram, if any, that already answers to this draft's address at
-    /// a different path - the collision a fold of this draft alone cannot avoid.
+    /// The addresses the folder would still answer to once the deletions in
+    /// `folding` had landed: permalink to path, over the base rows no folded
+    /// tombstone takes away.
+    ///
+    /// **The one projection both halves of the address rule are asked of**, and
+    /// that is the point of it existing rather than each half computing its
+    /// own: the preview asks it per actor ("what if only they folded") to fill
+    /// in a draft's `conflict`, and [`Engine::fold_collision`] asks it over
+    /// every folded actor to decide the refusal. Asked two different ways they
+    /// drifted, and the drift landed on the commonest flow there is - a rename
+    /// inside one overlay is a tombstone at the old path plus an entry at the
+    /// new one carrying the same address (`move_within_overlay`), so a
+    /// projection that did not subtract the tombstone called every rename a
+    /// collision in the plan and then folded it without complaint.
+    fn surviving_base<'a>(
+        folding: &[&ActorDrafts],
+        base: &'a [EngramDescriptor],
+    ) -> HashMap<&'a str, &'a str> {
+        let deleted: HashSet<&str> = folding
+            .iter()
+            .flat_map(|held| held.entries.iter())
+            .filter(|draft| draft.tombstone)
+            .map(|draft| draft.path.as_str())
+            .collect();
+        base.iter()
+            .filter(|row| !deleted.contains(row.path.as_str()))
+            .map(|row| (row.permalink.as_str(), row.path.as_str()))
+            .collect()
+    }
+
+    /// The base engram, if any, that would still answer to this draft's address
+    /// at a different path once this actor's own deletions had landed - the
+    /// collision a fold of this actor's drafts alone cannot avoid.
     fn address_held_elsewhere(
         draft: &crystalline_index::StoredEngram,
-        base: &[EngramDescriptor],
+        surviving: &HashMap<&str, &str>,
     ) -> Option<String> {
-        base.iter()
-            .find(|row| row.permalink == draft.permalink && row.path != draft.path)
-            .map(|row| {
+        surviving
+            .get(draft.permalink.as_str())
+            .filter(|path| **path != draft.path)
+            .map(|path| {
                 format!(
-                    "the address '{}' already belongs to {} in the folder the team shares",
-                    draft.permalink, row.path
+                    "the address '{}' already belongs to {path} in the folder the team shares",
+                    draft.permalink
                 )
             })
+    }
+
+    /// The addresses two actors' different paths would both claim.
+    ///
+    /// The other half of what a plan can say about addresses, and it is
+    /// choice-dependent where a draft's own `conflict` is not: neither draft is
+    /// in the folder for the other one's projection to find, and the paths
+    /// differ so `contested_paths` says nothing either. Without it a plan that
+    /// looked clean was refused at confirm time, which is exactly the
+    /// "never decided by omission" property the rest of this verb is built on.
+    fn contested_addresses(drafts: &[ActorDrafts]) -> Vec<Value> {
+        let mut by_address: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+        for held in drafts {
+            for draft in held.entries.iter().filter(|draft| !draft.tombstone) {
+                let entry = by_address.entry(draft.permalink.as_str()).or_default();
+                entry.0.insert(draft.path.as_str());
+                entry.1.insert(held.actor.as_str());
+            }
+        }
+        by_address
+            .into_iter()
+            // One path two actors are both drafting is `contested_paths`'
+            // answer, not this one: at most one of them may be the file there
+            // whatever address they give it.
+            .filter(|(_, (paths, actors))| paths.len() > 1 && actors.len() > 1)
+            .map(|(permalink, (paths, actors))| {
+                json!({
+                    "permalink": permalink,
+                    "paths": paths.into_iter().collect::<Vec<_>>(),
+                    "actors": actors.into_iter().collect::<Vec<_>>(),
+                })
+            })
+            .collect()
     }
 
     /// One choice per actor holding drafts, refusing an actor left out and an
@@ -12851,35 +12979,25 @@ impl Engine {
         domain: &str,
         folding: &[&ActorDrafts],
         base: &[EngramDescriptor],
-    ) -> Option<EngineError> {
+    ) -> Option<String> {
         // Two actors folding one path: whoever went second would be the file,
         // which is not an answer either of them gave.
         let mut owner: HashMap<&str, &str> = HashMap::new();
         for held in folding {
             for draft in &held.entries {
                 if let Some(first) = owner.insert(draft.path.as_str(), held.actor.as_str()) {
-                    return Some(EngineError::Conflict(format!(
+                    return Some(format!(
                         "'{first}' and '{}' are both drafting {} in domain '{domain}', and only \
                          one of them can be the file: fold one of them and discard the other, or \
                          let them settle it between themselves first",
                         held.actor, draft.path
-                    )));
+                    ));
                 }
             }
         }
-        // What the folder would answer to afterwards: the base rows, minus what
-        // a folded deletion takes away, plus every folded draft.
-        let mut address: HashMap<&str, &str> = HashMap::new();
-        for row in base {
-            let deleted = folding.iter().any(|held| {
-                held.entries
-                    .iter()
-                    .any(|draft| draft.tombstone && draft.path == row.path)
-            });
-            if !deleted {
-                address.insert(row.permalink.as_str(), row.path.as_str());
-            }
-        }
+        // What the folder would answer to afterwards: the projection every
+        // half of this rule shares, plus every folded draft on top of it.
+        let mut address = Self::surviving_base(folding, base);
         for held in folding {
             for draft in &held.entries {
                 if draft.tombstone {
@@ -12887,13 +13005,13 @@ impl Engine {
                 }
                 match address.insert(draft.permalink.as_str(), draft.path.as_str()) {
                     Some(other) if other != draft.path => {
-                        return Some(EngineError::Conflict(format!(
+                        return Some(format!(
                             "folding '{}' drafted by {} into domain '{domain}' would give the \
                              address '{}' to a second engram: {other} already answers to it. One \
                              engram answers to one address, so give the draft an address of its \
                              own, or discard it",
                             draft.path, held.actor, draft.permalink
-                        )));
+                        ));
                     }
                     _ => {}
                 }
@@ -12910,8 +13028,9 @@ impl Engine {
     /// [`EngineError::UnknownDomain`], which is reachable in one shape and is
     /// the same answer [`Engine::domain_remove`] gives it: a domain another
     /// process registered in the config file after this engine started is in
-    /// [`Engine::discovered_domains`] (so [`Engine::domain_entry`] resolves it
-    /// and the gates above pass) and not in the snapshot this persists from.
+    /// the discovered-domain cache (where `domain_entry` finds it after missing
+    /// in `self.config`, so the gates above pass) and not in the snapshot this
+    /// persists from.
     /// The refusal is confusing rather than damaging - nothing is written - and
     /// closing it means every config mutation here re-reading the file under
     /// its own lock, which is a change to all of them rather than to this one.
@@ -14058,10 +14177,19 @@ impl Engine {
         // the machine - and the key is absent on a domain that takes changes
         // directly, where a local change is ordinary unshared work and
         // `local_changes` already says so.
-        let out_of_band = entry
-            .is_overlay()
-            .then(|| origin::unshared_work(&root, &state_dir).map(|work| work.paths))
-            .flatten();
+        // Emitted for every reviewing domain, empty when nothing is known to be
+        // unshared - the opposite of the rule `detail` follows beside it, and
+        // deliberately. `detail` is absent when the walk never happened because
+        // "nothing unshared" and "this could not be told" must not render the
+        // same; here the key's presence is what says the domain reviews at all,
+        // so making it absent for a domain that has never been pulled would say
+        // "this domain takes changes directly", which is a different and wrong
+        // thing.
+        let out_of_band = entry.is_overlay().then(|| {
+            origin::unshared_work(&root, &state_dir)
+                .map(|work| work.paths)
+                .unwrap_or_default()
+        });
         let with_out_of_band = |mut value: Value| {
             if let Some(paths) = &out_of_band
                 && let Some(object) = value.as_object_mut()
