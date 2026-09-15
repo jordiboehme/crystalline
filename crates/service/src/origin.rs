@@ -553,7 +553,11 @@ impl UnsharedWork {
 /// The cost is one walk of the domain root with a hash per file, the same walk
 /// `origin status` performs. Callers that already ran a status pay it twice;
 /// that is deliberate, because the alternative is threading a change list out
-/// through an aggregate JSON report that deliberately carries counts.
+/// through an aggregate JSON report that deliberately carries counts. A status
+/// of a domain in REVIEW mode pays for a third: the status walks, `detail` walks
+/// again when it is asked for, and the `out_of_band` list this answers walks
+/// once more, because in that mode a local change is not unshared work but work
+/// that went round review entirely.
 pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWork> {
     let state = OriginState::load(state_dir).ok().flatten()?;
     let detected =

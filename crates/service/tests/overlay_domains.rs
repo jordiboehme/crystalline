@@ -305,6 +305,12 @@ impl Fixture {
         let id = self.domain_id(&*store, domain).await;
         let mut rec = record(PLAN, path);
         rec.tombstone = true;
+        // A tombstone answers to no address, so its permalink column carries
+        // the row's own identity in this actor's dimension: its path. That is
+        // what `overlay_journal::tombstone_record` and `write_overlay_tombstone`
+        // both write, and a helper that wrote anything else would let a test
+        // pass against a shape no verb produces (Task 4's deviation 3).
+        rec.permalink = path.to_string();
         store.upsert_overlay(id, actor, &rec).await.unwrap();
         overlay_journal::journal_tombstone(&self.state, domain, actor, path).unwrap();
     }
