@@ -8484,6 +8484,12 @@ impl Engine {
                 // every domain on it: privacy is a membership record, and a
                 // machine with no accounts has none.
                 "private": private.contains(name),
+                // Whether this domain reviews changes before they land, so a
+                // client says which way a write in it will go rather than
+                // finding out from the receipt. Absent as `null` on a domain
+                // that takes changes directly, which is how a domain starts
+                // out.
+                "review": entry.is_overlay().then_some("overlay"),
             });
             // In a shared database a file domain names its current host so an
             // agent and an operator see who syncs what; `hosted_here` is true when

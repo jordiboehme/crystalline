@@ -115,6 +115,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::list,
         domains_admin::create,
         domains_admin::remove,
+        domains_admin::set_review_mode,
         domains_admin::set_visibility,
         members::list,
         members::set_member,
@@ -191,6 +192,9 @@ use crate::scope::{DomainAccess, DomainRight};
         Role,
         domains::SaveManifestBody,
         domains_admin::CreateDomainBody,
+        domains_admin::FoldArg,
+        domains_admin::ReviewBody,
+        domains_admin::ReviewModeArg,
         domains_admin::VisibilityBody,
         MemberLevel,
         DomainMember,
@@ -565,6 +569,16 @@ pub fn router(state: RestState) -> Router {
         .route(
             "/domains/{domain}/visibility",
             put(domains_admin::set_visibility),
+        )
+        // Whether the domain reviews changes before they land. The same gate
+        // unregistering it goes through - an instance admin, or a private
+        // domain's owner - because both decide something about the whole
+        // domain rather than about one engram in it, and taking review mode
+        // off ends every actor's unshared drafts. See
+        // [`domains_admin::set_review_mode`].
+        .route(
+            "/domains/{domain}/review",
+            put(domains_admin::set_review_mode),
         )
         // Who may reach a private domain. The listing is open to anyone who
         // may see the domain at all (a viewer-level member sees who else is

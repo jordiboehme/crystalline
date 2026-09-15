@@ -19,7 +19,7 @@ use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, Caller, ProblemDetail, RestState, refuse_read_only,
     require_domain_read, require_domain_write,
 };
-use crate::engine::{EngineError, PreviewCredential, ShareActor};
+use crate::engine::{EngineError, FoldChoice, PreviewCredential, ReviewModeConfirm, ShareActor};
 use crate::scope::DomainRight;
 
 /// The caller, when they may drive this instance's share surfaces - the status
@@ -1974,6 +1974,223 @@ fn github_off_conflict() -> ApiError {
 }
 
 /// What `PUT /domains/{domain}/visibility` takes.
+/// The mode `PUT /domains/{domain}/review` puts a domain in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewModeArg {
+    /// Every write joins its author's own draft; the folder the team shares
+    /// changes only through a reviewed proposal.
+    Overlay,
+    /// Every write lands in the folder straight away, which is how a domain
+    /// starts out.
+    Direct,
+}
+
+/// What one actor's drafts become when the domain stops reviewing changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FoldArg {
+    /// Write them into the folder the team shares.
+    Fold,
+    /// End them. The folder never hears about them.
+    Discard,
+}
+
+/// The body `PUT /domains/{domain}/review` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "The mode this domain takes changes in, and - when \
+                        leaving review mode - what happens to each actor's \
+                        private drafts. Omit `folds` to ask for the plan \
+                        instead of making the change; `overlay` never takes \
+                        one, since a domain that has not been reviewing yet \
+                        holds no drafts for anybody to decide about.")]
+pub struct ReviewBody {
+    /// `overlay` reviews changes before they land, `direct` takes them
+    /// straight into the folder.
+    #[schema(example = "overlay")]
+    pub mode: ReviewModeArg,
+    /// One choice per actor holding drafts, keyed by the actor's name. Absent
+    /// asks for the plan and writes nothing; present makes the change and has
+    /// to name every actor the plan names, and nobody else.
+    #[serde(default)]
+    pub folds: Option<std::collections::BTreeMap<String, FoldArg>>,
+}
+
+/// `PUT /domains/{domain}/review` - whether this domain reviews changes before
+/// they land, and what happens to the drafts on the way out.
+///
+/// **Turning review mode ON** is a promise about every future change: it joins
+/// its author's own draft and reaches the folder the team shares only through a
+/// proposal somebody reviewed. The domain has to be able to keep that promise,
+/// so a domain with no GitHub origin, a virtual domain and a domain whose
+/// folder already holds unshared work are each refused `409` in words that name
+/// what is in the way.
+///
+/// **Turning it OFF** ends every actor's private drafts, so it is a question
+/// before it is a change. A body with no `folds` key answers the plan - who
+/// holds what, which of their drafts are deletions, which paths more than one
+/// of them is drafting and which drafts have nowhere to land - and writes
+/// nothing at all. A body WITH one carries the answers: `fold` writes that
+/// actor's drafts into the folder, `discard` ends them. Every actor the plan
+/// names has to be there and nobody else, so nobody's unshared work is decided
+/// by omission or by a typo.
+///
+/// The gate is [`crate::engine::Engine::require_domain_owner`], the same one
+/// unregistering a domain goes through: an instance admin, or the owner of a
+/// private domain. A caller who may not see the domain is answered exactly as
+/// one naming a domain nobody registered.
+#[utoipa::path(
+    put,
+    path = "/api/v1/domains/{domain}/review",
+    tag = "domains",
+    operation_id = "set_domain_review_mode",
+    summary = "Whether this domain reviews changes before they land.",
+    description = "An instance admin, or a private domain's owner.\n\nmode \
+                   `overlay` turns REVIEW MODE on: every write joins its \
+                   author's own draft and the folder the team shares changes \
+                   only through a reviewed proposal. It needs a GitHub origin \
+                   (a reviewed change has to have somewhere to be proposed), a \
+                   folder (so not a virtual domain) and a folder with nothing \
+                   unshared in it already - each refused 409 naming what is in \
+                   the way.\n\nmode `direct` takes review mode off and ends \
+                   every private draft in the domain. WITHOUT a `folds` key \
+                   this answers the plan and writes nothing: each actor, their \
+                   drafts, which are deletions, which paths more than one of \
+                   them is drafting and which drafts have nowhere to land. \
+                   WITH one it makes the change, and the key has to name every \
+                   actor the plan named and nobody else - `fold` writes that \
+                   actor's drafts into the folder, `discard` ends them. Two \
+                   folded actors at one path, or a folded draft whose address \
+                   another engram already holds, refuse before anything is \
+                   written.\n\nAsking for a mode the domain already has changes \
+                   nothing and answers the same way.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    request_body = ReviewBody,
+    responses(
+        (
+            status = 200,
+            description = "The plan, for a `direct` body with no `folds` key \
+                           (`applied` false), or what the change did: `folded` \
+                           and `discarded` per actor, `rooms_closed` for the \
+                           co-editing rooms it ended, and `review` naming the \
+                           mode the domain is in now.",
+            body = Object,
+            example = json!({
+                "domain": "eng",
+                "mode": "direct",
+                "review": "overlay",
+                "applied": false,
+                "actors": [{
+                    "actor": "ada",
+                    "entries": 2,
+                    "drafts": [
+                        { "path": "plan.md", "permalink": "plan", "tombstone": false, "conflict": null },
+                        { "path": "notes/gone.md", "permalink": "notes/gone.md", "tombstone": true, "conflict": null }
+                    ]
+                }],
+                "contested_paths": []
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is neither an instance admin nor this \
+                           domain's owner, the request did not echo its CSRF \
+                           token, this instance is read-only, or the \
+                           trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain cannot take the mode asked for: no \
+                           GitHub origin, a virtual domain, unshared work in \
+                           the folder, an answer that does not cover every \
+                           actor holding drafts, or a fold two engrams would \
+                           come out of.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "`folds` on an `overlay` body: there are no drafts \
+                           to decide about on the way in.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_review_mode(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<ReviewBody>,
+) -> Result<Json<Value>, ApiError> {
+    // The same split `remove` makes, for the same reason: who may decide this
+    // is the engine's rule, so this surface and the CLI cannot answer it
+    // differently, and the one thing the engine cannot see is that an anonymous
+    // identity has no account to be anybody's owner, so it is told to log in
+    // (401) rather than that it is forbidden (403).
+    identity.require_account()?;
+    let (mode, confirm) = match (body.mode, body.folds) {
+        (ReviewModeArg::Overlay, Some(folds)) if !folds.is_empty() => {
+            return Err(ApiError::unprocessable(
+                "folds say what happens to each actor's private drafts, which is a question about \
+                 LEAVING review mode: a domain on its way in has none yet. Send mode 'overlay' on \
+                 its own"
+                    .to_string(),
+            ));
+        }
+        // Turning review on carries no choices, so an absent `folds` is the
+        // change rather than a question about it: there is nothing to ask.
+        (ReviewModeArg::Overlay, _) => (
+            Some(crystalline_core::config::ReviewMode::Overlay),
+            ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        ),
+        (ReviewModeArg::Direct, None) => (None, ReviewModeConfirm::Preview),
+        (ReviewModeArg::Direct, Some(folds)) => (
+            None,
+            ReviewModeConfirm::Confirmed {
+                folds: folds
+                    .into_iter()
+                    .map(|(actor, choice)| {
+                        (
+                            actor,
+                            match choice {
+                                FoldArg::Fold => FoldChoice::Fold,
+                                FoldArg::Discard => FoldChoice::Discard,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        ),
+    };
+    let report = state
+        .engine
+        .set_review_mode(&domain, mode, confirm, &identity.scope())
+        .await
+        .map_err(|e| match e {
+            // A domain that cannot take the mode asked for is a state this
+            // request meets rather than a request that is malformed: the same
+            // 409 `remove` answers its own conflicts with.
+            EngineError::Conflict(detail) => ApiError::conflict(detail),
+            other => other.into(),
+        })?;
+    Ok(Json(report))
+}
+
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[schema(description = "Whether the domain is private. `true` closes it to \
                         its owner and the people invited into it; `false` \

@@ -647,6 +647,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Whether this domain reviews changes before they land.
+         * @description An instance admin, or a private domain's owner.
+         *
+         *     mode `overlay` turns REVIEW MODE on: every write joins its author's own draft and the folder the team shares changes only through a reviewed proposal. It needs a GitHub origin (a reviewed change has to have somewhere to be proposed), a folder (so not a virtual domain) and a folder with nothing unshared in it already - each refused 409 naming what is in the way.
+         *
+         *     mode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and writes nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting and which drafts have nowhere to land. WITH one it makes the change, and the key has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written.
+         *
+         *     Asking for a mode the domain already has changes nothing and answers the same way.
+         */
+        put: operations["set_domain_review_mode"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/sync": {
         parameters: {
             query?: never;
@@ -1836,6 +1862,11 @@ export interface components {
             /** @description The member's login name, folded by [`normalize_account_name`]. */
             principal: string;
         };
+        /**
+         * @description What one actor's drafts become when the domain stops reviewing changes.
+         * @enum {string}
+         */
+        FoldArg: "fold" | "discard";
         /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
         GithubIdentityResponse: {
             /**
@@ -2460,6 +2491,28 @@ export interface components {
             /** @description The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown. */
             valid_to?: string | null;
         };
+        /** @description The mode this domain takes changes in, and - when leaving review mode - what happens to each actor's private drafts. Omit `folds` to ask for the plan instead of making the change; `overlay` never takes one, since a domain that has not been reviewing yet holds no drafts for anybody to decide about. */
+        ReviewBody: {
+            /**
+             * @description One choice per actor holding drafts, keyed by the actor's name. Absent
+             *     asks for the plan and writes nothing; present makes the change and has
+             *     to name every actor the plan names, and nobody else.
+             */
+            folds?: {
+                [key: string]: components["schemas"]["FoldArg"];
+            } | null;
+            /**
+             * @description `overlay` reviews changes before they land, `direct` takes them
+             *     straight into the folder.
+             */
+            mode: components["schemas"]["ReviewModeArg"];
+        };
+        /**
+         * @description What `PUT /domains/{domain}/visibility` takes.
+         *     The mode `PUT /domains/{domain}/review` puts a domain in.
+         * @enum {string}
+         */
+        ReviewModeArg: "overlay" | "direct";
         /**
          * @description What a user may do. Ordered least to most privileged; the REST layer maps
          *     each endpoint to the minimum role it accepts.
@@ -5673,6 +5726,107 @@ export interface operations {
                 };
             };
             /** @description The status is not deprecated, superseded or archived; a successor is missing for superseded or given for another status; the successor resolves to the same engram being retired; or valid_to is not a plain ISO date. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    set_domain_review_mode: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReviewBody"];
+            };
+        };
+        responses: {
+            /** @description The plan, for a `direct` body with no `folds` key (`applied` false), or what the change did: `folded` and `discarded` per actor, `rooms_closed` for the co-editing rooms it ended, and `review` naming the mode the domain is in now. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "actors": [
+                     *         {
+                     *           "actor": "ada",
+                     *           "drafts": [
+                     *             {
+                     *               "conflict": null,
+                     *               "path": "plan.md",
+                     *               "permalink": "plan",
+                     *               "tombstone": false
+                     *             },
+                     *             {
+                     *               "conflict": null,
+                     *               "path": "notes/gone.md",
+                     *               "permalink": "notes/gone.md",
+                     *               "tombstone": true
+                     *             }
+                     *           ],
+                     *           "entries": 2
+                     *         }
+                     *       ],
+                     *       "applied": false,
+                     *       "contested_paths": [],
+                     *       "domain": "eng",
+                     *       "mode": "direct",
+                     *       "review": "overlay"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is neither an instance admin nor this domain's owner, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain cannot take the mode asked for: no GitHub origin, a virtual domain, unshared work in the folder, an answer that does not cover every actor holding drafts, or a fold two engrams would come out of. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description `folds` on an `overlay` body: there are no drafts to decide about on the way in. */
             422: {
                 headers: {
                     [name: string]: unknown;

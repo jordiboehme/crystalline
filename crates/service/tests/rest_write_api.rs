@@ -1922,6 +1922,23 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // Review mode, in the direction that needs no answers: `eng` has no
+        // GitHub origin, so the allowed leg is a 409 - exactly the "anything
+        // but 401/403" this matrix asserts, while changing nothing at all.
+        //
+        // Admin rather than editor, and for the same reason the visibility and
+        // unregister rows above are: the route is gated by
+        // `Engine::require_domain_owner`, which needs `DomainRight::Own`, and
+        // on a SHARED domain nobody holds that but an instance admin. Deciding
+        // whether a whole domain reviews its changes is a domain-management
+        // verb, not content editing.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/review",
+            body: Some(serde_json::json!({"mode": "overlay"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         // The three membership mutations. `eng` is SHARED in this fixture, so
         // the gate they are being measured for is the domain right rather
         // than a membership row: an instance viewer resolves to `Read` there
@@ -2471,6 +2488,103 @@ fn canonicalize(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Deciding whether a domain reviews its changes is the domain owner's, and
+/// leaving review mode is the answer somebody has to give per actor before
+/// anybody's unshared drafts end.
+///
+/// The gate is `Engine::require_domain_owner`, the one every surface that ends
+/// something about a whole domain goes through, so an instance editor on a
+/// shared domain is refused where an admin gets past authorization. The matrix
+/// row beside this test drives the same route through every role and both CSRF
+/// legs; what this one adds is the two directions' own answers, which a matrix
+/// asserting "anything but 401/403" cannot see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_mode_route_is_owner_only_and_in_the_matrix() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // The route is in the matrix at all, which is what keeps it from shipping
+    // ungated: the enumeration test below fails by name otherwise.
+    assert!(
+        support::MOUNTED_OPERATIONS.contains(&"PUT /api/v1/domains/{domain}/review"),
+        "the router's own operation list carries the route"
+    );
+
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &editor,
+    )
+    .json(&serde_json::json!({"mode": "overlay"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        refused.status(),
+        403,
+        "an editor does not decide whether a whole domain reviews its changes"
+    );
+
+    // The admin gets past the gate and meets the domain's own answer: `eng` has
+    // no GitHub origin, so there is nowhere for a reviewed change to be
+    // proposed.
+    let conflict = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "overlay"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(conflict.status(), 409);
+    let problem: serde_json::Value = conflict.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("connect it to a GitHub repository"),
+        "and the refusal teaches the way in: {problem}"
+    );
+
+    // The other direction with no `folds` key is the question rather than the
+    // change: the plan comes back and nothing moves.
+    let plan = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "direct"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(plan.status(), 200);
+    let plan: serde_json::Value = plan.json().await.unwrap();
+    assert_eq!(plan["applied"], serde_json::json!(false));
+    assert_eq!(plan["actors"], serde_json::json!([]), "{plan}");
+
+    // And with one, it is the change - on a domain where nobody is drafting,
+    // which is every domain that was never in review mode.
+    let applied = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "direct", "folds": {}}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(applied.status(), 200);
+    let applied: serde_json::Value = applied.json().await.unwrap();
+    assert_eq!(applied["applied"], serde_json::json!(true));
+    assert_eq!(applied["review"], serde_json::Value::Null, "{applied}");
 }
 
 /// The enumeration property: `write_ops()` covers every mutating route this

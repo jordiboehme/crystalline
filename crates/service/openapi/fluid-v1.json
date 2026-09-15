@@ -3642,6 +3642,126 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/review": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Whether this domain reviews changes before they land.",
+        "description": "An instance admin, or a private domain's owner.\n\nmode `overlay` turns REVIEW MODE on: every write joins its author's own draft and the folder the team shares changes only through a reviewed proposal. It needs a GitHub origin (a reviewed change has to have somewhere to be proposed), a folder (so not a virtual domain) and a folder with nothing unshared in it already - each refused 409 naming what is in the way.\n\nmode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and writes nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting and which drafts have nowhere to land. WITH one it makes the change, and the key has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written.\n\nAsking for a mode the domain already has changes nothing and answers the same way.",
+        "operationId": "set_domain_review_mode",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The plan, for a `direct` body with no `folds` key (`applied` false), or what the change did: `folded` and `discarded` per actor, `rooms_closed` for the co-editing rooms it ended, and `review` naming the mode the domain is in now.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "actors": [
+                    {
+                      "actor": "ada",
+                      "drafts": [
+                        {
+                          "conflict": null,
+                          "path": "plan.md",
+                          "permalink": "plan",
+                          "tombstone": false
+                        },
+                        {
+                          "conflict": null,
+                          "path": "notes/gone.md",
+                          "permalink": "notes/gone.md",
+                          "tombstone": true
+                        }
+                      ],
+                      "entries": 2
+                    }
+                  ],
+                  "applied": false,
+                  "contested_paths": [],
+                  "domain": "eng",
+                  "mode": "direct",
+                  "review": "overlay"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is neither an instance admin nor this domain's owner, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain cannot take the mode asked for: no GitHub origin, a virtual domain, unshared work in the folder, an answer that does not cover every actor holding drafts, or a fold two engrams would come out of.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`folds` on an `overlay` body: there are no drafts to decide about on the way in.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/sync": {
       "get": {
         "tags": [
@@ -7697,6 +7817,14 @@
           }
         }
       },
+      "FoldArg": {
+        "type": "string",
+        "description": "What one actor's drafts become when the domain stops reviewing changes.",
+        "enum": [
+          "fold",
+          "discard"
+        ]
+      },
       "GithubIdentityResponse": {
         "type": "object",
         "description": "One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.",
@@ -8544,6 +8672,40 @@
             "description": "The date validity ends, plain ISO (YYYY-MM-DD). Absent means unknown."
           }
         }
+      },
+      "ReviewBody": {
+        "type": "object",
+        "description": "The mode this domain takes changes in, and - when leaving review mode - what happens to each actor's private drafts. Omit `folds` to ask for the plan instead of making the change; `overlay` never takes one, since a domain that has not been reviewing yet holds no drafts for anybody to decide about.",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "folds": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "One choice per actor holding drafts, keyed by the actor's name. Absent\nasks for the plan and writes nothing; present makes the change and has\nto name every actor the plan names, and nobody else.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FoldArg"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ReviewModeArg",
+            "description": "`overlay` reviews changes before they land, `direct` takes them\nstraight into the folder."
+          }
+        }
+      },
+      "ReviewModeArg": {
+        "type": "string",
+        "description": "What `PUT /domains/{domain}/visibility` takes.\nThe mode `PUT /domains/{domain}/review` puts a domain in.",
+        "enum": [
+          "overlay",
+          "direct"
+        ]
       },
       "Role": {
         "type": "string",
