@@ -1556,7 +1556,7 @@ impl Engine {
     ///
     /// Either half failing propagates rather than resolving to an empty set: a
     /// read that cannot learn what it may answer from refuses, and never widens.
-    async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
+    pub(crate) async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
         let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
         hidden.extend(self.unregistered_domains().await?);
         Ok(hidden)
@@ -4022,6 +4022,25 @@ impl Engine {
         Ok(store.list_attachments(domain_id).await?)
     }
 
+    /// [`Engine::attachment_list`] as this caller sees it.
+    ///
+    /// The name-addressed verb above is the **substrate**: the folder's own
+    /// rows, the same for everybody, which is what the machinery that holds no
+    /// scope needs. This one is the **projection**: on a domain that reviews
+    /// changes a file the caller uploaded is listed for them alone and a file
+    /// they deleted is absent for them, exactly as their drafted pages are.
+    /// Every surface that answers a person asks this one.
+    pub async fn attachment_list_as(
+        &self,
+        domain: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Vec<AttachmentRow>> {
+        let hidden = self.hidden_for(scope).await?;
+        DomainView::for_read(self, domain, &hidden, scope)?
+            .attachments()
+            .await
+    }
+
     /// One attachment's bytes and its metadata row.
     ///
     /// A file domain reads the file under its root; a virtual domain reads the
@@ -4036,6 +4055,23 @@ impl Engine {
     /// That keeps the sha a caller caches on describing exactly what it
     /// received. The match itself is the walker's stat prefilter, so the common
     /// case costs no hashing at all.
+    /// [`Engine::attachment_read`] as this caller sees it: their own bytes
+    /// where they hold some, a miss where they have deleted the path, and the
+    /// folder's answer otherwise. The projection to
+    /// [`Engine::attachment_read`]'s substrate, as
+    /// [`Engine::attachment_list_as`] is to [`Engine::attachment_list`].
+    pub async fn attachment_read_as(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<(Vec<u8>, AttachmentRow)> {
+        let hidden = self.hidden_for(scope).await?;
+        DomainView::for_read(self, domain, &hidden, scope)?
+            .attachment_bytes(path)
+            .await
+    }
+
     pub async fn attachment_read(
         &self,
         domain: &str,
@@ -6958,6 +6994,26 @@ impl Engine {
     /// caller can act on rather than a silent one, and the alternative is
     /// answering "attachments: none" for an engram nobody could read.
     pub async fn delete_preview(&self, p: &DeleteParams) -> Result<Value> {
+        self.delete_preview_as(p, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::delete_preview`] under the acting scope, the pair
+    /// [`Engine::delete_engram_as`] takes.
+    ///
+    /// The scope is what keeps round one honest about round two on a domain
+    /// that reviews changes. An attachment only this caller's own overlay holds
+    /// is a file the delete would really remove, so a preview built on the
+    /// folder alone would refuse a delete that was going to succeed - and a
+    /// path this caller has already deleted is one the delete would miss, so a
+    /// preview built on the folder would promise bytes that are not theirs to
+    /// take. Both directions are the same rule: **a preview must never be
+    /// stricter than the act it previews**, and it must not be laxer either.
+    pub async fn delete_preview_as(
+        &self,
+        p: &DeleteParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -6967,7 +7023,8 @@ impl Engine {
                     "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
                 )));
             }
-            let size = DomainView::base(self, &p.domain, &HashSet::new())?
+            let hidden = self.hidden_for(scope).await?;
+            let size = DomainView::for_read(self, &p.domain, &hidden, scope)?
                 .attachment_delete_size(&path)
                 .await?;
             return Ok(json!({
@@ -17475,7 +17532,7 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
 /// [`crystalline_core::validate_asset_path`]'s rules - the reserved prefix, the
 /// segment rules, the character rules, the length ceiling and the extension
 /// allowlist - reported as a malformed request.
-fn validate_attachment_path(path: &str) -> Result<()> {
+pub(crate) fn validate_attachment_path(path: &str) -> Result<()> {
     crystalline_core::validate_asset_path(path)
         .map_err(|e| EngineError::Invalid(format!("attachment path '{path}': {e}")))
 }
@@ -17525,7 +17582,7 @@ fn contained_asset_path(root: &Path, rel: &str) -> Result<PathBuf> {
 /// The metadata row describing these bytes at this path. The mime comes from
 /// the extension and never from a caller, which is why this cannot be built
 /// before [`validate_attachment_path`] has accepted the path.
-fn attachment_row(path: &str, bytes: &[u8], modified: String) -> Result<AttachmentRow> {
+pub(crate) fn attachment_row(path: &str, bytes: &[u8], modified: String) -> Result<AttachmentRow> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let mime = crystalline_core::attachment_mime(name).ok_or_else(|| {
         EngineError::Invalid(format!(
@@ -18166,7 +18223,7 @@ fn rewrite_line_asset_refs(line: &str, renames: &BTreeMap<String, String>) -> St
 
 /// A file's modification instant in the spelling the sync walker records, so a
 /// row written here and a row written by a scan compare equal.
-fn asset_modified(abs: &Path) -> String {
+pub(crate) fn asset_modified(abs: &Path) -> String {
     let mtime = std::fs::metadata(abs)
         .map(|meta| mtime_secs(&meta))
         .unwrap_or_else(|_| Utc::now().timestamp());
@@ -18176,7 +18233,7 @@ fn asset_modified(abs: &Path) -> String {
 }
 
 /// The miss message every attachment verb reports, one spelling.
-fn missing_attachment(domain: &str, path: &str) -> String {
+pub(crate) fn missing_attachment(domain: &str, path: &str) -> String {
     format!("no attachment '{path}' in domain '{domain}'")
 }
 

@@ -1739,7 +1739,11 @@ impl McpServer {
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
                 None => {
-                    let preview = self.engine.delete_preview(&p).await.map_err(to_error)?;
+                    let preview = self
+                        .engine
+                        .delete_preview_as(&p, &scope)
+                        .await
+                        .map_err(to_error)?;
                     return Ok(confirm_question(delete_question(&preview)).into());
                 }
                 Some(false) => {
@@ -2704,7 +2708,14 @@ impl McpServer {
         if self.engine.require_domain(domain, scope).await.is_err() {
             return Vec::new();
         }
-        let Ok(view) = DomainView::base(&self.engine, domain, &HashSet::new()) else {
+        // This reader's own view, so a draft-only attachment a draft
+        // references is a resource link for its author and nothing at all for
+        // anybody else. A screen that cannot be computed costs the links rather
+        // than widening them, exactly as an unresolvable view does.
+        let Ok(hidden) = self.engine.hidden_for(scope).await else {
+            return Vec::new();
+        };
+        let Ok(view) = DomainView::for_read(&self.engine, domain, &hidden, scope) else {
             return Vec::new();
         };
         let Ok(rows) = view.attachments().await else {
@@ -3362,7 +3373,9 @@ impl ServerHandler for McpServer {
                     .require_domain(&url.domain, &self.scope_of(&context))
                     .await
                     .map_err(to_error)?;
-                let (bytes, row) = DomainView::base(&self.engine, &url.domain, &HashSet::new())
+                let scope = self.scope_of(&context);
+                let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
+                let (bytes, row) = DomainView::for_read(&self.engine, &url.domain, &hidden, &scope)
                     .map_err(to_error)?
                     .attachment_bytes(path)
                     .await

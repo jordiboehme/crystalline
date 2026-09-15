@@ -231,10 +231,14 @@ pub async fn read(
     // The bytes an engram carries are the engram's domain's, so they are
     // reached through the same visibility check the engram is.
     require_domain_read(&state, &identity, &domain).await?;
-    // Through the reader's view of the domain, which for an attachment is its
-    // base view: the attachment table carries no actor dimension, so what one
-    // reader sees there is what the team's folder holds.
-    let (bytes, row) = DomainView::base(&state.engine, &domain, &HashSet::new())?
+    // Through this reader's own view of the domain: on a domain that reviews
+    // changes, a file they uploaded is theirs alone until it is shared, and a
+    // file they deleted reads absent for them and unchanged for everybody else.
+    // The registered-set screen is the caller's own, composed ahead of the
+    // actor dimension the way every other view here composes it.
+    let scope = identity.scope();
+    let hidden = state.engine.hidden_for(&scope).await?;
+    let (bytes, row) = DomainView::for_read(&state.engine, &domain, &hidden, &scope)?
         .attachment_bytes(&path)
         .await
         .map_err(malformed_path_is_a_bad_request)?;
@@ -482,7 +486,9 @@ pub async fn list(
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<AttachmentsResponse>, ApiError> {
     require_domain_read(&state, &identity, &domain).await?;
-    let rows = DomainView::base(&state.engine, &domain, &HashSet::new())?
+    let scope = identity.scope();
+    let hidden = state.engine.hidden_for(&scope).await?;
+    let rows = DomainView::for_read(&state.engine, &domain, &hidden, &scope)?
         .attachments()
         .await?;
     Ok(Json(AttachmentsResponse {

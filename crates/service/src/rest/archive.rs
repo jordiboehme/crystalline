@@ -698,7 +698,13 @@ async fn run_archive(
         .iter()
         .any(|item| matches!(item, Screened::Asset { .. }))
     {
-        held = DomainView::base(&state.engine, domain, &HashSet::new())?
+        // The importer's own view: a preview compares what the archive carries
+        // against what the person running the import already sees, so a file
+        // they hold only in their own overlay collides for them the way a
+        // reviewed one collides for everybody.
+        let scope = identity.scope();
+        let hidden = state.engine.hidden_for(&scope).await?;
+        held = DomainView::for_read(&state.engine, domain, &hidden, &scope)?
             .attachments()
             .await?
             .into_iter()

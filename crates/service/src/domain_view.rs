@@ -1352,28 +1352,183 @@ impl<'a> DomainView<'a> {
         self.engine.load_engram(source, domain_id, path).await
     }
 
-    /// Every attachment this reader sees in the domain, metadata only.
-    ///
-    /// **The same rows every other reader sees, and that is the answer rather
-    /// than an omission.** The attachment table carries no actor dimension, so
-    /// one actor's view of a domain's attachments IS its base attachments; an
-    /// attachment is shared state and a reference to one is asked of the union.
-    /// The operation exists so a later attachment overlay has one seam to land
-    /// in rather than five call sites to find.
-    pub(crate) async fn attachments(&self) -> Result<Vec<AttachmentRow>> {
-        self.engine.attachment_list(&self.domain).await
+    /// The state directory this view's files overlay lives under, resolved
+    /// through the engine's one resolver so the `testing` refusal that guards
+    /// the journal root guards this root the same way.
+    fn files_state_dir(&self) -> Result<std::path::PathBuf> {
+        self.engine.journal_state_dir()
     }
 
-    /// One attachment's bytes and its metadata row, from the same substrate
-    /// [`DomainView::attachments`] lists.
+    /// An error from the files overlay, named by the path it was about.
+    ///
+    /// A failure here is a failure, unlike a journal mirror's: the journal is a
+    /// copy of a row that already landed, and this tree is the only place a
+    /// draft file's bytes exist at all.
+    fn files_io(&self, path: &str, source: std::io::Error) -> EngineError {
+        EngineError::Io {
+            path: format!("the files overlay of '{}' at '{path}'", self.domain),
+            source,
+        }
+    }
+
+    /// Every attachment this reader sees in the domain, metadata only on the
+    /// base rows.
+    ///
+    /// The base view answers the folder's own rows and nothing else. An actor
+    /// view answers what that actor sees: a path they have deleted is absent, a
+    /// path they have written stands with their own bytes described, and a file
+    /// only they hold is a row like any other. Ordered by path either way, so a
+    /// listing reads the same whoever asked.
+    ///
+    /// **An actor's own overlay files are read and hashed here**, where the
+    /// base listing is one query and no bytes. `N` is one actor's own draft
+    /// files rather than the domain's, which is what makes that affordable -
+    /// and it is what makes `sha256`, `size` and `modified` on an overlay row
+    /// mean exactly what they mean on a base row, so a client caching on the
+    /// checksum is not lied to about bytes only it can see.
+    pub(crate) async fn attachments(&self) -> Result<Vec<AttachmentRow>> {
+        let base = self.engine.attachment_list(&self.domain).await?;
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(base);
+        };
+        let held = self.files()?;
+        if held.is_empty() {
+            return Ok(base);
+        }
+        let state_dir = self.files_state_dir()?;
+        let hidden: BTreeSet<&str> = held.iter().map(|entry| entry.path.as_str()).collect();
+        let mut rows: Vec<AttachmentRow> = base
+            .into_iter()
+            .filter(|row| !hidden.contains(row.path.as_str()))
+            .collect();
+        for entry in held.iter().filter(|entry| !entry.tombstone) {
+            rows.push(self.overlay_attachment_row(&state_dir, actor, &entry.path)?);
+        }
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(rows)
+    }
+
+    /// The row describing one of this actor's own overlay files: the bytes it
+    /// holds and the file's own modification instant, through the same builder
+    /// the folder's rows are built with.
+    fn overlay_attachment_row(
+        &self,
+        state_dir: &Path,
+        actor: &str,
+        path: &str,
+    ) -> Result<AttachmentRow> {
+        let bytes = crate::overlay_files::read(state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?
+            .ok_or_else(|| {
+                EngineError::NotFound(crate::engine::missing_attachment(&self.domain, path))
+            })?;
+        let abs = crate::overlay_files::file(state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?;
+        crate::engine::attachment_row(path, &bytes, crate::engine::asset_modified(&abs))
+    }
+
+    /// One attachment's bytes and its metadata row, as this reader sees them.
+    ///
+    /// The three-way answer the whole files overlay is: this actor's own bytes
+    /// when they hold some, [`EngineError::NotFound`] when they hold a deletion
+    /// of the path, and the folder's own answer otherwise - row heal included,
+    /// since that arm is the base's unchanged.
     pub(crate) async fn attachment_bytes(&self, path: &str) -> Result<(Vec<u8>, AttachmentRow)> {
+        if let Some((bytes, row)) = self.own_attachment(path)? {
+            return Ok((bytes, row));
+        }
         self.engine.attachment_read(&self.domain, path).await
     }
 
     /// What deleting one attachment would take away, for a preview that must
     /// never be stricter than the act it previews.
+    ///
+    /// The same three-way answer [`DomainView::attachment_bytes`] gives, which
+    /// is what keeps that rule true in review mode: a draft-only file the
+    /// delete would remove has a size here rather than a miss, and a path this
+    /// actor has already deleted is a miss here rather than the folder's size.
     pub(crate) async fn attachment_delete_size(&self, path: &str) -> Result<u64> {
-        self.engine.attachment_delete_size(&self.domain, path).await
+        match self.own_held(path)? {
+            Some(crate::overlay_files::Held::Bytes) => {
+                let state_dir = self.files_state_dir()?;
+                let actor = self.actor.as_deref().unwrap_or_default();
+                Ok(self.overlay_attachment_row(&state_dir, actor, path)?.size)
+            }
+            Some(crate::overlay_files::Held::Tombstone) => Err(EngineError::NotFound(
+                crate::engine::missing_attachment(&self.domain, path),
+            )),
+            _ => self.engine.attachment_delete_size(&self.domain, path).await,
+        }
+    }
+
+    /// What this actor holds at `path` in the files overlay, or [`None`] on the
+    /// base view - which never reads the files overlay at all.
+    ///
+    /// The path is validated by the substrate on the way in, so an illegal one
+    /// is refused here exactly as [`crate::engine::validate_attachment_path`]
+    /// refuses it further down.
+    fn own_held(&self, path: &str) -> Result<Option<crate::overlay_files::Held>> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(None);
+        };
+        let state_dir = self.files_state_dir()?;
+        match crate::overlay_files::held(&state_dir, &self.domain, actor, path) {
+            Ok(held) => Ok(Some(held)),
+            // A path this substrate refuses is a path the attachment verbs
+            // refuse; letting it through to the base arm is what keeps the one
+            // refusal message the caller already knows.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                crate::engine::validate_attachment_path(path)?;
+                Err(self.files_io(path, e))
+            }
+            Err(e) => Err(self.files_io(path, e)),
+        }
+    }
+
+    /// This actor's own bytes and row at `path`: [`Some`] when they hold bytes,
+    /// `NotFound` when they hold a deletion, [`None`] when the folder answers.
+    fn own_attachment(&self, path: &str) -> Result<Option<(Vec<u8>, AttachmentRow)>> {
+        match self.own_held(path)? {
+            None | Some(crate::overlay_files::Held::Nothing) => Ok(None),
+            Some(crate::overlay_files::Held::Tombstone) => Err(EngineError::NotFound(
+                crate::engine::missing_attachment(&self.domain, path),
+            )),
+            Some(crate::overlay_files::Held::Bytes) => {
+                let state_dir = self.files_state_dir()?;
+                let actor = self.actor.as_deref().unwrap_or_default();
+                let row = self.overlay_attachment_row(&state_dir, actor, path)?;
+                let bytes = crate::overlay_files::read(&state_dir, &self.domain, actor, path)
+                    .map_err(|e| self.files_io(path, e))?
+                    .ok_or_else(|| {
+                        EngineError::NotFound(crate::engine::missing_attachment(&self.domain, path))
+                    })?;
+                Ok(Some((bytes, row)))
+            }
+        }
+    }
+
+    /// This actor's own files overlay entries, files and deletions alike,
+    /// ordered by path. Empty on the base view, which holds none by
+    /// definition.
+    ///
+    /// The seam the lifecycle reads: a share stages these over the base
+    /// snapshot, the fold applies them to the folder, the counts name them
+    /// beside the drafted rows.
+    pub(crate) fn files(&self) -> Result<Vec<crate::overlay_files::FileEntry>> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let state_dir = self.files_state_dir()?;
+        let read = crate::overlay_files::entries(&state_dir, &self.domain, actor);
+        if read.unreadable {
+            tracing::warn!(
+                domain = self.domain.as_str(),
+                actor = actor,
+                "part of this actor's files overlay could not be read; what it holds there is \
+                 listed short"
+            );
+        }
+        Ok(read.entries)
     }
 
     /// The addresses the folder would still answer to once the deletions in
