@@ -296,6 +296,48 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Whether a domain reviews changes before they land, and the per-actor
+        // answer that ends its drafts on the way out - the same entry point the
+        // JSON API calls. As the machine owner, for the reason the removal
+        // above states.
+        "domain_review" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let overlay = req.get("mode").and_then(Value::as_str) == Some("overlay");
+            let preview = req.get("preview").and_then(Value::as_bool).unwrap_or(false);
+            let confirm = if preview {
+                crate::engine::ReviewModeConfirm::Preview
+            } else {
+                crate::engine::ReviewModeConfirm::Confirmed {
+                    folds: req
+                        .get("folds")
+                        .and_then(Value::as_object)
+                        .map(|map| {
+                            map.iter()
+                                .map(|(actor, choice)| {
+                                    (
+                                        actor.clone(),
+                                        if choice.as_str() == Some("fold") {
+                                            crate::engine::FoldChoice::Fold
+                                        } else {
+                                            crate::engine::FoldChoice::Discard
+                                        },
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            };
+            let mode = overlay.then_some(crystalline_core::config::ReviewMode::Overlay);
+            match shared
+                .engine
+                .set_review_mode(domain, mode, confirm, &crate::scope::Scope::Unrestricted)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "origin_add" => {
             let repo = req.get("repo").and_then(Value::as_str).unwrap_or("");
             let domain = req.get("domain").and_then(Value::as_str);

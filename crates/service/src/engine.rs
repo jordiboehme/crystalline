@@ -12429,11 +12429,11 @@ impl Engine {
     /// 3. **Nothing unshared in the folder already.** Work already sitting in
     ///    the tree went round no review at all, and turning the mode on over it
     ///    would bless it silently. The refusal names the paths and says to share
-    ///    or revert them first. [`crate::origin::unshared_work`] answering
-    ///    `None` - no origin state recorded yet, or a tree that cannot be walked
-    ///    - is "nothing KNOWN to be unshared" rather than "clean", and it is
-    ///    read as permission: a domain connected but never pulled has no
-    ///    snapshot to compare against, and refusing every one of those would
+    ///    or revert them first. When [`crate::origin::unshared_work`] answers
+    ///    `None` (no origin state recorded yet, or a tree that cannot be
+    ///    walked) that is "nothing KNOWN to be unshared" rather than "clean",
+    ///    and it is read as permission: a domain connected but never pulled has
+    ///    no snapshot to compare against, and refusing every one of those would
     ///    make the mode unreachable exactly where it is wanted.
     ///
     /// **Taking it off** ends every actor's private drafts, so it is never
@@ -16780,9 +16780,21 @@ pub async fn open_standalone(
     // through so a domain registered mid-command persists to, and re-reads from,
     // the same file even when it came from `CRYSTALLINE_CONFIG`.
     let read_only = effective.read_only();
-    let engine = Engine::new(store, file, None, Some(path))
+    let mut engine = Engine::new(store, file, None, Some(path))
         .with_read_only(read_only)
         .with_env_overlay(overlay);
+    // The daemonless engine is told where this machine's state directory is,
+    // rather than leaving [`Engine::journal_state_dir`] to resolve it. Both
+    // halves matter. In production it is the same path either way, and saying
+    // it here is what keeps a one-shot `crystalline write` into a domain in
+    // review mode able to mirror the draft it just wrote. Under the test seam
+    // the resolver refuses instead of falling back, so without this line every
+    // draft a CLI test writes would fail - and with it, the path resolves
+    // inside whatever isolated `HOME` that test set, which is the same
+    // directory `crystalline reindex --wipe` already restores drafts from.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back

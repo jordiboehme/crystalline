@@ -953,6 +953,89 @@ pub fn print_domain_remove(name: &str, report: &serde_json::Value, json: bool) {
     }
 }
 
+/// The plan `domain review <domain> direct` prints before it sends an answer:
+/// every actor holding drafts, what each of them holds, and the two kinds of
+/// trouble a fold can run into.
+pub fn print_review_plan(plan: &serde_json::Value) {
+    let actors = plan["actors"].as_array().cloned().unwrap_or_default();
+    if actors.is_empty() {
+        println!("Nobody is drafting in this domain, so leaving review mode ends nothing.");
+        return;
+    }
+    println!("Leaving review mode ends every private draft in this domain:");
+    for row in &actors {
+        let actor = row["actor"].as_str().unwrap_or("?");
+        let entries = row["entries"].as_u64().unwrap_or(0);
+        println!("  {actor} ({entries} draft(s))");
+        for draft in row["drafts"].as_array().cloned().unwrap_or_default() {
+            let path = draft["path"].as_str().unwrap_or("?");
+            let what = if draft["tombstone"].as_bool().unwrap_or(false) {
+                "deleted"
+            } else {
+                "drafted"
+            };
+            println!("    {what} {path}");
+            if let Some(conflict) = draft["conflict"].as_str() {
+                println!("      cannot be folded: {conflict}");
+            }
+        }
+    }
+    for contested in plan["contested_paths"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let path = contested["path"].as_str().unwrap_or("?");
+        let who: Vec<&str> = contested["actors"]
+            .as_array()
+            .map(|rows| rows.iter().filter_map(|a| a.as_str()).collect())
+            .unwrap_or_default();
+        println!(
+            "  {path} is drafted by {}, so at most one of them can be folded.",
+            who.join(" and ")
+        );
+    }
+    println!(
+        "Answer with --fold <actor> (write their drafts into the folder) or \
+         --discard <actor> (end them), one for each actor above."
+    );
+}
+
+/// What `domain review` says once the mode is what was asked for.
+pub fn print_domain_review(report: &serde_json::Value, json: bool) {
+    if json {
+        println!("{report}");
+        return;
+    }
+    let domain = report["domain"].as_str().unwrap_or("?");
+    match report["review"].as_str() {
+        Some(_) => println!(
+            "Domain '{domain}' reviews changes before they land: every write now joins its \
+             author's own draft, and the folder changes through a reviewed proposal."
+        ),
+        None => println!("Domain '{domain}' takes changes directly again."),
+    }
+    for row in report["folded"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "  folded {}: {} file(s) written, {} deleted.",
+            row["actor"].as_str().unwrap_or("?"),
+            row["written"].as_u64().unwrap_or(0),
+            row["deleted"].as_u64().unwrap_or(0)
+        );
+    }
+    for row in report["discarded"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "  discarded {}: {} draft(s) ended.",
+            row["actor"].as_str().unwrap_or("?"),
+            row["entries"].as_u64().unwrap_or(0)
+        );
+    }
+    let rooms = report["rooms_closed"].as_u64().unwrap_or(0);
+    if rooms > 0 {
+        println!("{rooms} open co-editing session(s) were saved and closed.");
+    }
+}
+
 // --- domain list -------------------------------------------------------------
 
 /// The slice of a domain's index stats this listing prints: how many engrams

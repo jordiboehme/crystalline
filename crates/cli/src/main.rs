@@ -1113,6 +1113,34 @@ enum DomainCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Whether this domain reviews changes before they land. In review mode
+    /// (`overlay`) every write joins its author's own draft and the folder the
+    /// team shares changes only through a reviewed proposal; `direct` takes
+    /// changes into the folder straight away, which is how a domain starts out.
+    ///
+    /// Turning it on needs a GitHub origin, a folder and nothing unshared in
+    /// that folder already. Turning it off ends every private draft in the
+    /// domain, so it always prints the plan first and then needs one `--fold`
+    /// or `--discard` per actor the plan names.
+    Review {
+        /// The registered domain.
+        domain: String,
+        /// overlay: review every change before it lands. direct: take changes
+        /// into the folder straight away.
+        #[arg(value_enum)]
+        mode: ReviewModeArg,
+        /// Write this actor's drafts into the folder the team shares. Repeat
+        /// for each actor; only meaningful with `direct`.
+        #[arg(long, value_name = "ACTOR")]
+        fold: Vec<String>,
+        /// End this actor's drafts without touching the folder. Repeat for
+        /// each actor; only meaningful with `direct`.
+        #[arg(long, value_name = "ACTOR")]
+        discard: Vec<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Hand a private domain to a different account. The old owner keeps
     /// nothing: invite them back if they should stay. The machine operator
     /// administers every domain.
@@ -1155,6 +1183,18 @@ enum MembersCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+}
+
+/// The two modes `domain review` accepts. `direct` rather than `off` because
+/// that is what it names: the way a domain takes changes when nobody reviews
+/// them, which is how every domain starts out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReviewModeArg {
+    /// Every write joins its author's own draft; the folder changes only
+    /// through a reviewed proposal.
+    Overlay,
+    /// Every write lands in the folder straight away.
+    Direct,
 }
 
 /// The two visibilities `domain visibility` accepts. `default` rather than
@@ -3075,6 +3115,15 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             owner,
             config,
         } => on_runtime(move || members::visibility(domain, visibility, owner, config, json)),
+        DomainCommand::Review {
+            domain,
+            mode,
+            fold,
+            discard,
+            config,
+        } => on_runtime(move || {
+            domain_review_dispatch(domain, mode, fold, discard, config, db, json)
+        }),
         DomainCommand::Transfer {
             domain,
             new_owner,
@@ -3533,6 +3582,95 @@ async fn domain_add_origin_dispatch(
 /// branch is reachable with a daemon running (`--db` is a global flag), and a
 /// removal taken there edits the config the daemon is serving while that
 /// daemon goes on watching the root.
+/// `domain review <domain> overlay|direct [--fold A]... [--discard A]...`.
+///
+/// Leaving review mode ends somebody's unshared work, so the plan comes first
+/// and it comes every time: the verb asks for it, shows it, and only then
+/// decides whether it has an answer to send.
+///
+/// - **No `--fold` or `--discard` at all, and somebody is drafting**: the plan
+///   is the whole answer. Nothing is changed, and the last line says what to
+///   pass. That is what makes a bare run safe to type: the destructive half of
+///   this verb cannot be reached without naming the people it is about.
+/// - **No flags, and nobody is drafting**: there is nothing to decide, so the
+///   mode changes. A domain that was never in review mode is this case, and
+///   asking somebody to confirm an empty list would be asking them to confirm
+///   nothing.
+/// - **Any flag**: the answer goes as given, and the engine refuses it if it
+///   does not cover every actor the plan named.
+///
+/// Turning review ON carries no answers at all - a domain on its way in holds
+/// no drafts - so that direction skips the plan and makes the change.
+async fn domain_review_dispatch(
+    domain: String,
+    mode: ReviewModeArg,
+    fold: Vec<String>,
+    discard: Vec<String>,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let overlay = mode == ReviewModeArg::Overlay;
+    if overlay {
+        if !fold.is_empty() || !discard.is_empty() {
+            anyhow::bail!(
+                "--fold and --discard say what happens to each actor's private drafts, which is a \
+                 question about LEAVING review mode: a domain on its way in has none yet"
+            );
+        }
+        let report = crystalline_service::domain_review(
+            &domain,
+            true,
+            false,
+            &[],
+            db.as_deref(),
+            config.as_deref(),
+        )
+        .await?;
+        cmd::print_domain_review(&report, json);
+        return Ok(());
+    }
+
+    let plan = crystalline_service::domain_review(
+        &domain,
+        false,
+        true,
+        &[],
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    if !json {
+        cmd::print_review_plan(&plan);
+    }
+
+    let answers: Vec<(String, bool)> = fold
+        .into_iter()
+        .map(|actor| (actor, true))
+        .chain(discard.into_iter().map(|actor| (actor, false)))
+        .collect();
+    let drafting = plan["actors"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty());
+    if answers.is_empty() && drafting {
+        if json {
+            print_value(&plan, true);
+        }
+        return Ok(());
+    }
+    let report = crystalline_service::domain_review(
+        &domain,
+        false,
+        false,
+        &answers,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    cmd::print_domain_review(&report, json);
+    Ok(())
+}
+
 async fn domain_remove_dispatch(
     name: String,
     purge: bool,

@@ -1010,6 +1010,78 @@ pub async fn domain_remove(
     Ok(report)
 }
 
+/// Turn review mode on for a domain, or take it off and settle every actor's
+/// drafts: over the daemon when one owns the index, else against a directly
+/// opened store.
+///
+/// The same shape [`domain_remove`] has, and for the same reasons: the CLI is
+/// the machine owner, so it passes [`Scope::Unrestricted`] and the gate resolves
+/// to `Own` on every domain - whoever can run this already holds the files. It
+/// opens the index because the verb reads every actor's drafts out of it and
+/// writes the folds back through a sync, and because a shared database's rows
+/// are every instance's: a config-only edit here would leave the domain
+/// reviewing for everybody else while this machine stopped.
+///
+/// `folds` carries the per-actor answers when there are any; an empty slice
+/// with `preview` false is the answer for a domain nobody is drafting in.
+/// `preview` asks for the plan and writes nothing.
+pub async fn domain_review(
+    name: &str,
+    overlay_mode: bool,
+    preview: bool,
+    folds: &[(String, bool)],
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    let folds_json: Value = folds
+        .iter()
+        .map(|(actor, fold)| {
+            (
+                actor.clone(),
+                Value::from(if *fold { "fold" } else { "discard" }),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>()
+        .into();
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "domain_review", "domain": name,
+            "mode": if overlay_mode { "overlay" } else { "direct" },
+            "preview": preview, "folds": folds_json,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let mode = overlay_mode.then_some(crystalline_core::config::ReviewMode::Overlay);
+    let confirm = if preview {
+        crate::engine::ReviewModeConfirm::Preview
+    } else {
+        crate::engine::ReviewModeConfirm::Confirmed {
+            folds: folds
+                .iter()
+                .map(|(actor, fold)| {
+                    (
+                        actor.clone(),
+                        if *fold {
+                            crate::engine::FoldChoice::Fold
+                        } else {
+                            crate::engine::FoldChoice::Discard
+                        },
+                    )
+                })
+                .collect(),
+        }
+    };
+    Ok(engine
+        .set_review_mode(name, mode, confirm, &Scope::Unrestricted)
+        .await?)
+}
+
 /// Connect a new domain to a GitHub repository: over the daemon when one owns
 /// the index, else against a directly opened store. `want_embeddings` is
 /// `false` in the standalone fallback, matching `domain_import` and
