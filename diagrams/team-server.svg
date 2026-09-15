@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 470" width="720" height="470" role="img" aria-labelledby="team-title team-desc">
+  <title id="team-title">One shared instance for a team</title>
+  <desc id="team-desc">A large rounded panel in the middle labelled one shared instance, the daemon on the team's server, holding the MCP server, which every agent authenticates against, Fluid, which carries accounts, roles and single sign-on, and below them the search index. The panel stands on a base labelled plain markdown files, the source of truth. On the left, agents connect over MCP with a token and people connect in a browser, signed in; both paths pass through a dashed box marked proxy, TLS, where configured. On the right, a dashed box marked identity provider, single sign-on where configured, is joined to Fluid by a double-headed arrow labelled sign in.</desc>
+
+  <!-- TODO-0.18.0: the labels assert that every agent authenticates with a token and that an identity provider signs people in | source: plans/2026-08-31-sso-private-domains-spec.md sections 2 and 6; plans/2026-09-01-identity-program-plan.md resolved decision 1 -->
+
+  <defs>
+    <marker id="crys-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6c5eb5"/>
+    </marker>
+  </defs>
+
+  <!-- Panel -->
+  <rect x="0.5" y="0.5" width="719" height="469" rx="12" ry="12"
+        fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+
+  <g font-family="Avenir Next, Segoe UI, system-ui, sans-serif"
+     stroke-linejoin="round" stroke-linecap="round">
+
+    <!-- The shared instance: one daemon on the team's server -->
+    <g>
+      <rect x="272" y="40" width="300" height="330" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="422" y="70" text-anchor="middle" font-size="16" font-weight="600" fill="#352879">ONE SHARED INSTANCE</text>
+      <text x="422" y="90" text-anchor="middle" font-size="14" fill="#57606a">the daemon, on the team's server</text>
+    </g>
+
+    <!-- Surfaces inside the instance -->
+    <g>
+      <rect x="292" y="112" width="260" height="60" rx="8" ry="8"
+            fill="#6c5eb5" fill-opacity="0.12" stroke="#6c5eb5" stroke-width="1.5"/>
+      <text x="422" y="138" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">MCP server</text>
+      <text x="422" y="157" text-anchor="middle" font-size="12" fill="#57606a">every agent authenticates, with a token</text>
+
+      <rect x="292" y="196" width="260" height="60" rx="8" ry="8"
+            fill="#70a4b2" fill-opacity="0.12" stroke="#70a4b2" stroke-width="1.5"/>
+      <text x="422" y="222" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">Fluid</text>
+      <text x="422" y="241" text-anchor="middle" font-size="12" fill="#57606a">accounts, roles, single sign-on</text>
+
+      <rect x="292" y="280" width="260" height="60" rx="8" ry="8"
+            fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+      <text x="422" y="306" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">search index</text>
+      <text x="422" y="325" text-anchor="middle" font-size="12" fill="#57606a">derived, disposable, one for the whole team</text>
+    </g>
+
+    <!-- Index and files: derived both ways -->
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-start="url(#crys-arrow)" marker-end="url(#crys-arrow)">
+      <path d="M 422 341 L 422 395"/>
+    </g>
+    <text x="440" y="362" font-size="12" fill="#57606a">watches, reads, writes</text>
+
+    <!-- Base: the source of truth -->
+    <g>
+      <rect x="272" y="396" width="300" height="56" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="422" y="420" text-anchor="middle" font-size="14" font-weight="600" fill="#352879">plain markdown files</text>
+      <text x="422" y="439" text-anchor="middle" font-size="12" fill="#57606a">the source of truth, on the server's disk</text>
+    </g>
+
+    <!-- Who connects, and how -->
+    <g>
+      <rect x="24" y="112" width="120" height="60" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="84" y="138" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">agents</text>
+      <text x="84" y="157" text-anchor="middle" font-size="12" fill="#57606a">MCP, with a token</text>
+
+      <rect x="24" y="196" width="120" height="60" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="84" y="222" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">people</text>
+      <text x="84" y="241" text-anchor="middle" font-size="12" fill="#57606a">browser, signed in</text>
+    </g>
+
+    <!-- The proxy in front, where configured: both paths pass through it -->
+    <g>
+      <rect x="176" y="96" width="64" height="176" rx="8" ry="8"
+            fill="#ffffff" stroke="#57606a" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="208" y="118" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">proxy</text>
+      <text x="208" y="262" text-anchor="middle" font-size="12" fill="#57606a">TLS</text>
+    </g>
+    <text x="208" y="290" text-anchor="middle" font-size="12" fill="#57606a">where configured</text>
+
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 144 142 L 292 142"/>
+      <path d="M 144 226 L 292 226"/>
+    </g>
+
+    <!-- The identity provider, where single sign-on is configured -->
+    <g>
+      <rect x="600" y="196" width="96" height="60" rx="8" ry="8"
+            fill="#ffffff" stroke="#57606a" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <text x="648" y="218" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">identity</text>
+      <text x="648" y="234" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">provider</text>
+      <text x="648" y="250" text-anchor="middle" font-size="12" fill="#57606a">single sign-on</text>
+    </g>
+    <text x="648" y="274" text-anchor="middle" font-size="12" fill="#57606a">where configured</text>
+
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-start="url(#crys-arrow)" marker-end="url(#crys-arrow)">
+      <path d="M 552 226 L 600 226"/>
+    </g>
+    <text x="576" y="188" text-anchor="middle" font-size="12" fill="#57606a">sign in</text>
+  </g>
+</svg>
