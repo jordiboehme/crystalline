@@ -133,6 +133,41 @@ async fn attach_tags(conn: &Connection, hits: &mut [(i64, SearchHit)]) -> Result
     Ok(())
 }
 
+/// The actor screen every candidate leg opens its `WHERE` with: which rows of
+/// the `engram` table this search is entitled to see.
+///
+/// `None` emits the base predicate verbatim, so a search that names no actor is
+/// byte-for-byte the statement that was there before the actor dimension
+/// existed. `Some(actor)` emits the shadowing form, which is two legs:
+///
+/// * that actor's own drafts, tombstones excluded - a draft deletion is a row
+///   saying an engram is gone, never an engram to answer with, and it carries
+///   the base row's own text, so a leg that forgot to exclude it would match
+///   every query the deleted engram matched;
+/// * plus every base row that actor holds no row of their own at, which is the
+///   anti-join. It correlates on `(domain_id, path, actor)` alone - the columns
+///   of `idx_engram_path_actor`, so each probe is an index seek and no body is
+///   read - and it deliberately does NOT exclude tombstones. A tombstone is
+///   exactly what takes its base row away; skipping them here would answer a
+///   deletion with the deleted engram showing through from the base.
+///
+/// Path is the correlation key rather than permalink because a tombstone's
+/// permalink is its own path, so a permalink anti-join would shadow nothing it
+/// was written to shadow.
+fn actor_screen(actor: Option<&str>, params: &mut Vec<Value>, n: &mut usize) -> String {
+    let Some(actor) = actor else {
+        return "e.actor = ''".to_string();
+    };
+    let ph = *n;
+    params.push(Value::Text(actor.to_string()));
+    *n += 1;
+    format!(
+        "e.tombstone = 0 AND (e.actor = ?{ph} OR (e.actor = '' AND NOT EXISTS (\
+         SELECT 1 FROM engram o WHERE o.domain_id = e.domain_id AND o.path = e.path \
+         AND o.actor = ?{ph})))"
+    )
+}
+
 /// The lexical modes: Text, Title and Permalink. A LIKE-candidate prefilter in
 /// SQL, ranked in Rust by a weighted term-frequency score.
 async fn run_lexical(
@@ -153,15 +188,15 @@ async fn run_lexical(
         build_scalar_filters(query, &mut clauses, &mut params, &mut n, aliases);
         // The reader-chosen filters, as a trailing conjunction rather than a
         // `WHERE` of their own: every statement below opens its own `WHERE` with
-        // the base predicate, so a search answers out of the domain's files and
-        // never out of somebody's draft. Threading the actor through here is Task
-        // 5's job; until then the base is the only dimension a search reads.
+        // the actor screen, so a search answers out of the domain's files plus
+        // the asking actor's own drafts and never out of anybody else's.
         let and_filters = if clauses.is_empty() {
             String::new()
         } else {
             format!("AND {}", clauses.join(" AND "))
         };
-        return filter_only(conn, &and_filters, params, limit, page).await;
+        let actor_screen = actor_screen(query.actor.as_deref(), &mut params, &mut n);
+        return filter_only(conn, &actor_screen, &and_filters, params, limit, page).await;
     }
 
     let mut scored = scored_lexical(conn, query, &terms, aliases, candidate_cap).await?;
@@ -223,9 +258,8 @@ async fn scored_lexical(
 
     // The reader-chosen filters, as a trailing conjunction rather than a
     // `WHERE` of their own: every statement below opens its own `WHERE` with
-    // the base predicate, so a search answers out of the domain's files and
-    // never out of somebody's draft. Threading the actor through here is Task
-    // 5's job; until then the base is the only dimension a search reads.
+    // the actor screen, so a search answers out of the domain's files plus the
+    // asking actor's own drafts and never out of anybody else's.
     let and_filters = if clauses.is_empty() {
         String::new()
     } else {
@@ -241,9 +275,10 @@ async fn scored_lexical(
     // properties are pinned by `EXPLAIN QUERY PLAN` and a source scan in
     // `tests/turso_only.rs`. Keep the bound and keep the order: any other
     // ordering here, or a `GROUP BY`, would spill every matched body to disk.
+    let actor_screen = actor_screen(query.actor.as_deref(), &mut params, &mut n);
     let sql = format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE e.actor = '' {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
+         WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
     );
     let rows = query_all(conn, &sql, params).await?;
 
@@ -271,6 +306,7 @@ async fn scored_lexical(
 
 async fn filter_only(
     conn: &Connection,
+    actor_screen: &str,
     and_filters: &str,
     params: Vec<Value>,
     limit: usize,
@@ -280,7 +316,7 @@ async fn filter_only(
         conn,
         &format!(
             "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' {and_filters}"
+             WHERE {actor_screen} {and_filters}"
         ),
         params.clone(),
     )
@@ -294,7 +330,7 @@ async fn filter_only(
     // whole match set. Adding a `GROUP BY` here would remove that bound.
     let sql = format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE e.actor = '' {and_filters} \
+         WHERE {actor_screen} {and_filters} \
          ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
     );
     let rows = query_all(conn, &sql, params).await?;
@@ -541,11 +577,11 @@ const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_ty
 /// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
 /// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins)
 /// and costs nothing: it is the grouping key, already in the sorter record.
-fn semantic_phase1_sql(and_filters: &str) -> String {
+fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
     format!(
         "SELECT c.engram_id, min(vector_distance_cos(c.embedding, ?1)) AS dist \
          FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
-         WHERE e.actor = '' {and_filters} \
+         WHERE {actor_screen} {and_filters} \
          GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC LIMIT {SEMANTIC_TOPK}"
     )
 }
@@ -554,10 +590,10 @@ fn semantic_phase1_sql(and_filters: &str) -> String {
 /// by primary key. No `ORDER BY` and no `GROUP BY`, so the wide columns never
 /// reach a sorter; the phase-1 order is reapplied in Rust. The id list is
 /// interpolated because every id is an `i64` read out of this same database.
-fn semantic_hydrate_sql(ids: &str) -> String {
+fn semantic_hydrate_sql(actor_screen: &str, ids: &str) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE e.actor = '' AND e.id IN ({ids})"
+         WHERE {actor_screen} AND e.id IN ({ids})"
     )
 }
 
@@ -589,12 +625,21 @@ async fn semantic_candidates(
     n += 1;
     let dims_ph = n;
     params.push(Value::Integer(dims as i64));
+    // The counter goes on past the last placeholder this block wrote, because
+    // the actor screen below takes the next one.
+    n += 1;
     clauses.push(format!(
         "c.embedding IS NOT NULL AND c.model = ?{model_ph} AND c.dims = ?{dims_ph}"
     ));
 
     let and_filters = format!("AND {}", clauses.join(" AND "));
-    let rows = query_all(conn, &semantic_phase1_sql(&and_filters), params).await?;
+    let phase1_screen = actor_screen(query.actor.as_deref(), &mut params, &mut n);
+    let rows = query_all(
+        conn,
+        &semantic_phase1_sql(&phase1_screen, &and_filters),
+        params,
+    )
+    .await?;
     let winners: Vec<(i64, f64)> = rows
         .iter()
         .map(|r| (cell_i64(r, 0).unwrap_or(0), cell_real(r, 1).unwrap_or(1.0)))
@@ -609,7 +654,18 @@ async fn semantic_candidates(
         .map(|(id, _)| id.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let rows = query_all(conn, &semantic_hydrate_sql(&ids), vec![]).await?;
+    // The hydrate carries the screen too, rather than trusting phase 1 to have
+    // applied it: the two statements are edited apart from each other, and a
+    // wide projection is the one place a leak would carry the whole document.
+    let mut hydrate_params: Vec<Value> = Vec::new();
+    let mut hn = 1usize;
+    let hydrate_screen = actor_screen(query.actor.as_deref(), &mut hydrate_params, &mut hn);
+    let rows = query_all(
+        conn,
+        &semantic_hydrate_sql(&hydrate_screen, &ids),
+        hydrate_params,
+    )
+    .await?;
     // Consume the rows by value so each engram body is moved into its candidate
     // rather than copied beside it, the same discipline `scored_lexical` uses.
     let mut by_id: std::collections::HashMap<i64, Candidate> =
@@ -1345,9 +1401,11 @@ mod tests {
         &rest[..end]
     }
 
-    /// A representative filtered WHERE clause, shaped like the one
-    /// `build_scalar_filters` produces for a domain-scoped semantic query.
-    const WHERE_SQL: &str = "WHERE d.name IN (?2) AND c.embedding IS NOT NULL \
+    /// A representative trailing conjunction, shaped like the one
+    /// `build_scalar_filters` produces for a domain-scoped semantic query: the
+    /// statement opens its own `WHERE` with the actor screen and these ride
+    /// behind it.
+    const WHERE_SQL: &str = "AND d.name IN (?2) AND c.embedding IS NOT NULL \
                              AND c.model = ?3 AND c.dims = ?4";
 
     /// The regression guard for the 2026-07-28 spill: phase 1 runs the grouping
@@ -1357,7 +1415,7 @@ mod tests {
     /// the aggregate may appear.
     #[test]
     fn the_semantic_phase_one_projection_carries_no_engram_columns() {
-        let sql = semantic_phase1_sql(WHERE_SQL);
+        let sql = semantic_phase1_sql("e.actor = ''", WHERE_SQL);
         let projection = projection_of(&sql);
         assert_eq!(
             projection, "c.engram_id, min(vector_distance_cos(c.embedding, ?1)) AS dist",
@@ -1380,7 +1438,7 @@ mod tests {
     /// grouping and no ordering, so nothing it projects can reach a sorter.
     #[test]
     fn the_semantic_hydrate_never_sorts() {
-        let sql = semantic_hydrate_sql("1,2,3");
+        let sql = semantic_hydrate_sql("e.actor = ''", "1,2,3");
         assert!(
             !sql.contains("ORDER BY"),
             "no ordering in the hydrate: {sql}"
@@ -1416,7 +1474,7 @@ mod tests {
 
         let and_filters = "AND c.embedding IS NOT NULL AND c.model = ?2 AND c.dims = ?3";
         let phase1 = store
-            .explain_query_plan(&semantic_phase1_sql(and_filters))
+            .explain_query_plan(&semantic_phase1_sql("e.actor = ''", and_filters))
             .await
             .unwrap()
             .join(" | ");
@@ -1431,7 +1489,7 @@ mod tests {
         // narrowness is the invariant, not the sorter count.
 
         let hydrate = store
-            .explain_query_plan(&semantic_hydrate_sql("1,2,3"))
+            .explain_query_plan(&semantic_hydrate_sql("e.actor = ''", "1,2,3"))
             .await
             .unwrap()
             .join(" | ");

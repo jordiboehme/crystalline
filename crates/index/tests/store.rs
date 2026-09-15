@@ -5524,6 +5524,336 @@ async fn a_tombstone_is_a_row(store: &dyn Store) {
 }
 parity!(a_tombstone_is_an_overlay_row_too, a_tombstone_is_a_row);
 
+/// A draft of `path`, parsed from markdown the way a write verb parses what it
+/// was handed, so a draft row carries the observations, tags and chunks-worth
+/// of text a base row carries.
+async fn draft(
+    store: &dyn Store,
+    domain: DomainId,
+    actor: &str,
+    path: &str,
+    markdown: &str,
+) -> EngramId {
+    let parsed = crystalline_core::parse_engram(markdown).unwrap();
+    let record = EngramRecord::from_engram(
+        &parsed,
+        path,
+        FileStamp {
+            mtime: 0,
+            size: markdown.len() as u64,
+            sha256: format!("{actor}-{path}"),
+        },
+    );
+    store.upsert_overlay(domain, actor, &record).await.unwrap()
+}
+
+/// The `(permalink, title)` of every hit, sorted, which is what an assertion
+/// about who sees which row is actually about.
+fn rows(page: &crystalline_index::Page<crystalline_index::SearchHit>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = page
+        .items
+        .iter()
+        .map(|h| (h.permalink.clone(), h.title.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A search names whose rows it wants, and gets the base rows plus that actor's
+/// own drafts, with a draft standing in for the base row it replaces.
+///
+/// Three claims, and all three are the actor predicate rather than anything
+/// downstream. A draft at a path no file holds is a hit of its own. A draft
+/// over a base row is the hit, once, with the draft's own title - one engram,
+/// one answer. And another actor's draft is nowhere in it: bob's rewrite of
+/// the field notes never reaches alice, and neither reaches a search that names
+/// no actor at all, which is what every unauthenticated reader and every
+/// pre-overlay caller gets.
+///
+/// The lexical, filter-only and semantic legs each ask through a different
+/// candidate query, so all three are asserted: a predicate that landed on one
+/// of them would leak through the other two.
+async fn search_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates the rollout #t\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram(
+            "Field notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook stays open #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates nothing any more #t\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- [idea] an audit of the audit itself #t\n",
+        ),
+    )
+    .await;
+    let bob_notes = draft(
+        store,
+        domain,
+        "bob",
+        "notes.md",
+        &engram(
+            "Bob's notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook, bob's own copy #t\n",
+        ),
+    )
+    .await;
+
+    let base = vec![
+        ("notes".to_string(), "Field notes".to_string()),
+        ("plan".to_string(), "Rollout plan".to_string()),
+    ];
+    let alices = vec![
+        ("fresh".to_string(), "Fresh idea".to_string()),
+        ("notes".to_string(), "Field notes".to_string()),
+        ("plan".to_string(), "Rollout plan, revised".to_string()),
+    ];
+    let bobs = vec![
+        ("notes".to_string(), "Bob's notes".to_string()),
+        ("plan".to_string(), "Rollout plan".to_string()),
+    ];
+
+    // The lexical leg.
+    let lexical = |actor: Option<&str>| SearchQuery {
+        text: Some("audit".to_string()),
+        actor: actor.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        // An actor holding nothing sees exactly what the files say, which is
+        // also the answer for every account that never drafted here.
+        (Some("carol"), &base),
+    ] {
+        let page = store.search(&lexical(actor)).await.unwrap();
+        assert_eq!(rows(&page), *want, "the lexical leg, as {actor:?}");
+        assert_eq!(page.total, want.len(), "and its total, as {actor:?}");
+    }
+
+    // The filter-only leg: no text at all, so a different statement answers.
+    let filtered = |actor: Option<&str>| SearchQuery {
+        engram_type: Some("engram".to_string()),
+        actor: actor.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        (Some("carol"), &base),
+    ] {
+        let page = store.search(&filtered(actor)).await.unwrap();
+        assert_eq!(rows(&page), *want, "the filter-only leg, as {actor:?}");
+        assert_eq!(page.total, want.len(), "and its total, as {actor:?}");
+    }
+
+    // The semantic leg. A draft's chunks are written exactly as a base row's,
+    // keyed to the draft's own id, so the vector scan reaches them and the
+    // predicate is the only thing deciding whose rows come back.
+    for (id, text) in [
+        (alice_plan, "the audit gates nothing any more"),
+        (alice_fresh, "an audit of the audit itself"),
+        (bob_notes, "the audit notebook, bob's own copy"),
+    ] {
+        store
+            .replace_chunks(
+                id,
+                &[NewChunk {
+                    seq: 0,
+                    text: text.to_string(),
+                    text_hash: format!("hash-{}", id.0),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let embedded: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&embedded, "m8").await.unwrap();
+
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        (Some("carol"), &base),
+    ] {
+        let page = store
+            .search(&SearchQuery {
+                actor: actor.map(str::to_string),
+                limit: 50,
+                ..semantic_query("audit", 8, "m8")
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&page), *want, "the semantic leg, as {actor:?}");
+    }
+}
+parity!(
+    search_serves_base_plus_own_overlay_with_shadowing,
+    search_across_the_actor_dimension
+);
+
+/// A path its author has deleted is absent from that author's own search and
+/// present in everybody else's.
+///
+/// A tombstone is a full row carrying the base row's text, so it would match
+/// the same query the base row matches; a candidate leg that forgot to exclude
+/// it would answer a deletion with the deleted engram. And it has to shadow the
+/// base row while doing so, which is the half a `tombstone = 0` in the wrong
+/// place gets backwards: filter tombstones inside the anti-join and the
+/// deletion becomes invisible, with the base row showing through as though
+/// nobody had deleted anything.
+async fn a_tombstoned_path_leaves_its_authors_search(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Ledger",
+            "a",
+            "engram",
+            "",
+            "- [fact] the ledger reconciles nightly #t\n",
+        ),
+    );
+    write(
+        root,
+        "b.md",
+        &engram(
+            "Ledger appendix",
+            "b",
+            "engram",
+            "",
+            "- [fact] the ledger appendix lists the exceptions #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    // The tombstone the engine writes: the base row's own text, its path as its
+    // permalink, and the flag. The text is what makes this sharp - it matches
+    // the query as well as the base row does.
+    let mut stone = record(
+        "a.md",
+        "a.md",
+        "- [fact] the ledger reconciles nightly #t\n",
+        "alice-a",
+    );
+    stone.title = "Ledger".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let both = vec![
+        ("a".to_string(), "Ledger".to_string()),
+        ("b".to_string(), "Ledger appendix".to_string()),
+    ];
+    let without_a = vec![("b".to_string(), "Ledger appendix".to_string())];
+
+    for (actor, want) in [
+        (None, &both),
+        (Some("alice"), &without_a),
+        (Some("bob"), &both),
+    ] {
+        let lexical = store
+            .search(&SearchQuery {
+                text: Some("ledger".to_string()),
+                actor: actor.map(str::to_string),
+                limit: 50,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&lexical), *want, "the lexical leg, as {actor:?}");
+        assert_eq!(lexical.total, want.len(), "and its total, as {actor:?}");
+
+        let filtered = store
+            .search(&SearchQuery {
+                engram_type: Some("engram".to_string()),
+                actor: actor.map(str::to_string),
+                limit: 50,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&filtered), *want, "the filter-only leg, as {actor:?}");
+        assert_eq!(filtered.total, want.len(), "and its total, as {actor:?}");
+    }
+}
+parity!(
+    a_tombstoned_path_is_absent_for_its_author_and_present_for_base,
+    a_tombstoned_path_leaves_its_authors_search
+);
+
 /// Every statement that reads the `engram` table says which actor's rows it
 /// means, or says in as many words that it means all of them.
 ///
@@ -5571,6 +5901,14 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         // An insert says whose row it writes through the conflict target it
         // names, which is the actor-aware unique index.
         "ON CONFLICT(domain_id, path, actor)",
+        // A search candidate leg names its rows through the composed screen
+        // each backend's `actor_screen` builds: the base predicate verbatim
+        // when the search names no actor, and the shadowing form - this
+        // actor's own drafts minus tombstones, plus every base row they hold
+        // no row at - when it names one. The screen's own source is a site in
+        // this census too, and it is the one that carries the bound `actor =`
+        // spellings for both dialects.
+        "{actor_screen}",
     ];
     const WAIVER: &str = "-- actor: all";
     // How far around a statement its predicate or waiver may sit. A statement
@@ -5619,10 +5957,12 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         }
     }
     assert_eq!(
-        sites, 132,
+        sites, 134,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         54 per backend in mod.rs, 10 per backend in search.rs, 4 in the shared \
-         reference-resolution expression"
+         54 per backend in mod.rs, 11 per backend in search.rs, 4 in the shared \
+         reference-resolution expression. The eleventh per backend is the \
+         anti-join inside `actor_screen`, which asks whether the reader holds a \
+         row of their own at a base row's path"
     );
     assert_eq!(
         waived, 14,

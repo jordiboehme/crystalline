@@ -504,6 +504,22 @@ pub struct SearchQuery {
     /// domain. The value is a literal path, so `%` and `_` in a folder name are
     /// escaped rather than matched as wildcards.
     pub path_prefix: Option<String>,
+    /// Whose rows to search: `None` is the base dimension alone - the rows the
+    /// domains' files on disk say exist - and `Some(actor)` is that actor's own
+    /// drafts folded in over it.
+    ///
+    /// The fold is a shadowing one, so an engram is one answer however many
+    /// rows carry it. A draft at a path no file holds is a hit of its own; a
+    /// draft over a base row replaces it; a draft deletion (a tombstone) takes
+    /// the base row away and is never a hit itself. Nobody else's drafts are
+    /// ever in range: the value is one actor key, and the predicate reads it
+    /// literally.
+    ///
+    /// `None` is what every unauthenticated reader and every caller on a domain
+    /// that reviews nothing gets, and the backends emit the base predicate
+    /// verbatim for it, so a search that names no actor is the search that was
+    /// there before this dimension existed.
+    pub actor: Option<String>,
     /// Page size.
     pub limit: usize,
     /// One-based page number.
