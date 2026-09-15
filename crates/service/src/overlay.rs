@@ -24,13 +24,19 @@
 //! registers a file domain rooted at a path, and an optional
 //! `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN=owner/repo[/subpath][@branch]` attaches a
 //! GitHub origin to it so a headless node bootstraps the team domain itself on
-//! first contact. These domains are merged into the effective config last (env
-//! wins over a file entry of the same name) and are never written back to the
-//! file. Two grammar consequences follow from the `_ORIGIN` suffix rule and
-//! are load-bearing: a domain whose env fragment would end in `_ORIGIN` cannot
-//! be env-defined (that spelling is always read as an origin attachment), and
-//! a file domain whose name contains an underscore cannot be env-shadowed
-//! (env names map `_` to `-`, so they never collide with an underscore name).
+//! first contact. `CRYSTALLINE_DOMAIN_<NAME>_REVIEW=overlay` puts that domain
+//! in review mode, so every write on the node joins its author's own draft and
+//! the folder goes on saying what the team reviewed. These domains are merged
+//! into the effective config last (env wins over a file entry of the same name)
+//! and are never written back to the file. Three grammar consequences follow
+//! from the two suffix rules and are load-bearing: a domain whose env fragment
+//! would end in `_ORIGIN` cannot be env-defined (that spelling is always read
+//! as an origin attachment), a domain whose env fragment would end in `_REVIEW`
+//! cannot be env-defined either (so there is no env-defined domain named
+//! `code-review`, because `CRYSTALLINE_DOMAIN_CODE_REVIEW` is review mode for a
+//! domain named `code`), and a file domain whose name contains an underscore
+//! cannot be env-shadowed (env names map `_` to `-`, so they never collide with
+//! an underscore name).
 //!
 //! `CRYSTALLINE_GITHUB_TOKEN` carries a GitHub token for a headless node: see
 //! [`GITHUB_TOKEN_ENV`] and [`EnvOverlay::github_token`]. It is never applied
@@ -43,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
-use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
+use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig, ReviewMode};
 
 use crate::origin;
 use crate::settings;
@@ -62,6 +68,16 @@ pub const DOMAIN_ENV_PREFIX: &str = "CRYSTALLINE_DOMAIN_";
 /// The suffix on the variable that attaches an origin to an env-defined
 /// domain: `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN`.
 const DOMAIN_ORIGIN_SUFFIX: &str = "_ORIGIN";
+
+/// The suffix on the variable that puts an env-defined domain in review mode:
+/// `CRYSTALLINE_DOMAIN_<NAME>_REVIEW`. Read exactly the way
+/// [`DOMAIN_ORIGIN_SUFFIX`] is, and it narrows the grammar the same way: a
+/// domain whose fragment would end in `_REVIEW` cannot be env-defined.
+const DOMAIN_REVIEW_SUFFIX: &str = "_REVIEW";
+
+/// The one value [`DOMAIN_REVIEW_SUFFIX`] takes, the env spelling of
+/// [`crystalline_core::config::ReviewMode::Overlay`].
+const REVIEW_OVERLAY_VALUE: &str = "overlay";
 
 /// The variable carrying a GitHub token for a headless node:
 /// `CRYSTALLINE_GITHUB_TOKEN`. Checked before the keyring and the file store
@@ -203,9 +219,14 @@ impl EnvOverlay {
     /// `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN=owner/repo[/subpath][@branch]`
     /// attaches a GitHub origin to the `<NAME>` domain: every variable ending
     /// in `_ORIGIN` is read as an origin attachment, and one whose base
-    /// `CRYSTALLINE_DOMAIN_<NAME>` is not itself defined is fatal. All
-    /// `CRYSTALLINE_DOMAIN_*` variables are collected first, so an origin may
-    /// appear before its base domain in the iterator without failing.
+    /// `CRYSTALLINE_DOMAIN_<NAME>` is not itself defined is fatal.
+    /// `CRYSTALLINE_DOMAIN_<NAME>_REVIEW=overlay` puts the `<NAME>` domain in
+    /// review mode and is read the same way, with the same orphan rule; any
+    /// other value is fatal naming the variable, since a value nobody
+    /// recognizes read as "off" would be a node quietly not reviewing anything.
+    /// All `CRYSTALLINE_DOMAIN_*` variables are collected first, so an origin
+    /// or a review attachment may appear before its base domain in the iterator
+    /// without failing.
     ///
     /// [`GITHUB_TOKEN_ENV`], when present and non-empty, is captured as
     /// [`EnvOverlay::github_token`]; an empty value reads as unset, the same
@@ -225,6 +246,7 @@ impl EnvOverlay {
         // regardless of the order the two variables arrive in.
         let mut domain_vars: Vec<(String, String)> = Vec::new();
         let mut origin_vars: Vec<(String, String)> = Vec::new();
+        let mut review_vars: Vec<(String, String)> = Vec::new();
 
         for (name, value) in vars {
             // A plain, non-Crystalline variable is not ours to reason about.
@@ -256,15 +278,21 @@ impl EnvOverlay {
                 continue;
             }
             if let Some(fragment) = name.strip_prefix(DOMAIN_ENV_PREFIX) {
-                // Every `_ORIGIN`-suffixed name is an origin attachment; every
-                // other is a domain definition. Both are resolved below. An
-                // empty `_ORIGIN` value reads as "no attachment", matching the
-                // empty-is-unset convention of every other variable (an empty
-                // domain PATH stays an error: the base variable declares a
-                // domain, so it has to say where the domain lives).
+                // Every `_ORIGIN`-suffixed name is an origin attachment and
+                // every `_REVIEW`-suffixed one is a review-mode attachment;
+                // every other is a domain definition. All three are resolved
+                // below. An empty attachment value reads as "no attachment",
+                // matching the empty-is-unset convention of every other
+                // variable (an empty domain PATH stays an error: the base
+                // variable declares a domain, so it has to say where the domain
+                // lives).
                 if fragment.ends_with(DOMAIN_ORIGIN_SUFFIX) {
                     if !value.is_empty() {
                         origin_vars.push((name, value));
+                    }
+                } else if fragment.ends_with(DOMAIN_REVIEW_SUFFIX) {
+                    if !value.is_empty() {
+                        review_vars.push((name, value));
                     }
                 } else {
                     domain_vars.push((name, value));
@@ -290,7 +318,7 @@ impl EnvOverlay {
             ))
         })?;
 
-        let domains = resolve_env_domains(domain_vars, origin_vars)?;
+        let domains = resolve_env_domains(domain_vars, origin_vars, review_vars)?;
 
         Ok(EnvOverlay {
             settings,
@@ -428,12 +456,14 @@ impl EnvOverlay {
 /// Resolves the collected `CRYSTALLINE_DOMAIN_*` variables into the overlay's
 /// domain map: every domain-definition variable becomes a file [`DomainEntry`],
 /// then every `_ORIGIN` variable attaches a parsed [`OriginConfig`] to its base
-/// domain. An origin with no matching base domain, an invalid name, an empty
-/// path or a malformed origin value is fatal, each error naming the offending
-/// variable.
+/// domain and every `_REVIEW` variable puts its base domain in review mode. An
+/// attachment with no matching base domain, an invalid name, an empty path, a
+/// malformed origin value or a review value that names no mode is fatal, each
+/// error naming the offending variable.
 fn resolve_env_domains(
     domain_vars: Vec<(String, String)>,
     origin_vars: Vec<(String, String)>,
+    review_vars: Vec<(String, String)>,
 ) -> Result<IndexMap<String, EnvDomain>, OverlayError> {
     let mut domains: IndexMap<String, EnvDomain> = IndexMap::new();
     // The `<NAME>` fragment (for example `TEAM_KNOWLEDGE`) to the mapped domain
@@ -494,6 +524,32 @@ fn resolve_env_domains(
             .expect("name recorded when the base domain was resolved")
             .entry
             .origin = Some(origin);
+    }
+
+    for (var, value) in review_vars {
+        let fragment = var
+            .strip_prefix(DOMAIN_ENV_PREFIX)
+            .expect("collected with the domain prefix");
+        let base = fragment
+            .strip_suffix(DOMAIN_REVIEW_SUFFIX)
+            .expect("collected by its review suffix");
+        let Some(name) = fragment_to_name.get(base) else {
+            return Err(OverlayError(format!(
+                "environment variable {var} has no matching {DOMAIN_ENV_PREFIX}{base}"
+            )));
+        };
+        if value.trim() != REVIEW_OVERLAY_VALUE {
+            return Err(OverlayError(format!(
+                "invalid environment variable {var}: review mode is '{REVIEW_OVERLAY_VALUE}', the \
+                 mode where every write joins its author's own draft; unset the variable for a \
+                 domain that takes changes directly"
+            )));
+        }
+        domains
+            .get_mut(name)
+            .expect("name recorded when the base domain was resolved")
+            .entry
+            .review = Some(ReviewMode::Overlay);
     }
 
     Ok(domains)
@@ -1125,6 +1181,79 @@ mod tests {
                 .unwrap()
                 .repo,
             "acme/brand"
+        );
+    }
+
+    #[test]
+    fn a_review_variable_turns_the_mode_on_and_a_stray_one_is_fatal() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand"),
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "overlay"),
+            ("CRYSTALLINE_DOMAIN_SOLO", "/k/solo"),
+        ])
+        .unwrap();
+        assert!(
+            ov.env_domain("team").unwrap().entry.is_overlay(),
+            "the domain the variable names reviews changes"
+        );
+        assert!(
+            !ov.env_domain("solo").unwrap().entry.is_overlay(),
+            "and a domain with no such variable takes them directly"
+        );
+
+        // Order does not matter: the variables are collected before any of them
+        // is resolved, exactly as an origin attachment is.
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "overlay"),
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+        ])
+        .unwrap();
+        assert!(ov.env_domain("team").unwrap().entry.is_overlay());
+
+        // `VAR=` reads as unset, the way every other variable here does.
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", ""),
+            ("CRYSTALLINE_DOMAIN_LONER_REVIEW", ""),
+        ])
+        .unwrap();
+        assert!(!ov.env_domain("team").unwrap().entry.is_overlay());
+        assert!(ov.env_domain("loner").is_none());
+
+        // A review variable naming a domain the environment does not define is
+        // fatal, the way a stray `_ORIGIN` is: it is a deployment that believes
+        // it turned review on somewhere it did not.
+        let err = overlay(&[("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "overlay")]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM_REVIEW"), "{msg}");
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM"), "{msg}");
+
+        // And a value that names no mode is fatal naming the variable and what
+        // it will take, rather than being read as "off".
+        let err = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "yes"),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM_REVIEW"), "{msg}");
+        assert!(msg.contains("overlay"), "{msg}");
+    }
+
+    #[test]
+    fn a_domain_whose_fragment_ends_in_review_cannot_be_env_defined() {
+        // The suffix is load-bearing: `CRYSTALLINE_DOMAIN_CODE_REVIEW` is read
+        // as review mode for a domain named `code`, never as a domain named
+        // `code-review`. The grammar note on this module says so, and this is
+        // what holds it.
+        let err = overlay(&[("CRYSTALLINE_DOMAIN_CODE_REVIEW", "/k/code-review")]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_CODE_REVIEW"), "{msg}");
+        assert!(
+            overlay(&[("CRYSTALLINE_DOMAIN_CODE_REVIEW", "/k/code-review")])
+                .err()
+                .is_some()
         );
     }
 

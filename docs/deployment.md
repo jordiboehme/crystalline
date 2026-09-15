@@ -329,11 +329,12 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_CONFIG` | an alternate config file path | `--config` wins over it |
 | `CRYSTALLINE_DOMAIN_<NAME>` | a domain rooted at that path, overlay only | never written to `config.yaml` |
 | `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN` | `owner/repo[/subpath][@branch]` | bootstraps the domain on first start |
+| `CRYSTALLINE_DOMAIN_<NAME>_REVIEW` | `overlay`, the only value it takes | puts the domain in review mode: every write joins its author's own draft and the folder goes on saying what the team reviewed. Needs the `_ORIGIN` variable beside it, since a reviewed change is proposed to the team on GitHub. Any other value refuses at startup naming the variable, rather than being read as off |
 | `CRYSTALLINE_GITHUB_TOKEN` | this machine's GitHub token | read-only; `connect github` refuses while set |
 | `CRYSTALLINE_MODELS_DIR` | the model cache path | pre-existing, unchanged |
 | `CRYSTALLINE_CHANNEL` | install channel marker | set to `mcpb` by the Claude Desktop extension manifest so degraded-startup copy tells the user to update the extension rather than the binary; not meant to be set by hand |
 
-`<NAME>` in a domain variable is lowercased with underscores turned into hyphens for the domain name itself (`CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE` becomes the domain `team-knowledge`). Precedence, highest first: a command-line flag, then an environment variable, then `config.yaml`, then the built-in default; an environment value is never written back to the config file.
+`<NAME>` in a domain variable is lowercased with underscores turned into hyphens for the domain name itself (`CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE` becomes the domain `team-knowledge`). The two suffixes are read before the name is, so a `<NAME>` ending in `_ORIGIN` or `_REVIEW` names no domain: `CRYSTALLINE_DOMAIN_CODE_REVIEW` is review mode for a domain called `code`, never a domain called `code-review`, and a domain that wants either of those words at the end of its name is registered in `config.yaml` instead. A suffix variable naming a domain no `CRYSTALLINE_DOMAIN_<NAME>` defines refuses at startup naming both variables, so a node never comes up believing it attached an origin or turned review on somewhere it did not. Precedence, highest first: a command-line flag, then an environment variable, then `config.yaml`, then the built-in default; an environment value is never written back to the config file.
 
 ## Private domains
 
