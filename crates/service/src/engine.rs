@@ -8453,6 +8453,23 @@ impl Engine {
                 // out.
                 "review": entry.is_overlay().then_some("overlay"),
             });
+            // What THIS caller is holding in a domain that reviews changes, so
+            // a screen can say "you have work waiting here" off the listing it
+            // already reads. It rides here rather than only on the domain's
+            // sync status because that status is gated with the share verbs: a
+            // plain member of a reviewing domain could not reach their own
+            // count, which is a fact about them rather than about the team.
+            // Absent on a domain that takes changes directly, exactly as
+            // `review` is and for the same reason; null when the index could
+            // not be counted, which is not the same as holding nothing.
+            if entry.is_overlay() {
+                obj["my_drafts"] = crate::review::DraftView::new(
+                    self.overlay_counts_by_actor(name).await,
+                    crate::scope::overlay_actor(scope),
+                    false,
+                )
+                .mine();
+            }
             // In a shared database a file domain names its current host so an
             // agent and an operator see who syncs what; `hosted_here` is true when
             // this instance holds the lock.

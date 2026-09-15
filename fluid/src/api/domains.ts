@@ -45,6 +45,17 @@ export interface DomainSummary {
    * a domain starts out and what an older server says about every domain.
    */
   review: string | null;
+  /**
+   * How many drafts this session's own account holds in this domain, null when
+   * the domain takes changes directly (nobody can draft there), and null again
+   * when the server could not count them.
+   *
+   * It rides on the listing rather than only on the domain's sync status
+   * because that status is gated with the share verbs: a plain member of a
+   * reviewing domain could not reach their own count, and a count of your own
+   * unshared work is a fact about you rather than about the team.
+   */
+  myDrafts: number | null;
 }
 
 /** Everything `GET /domains` says. */
@@ -69,6 +80,7 @@ function readDomain(value: unknown): DomainSummary | null {
     whenToUse: asStrings(record?.when_to_use),
     private: record?.private === true,
     review: typeof record?.review === "string" ? record.review : null,
+    myDrafts: typeof record?.my_drafts === "number" ? record.my_drafts : null,
   };
 }
 

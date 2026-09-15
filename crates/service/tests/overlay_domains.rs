@@ -925,6 +925,51 @@ async fn a_refused_removal_closes_no_co_editing_room() {
     );
 }
 
+/// A member is told what a member is holding, on the one read every member
+/// already makes.
+///
+/// The domain's sync status carries the same count, and a plain member cannot
+/// reach that route: it is gated with the share verbs. So the listing carries
+/// it too - a count of your own unshared work is a fact about you, and the
+/// screen that says "you have work waiting here" must not need permission to
+/// share in order to say it.
+#[tokio::test]
+async fn a_members_listing_carries_its_own_draft_count() {
+    let f = screened_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.tombstone("team", "alice", "gone.md").await;
+    f.draft("team", "owner", "fresh.md", ALICE_NEW).await;
+
+    let listing = f
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &account("alice"),
+        )
+        .await
+        .unwrap();
+    let team = listing["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "team")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        team["my_drafts"],
+        serde_json::json!(2),
+        "her own two, a deletion among them, and nothing of the owner's: {team}"
+    );
+    assert_eq!(team["review"], serde_json::json!("overlay"));
+    let text = team.to_string();
+    for secret in ["plan.md", "gone.md", "fresh.md", "owner"] {
+        assert!(
+            !text.contains(secret),
+            "a listing row says how much, never whose or what, and {secret} is in it: {text}"
+        );
+    }
+}
+
 /// An engine that was never told where its state directory is reaches no
 /// journal at all in a test build, and says which method to call.
 ///

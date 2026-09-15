@@ -22,12 +22,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
-import {
-  archiveDownloadUrl,
-  fetchSyncStatus,
-  syncStatusKey,
-  unregisterDomain,
-} from "../api/admin";
+import { archiveDownloadUrl, unregisterDomain } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
@@ -107,20 +102,12 @@ export default function DomainHome() {
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
   });
-  // The same read the sync card makes, under the same key, so the two share one
-  // request rather than asking twice. Only where the card itself is drawn: the
-  // route behind it is gated with the share verbs, and a screen must knock on
-  // nothing it would be refused. What the header wants from it is the one fact
-  // the listing cannot carry - how much of this reviewing domain's unshared
-  // work is the reader's own - because that is an answer about a person and the
-  // listing is the same for everybody.
-  const sync = useQuery({
-    queryKey: syncStatusKey(domain),
-    queryFn: () => fetchSyncStatus(domain),
-    enabled: capabilities.canShare,
-    retry: false,
-  });
-  const myDrafts = sync.data?.reviewing === true ? sync.data.myDrafts : null;
+  // Off the listing every screen already reads, and deliberately not off the
+  // domain's sync status, which carries the same count: that route is gated
+  // with the share verbs, so a plain member of a reviewing domain could not
+  // reach it, and their own count is exactly what this line is for. A domain
+  // that takes changes directly carries no count at all, which is null here.
+  const myDrafts = summary?.review == null ? null : summary.myDrafts;
   // A domain nobody registered is a wrong address, not an empty shelf. The
   // tree is what says so: a 404 from the manifest also means a domain that
   // simply has not been introduced yet.

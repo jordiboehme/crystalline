@@ -331,6 +331,46 @@ describe("the domain screen", () => {
     });
   });
 
+  it("tells a member how much of their own work is waiting in a reviewing domain", async () => {
+    // An editor, so `can_share` is false and neither share card is drawn: this
+    // is the person whose count used to be invisible in the browser, because
+    // the only place that carried it was the sync route, which is gated with
+    // the share verbs. The listing is the read every member already makes.
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "eng",
+            kind: "file",
+            engrams: 4,
+            review: "overlay",
+            my_drafts: 2,
+            when_to_use: ["Route here for eng questions."],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    expect(
+      await screen.findByText(/You have 2 draft changes here/),
+    ).toBeVisible();
+    // No share card on this session, so the header is the whole of what says
+    // it.
+    expect(screen.queryByRole("region", { name: "Team sync" })).toBeNull();
+  });
+
+  it("says nothing about drafts on a domain that takes changes directly", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
+    expect(screen.queryByText(/draft changes here/)).toBeNull();
+  });
+
   it("wears no private badge when the domain is shared", async () => {
     serve();
 

@@ -117,11 +117,11 @@ describe("SyncCard", () => {
     expect(within(table).getByText("ada")).toBeInTheDocument();
     expect(within(table).getByText("bo")).toBeInTheDocument();
 
-    // The header says it too, where somebody arriving at the domain reads
-    // first.
-    expect(
-      screen.getByText(/You have 2 draft changes here/),
-    ).toBeInTheDocument();
+    // The header says it too, and says it off the domain listing rather than
+    // off this card's read, so a member who cannot reach the sync route still
+    // gets it - pinned in `DomainHome.test.tsx`, where that listing is the
+    // fixture.
+    expect(screen.queryByText(/You have 2 draft changes here/)).toBeNull();
   });
 
   it("tells a caller their own count and nobody else's", async () => {
