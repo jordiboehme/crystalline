@@ -3236,6 +3236,30 @@ impl Engine {
         }
     }
 
+    /// The row whose outbound edges a reader sees for an engram: their own
+    /// draft's row when they hold one at that path, the base row otherwise.
+    ///
+    /// A draft-only engram already carries its own id, because nothing else
+    /// could have described it; this is about a draft that stands over a base
+    /// row, whose descriptor is the base's so that one engram keeps one
+    /// address. Its edges are not the base's.
+    async fn overlay_edge_id(
+        &self,
+        desc: &EngramDescriptor,
+        overlay: Option<&str>,
+    ) -> Result<EngramId> {
+        let Some(actor) = overlay else {
+            return Ok(desc.id);
+        };
+        let store = self.store.lock().await;
+        Ok(store
+            .overlay_entry(desc.domain_id, actor, &desc.path)
+            .await?
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| entry.id)
+            .unwrap_or(desc.id))
+    }
+
     /// [`Engine::resolve`] with the domains the caller may not see subtracted.
     ///
     /// A hidden domain resolves as an empty one rather than as a refusal: the
@@ -5461,9 +5485,20 @@ impl Engine {
         // Enrich the response with reference resolution: which outbound links
         // land, and who points back in. The descriptor carries the ids, so this
         // works for file, virtual and non-host reads alike.
+        //
+        // Outbound is asked of the row this reader is actually looking at.
+        // A draft over a base row resolves to the BASE descriptor, so one
+        // engram keeps one address - but the relations and prose links in front
+        // of them are the ones their own document wrote, and those hang off
+        // their own row; asking the base row would report a relation they added
+        // as unresolved and one they removed as still there. Inbound stays the
+        // base row's, deliberately: who points here is a fact about the address
+        // the team shares, and nobody can write a reference to a draft only its
+        // author can read.
+        let edge_id = self.overlay_edge_id(&desc, overlay.as_deref()).await?;
         let (outbound, inbound) = {
             let store = self.store.lock().await;
-            let outbound = store.outbound_refs(desc.id).await?;
+            let outbound = store.outbound_refs(edge_id).await?;
             let mut inbound = store
                 .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
                 .await?;

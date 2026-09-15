@@ -2573,3 +2573,72 @@ async fn a_drafts_relation_reaches_its_authors_context_and_nobody_elses() {
         "her deletion is hers: the team's plan is where it was for everybody else"
     );
 }
+
+/// A draft's own relations are the ones its author reads back.
+///
+/// `read_engram` resolves a draft over a base row to the BASE descriptor, so
+/// one engram keeps one address however it is being rewritten. The edges are
+/// the other half of that answer and they are not the base row's: a relation
+/// the draft added would read as unresolved and one it removed would still be
+/// reported, which is the index contradicting the document in the same
+/// response. Who points IN stays the base row's, because that is a fact about
+/// the address the team shares rather than about the private rewrite.
+///
+/// The relation points at a base row, which is the only kind of target a
+/// reference ever resolves to: a resolved edge is a fact about the domain, so
+/// nothing lands on one reader's private draft.
+#[tokio::test]
+async fn a_drafts_own_relations_are_what_its_author_reads() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+
+    f.engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("- relates_to [[manifest]]".to_string()),
+                key: None,
+                value: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    let hers = f.engine.read_engram(&read("plan"), &alice).await.unwrap();
+    assert_eq!(
+        hers["permalink"],
+        serde_json::json!("plan"),
+        "one engram, one address: her read is still of the team's plan"
+    );
+    let relations = hers["relations"].as_array().unwrap();
+    assert_eq!(
+        relations.len(),
+        1,
+        "the relation she wrote is in the document she reads: {hers}"
+    );
+    assert_eq!(
+        relations[0]["resolved"],
+        serde_json::json!(true),
+        "and it resolves, because her own row is where her edges hang: {hers}"
+    );
+
+    let theirs = f
+        .engine
+        .read_engram(&read("plan"), &account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        theirs["relations"].as_array().unwrap().is_empty(),
+        "and the engram the team reviewed has no relation at all: {theirs}"
+    );
+}
