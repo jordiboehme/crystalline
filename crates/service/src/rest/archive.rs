@@ -88,10 +88,14 @@
 //! REST-local mutex could not close it and would only queue uploads behind
 //! minutes-long admin work. Fixing it for real means fixing it in the engine.
 
+use std::collections::HashSet;
+
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Bytes};
+
+use crate::domain_view::DomainView;
 
 use super::auth::Identity;
 use super::engrams::ValidateFinding;
@@ -694,9 +698,8 @@ async fn run_archive(
         .iter()
         .any(|item| matches!(item, Screened::Asset { .. }))
     {
-        held = state
-            .engine
-            .attachment_list(domain)
+        held = DomainView::base(&state.engine, domain, &HashSet::new())?
+            .attachments()
             .await?
             .into_iter()
             .map(|row| row.path)

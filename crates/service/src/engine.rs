@@ -35,7 +35,7 @@ use crystalline_core::{
     Manifest, YamlValue, is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
-    AckCounts, AckEntry, AttachmentRow, BrowseLevel, ChunkParams, DEFAULT_RETIRED_WEIGHT,
+    AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
     EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
     EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
@@ -53,6 +53,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::domain_view::DomainView;
 use crate::origin;
 use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
@@ -582,7 +583,7 @@ pub enum WatchEvent {
 /// file domain, or the database for a virtual domain. This is the one seam every
 /// content mutation branches on; everything after `parse_engram` is shared (see
 /// [`Engine::index_markdown`]).
-enum ContentSource {
+pub(crate) enum ContentSource {
     /// A file domain rooted at this filesystem path.
     File {
         /// The tilde-expanded domain root.
@@ -2168,7 +2169,7 @@ impl Engine {
     /// a file domain, or the database for a virtual domain. Errors when the
     /// domain is not registered (the write path wants that), the layered lookup
     /// mirroring [`Engine::domain_entry`].
-    fn content_source(&self, name: &str) -> Result<ContentSource> {
+    pub(crate) fn content_source(&self, name: &str) -> Result<ContentSource> {
         let entry = self.domain_entry(name)?;
         Ok(self.source_of(&entry))
     }
@@ -2177,7 +2178,11 @@ impl Engine {
     /// not see resolves to no source at all, with the same
     /// [`EngineError::UnknownDomain`] a name nobody registered gets, its
     /// `registered` list filtered to the visible set.
-    fn content_source_scoped(&self, name: &str, hidden: &HashSet<String>) -> Result<ContentSource> {
+    pub(crate) fn content_source_scoped(
+        &self,
+        name: &str,
+        hidden: &HashSet<String>,
+    ) -> Result<ContentSource> {
         let entry = self.domain_entry_scoped(name, hidden)?;
         Ok(self.source_of(&entry))
     }
@@ -2196,72 +2201,10 @@ impl Engine {
     /// registers reviews nothing: the verb that asked is about to refuse it as
     /// unregistered anyway, and answering "yes" here would route a write into a
     /// draft of a domain that does not exist.
-    fn reviews_changes(&self, name: &str) -> bool {
+    pub(crate) fn reviews_changes(&self, name: &str) -> bool {
         self.domain_entry(name)
             .map(|entry| entry.is_overlay())
             .unwrap_or(false)
-    }
-
-    /// Whose draft this write joins, or `None` when the domain takes changes
-    /// directly and the write goes to the folder or the database as it always
-    /// did.
-    ///
-    /// The one place review mode turns into a routing decision, so every write
-    /// verb asks it the same way and a verb added later inherits the rule
-    /// instead of having to remember it. [`EngineError::Refused`] with
-    /// [`OVERLAY_NEEDS_IDENTITY`] when the domain reviews changes and the
-    /// caller has no identity: the alternative is a write falling through onto
-    /// reviewed truth, which is the one outcome this whole mode exists to
-    /// prevent.
-    ///
-    /// **The registered-set screen composes ahead of the actor dimension here
-    /// too, and on this side it is load bearing twice over.** A write that
-    /// routed would put a stranger's draft into a domain they may not see; and
-    /// the refusal itself says "this domain reviews changes before they land",
-    /// which is a fact about a domain they must not learn exists. So a domain
-    /// [`Engine::hidden_for`] hides is answered here exactly as a domain nobody
-    /// registered, by the same [`Engine::refuse_hidden_domain`] every read
-    /// goes through, before either answer below can be reached.
-    ///
-    /// **A direct domain never reaches that screen**, and that is deliberate
-    /// rather than an oversight: this function answers `None` for it on the
-    /// first line, which is what it answered before review mode existed, so
-    /// every direct write behaves byte for byte as it always has and keeps
-    /// relying on the surface gate in front of it (MCP `refuse_unwritable`,
-    /// REST `require_domain_write`) exactly as its neighbours do.
-    async fn overlay_for_write(
-        &self,
-        name: &str,
-        scope: &crate::scope::Scope,
-    ) -> Result<Option<String>> {
-        if !self.reviews_changes(name) {
-            return Ok(None);
-        }
-        self.refuse_hidden_domain(name, scope).await?;
-        match crate::scope::overlay_actor(scope) {
-            Some(actor) => Ok(Some(actor)),
-            None => Err(EngineError::Refused(OVERLAY_NEEDS_IDENTITY.to_string())),
-        }
-    }
-
-    /// Whose drafts shadow this domain for this reader, or `None` when the
-    /// domain takes changes directly or the reader has no identity.
-    ///
-    /// The read-side counterpart of [`Engine::overlay_for_write`], and it never
-    /// refuses: a reader with no identity reads the folder the team reviewed,
-    /// which is a complete and correct answer rather than a denied one.
-    ///
-    /// The caller has already applied [`Engine::hidden_for`] by the time this
-    /// runs, on every verb that calls it. That order is the rule and not an
-    /// accident: the registered-set screen composes ahead of the actor
-    /// dimension, so a draft in a domain this caller may not see, and a draft
-    /// in a domain this instance has no registration for, are both absent
-    /// before whose-draft-is-it is ever asked.
-    fn overlay_for_read(&self, name: &str, scope: &crate::scope::Scope) -> Option<String> {
-        if !self.reviews_changes(name) {
-            return None;
-        }
-        crate::scope::overlay_actor(scope)
     }
 
     /// [`Engine::actor`] for a write that joins a draft overlay: the identity
@@ -2283,233 +2226,21 @@ impl Engine {
 
     /// The actor a write records, given where it is landing: the composed
     /// identity for a draft, the configured one for a direct write.
-    fn actor_for(&self, client: Option<&str>, overlay: Option<&String>) -> String {
+    fn actor_for(&self, client: Option<&str>, overlay: Option<&str>) -> String {
         match overlay {
             Some(_) => self.draft_actor(client),
             None => self.actor(client),
         }
     }
 
-    /// What `actor` sees at `path`: their own draft when they hold one, the
-    /// base text otherwise, and `None` when their own tombstone deletes it or
-    /// nothing stands there at all.
-    ///
-    /// The text every overlay write compares its `expected_checksum` against
-    /// and every overlay edit applies to, which is why it is one function: a
-    /// first edit has to read the base (there is no draft yet) and every later
-    /// one has to read the draft (or the second edit conflicts against the
-    /// first).
-    async fn overlay_visible_text(
-        &self,
-        base: &ContentSource,
-        desc: &EngramDescriptor,
-        actor: &str,
-    ) -> Result<Option<String>> {
-        let held = {
-            let store = self.store.lock().await;
-            store
-                .overlay_entry(desc.domain_id, actor, &desc.path)
-                .await?
-        };
-        match held {
-            Some(entry) if entry.tombstone => Ok(None),
-            Some(entry) => Ok(Some(entry.content)),
-            None => self.load_content(base, desc).await.map(Some),
-        }
-    }
-
-    /// Write one actor's draft of a path: the row, its chunks and its mirror.
-    ///
-    /// The single place a draft is created, so every verb that routes lands the
-    /// same shape and the shape agrees with what the journal restore writes
-    /// back after a wipe. A draft row carries the WHOLE document in its
-    /// `content` column, frontmatter included, exactly as a virtual domain's
-    /// rows do: no file on disk holds a draft, so the row is the only place the
-    /// document lives and a body-only row would lose the frontmatter for good.
-    ///
-    /// **The row goes down before the mirror, and a mirror that fails does not
-    /// unsay the row.** The answer is `Some(warning)`: the write landed, and
-    /// this machine could not copy it where a `reindex --wipe` would find it.
-    ///
-    /// The ordering is what keeps the restore honest under Task 2's rule that
-    /// store rows win. A mirror with no row is a GAP, so the next restore
-    /// fills it - which would mean a write the caller was told had failed
-    /// appearing as a draft later, and, for a tombstone, a deletion taking
-    /// effect after the fact. A row with no mirror is not a gap, so the restore
-    /// does nothing with it: the journal never holds anything the index did not
-    /// accept, and the only loss is the one a wipe takes, which is exactly what
-    /// the warning names.
-    ///
-    /// Reporting it as a failure instead would be worse than silent, because
-    /// three callers act on that answer: a split would delete the engram
-    /// holding the observations it just moved, a move's rollback would undo a
-    /// move that happened, and a delete would be unretryable - its next attempt
-    /// answering "no engram" against the tombstone it claims it did not write.
-    /// The state directory is resolved before the row is ever written (in
-    /// [`Engine::put_overlay_entry`], which is the half that writes), so an
-    /// engine with no journal at all still refuses before it writes a row it
-    /// could never mirror.
-    ///
-    /// **The address is checked here**, which is what makes this the one place
-    /// a draft can be created: see
-    /// [`Engine::refuse_permalink_held_elsewhere`], which every verb that
-    /// routes through this writer inherits.
-    async fn write_overlay_entry(
-        &self,
-        domain: &str,
-        domain_id: DomainId,
-        actor: &str,
-        path: &str,
-        text: &str,
-    ) -> Result<Option<String>> {
-        let record = Self::overlay_record(path, text)?;
-        self.refuse_permalink_held_elsewhere(
-            domain,
-            domain_id,
-            actor,
-            &record.permalink,
-            path,
-            None,
-        )
-        .await?;
-        self.put_overlay_entry(domain, domain_id, actor, path, record)
-            .await
-    }
-
-    /// [`Engine::write_overlay_entry`] without the address check, for the one
-    /// caller that must never be refused: a move's rollback.
-    ///
-    /// The rollback puts back a draft this actor was already holding a moment
-    /// ago, so the state it restores is one the check had already allowed, and
-    /// the text it restores lives in that row and nowhere else - a refusal
-    /// there would be the move losing the draft rather than not making it.
-    /// [`Engine::move_within_overlay`] asks the check its own question before
-    /// it writes anything at all, so the rule still holds for the move.
-    async fn write_overlay_entry_unchecked(
-        &self,
-        domain: &str,
-        domain_id: DomainId,
-        actor: &str,
-        path: &str,
-        text: &str,
-    ) -> Result<Option<String>> {
-        let record = Self::overlay_record(path, text)?;
-        self.put_overlay_entry(domain, domain_id, actor, path, record)
-            .await
-    }
-
-    /// Refuse a draft that would answer to an address another path already
-    /// answers to.
-    ///
-    /// The overlay dimension relaxes what the index enforces. The unique index
-    /// is `(domain, permalink, actor)`, so `(team, plan, alice)` and
-    /// `(team, plan, "")` are two different rows and the database says nothing
-    /// about a draft of `notes.md` whose frontmatter now reads `permalink:
-    /// plan` while the team's `plan.md` holds that address. Nothing downstream
-    /// can carry those two rows: a search merges its hits by permalink and
-    /// drops one of them silently, and a draft holding an address the reviewed
-    /// folder already spends could never be folded back into that folder,
-    /// since the base rows do refuse it there. So the write path keeps the
-    /// rule, in the words the import path keeps it in
-    /// (`permalink '...' already exists at another path`).
-    ///
-    /// **What counts as a holder is this actor's own view of the domain**,
-    /// which is the only view their drafts live in: their own drafts, and the
-    /// base rows their own tombstone has not deleted. A path they have deleted
-    /// holds nothing for them, exactly as it holds no engram for them - the
-    /// same reading [`Engine::write_engram_as`] already applies to a name - and
-    /// a move depends on it, since a move tombstones the source before it
-    /// writes the destination and the two carry one permalink between them.
-    ///
-    /// `vacating` is the path a caller is about to empty in the same breath: a
-    /// move's source, which still holds the address at the moment the question
-    /// is asked and will not hold it by the time the destination lands. It is
-    /// the move's alone and no other verb may pass it - every other write
-    /// leaves whatever it found standing, so a path named here that keeps its
-    /// row is the rule quietly switched off for one address.
-    async fn refuse_permalink_held_elsewhere(
-        &self,
-        domain: &str,
-        domain_id: DomainId,
-        actor: &str,
-        permalink: &str,
-        path: &str,
-        vacating: Option<&str>,
-    ) -> Result<()> {
-        let (entries, base) = {
-            let store = self.store.lock().await;
-            let entries = store.overlay_entries(domain_id, actor).await?;
-            // `find_engram` answers a title as well as a permalink, and a title
-            // is not an address anybody holds; an exact permalink sorts first,
-            // so filtering the answer hides no real holder behind a namesake.
-            let base = store
-                .find_engram(domain, permalink)
-                .await?
-                .filter(|found| found.permalink == permalink);
-            (entries, base)
-        };
-        let elsewhere = |at: &str| at != path && Some(at) != vacating;
-        let held_at = entries
-            .iter()
-            .find(|entry| {
-                !entry.tombstone && entry.permalink == permalink && elsewhere(&entry.path)
-            })
-            .map(|entry| entry.path.clone())
-            .or_else(|| {
-                base.filter(|found| {
-                    elsewhere(&found.path)
-                        && !entries
-                            .iter()
-                            .any(|entry| entry.tombstone && entry.path == found.path)
-                })
-                .map(|found| found.path)
-            });
-        if let Some(at) = held_at {
-            return Err(EngineError::Conflict(format!(
-                "permalink '{permalink}' already exists at another path ({at}) in domain \
-                 '{domain}'; one engram answers to one address, so give this draft an address of \
-                 its own, or draft the change to '{at}' instead"
-            )));
-        }
-        Ok(())
-    }
-
     /// A draft's record: the parsed document with the WHOLE of it kept in the
     /// `content` column, and the permalink the row will answer to - the
     /// frontmatter's when it carries one, the path's slug when it does not.
-    fn overlay_record(path: &str, text: &str) -> Result<EngramRecord> {
+    pub(crate) fn overlay_record(path: &str, text: &str) -> Result<EngramRecord> {
         let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
         record.content = text.to_string();
         Ok(record)
-    }
-
-    /// The row and the mirror of a draft, once the address has been settled.
-    async fn put_overlay_entry(
-        &self,
-        domain: &str,
-        domain_id: DomainId,
-        actor: &str,
-        path: &str,
-        record: EngramRecord,
-    ) -> Result<Option<String>> {
-        let state_dir = self.journal_state_dir()?;
-        self.commit_overlay_row(domain_id, actor, &record).await?;
-        let warning = match crate::overlay_journal::journal_write(
-            &state_dir,
-            domain,
-            actor,
-            path,
-            &record.content,
-        ) {
-            Ok(()) => None,
-            Err(e) => Some(unmirrored(domain, actor, path, &e)),
-        };
-        if let Some(text) = &warning {
-            tracing::warn!(domain, actor, path, "{text}");
-        }
-        self.nudge_embed();
-        Ok(warning)
     }
 
     /// Write one actor's deletion of a base row: a tombstone row standing at
@@ -2524,7 +2255,7 @@ impl Engine {
     ///
     /// Answers `Some(warning)` for a mirror that failed after the row landed,
     /// for the reason [`Engine::write_overlay_entry`] gives at length.
-    async fn write_overlay_tombstone(
+    pub(crate) async fn write_overlay_tombstone(
         &self,
         domain: &str,
         actor: &str,
@@ -2578,7 +2309,7 @@ impl Engine {
 
     /// The row half of both overlay writers, in one transaction: the row, its
     /// chunks (none for a tombstone) and the forward references it settles.
-    async fn commit_overlay_row(
+    pub(crate) async fn commit_overlay_row(
         &self,
         domain_id: DomainId,
         actor: &str,
@@ -2614,34 +2345,6 @@ impl Engine {
                 Err(e)
             }
         }
-    }
-
-    /// Drop one actor's draft at a path, row and mirror together, so a verb
-    /// that undoes a draft leaves nothing for a later restore to resurrect.
-    ///
-    /// **The mirror goes first here**, which is the opposite order to the two
-    /// writers above and is the same rule read from the other end: a mirror
-    /// that outlived its row is a gap the next restore fills, so clearing the
-    /// row first and failing on the mirror would resurrect a draft its author
-    /// dropped. Failing on the mirror before the row has moved refuses a call
-    /// that did nothing, which is the honest answer and the retryable one.
-    async fn drop_overlay_entry(
-        &self,
-        domain: &str,
-        domain_id: DomainId,
-        actor: &str,
-        path: &str,
-    ) -> Result<()> {
-        let state_dir = self.journal_state_dir()?;
-        crate::overlay_journal::journal_clear(&state_dir, domain, actor, path).map_err(
-            |source| EngineError::Io {
-                path: state_dir.display().to_string(),
-                source,
-            },
-        )?;
-        let store = self.store.lock().await;
-        store.clear_overlay_entry(domain_id, actor, path).await?;
-        Ok(())
     }
 
     /// Take every draft the team's folder has caught up with out of the
@@ -2802,14 +2505,19 @@ impl Engine {
 
         let mut cleared = 0u64;
         for (actor, entries) in &held {
+            // Named here because convergence answers to nobody: it is a
+            // comparison of the base snapshot against each actor's entries, so
+            // it reads BOTH sides raw and never through a projection of one
+            // over the other. The view is used only as the writer that ends a
+            // converged draft, which is why it screens nothing.
+            let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
                 match settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own) {
                     Settle::Leave => {}
                     Settle::Clear => {
-                        self.drop_overlay_entry(domain, domain_id, actor, &entry.path)
-                            .await?;
+                        view.drop(domain_id, &entry.path).await?;
                         record.settle(actor, &entry.path);
                         cleared += 1;
                     }
@@ -2910,31 +2618,22 @@ impl Engine {
     ) -> Result<bool> {
         let landed = crystalline_remote::state::read_base_file(state_dir, dest)?
             .is_some_and(|base| base == entry.content.as_bytes());
-        self.drop_overlay_entry(domain, domain_id, actor, &entry.path)
-            .await?;
+        let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+        view.drop(domain_id, &entry.path).await?;
         if landed {
             // The rename carried this actor's own words with it: the draft is
             // the folder now, under its new name.
             return Ok(true);
         }
-        match self
-            .write_overlay_entry(domain, domain_id, actor, dest, &entry.content)
-            .await
-        {
+        match view.write(domain_id, dest, &entry.content).await {
             Ok(None) => {}
             // The row landed and its mirror did not. Logged rather than
             // swallowed: the index serves the row either way, and it is the
             // next `reindex --wipe` that would notice the difference.
             Ok(Some(warning)) => tracing::warn!(domain, actor, path = dest, "{warning}"),
             Err(e) => {
-                if let Err(undo) = self
-                    .write_overlay_entry_unchecked(
-                        domain,
-                        domain_id,
-                        actor,
-                        &entry.path,
-                        &entry.content,
-                    )
+                if let Err(undo) = view
+                    .write_unchecked(domain_id, &entry.path, &entry.content)
                     .await
                 {
                     tracing::error!(
@@ -3349,7 +3048,7 @@ impl Engine {
     /// gating those names - `domain`, plus `destination_domain` on a move,
     /// which are the only domain-valued fields any write parameter carries -
     /// gates the whole call.
-    async fn resolve_in(
+    pub(crate) async fn resolve_in(
         &self,
         identifier: &str,
         domain: &str,
@@ -3396,303 +3095,52 @@ impl Engine {
             Some(url) => Some(url.domain),
             None => domain.map(str::to_string),
         };
-        let overlay = named
+        // A name nobody registered builds no view and is left to
+        // `resolve_scoped` to answer, exactly as it was before the view
+        // existed: the miss it produces is the one an engram that was never
+        // written produces, and an early refusal here would not be.
+        let view = named
             .as_deref()
             .filter(|name| !hidden.contains(*name))
-            .and_then(|name| self.overlay_for_read(name, scope));
-        let Some(actor) = overlay else {
+            .and_then(|name| DomainView::for_read(self, name, hidden, scope).ok());
+        let Some(actor) = view.as_ref().and_then(|view| view.actor()) else {
             let (desc, source) = self.resolve_scoped(identifier, domain, hidden).await?;
             // A bare identifier with no domain named reaches here, and by now
             // the domain IS known: the descriptor says which one. So a path
             // this reader has tombstoned is absent for them however they
             // addressed it. Only the DRAFT half stays conditional on naming a
             // domain - see the doc above.
-            if let Some(actor) = self.overlay_for_read(&desc.domain, scope) {
-                let held = {
-                    let store = self.store.lock().await;
-                    store
-                        .overlay_entry(desc.domain_id, &actor, &desc.path)
-                        .await?
-                };
-                if held.is_some_and(|entry| entry.tombstone) {
+            let view = DomainView::for_read(self, &desc.domain, hidden, scope)?;
+            if let Some(actor) = view.actor() {
+                if !view.exists(desc.domain_id, &desc.path).await? {
                     return Err(EngineError::NotFound(format!(
                         "no engram matches '{identifier}'"
                     )));
                 }
+                let actor = actor.to_string();
                 return Ok((desc, source, Some(actor)));
             }
             return Ok((desc, source, None));
         };
-        let name = named.expect("an overlay actor is only resolved for a named domain");
+        let view = view
+            .as_ref()
+            .expect("an overlay actor is only resolved for a named domain");
+        let name = view.domain().to_string();
         match self.resolve_scoped(identifier, domain, hidden).await {
             Ok((desc, source)) => {
-                let held = {
-                    let store = self.store.lock().await;
-                    store
-                        .overlay_entry(desc.domain_id, &actor, &desc.path)
-                        .await?
-                };
-                if held.is_some_and(|entry| entry.tombstone) {
+                if !view.exists(desc.domain_id, &desc.path).await? {
                     return Err(EngineError::NotFound(format!(
                         "no engram '{identifier}' in domain '{name}'"
                     )));
                 }
-                Ok((desc, source, Some(actor)))
+                Ok((desc, source, Some(actor.to_string())))
             }
-            Err(EngineError::NotFound(miss)) => {
-                match self.resolve_draft(&name, &actor, identifier).await? {
-                    Some((desc, source)) => Ok((desc, source, Some(actor))),
-                    None => Err(EngineError::NotFound(miss)),
-                }
-            }
+            Err(EngineError::NotFound(miss)) => match view.resolve_draft(identifier).await? {
+                Some((desc, source)) => Ok((desc, source, Some(actor.to_string()))),
+                None => Err(EngineError::NotFound(miss)),
+            },
             Err(e) => Err(e),
         }
-    }
-
-    /// [`Engine::resolve_in`] for a call that may be acting inside a draft
-    /// overlay: what THIS actor sees at that identifier.
-    ///
-    /// `None` is the base resolution unchanged, so a direct domain reaches
-    /// exactly the code it always did. With an actor there are three
-    /// differences, and each one is a place a draft would otherwise be
-    /// invisible to its own author:
-    ///
-    /// * a path this actor has tombstoned resolves to nothing, in the same
-    ///   words an engram nobody wrote produces - their deletion is a deletion
-    ///   for them;
-    /// * a draft at a path no base row holds resolves through the draft's own
-    ///   row, which is the only way an engram created in review mode can be
-    ///   edited, moved or deleted at all;
-    /// * a draft over a base row resolves to the BASE descriptor. Its path,
-    ///   domain and permalink are what a write needs, and the draft's own row
-    ///   is read by the arm that writes it, so resolving to the base keeps one
-    ///   engram one address whether or not this actor has started drafting it.
-    async fn resolve_in_for(
-        &self,
-        identifier: &str,
-        domain: &str,
-        overlay: Option<&str>,
-    ) -> Result<(EngramDescriptor, ContentSource)> {
-        let Some(actor) = overlay else {
-            return self.resolve_in(identifier, domain).await;
-        };
-        match self.resolve_in(identifier, domain).await {
-            Ok((desc, source)) => {
-                let held = {
-                    let store = self.store.lock().await;
-                    store
-                        .overlay_entry(desc.domain_id, actor, &desc.path)
-                        .await?
-                };
-                if held.is_some_and(|entry| entry.tombstone) {
-                    return Err(EngineError::NotFound(format!(
-                        "no engram '{identifier}' in domain '{domain}'"
-                    )));
-                }
-                Ok((desc, source))
-            }
-            // The base knows nothing about this identifier, which is exactly
-            // the case a draft-only engram is in. The miss is kept and raised
-            // unchanged when the overlay knows nothing either, so an
-            // identifier nobody wrote reads the same in both modes.
-            Err(EngineError::NotFound(miss)) => {
-                match self.resolve_draft(domain, actor, identifier).await? {
-                    Some(found) => Ok(found),
-                    None => Err(EngineError::NotFound(miss)),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// One actor's own draft at an identifier, when no base row answers to it.
-    ///
-    /// Matched by permalink, by title and by path, which is the same ladder
-    /// the base lookup offers, over the entries this actor holds. Tombstones
-    /// are skipped: a deletion is not an engram to find.
-    async fn resolve_draft(
-        &self,
-        domain: &str,
-        actor: &str,
-        identifier: &str,
-    ) -> Result<Option<(EngramDescriptor, ContentSource)>> {
-        // An absolute identifier naming another domain is not this domain's to
-        // answer, exactly as `resolve_in` refuses it.
-        let wanted = match CrystallineUrl::parse(identifier) {
-            Some(url) if url.domain != domain => return Ok(None),
-            Some(url) => url.permalink,
-            None => identifier.to_string(),
-        };
-        let (domain_id, source) = self.domain_source(domain).await?;
-        let entries = {
-            let store = self.store.lock().await;
-            store.overlay_entries(domain_id, actor).await?
-        };
-        for entry in entries {
-            if entry.tombstone {
-                continue;
-            }
-            let Ok(engram) = parse_engram(&entry.content) else {
-                continue;
-            };
-            let record =
-                EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
-            let names = [
-                entry.permalink.as_str(),
-                record.title.as_str(),
-                entry.path.as_str(),
-            ];
-            if !names.iter().any(|name| *name == wanted) {
-                continue;
-            }
-            return Ok(Some((
-                EngramDescriptor {
-                    id: entry.id,
-                    domain_id,
-                    domain: domain.to_string(),
-                    path: entry.path,
-                    permalink: entry.permalink,
-                    title: record.title,
-                    engram_type: record.engram_type,
-                    status: record.status,
-                },
-                source,
-            )));
-        }
-        Ok(None)
-    }
-
-    /// The seeds of a graph traversal, in one reader's own view of the domain.
-    ///
-    /// Three edits, the same three [`Engine::shadow_level`] makes to a browse
-    /// level: a path this reader has deleted seeds nothing, a path they are
-    /// drafting seeds from their own row - so the traversal walks the edges
-    /// they wrote rather than the ones the reviewed file carries - and a draft
-    /// at a path no file holds is a seed like any other. `None` hands the base
-    /// seeds back untouched, which is what a reader with no identity gets and
-    /// what every caller got before the dimension existed.
-    ///
-    /// The registered-set screen composes ahead of this, never behind it: a
-    /// caller passes `None` for a domain the reader may not see, so a draft of
-    /// their own is no way back into a domain that is hidden from them.
-    async fn shadow_seeds(
-        &self,
-        domain: &str,
-        overlay: Option<&str>,
-        base: Vec<EngramDescriptor>,
-    ) -> Result<Vec<EngramDescriptor>> {
-        let Some(actor) = overlay else {
-            return Ok(base);
-        };
-        let (domain_id, _) = self.domain_source(domain).await?;
-        let entries = {
-            let store = self.store.lock().await;
-            store.overlay_entries(domain_id, actor).await?
-        };
-        let held: HashMap<&str, &crystalline_index::StoredEngram> = entries
-            .iter()
-            .map(|entry| (entry.path.as_str(), entry))
-            .collect();
-        let mut seeds: Vec<EngramDescriptor> = Vec::with_capacity(base.len());
-        let mut base_paths: HashSet<String> = HashSet::new();
-        for d in base {
-            base_paths.insert(d.path.clone());
-            match held.get(d.path.as_str()) {
-                // Deleted: this reader anchors on nothing here, and nothing
-                // reaches them through it either.
-                Some(entry) if entry.tombstone => {}
-                Some(entry) => seeds.extend(overlay_descriptor(domain, domain_id, entry)),
-                None => seeds.push(d),
-            }
-        }
-        for entry in &entries {
-            if !base_paths.contains(&entry.path) {
-                seeds.extend(overlay_descriptor(domain, domain_id, entry));
-            }
-        }
-        Ok(seeds)
-    }
-
-    /// [`Engine::shadow_seeds`] for a single named anchor: the base row this
-    /// reader sees at that address, their own draft of it when they hold one,
-    /// nothing at all when they have deleted it, and their draft-only engram
-    /// when no file holds that address at all.
-    async fn shadow_anchor(
-        &self,
-        domain: &str,
-        overlay: Option<&str>,
-        base: Option<EngramDescriptor>,
-        permalink: &str,
-    ) -> Result<Option<EngramDescriptor>> {
-        let Some(actor) = overlay else {
-            return Ok(base);
-        };
-        match base {
-            // One path, so one targeted lookup rather than a scan of this
-            // actor's whole overlay: the question is only ever "does this
-            // reader hold a row at the path the base row stands at".
-            Some(d) => {
-                let (domain_id, _) = self.domain_source(domain).await?;
-                let entry = {
-                    let store = self.store.lock().await;
-                    store.overlay_entry(domain_id, actor, &d.path).await?
-                };
-                Ok(match entry {
-                    Some(entry) if entry.tombstone => None,
-                    Some(entry) => overlay_descriptor(domain, domain_id, &entry),
-                    None => Some(d),
-                })
-            }
-            None => Ok(self
-                .resolve_draft(domain, actor, permalink)
-                .await?
-                .map(|(desc, _)| desc)),
-        }
-    }
-
-    /// The row whose outbound edges a reader sees for an engram: their own
-    /// draft's row when they hold one at that path, the base row otherwise.
-    ///
-    /// A draft-only engram already carries its own id, because nothing else
-    /// could have described it; this is about a draft that stands over a base
-    /// row, whose descriptor is the base's so that one engram keeps one
-    /// address. Its edges are not the base's.
-    async fn overlay_edge_id(
-        &self,
-        desc: &EngramDescriptor,
-        overlay: Option<&str>,
-    ) -> Result<EngramId> {
-        let Some(actor) = overlay else {
-            return Ok(desc.id);
-        };
-        let store = self.store.lock().await;
-        Ok(store
-            .overlay_entry(desc.domain_id, actor, &desc.path)
-            .await?
-            .filter(|entry| !entry.tombstone)
-            .map(|entry| entry.id)
-            .unwrap_or(desc.id))
-    }
-
-    /// The address one actor's own draft at `path` answers to, or `None` when
-    /// they hold no draft there (or hold a deletion, which answers to no
-    /// address at all).
-    async fn draft_permalink_at(
-        &self,
-        domain: &str,
-        actor: &str,
-        path: Option<&str>,
-    ) -> Result<Option<String>> {
-        let Some(path) = path else {
-            return Ok(None);
-        };
-        let (domain_id, _) = self.domain_source(domain).await?;
-        let store = self.store.lock().await;
-        Ok(store
-            .overlay_entry(domain_id, actor, path)
-            .await?
-            .filter(|entry| !entry.tombstone)
-            .map(|entry| entry.permalink))
     }
 
     /// [`Engine::resolve`] with the domains the caller may not see subtracted.
@@ -3887,7 +3335,7 @@ impl Engine {
     /// Load an engram's parsed form through a content source: the file on disk
     /// for a file domain, or the stored `content` column for a virtual domain.
     /// Backs validation and schema inference across both kinds.
-    async fn load_engram(
+    pub(crate) async fn load_engram(
         &self,
         source: &ContentSource,
         domain_id: DomainId,
@@ -3907,7 +3355,7 @@ impl Engine {
     /// file when a file domain holds it on disk, else the stored `content`
     /// column. This keeps files-are-truth for the host while serving virtual and
     /// non-host reads from the database.
-    async fn load_content(
+    pub(crate) async fn load_content(
         &self,
         source: &ContentSource,
         desc: &EngramDescriptor,
@@ -4008,8 +3456,9 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let source = self.content_source(&p.domain)?;
-        let overlay = self.overlay_for_write(&p.domain, scope).await?;
-        let actor = self.actor_for(client, overlay.as_ref());
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
         let engram_type = p
             .engram_type
             .clone()
@@ -4042,7 +3491,7 @@ impl Engine {
         // in its own arm after the file is written, exactly where it always
         // did, so a create this call is about to refuse leaves behind no
         // `domain` row it would not have created before.
-        let overlay_domain_id = match &overlay {
+        let overlay_domain_id = match overlay {
             Some(_) => Some(self.domain_source(&p.domain).await?.0),
             None => None,
         };
@@ -4055,7 +3504,7 @@ impl Engine {
         // nothing there).
         {
             let store = self.store.lock().await;
-            let taken = match (&overlay, overlay_domain_id) {
+            let taken = match (overlay, overlay_domain_id) {
                 (Some(actor), Some(domain_id)) => {
                     match store.overlay_entry(domain_id, actor, &rel).await? {
                         Some(entry) if entry.tombstone => None,
@@ -4109,10 +3558,8 @@ impl Engine {
         // The third place a write can land, and the reason it comes first: on a
         // domain in review mode the folder and the database both stay as the
         // team left them, so neither arm below may run.
-        if let (Some(actor), Some(domain_id)) = (&overlay, overlay_domain_id) {
-            let warning = self
-                .write_overlay_entry(&p.domain, domain_id, actor, &rel, &markdown)
-                .await?;
+        if let (Some(_), Some(domain_id)) = (overlay, overlay_domain_id) {
+            let warning = view.write(domain_id, &rel, &markdown).await?;
             receipt["draft"] = json!(true);
             note_unmirrored(&mut receipt, warning);
             return Ok(receipt);
@@ -4179,7 +3626,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope).await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
         // A document that is not an engram would poison the index on reindex,
         // so it is refused before anything is written. This is the one hard
         // gate, and it is deliberately narrow: the text must parse (clean
@@ -4203,9 +3651,7 @@ impl Engine {
                     .into(),
             ));
         }
-        let (desc, source) = self
-            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
-            .await?;
+        let (desc, source) = view.resolve(&p.identifier).await?;
         // A reserved name never resolves to an engram today (sync skips both),
         // so this is defence in depth rather than a reachable branch: the
         // generated `index.md` is derived from its folder and would be
@@ -4227,7 +3673,7 @@ impl Engine {
         // actor's draft verbatim, checked against the version they read - which
         // in review mode is their own draft where they hold one, so a second
         // save does not conflict against the first.
-        if let Some(who) = &overlay {
+        if let Some(who) = overlay {
             // Written directly rather than through `apply_source_edit`, and
             // that is the save's own contract rather than an omission: the
             // shared edit path stamps `generated`, and a save of what was read
@@ -4242,15 +3688,12 @@ impl Engine {
                 .join(&desc.path);
             let lock = self.write_lock(&mirror);
             let _guard = lock.lock().await;
-            let current = self
-                .overlay_visible_text(&source, &desc, who)
-                .await?
-                .ok_or_else(|| {
-                    EngineError::NotFound(format!(
-                        "no engram '{}' in domain '{}'",
-                        p.identifier, desc.domain
-                    ))
-                })?;
+            let current = view.text_at(&source, &desc).await?.ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    p.identifier, desc.domain
+                ))
+            })?;
             let found = sha256_hex(current.as_bytes());
             if found != p.expected_checksum {
                 return Err(EngineError::Conflict(stale_edit_message(
@@ -4258,9 +3701,7 @@ impl Engine {
                     &found,
                 )));
             }
-            let warning = self
-                .write_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path, &p.content)
-                .await?;
+            let warning = view.write(desc.domain_id, &desc.path, &p.content).await?;
             // Where the draft now answers, derived exactly as the row's own
             // permalink is: an author who edited the frontmatter's permalink
             // line has just moved the address, and the receipt has to say so.
@@ -4401,7 +3842,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(domain, scope).await?;
+        let view = DomainView::for_write(self, domain, scope).await?;
+        let overlay = view.actor();
         let parsed =
             parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
@@ -4430,10 +3872,8 @@ impl Engine {
         // The third place a restore can land: in review mode the recovered
         // document is this actor's draft of the path, never a file written
         // back into what the team reviewed.
-        if let Some(who) = &overlay {
-            let warning = self
-                .write_overlay_entry(domain, domain_id, who, path, content)
-                .await?;
+        if overlay.is_some() {
+            let warning = view.write(domain_id, path, content).await?;
             let permalink = parse_engram(content)
                 .map(|engram| {
                     EngramRecord::from_engram(&engram, path, virtual_stamp(content)).permalink
@@ -4504,7 +3944,7 @@ impl Engine {
     /// way a create does. The domain-addressed half of what
     /// [`Engine::resolve`] does for an identifier, for a write path whose
     /// engram is not in the index to resolve.
-    async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
+    pub(crate) async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
         let source = self.content_source(domain)?;
         let store = self.store.lock().await;
         let domain_id = match &source {
@@ -5194,21 +4634,17 @@ impl Engine {
             })
             .transpose()?;
 
-        let overlay = self.overlay_for_write(&p.domain, scope).await?;
-        let actor = self.actor_for(client, overlay.as_ref());
-        let (desc, source) = self
-            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
-            .await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
+        let (desc, source) = view.resolve(&p.identifier).await?;
 
         // Resolved before the target is touched: a missing successor must
         // never leave the target half-retired. Through the same view, so a
         // retirement in review mode can name a successor that only exists as
         // this actor's draft.
         let successor = match &p.successor {
-            Some(identifier) => Some(
-                self.resolve_in_for(identifier, &p.domain, overlay.as_deref())
-                    .await?,
-            ),
+            Some(identifier) => Some(view.resolve(identifier).await?),
             None => None,
         };
         // A successor that resolves to the target itself would append a
@@ -5255,9 +4691,9 @@ impl Engine {
             ))
         };
         let mut warning = None;
-        if let Some(who) = &overlay {
+        if overlay.is_some() {
             warning = self
-                .apply_source_edit(&desc, &source, Some(who), None, &actor, retire_target)
+                .apply_source_edit(&desc, &source, &view, None, &actor, retire_target)
                 .await?;
         } else {
             match &source {
@@ -5341,19 +4777,16 @@ impl Engine {
             // The successor's side of the pair joins the same actor's draft,
             // for the same reason the target's did: in review mode nothing this
             // verb writes belongs in the folder the team reviewed.
-            if let Some(who) = &overlay {
-                let current = self
-                    .overlay_visible_text(succ_source, succ_desc, who)
-                    .await?
-                    .ok_or_else(|| {
-                        EngineError::NotFound(format!(
-                            "no engram '{}' in domain '{}'",
-                            succ_desc.permalink, succ_desc.domain
-                        ))
-                    })?;
+            if overlay.is_some() {
+                let current = view.text_at(succ_source, succ_desc).await?.ok_or_else(|| {
+                    EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        succ_desc.permalink, succ_desc.domain
+                    ))
+                })?;
                 if !already(&current) {
                     let succ_warning = self
-                        .apply_source_edit(succ_desc, succ_source, Some(who), None, &actor, |c| {
+                        .apply_source_edit(succ_desc, succ_source, &view, None, &actor, |c| {
                             Ok(append_body(c, &line))
                         })
                         .await?;
@@ -5566,25 +4999,21 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope).await?;
-        let actor = self.actor_for(client, overlay.as_ref());
-        let (desc, source) = self
-            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
-            .await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
+        let (desc, source) = view.resolve(&p.identifier).await?;
         // The text the split moves observations out of is what this actor sees
         // there: their own draft when they hold one, the reviewed file
         // otherwise. Splitting the base under a draft would move lines the
         // splitter is not looking at.
-        let content = match &overlay {
-            Some(who) => self
-                .overlay_visible_text(&source, &desc, who)
-                .await?
-                .ok_or_else(|| {
-                    EngineError::NotFound(format!(
-                        "no engram '{}' in domain '{}'",
-                        p.identifier, p.domain
-                    ))
-                })?,
+        let content = match overlay {
+            Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    p.identifier, p.domain
+                ))
+            })?,
             None => self.load_content(&source, &desc).await?,
         };
         let checksum = sha256_hex(content.as_bytes());
@@ -5649,14 +5078,9 @@ impl Engine {
             .unwrap_or_else(|| crystalline_core::slugify(&title));
         let remaining = append_body(&plan.remaining, &format!("- split_into [[{back_link}]]"));
         let edited = self
-            .apply_source_edit_staged(
-                &desc,
-                &source,
-                overlay.as_deref(),
-                Some(&checksum),
-                &actor,
-                move |_| Ok(remaining),
-            )
+            .apply_source_edit_staged(&desc, &source, &view, Some(&checksum), &actor, move |_| {
+                Ok(remaining)
+            })
             .await;
         let source_warning = match edited {
             Ok(warning) => warning,
@@ -5811,25 +5235,23 @@ impl Engine {
 
     // --- read ----------------------------------------------------------------
 
-    /// One engram's exact file text and identity: what the collab session
-    /// layer loads at open and probes with on its idle external-change check.
-    /// Deliberately thin - [`Engine::read_engram`] resolves references and
-    /// builds hints this caller never reads.
+    /// One engram's exact file text and identity, addressed by domain name:
+    /// the base view of that domain, read the way the collab session layer
+    /// reads it at open. Deliberately thin - [`Engine::read_engram`] resolves
+    /// references and builds hints this caller never reads.
+    ///
+    /// **Whose text** is a view's to say, and this name-addressed form answers
+    /// with the folder the team reviewed, whoever else is drafting - which is
+    /// what it answered before there was anything else it could have answered.
+    /// A caller that already holds a reader's own view asks that view instead.
     pub async fn engram_text(&self, domain: &str, identifier: &str) -> Result<EngramText> {
-        let (desc, source) = self.resolve_in(identifier, domain).await?;
-        let content = self.load_content(&source, &desc).await?;
-        let checksum = sha256_hex(content.as_bytes());
-        Ok(EngramText {
-            domain: desc.domain,
-            permalink: desc.permalink,
-            path: desc.path,
-            content,
-            checksum,
-        })
+        DomainView::base(self, domain, &HashSet::new())?
+            .engram_text(identifier)
+            .await
     }
 
     /// The exact text a domain holds at a domain-relative PATH right now, or
-    /// `None` when nothing is there.
+    /// `None` when nothing is there: the base view of that domain.
     ///
     /// Path-addressed on purpose, and the counterpart of
     /// [`Engine::restore_engram`]: a collab room whose engram vanished from
@@ -5844,47 +5266,9 @@ impl Engine {
         domain: &str,
         path: &str,
     ) -> Result<Option<EngramText>> {
-        let source = self.content_source(domain)?;
-        let content = match &source {
-            ContentSource::File { root } => {
-                let abs = join_rel(root, path);
-                match std::fs::read_to_string(&abs) {
-                    Ok(text) => text,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(source) => {
-                        return Err(EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        });
-                    }
-                }
-            }
-            ContentSource::Virtual => {
-                let (domain_id, _) = self.domain_source(domain).await?;
-                let store = self.store.lock().await;
-                match store.engram_content(domain_id, path).await? {
-                    Some(text) => text,
-                    None => return Ok(None),
-                }
-            }
-        };
-        let permalink = {
-            let store = self.store.lock().await;
-            store
-                .list_engrams(domain, Some(path), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == path)
-                .map(|found| found.permalink)
-                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
-        };
-        Ok(Some(EngramText {
-            domain: domain.to_string(),
-            permalink,
-            path: path.to_string(),
-            checksum: sha256_hex(content.as_bytes()),
-            content,
-        }))
+        DomainView::base(self, domain, &HashSet::new())?
+            .engram_text_at_path(path)
+            .await
     }
 
     /// Read an engram's full markdown and resolved frontmatter. The content
@@ -5902,16 +5286,16 @@ impl Engine {
         let (desc, source, overlay) = self
             .resolve_shadowed(&p.identifier, p.domain.as_deref(), &hidden, scope)
             .await?;
+        // The reader's own view of the domain the identifier landed in, which
+        // is the one `resolve_shadowed` just answered through.
+        let view = DomainView::for_read(self, &desc.domain, &hidden, scope)?;
         let content = match &overlay {
-            Some(who) => self
-                .overlay_visible_text(&source, &desc, who)
-                .await?
-                .ok_or_else(|| {
-                    EngineError::NotFound(format!(
-                        "no engram '{}' in domain '{}'",
-                        p.identifier, desc.domain
-                    ))
-                })?,
+            Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    p.identifier, desc.domain
+                ))
+            })?,
             None => self.load_content(&source, &desc).await?,
         };
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
@@ -5930,7 +5314,7 @@ impl Engine {
         // base row's, deliberately: who points here is a fact about the address
         // the team shares, and nobody can write a reference to a draft only its
         // author can read.
-        let edge_id = self.overlay_edge_id(&desc, overlay.as_deref()).await?;
+        let edge_id = view.edge_id(&desc).await?;
         let (outbound, inbound) = {
             let store = self.store.lock().await;
             let outbound = store.outbound_refs(edge_id).await?;
@@ -6182,11 +5566,10 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope).await?;
-        let actor = self.actor_for(client, overlay.as_ref());
-        let (desc, source) = self
-            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
-            .await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
+        let (desc, source) = view.resolve(&p.identifier).await?;
         // An `evolve_ack` assignment is the one set_frontmatter key whose value
         // the server completes rather than takes: the scope comes from running
         // detection over this engram's domain, which needs the store and so
@@ -6198,7 +5581,7 @@ impl Engine {
             .apply_source_edit(
                 &desc,
                 &source,
-                overlay.as_deref(),
+                &view,
                 p.expected_checksum.as_deref(),
                 &actor,
                 |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
@@ -6238,7 +5621,7 @@ impl Engine {
         &self,
         desc: &EngramDescriptor,
         source: &ContentSource,
-        overlay: Option<&str>,
+        view: &DomainView<'_>,
         expected_checksum: Option<&str>,
         actor: &str,
         apply: F,
@@ -6246,7 +5629,7 @@ impl Engine {
     where
         F: FnOnce(&str) -> Result<String>,
     {
-        self.apply_source_edit_staged(desc, source, overlay, expected_checksum, actor, apply)
+        self.apply_source_edit_staged(desc, source, view, expected_checksum, actor, apply)
             .await
             .map_err(|failure| failure.error)
     }
@@ -6265,7 +5648,7 @@ impl Engine {
         &self,
         desc: &EngramDescriptor,
         source: &ContentSource,
-        overlay: Option<&str>,
+        view: &DomainView<'_>,
         expected_checksum: Option<&str>,
         actor: &str,
         apply: F,
@@ -6281,7 +5664,7 @@ impl Engine {
         // Every failure on this arm is a `before`: the row and its chunks go
         // down in one transaction that rolls back whole, so an edit that
         // refuses leaves the draft holding exactly the bytes it held.
-        if let Some(who) = overlay {
+        if let Some(who) = view.actor() {
             let state_dir = self
                 .journal_state_dir()
                 .map_err(SourceEditFailure::before)?;
@@ -6295,8 +5678,8 @@ impl Engine {
                 .join(&desc.path);
             let lock = self.write_lock(&mirror);
             let _guard = lock.lock().await;
-            let current = self
-                .overlay_visible_text(source, desc, who)
+            let current = view
+                .text_at(source, desc)
                 .await
                 .map_err(SourceEditFailure::before)?
                 .ok_or_else(|| {
@@ -6321,8 +5704,8 @@ impl Engine {
                     "reindex failed (test seam)".to_string(),
                 )));
             }
-            let warning = self
-                .write_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path, &edited)
+            let warning = view
+                .write(desc.domain_id, &desc.path, &edited)
                 .await
                 .map_err(SourceEditFailure::before)?;
             // Neither tail below runs. A draft of the MANIFEST is one actor's
@@ -6709,192 +6092,6 @@ impl Engine {
 
     // --- move ----------------------------------------------------------------
 
-    /// A move inside one actor's draft overlay: a tombstone at the source and
-    /// an entry at the destination.
-    ///
-    /// The shape a rename in review mode has to take, and the shape a later
-    /// convergence pass has to recognize: the reviewed file stays exactly where
-    /// the team put it, and this actor's view of the domain has the engram at
-    /// its new address until the move is reviewed.
-    ///
-    /// A cross-domain move is refused rather than half-performed. A draft
-    /// belongs to the domain it is drafted in - it has no row, no file and no
-    /// reviewer anywhere else - so carrying one across would either write into
-    /// a domain that never reviewed it or leave the engram in two places at
-    /// once, and the refusal names the order that works instead.
-    async fn move_within_overlay(
-        &self,
-        p: &MoveParams,
-        src: &EngramDescriptor,
-        src_source: &ContentSource,
-        dest_rel: &str,
-        cross: bool,
-        actor: &str,
-    ) -> Result<Value> {
-        if cross {
-            return Err(EngineError::Refused(format!(
-                "'{}' reviews changes before they land, so this engram is a draft, and a draft \
-                 moves only inside the domain it is drafted in - share the change first, then \
-                 move the engram the team has",
-                p.domain
-            )));
-        }
-        if dest_rel == src.path {
-            return Err(EngineError::Invalid(
-                "the destination is where the engram already is".into(),
-            ));
-        }
-        // Free in THIS actor's view, which is the only view the move happens
-        // in: a path another actor is drafting at is not taken for this one,
-        // and a base row at the destination is, since the moved engram would
-        // shadow it rather than land beside it.
-        {
-            let store = self.store.lock().await;
-            let taken = store
-                .overlay_entry(src.domain_id, actor, dest_rel)
-                .await?
-                .map(|entry| !entry.tombstone)
-                .unwrap_or(false)
-                || store
-                    .list_engrams(&p.domain, Some(dest_rel), None)
-                    .await?
-                    .iter()
-                    .any(|found| found.path == dest_rel);
-            if taken {
-                return Err(EngineError::Conflict(format!(
-                    "'{dest_rel}' already holds an engram in domain '{}'",
-                    p.domain
-                )));
-            }
-        }
-        let text = self
-            .overlay_visible_text(src_source, src, actor)
-            .await?
-            .ok_or_else(|| {
-                EngineError::NotFound(format!(
-                    "no engram '{}' in domain '{}'",
-                    p.identifier, p.domain
-                ))
-            })?;
-        // Where the engram would answer from once it has moved: the document
-        // travels verbatim, so the address travels with it unless the
-        // frontmatter never carried one and the path's own slug is it.
-        let dest_permalink = parse_engram(&text)
-            .map(|engram| {
-                EngramRecord::from_engram(&engram, dest_rel, virtual_stamp(&text)).permalink
-            })
-            .unwrap_or_else(|_| src.permalink.clone());
-        // Asked BEFORE either write, although the writer below asks it again:
-        // a move is two writes, and a refusal that arrived at the second one
-        // would already have tombstoned or dropped the source, leaving the
-        // rollback to put back a draft that lives in that row and nowhere
-        // else. The source does not count against itself - it is about to be a
-        // tombstone, which answers to no address, or gone.
-        self.refuse_permalink_held_elsewhere(
-            &p.domain,
-            src.domain_id,
-            actor,
-            &dest_permalink,
-            dest_rel,
-            Some(&src.path),
-        )
-        .await?;
-        // The SOURCE first, and the order is forced rather than preferred: one
-        // actor holds one row per permalink per domain, and until the source is
-        // a tombstone (which answers to no permalink) or gone, the engram's own
-        // permalink is still spoken for and the destination cannot take it.
-        //
-        // Which is why the destination's failure puts the source back. Once the
-        // source is a tombstone this actor reads nothing at that path, so a
-        // retry would not find the engram to move and the text - which for a
-        // draft lives in that row and nowhere else - would be gone. The
-        // rollback is what makes a move that fails a move that did not happen.
-        let held_draft = {
-            let store = self.store.lock().await;
-            store
-                .overlay_entry(src.domain_id, actor, &src.path)
-                .await?
-                .is_some_and(|entry| !entry.tombstone)
-        };
-        let base = {
-            let store = self.store.lock().await;
-            store
-                .list_engrams(&p.domain, Some(&src.path), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == src.path)
-        };
-        let mut warnings: Vec<String> = Vec::new();
-        match &base {
-            // A draft of a path no file holds was only ever this actor's, so
-            // the move takes it with them; a tombstone over nothing would
-            // leave a deletion of an engram the team never had.
-            None => {
-                self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
-                    .await?;
-            }
-            Some(base) => {
-                let base_text = self.load_content(src_source, base).await?;
-                warnings.extend(
-                    self.write_overlay_tombstone(&p.domain, actor, base, &base_text)
-                        .await?,
-                );
-            }
-        }
-        match self
-            .write_overlay_entry(&p.domain, src.domain_id, actor, dest_rel, &text)
-            .await
-        {
-            Ok(warning) => warnings.extend(warning),
-            Err(e) => {
-                // The destination's ROW did not land - a mirror that failed
-                // would have come back as a warning above - so there is nothing
-                // at the destination to collide with, and the source goes back
-                // to exactly what this actor held: their own draft when they
-                // had one, and otherwise nothing of their own at all, which is
-                // the base row showing through again.
-                let undo = if held_draft {
-                    self.write_overlay_entry_unchecked(
-                        &p.domain,
-                        src.domain_id,
-                        actor,
-                        &src.path,
-                        &text,
-                    )
-                    .await
-                    .map(|_| ())
-                } else {
-                    self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
-                        .await
-                };
-                if let Err(undo) = undo {
-                    tracing::error!(
-                        domain = p.domain.as_str(),
-                        path = src.path.as_str(),
-                        "the move could not write the destination and could not put the source \
-                         back either: {undo}"
-                    );
-                }
-                return Err(e);
-            }
-        }
-        let mut receipt = json!({
-            "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
-            "to": { "domain": p.domain, "permalink": dest_permalink, "path": dest_rel },
-            "cross_domain": false,
-            "links_rewritten": 0,
-            "attachment_warnings": Vec::<String>::new(),
-            "draft": true,
-        });
-        // A move is two writes and either mirror can fail on its own, so the
-        // receipt carries whichever of them did rather than the first.
-        note_unmirrored(
-            &mut receipt,
-            (!warnings.is_empty()).then(|| warnings.join(" ")),
-        );
-        Ok(receipt)
-    }
-
     /// Move an engram to a new path or domain, rewriting inbound bare links on a
     /// cross-domain move. Source and destination may each be a file or virtual
     /// domain, so a move carries content between the two truths: a same-domain
@@ -6920,10 +6117,9 @@ impl Engine {
         // Resolved once, before anything is written, and used twice below: to
         // look the destination up, and to bound the inbound rewrite.
         let hidden = self.hidden_for(scope).await?;
-        let overlay = self.overlay_for_write(&p.domain, scope).await?;
-        let (src, src_source) = self
-            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
-            .await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let (src, src_source) = view.resolve(&p.identifier).await?;
         let dest_domain = p
             .destination_domain
             .clone()
@@ -6961,9 +6157,9 @@ impl Engine {
         // see it where they moved it to. The folder itself does not move,
         // which is the whole of review mode - the rename is reviewed like any
         // other change.
-        if let Some(who) = &overlay {
-            return self
-                .move_within_overlay(p, &src, &src_source, &dest_rel, cross, who)
+        if overlay.is_some() {
+            return view
+                .move_within(p, &src, &src_source, &dest_rel, cross)
                 .await;
         }
 
@@ -7542,7 +6738,8 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let overlay = self.overlay_for_write(&p.domain, scope).await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
         if let Some(path) = attachment_identifier(&p.identifier) {
             // Refused rather than ignored: `expected_checksum` is a promise
             // about markdown a caller read, and an attachment's bytes are not
@@ -7561,9 +6758,7 @@ impl Engine {
                 "deleted": true,
             }));
         }
-        let (desc, source) = self
-            .resolve_in_for(&p.identifier, &p.domain, overlay.as_deref())
-            .await?;
+        let (desc, source) = view.resolve(&p.identifier).await?;
         // Held across the comparison and the removal, so a guarded delete
         // cannot check a file that a concurrent save then rewrites underneath
         // it. See `Engine::write_lock`.
@@ -7577,8 +6772,8 @@ impl Engine {
         };
         // The text the guard compares against is the one this caller read,
         // which in review mode is their own draft where they hold one.
-        let visible = match &overlay {
-            Some(who) => self.overlay_visible_text(&source, &desc, who).await?,
+        let visible = match overlay {
+            Some(_) => view.text_at(&source, &desc).await?,
             None => Some(self.load_content(&source, &desc).await?),
         };
         if let Some(expected) = &p.expected_checksum {
@@ -7597,7 +6792,7 @@ impl Engine {
         // The third place a delete can land, and neither arm below runs for
         // it: the file the team reviewed stays where it is, and this actor's
         // deletion of it stands beside it as a draft.
-        if let Some(who) = &overlay {
+        if let Some(who) = overlay {
             if visible.is_none() {
                 return Err(EngineError::NotFound(format!(
                     "no engram '{}' in domain '{}'",
@@ -7623,8 +6818,7 @@ impl Engine {
             };
             match base {
                 None => {
-                    self.drop_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path)
-                        .await?;
+                    view.drop(desc.domain_id, &desc.path).await?;
                 }
                 Some(_) => {
                     // The tombstone stands under the BASE row's own identity
@@ -7731,7 +6925,9 @@ impl Engine {
                     "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
                 )));
             }
-            let size = self.attachment_delete_size(&p.domain, &path).await?;
+            let size = DomainView::base(self, &p.domain, &HashSet::new())?
+                .attachment_delete_size(&path)
+                .await?;
             return Ok(json!({
                 "domain": p.domain,
                 "path": path,
@@ -7815,7 +7011,7 @@ impl Engine {
     /// and only the row stands. No bytes are read and nothing is written -
     /// unlike the read, which heals the row it serves, so round one no longer
     /// mutates the derived layer at all.
-    async fn attachment_delete_size(&self, domain: &str, path: &str) -> Result<u64> {
+    pub(crate) async fn attachment_delete_size(&self, domain: &str, path: &str) -> Result<u64> {
         validate_attachment_path(path)?;
         let (domain_id, source) = self.domain_source(domain).await?;
         let row = {
@@ -8179,6 +7375,10 @@ impl Engine {
             .and_then(Value::as_str)
             .map(str::to_string);
         let work = async {
+            // This writer's own view of the domain they just wrote in. The
+            // write itself already screened the domain (`refuse_hidden_domain`
+            // on the way in), so there is nothing left for this pass to screen.
+            let view = DomainView::for_read(self, &domain, &HashSet::new(), scope)?;
             let text = match probe {
                 SimilarProbe::Write {
                     title,
@@ -8193,9 +7393,8 @@ impl Engine {
                     // base-only lookup answered `None` there - which skipped
                     // the advisory silently, on exactly the writes a domain in
                     // review mode is made of.
-                    let overlay = self.overlay_for_read(&domain, scope);
-                    let title = self
-                        .resolve_in_for(&permalink, &domain, overlay.as_deref())
+                    let title = view
+                        .resolve(&permalink)
                         .await
                         .ok()
                         .map(|(desc, _)| desc.title);
@@ -8215,13 +7414,10 @@ impl Engine {
             // them to merge into it. Excluding the draft's loses nothing:
             // wherever a draft stands at a path, the base row at that path is
             // shadowed out of the candidate set anyway.
-            let exclude = match self.overlay_for_read(&domain, scope) {
-                Some(actor) => self
-                    .draft_permalink_at(&domain, &actor, receipt_path.as_deref())
-                    .await?
-                    .unwrap_or_else(|| permalink.clone()),
-                None => permalink.clone(),
-            };
+            let exclude = view
+                .draft_permalink_at(receipt_path.as_deref())
+                .await?
+                .unwrap_or_else(|| permalink.clone());
             self.await_embed_backlog(SIMILAR_BACKLOG_WAIT).await;
             self.similar_engrams(&text, Some((&domain, &exclude)), scope)
                 .await
@@ -8300,8 +7496,13 @@ impl Engine {
         // The registered-set screen composes ahead of the actor dimension: the
         // overlay question is asked only about a domain this reader may see, so
         // a draft of their own is no way into one they may not.
-        let overlay = visible_anchor
-            .then(|| self.overlay_for_read(&url.domain, scope))
+        //
+        // No view at all for a domain this reader may not see, and none for a
+        // name nobody registered either: both keep the base seeds they were
+        // handed, and both fall through to the same miss. Building one for
+        // either would answer one of them with a refusal the other never gets.
+        let view = visible_anchor
+            .then(|| DomainView::for_read(self, &url.domain, &hidden, scope).ok())
             .flatten();
         let seeds: Vec<EngramDescriptor> = if url.glob {
             let base = if visible_anchor {
@@ -8310,11 +7511,13 @@ impl Engine {
             } else {
                 Vec::new()
             };
-            self.shadow_seeds(&url.domain, overlay.as_deref(), base)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+            match &view {
+                Some(view) => view.list_over(base).await?,
+                None => base,
+            }
+            .into_iter()
+            .filter(|d| url.matches(&d.domain, &d.permalink))
+            .collect()
         } else {
             let found = if visible_anchor {
                 let store = self.store.lock().await;
@@ -8322,10 +7525,11 @@ impl Engine {
             } else {
                 None
             };
-            match self
-                .shadow_anchor(&url.domain, overlay.as_deref(), found, &url.permalink)
-                .await?
-            {
+            let anchored = match &view {
+                Some(view) => view.anchor(found, &url.permalink).await?,
+                None => found,
+            };
+            match anchored {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -8485,9 +7689,6 @@ impl Engine {
         // with the same miss a visible domain with nothing in it answers with.
         // See [`Engine::build_context`], which seeds the same way.
         let visible_anchor = !hidden.contains(&url.domain);
-        let overlay = visible_anchor
-            .then(|| self.overlay_for_read(&url.domain, scope))
-            .flatten();
         let base: Vec<EngramDescriptor> = if url.glob {
             if visible_anchor {
                 store.list_engrams(&url.domain, None, None).await?
@@ -8505,22 +7706,26 @@ impl Engine {
             }
         };
         drop(store);
+        // See [`Engine::build_context`], which seeds through a view the same
+        // way: a domain this reader may not see builds none.
+        let view = visible_anchor
+            .then(|| DomainView::for_read(self, &url.domain, &hidden, scope).ok())
+            .flatten();
         let seeds: Vec<EngramDescriptor> = if url.glob {
-            self.shadow_seeds(&url.domain, overlay.as_deref(), base)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+            match &view {
+                Some(view) => view.list_over(base).await?,
+                None => base,
+            }
+            .into_iter()
+            .filter(|d| url.matches(&d.domain, &d.permalink))
+            .collect()
         } else {
-            match self
-                .shadow_anchor(
-                    &url.domain,
-                    overlay.as_deref(),
-                    base.into_iter().next(),
-                    &url.permalink,
-                )
-                .await?
-            {
+            let found = base.into_iter().next();
+            let anchored = match &view {
+                Some(view) => view.anchor(found, &url.permalink).await?,
+                None => found,
+            };
+            match anchored {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -8659,7 +7864,7 @@ impl Engine {
         // This reader's own drafts, folded in after the screen above exactly as
         // they are on a browse: the domains `hidden_for` already allowed, and
         // only then whose drafts they are.
-        self.shadow_recent(&filter, &hidden, scope, &mut items)
+        self.fold_recent_drafts(&filter, &hidden, scope, &mut items)
             .await?;
         Ok(json!({
             "timeframe": timeframe,
@@ -8668,30 +7873,20 @@ impl Engine {
         }))
     }
 
-    /// Fold one reader's drafts into a recency listing.
+    /// Fold every reviewing domain's drafts into a recency listing.
     ///
-    /// The same three edits shadowing means everywhere: a row this actor has
-    /// tombstoned leaves, a row they are drafting is described by their draft,
-    /// and a draft the base listing does not hold joins it. The result is
-    /// re-sorted and re-cut exactly as the statement sorted and cut it, so a
-    /// caller reading `count` reads the count of what came back.
-    ///
-    /// **The base page was already cut to the limit in SQL**, so a draft
-    /// joining it can push out a base row that would otherwise have been the
-    /// last one shown, and a tombstone over a row below the cut subtracts
-    /// nothing. Both are the same imprecision [`Engine::shadow_level`] carries
-    /// and for the same reason: an exact answer needs the actor threaded into
-    /// the statement, which is the index-side work Task 5 does for search.
-    /// Neither can hide a draft from its own author, which is the hole this
-    /// closes.
-    async fn shadow_recent(
+    /// The cross-domain half: which domains this reader may see, which of them
+    /// the filter allows, and the one re-sort and re-cut over the whole folded
+    /// list. What each domain's own drafts do to the page is
+    /// [`DomainView::recent_into`], asked once per domain.
+    async fn fold_recent_drafts(
         &self,
         filter: &RecentFilter,
         hidden: &HashSet<String>,
         scope: &crate::scope::Scope,
         items: &mut Vec<EngramSummary>,
     ) -> Result<()> {
-        let reviewed: Vec<(String, String)> = self
+        let reviewed: Vec<DomainView<'_>> = self
             .registered_domain_names()
             .into_iter()
             .filter(|name| !hidden.contains(name))
@@ -8701,76 +7896,14 @@ impl Engine {
                     .as_ref()
                     .is_none_or(|only| only.iter().any(|d| d == name))
             })
-            .filter_map(|name| {
-                self.overlay_for_read(&name, scope)
-                    .map(|actor| (name, actor))
-            })
+            .filter_map(|name| DomainView::for_read(self, &name, hidden, scope).ok())
+            .filter(|view| view.actor().is_some())
             .collect();
         if reviewed.is_empty() {
             return Ok(());
         }
-        for (domain, actor) in reviewed {
-            let (domain_id, _) = self.domain_source(&domain).await?;
-            let entries = {
-                let store = self.store.lock().await;
-                store.overlay_entries(domain_id, &actor).await?
-            };
-            if entries.is_empty() {
-                continue;
-            }
-            for entry in &entries {
-                // What the base row at this path answers to, which is the only
-                // thing that ties a draft to the row it shadows here: a
-                // recency listing carries no path.
-                let shadowed = {
-                    let store = self.store.lock().await;
-                    store
-                        .list_engrams(&domain, Some(&entry.path), None)
-                        .await?
-                        .into_iter()
-                        .find(|found| found.path == entry.path)
-                        .map(|found| found.permalink)
-                };
-                items.retain(|item| {
-                    item.domain != domain
-                        || (Some(&item.permalink) != shadowed.as_ref()
-                            && item.permalink != entry.permalink)
-                });
-                if entry.tombstone {
-                    continue;
-                }
-                let Ok(engram) = parse_engram(&entry.content) else {
-                    continue;
-                };
-                let record =
-                    EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
-                // The caller's own filters, applied to a draft exactly as the
-                // statement applied them to a base row.
-                let recorded = record.recorded_at.map(|at| at.to_string());
-                if filter
-                    .after
-                    .as_ref()
-                    .is_some_and(|after| recorded.as_ref().is_none_or(|at| at < after))
-                {
-                    continue;
-                }
-                if filter
-                    .engram_types
-                    .as_ref()
-                    .is_some_and(|types| !types.contains(&record.engram_type))
-                {
-                    continue;
-                }
-                items.push(EngramSummary {
-                    domain: domain.clone(),
-                    permalink: entry.permalink.clone(),
-                    title: record.title,
-                    engram_type: record.engram_type,
-                    status: record.status,
-                    recorded_at: recorded,
-                    tags: record.tags,
-                });
-            }
+        for view in reviewed {
+            view.recent_into(filter, items).await?;
         }
         // The statement's own order, re-applied over the folded list.
         items.sort_by(|a, b| {
@@ -9351,9 +8484,9 @@ impl Engine {
         // their draft, and a draft at a path the domain's files never held
         // joins it. Applied AFTER the domain screen above, which is the order
         // the whole actor dimension composes in.
-        if let Some(actor) = self.overlay_for_read(&p.domain, scope) {
-            self.shadow_level(&p.domain, &actor, prefix.as_deref(), depth, &mut level)
-                .await?;
+        {
+            let view = DomainView::for_read(self, &p.domain, &hidden, scope)?;
+            view.level(prefix.as_deref(), depth, &mut level).await?;
         }
 
         // Whether the level was cut is a fact about the rows, decided before the
@@ -9390,102 +8523,6 @@ impl Engine {
             "truncated": truncated,
             "total": level.total,
         }))
-    }
-
-    /// Fold one reader's drafts into a browse level.
-    ///
-    /// Three edits, which are the whole of what shadowing means for a listing:
-    /// a row this actor has tombstoned leaves, a row they are drafting is
-    /// described by their draft rather than by the file, and a draft at a path
-    /// the domain's files never held joins the level and contributes its folder
-    /// if it is in one.
-    ///
-    /// **The level's `total` is adjusted by what this pass can see, and on a
-    /// level the cap already cut that is the base level's count plus this
-    /// actor's drafts rather than an exact one.** `browse_level` pushes the
-    /// prefix, the depth and [`TREE_LEVEL_CAP`] into SQL and counts under the
-    /// same filter, so a tombstone over a row that fell outside the returned
-    /// page cannot be subtracted here without reading the page the cap
-    /// withheld. A cut level is already telling its client to ask for the
-    /// listing instead; an exact count for one needs the actor threaded into
-    /// the statement, which is the index-side work Task 5 does for search.
-    async fn shadow_level(
-        &self,
-        domain: &str,
-        actor: &str,
-        prefix: Option<&str>,
-        depth: usize,
-        level: &mut BrowseLevel,
-    ) -> Result<()> {
-        let (domain_id, _) = self.domain_source(domain).await?;
-        let entries = {
-            let store = self.store.lock().await;
-            store.overlay_entries(domain_id, actor).await?
-        };
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let folder = folder_slash_lower(prefix.unwrap_or_default());
-        let mut drafts: HashMap<String, &crystalline_index::StoredEngram> = HashMap::new();
-        let mut tombstones: HashSet<String> = HashSet::new();
-        for entry in &entries {
-            if entry.tombstone {
-                tombstones.insert(entry.path.clone());
-            } else {
-                drafts.insert(entry.path.clone(), entry);
-            }
-        }
-
-        let before = level.engrams.len();
-        level.engrams.retain(|d| !tombstones.contains(&d.path));
-        let removed = before - level.engrams.len();
-
-        let mut seen: HashSet<String> = level.engrams.iter().map(|d| d.path.clone()).collect();
-        for row in level.engrams.iter_mut() {
-            if let Some(draft) = drafts.get(&row.path) {
-                overwrite_from_draft(row, draft);
-            }
-        }
-
-        // The drafts the base level does not hold, at this level and under this
-        // prefix: the same two cuts `browse_level` makes in SQL, made here in
-        // Rust over a handful of rows.
-        let mut added = 0usize;
-        let mut folders: BTreeSet<String> = level.folders.iter().cloned().collect();
-        for entry in &entries {
-            if entry.tombstone || seen.contains(&entry.path) {
-                continue;
-            }
-            let lowered = entry.path.to_lowercase();
-            let Some(rel) = lowered.strip_prefix(folder.as_str()) else {
-                continue;
-            };
-            let rel = &entry.path[entry.path.len() - rel.len()..];
-            if let Some((head, _)) = rel.split_once('/') {
-                folders.insert(head.to_string());
-            }
-            if rel.matches('/').count() >= depth {
-                continue;
-            }
-            let mut row = EngramDescriptor {
-                id: entry.id,
-                domain_id,
-                domain: domain.to_string(),
-                path: entry.path.clone(),
-                permalink: entry.permalink.clone(),
-                title: String::new(),
-                engram_type: String::new(),
-                status: String::new(),
-            };
-            overwrite_from_draft(&mut row, entry);
-            seen.insert(entry.path.clone());
-            level.engrams.push(row);
-            added += 1;
-        }
-        level.engrams.sort_by(|a, b| a.path.cmp(&b.path));
-        level.folders = folders.into_iter().collect();
-        level.total = level.total.saturating_sub(removed) + added;
-        Ok(())
     }
 
     // --- validate ------------------------------------------------------------
@@ -10216,25 +9253,21 @@ impl Engine {
         if rule_info(&rule).is_none() {
             return Err(EngineError::Invalid(unknown_rule_message(&rule)));
         }
-        let overlay = self.overlay_for_write(domain, acting).await?;
-        let actor = self.actor_for(client, overlay.as_ref());
+        let view = DomainView::for_write(self, domain, acting).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
         let scope = scope
             .map(str::trim)
             .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
-        let (desc, source) = self
-            .resolve_in_for(identifier, domain, overlay.as_deref())
-            .await?;
+        let (desc, source) = view.resolve(identifier).await?;
         // Checked before the write so an engram carrying no such entry answers
         // "nothing to withdraw" without a rewrite, a reindex or a touched
         // generated block. Read through the overlay, so an acknowledgment a
         // draft carries is what a withdrawal in review mode looks at.
-        let current = match &overlay {
-            Some(who) => self
-                .overlay_visible_text(&source, &desc, who)
-                .await?
-                .ok_or_else(|| {
-                    EngineError::NotFound(format!("no engram '{identifier}' in domain '{domain}'"))
-                })?,
+        let current = match overlay {
+            Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
+                EngineError::NotFound(format!("no engram '{identifier}' in domain '{domain}'"))
+            })?,
             None => self.load_source(&source, &desc).await?,
         };
         if !has_ack(&current, &rule, scope) {
@@ -10242,14 +9275,9 @@ impl Engine {
         }
         // The answer here is a bool, so a mirror warning has nowhere to ride
         // out; `write_overlay_entry` has already logged it.
-        self.apply_source_edit(
-            &desc,
-            &source,
-            overlay.as_deref(),
-            None,
-            &actor,
-            |current| Ok(without_ack(current, &rule, scope)),
-        )
+        self.apply_source_edit(&desc, &source, &view, None, &actor, |current| {
+            Ok(without_ack(current, &rule, scope))
+        })
         .await?;
         Ok(true)
     }
@@ -10310,7 +9338,15 @@ impl Engine {
     ) -> Result<Option<DomainSweep>> {
         let mut unparsed = 0usize;
         let source = self.content_source(name)?;
-        let overlay = self.overlay_for_read(name, scope);
+        // One view, built once and asked five times below - the listing, the
+        // entries, the base text behind them, the draft references and the
+        // actor key the lead vectors are read in - where each of those used to
+        // derive the same actor for itself. The caller has already screened the
+        // domain (`evolve_detect` resolves every name through
+        // `domain_entry_scoped` before it gets here), so this pass screens
+        // nothing further.
+        let view = DomainView::for_read(self, name, &HashSet::new(), scope)?;
+        let overlay = view.actor();
         let store = self.store.lock().await;
         let base = store.list_engrams(name, None, None).await?;
         drop(store);
@@ -10326,7 +9362,7 @@ impl Engine {
         // finding about a base row its author has already redrafted is a
         // finding about text they no longer see. The lock is dropped first
         // because the helper takes it itself.
-        let descs = self.shadow_seeds(name, overlay.as_deref(), base).await?;
+        let descs = view.list_over(base).await?;
         // No engrams means no domain row to query against and nothing to
         // detect. An empty domain is quiet, not an error. Read off the listing
         // rather than the registration, so a domain whose only rows are one
@@ -10335,17 +9371,18 @@ impl Engine {
             return Ok(None);
         };
 
-        let held = self.overlay_view(domain_id, overlay.as_deref()).await?;
-        let drafts = &held.text;
+        let held = view.entries(domain_id).await?;
+        let drafts = DomainView::held_text(&held);
+        let drafts = &drafts;
         // What the domain's own rows reference at the paths this caller's view
         // replaced or removed, which is the other half of the union `V108` asks
         // its question of. Read from the base text, never from the draft.
-        let shadowed_asset_refs = self.shadowed_asset_refs(&source, domain_id, &held).await;
+        let shadowed_asset_refs = view.shadowed_asset_refs(domain_id, &held).await;
 
         // Traversed in the caller's dimension too, or every draft would come
         // back with no edges at all and `V104` would report the engrams
         // somebody is working on hardest as orphans.
-        let graph = self.sweep_graph(&descs, overlay.as_deref()).await?;
+        let graph = self.sweep_graph(&descs, overlay).await?;
         let mut inbound: HashMap<i64, usize> = HashMap::new();
         let mut outbound: HashMap<i64, usize> = HashMap::new();
         for edge in &graph.edges {
@@ -10362,7 +9399,7 @@ impl Engine {
         // That query answers for the rows the domain itself holds, which is the
         // base half of this caller's view. The other half is their own drafts,
         // and it is assembled in their dimension rather than the domain's.
-        unresolved.extend(self.draft_unresolved(&*store, name, &descs, drafts).await?);
+        unresolved.extend(view.draft_unresolved(&*store, &descs, drafts).await?);
         // Shared on purpose, and the one input to the sweep that is: `V203`
         // speaks about the vocabulary a domain has agreed on, so a tag one
         // actor is trying out in a draft is not yet drift and the team's own
@@ -10385,7 +9422,7 @@ impl Engine {
         // vector and the fact it attaches to are one engram's.
         let mut lead_vectors: HashMap<i64, Vec<f32>> = if embedded {
             store
-                .lead_vectors(domain_id, &self.model_id, overlay.as_deref())
+                .lead_vectors(domain_id, &self.model_id, overlay)
                 .await?
                 .into_iter()
                 .map(|lv| (lv.engram_id.0, lv.vector))
@@ -10443,7 +9480,7 @@ impl Engine {
                 // own actor key for their draft standing at that path. What
                 // `V301`'s path skip reads the dimension out of.
                 actor: match held {
-                    Some(_) => overlay.clone().unwrap_or_default(),
+                    Some(_) => overlay.unwrap_or_default().to_string(),
                     None => String::new(),
                 },
                 status,
@@ -10536,145 +9573,6 @@ impl Engine {
             unshared: work.count(),
             oldest_change: work.oldest_change_date(),
         })
-    }
-
-    /// One actor's overlay rows over a domain, read in a single query.
-    ///
-    /// `None` - a domain that takes changes directly, or a caller with no
-    /// identity of their own - answers with an empty view, which is what makes
-    /// every reader of it degrade to the base behaviour without a branch of
-    /// their own.
-    async fn overlay_view(&self, domain_id: DomainId, actor: Option<&str>) -> Result<OverlayView> {
-        let Some(actor) = actor else {
-            return Ok(OverlayView::default());
-        };
-        let entries = {
-            let store = self.store.lock().await;
-            store.overlay_entries(domain_id, actor).await?
-        };
-        let mut view = OverlayView::default();
-        for entry in entries {
-            view.paths.push(entry.path.clone());
-            if !entry.tombstone {
-                view.text.insert(entry.path, entry.content);
-            }
-        }
-        Ok(view)
-    }
-
-    /// The attachment paths the domain's OWN text references or claims at the
-    /// paths one actor's view has replaced or removed.
-    ///
-    /// `V108`'s other half. An attachment is shared state and deleting one is a
-    /// shared act, so the question "does anything reference this file" is asked
-    /// of the union rather than of one reader: an author who drafts a reference
-    /// away is never told the file is now unused, and neither is anybody else.
-    /// The base document is what is read here - [`Engine::load_engram`] takes
-    /// the file for a file domain and the `actor = ''` row for a virtual one -
-    /// so a path only this actor's overlay holds contributes nothing, having no
-    /// shared text to speak for it.
-    ///
-    /// Best effort by construction: a base document that no longer parses is
-    /// skipped, which is the same answer the fact assembly gives it.
-    async fn shadowed_asset_refs(
-        &self,
-        source: &ContentSource,
-        domain_id: DomainId,
-        held: &OverlayView,
-    ) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for path in &held.paths {
-            let Some(engram) = self.load_engram(source, domain_id, path).await else {
-                continue;
-            };
-            out.extend(crystalline_core::find_asset_refs(&engram.body));
-            out.extend(asset_claim(&engram.frontmatter));
-        }
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// The dangling references in one actor's own drafts, as
-    /// [`crystalline_index::UnresolvedRef`] rows to stand beside the base ones.
-    ///
-    /// Two halves, and both are the same sentence read from different ends: the
-    /// references come off the draft's own row ([`Store::outbound_refs`], the
-    /// call `read_engram` makes for a draft's outbound edges), and whether each
-    /// one answers to anything is decided against `descs` - the shadowed
-    /// listing, which is base rows plus this actor's drafts with their deleted
-    /// paths already absent. The stored `resolved` flag cannot answer it: every
-    /// arm of the index's resolution is `actor = ''` by design, so it calls a
-    /// link between two of one author's drafts broken and a link to a path they
-    /// have deleted sound, and both are backwards for the person reading.
-    ///
-    /// A reference into ANOTHER domain keeps the stored verdict. That domain's
-    /// rows are not in this listing, and a resolved edge there is a fact about
-    /// the domain rather than about a reader - which is the rule that stays,
-    /// deliberately, whatever this sweep does inside its own domain.
-    ///
-    /// Rows come back ordered the way both backends order the base rows - by
-    /// path, then line, then kind, then target (`turso/mod.rs` `ORDER BY 7, 6,
-    /// 2, 5`, and the matching Postgres form) - because `outbound_refs` orders
-    /// by line alone, which leaves two references on one line to the union's
-    /// own arm order. The `links_to` default for a prose wikilink is
-    /// [`crystalline_index::LINKS_TO`], the constant both backends spell into
-    /// their own queries, so the two never drift apart.
-    async fn draft_unresolved(
-        &self,
-        store: &dyn Store,
-        domain: &str,
-        descs: &[EngramDescriptor],
-        drafts: &HashMap<String, String>,
-    ) -> Result<Vec<crystalline_index::UnresolvedRef>> {
-        if drafts.is_empty() {
-            return Ok(Vec::new());
-        }
-        // The two readings the index tries inside one domain: the target as a
-        // permalink, then as a title, the second case-insensitively.
-        let permalinks: HashSet<&str> = descs.iter().map(|d| d.permalink.as_str()).collect();
-        let titles: HashSet<String> = descs.iter().map(|d| d.title.to_lowercase()).collect();
-
-        let mut held: Vec<&EngramDescriptor> = descs
-            .iter()
-            .filter(|d| drafts.contains_key(&d.path))
-            .collect();
-        held.sort_by(|a, b| a.path.cmp(&b.path));
-
-        let mut out: Vec<crystalline_index::UnresolvedRef> = Vec::new();
-        for d in held {
-            let mut refs: Vec<crystalline_index::UnresolvedRef> = Vec::new();
-            for reference in store.outbound_refs(d.id).await? {
-                let answered = match reference.to_domain.as_deref() {
-                    Some(named) if named != domain => reference.resolved,
-                    _ => {
-                        permalinks.contains(reference.to_target.as_str())
-                            || titles.contains(&reference.to_target.to_lowercase())
-                    }
-                };
-                if answered {
-                    continue;
-                }
-                refs.push(crystalline_index::UnresolvedRef {
-                    from: d.id,
-                    rel_type: reference
-                        .rel_type
-                        .unwrap_or_else(|| crystalline_index::LINKS_TO.to_string()),
-                    kind: reference.kind,
-                    target_domain: reference.to_domain,
-                    target: reference.to_target,
-                    line: Some(reference.line),
-                });
-            }
-            refs.sort_by(|a, b| {
-                a.line
-                    .cmp(&b.line)
-                    .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
-                    .then_with(|| a.target.cmp(&b.target))
-            });
-            out.extend(refs);
-        }
-        Ok(out)
     }
 
     /// The resolved graph around a whole domain, at depth 1 so every
@@ -12065,7 +10963,7 @@ impl Engine {
     /// never watched - would otherwise sit unembedded until the self-heal
     /// tick. With no worker wired this is a no-op, as [`Engine::request_embed`]
     /// already is.
-    fn nudge_embed(&self) {
+    pub(crate) fn nudge_embed(&self) {
         let _ = self.request_embed();
     }
 
@@ -13423,9 +12321,9 @@ impl Engine {
         // stands NOW rather than as the plan found it: see step 4 of the
         // ordering.
         for held in self.overlay_actor_drafts(domain_id).await? {
+            let view = DomainView::for_actor(self, domain, &HashSet::new(), &held.actor)?;
             for draft in &held.entries {
-                self.drop_overlay_entry(domain, domain_id, &held.actor, &draft.path)
-                    .await?;
+                view.drop(domain_id, &draft.path).await?;
             }
         }
 
@@ -15074,15 +13972,9 @@ impl Engine {
                 "domain '{domain}' has no origin state; add the domain from its origin first"
             ))
         })?;
-        let entries = {
-            let store = self.store.lock().await;
-            match store.domain_id(domain).await? {
-                Some(domain_id) => store.overlay_entries(domain_id, actor).await?,
-                None => Vec::new(),
-            }
-        };
+        let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
         Ok(PreparedShare {
-            staging: share_staging::build(domain, state_dir, &state.files, &entries)?,
+            staging: view.materialise(state_dir, &state.files).await?,
             pinned: state.base_commit,
         })
     }
@@ -15667,7 +14559,8 @@ impl Engine {
                 report.skipped_diverged.push(file.path.clone());
                 continue;
             }
-            self.drop_overlay_entry(domain, domain_id, actor, &file.path)
+            DomainView::for_actor(self, domain, &HashSet::new(), actor)?
+                .drop(domain_id, &file.path)
                 .await?;
             match file.change {
                 // A page only this actor had goes away with the proposal.
@@ -15883,11 +14776,11 @@ impl Engine {
         path: &str,
         resolution: ops::Resolution<'_>,
     ) -> Result<Value> {
+        let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
         match resolution {
             ops::Resolution::Mine => {}
             ops::Resolution::Theirs => {
-                self.drop_overlay_entry(domain, domain_id, actor, path)
-                    .await?;
+                view.drop(domain_id, path).await?;
             }
             ops::Resolution::Merged(bytes) => {
                 let text = std::str::from_utf8(bytes).map_err(|_| {
@@ -15895,8 +14788,7 @@ impl Engine {
                         "the merged content is not valid UTF-8, so it is not an engram".to_string(),
                     )
                 })?;
-                self.write_overlay_entry(domain, domain_id, actor, path, text)
-                    .await?;
+                view.write(domain_id, path, text).await?;
             }
         }
         let remaining = self.settle_convergence(domain, actor, path);
@@ -16104,7 +14996,7 @@ impl Engine {
     /// The state directory the overlay journal lives under: the test override,
     /// or the real one. `<state_dir>/overlays/<domain>/<actor>/<path>` is the
     /// journal's own layout, which [`crate::overlay_journal`] owns.
-    fn journal_state_dir(&self) -> Result<PathBuf> {
+    pub(crate) fn journal_state_dir(&self) -> Result<PathBuf> {
         match &self.state_dir_override {
             Some(p) => Ok(p.clone()),
             // **Under the test seam this refuses instead of falling back**, and
@@ -18719,31 +17611,6 @@ fn asset_tail(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// The `assets/` path an engram's `analyzes` claim names, or `None` when it
-/// claims nothing under the folder.
-///
-/// `analyzes` is ordinary custom frontmatter (the agent's act of claiming an
-/// attachment it read), so the value is whatever was written there: a leading
-/// `./` is stripped and the folder segment is folded to its canonical
-/// spelling, and anything that does not address the reserved folder at all is
-/// not a claim.
-/// One actor's overlay over one domain, as a sweep needs it once the listing
-/// has already been shadowed: the document they hold at each path, and every
-/// path where their view and the domain's diverge at all.
-///
-/// Read once per sweep rather than per engram, and empty for a sweep that is
-/// nobody's in particular.
-#[derive(Default)]
-struct OverlayView {
-    /// Path to this actor's own document. Tombstones are absent: a deletion is
-    /// not an engram to assemble facts from, and the listing has dropped it
-    /// too.
-    text: HashMap<String, String>,
-    /// Every path this actor holds a row at, tombstones included - which is
-    /// exactly where their view and the domain's own rows disagree.
-    paths: Vec<String>,
-}
-
 /// One domain's sweep: its report and how many of its engrams no longer parse.
 struct DomainSweep {
     /// The ranked findings for that domain, acknowledgments already applied.
@@ -19031,7 +17898,15 @@ fn ack_json(entry: &EvolveAck) -> Value {
     })
 }
 
-fn asset_claim(fm: &Frontmatter) -> Option<String> {
+/// The `assets/` path an engram's `analyzes` claim names, or `None` when it
+/// claims nothing under the folder.
+///
+/// `analyzes` is ordinary custom frontmatter (the agent's act of claiming an
+/// attachment it read), so the value is whatever was written there: a leading
+/// `./` is stripped and the folder segment is folded to its canonical
+/// spelling, and anything that does not address the reserved folder at all is
+/// not a claim.
+pub(crate) fn asset_claim(fm: &Frontmatter) -> Option<String> {
     let raw = fm.extra.get("analyzes")?.as_str()?.trim();
     crystalline_core::canonical_asset_path(raw.trim_start_matches("./"))
 }
@@ -19317,7 +18192,7 @@ fn assets_reserved_error(rel: &str) -> String {
 /// One field on every routed verb, so a caller learns the same thing the same
 /// way whichever verb it called, and a receipt with no such field means the
 /// draft is mirrored.
-fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
+pub(crate) fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
     if let Some(text) = warning {
         receipt["draft_warning"] = json!(text);
     }
@@ -19331,7 +18206,7 @@ fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
 /// exist again. The underlying error rides along because the cause is almost
 /// always a state directory that is not writable, which the reader can see and
 /// fix.
-fn unmirrored(domain: &str, actor: &str, path: &str, reason: &std::io::Error) -> String {
+pub(crate) fn unmirrored(domain: &str, actor: &str, path: &str, reason: &std::io::Error) -> String {
     format!(
         "the draft of '{path}' landed in the index, but this machine could not mirror it under \
          its state directory ({reason}), so a 'crystalline reindex --wipe' would lose it; make \
@@ -19344,7 +18219,7 @@ fn unmirrored(domain: &str, actor: &str, path: &str, reason: &std::io::Error) ->
 /// otherwise ending in the slash that makes it a folder. The Rust counterpart
 /// of the backends' own `folder_slash`, used to cut draft paths to the level
 /// being browsed.
-fn folder_slash_lower(prefix: &str) -> String {
+pub(crate) fn folder_slash_lower(prefix: &str) -> String {
     if prefix.is_empty() {
         return String::new();
     }
@@ -19363,7 +18238,7 @@ fn folder_slash_lower(prefix: &str) -> String {
 /// nothing can traverse either. The `id` is the draft row's OWN id, which is
 /// the whole point: it is the key its observations, relations, links and chunks
 /// hang off, so a traversal seeded with it walks the edges its author wrote.
-fn overlay_descriptor(
+pub(crate) fn overlay_descriptor(
     domain: &str,
     domain_id: crystalline_index::DomainId,
     entry: &crystalline_index::StoredEngram,
@@ -19388,7 +18263,10 @@ fn overlay_descriptor(
 /// Describe a browse row by the draft standing at its path: the permalink,
 /// title, type and status the reader's own document carries, so a listing says
 /// what they would open rather than what the file says.
-fn overwrite_from_draft(row: &mut EngramDescriptor, draft: &crystalline_index::StoredEngram) {
+pub(crate) fn overwrite_from_draft(
+    row: &mut EngramDescriptor,
+    draft: &crystalline_index::StoredEngram,
+) {
     row.permalink = draft.permalink.clone();
     row.id = draft.id;
     if let Ok(engram) = parse_engram(&draft.content) {
@@ -19543,7 +18421,7 @@ pub(crate) fn virtual_stamp(content: &str) -> FileStamp {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     crystalline_index::hex_lower(&hasher.finalize())

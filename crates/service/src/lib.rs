@@ -13,6 +13,7 @@ pub mod client;
 pub mod collab;
 pub mod control;
 pub mod daemon;
+pub(crate) mod domain_view;
 pub mod engine;
 pub mod harness_cli;
 mod index_files;

@@ -26,20 +26,17 @@
 //! The verb itself - the gates, the credential, the lock, the ordering argument
 //! - is `Engine::origin_share` in [`crate::engine`].
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crystalline_index::StoredEngram;
+use crystalline_remote::RemoteError;
 use crystalline_remote::provider::{
     CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
     ProposalRequest, ProposalState, Provider, StackInfo, TreeWrite,
 };
-use crystalline_remote::state::BaseStamp;
-use crystalline_remote::{RemoteError, state};
 
 use crate::engine::{
     EngineError, OVERLAY_NEEDS_IDENTITY, OWNER_IDENTITY_NAME, Result as EngineResult, ShareActor,
-    is_within_domain, join_rel,
+    join_rel,
 };
 
 /// The folder under a domain's origin state directory that one share of a
@@ -106,6 +103,12 @@ pub(crate) struct OverlayStaging {
 }
 
 impl OverlayStaging {
+    /// A staged tree rooted at `root`, owned from here on by whoever holds it:
+    /// [`crate::domain_view::DomainView::materialise`] is what stages one.
+    pub(crate) fn at(root: PathBuf) -> OverlayStaging {
+        OverlayStaging { root }
+    }
+
     /// The staged tree's root, to hand to `crystalline_remote::ops` in place of
     /// the domain's folder.
     pub(crate) fn root(&self) -> &Path {
@@ -126,106 +129,13 @@ impl Drop for OverlayStaging {
     }
 }
 
-/// Stages the tree one actor's share of a reviewing domain is detected against:
-/// the base snapshot's own content, with that actor's overlay rows laid over it
-/// - a draft as the file's content, a tombstone as the file's absence.
-///
-/// **The base snapshot is one side, never the folder.** Its content lives under
-/// the state directory as the copies a pull recorded
-/// ([`state::read_base_file`]), and reading those rather than the files beside
-/// them is what makes "exactly this actor's draft" true: a stray direct edit of
-/// the reviewed folder is nobody's draft and takes no part in any share. Every
-/// path a pull records is written to both in lockstep, so a recorded path with
-/// no copy is a damaged state directory and is refused by name rather than
-/// quietly read off the folder.
-///
-/// **`entries` are index rows, never the journal beside them.** The journal
-/// under the state directory is the durable mirror a rebuilt index is restored
-/// from, and a mirror that had fallen behind would quietly change what a share
-/// carries. The index is the live truth, so the index is what the caller reads.
-///
-/// Nothing is cleared: a shared draft is still a draft, and the entries stay
-/// exactly as they stand until the merged work is pulled back and convergence
-/// takes them out.
-pub(crate) fn build(
-    domain: &str,
-    state_dir: &Path,
-    base: &BTreeMap<String, BaseStamp>,
-    entries: &[StoredEngram],
-) -> EngineResult<OverlayStaging> {
-    let staging = OverlayStaging {
-        root: state_dir.join(OVERLAY_STAGING_DIR),
-    };
-    // A tree a previous run left behind - a process killed between the share and
-    // the guard's own cleanup - is not a tree this share may inherit.
-    match std::fs::remove_dir_all(staging.root()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(EngineError::Io {
-                path: staging.root().display().to_string(),
-                source,
-            });
-        }
-    }
-    std::fs::create_dir_all(staging.root()).map_err(|source| EngineError::Io {
-        path: staging.root().display().to_string(),
-        source,
-    })?;
-    for rel in base.keys() {
-        if !is_within_domain(rel) {
-            continue;
-        }
-        let Some(content) = state::read_base_file(state_dir, rel)? else {
-            return Err(EngineError::Conflict(format!(
-                "domain '{domain}' records '{rel}' in its base snapshot but keeps no copy of it, \
-                 so a share cannot say what the team's own version is. Its origin state is \
-                 damaged: resync the domain by removing it and adding it from its origin again, \
-                 then share"
-            )));
-        };
-        write_staged_file(staging.root(), rel, &content)?;
-    }
-    for entry in entries {
-        // The write verbs normalize a draft's path before it becomes a row, so
-        // this is the second assertion rather than the first - and it is here
-        // because a path that escaped would write outside the staged tree, which
-        // is the one failure a share could not recover from. The rule is the one
-        // every write and move verb holds a path to, so a filename a person
-        // chose - `notes/plan: v2.md` and its like - is a path like any other.
-        if !is_within_domain(&entry.path) {
-            return Err(EngineError::Conflict(format!(
-                "draft '{}' in domain '{domain}' stands at a path that is not inside the domain, \
-                 so it cannot be shared",
-                entry.path
-            )));
-        }
-        if entry.tombstone {
-            let path = join_rel(staging.root(), &entry.path);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(EngineError::Io {
-                        path: path.display().to_string(),
-                        source,
-                    });
-                }
-            }
-        } else {
-            write_staged_file(staging.root(), &entry.path, entry.content.as_bytes())?;
-        }
-    }
-    Ok(staging)
-}
-
 /// Writes `bytes` at `rel` under `root`, creating the folders on the way.
 ///
 /// `rel` is a domain-relative forward-slashed path whose containment the caller
 /// has already asserted; [`join_rel`] puts it together a segment at a time, so a
 /// separator that means something else on another platform cannot re-root the
 /// result.
-fn write_staged_file(root: &Path, rel: &str, bytes: &[u8]) -> EngineResult<()> {
+pub(crate) fn write_staged_file(root: &Path, rel: &str, bytes: &[u8]) -> EngineResult<()> {
     let path = join_rel(root, rel);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| EngineError::Io {

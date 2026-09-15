@@ -249,6 +249,7 @@
 //! `add_domain` through team mode, `share_changes`, `update_domain`,
 //! `origin_status` and `withdraw_proposal`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -964,6 +965,7 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
+use crate::domain_view::DomainView;
 use crate::engine::{
     ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential,
     ProvisionAction, ShareActor, sanitize_actor,
@@ -2702,7 +2704,10 @@ impl McpServer {
         if self.engine.require_domain(domain, scope).await.is_err() {
             return Vec::new();
         }
-        let Ok(rows) = self.engine.attachment_list(domain).await else {
+        let Ok(view) = DomainView::base(&self.engine, domain, &HashSet::new()) else {
+            return Vec::new();
+        };
+        let Ok(rows) = view.attachments().await else {
             return Vec::new();
         };
         refs.iter()
@@ -3357,9 +3362,9 @@ impl ServerHandler for McpServer {
                     .require_domain(&url.domain, &self.scope_of(&context))
                     .await
                     .map_err(to_error)?;
-                let (bytes, row) = self
-                    .engine
-                    .attachment_read(&url.domain, path)
+                let (bytes, row) = DomainView::base(&self.engine, &url.domain, &HashSet::new())
+                    .map_err(to_error)?
+                    .attachment_bytes(path)
                     .await
                     .map_err(to_error)?;
                 return Ok(ReadResourceResult::new(vec![attachment_contents(

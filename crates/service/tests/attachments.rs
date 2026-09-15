@@ -1823,3 +1823,88 @@ async fn a_delete_preview_is_never_stricter_than_the_delete_it_previews() {
         "the row went with it"
     );
 }
+
+// --- the attachment seam, in review mode ------------------------------------
+
+/// A domain that reviews changes answers every actor with the attachments the
+/// team's folder holds, and this pins no change rather than a new one.
+///
+/// The attachment table carries no actor dimension, so one actor's view of a
+/// domain's attachments IS its base attachments: "the actor's view" is
+/// satisfied by construction here rather than by a projection. The test exists
+/// so that answer has one place to be read out of, and so a later attachment
+/// overlay has one seam to land in rather than five call sites to find.
+#[tokio::test]
+async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every_actor() {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "team");
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    let mut entry = DomainEntry::file(dir.clone());
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+
+    engine
+        .attachment_write("team", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    // One actor holding a draft over the domain's only engram, so the domain is
+    // genuinely being drafted in while the attachment question is asked.
+    engine
+        .write_engram_as(
+            &WriteParams {
+                domain: "team".to_string(),
+                title: "Fresh".to_string(),
+                content: "- [idea] a page only alice has #team".to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec!["team".to_string()],
+                status: None,
+                metadata: None,
+                overwrite: false,
+            },
+            Some("claude-code/2.0-for-alice"),
+            &Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let listed = engine.attachment_list("team").await.unwrap();
+    assert_eq!(
+        listed.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        vec!["assets/shot.png"],
+        "the listing is the folder the team reviewed"
+    );
+    let (bytes, row) = engine
+        .attachment_read("team", "assets/shot.png")
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "and so are the bytes");
+    assert_eq!(row.path, "assets/shot.png");
+    assert_eq!(
+        std::fs::read(dir.join("assets/shot.png")).unwrap(),
+        PNG,
+        "which is where they are: an attachment is shared state, not a draft"
+    );
+    drop(scratch);
+}

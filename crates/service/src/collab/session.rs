@@ -18,6 +18,7 @@ use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 use super::control::{self, Control};
 use super::merge::{self, MergeOutcome};
 use super::text::{Separator, collab_eligible, file_text, separator_of, session_text};
+use crate::domain_view::DomainView;
 use crate::engine::{Engine, EngineError, EngramText};
 
 /// The name of the one shared Y.Text every session document carries. The
@@ -437,8 +438,12 @@ impl CollabSession {
         epoch: String,
         registry: Weak<CollabSessions>,
     ) -> Result<Arc<CollabSession>, JoinError> {
-        let loaded = engine
-            .engram_text(&key.0, &key.1)
+        // The base view: a room opens on the text the team reviewed, whoever
+        // else is drafting in the domain. The domain was screened by the
+        // surface that asked for the room.
+        let loaded = DomainView::base(&engine, &key.0, &HashSet::new())
+            .map_err(JoinError::Engine)?
+            .engram_text(&key.1)
             .await
             .map_err(JoinError::Engine)?;
         if !collab_eligible(&loaded.content) {
@@ -847,11 +852,14 @@ impl CollabSession {
                     return None;
                 }
                 SaveOutcome::External(detail) => {
-                    let theirs = match self
-                        .engine
-                        .engram_text(&self.domain, &state.permalink)
-                        .await
-                    {
+                    let base = match DomainView::base(&self.engine, &self.domain, &HashSet::new()) {
+                        Ok(base) => base,
+                        Err(err) => {
+                            self.fail_save(state, err.to_string());
+                            return None;
+                        }
+                    };
+                    let theirs = match base.engram_text(&state.permalink).await {
                         Ok(theirs) => theirs,
                         // The engram the CAS refused is not there to read: the
                         // write and the delete raced, so this is the deletion.
@@ -1074,11 +1082,10 @@ impl CollabSession {
             return None;
         }
         state.last_probe = Some(now);
-        match self
-            .engine
-            .engram_text(&self.domain, &state.permalink)
-            .await
-        {
+        let Ok(base) = DomainView::base(&self.engine, &self.domain, &HashSet::new()) else {
+            return None;
+        };
+        match base.engram_text(&state.permalink).await {
             Ok(theirs) if theirs.checksum != state.checksum => {
                 let detail = format!(
                     "'{}' changed on disk while this session was idle",
@@ -1190,11 +1197,10 @@ impl CollabSession {
     /// re-opens as an edit conflict instead. A session never silently
     /// overwrites external work.
     async fn restore_mine(&self, state: &mut SessionState) -> Option<String> {
-        match self
-            .engine
-            .engram_text_at_path(&self.domain, &state.path)
-            .await
-        {
+        let Ok(base) = DomainView::base(&self.engine, &self.domain, &HashSet::new()) else {
+            return None;
+        };
+        match base.engram_text_at_path(&state.path).await {
             Ok(Some(theirs)) if theirs.content != state.last_saved_text => {
                 let detail = format!(
                     "'{}' is on disk again with somebody else's text, so restoring \

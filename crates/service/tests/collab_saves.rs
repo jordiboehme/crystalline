@@ -765,3 +765,83 @@ async fn a_second_refusal_with_a_new_reason_reaches_the_room() {
         Control::Saved { .. }
     ));
 }
+
+// --- the room's text in a reviewing domain -----------------------------------
+
+/// A co-editing room in a domain that reviews changes opens on the text the
+/// team reviewed, whoever else is drafting.
+///
+/// This pins TODAY's answer rather than proposing one: the session reads its
+/// document through the engine's base text seam, which carries no actor. A room
+/// save then lands in the saver's own draft, which is the seam Task 13 moves -
+/// so this test is what makes that change visible as a change.
+#[tokio::test]
+async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "team");
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    let mut entry = DomainEntry::file(dir.clone());
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+
+    // The machine owner rewrites the engram, which in review mode is a draft
+    // standing over the file rather than the file.
+    let checksum = engine
+        .read_engram(
+            &crystalline_service::params::ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("team".to_string()),
+            },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap()["checksum"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "alpha".to_string(),
+                content: ALPHA.replace("A rule about alpha.", "A draft about alpha."),
+                expected_checksum: checksum,
+            },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("alpha.md")).unwrap(),
+        ALPHA,
+        "the folder still says what the team reviewed"
+    );
+
+    let sessions = CollabSessions::new(engine.clone());
+    let joined = sessions.join("team", "alpha").await.unwrap();
+    let doc = sync_client(&joined).await;
+    let text = doc.get_or_insert_text("content");
+    let opened = text.get_string(&doc.transact());
+    assert_eq!(
+        opened, ALPHA,
+        "and the room opens on it, not on anybody's draft"
+    );
+    drop(scratch);
+}

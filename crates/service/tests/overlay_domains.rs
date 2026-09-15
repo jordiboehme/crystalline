@@ -28,7 +28,7 @@ use crystalline_service::engine::ConfigureAction;
 use crystalline_service::overlay_journal;
 use crystalline_service::params::{DeleteParams, EditParams, ReadParams, WriteParams};
 use crystalline_service::rest::{AuthStore, Role};
-use crystalline_service::{Engine, Scope, SimilarProbe};
+use crystalline_service::{Engine, Scope, ShareActor, SimilarProbe};
 use crystalline_service::{FoldChoice, ReviewModeConfirm};
 use tokio::sync::Mutex;
 use yrs::sync::{Message, MessageReader, SyncMessage};
@@ -4265,4 +4265,420 @@ async fn leaving_a_domain_that_never_reviewed_changes_nothing() {
         "the fold a half-finished call left behind still lands: {receipt}"
     );
     assert!(f.domain_root("team").join("fresh.md").exists());
+}
+
+// --- one view of what is real to an actor -----------------------------------
+
+/// A base engram this reader deletes, so a tombstone is one of the four shapes.
+const OLD: &str = "---\ntype: engram\ntitle: Old\npermalink: old\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Old\n\n- [decision] on its way out #team\n";
+/// A base engram this reader renames, which is the shape a projection gets
+/// wrong: a tombstone at the old path and an entry at the new one carrying the
+/// same address.
+const MOVING: &str = "---\ntype: engram\ntitle: Moving\npermalink: moving\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Moving\n\n- [decision] about to be renamed #team\n";
+
+/// The paths a surface says stand, sorted, as one comparable list.
+fn sorted(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort();
+    paths
+}
+
+/// Four surfaces that each used to derive their own projection of an overlay -
+/// the fold plan, the staged share tree, the sweep's listing and a browse level
+/// - asked about one actor holding all four shapes at once, and made to agree.
+///
+/// The fourth shape is the one the Task 7 review actually caught drifting: a
+/// rename inside one overlay is a PAIR, a tombstone at the old path and an
+/// entry at the new one carrying the same address, and a projection that does
+/// not subtract the tombstone calls it a collision on one surface and folds it
+/// without complaint on another.
+#[tokio::test]
+async fn one_view_answers_the_fold_the_share_the_sweep_and_the_browse() {
+    let f = reviewed_origin_fixture().await;
+    let root = f.domain_root("team");
+    std::fs::write(root.join("old.md"), OLD).unwrap();
+    std::fs::write(root.join("moving.md"), MOVING).unwrap();
+    f.engine.sync(None).await.unwrap();
+    // The folder is exactly what the team reviewed, so nothing here is
+    // out-of-band work and the share below detects the overlay alone.
+    f.snapshot_origin("team");
+    // ...and the copies a pull records beside the stamps, which are the side a
+    // share of a reviewing domain stages its tree from.
+    for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = std::fs::read(entry.path()).unwrap();
+        crystalline_remote::state::write_base_file(&f.origins.join("team"), &rel, &bytes).unwrap();
+    }
+
+    let owner = Scope::Unrestricted;
+    let who = Some("claude-code/2.0");
+
+    // 1. a draft over a base file.
+    let checksum = f.engine.read_engram(&read("plan"), &owner).await.unwrap()["checksum"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    f.engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                content: PLAN.replace("title: Plan", "title: The owner's Plan"),
+                expected_checksum: checksum,
+            },
+            &owner,
+        )
+        .await
+        .unwrap();
+    // 2. a draft at a path no file holds.
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("notes".to_string()),
+                ..write_params("team", "Fresh", "- [idea] a page only the owner has #team")
+            },
+            who,
+            &owner,
+        )
+        .await
+        .unwrap();
+    // 3. a tombstone.
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "old".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            who,
+            &owner,
+        )
+        .await
+        .unwrap();
+    // 4. a rename: a tombstone at the old path plus an entry at the new one.
+    f.engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "moving".to_string(),
+                domain: "team".to_string(),
+                destination: "archive/moving.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &owner,
+        )
+        .await
+        .unwrap();
+
+    // What this actor's view of the folder holds, which every surface below has
+    // to answer with.
+    let standing = [
+        "MANIFEST.md".to_string(),
+        "archive/moving.md".to_string(),
+        "notes/fresh.md".to_string(),
+        "plan.md".to_string(),
+    ];
+    let gone = vec!["moving.md".to_string(), "old.md".to_string()];
+
+    // The browse level: the folders a draft invented are in the tree and the
+    // paths this actor deleted are not.
+    let browse = f
+        .engine
+        .browse_domain(
+            &crystalline_service::params::BrowseParams {
+                domain: "team".to_string(),
+                path: None,
+                depth: None,
+                glob: None,
+            },
+            &owner,
+        )
+        .await
+        .unwrap();
+    let level: Vec<String> = browse["engrams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        sorted(level.clone()),
+        vec!["MANIFEST.md".to_string(), "plan.md".to_string()],
+        "the root level is the base minus this actor's deletions: {browse}"
+    );
+    assert_eq!(
+        browse["folders"],
+        serde_json::json!(["archive", "notes"]),
+        "and both folders a draft invented are in the tree: {browse}"
+    );
+
+    // The sweep: the same listing, counted.
+    let sweep = f
+        .engine
+        .evolve_engrams(
+            &crystalline_service::params::EvolveParams {
+                domains: vec!["team".to_string()],
+                ..Default::default()
+            },
+            &owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sweep["engrams_scanned"],
+        serde_json::json!(standing.len()),
+        "the sweep scans exactly what this actor's view holds: {sweep}"
+    );
+
+    // The fold plan: every entry, and not one of them a conflict.
+    let plan = f
+        .engine
+        .set_review_mode("team", None, ReviewModeConfirm::Preview, &owner)
+        .await
+        .unwrap();
+    let entries = plan_entries(&plan, "owner");
+    let planned_gone: Vec<String> = entries
+        .iter()
+        .filter(|(_, tombstone, _)| *tombstone)
+        .map(|(path, _, _)| path.clone())
+        .collect();
+    let planned_standing: Vec<String> = entries
+        .iter()
+        .filter(|(_, tombstone, _)| !*tombstone)
+        .map(|(path, _, _)| path.clone())
+        .collect();
+    assert_eq!(sorted(planned_gone), gone, "the plan's deletions: {plan}");
+    assert_eq!(
+        sorted(planned_standing),
+        vec![
+            "archive/moving.md".to_string(),
+            "notes/fresh.md".to_string(),
+            "plan.md".to_string()
+        ],
+        "the plan's drafts: {plan}"
+    );
+    assert!(
+        entries.iter().all(|(_, _, conflict)| !*conflict),
+        "and the rename is not a collision on this surface either: {plan}"
+    );
+
+    // The staged share tree: the same paths, as a delta against the folder.
+    let share = f
+        .engine
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(share["outcome"], "proposed", "{share}");
+    let added: Vec<String> = share["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect();
+    let updated: Vec<String> = share["updated"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect();
+    let deleted: Vec<String> = share["deleted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect();
+    let mut shared_standing = added;
+    shared_standing.extend(updated);
+    assert_eq!(
+        sorted(shared_standing),
+        vec![
+            "archive/moving.md".to_string(),
+            "notes/fresh.md".to_string(),
+            "plan.md".to_string()
+        ],
+        "the share carries exactly the paths that stand in this actor's view: {share}"
+    );
+    assert_eq!(
+        sorted(deleted),
+        gone,
+        "and takes away exactly the ones they deleted: {share}"
+    );
+}
+
+/// A domain that takes changes directly is byte for byte what it was before the
+/// dimension existed: the write is the file, the read is the file, and nobody
+/// holds a draft of anything.
+#[tokio::test]
+async fn a_direct_domain_reads_and_writes_byte_for_byte_through_the_view() {
+    let f = fixture().await;
+    let owner = Scope::Unrestricted;
+
+    f.engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] straight into the folder #team"),
+            Some("claude-code/2.0"),
+            &owner,
+        )
+        .await
+        .unwrap();
+
+    let on_disk = std::fs::read_to_string(f.domain_root("team").join("fresh.md"))
+        .expect("a direct write is the file");
+    assert!(on_disk.contains("straight into the folder"));
+    assert_eq!(
+        f.reads("fresh", &owner).await.unwrap(),
+        on_disk,
+        "and the read is that same file, byte for byte"
+    );
+    assert_eq!(
+        f.reads("plan", &account("alice")).await.unwrap(),
+        std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap(),
+        "for everybody, whoever they are"
+    );
+    for actor in ["", "owner", "alice"] {
+        assert!(
+            f.held("team", actor).await.is_empty(),
+            "and no view of a direct domain holds a draft of anything"
+        );
+    }
+}
+
+/// The registered-set screen composes ahead of the actor dimension, never
+/// behind it: a draft of alice's in a domain a reader may not see is absent
+/// from every surface, and so is the domain.
+#[tokio::test]
+async fn a_draft_in_a_hidden_domain_is_still_invisible_through_the_view() {
+    let f = screened_fixture().await;
+    let alice = account("alice");
+    let out = account("out");
+    f.engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] a page only alice has #team"),
+            Some("claude-code/2.0-for-alice"),
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    let browse = f
+        .engine
+        .browse_domain(
+            &crystalline_service::params::BrowseParams {
+                domain: "team".to_string(),
+                path: None,
+                depth: None,
+                glob: None,
+            },
+            &out,
+        )
+        .await
+        .expect_err("a browse of a domain this reader may not see is an unknown domain");
+    assert!(
+        browse.to_string().contains("team") && !browse.to_string().contains("Fresh"),
+        "and it says nothing about what is in there: {browse}"
+    );
+
+    let sweep = f
+        .engine
+        .evolve_engrams(
+            &crystalline_service::params::EvolveParams {
+                domains: vec!["team".to_string()],
+                ..Default::default()
+            },
+            &out,
+        )
+        .await
+        .expect_err("and so is a sweep of it");
+    assert!(!sweep.to_string().contains("Fresh"), "{sweep}");
+
+    let read = f.reads("fresh", &out).await.expect_err("and so is a read");
+    assert!(!read.contains("only alice has"), "{read}");
+    assert!(
+        f.reads("fresh", &alice)
+            .await
+            .unwrap()
+            .contains("only alice has"),
+        "while her own draft still reads for her"
+    );
+}
+
+/// A reader with no identity is not a refusal on the read side and is one on
+/// the write side, and the asymmetry is the whole of it: they read the folder
+/// the team reviewed, which is a complete answer, and they cannot write,
+/// because there is no draft for the write to join.
+#[tokio::test]
+async fn a_write_with_no_identity_still_refuses_and_a_read_still_answers_the_base() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+
+    let err = f
+        .engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] nobody in particular #team"),
+            None,
+            &Scope::Anonymous,
+        )
+        .await
+        .expect_err("a write with no identity is refused");
+    assert_eq!(err.to_string(), crystalline_service::OVERLAY_NEEDS_IDENTITY);
+
+    let base = f
+        .reads("plan", &Scope::Anonymous)
+        .await
+        .expect("and the read answers rather than refusing");
+    assert_eq!(
+        base, PLAN,
+        "with the folder the team reviewed, and nobody's draft of it"
+    );
+}
+
+/// Another actor's view is buildable, because the fold, the removal gate and a
+/// share of somebody else's drafts all legitimately need one - and it is
+/// reachable from those surfaces alone.
+///
+/// A source scan rather than a behavioural assertion, for the reason the index
+/// census guard is one: the failure this pins is a call site added later in the
+/// wrong place, which no read request can be written to provoke in advance.
+#[test]
+fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let allowed = [
+        // A share resolved through `ShareActor`, and the convergence pass a
+        // pull runs, which name an actor without anybody having asked.
+        "domain_view.rs",
+        // The fold plan, the fold and the removal gate.
+        "engine.rs",
+    ];
+    let mut found: Vec<String> = Vec::new();
+    for entry in walkdir::WalkDir::new(&src).into_iter().flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        if text.contains("for_actor(") {
+            found.push(
+                entry
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+    found.sort();
+    found.dedup();
+    assert_eq!(
+        found,
+        allowed.map(str::to_string).to_vec(),
+        "somebody else's view is reachable from a file that is not one of the owner-gated \
+         surfaces; a read verb that reaches it answers one reader with another reader's drafts"
+    );
 }

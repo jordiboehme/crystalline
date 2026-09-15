@@ -28,6 +28,8 @@
 //! a malformed path is a malformed request, not an unprocessable one.
 
 use axum::Json;
+use std::collections::HashSet;
+
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -40,6 +42,7 @@ use super::{
     ApiError, ApiPath, ProblemDetail, REVALIDATE, RestState, if_none_match_matches,
     refuse_read_only, require_domain_read, require_domain_write,
 };
+use crate::domain_view::DomainView;
 use crate::engine::EngineError;
 
 /// The `Content-Security-Policy` every attachment is served under: no origin
@@ -228,9 +231,11 @@ pub async fn read(
     // The bytes an engram carries are the engram's domain's, so they are
     // reached through the same visibility check the engram is.
     require_domain_read(&state, &identity, &domain).await?;
-    let (bytes, row) = state
-        .engine
-        .attachment_read(&domain, &path)
+    // Through the reader's view of the domain, which for an attachment is its
+    // base view: the attachment table carries no actor dimension, so what one
+    // reader sees there is what the team's folder holds.
+    let (bytes, row) = DomainView::base(&state.engine, &domain, &HashSet::new())?
+        .attachment_bytes(&path)
         .await
         .map_err(malformed_path_is_a_bad_request)?;
     let etag = format!("\"{}\"", row.sha256);
@@ -477,7 +482,9 @@ pub async fn list(
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<AttachmentsResponse>, ApiError> {
     require_domain_read(&state, &identity, &domain).await?;
-    let rows = state.engine.attachment_list(&domain).await?;
+    let rows = DomainView::base(&state.engine, &domain, &HashSet::new())?
+        .attachments()
+        .await?;
     Ok(Json(AttachmentsResponse {
         attachments: rows.into_iter().map(AttachmentView::from).collect(),
     }))

@@ -14,14 +14,16 @@
 //! is `Engine::set_review_mode` in [`crate::engine`], which is where the
 //! ordering argument lives; this module is the half that decides what an answer
 //! would produce, so the plan and the fold can be held to one rule by sharing
-//! one [`surviving_base`] rather than by two call sites agreeing to agree.
+//! one [`DomainView::address_map`] rather than by two call sites agreeing to
+//! agree.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crystalline_core::config::DomainEntry;
 use crystalline_index::EngramDescriptor;
 use serde_json::{Value, json};
 
+use crate::domain_view::DomainView;
 use crate::engine::EngineError;
 
 /// What one actor's drafts become when their domain stops reviewing changes.
@@ -110,7 +112,7 @@ pub(crate) fn plan_json(
             // The folder as it would be if THIS actor folded and nobody
             // else did, which is the only address question a plan can
             // answer before the answers are in.
-            let surviving = surviving_base(&[held], base);
+            let surviving = DomainView::address_map(&[held], base);
             let rows: Vec<Value> = held
                 .entries
                 .iter()
@@ -153,36 +155,6 @@ pub(crate) fn plan_json(
         "contested_paths": contested,
         "contested_addresses": contested_addresses(drafts),
     })
-}
-
-/// The addresses the folder would still answer to once the deletions in
-/// `folding` had landed: permalink to path, over the base rows no folded
-/// tombstone takes away.
-///
-/// **The one projection both halves of the address rule are asked of**, and
-/// that is the point of it existing rather than each half computing its
-/// own: the preview asks it per actor ("what if only they folded") to fill
-/// in a draft's `conflict`, and [`collision`] asks it over
-/// every folded actor to decide the refusal. Asked two different ways they
-/// drifted, and the drift landed on the commonest flow there is - a rename
-/// inside one overlay is a tombstone at the old path plus an entry at the
-/// new one carrying the same address (`move_within_overlay`), so a
-/// projection that did not subtract the tombstone called every rename a
-/// collision in the plan and then folded it without complaint.
-pub(crate) fn surviving_base<'a>(
-    folding: &[&ActorDrafts],
-    base: &'a [EngramDescriptor],
-) -> HashMap<&'a str, &'a str> {
-    let deleted: HashSet<&str> = folding
-        .iter()
-        .flat_map(|held| held.entries.iter())
-        .filter(|draft| draft.tombstone)
-        .map(|draft| draft.path.as_str())
-        .collect();
-    base.iter()
-        .filter(|row| !deleted.contains(row.path.as_str()))
-        .map(|row| (row.permalink.as_str(), row.path.as_str()))
-        .collect()
 }
 
 /// The base engram, if any, that would still answer to this draft's address
@@ -316,7 +288,7 @@ pub(crate) fn collision(
     }
     // What the folder would answer to afterwards: the projection every
     // half of this rule shares, plus every folded draft on top of it.
-    let mut address = surviving_base(folding, base);
+    let mut address = DomainView::address_map(folding, base);
     for held in folding {
         for draft in &held.entries {
             if draft.tombstone {
