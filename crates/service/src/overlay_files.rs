@@ -127,6 +127,16 @@ fn files_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Result<PathBuf>
 /// the journal repeats its own: this is the last line before a path becomes a
 /// place on disk, and one of the three names it is built from is chosen by
 /// whoever holds an account.
+///
+/// The screen is the string rule alone, deliberately, which is where this
+/// differs from `Engine::contained_asset_path`: that one canonicalizes as well,
+/// because a domain folder is a place a person keeps their own files and can
+/// hold a symlink somebody put there. This tree is written only by this module
+/// and holds only what it wrote, so the string rule - which
+/// [`crystalline_core::validate_asset_path`] makes strict (no `.`, `..`, hidden
+/// segment, backslash or colon, and an allowlisted extension) - is the whole of
+/// it. It is the same reading [`crate::overlay_journal`]'s entry path states
+/// for its own paths.
 pub(crate) fn file(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<PathBuf> {
     crystalline_core::validate_asset_path(path).map_err(|e| {
         io::Error::new(

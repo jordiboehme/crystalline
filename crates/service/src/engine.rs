@@ -14902,6 +14902,18 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // An attachment is not an engram and this verb settles engrams. The
+        // path would be normalized to `<path>.md` on the next line and then
+        // miss everything, so the refusal comes first and says what to do
+        // instead: the bytes are settled by writing them again or by deleting
+        // them, which is the same pair of verbs that put them there.
+        if is_assets_reserved(path) {
+            return Err(EngineError::Invalid(format!(
+                "'{path}' is an attachment, and a conflict resolution settles an engram's \
+                 markdown; upload the file again to keep your version or delete it to take the \
+                 one the team has"
+            )));
+        }
         let resolution = origin::resolution_from(keep, content)?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;

@@ -1509,23 +1509,29 @@ impl<'a> DomainView<'a> {
 
     /// Write this actor's own copy of one non-engram path.
     ///
-    /// **Refuses on the base view.** A base view's write goes to the folder and
-    /// is [`Engine::attachment_write`]'s, never this - so reaching here without
-    /// an actor is a routing bug rather than a caller's mistake, and it says so
-    /// in [`EngineError::Internal`] instead of teaching a caller something they
-    /// cannot act on. Unreachable through a verb:
-    /// [`crate::engine::Engine::attachment_write_in`] takes the base arm
-    /// whenever the view has no actor.
+    /// **Refuses on the base view, and the refusal is checked before anything
+    /// else.** A base view's write goes to the folder and is
+    /// [`Engine::attachment_write`]'s, never this - so reaching here without an
+    /// actor is a routing bug rather than a caller's mistake, and it says so in
+    /// [`EngineError::Internal`] instead of teaching a caller something they
+    /// cannot act on. Unreachable through a verb: the engine's view-taking
+    /// write takes the base arm whenever the view has no actor.
     ///
-    /// The row that comes back is built the way the folder's rows are built,
-    /// off the bytes and the file's own modification instant, so nothing
-    /// downstream can tell an overlay row from a base one by its shape.
+    /// The row that comes back is built the way the folder's rows are built:
+    /// off the bytes **the caller handed in** and the file's own modification
+    /// instant, so nothing downstream can tell an overlay row from a base one
+    /// by its shape. Hashing what is on disk instead would cost a second full
+    /// read and would let a concurrent replace hand this caller a receipt
+    /// describing the other writer's bytes - which is what the folder arm's
+    /// per-file lock exists to prevent there.
     pub(crate) async fn put_file(&self, path: &str, bytes: &[u8]) -> Result<AttachmentRow> {
-        let state_dir = self.files_state_dir()?;
         let actor = self.files_writer()?;
+        let state_dir = self.files_state_dir()?;
         crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes)
             .map_err(|e| self.files_io(path, e))?;
-        self.overlay_attachment_row(&state_dir, actor, path)
+        let abs = crate::overlay_files::file(&state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?;
+        crate::engine::attachment_row(path, bytes, crate::engine::asset_modified(&abs))
     }
 
     /// Mark this actor's deletion of one non-engram path.
@@ -1546,10 +1552,22 @@ impl<'a> DomainView<'a> {
     /// [`EngineError::NotFound`] when neither the overlay nor the folder holds
     /// the path, which is the miss [`Engine::attachment_delete`] reports.
     pub(crate) async fn tombstone_file(&self, path: &str) -> Result<()> {
-        let state_dir = self.files_state_dir()?;
         let actor = self.files_writer()?;
+        let state_dir = self.files_state_dir()?;
         let held = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
             .map_err(|e| self.files_io(path, e))?;
+        // **A path this actor has already deleted is a miss**, not a second
+        // deletion, and the reason is that this view has to agree with itself:
+        // a read there answers `NotFound` and so does the size, so a delete
+        // that answered success would be the one operation of the three still
+        // claiming the path is there. It is the answer a direct domain gives on
+        // the second delete of one file, for the same reason.
+        if held == crate::overlay_files::Held::Tombstone {
+            return Err(EngineError::NotFound(crate::engine::missing_attachment(
+                &self.domain,
+                path,
+            )));
+        }
         let base_holds = match self.engine.attachment_delete_size(&self.domain, path).await {
             Ok(_) => true,
             Err(EngineError::NotFound(_)) => false,
@@ -1573,11 +1591,21 @@ impl<'a> DomainView<'a> {
     ///
     /// One hop through [`crate::overlay_files::target_actor`], which is where
     /// the join that will one day answer differently belongs - see its doc.
+    ///
+    /// [`EngineError::Internal`] on the base view rather than
+    /// [`DomainView::writing_actor`]'s [`OVERLAY_NEEDS_IDENTITY`]: a base view
+    /// reaching a files-overlay write is a routing bug in this crate, and a
+    /// sentence teaching a person how to connect would be teaching them to fix
+    /// something that is not theirs.
     fn files_writer(&self) -> Result<&str> {
-        Ok(crate::overlay_files::target_actor(
-            self.writing_actor()?,
-            None,
-        ))
+        let Some(actor) = self.actor.as_deref() else {
+            return Err(EngineError::Internal(format!(
+                "a files overlay write reached the base view of '{}'; a write with no actor \
+                 belongs in the folder, not in an overlay",
+                self.domain
+            )));
+        };
+        Ok(crate::overlay_files::target_actor(actor, None))
     }
 
     /// This actor's own files overlay entries, files and deletions alike,

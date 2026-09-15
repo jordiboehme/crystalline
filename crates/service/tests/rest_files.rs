@@ -911,6 +911,21 @@ async fn an_upload_into_a_reviewing_domain_answers_draft_true_and_serves_it_to_i
         "another account is told there is nothing"
     );
 
+    // A path the attachment rules refuse is still a 400 naming the rule on
+    // this branch, not the 500 an unmapped engine error would give.
+    let resp = put(
+        fx.addr,
+        &eddy,
+        "/api/v1/domains/rev/files/notes/plan.png",
+        PNG,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "a malformed path is the caller's to correct, in review mode too"
+    );
+
     // The listing differs by session, which is the same statement said about
     // the metadata surface rather than the bytes.
     for (session, expected) in [

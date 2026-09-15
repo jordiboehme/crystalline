@@ -2184,6 +2184,23 @@ async fn a_tombstoned_base_attachment_reads_absent_for_the_actor_and_present_for
         matches!(miss, EngineError::NotFound(_)),
         "alice has nothing left to delete there: {miss:?}"
     );
+
+    // And the delete agrees with the read and the size it stands beside: a
+    // second one is a miss, not a second deletion, exactly as it is on a
+    // domain that takes changes directly.
+    let miss = engine
+        .attachment_delete_as("rev-gone", "assets/deck.png", &alice())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(miss, EngineError::NotFound(_)),
+        "deleting what she has already deleted is a miss: {miss:?}"
+    );
+    let (bytes, _) = engine
+        .attachment_read_as("rev-gone", "assets/deck.png", &bob())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "and bob's file was never in question");
 }
 
 /// **A file only its own actor ever held leaves no marker behind.**
