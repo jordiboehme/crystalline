@@ -802,6 +802,20 @@ impl Store for TursoStore {
         Ok(DomainId(id))
     }
 
+    async fn domain_id(&self, name: &str) -> Result<Option<DomainId>> {
+        // `scalar_i64` above works only because the upsert beside it has just
+        // guaranteed a row. This one has no such guarantee - an unregistered
+        // name is an ordinary answer here - so the rows are taken as they come
+        // and an empty result is `None` rather than an error.
+        let rows = query_all(
+            &self.conn,
+            "SELECT id FROM domain WHERE name=?1",
+            vec![Value::Text(name.to_string())],
+        )
+        .await?;
+        Ok(rows.first().and_then(|r| cell_i64(r, 0)).map(DomainId))
+    }
+
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>> {
         let rows = query_all(
             &self.conn,

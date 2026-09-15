@@ -5525,6 +5525,37 @@ async fn a_tombstone_is_a_row(store: &dyn Store) {
 }
 parity!(a_tombstone_is_an_overlay_row_too, a_tombstone_is_a_row);
 
+/// Asking which domain a name is, without registering one on the way.
+///
+/// Every other route to a `DomainId` is `upsert_domain`, which writes. A read
+/// that has to count somebody's drafts - a status call, a removal's question -
+/// cannot spend a write to ask, least of all on a read-only instance, so this
+/// is the read-only form: the id of a domain the index already holds, and
+/// `None` for a name it has never been told about, with the table left exactly
+/// as it was either way.
+async fn domain_id_is_a_read(store: &dyn Store) {
+    let registered = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_id("eng").await.unwrap(),
+        Some(registered),
+        "a registered domain answers with the id every write verb resolved"
+    );
+    assert_eq!(
+        store.domain_id("nobody-registered-this").await.unwrap(),
+        None,
+        "a name the index has never held is absent rather than an error"
+    );
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["eng".to_string()],
+        "and asking after an unregistered name registered nothing"
+    );
+}
+parity!(domain_id_answers_without_registering_anything, domain_id_is_a_read);
+
 /// A draft of `path`, parsed from markdown the way a write verb parses what it
 /// was handed, so a draft row carries the observations, tags and chunks-worth
 /// of text a base row carries.

@@ -755,6 +755,19 @@ impl Store for PostgresStore {
         Ok(DomainId(row.0))
     }
 
+    async fn domain_id(&self, name: &str) -> Result<Option<DomainId>> {
+        // The read-only twin of the upsert above: an unregistered name is an
+        // ordinary answer rather than an error, so this fetches optionally
+        // instead of insisting on a row the way the insert can.
+        let mut conn = self.acquire().await?;
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM domain WHERE name=$1")
+            .bind(name)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(row.map(|r| DomainId(r.0)))
+    }
+
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>> {
         let mut conn = self.acquire().await?;
         // The snapshot names what is on disk, so it is the base rows and only

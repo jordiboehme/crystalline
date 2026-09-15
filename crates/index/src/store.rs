@@ -1450,6 +1450,17 @@ pub trait Store: Send + Sync {
         kind: DomainKind,
     ) -> Result<DomainId>;
 
+    /// The id of a domain the index already holds, or `None` for a name it has
+    /// never been told about. A pure read: it registers nothing.
+    ///
+    /// [`Store::upsert_domain`] is the other way to a [`DomainId`] and it
+    /// writes, which is fine for a verb that is about to write anyway and wrong
+    /// for one that is answering a question. A status call counting somebody's
+    /// drafts, or a removal asking who would lose work, has to reach the rows
+    /// without registering a domain on the way - and has to stay answerable on
+    /// a read-only instance, where a write is refused outright.
+    async fn domain_id(&self, name: &str) -> Result<Option<DomainId>>;
+
     /// The recorded file stamps for a domain, keyed by domain-relative path.
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>>;
 
