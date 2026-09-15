@@ -615,6 +615,15 @@ pub struct EngramFacts {
     pub title: String,
     /// The domain-relative file path, for a human pointing an editor at it.
     pub path: String,
+    /// Whose row this fact was assembled from: the empty string for the base
+    /// row - the engram as the domain's files or its database hold it - and an
+    /// actor key for that actor's own draft of the same path.
+    ///
+    /// No rule reads it as a condition today. It is here so a fact says which
+    /// dimension it came out of, which is what the `V301` path skip below is
+    /// about and what the contradiction scorer will need when it pairs an
+    /// actor's drafts against the engrams they are drafts of.
+    pub actor: String,
     /// The exact frontmatter `status`, lowercased.
     pub status: String,
     /// The frontmatter `type`, lowercased.
@@ -699,6 +708,7 @@ impl EngramFacts {
             title: permalink.clone(),
             path: format!("{permalink}.md"),
             permalink,
+            actor: String::new(),
             status: "stable".to_string(),
             engram_type: "engram".to_string(),
             tags: Vec::new(),
@@ -2127,6 +2137,11 @@ fn detect_redundancy(input: &SweepInput, report: &mut SweepReport) {
 /// twin threshold and that `V201` did not already put in one cluster - a
 /// cluster already prescribes the merge, so a twin finding on top would be two
 /// findings for one fact. Indexed over `live` so the cluster map lines up.
+///
+/// A pair whose two facts stand at one path is skipped as well: those are one
+/// engram's versions - a draft and the row it is a draft of, or two actors'
+/// drafts of the same path - and the merge a twin finding prescribes is
+/// meaningless between them.
 fn detect_twins(
     live: &[&EngramFacts],
     cluster_of: &HashMap<usize, usize>,
@@ -2153,6 +2168,15 @@ fn detect_twins(
     }
     let mut emitted = 0usize;
     for pair in &found.pairs {
+        // Two rows standing at one path are one engram's versions, not two
+        // engrams: a draft and the row it is a draft of say close to the same
+        // thing by construction, and so do two actors' drafts of one path. A
+        // twin finding on such a pair would tell an author to merge their own
+        // rewrite into the version they are rewriting. Path rather than actor,
+        // because it is the path that says the rows are about one engram.
+        if live[pair.a].domain == live[pair.b].domain && live[pair.a].path == live[pair.b].path {
+            continue;
+        }
         if let (Some(ca), Some(cb)) = (cluster_of.get(&pair.a), cluster_of.get(&pair.b))
             && ca == cb
         {

@@ -491,3 +491,166 @@ async fn withdrawing_one_pair_leaves_the_other_acknowledged() {
     );
     assert_eq!(standing[0].0, rows[0].0);
 }
+
+// --- Task 6: V301 in one actor's dimension ----------------------------------
+
+/// The base engram markdown the team has reviewed.
+fn team_engram(title: &str, permalink: &str, body: &str) -> String {
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# {title}\n\n{body}\n"
+    )
+}
+
+/// A file domain `team` in review mode holding the twin pair the team
+/// reviewed, with the topic provider installed and a state directory of its
+/// own so a draft can be mirrored.
+///
+/// Review mode is written straight into the configuration, as Task 4's
+/// fixtures do: turning it on through a verb is Task 7's.
+async fn review_engine() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("retry-queue.md"),
+        team_engram("Retry queue", "retry-queue", A),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("retry-backoff.md"),
+        team_engram("Retry backoff", "retry-backoff", PARAPHRASE),
+    )
+    .unwrap();
+
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            cfg,
+            Some(Arc::new(support::TopicEmbedder) as Arc<_>),
+            Some(config_path),
+        )
+        .with_state_dir(tmp.path().join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    (tmp, engine)
+}
+
+/// One account, as an authenticated surface resolves it.
+fn account(name: &str) -> Scope {
+    Scope::User {
+        account: name.to_string(),
+        admin: false,
+    }
+}
+
+/// The redundancy sweep of `team`, asked as somebody in particular.
+async fn sweep_team(engine: &Engine, scope: &Scope) -> Value {
+    engine
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                families: vec!["redundancy".to_string()],
+                rules: Vec::new(),
+                min_priority: None,
+                limit: Some(50),
+                page: None,
+                today: Some("2026-09-07".to_string()),
+                include_acknowledged: false,
+            },
+            scope,
+        )
+        .await
+        .unwrap()
+}
+
+/// A draft is never the twin of the engram it is a draft of.
+///
+/// `V301` says two current engrams mean close to the same thing and prescribes
+/// a merge. A draft and the row it stands over mean close to the same thing by
+/// construction - that is what makes it a draft of that engram - so the pair is
+/// never a finding, and the sweep reaches that answer by asking for the lead
+/// vectors in the reader's own dimension: at a path this reader is drafting,
+/// the vector that comes back is their row's, never the reviewed file's.
+///
+/// What that costs while the sweep's engram listing is still the base one:
+/// a drafted path has no fact for its vector to attach to, so `V301` is simply
+/// quiet about that path for its author, and loud as ever for everybody else.
+/// The pair comes back for the author as their draft against the other engram
+/// once the listing is shadowed too.
+#[tokio::test]
+async fn a_draft_is_never_its_base_rows_twin() {
+    let (_tmp, engine) = review_engine().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    let pairs = |value: &Value| -> Vec<String> {
+        value["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["rule"] == "V301")
+            .map(|f| f["scope"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let team_pair = vec!["team/retry-backoff, team/retry-queue".to_string()];
+    assert_eq!(
+        pairs(&sweep_team(&engine, &bob).await),
+        team_pair,
+        "the pair the team reviewed is a twin pair for a reader drafting nothing"
+    );
+
+    // Alice rewrites one of them. Her draft is a near copy of the row it
+    // stands over, which is exactly the pair the rule must not report.
+    let edited = engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "retry-queue".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("- [decision] and a retry that exhausts its backoff goes to the dead-letter queue #t".to_string()),
+                key: None,
+                value: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(edited["draft"], Value::Bool(true), "{edited}");
+    engine.embed_pending().await.unwrap();
+
+    assert!(
+        pairs(&sweep_team(&engine, &alice).await).is_empty(),
+        "the path she is drafting is her own row, and the sweep never pairs it \
+         with the engram it is a draft of: {:?}",
+        pairs(&sweep_team(&engine, &alice).await)
+    );
+    assert_eq!(
+        pairs(&sweep_team(&engine, &bob).await),
+        team_pair,
+        "and her draft changed nothing about what the team's own sweep says"
+    );
+}

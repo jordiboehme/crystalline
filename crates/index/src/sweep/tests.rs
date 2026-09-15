@@ -1124,6 +1124,48 @@ fn v301_flags_a_twin_pair_on_lead_vectors_and_scopes_the_pair() {
     assert!(report.truncations.is_empty());
 }
 
+/// Two rows standing at one path are never each other's twin, whoever wrote
+/// them.
+///
+/// A draft and the engram it is a draft of say close to the same thing by
+/// construction - that is what makes it a draft of that engram rather than a
+/// new one - so a twin finding on the pair would be the sweep telling an author
+/// to merge their own work into the version they are rewriting. The same holds
+/// for two actors' drafts of one path, which are two proposals for one engram
+/// and not two engrams. `path` is the key rather than `actor`, because it is
+/// the path that says the two rows are about the same engram; the actor is on
+/// the facts so a reader of a finding can see whose row it fired on.
+#[test]
+fn twins_at_one_path_across_actors_are_skipped() {
+    let mut base = fact(1, "retry-queue");
+    base.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut drafted = fact(2, "retry-queue-revised");
+    drafted.path = base.path.clone();
+    drafted.actor = "alice".to_string();
+    drafted.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut other = fact(3, "retry-queue-notes");
+    other.path = base.path.clone();
+    other.actor = "bob".to_string();
+    other.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+
+    let report = detect(&input(vec![base, drafted, other]));
+    assert!(
+        !fired(&report).contains(&"V301"),
+        "three rows at one path are one engram's rewrites, not twins: {:?}",
+        fired(&report)
+    );
+
+    // And the rule still speaks about two rows that really are two engrams,
+    // one of them a draft: the skip is about the path, not about drafts.
+    let mut base = fact(1, "retry-queue");
+    base.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut elsewhere = fact(2, "retry-backoff");
+    elsewhere.actor = "alice".to_string();
+    elsewhere.lead_vector = Some(unit(&[0.98, 0.2, 0.0]));
+    let report = detect(&input(vec![base, elsewhere]));
+    only(&report, "V301");
+}
+
 #[test]
 fn v301_stays_quiet_below_the_threshold_without_vectors_and_across_widths() {
     let mut a = fact(1, "one");

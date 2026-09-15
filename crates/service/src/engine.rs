@@ -5722,7 +5722,7 @@ impl Engine {
         // detection over this engram's domain, which needs the store and so
         // cannot happen inside the pure text edit below. Computed before the
         // write lock is taken, so a sweep never runs while a file is held.
-        let ack = self.ack_draft(p, &desc, &actor).await?;
+        let ack = self.ack_draft(p, &desc, &actor, scope).await?;
 
         let warning = self
             .apply_source_edit(
@@ -9235,7 +9235,7 @@ impl Engine {
         // unscoped sweep needs to whatever the largest domain costs.
         for name in &swept_scope {
             let Some(swept) = self
-                .sweep_domain(name, today, &known_domains, p.include_acknowledged)
+                .sweep_domain(name, today, &known_domains, p.include_acknowledged, scope)
                 .await?
             else {
                 continue;
@@ -9472,6 +9472,7 @@ impl Engine {
         p: &EditParams,
         desc: &EngramDescriptor,
         actor: &str,
+        scope: &crate::scope::Scope,
     ) -> Result<Option<AckDraft>> {
         Ok(match Self::ack_intent(p)? {
             None => None,
@@ -9484,11 +9485,11 @@ impl Engine {
                     .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
                 let scope = match named {
                     Some(named) => Some(
-                        self.named_scope(&desc.domain, &desc.permalink, &rule, named)
+                        self.named_scope(&desc.domain, &desc.permalink, &rule, named, scope)
                             .await?,
                     ),
                     None => {
-                        self.firing_scope(&desc.domain, &desc.permalink, &rule)
+                        self.firing_scope(&desc.domain, &desc.permalink, &rule, scope)
                             .await?
                     }
                 };
@@ -9524,8 +9525,9 @@ impl Engine {
         permalink: &str,
         rule: &str,
         named: &str,
+        scope: &crate::scope::Scope,
     ) -> Result<String> {
-        let firing = self.firing_findings(domain, permalink, rule).await?;
+        let firing = self.firing_findings(domain, permalink, rule, scope).await?;
         if firing.iter().any(|f| f.scope == named) {
             return Ok(named.to_string());
         }
@@ -9557,8 +9559,9 @@ impl Engine {
         domain: &str,
         permalink: &str,
         rule: &str,
+        scope: &crate::scope::Scope,
     ) -> Result<Option<String>> {
-        let firing = self.firing_findings(domain, permalink, rule).await?;
+        let firing = self.firing_findings(domain, permalink, rule, scope).await?;
         Ok(firing
             .iter()
             .find(|f| !f.acknowledged)
@@ -9578,13 +9581,14 @@ impl Engine {
         domain: &str,
         permalink: &str,
         rule: &str,
+        scope: &crate::scope::Scope,
     ) -> Result<Vec<Finding>> {
         let mut known_domains = self.known_domain_names();
         known_domains.sort();
         known_domains.dedup();
         let today = Utc::now().date_naive();
         let Some(swept) = self
-            .sweep_domain(domain, today, &known_domains, true)
+            .sweep_domain(domain, today, &known_domains, true, scope)
             .await?
         else {
             return Ok(Vec::new());
@@ -9770,9 +9774,11 @@ impl Engine {
         today: NaiveDate,
         known_domains: &[String],
         include_acknowledged: bool,
+        scope: &crate::scope::Scope,
     ) -> Result<Option<DomainSweep>> {
         let mut unparsed = 0usize;
         let source = self.content_source(name)?;
+        let overlay = self.overlay_for_read(name, scope);
         let store = self.store.lock().await;
         let descs = store.list_engrams(name, None, None).await?;
         drop(store);
@@ -9803,9 +9809,19 @@ impl Engine {
         // Lead vectors for V301, only with a provider installed: without one
         // the rule stays silent whatever a previous run left embedded, so a
         // sweep on a machine that never embeds never speaks about meaning.
+        //
+        // Asked in the caller's own dimension. On a domain that does not review
+        // changes this is `None` and the answer is the base rows, byte for byte
+        // what it always was. On one that does, a path this caller is drafting
+        // contributes THEIR row's vector rather than the reviewed file's - so
+        // `V301` never tells an author their own rewrite is a twin of the
+        // version they are rewriting, and never speaks about a version they are
+        // not reading. Until the sweep's engram listing is shadowed too, a
+        // drafted path therefore has no fact to attach a vector to and the rule
+        // is simply quiet about it for that author.
         let mut lead_vectors: HashMap<i64, Vec<f32>> = if embedded {
             store
-                .lead_vectors(domain_id, &self.model_id, None)
+                .lead_vectors(domain_id, &self.model_id, overlay.as_deref())
                 .await?
                 .into_iter()
                 .map(|lv| (lv.engram_id.0, lv.vector))
@@ -9848,6 +9864,12 @@ impl Engine {
                 permalink: d.permalink.clone(),
                 title,
                 path: d.path.clone(),
+                // The base listing is what the facts are assembled from, so
+                // every fact here is a base row and says so. A fact that is
+                // one actor's own draft arrives with the sweep's shadowed
+                // listing; this field is what carries the answer then, and
+                // what `V301`'s path skip reads the dimension out of.
+                actor: String::new(),
                 status,
                 engram_type: fm.engram_type.trim().to_ascii_lowercase(),
                 tags: fm.tags.clone(),
