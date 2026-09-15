@@ -2273,3 +2273,178 @@ async fn an_authenticated_search_finds_the_callers_draft_and_nobody_elses() {
         "and the engram the team reviewed is in his answer too: {his}"
     );
 }
+
+/// **A draft never takes a permalink another path already holds.**
+///
+/// The overlay dimension relaxes what the index enforces: the unique index is
+/// `(domain, permalink, actor)`, so a draft and a base row at a *different*
+/// path can share one address and the database says nothing. Nothing
+/// downstream can carry that state. A search merges its hits by permalink and
+/// would drop one of the two without saying so, and a draft holding an address
+/// the reviewed folder already spends could never be folded back into it,
+/// since the base rows do refuse it there. So the write path keeps the rule
+/// the import path keeps, in the words the import path uses.
+///
+/// Three verbs, because a permalink reaches a draft by three different routes:
+/// a save takes it from the document verbatim, a create derives it from where
+/// the engram lands, and a move carries the one the draft already has to a new
+/// path. The move is the sharp one - it writes twice, so a refusal that came
+/// too late would have vacated the source already, and a draft lives in its
+/// row and nowhere else.
+#[tokio::test]
+async fn a_draft_never_takes_a_permalink_another_path_holds() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+    // Two more engrams the team reviewed: one whose path and permalink agree,
+    // and one whose path and permalink do not, which is the shape a create can
+    // collide with (its own address is always its path).
+    std::fs::write(f.domain_root("team").join("notes.md"), NOTES).unwrap();
+    std::fs::create_dir_all(f.domain_root("team").join("docs")).unwrap();
+    std::fs::write(f.domain_root("team").join("docs").join("ledger.md"), LEDGER).unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    // -- save: the document is written verbatim, so the permalink line in it is
+    //    the address the row takes, and the path does not move --
+    let read = f.engine.read_engram(&read("notes"), &alice).await.unwrap();
+    let stolen = f
+        .engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "notes".to_string(),
+                content: NOTES.replace("permalink: notes", "permalink: plan"),
+                expected_checksum: read["checksum"].as_str().unwrap().to_string(),
+            },
+            &alice,
+        )
+        .await
+        .expect_err("a save may not point her draft of one path at another path's address");
+    assert!(
+        stolen
+            .to_string()
+            .contains("permalink 'plan' already exists at another path")
+            && stolen.to_string().contains("plan.md"),
+        "and the refusal names the path that holds it: {stolen}"
+    );
+    assert!(
+        f.held("team", "alice").await.is_empty(),
+        "a refused save leaves her holding no draft at all"
+    );
+
+    // -- create: the address is where the engram lands, and an engram the team
+    //    keeps somewhere else can already answer to it. `overwrite` is a
+    //    same-path decision, so it is no way past this --
+    let taken = f
+        .engine
+        .write_engram_as(
+            &WriteParams {
+                overwrite: true,
+                ..write_params("team", "Nightly ledger", "- [idea] a second ledger #team")
+            },
+            who,
+            &alice,
+        )
+        .await
+        .expect_err("a create may not land on an address the team's folder already spends");
+    assert!(
+        taken
+            .to_string()
+            .contains("permalink 'nightly-ledger' already exists at another path")
+            && taken.to_string().contains("docs/ledger.md"),
+        "naming where it is held, not just that it is: {taken}"
+    );
+
+    // -- and the addresses stayed unique, which is what the refusals are for:
+    //    a search answers with each one exactly once --
+    let hits = f
+        .engine
+        .search_engrams(
+            &crystalline_service::params::SearchParams {
+                domains: vec!["team".to_string()],
+                ..Default::default()
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+    let mut addresses: Vec<String> = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["permalink"].as_str().unwrap_or_default().to_string())
+        .collect();
+    addresses.sort();
+    let unique = {
+        let mut seen = addresses.clone();
+        seen.dedup();
+        seen
+    };
+    assert_eq!(
+        addresses, unique,
+        "every address in her own search answers once: {addresses:?}"
+    );
+    assert!(
+        addresses.contains(&"plan".to_string())
+            && addresses.contains(&"nightly-ledger".to_string()),
+        "both contested addresses are in it, each held by the engram the team reviewed: {addresses:?}"
+    );
+
+    // -- move: the draft carries its address to the new path, and the team can
+    //    have taken that address in the meantime --
+    f.engine
+        .write_engram_as(
+            &write_params("team", "Rota", "- [decision] alice takes the rota #team"),
+            who,
+            &alice,
+        )
+        .await
+        .expect("nothing holds that address yet, so her draft may have it");
+    std::fs::write(
+        f.domain_root("team").join("other.md"),
+        NOTES
+            .replace("permalink: notes", "permalink: rota")
+            .replace("Notes", "Rota"),
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    let moved = f
+        .engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                // By path: the address itself now resolves to the engram the
+                // team put at it, which is the collision seen from the other
+                // side, and her draft answers to its own path whoever else
+                // holds the address.
+                identifier: "rota.md".to_string(),
+                domain: "team".to_string(),
+                destination: "archive/rota.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &alice,
+        )
+        .await
+        .expect_err(
+            "the team took that address while she was drafting, so the move has nowhere to land",
+        );
+    assert!(
+        moved
+            .to_string()
+            .contains("permalink 'rota' already exists at another path")
+            && moved.to_string().contains("other.md"),
+        "naming the engram that now holds it: {moved}"
+    );
+    let held = f.held("team", "alice").await;
+    let shape: Vec<(&str, bool)> = held
+        .iter()
+        .map(|(path, _, tomb)| (path.as_str(), *tomb))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("rota.md", false)],
+        "and a move that cannot land writes nothing: her draft is where it was, not a tombstone \
+         over a draft that is gone: {held:?}"
+    );
+}

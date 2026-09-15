@@ -2324,9 +2324,15 @@ impl Engine {
     /// holding the observations it just moved, a move's rollback would undo a
     /// move that happened, and a delete would be unretryable - its next attempt
     /// answering "no engram" against the tombstone it claims it did not write.
-    /// The state directory is resolved before anything else, so an engine with
-    /// no journal at all still refuses before it writes a row it could never
-    /// mirror.
+    /// The state directory is resolved before the row is ever written (in
+    /// [`Engine::put_overlay_entry`], which is the half that writes), so an
+    /// engine with no journal at all still refuses before it writes a row it
+    /// could never mirror.
+    ///
+    /// **The address is checked here**, which is what makes this the one place
+    /// a draft can be created: see
+    /// [`Engine::refuse_permalink_held_elsewhere`], which every verb that
+    /// routes through this writer inherits.
     async fn write_overlay_entry(
         &self,
         domain: &str,
@@ -2335,16 +2341,149 @@ impl Engine {
         path: &str,
         text: &str,
     ) -> Result<Option<String>> {
-        let state_dir = self.journal_state_dir()?;
+        let record = Self::overlay_record(path, text)?;
+        self.refuse_permalink_held_elsewhere(
+            domain,
+            domain_id,
+            actor,
+            &record.permalink,
+            path,
+            None,
+        )
+        .await?;
+        self.put_overlay_entry(domain, domain_id, actor, path, record)
+            .await
+    }
+
+    /// [`Engine::write_overlay_entry`] without the address check, for the one
+    /// caller that must never be refused: a move's rollback.
+    ///
+    /// The rollback puts back a draft this actor was already holding a moment
+    /// ago, so the state it restores is one the check had already allowed, and
+    /// the text it restores lives in that row and nowhere else - a refusal
+    /// there would be the move losing the draft rather than not making it.
+    /// [`Engine::move_within_overlay`] asks the check its own question before
+    /// it writes anything at all, so the rule still holds for the move.
+    async fn write_overlay_entry_unchecked(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        path: &str,
+        text: &str,
+    ) -> Result<Option<String>> {
+        let record = Self::overlay_record(path, text)?;
+        self.put_overlay_entry(domain, domain_id, actor, path, record)
+            .await
+    }
+
+    /// Refuse a draft that would answer to an address another path already
+    /// answers to.
+    ///
+    /// The overlay dimension relaxes what the index enforces. The unique index
+    /// is `(domain, permalink, actor)`, so `(team, plan, alice)` and
+    /// `(team, plan, "")` are two different rows and the database says nothing
+    /// about a draft of `notes.md` whose frontmatter now reads `permalink:
+    /// plan` while the team's `plan.md` holds that address. Nothing downstream
+    /// can carry those two rows: a search merges its hits by permalink and
+    /// drops one of them silently, and a draft holding an address the reviewed
+    /// folder already spends could never be folded back into that folder,
+    /// since the base rows do refuse it there. So the write path keeps the
+    /// rule, in the words the import path keeps it in
+    /// (`permalink '...' already exists at another path`).
+    ///
+    /// **What counts as a holder is this actor's own view of the domain**,
+    /// which is the only view their drafts live in: their own drafts, and the
+    /// base rows their own tombstone has not deleted. A path they have deleted
+    /// holds nothing for them, exactly as it holds no engram for them - the
+    /// same reading [`Engine::write_engram_as`] already applies to a name - and
+    /// a move depends on it, since a move tombstones the source before it
+    /// writes the destination and the two carry one permalink between them.
+    ///
+    /// `vacating` is the path a caller is about to empty in the same breath: a
+    /// move's source, which still holds the address at the moment the question
+    /// is asked and will not hold it by the time the destination lands. It is
+    /// the move's alone and no other verb may pass it - every other write
+    /// leaves whatever it found standing, so a path named here that keeps its
+    /// row is the rule quietly switched off for one address.
+    async fn refuse_permalink_held_elsewhere(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        permalink: &str,
+        path: &str,
+        vacating: Option<&str>,
+    ) -> Result<()> {
+        let (entries, base) = {
+            let store = self.store.lock().await;
+            let entries = store.overlay_entries(domain_id, actor).await?;
+            // `find_engram` answers a title as well as a permalink, and a title
+            // is not an address anybody holds; an exact permalink sorts first,
+            // so filtering the answer hides no real holder behind a namesake.
+            let base = store
+                .find_engram(domain, permalink)
+                .await?
+                .filter(|found| found.permalink == permalink);
+            (entries, base)
+        };
+        let elsewhere = |at: &str| at != path && Some(at) != vacating;
+        let held_at = entries
+            .iter()
+            .find(|entry| {
+                !entry.tombstone && entry.permalink == permalink && elsewhere(&entry.path)
+            })
+            .map(|entry| entry.path.clone())
+            .or_else(|| {
+                base.filter(|found| {
+                    elsewhere(&found.path)
+                        && !entries
+                            .iter()
+                            .any(|entry| entry.tombstone && entry.path == found.path)
+                })
+                .map(|found| found.path)
+            });
+        if let Some(at) = held_at {
+            return Err(EngineError::Conflict(format!(
+                "permalink '{permalink}' already exists at another path ({at}) in domain \
+                 '{domain}'; one engram answers to one address, so give this draft an address of \
+                 its own, or draft the change to '{at}' instead"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A draft's record: the parsed document with the WHOLE of it kept in the
+    /// `content` column, and the permalink the row will answer to - the
+    /// frontmatter's when it carries one, the path's slug when it does not.
+    fn overlay_record(path: &str, text: &str) -> Result<EngramRecord> {
         let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
         record.content = text.to_string();
+        Ok(record)
+    }
+
+    /// The row and the mirror of a draft, once the address has been settled.
+    async fn put_overlay_entry(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        path: &str,
+        record: EngramRecord,
+    ) -> Result<Option<String>> {
+        let state_dir = self.journal_state_dir()?;
         self.commit_overlay_row(domain_id, actor, &record).await?;
-        let warning =
-            match crate::overlay_journal::journal_write(&state_dir, domain, actor, path, text) {
-                Ok(()) => None,
-                Err(e) => Some(unmirrored(domain, actor, path, &e)),
-            };
+        let warning = match crate::overlay_journal::journal_write(
+            &state_dir,
+            domain,
+            actor,
+            path,
+            &record.content,
+        ) {
+            Ok(()) => None,
+            Err(e) => Some(unmirrored(domain, actor, path, &e)),
+        };
         if let Some(text) = &warning {
             tracing::warn!(domain, actor, path, "{text}");
         }
@@ -6079,6 +6218,29 @@ impl Engine {
                     p.identifier, p.domain
                 ))
             })?;
+        // Where the engram would answer from once it has moved: the document
+        // travels verbatim, so the address travels with it unless the
+        // frontmatter never carried one and the path's own slug is it.
+        let dest_permalink = parse_engram(&text)
+            .map(|engram| {
+                EngramRecord::from_engram(&engram, dest_rel, virtual_stamp(&text)).permalink
+            })
+            .unwrap_or_else(|_| src.permalink.clone());
+        // Asked BEFORE either write, although the writer below asks it again:
+        // a move is two writes, and a refusal that arrived at the second one
+        // would already have tombstoned or dropped the source, leaving the
+        // rollback to put back a draft that lives in that row and nowhere
+        // else. The source does not count against itself - it is about to be a
+        // tombstone, which answers to no address, or gone.
+        self.refuse_permalink_held_elsewhere(
+            &p.domain,
+            src.domain_id,
+            actor,
+            &dest_permalink,
+            dest_rel,
+            Some(&src.path),
+        )
+        .await?;
         // The SOURCE first, and the order is forced rather than preferred: one
         // actor holds one row per permalink per domain, and until the source is
         // a tombstone (which answers to no permalink) or gone, the engram's own
@@ -6134,9 +6296,15 @@ impl Engine {
                 // had one, and otherwise nothing of their own at all, which is
                 // the base row showing through again.
                 let undo = if held_draft {
-                    self.write_overlay_entry(&p.domain, src.domain_id, actor, &src.path, &text)
-                        .await
-                        .map(|_| ())
+                    self.write_overlay_entry_unchecked(
+                        &p.domain,
+                        src.domain_id,
+                        actor,
+                        &src.path,
+                        &text,
+                    )
+                    .await
+                    .map(|_| ())
                 } else {
                     self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
                         .await
@@ -6152,11 +6320,6 @@ impl Engine {
                 return Err(e);
             }
         }
-        let dest_permalink = parse_engram(&text)
-            .map(|engram| {
-                EngramRecord::from_engram(&engram, dest_rel, virtual_stamp(&text)).permalink
-            })
-            .unwrap_or_else(|_| src.permalink.clone());
         let mut receipt = json!({
             "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
             "to": { "domain": p.domain, "permalink": dest_permalink, "path": dest_rel },
