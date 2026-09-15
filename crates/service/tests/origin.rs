@@ -59,6 +59,17 @@ async fn engine_with(
     .with_read_only(read_only)
     .with_origin_provider(provider)
     .with_origins_dir(origins_dir.to_path_buf())
+    // The overlay journal's own root, and it is named rather than defaulted:
+    // an engine built without one refuses every draft write under the test
+    // seam, on purpose, so a fixture that touches drafts has to say where the
+    // mirror lives. It sits beside the origins directory, under the same
+    // tempdir, so nothing here reaches the real machine's state directory.
+    .with_state_dir(
+        origins_dir
+            .parent()
+            .expect("the origins directory is inside the tempdir")
+            .to_path_buf(),
+    )
 }
 
 /// An engine whose only domains come from an environment overlay, wired to the
@@ -3875,5 +3886,665 @@ async fn a_draft_path_is_screened_the_way_a_file_in_the_folder_is() {
     assert!(
         !drafted.to_string().contains("not inside the domain"),
         "the engine does not invent a refusal for a legal domain path: {drafted}"
+    );
+}
+
+// --- convergence, conflicts and withdraw into the overlay ---------------------
+//
+// A draft ends one of two ways: the team merges it and a later pull brings it
+// back, which takes it out of the overlay, or it goes on standing against a
+// folder that has moved under it, which is its author's conflict and nobody
+// else's. Both are decided by the convergence pass that runs after a pull that
+// advanced the base, and both are asserted here in the row AND in the mirror
+// beside it: a row cleared while its mirror stays would put the draft back on
+// the next `reindex --wipe`.
+
+/// The file one actor's draft is mirrored in, under the state directory these
+/// fixtures point at: `<tmp>/overlays/team/<actor>/<path>`.
+fn journal_file(tmp: &Path, actor: &str, path: &str) -> std::path::PathBuf {
+    let mut file = tmp.join("overlays").join("team").join(actor);
+    for seg in path.split('/') {
+        file.push(seg);
+    }
+    file
+}
+
+/// Mirror a draft the way `write_overlay_entry` does after the row lands. The
+/// `draft` helper above writes the row alone on purpose; a scenario about
+/// convergence needs both halves, because clearing exactly one of them is the
+/// bug it exists to catch.
+fn mirror(tmp: &Path, actor: &str, path: &str, text: &str) {
+    let file = journal_file(tmp, actor, path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, text).unwrap();
+}
+
+/// One actor's overlay rows in `team`, ordered as the store returns them.
+async fn overlay_entries(eng: &Engine, actor: &str) -> Vec<crystalline_index::StoredEngram> {
+    let store = eng.store();
+    let store = store.lock().await;
+    let id = store
+        .domain_id("team")
+        .await
+        .unwrap()
+        .expect("team is indexed");
+    store.overlay_entries(id, actor).await.unwrap()
+}
+
+/// The paths one actor holds, for a readable assertion.
+async fn overlay_paths(eng: &Engine, actor: &str) -> Vec<String> {
+    overlay_entries(eng, actor)
+        .await
+        .into_iter()
+        .map(|e| e.path)
+        .collect()
+}
+
+/// The team merges a draft and the next pull brings it back: the draft is the
+/// folder now, so it stops being a draft.
+///
+/// The row and the mirror go together. A draft at a path the pull never touched
+/// is left exactly where it stands.
+#[tokio::test]
+async fn a_merged_and_pulled_draft_converges_out_of_the_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
+
+    // The team reviewed the rewrite and merged it.
+    let merged = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", DRAFT_PLAN.as_bytes().to_vec()),
+    ]));
+    mock.set_branch("main", &merged);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        overlay_paths(&eng, "owner").await,
+        vec!["notes/fresh.md".to_string()],
+        "the merged draft left the overlay and the unmerged one stayed"
+    );
+    assert!(
+        !journal_file(tmp.path(), "owner", "notes/plan.md").exists(),
+        "the mirror went with the row, or the next wipe puts the draft back"
+    );
+    assert!(
+        journal_file(tmp.path(), "owner", "notes/fresh.md").exists(),
+        "the draft that is still a draft still has its mirror"
+    );
+
+    let status = eng
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let domain = &status["domains"][0];
+    assert_eq!(domain["converged"]["cleared"], 1, "{status}");
+    assert_eq!(domain["converged"]["diverged"], 0, "{status}");
+    assert_eq!(domain["my_drafts"], 1, "the count reads the rows: {status}");
+}
+
+/// The folder moves under a draft and the draft is its author's conflict.
+///
+/// Whoever owns the domain is told how many each actor is holding open, and
+/// never what any of them says.
+#[tokio::test]
+async fn a_diverged_draft_is_its_authors_conflict_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
+    // A draft at a path this pull never touches: not merged, not in conflict.
+    draft(&eng, "alice", "notes/fresh.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "alice", "notes/fresh.md", DRAFT_FRESH);
+
+    // Somebody else's change to the same page landed instead.
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/plan.md",
+            engram("Plan", "plan", "the plan as the team now has it"),
+        ),
+    ]));
+    mock.set_branch("main", &moved);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    // Nothing was taken away from her.
+    assert_eq!(
+        overlay_paths(&eng, "alice").await,
+        vec!["notes/fresh.md".to_string(), "notes/plan.md".to_string()],
+        "a conflict is reported, never resolved behind the author's back"
+    );
+
+    let hers = eng
+        .origin_status(
+            Some("team"),
+            false,
+            &Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    let domain = &hers["domains"][0];
+    assert_eq!(domain["converged"]["diverged"], 1, "{hers}");
+    assert_eq!(
+        domain["converged"]["mine"],
+        serde_json::json!(["notes/plan.md"]),
+        "her own conflict, named: {hers}"
+    );
+    // Who may see the per-actor counts is Task 8's rule and not a second one
+    // of this key's own: the same gate `drafts` already answers to, so the two
+    // keys can never disagree about who is allowed to read them.
+    assert_eq!(
+        domain["converged"]["actors"].is_null(),
+        domain["drafts"].is_null(),
+        "the counts follow the draft counts beside them: {hers}"
+    );
+
+    // Somebody who is drafting nothing here has no conflict of their own.
+    let theirs = eng
+        .origin_status(
+            Some("team"),
+            false,
+            &Scope::User {
+                account: "bob".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        theirs["domains"][0]["converged"]["mine"],
+        serde_json::json!([]),
+        "{theirs}"
+    );
+
+    // Whoever owns the domain sees the counts, and no content at all.
+    let owners = eng
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let domain = &owners["domains"][0];
+    assert_eq!(
+        domain["converged"]["actors"],
+        serde_json::json!([{ "actor": "alice", "entries": 1 }]),
+        "{owners}"
+    );
+    assert!(
+        !domain["converged"]["actors"].to_string().contains("plan"),
+        "an owner counts another actor's conflicts and reads none of them: {owners}"
+    );
+}
+
+/// A pull that renames a base path takes the draft standing over it along.
+///
+/// The address is the signal: the base at the old path is gone and a base the
+/// pull brought in answers to the address the draft holds, so the page moved
+/// and the draft still applies to it. Row and mirror move as one.
+#[tokio::test]
+async fn a_renamed_base_path_takes_the_draft_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
+
+    // The team filed the same page under a new name.
+    let renamed = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan-v2.md", team_plan()),
+    ]));
+    mock.set_branch("main", &renamed);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        overlay_paths(&eng, "alice").await,
+        vec!["notes/plan-v2.md".to_string()],
+        "the draft travelled with the page it is a draft of"
+    );
+    assert!(
+        journal_file(tmp.path(), "alice", "notes/plan-v2.md").exists(),
+        "the mirror moved with the row"
+    );
+    assert!(
+        !journal_file(tmp.path(), "alice", "notes/plan.md").exists(),
+        "and nothing was left at the old path for a wipe to resurrect"
+    );
+}
+
+/// A pull that brings a base file answering to an address a live draft already
+/// holds elsewhere is that author's conflict.
+///
+/// It is never a silent drop and never a rewrite of what the team reviewed:
+/// search merges its hits by permalink, so two rows answering to one address
+/// would lose one of them without a word.
+#[tokio::test]
+async fn a_pulled_address_collision_is_the_drafters_divergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(tmp.path(), mock.clone(), &[("MANIFEST.md", manifest())]).await;
+    let root = tmp.path().join("team-knowledge");
+
+    // A page only this actor has, answering to `plan`.
+    draft(&eng, "owner", "notes/mine.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/mine.md", DRAFT_PLAN);
+
+    // The team adds a page of its own at that address, under another name.
+    let collided = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", team_plan()),
+    ]));
+    mock.set_branch("main", &collided);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        overlay_paths(&eng, "owner").await,
+        vec!["notes/mine.md".to_string()],
+        "the draft stands where its author left it"
+    );
+    assert_eq!(
+        std::fs::read(root.join("notes/plan.md")).unwrap(),
+        team_plan(),
+        "and the folder still says what the team reviewed"
+    );
+
+    let status = eng
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["converged"]["mine"],
+        serde_json::json!(["notes/mine.md"]),
+        "{status}"
+    );
+}
+
+/// Withdrawing a shared proposal with `revert` puts the actor's own view back,
+/// and the folder the team reviewed is never touched.
+#[tokio::test]
+async fn withdraw_revert_lands_in_the_overlay_while_the_tree_stays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
+
+    let shared = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+
+    let report = eng
+        .origin_withdraw("team", None, true, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(report["closed"], true, "{report}");
+
+    assert!(
+        overlay_paths(&eng, "owner").await.is_empty(),
+        "the revert put this actor's view back to the team's folder"
+    );
+    assert!(
+        !journal_file(tmp.path(), "owner", "notes/plan.md").exists()
+            && !journal_file(tmp.path(), "owner", "notes/fresh.md").exists(),
+        "row and mirror went together"
+    );
+
+    // The folder is exactly what it was: a revert in a reviewing domain has
+    // nothing to say about what the team reviewed.
+    assert_eq!(
+        std::fs::read(root.join("notes/plan.md")).unwrap(),
+        team_plan()
+    );
+    assert!(!root.join("notes/fresh.md").exists());
+}
+
+/// A conflict resolved in a reviewing domain is a draft, not a write of the
+/// folder: keeping the team's version ends the draft, and merged content
+/// becomes the author's new draft.
+#[tokio::test]
+async fn a_resolution_in_a_reviewing_domain_is_a_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
+
+    let merged = eng
+        .origin_resolve(
+            "team",
+            "notes/plan.md",
+            None,
+            Some(DRAFT_FRESH.as_bytes()),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged["draft"], true, "{merged}");
+    let entries = overlay_entries(&eng, "owner").await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].content, DRAFT_FRESH, "{merged}");
+    assert_eq!(
+        std::fs::read(root.join("notes/plan.md")).unwrap(),
+        team_plan(),
+        "the folder the team reviewed is never what a resolution writes"
+    );
+
+    // Taking the team's version ends the draft entirely.
+    let theirs = eng
+        .origin_resolve(
+            "team",
+            "notes/plan.md",
+            Some("theirs"),
+            None,
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(theirs["draft"], true, "{theirs}");
+    assert!(overlay_paths(&eng, "owner").await.is_empty());
+    assert!(!journal_file(tmp.path(), "owner", "notes/plan.md").exists());
+}
+
+/// Conflicts and withdrawals are somebody's, so an agent with no identity is
+/// refused in the words every draft verb refuses in.
+#[tokio::test]
+async fn an_http_agent_without_identity_cannot_resolve_or_withdraw_a_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+
+    let err = eng
+        .origin_resolve(
+            "team",
+            "notes/plan.md",
+            Some("theirs"),
+            None,
+            ShareActor::HttpAgent,
+        )
+        .await
+        .expect_err("nobody's conflict is nobody's to settle");
+    assert_eq!(err.to_string(), crystalline_service::OVERLAY_NEEDS_IDENTITY);
+
+    let err = eng
+        .origin_withdraw("team", None, true, ShareActor::HttpAgent)
+        .await
+        .expect_err("nobody's proposal is nobody's to withdraw");
+    assert_eq!(err.to_string(), crystalline_service::OVERLAY_NEEDS_IDENTITY);
+}
+
+/// Stacking a second layer on an open one is refused while the domain reviews.
+///
+/// A layer is detected against the chain tip, and in review mode the tip may be
+/// somebody else's open layer while the tree the amend reads from holds no
+/// layer content at all. Refusing teaches the way through instead of guessing.
+#[tokio::test]
+async fn stacking_on_an_open_layer_is_refused_while_the_domain_reviews() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    mock.enable_stacks();
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
+    let first = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
+    let err = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .expect_err("a stacked layer is not served while the domain reviews");
+    let text = err.to_string();
+    assert!(
+        text.contains("this domain reviews changes")
+            && text.contains("share a fresh proposal instead"),
+        "{text}"
+    );
+}
+
+/// A domain that takes changes directly holds no drafts, so the pass a pull
+/// runs has nothing to do and touches nothing.
+#[tokio::test]
+async fn a_pull_into_a_domain_that_takes_changes_directly_converges_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+    let root = tmp.path().join("kb");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", team_plan()),
+    ]));
+    mock.set_branch("main", &moved);
+    eng.origin_update(Some("kb"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    let status = eng
+        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let domain = &status["domains"][0];
+    assert!(
+        domain["converged"].is_null(),
+        "a domain nobody drafts in says nothing about drafts: {status}"
+    );
+    assert!(
+        !tmp.path().join("overlays").exists(),
+        "and no journal was made"
+    );
+}
+
+/// The clear-only pass ends what has landed and calls nothing a conflict.
+///
+/// It is the whole of what can be said with no pull to attribute a divergence
+/// to: a draft the folder has caught up with is over, and a draft that says
+/// something else is unshared work, which is not a conflict and never was.
+#[tokio::test]
+async fn the_clear_only_pass_ends_what_has_landed_and_flags_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/plan.md", DRAFT_PLAN.as_bytes().to_vec()),
+            ("notes/old.md", engram("Old", "old", "on its way out")),
+        ],
+    )
+    .await;
+
+    // A draft the folder already says, a draft it does not, and a deletion of
+    // a page the folder still has.
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
+    tombstone(&eng, "owner", "notes/old.md").await;
+
+    let report = eng.converge_overlays("team").await.unwrap();
+    assert_eq!(report.cleared, 1, "the draft the folder caught up with");
+    assert_eq!(report.diverged, 0, "and nothing is anybody's conflict");
+    assert_eq!(
+        overlay_paths(&eng, "owner").await,
+        vec!["notes/fresh.md".to_string(), "notes/old.md".to_string()]
+    );
+
+    // A domain that takes changes directly answers the same call with zeroes
+    // and touches nothing at all.
+    let quiet = eng.converge_overlays("no-such-domain").await.unwrap();
+    assert_eq!(quiet, crystalline_service::ConvergenceReport::default());
+}
+
+/// A conflict the pull left in the reviewed folder is still settled against the
+/// folder, even while the domain reviews changes.
+///
+/// It is nobody's draft: somebody edited the team's own files out of band and
+/// upstream then changed the same file, so what settles it is the resolution
+/// the verb has always performed. Review mode is not a reason to leave a
+/// conflict standing in the team's files with no verb that can reach it - and
+/// the drafts beside it are untouched by that resolution.
+#[tokio::test]
+async fn an_out_of_band_conflict_is_still_settled_against_the_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+
+    // Somebody's draft, which takes no part in this at all.
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
+
+    // A direct edit of the reviewed folder, and an upstream change to the same
+    // file: the pull records a conflict nobody drafted.
+    std::fs::write(
+        root.join("notes/plan.md"),
+        engram("Plan", "plan", "edited straight on disk"),
+    )
+    .unwrap();
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", engram("Plan", "plan", "changed upstream")),
+    ]));
+    mock.set_branch("main", &moved);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let state = OriginState::load(&tmp.path().join("origins").join("team"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.conflicts.len(), 1, "the pull recorded a conflict");
+
+    let settled = eng
+        .origin_resolve(
+            "team",
+            "notes/plan.md",
+            Some("theirs"),
+            None,
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled["remaining"], 0, "{settled}");
+    assert!(
+        settled["draft"].is_null(),
+        "settling the folder's conflict is not a draft: {settled}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("notes/plan.md")).unwrap(),
+        engram("Plan", "plan", "changed upstream"),
+        "the folder took the team's version"
+    );
+    assert_eq!(
+        overlay_paths(&eng, "owner").await,
+        vec!["notes/fresh.md".to_string()],
+        "and the draft beside it was never part of the question"
+    );
+
+    // A path that is neither a draft of this caller's nor a recorded conflict
+    // teaches the way in rather than resolving something.
+    let err = eng
+        .origin_resolve(
+            "team",
+            "notes/nothing.md",
+            Some("theirs"),
+            None,
+            ShareActor::Owner,
+        )
+        .await
+        .expect_err("there is nothing there to settle");
+    let text = err.to_string();
+    assert!(
+        text.contains("not drafting") && text.contains("draft the change first"),
+        "{text}"
     );
 }

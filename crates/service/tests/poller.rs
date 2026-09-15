@@ -66,6 +66,16 @@ async fn engine_with(
     .with_origin_provider(provider)
     .with_origins_dir(origins_dir.to_path_buf())
     .with_token_store_dir(token_dir.to_path_buf())
+    // Where the overlay journal lives, named rather than defaulted: an engine
+    // built without one refuses every draft write under the test seam, so a
+    // tick that converges drafts has to say. It sits beside the origins
+    // directory, inside the same tempdir.
+    .with_state_dir(
+        origins_dir
+            .parent()
+            .expect("the origins directory is inside the tempdir")
+            .to_path_buf(),
+    )
 }
 
 /// The same wiring as [`engine_with`], but the domains come from an
@@ -711,4 +721,97 @@ async fn status_report_origins_block_shape_when_enabled() {
     let domains = status["origins"]["domains"].as_array().unwrap();
     assert!(!domains[0]["next_due"].is_null());
     assert_eq!(domains[0]["last_result"]["outcome"], "up_to_date");
+}
+
+/// The poller's pull converges drafts exactly as an on-demand update does.
+///
+/// It is the same code path - `origin_poll_tick` delegates to
+/// `origin_update_one` - and this says so from the outside, so a later change
+/// that gives the poller a pull of its own cannot quietly leave drafts behind.
+#[tokio::test]
+async fn a_poll_tick_converges_a_merged_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let draft_text = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-02\n---\n\nthe plan as this actor would have it\n";
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/plan.md",
+            engram("Plan", "plan", "as the team has it"),
+        ),
+    ]));
+    mock.set_branch("main", &commit);
+    let root = tmp.path().join("team-knowledge");
+    write_fake_token(tmp.path());
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        tmp.path(),
+        mock.clone(),
+        Some(60),
+    )
+    .await;
+    eng.origin_add(
+        "acme/team",
+        Some("team"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "team",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &crystalline_service::Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+
+    // One actor's draft of the team's page, row and mirror, the way a write
+    // verb leaves it.
+    {
+        let store = eng.store();
+        let store = store.lock().await;
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        let mut record = crystalline_index::EngramRecord::from_engram(
+            &crystalline_core::parse_engram(draft_text).unwrap(),
+            "notes/plan.md",
+            crystalline_index::FileStamp {
+                mtime: 0,
+                size: draft_text.len() as u64,
+                sha256: "0".repeat(64),
+            },
+        );
+        record.content = draft_text.to_string();
+        store.upsert_overlay(id, "owner", &record).await.unwrap();
+    }
+    let mirror = tmp
+        .path()
+        .join("overlays")
+        .join("team")
+        .join("owner")
+        .join("notes")
+        .join("plan.md");
+    std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    std::fs::write(&mirror, draft_text).unwrap();
+
+    // The team merged it.
+    let merged = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", draft_text.as_bytes().to_vec()),
+    ]));
+    mock.set_branch("main", &merged);
+
+    eng.origin_poll_tick(Instant::now(), Utc::now()).await;
+
+    let left = {
+        let store = eng.store();
+        let store = store.lock().await;
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        store.overlay_entries(id, "owner").await.unwrap()
+    };
+    assert!(left.is_empty(), "the poller's pull converged the draft");
+    assert!(!mirror.exists(), "row and mirror went together");
 }
