@@ -2212,10 +2212,11 @@ pub struct ReviewBody {
                 "applied": false,
                 "actors": [{
                     "actor": "ada",
-                    "entries": 2,
+                    "entries": 3,
                     "drafts": [
                         { "path": "plan.md", "permalink": "plan", "tombstone": false, "conflict": null },
-                        { "path": "notes/gone.md", "permalink": "notes/gone.md", "tombstone": true, "conflict": null }
+                        { "path": "notes/gone.md", "permalink": "notes/gone.md", "tombstone": true, "conflict": null },
+                        { "path": "assets/deck.png", "kind": "file", "tombstone": false, "conflict": null }
                     ]
                 }],
                 "contested_paths": [],

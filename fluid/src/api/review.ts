@@ -21,8 +21,20 @@ import { api, encodeSegment } from "./client";
 export interface PlannedDraft {
   /** The domain-relative path this draft is of. */
   path: string;
-  /** The address it answers to. */
-  permalink: string;
+  /**
+   * What kind of thing stands there: `"file"` for something the actor wrote
+   * beside their pages - an attachment - and absent for an engram.
+   *
+   * Absent rather than `"engram"`, because an engram row is exactly the shape
+   * it always was: this key is the discriminator a reader added afterwards,
+   * and every reader that predates it goes on reading the rows it knew.
+   */
+  kind?: "file";
+  /**
+   * The address it answers to, absent on a file: bytes answer to no address,
+   * so nothing about a file can collide with one.
+   */
+  permalink?: string;
   /** Whether it is this actor's deletion of the engram at that path. */
   tombstone: boolean;
   /**
@@ -36,6 +48,7 @@ export interface PlannedDraft {
 /** One actor's drafts, as the plan names them. */
 export interface PlannedActor {
   actor: string;
+  /** How many draft changes they are holding: pages plus files. */
   entries: number;
   drafts: PlannedDraft[];
 }

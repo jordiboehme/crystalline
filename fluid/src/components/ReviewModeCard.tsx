@@ -31,7 +31,7 @@ import { useId, useState } from "react";
 
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
-import type { FoldChoice, ReviewPlan } from "../api/review";
+import type { FoldChoice, PlannedActor, ReviewPlan } from "../api/review";
 import { enableReview, fetchReviewPlan, leaveReview } from "../api/review";
 import { useAuth } from "../auth/AuthContext";
 import { BUTTON } from "./primitives";
@@ -42,6 +42,24 @@ const READ_ONLY_REASON =
 
 /** The answer each actor starts at: fold, because ending somebody's unshared work is the choice that should be deliberate. */
 const DEFAULT_CHOICE: FoldChoice = "fold";
+
+/**
+ * What one actor is holding, as the legend says it.
+ *
+ * A plain count while every change is a page, which is what it always said.
+ * With files among them it says how many, because what folding does to a file
+ * is not what it does to a page: the bytes become the team's file rather than
+ * a page anybody reads, and somebody answering the plan should not find that
+ * out afterwards.
+ */
+function countOf(row: PlannedActor): string {
+  const files = row.drafts.filter((draft) => draft.kind === "file").length;
+  if (files === 0) {
+    return `${row.entries}`;
+  }
+  const what = files === 1 ? "1 of them a file" : `${files} of them files`;
+  return `${row.entries} draft changes, ${what}`;
+}
 
 export function ReviewModeCard({
   domain,
@@ -146,15 +164,15 @@ export function ReviewModeCard({
                     <li key={row.actor}>
                       <fieldset>
                         <legend className="text-sm font-medium">
-                          {row.actor} ({row.entries})
+                          {row.actor} ({countOf(row)})
                         </legend>
                         <ul className="ml-4 list-disc text-sm text-slate-600 dark:text-slate-400">
                           {row.drafts.map((draft) => (
                             <li key={draft.path}>
-                              {draft.tombstone
-                                ? `deleted ${draft.path}`
-                                : `drafted ${draft.path}`}
-                              {draft.conflict !== null && (
+                              {draft.tombstone ? "deleted " : "drafted "}
+                              {draft.kind === "file" ? "the file " : ""}
+                              {draft.path}
+                              {draft.conflict != null && (
                                 <span className="text-red-700 dark:text-red-300">
                                   {" "}
                                   - {draft.conflict}

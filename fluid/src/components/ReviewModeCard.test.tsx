@@ -212,6 +212,60 @@ describe("ReviewModeCard", () => {
     });
   });
 
+  it("says which of the draft changes is a file", async () => {
+    serve({
+      "/domains/eng/review": (_path, init) =>
+        sent(init).folds === undefined
+          ? planResponse({
+              actors: [
+                {
+                  actor: "ada",
+                  entries: 3,
+                  drafts: [
+                    {
+                      path: "plan.md",
+                      permalink: "plan",
+                      tombstone: false,
+                      conflict: null,
+                    },
+                    {
+                      path: "assets/deck.png",
+                      kind: "file",
+                      tombstone: false,
+                      conflict: null,
+                    },
+                    {
+                      path: "assets/old.png",
+                      kind: "file",
+                      tombstone: true,
+                      conflict: null,
+                    },
+                  ],
+                },
+              ],
+            })
+          : {},
+    });
+    renderApp("/d/eng");
+
+    const region = await screen.findByRole("region", { name: "Review mode" });
+    await userEvent.click(
+      within(region).getByRole("button", { name: "Take review mode off" }),
+    );
+
+    // Her line counts everything she is holding and says how much of it is
+    // files, and each file row says which it is: folding a file puts bytes in
+    // the team's folder, which is not what folding a page does.
+    await screen.findByText(/ada \(3 draft changes, 2 of them files\)/);
+    expect(
+      within(region).getByText(/drafted the file assets\/deck.png/),
+    ).toBeInTheDocument();
+    expect(
+      within(region).getByText(/deleted the file assets\/old.png/),
+    ).toBeInTheDocument();
+    expect(within(region).getByText(/drafted plan.md/)).toBeInTheDocument();
+  });
+
   it("names both kinds of trouble a fold runs into", async () => {
     serve({
       "/domains/eng/review": (_path, init) =>

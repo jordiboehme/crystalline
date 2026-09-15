@@ -990,15 +990,32 @@ fn review_plan_lines(plan: &serde_json::Value) -> Vec<String> {
     for row in &actors {
         let actor = row["actor"].as_str().unwrap_or("?");
         let entries = row["entries"].as_u64().unwrap_or(0);
-        out.push(format!("  {actor} ({entries} draft(s))"));
-        for draft in row["drafts"].as_array().cloned().unwrap_or_default() {
+        let drafts = row["drafts"].as_array().cloned().unwrap_or_default();
+        // How many of them are files, said on the actor's own line, because
+        // what happens to a file when it folds is not what happens to a page:
+        // the bytes become the team's file rather than a page they can read.
+        let files = drafts
+            .iter()
+            .filter(|draft| draft["kind"] == serde_json::json!("file"))
+            .count();
+        out.push(match files {
+            0 => format!("  {actor} ({entries} draft(s))"),
+            1 => format!("  {actor} ({entries} draft changes, 1 of them a file)"),
+            n => format!("  {actor} ({entries} draft changes, {n} of them files)"),
+        });
+        for draft in drafts {
             let path = draft["path"].as_str().unwrap_or("?");
             let what = if draft["tombstone"].as_bool().unwrap_or(false) {
                 "deleted"
             } else {
                 "drafted"
             };
-            out.push(format!("    {what} {path}"));
+            let kind = if draft["kind"] == serde_json::json!("file") {
+                "the file "
+            } else {
+                ""
+            };
+            out.push(format!("    {what} {kind}{path}"));
             if let Some(conflict) = draft["conflict"].as_str() {
                 out.push(format!("      cannot be folded: {conflict}"));
             }
@@ -2757,6 +2774,49 @@ fn print_report(r: &crystalline_index::SyncReport) {
 #[cfg(test)]
 mod review_plan_tests {
     use super::review_plan_lines;
+
+    /// A file in the plan is named as one, on the actor's own line and on its
+    /// own row.
+    ///
+    /// What folding does to a page and what it does to a file are different
+    /// enough to be worth a word: a page becomes text the team reads, a file
+    /// becomes bytes in the team's folder. A plan that called both "drafts"
+    /// would leave the person answering it to find that out afterwards.
+    #[test]
+    fn the_plan_says_which_of_the_draft_changes_is_a_file() {
+        let plan = serde_json::json!({
+            "actors": [
+                { "actor": "ada", "entries": 3, "drafts": [
+                    { "path": "alpha.md", "permalink": "alpha", "tombstone": false, "conflict": null },
+                    { "path": "assets/deck.png", "kind": "file", "tombstone": false, "conflict": null },
+                    { "path": "assets/old.png", "kind": "file", "tombstone": true, "conflict": null },
+                ]},
+                { "actor": "bo", "entries": 1, "drafts": [
+                    { "path": "beta.md", "permalink": "beta", "tombstone": false, "conflict": null }
+                ]},
+            ],
+            "contested_paths": [],
+            "contested_addresses": [],
+        });
+        let lines = review_plan_lines(&plan).join("\n");
+        assert!(
+            lines.contains("ada (3 draft changes, 2 of them files)"),
+            "her line counts them and says how many are files: {lines}"
+        );
+        assert!(
+            lines.contains("    drafted the file assets/deck.png")
+                && lines.contains("    deleted the file assets/old.png"),
+            "and each file row says which it is: {lines}"
+        );
+        assert!(
+            lines.contains("  bo (1 draft(s))"),
+            "an actor drafting no files reads exactly as they always did: {lines}"
+        );
+        assert!(
+            lines.contains("    drafted alpha.md"),
+            "and so does a page: {lines}"
+        );
+    }
 
     /// Both kinds of trouble a fold runs into reach the person answering the
     /// plan, because a plan that shows one and hides the other is a clean plan

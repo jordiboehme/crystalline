@@ -5875,9 +5875,15 @@ export interface operations {
                      *               "path": "notes/gone.md",
                      *               "permalink": "notes/gone.md",
                      *               "tombstone": true
+                     *             },
+                     *             {
+                     *               "conflict": null,
+                     *               "kind": "file",
+                     *               "path": "assets/deck.png",
+                     *               "tombstone": false
                      *             }
                      *           ],
-                     *           "entries": 2
+                     *           "entries": 3
                      *         }
                      *       ],
                      *       "applied": false,
