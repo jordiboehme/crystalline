@@ -12129,9 +12129,14 @@ impl Engine {
     /// The one corner where a direct domain is not byte for byte what it was:
     /// it is not this function (gated, so a direct domain never reaches the
     /// tree) but its ungated listing twin, which flags every actor of a direct
-    /// domain whose `<state>/overlays/<domain>` is damaged - so a mid-fold
-    /// recovery there refuses where it used to fold. That is the more correct
-    /// answer and it is named here rather than discovered.
+    /// domain whose `<state>/overlays/<domain>` is damaged. What that changes
+    /// is one case and only one: a **mid-fold recovery** there - a domain the
+    /// key came off mid-verb, still holding rows or visible files - refuses
+    /// where it used to fold half. That is the more correct answer, and it is
+    /// named here rather than discovered. A plain statement that an
+    /// already-direct domain takes changes directly is untouched:
+    /// [`Engine::refuse_unlistable_files`] applies only where the domain
+    /// reviews changes or a draft file is actually visible.
     fn overlay_file_counts(&self, name: &str) -> Option<Option<BTreeMap<String, u64>>> {
         if !self.reviews_changes(name) {
             return Some(None);
@@ -12536,6 +12541,20 @@ impl Engine {
         for actor in actors {
             let entries = held.get(&actor).cloned().unwrap_or_default();
             let own = files.per_actor.get(&actor);
+            // An actor whose files folder is there, readable and empty holds
+            // nothing at all, and nothing is not a thing to decide about:
+            // listing them would put a `bob (0 draft(s))` line in the plan that
+            // `review::choices` then demands an answer for, and would make a
+            // domain holding nothing impossible to take out of review mode
+            // without naming somebody who is not there. The LISTING keeps them
+            // (the sweep wants exactly those folders); this per-actor view is
+            // where they drop out.
+            if entries.is_empty()
+                && own.is_some_and(|read| read.entries.is_empty() && !read.unreadable)
+                && !files.unreadable
+            {
+                continue;
+            }
             out.push(ActorDrafts {
                 entries,
                 files: own.map(|read| read.entries.clone()).unwrap_or_default(),
@@ -12609,14 +12628,30 @@ impl Engine {
     /// copy of their work ends must never read a failure as "there was nothing
     /// there".
     fn refuse_unlistable_files(&self, domain: &str) -> Option<EngineError> {
-        let whose = match self.overlay_domain_files(domain).unlistable()? {
-            Some(actor) => format!("the files '{actor}' has drafted"),
+        let files = self.overlay_domain_files(domain);
+        let whose = files.unlistable()?;
+        // **Only where there is something for it to protect.** A domain that
+        // takes changes directly and holds no draft file anybody can see has no
+        // fold for a half-read listing to spoil, and the sweep that could have
+        // destroyed something is guarded on its own account. Refusing there
+        // would turn `PUT {"mode":"direct"}` on a domain that already takes
+        // changes directly - a statement that writes nothing - into an error
+        // over a tree nobody in that domain can write to.
+        let anything_held = files
+            .per_actor
+            .values()
+            .any(|read| !read.entries.is_empty());
+        if !self.reviews_changes(domain) && !anything_held {
+            return None;
+        }
+        let whose = match whose {
+            Some(actor) => format!("the files '{actor}' has drafted in domain '{domain}'"),
             None => format!("the files overlay of domain '{domain}'"),
         };
         Some(EngineError::Conflict(format!(
-            "{whose} in domain '{domain}' could not be read, and leaving review mode ends every \
-             draft in it one way or the other. Nothing was folded, nothing was ended and the \
-             domain reviews changes still; answer again once the state directory can be read"
+            "{whose} could not be read, and leaving review mode ends every draft in it one way \
+             or the other. Nothing was folded, nothing was ended and the domain reviews changes \
+             still; answer again once the state directory can be read"
         )))
     }
 
@@ -15767,6 +15802,15 @@ impl Engine {
     /// The state directory the overlay journal lives under: the test override,
     /// or the real one. `<state_dir>/overlays/<domain>/<actor>/<path>` is the
     /// journal's own layout, which [`crate::overlay_journal`] owns.
+    /// **This resolver performs no I/O, and that is load bearing.** Its failure
+    /// means "this process knows no path at all", a fact about the environment,
+    /// which is why [`Engine::overlay_domain_files`] may read it as nothing
+    /// there is rather than as something it cannot see: nothing can ever have
+    /// been written through a resolver that answers no path. A `create_dir_all`
+    /// or a `canonicalize` added here would turn a real permission failure on
+    /// the state root into that same answer, and the silent omission that arm
+    /// is safe from today would reopen. Every directory failure is detected
+    /// strictly after this call, inside `overlay_files::by_actor`.
     pub(crate) fn journal_state_dir(&self) -> Result<PathBuf> {
         match &self.state_dir_override {
             Some(p) => Ok(p.clone()),

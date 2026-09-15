@@ -4189,6 +4189,73 @@ async fn leaving_review_mode_with_an_unreadable_files_folder_refuses_and_keeps_e
     );
 }
 
+/// An empty files folder is nothing to decide, so nobody is asked about it -
+/// and it is still swept.
+///
+/// A folder with no entries in it can be left behind by a write that failed
+/// after creating its parents. Listing the actor is what lets the sweep end it;
+/// asking the person leaving review mode to fold or discard an actor who holds
+/// nothing is a question with no content, and refusing a confirm that does not
+/// answer it would make a domain that holds nothing impossible to take out of
+/// review mode.
+#[tokio::test]
+async fn an_actor_with_an_empty_files_folder_is_asked_about_by_nobody_and_swept_anyway() {
+    let f = review_fixture().await;
+    let empty = f.state.join("overlays/team/alice/files");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let plan = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan["actors"],
+        serde_json::json!([]),
+        "an actor holding nothing is nobody the plan has to name: {plan}"
+    );
+
+    let receipt = f
+        .engine
+        .set_review_mode("team", None, folds(&[]), &Scope::Unrestricted)
+        .await
+        .expect("an answer that names nobody is the whole answer here");
+    assert_eq!(receipt["applied"], serde_json::json!(true), "{receipt}");
+    assert!(
+        !empty.exists(),
+        "and the folder went with the mode, as an empty one should"
+    );
+}
+
+/// A statement that a direct domain takes changes directly stays a statement,
+/// whatever state the overlay tree is in.
+///
+/// `PUT {"mode":"direct"}` on a domain that already takes changes directly and
+/// holds no drafts writes nothing, closes no room and syncs nothing - which is
+/// the whole point of that branch. A damaged overlay tree is a fact about a
+/// domain nobody can draft in, so it has no bearing on the answer: the refusal
+/// that protects a fold applies where there is a fold to protect.
+#[tokio::test]
+async fn a_no_op_statement_on_a_direct_domain_succeeds_over_a_damaged_overlay_tree() {
+    let f = fixture().await;
+    std::fs::create_dir_all(f.state.join("overlays")).unwrap();
+    std::fs::write(f.state.join("overlays/team"), "not a folder").unwrap();
+
+    let receipt = f
+        .engine
+        .set_review_mode("team", None, folds(&[]), &Scope::Unrestricted)
+        .await
+        .expect("a domain that takes changes directly already is told so, not refused");
+    assert_eq!(receipt["applied"], serde_json::json!(true), "{receipt}");
+    assert_eq!(receipt["folded"], serde_json::json!([]), "{receipt}");
+    assert_eq!(receipt["discarded"], serde_json::json!([]), "{receipt}");
+}
+
 /// **A fold that failed part way folds the leftover file on the next call.**
 ///
 /// The review key comes off in the middle of the verb, so everything after it

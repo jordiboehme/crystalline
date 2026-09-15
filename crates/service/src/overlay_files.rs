@@ -373,13 +373,39 @@ pub(crate) fn by_actor(state_dir: &Path, domain: &str) -> DomainFiles {
         // folder exists is listed whatever is in it, empty and unreadable
         // alike. An empty folder listed is what lets the sweep end it, and an
         // unreadable one listed is what lets the fold refuse by name.
+        //
+        // **Asked with an explicit match, never with `exists`.**
+        // [`std::path::Path::exists`] is `metadata().is_ok()`, which answers
+        // `false` both for "not there" and for "cannot be determined" - so an
+        // actor whose own folder cannot be traversed used to answer "no files
+        // folder" and be dropped here. An actor who is not in the listing is
+        // one the fold's refusal cannot name and no sweep ever reaches, which
+        // is the silent omission this listing exists to prevent, one directory
+        // further up. `symlink_metadata` rather than `metadata` so a dangling
+        // symlink is a thing that is there rather than a thing that is not.
         let Ok(files) = files_dir(state_dir, domain, &name) else {
             continue;
         };
-        if !files.exists() {
-            continue;
+        match std::fs::symlink_metadata(&files) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    domain = domain,
+                    actor = name.as_str(),
+                    "the files folder of '{name}' could not be asked about: {e}"
+                );
+                per_actor.insert(
+                    name.clone(),
+                    FileRead {
+                        entries: Vec::new(),
+                        unreadable: true,
+                    },
+                );
+            }
+            Ok(_) => {
+                per_actor.insert(name.clone(), entries(state_dir, domain, &name));
+            }
         }
-        per_actor.insert(name.clone(), entries(state_dir, domain, &name));
     }
     DomainFiles {
         per_actor,
@@ -620,6 +646,67 @@ mod tests {
             state.join("overlays/team/alice/plan.md").is_file(),
             "and the actor's own folder, which holds their journal drafts, stays"
         );
+    }
+
+    /// **A folder that cannot be asked about at all is flagged, never skipped.**
+    ///
+    /// "Not there" and "cannot be determined" are one answer from
+    /// [`std::path::Path::exists`], which is `metadata().is_ok()`. An actor
+    /// whose own folder cannot be traversed therefore answered "no files
+    /// folder" and was dropped from the listing - and an actor who is not in
+    /// the listing is an actor the fold's refusal cannot name, whose files no
+    /// sweep ever ends, and whose bytes are left in a domain that reviews
+    /// nothing. That is the same silent omission this whole listing exists to
+    /// prevent, one directory further up.
+    ///
+    /// Unix only - the permission bits are the discriminator, and Windows has
+    /// no equivalent that leaves the parent listable. Skipped in the one
+    /// environment where the bits do not bind (a run as root), with a note
+    /// rather than a silent pass.
+    #[cfg(unix)]
+    #[test]
+    fn an_actor_whose_files_folder_cannot_be_stated_is_flagged_rather_than_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = dir();
+        let state = tmp.path();
+        put(state, "team", "alice", "assets/deck.png", PNG).unwrap();
+        put(state, "team", "bob", "assets/his.png", PNG).unwrap();
+
+        // Bob's own folder is untraversable, so a stat of the `files` folder
+        // inside it cannot be answered either way. His folder itself is still
+        // listed by the domain walk, because that needs traverse on the domain
+        // folder rather than on his.
+        let bob = state.join("overlays/team/bob");
+        std::fs::set_permissions(&bob, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if bob.join("files").exists() {
+            std::fs::set_permissions(&bob, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipped: this process stats through a mode-000 directory, so the permission \
+                 bits cannot discriminate here (a run as root)"
+            );
+            return;
+        }
+
+        let held = by_actor(state, "team");
+        assert_eq!(
+            held.unlistable(),
+            Some(Some("bob")),
+            "the actor nothing could be learned about is named"
+        );
+        assert!(
+            held.per_actor.contains_key("bob"),
+            "and he is in the listing, or no refusal could name him and no sweep \
+             would ever reach him"
+        );
+        assert_eq!(
+            held.counts().get("alice"),
+            Some(&1),
+            "while the actor who could be read is read"
+        );
+
+        // Left as we found it, so the tempdir can be removed.
+        std::fs::set_permissions(&bob, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// An answer that could not see everything says so, and a sidecar counts
