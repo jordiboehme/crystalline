@@ -315,6 +315,68 @@ impl Fixture {
         overlay_journal::journal_tombstone(&self.state, domain, actor, path).unwrap();
     }
 
+    /// Write one actor's draft FILE: an attachment written in review mode,
+    /// which lands in that actor's files overlay and never in the folder.
+    ///
+    /// It goes through `attachment_write_as` rather than through a
+    /// `DomainView`, because `domain_view` is `pub(crate)` and an integration
+    /// test cannot build one. The receipt's `draft` flag is asserted here, so a
+    /// fixture can never quietly write the team's folder instead.
+    async fn file(&self, domain: &str, actor: &str, path: &str, bytes: &[u8]) {
+        let written = self
+            .engine
+            .attachment_write_as(domain, path, bytes.to_vec(), &scope_of(actor))
+            .await
+            .unwrap();
+        assert!(written.draft, "a write in review mode is a draft: {path}");
+    }
+
+    /// One actor's deletion of a reviewed file: a marker in their files
+    /// overlay, with the folder untouched.
+    async fn delete_file(&self, domain: &str, actor: &str, path: &str) {
+        let draft = self
+            .engine
+            .attachment_delete_as(domain, path, &scope_of(actor))
+            .await
+            .unwrap();
+        assert!(draft, "a deletion in review mode is a draft: {path}");
+    }
+
+    /// What one actor's files overlay holds on disk, as `(path, tombstone)`
+    /// pairs ordered by path.
+    fn files_held(&self, domain: &str, actor: &str) -> Vec<(String, bool)> {
+        let dir = self
+            .state
+            .join("overlays")
+            .join(domain)
+            .join(actor)
+            .join("files");
+        let mut out = Vec::new();
+        fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(String, bool)>) {
+            let Ok(listed) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in listed.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &rel, out);
+                } else if let Some(base) = rel.strip_suffix(".tombstone") {
+                    out.push((base.to_string(), true));
+                } else {
+                    out.push((rel, false));
+                }
+            }
+        }
+        walk(&dir, "", &mut out);
+        out.sort();
+        out
+    }
+
     /// What one actor holds, as `(path, content, tombstone)` triples ordered by
     /// path.
     async fn held(&self, domain: &str, actor: &str) -> Vec<(String, String, bool)> {
@@ -993,6 +1055,139 @@ async fn a_refused_removal_closes_no_co_editing_room() {
     );
 }
 
+/// A PNG stand-in: it never has to decode, only to travel unchanged, so it is
+/// a short blob carrying the NUL a text-shaped path would lose.
+const DECK_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00a deck somebody drafted";
+
+/// A file somebody drafted is unshared work exactly as a drafted page is, so
+/// the removal counts it and asks about it by name - and a files overlay that
+/// cannot be read is not an empty one.
+///
+/// The files overlay is primary data rather than a mirror of a row, which is
+/// what makes this different from the journal beside it: a journal nobody can
+/// read is a copy of rows that are readable, while a files overlay nobody can
+/// read is work nobody can account for. So it refuses, exactly as an index that
+/// cannot be asked does, and for the same reason - the branch that decides
+/// whether somebody's only copy of their work is deleted must never read a
+/// failure as "there was nothing there".
+#[tokio::test]
+async fn the_removal_gate_counts_files_as_drafts_and_an_unreadable_files_folder_refuses() {
+    let f = review_fixture().await;
+    f.file("team", "bob", "assets/deck.png", DECK_PNG).await;
+
+    // Named, because the preview raises every refusal the removal would: an
+    // unnamed actor holding anything is exactly the refusal asserted below.
+    let preview = f
+        .engine
+        .domain_remove_preview("team", &Scope::Unrestricted, false, &["bob".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["drafts"],
+        serde_json::json!([{ "actor": "bob", "entries": 1 }]),
+        "his one file is one draft: {preview}"
+    );
+    assert_eq!(preview["drafts_unknown"], serde_json::json!(false));
+
+    let refused = f
+        .engine
+        .unregister_domain("team", &Scope::Unrestricted, false, &[])
+        .await
+        .expect_err("a file somebody drafted is not ended by omission");
+    assert!(
+        refused.to_string().contains("bob (1 draft)"),
+        "the refusal names him and what he is holding: {refused}"
+    );
+
+    // The folder is not a folder any more. Portable, deterministic, and
+    // exactly as unreadable as a permission problem.
+    let files = f.state.join("overlays/team/bob/files");
+    std::fs::remove_dir_all(&files).unwrap();
+    std::fs::write(&files, "not a folder").unwrap();
+
+    // The preview raises the removal's own refusals before it shapes an
+    // answer, so an unreadable count is a refusal here rather than a
+    // `drafts_unknown: true` body: the question is never put about a removal
+    // that would refuse anyway.
+    let refused = f
+        .engine
+        .domain_remove_preview("team", &Scope::Unrestricted, false, &["bob".to_string()])
+        .await
+        .expect_err("a count nothing could read is asked about by nobody");
+    assert!(
+        refused.to_string().contains("could not be read"),
+        "and the preview says why: {refused}"
+    );
+    let refused = f
+        .engine
+        .unregister_domain("team", &Scope::Unrestricted, false, &["bob".to_string()])
+        .await
+        .expect_err("a count nothing could read refuses however it was answered");
+    assert!(
+        refused.to_string().contains("could not be read"),
+        "and it says why: {refused}"
+    );
+
+    // Readable again, and the removal that follows says how much it took: the
+    // journal's sweep carries the files away with the drafts by construction,
+    // so a count that left them out would be a number smaller than the loss.
+    std::fs::remove_file(&files).unwrap();
+    f.file("team", "bob", "assets/deck.png", DECK_PNG).await;
+    let report = f
+        .engine
+        .unregister_domain("team", &Scope::Unrestricted, false, &["bob".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        report["drafts_swept"],
+        serde_json::json!(1),
+        "the one file went with the domain, and is counted: {report}"
+    );
+}
+
+/// Every count of drafts is one count: the listing's own `my_drafts`, the
+/// domain's sync status and the owner-only `drafts` view all answer rows plus
+/// files, because all three are derived in one place.
+#[tokio::test]
+async fn my_drafts_and_the_drafts_route_count_files_beside_rows() {
+    let f = review_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "alice", "assets/deck.png", DECK_PNG).await;
+    f.file("team", "alice", "assets/notes.png", DECK_PNG).await;
+
+    let listing = f
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &account("alice"),
+        )
+        .await
+        .unwrap();
+    let team = listing["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "team")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        team["my_drafts"],
+        serde_json::json!(3),
+        "her page and her two files: {team}"
+    );
+
+    let drafts = f
+        .engine
+        .domain_drafts("team", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        drafts,
+        serde_json::json!({ "actors": [{ "actor": "alice", "entries": 3 }] }),
+        "and whoever owns the domain sees the same three: {drafts}"
+    );
+}
+
 /// A member is told what a member is holding, on the one read every member
 /// already makes.
 ///
@@ -1233,6 +1428,17 @@ fn account(name: &str) -> Scope {
     Scope::User {
         account: name.to_string(),
         admin: false,
+    }
+}
+
+/// The scope one actor name means. The machine owner drafts as `owner`, which
+/// is [`Scope::Unrestricted`]'s own overlay key, and anybody else drafts under
+/// their account.
+fn scope_of(actor: &str) -> Scope {
+    if actor == "owner" {
+        Scope::Unrestricted
+    } else {
+        account(actor)
     }
 }
 

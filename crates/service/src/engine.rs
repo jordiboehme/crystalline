@@ -11898,31 +11898,80 @@ impl Engine {
     /// drafts in it either - a registration nothing has synced yet - and that
     /// is an honest empty rather than an unknown.
     pub(crate) async fn overlay_counts_by_actor(&self, name: &str) -> Option<Vec<(String, u64)>> {
-        let store = self.store.lock().await;
-        let id = match store.domain_id(name).await {
-            Ok(Some(id)) => id,
-            Ok(None) => return Some(Vec::new()),
-            Err(e) => {
-                tracing::warn!(
-                    domain = name,
-                    error = format!("{e:#}"),
-                    "the index could not say which domain '{name}' is, so nobody's drafts in \
-                     it can be counted"
-                );
-                return None;
-            }
-        };
-        match store.overlay_counts(id).await {
-            Ok(counts) => Some(counts),
-            Err(e) => {
-                tracing::warn!(
-                    domain = name,
-                    error = format!("{e:#}"),
-                    "the drafts held in domain '{name}' could not be counted"
-                );
-                None
+        let mut held: BTreeMap<String, u64> = BTreeMap::new();
+        {
+            let store = self.store.lock().await;
+            let id = match store.domain_id(name).await {
+                Ok(Some(id)) => Some(id),
+                // A domain this index holds no row for has no drafted rows in
+                // it - a registration nothing has synced yet - and that is an
+                // honest empty rather than an unknown. It can still hold FILES,
+                // so this is a `None` to skip the row half with and never an
+                // early return.
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        domain = name,
+                        error = format!("{e:#}"),
+                        "the index could not say which domain '{name}' is, so nobody's drafts in \
+                         it can be counted"
+                    );
+                    return None;
+                }
+            };
+            if let Some(id) = id {
+                match store.overlay_counts(id).await {
+                    Ok(counts) => held.extend(counts),
+                    Err(e) => {
+                        tracing::warn!(
+                            domain = name,
+                            error = format!("{e:#}"),
+                            "the drafts held in domain '{name}' could not be counted"
+                        );
+                        return None;
+                    }
+                }
             }
         }
+        if let Some(files) = self.overlay_file_counts(name)? {
+            for (actor, entries) in files {
+                *held.entry(actor).or_default() += entries;
+            }
+        }
+        Some(held.into_iter().collect())
+    }
+
+    /// Every actor's files-overlay count in one domain, `None` when it could
+    /// not be read at all, and `Some(None)` for a domain that cannot hold one.
+    ///
+    /// **Only a domain that reviews changes is walked**, which is what keeps a
+    /// domain taking changes directly byte for byte the answer it was: nothing
+    /// writes a files overlay outside review mode, so a walk there could only
+    /// ever report zero - and a state directory somebody has damaged would turn
+    /// every direct domain's count into an unknown over a tree that holds
+    /// nothing. It also keeps a directory walk off the listing of a machine
+    /// whose domains all take changes directly.
+    ///
+    /// A state directory that cannot be resolved is unknown rather than empty:
+    /// this tree is the only place a draft file's bytes exist, so "nowhere to
+    /// look" is not "nothing there".
+    fn overlay_file_counts(&self, name: &str) -> Option<Option<BTreeMap<String, u64>>> {
+        if !self.reviews_changes(name) {
+            return Some(None);
+        }
+        let Ok(state_dir) = self.journal_state_dir() else {
+            tracing::warn!(
+                domain = name,
+                "the files overlay of '{name}' could not be located, so what anybody has \
+                 drafted there is unknown"
+            );
+            return None;
+        };
+        let (per_actor, unreadable) = crate::overlay_files::counts(&state_dir, name);
+        if unreadable {
+            return None;
+        }
+        Some(Some(per_actor))
     }
 
     /// Sweep a domain's overlay journal as part of ending it, answering with
@@ -12205,6 +12254,18 @@ impl Engine {
             crate::scope::overlay_actor(scope).as_deref(),
             end_drafts,
         )?;
+        // Counted here and not after the sweep, and here rather than below the
+        // registry step: the files overlay is only walked for a domain that
+        // reviews changes, and one line further down this domain is not
+        // registered at all. The journal's own `remove_dir_all` takes these
+        // files with the drafts by construction, so what is missing without
+        // this line is the NUMBER - a removal that swept files it never
+        // mentioned in front of the person who confirmed it.
+        let files_swept: u64 = self
+            .overlay_file_counts(name)
+            .flatten()
+            .map(|per_actor| per_actor.values().sum())
+            .unwrap_or(0);
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
             Some(sessions) => sessions.dispose_domain(name).await,
             None => 0,
@@ -12215,7 +12276,7 @@ impl Engine {
         // them. A domain's removal takes every actor's drafts with it, and
         // leaving the journal behind would mean a domain re-added under this
         // name resurrecting somebody's old private drafts into it.
-        let drafts_swept = self.sweep_domain_journal(name).await;
+        let drafts_swept = self.sweep_domain_journal(name).await + files_swept;
         if let Value::Object(map) = &mut report {
             map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
             map.insert("drafts_swept".to_string(), Value::from(drafts_swept));
