@@ -60,7 +60,11 @@ use crate::engine::{is_contained_rel, is_within_domain, virtual_stamp};
 pub const JOURNAL_DIR: &str = "overlays";
 
 /// The suffix marking a tombstone sidecar.
-const TOMBSTONE_SUFFIX: &str = ".tombstone";
+///
+/// Shared with [`crate::overlay_files`], which marks a deletion in the files
+/// overlay the same way: one spelling, so the two substrates can never disagree
+/// about what a deletion looks like on disk.
+pub(crate) const TOMBSTONE_SUFFIX: &str = ".tombstone";
 
 /// The file one domain's convergence record lives in, inside that domain's
 /// journal folder.
@@ -159,14 +163,30 @@ pub struct JournalEntry {
 }
 
 /// The journal root for one domain, `<state_dir>/overlays/<domain>`.
-fn domain_dir(state_dir: &Path, domain: &str) -> io::Result<PathBuf> {
+///
+/// Shared with [`crate::overlay_files`], whose per-actor trees stand inside the
+/// actor folders under it.
+pub(crate) fn domain_dir(state_dir: &Path, domain: &str) -> io::Result<PathBuf> {
     Ok(state_dir
         .join(JOURNAL_DIR)
         .join(one_segment(domain, "domain")?))
 }
 
 /// One actor's folder inside a domain's journal.
-fn actor_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Result<PathBuf> {
+///
+/// The files overlay lives INSIDE this folder, under
+/// [`crate::overlay_files::FILES_DIR`], which is why it is shared rather than
+/// private: an actor's drafts and the files they wrote in review mode are one
+/// actor's private work, so [`journal_remove_domain`]'s single
+/// `remove_dir_all` takes both by construction rather than by a second sweep
+/// somebody has to remember to call.
+///
+/// The two trees coexist because neither can hold the other's paths. The walk
+/// below keeps only `.md` and `.md.tombstone`, and an attachment path can never
+/// end in `.md` (`.md` is not on the attachment extension allowlist), so
+/// nothing in `files/` is ever read back as a draft and nothing the journal
+/// writes is ever served as an attachment.
+pub(crate) fn actor_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Result<PathBuf> {
     Ok(domain_dir(state_dir, domain)?.join(one_segment(actor, "actor")?))
 }
 
@@ -196,7 +216,7 @@ fn entry_path(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Re
 /// appending to it, which would point `journal_remove_domain`'s recursive
 /// delete at a whole volume. The entry path keeps the looser rule on purpose,
 /// because an engram file is whatever a person named it.
-fn one_segment<'a>(name: &'a str, what: &str) -> io::Result<&'a str> {
+pub(crate) fn one_segment<'a>(name: &'a str, what: &str) -> io::Result<&'a str> {
     if !is_contained_rel(name) || name.contains('/') {
         return Err(refused(what, name));
     }
@@ -219,7 +239,9 @@ fn refused(what: &str, value: &str) -> io::Error {
 }
 
 /// The tombstone sidecar beside a draft file.
-fn tombstone_of(file: &Path) -> PathBuf {
+///
+/// Shared with [`crate::overlay_files`] so the sidecar is named in one place.
+pub(crate) fn tombstone_of(file: &Path) -> PathBuf {
     let mut name = file
         .file_name()
         .map(|n| n.to_os_string())
@@ -229,13 +251,15 @@ fn tombstone_of(file: &Path) -> PathBuf {
 }
 
 /// Write atomically through [`config::save_bytes`], so a reader never sees a
-/// half-written draft and a crash never truncates one.
-fn save(file: &Path, bytes: &[u8]) -> io::Result<()> {
+/// half-written draft and a crash never truncates one. Shared with
+/// [`crate::overlay_files`], whose bytes arrive the same way.
+pub(crate) fn save(file: &Path, bytes: &[u8]) -> io::Result<()> {
     config::save_bytes(file, bytes).map_err(io::Error::other)
 }
 
-/// Remove a file that may not be there.
-fn remove_if_present(file: &Path) -> io::Result<()> {
+/// Remove a file that may not be there. Shared with
+/// [`crate::overlay_files`].
+pub(crate) fn remove_if_present(file: &Path) -> io::Result<()> {
     match std::fs::remove_file(file) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -295,7 +319,11 @@ pub fn journal_clear(state_dir: &Path, domain: &str, actor: &str, path: &str) ->
 /// Remove every folder from `from` up to and including `stop` that is empty,
 /// stopping at the first one that is not. Best effort: a folder that could not
 /// be read or removed is left where it is.
-fn prune_empty(from: Option<&Path>, stop: &Path) {
+///
+/// Shared with [`crate::overlay_files`], which prunes up to its own `files/`
+/// folder rather than to the actor's - the actor's folder is this module's and
+/// outlives a cleared file.
+pub(crate) fn prune_empty(from: Option<&Path>, stop: &Path) {
     let mut cur = from.map(Path::to_path_buf);
     while let Some(dir) = cur {
         if !dir.starts_with(stop) || std::fs::remove_dir(&dir).is_err() {
@@ -444,6 +472,14 @@ fn walk(state_dir: &Path, domain: &str, read_content: bool) -> (Vec<JournalEntry
 
 /// Walk one actor's folder, appending every mirrored entry under it. Answers
 /// whether anything under it could not be read.
+///
+/// **It descends into the files overlay and takes nothing out of it.** That
+/// tree stands at `<actor>/files/` ([`crate::overlay_files`]), and the `is_md`
+/// screen below is what keeps it out: every path there is a validated
+/// attachment path, so it ends in an allowlisted extension and `.md` is not one
+/// of them - a file there can no more be read back as a draft than
+/// `<path>.tombstone` can. The coexistence is pinned by
+/// `the_journal_walk_never_reads_an_overlay_file_or_its_sidecar_as_a_draft`.
 fn collect(
     dir: &Path,
     prefix: &str,
@@ -933,6 +969,61 @@ mod tests {
         let counts = journal_counts(state, "never");
         assert_eq!(counts.total, 0);
         assert!(!counts.unreadable);
+    }
+
+    /// **The two substrates share an actor folder and cannot read each other.**
+    ///
+    /// [`crate::overlay_files`] stands at `<actor>/files/`, which this walk
+    /// descends into like any other folder. What keeps it out of a restore is
+    /// the `is_md` screen and nothing else, so the sharp shape is planted here:
+    /// a draft whose own path happens to start with `files/`, beside an overlay
+    /// file and an overlay sidecar under the same folder. The draft comes back
+    /// and the two files do not.
+    #[test]
+    fn the_journal_walk_never_reads_an_overlay_file_or_its_sidecar_as_a_draft() {
+        let tmp = dir();
+        let state = tmp.path();
+
+        journal_write(state, "team", "alice", "files/notes.md", DRAFT).unwrap();
+        crate::overlay_files::put(state, "team", "alice", "assets/a.png", b"png bytes").unwrap();
+        crate::overlay_files::tombstone(state, "team", "alice", "assets/b.png").unwrap();
+
+        assert!(
+            state
+                .join("overlays/team/alice/files/assets/a.png")
+                .is_file()
+                && state
+                    .join("overlays/team/alice/files/assets/b.png.tombstone")
+                    .is_file()
+                && state.join("overlays/team/alice/files/notes.md").is_file(),
+            "all three stand under one actor folder"
+        );
+
+        let read = journal_entries(state, "team");
+        assert_eq!(
+            read.entries,
+            vec![JournalEntry {
+                actor: "alice".to_string(),
+                path: "files/notes.md".to_string(),
+                content: Some(DRAFT.to_string()),
+            }],
+            "only the draft is a journal entry; neither the overlay file nor its sidecar is"
+        );
+        assert!(!read.unreadable);
+        assert_eq!(journal_counts(state, "team").total, 1);
+
+        // And the reverse: the files overlay reads none of the journal's own
+        // drafts, whatever folder they happen to stand in.
+        let files = crate::overlay_files::entries(state, "team", "alice");
+        assert_eq!(
+            files
+                .entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["assets/a.png", "assets/b.png"],
+            "the draft at files/notes.md is not one of this actor's overlay files"
+        );
     }
 
     /// Every one of the three names is screened, because every one of them
