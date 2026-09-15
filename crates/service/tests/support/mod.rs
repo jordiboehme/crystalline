@@ -191,6 +191,12 @@ struct Inner {
     /// provider call at all (disabled, unauthenticated, or paused for a rate
     /// limit).
     branch_head_calls: usize,
+    /// A branch move armed to happen right AFTER the nth `branch_head` probe
+    /// answers: `(n, branch, commit)`. Set through
+    /// `MockProvider::move_branch_after_head_probes`, and the only way a test
+    /// can put an upstream advance in the middle of one engine call - which is
+    /// the window a share of a reviewing domain has to be safe across.
+    branch_move_after_probe: Option<(usize, String, String)>,
     /// How many times `tarball` has been called, for the connect-race test:
     /// a first connect parks mid-download while an identical retry queues on
     /// the origin lock, so a count of exactly one proves the retry answered
@@ -380,6 +386,20 @@ impl MockProvider {
         self.inner.lock().unwrap().branch_head_calls
     }
 
+    /// Moves `branch` to `commit` right after the `probe`th `branch_head` call
+    /// answers, counting from the first call this provider ever served.
+    ///
+    /// The one way a test can advance the remote in the middle of a single
+    /// engine call: a share of a domain that reviews changes pulls the folder
+    /// and then proposes, and what happens when the team's copy moves between
+    /// those two steps is a behaviour rather than a race to be hoped away. The
+    /// probe that triggers it still answers with the head as it stood, so the
+    /// move is strictly after it.
+    pub fn move_branch_after_head_probes(&self, probe: usize, branch: &str, commit: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.branch_move_after_probe = Some((probe, branch.to_string(), commit.to_string()));
+    }
+
     /// Arms a gate that blocks every `tarball` download until the returned
     /// sender flips it open, and starts counting `tarball` calls. The
     /// connect-race test uses it to park a first connect mid-download while
@@ -534,14 +554,26 @@ impl Provider for MockProvider {
             }
         })?;
         let current = inner.etags.get(&origin.branch).cloned();
-        if etag.is_some() && etag == current.as_deref() {
-            Ok(HeadProbe::Unchanged)
+        let answer = if etag.is_some() && etag == current.as_deref() {
+            HeadProbe::Unchanged
         } else {
-            Ok(HeadProbe::Changed {
+            HeadProbe::Changed {
                 head: commit,
                 etag: current,
-            })
+            }
+        };
+        // Armed moves fire after the answer is fixed, so this probe reports the
+        // head as it stood and the next one sees the advance.
+        if let Some((probe, branch, target)) = inner.branch_move_after_probe.clone()
+            && inner.branch_head_calls == probe
+        {
+            inner.branch_move_after_probe = None;
+            inner.etag_counter += 1;
+            let etag = format!("etag{}", inner.etag_counter);
+            inner.branches.insert(branch.clone(), target);
+            inner.etags.insert(branch, etag);
         }
+        Ok(answer)
     }
 
     async fn compare(

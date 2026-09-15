@@ -33,6 +33,7 @@ pub mod rest;
 pub(crate) mod review;
 pub mod scope;
 pub mod settings;
+pub(crate) mod share_staging;
 pub mod similar;
 pub mod stub;
 pub mod subscribers;

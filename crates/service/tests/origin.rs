@@ -3508,3 +3508,368 @@ async fn a_review_mode_share_pulls_the_teams_folder_not_the_staged_tree() {
         "the folder is level with its own base: {again}"
     );
 }
+
+/// A draft carrying a `generated` block, so a preview of a domain that takes
+/// changes directly has provenance to report and the contrast with a reviewing
+/// domain's preview is a real difference rather than two empty answers.
+const AUTHORED: &str = "---\ntype: engram\ntitle: Authored\npermalink: authored\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-02\ngenerated: { by: human:ada, at: 2026-08-29T09:00:00+00:00 }\n---\n\nsomebody is named for this one\n";
+
+/// The team's copy moving while a share is being prepared is answered, not
+/// merged.
+///
+/// A share pulls the folder first and then proposes against the staged tree. The
+/// proposal step would pull for itself, and that pull would land the team's
+/// merged work inside the staged tree - which is deleted when the share ends,
+/// while the base snapshot advances past it, leaving the folder permanently
+/// behind its own base with no pull that would ever bring it back. So the share
+/// refuses instead, and says to run it again.
+#[tokio::test]
+async fn an_upstream_move_after_the_share_pulled_refuses_instead_of_merging_into_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+    let state_dir = tmp.path().join("origins").join("team");
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+
+    let settled = crystalline_remote::state::OriginState::load(&state_dir)
+        .unwrap()
+        .unwrap()
+        .base_commit;
+
+    // The team merges something the instant after this share has pulled.
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", team_plan()),
+        ("notes/merged.md", engram("Merged", "merged", "already in")),
+    ]));
+    mock.move_branch_after_head_probes(mock.branch_head_calls() + 1, "main", &moved);
+
+    let err = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .expect_err("a share cannot merge the team's work into a tree it is about to delete");
+    let text = err.to_string();
+    assert!(text.contains("run it again"), "{text}");
+
+    // Nothing moved: not the folder, not the base record.
+    assert!(!root.join("notes/merged.md").exists());
+    let after = crystalline_remote::state::OriginState::load(&state_dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.base_commit, settled, "the base record stands still");
+    assert!(!after.files.contains_key("notes/merged.md"));
+    assert!(after.conflicts.is_empty(), "no conflict was recorded");
+
+    // Nothing was lost either: the draft is still the actor's.
+    {
+        let store = eng.store();
+        let store = store.lock().await;
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        let entries = store.overlay_entries(id, "owner").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "notes/fresh.md");
+    }
+
+    // And running it again, after the pull has landed, shares as it should.
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(root.join("notes/merged.md").exists());
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(result["added"], serde_json::json!(["notes/fresh.md"]));
+}
+
+/// An actor holding no drafts has nothing to share, and hears that rather than
+/// a proposal of the folder they never wrote in.
+#[tokio::test]
+async fn an_actor_with_no_drafts_has_nothing_to_share() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    // Somebody else is drafting; this actor is not.
+    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "nothing_to_share", "{result}");
+}
+
+/// A shared draft is still a draft.
+///
+/// Sharing proposes the work; it does not take it out of the overlay. The rows
+/// stay exactly as they stood, which is the precondition convergence is defined
+/// against: a merged proposal pulled back is what clears them, and nothing else.
+/// So a second share of the same untouched drafts proposes the same paths again,
+/// against the same base.
+#[tokio::test]
+async fn a_shared_draft_is_still_a_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+
+    let before = {
+        let store = eng.store();
+        let store = store.lock().await;
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        store.overlay_entries(id, "owner").await.unwrap()
+    };
+    assert_eq!(before.len(), 2);
+
+    let first = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed");
+    assert_eq!(first["added"], serde_json::json!(["notes/fresh.md"]));
+    assert_eq!(first["updated"], serde_json::json!(["notes/plan.md"]));
+
+    let after = {
+        let store = eng.store();
+        let store = store.lock().await;
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        store.overlay_entries(id, "owner").await.unwrap()
+    };
+    assert_eq!(after, before, "the share cleared nothing");
+
+    // The mock forge serves no stacks, so a second share updates the one open
+    // proposal - and it carries the same paths, because the drafts are still
+    // the actor's and the base has not moved.
+    let second = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "updated", "{second}");
+    assert_eq!(
+        second["proposal"]["added"],
+        serde_json::json!(["notes/fresh.md"])
+    );
+    assert_eq!(
+        second["proposal"]["updated"],
+        serde_json::json!(["notes/plan.md"])
+    );
+}
+
+/// The preview a person confirms a share on lists the actor's overlay paths, and
+/// nothing is preselected for them.
+///
+/// Preselection is a guess at which files in a mixed delta are the caller's own,
+/// read off each file's `generated` block. A reviewing domain's plan is built
+/// from the caller's own drafts, so every path in it is already theirs and the
+/// guess has nothing left to answer - which is why `last_author` is absent here
+/// and present for the same file in a domain that takes changes directly.
+#[tokio::test]
+async fn the_share_preview_lists_the_overlay_paths_without_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "owner", "notes/authored.md", AUTHORED).await;
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+
+    let plan = eng
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    let changes = plan["changes"].as_array().unwrap();
+    let paths: Vec<&str> = changes
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["notes/authored.md", "notes/plan.md"]);
+    for change in changes {
+        assert_eq!(
+            change["last_author"],
+            serde_json::Value::Null,
+            "a reviewing domain preselects nothing: {plan}"
+        );
+    }
+
+    // The same file in a domain that takes changes directly DOES carry its
+    // provenance, so the absence above is a decision and not an empty column.
+    let direct_tmp = tempfile::tempdir().unwrap();
+    let direct_mock = Arc::new(MockProvider::new());
+    let commit = direct_mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    direct_mock.set_branch("main", &commit);
+    let direct_root = direct_tmp.path().join("kb");
+    let direct = engine_with(
+        &direct_tmp.path().join("config.yaml"),
+        &direct_tmp.path().join("origins"),
+        direct_mock,
+        true,
+        false,
+    )
+    .await;
+    direct
+        .origin_add(
+            "acme/kb",
+            Some("kb"),
+            None,
+            None,
+            Some(direct_root.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+    std::fs::create_dir_all(direct_root.join("notes")).unwrap();
+    std::fs::write(direct_root.join("notes/authored.md"), AUTHORED).unwrap();
+    let direct_plan = direct
+        .origin_share_preview(
+            "kb",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        direct_plan["changes"][0]["last_author"], "human:ada",
+        "{direct_plan}"
+    );
+}
+
+/// A base path the state directory holds no copy of is an error naming the way
+/// out, never a quiet read of the folder instead.
+///
+/// The base snapshot's copies are what makes "exactly this actor's draft" true:
+/// read the folder for one of them and a stray direct edit of that path would
+/// travel as this actor's work. Every path a pull records is written to both in
+/// lockstep, so a missing copy is a state directory somebody damaged, and a
+/// resync is the answer.
+#[tokio::test]
+async fn a_base_path_with_no_recorded_copy_asks_for_a_resync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+
+    // The recorded copy goes missing while the path stays in the snapshot.
+    let copy = tmp
+        .path()
+        .join("origins")
+        .join("team")
+        .join("base")
+        .join("notes")
+        .join("plan.md");
+    assert!(copy.exists(), "the pull recorded a base copy");
+    std::fs::remove_file(&copy).unwrap();
+
+    let err = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .expect_err("a damaged state directory is not a share");
+    let text = err.to_string();
+    assert!(text.contains("notes/plan.md"), "{text}");
+    assert!(text.contains("resync"), "{text}");
+}
+
+/// A draft path is held to the rule every write and move verb holds one to, and
+/// to no stricter rule of the share's own.
+///
+/// `notes/plan: v2.md` is a filename a person can choose and this product
+/// indexes like any other, so the staging screen is `is_within_domain` rather
+/// than the archive-and-attachment rule beside it. What such a path then meets
+/// is the repository path rule in `crystalline_remote`, which refuses a colon
+/// segment because it is a drive or stream marker on Windows - and it refuses it
+/// for a file in a folder exactly as it does for a draft. So the two domains
+/// answer the same thing, which is the point: review mode adds no screen of its
+/// own.
+#[tokio::test]
+async fn a_draft_path_is_screened_the_way_a_file_in_the_folder_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "owner", "notes/plan: v2.md", DRAFT_FRESH).await;
+
+    let drafted = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .expect_err("the repository path rule refuses a colon segment");
+
+    // The same filename, as a file in a domain that takes changes directly.
+    let direct_tmp = tempfile::tempdir().unwrap();
+    let direct_mock = Arc::new(MockProvider::new());
+    let commit = direct_mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    direct_mock.set_branch("main", &commit);
+    let direct_root = direct_tmp.path().join("kb");
+    let direct = engine_with(
+        &direct_tmp.path().join("config.yaml"),
+        &direct_tmp.path().join("origins"),
+        direct_mock,
+        true,
+        false,
+    )
+    .await;
+    direct
+        .origin_add(
+            "acme/kb",
+            Some("kb"),
+            None,
+            None,
+            Some(direct_root.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+    std::fs::create_dir_all(direct_root.join("notes")).unwrap();
+    std::fs::write(direct_root.join("notes/plan: v2.md"), DRAFT_FRESH).unwrap();
+    let on_disk = direct
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .expect_err("the same rule, for a file in the folder");
+
+    assert_eq!(
+        drafted.to_string(),
+        on_disk.to_string(),
+        "review mode adds no screen of its own"
+    );
+    assert!(
+        !drafted.to_string().contains("not inside the domain"),
+        "the engine does not invent a refusal for a legal domain path: {drafted}"
+    );
+}
