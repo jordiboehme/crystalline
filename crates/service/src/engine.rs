@@ -4016,6 +4016,13 @@ impl Engine {
     ///
     /// Bytes are never loaded: a listing of a domain full of slide decks costs
     /// one query.
+    ///
+    /// **The substrate, not the projection.** This answers what the domain
+    /// holds, the same for everybody, which is what the machinery that carries
+    /// no caller's scope needs - a cross-domain move's carry, the split's
+    /// screen, an archive export. A surface answering a person asks
+    /// [`Engine::attachment_list_as`], which lays that caller's own drafted
+    /// files over it.
     pub async fn attachment_list(&self, domain: &str) -> Result<Vec<AttachmentRow>> {
         let (domain_id, _) = self.domain_source(domain).await?;
         let store = self.store.lock().await;
@@ -4279,6 +4286,108 @@ impl Engine {
         }
         crate::maintenance::record_pending(domain);
         Ok(())
+    }
+
+    /// What an attachment write landed as: the row that now describes it, and
+    /// whether it is this actor's draft rather than the domain's own file.
+    ///
+    /// Create or replace one attachment as this caller sees the domain.
+    ///
+    /// The routing decision review mode turns an upload into, in one place. A
+    /// domain that takes changes directly runs
+    /// [`Engine::attachment_write`] byte for byte, and its receipt carries no
+    /// `draft` at all. A domain that reviews changes lands the bytes in this
+    /// actor's files overlay instead: **no write in review mode reaches the
+    /// folder**, which is the rule the whole mode rests on, and the receipt
+    /// says `draft: true`.
+    ///
+    /// **The write right and the identity refusal are the view's.**
+    /// [`DomainView::for_write`] screens the registered set, then refuses a
+    /// caller with no identity with [`OVERLAY_NEEDS_IDENTITY`] - the same
+    /// sentence, in the same words, an engram write is refused with, because it
+    /// is the same question: there is no identity for a draft to belong to.
+    /// The surface gate in front of it (REST `require_domain_write`) still
+    /// stands where it always did.
+    pub(crate) async fn attachment_write_in(
+        &self,
+        view: &DomainView<'_>,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<WrittenAttachment> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
+            return Err(EngineError::Invalid(over_cap_error(
+                path,
+                bytes.len() as u64,
+            )));
+        }
+        if view.actor().is_some() {
+            let row = view.put_file(path, &bytes).await?;
+            crate::maintenance::record_pending(view.domain());
+            return Ok(WrittenAttachment { row, draft: true });
+        }
+        let row = self.attachment_write(view.domain(), path, bytes).await?;
+        Ok(WrittenAttachment { row, draft: false })
+    }
+
+    /// The view-taking write above under the acting scope, for the surfaces
+    /// that hold a scope rather than a view.
+    pub async fn attachment_write_as(
+        &self,
+        domain: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        scope: &crate::scope::Scope,
+    ) -> Result<WrittenAttachment> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let view = DomainView::for_write(self, domain, scope).await?;
+        self.attachment_write_in(&view, path, bytes).await
+    }
+
+    /// Remove one attachment as this caller sees the domain, answering whether
+    /// the deletion landed as a draft.
+    ///
+    /// A direct domain removes the file or the blob and the row, as it always
+    /// has. In review mode the folder is not touched: a reviewed file is hidden
+    /// behind this actor's own deletion marker until the deletion is reviewed
+    /// like any other change, and a file only this actor holds simply goes,
+    /// since a marker over a base nothing holds is exactly what convergence
+    /// would clear again.
+    pub(crate) async fn attachment_delete_in(
+        &self,
+        view: &DomainView<'_>,
+        path: &str,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        if view.actor().is_some() {
+            view.tombstone_file(path).await?;
+            crate::maintenance::record_pending(view.domain());
+            return Ok(true);
+        }
+        self.attachment_delete(view.domain(), path).await?;
+        Ok(false)
+    }
+
+    /// The view-taking delete above under the acting scope.
+    pub async fn attachment_delete_as(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let view = DomainView::for_write(self, domain, scope).await?;
+        self.attachment_delete_in(&view, path).await
     }
 
     // --- attachments a cross-domain move carries ------------------------------
@@ -6828,13 +6937,20 @@ impl Engine {
                     "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
                 )));
             }
-            self.attachment_delete(&p.domain, &path).await?;
-            return Ok(json!({
+            // Through the view this verb already built, so an attachment
+            // delete lands where an engram delete lands: in review mode as
+            // this actor's own deletion, with the folder untouched.
+            let draft = self.attachment_delete_in(&view, &path).await?;
+            let mut receipt = json!({
                 "domain": p.domain,
                 "path": path,
                 "attachment": true,
                 "deleted": true,
-            }));
+            });
+            if draft {
+                receipt["draft"] = json!(true);
+            }
+            return Ok(receipt);
         }
         let (desc, source) = view.resolve(&p.identifier).await?;
         // Held across the comparison and the removal, so a guarded delete
@@ -17577,6 +17693,21 @@ fn contained_asset_path(root: &Path, rel: &str) -> Result<PathBuf> {
         }
     }
     Ok(abs)
+}
+
+/// What an attachment write landed as: the row that now describes it, and
+/// whether it is this actor's own draft rather than the domain's file.
+///
+/// `draft` is the whole of what review mode adds to an upload, so it rides out
+/// on the receipt rather than being inferred from the domain's configuration by
+/// whoever renders it.
+#[derive(Debug, Clone)]
+pub struct WrittenAttachment {
+    /// The row describing the bytes as stored.
+    pub row: AttachmentRow,
+    /// Whether the bytes landed in the writer's own files overlay rather than
+    /// in the folder the team reviewed.
+    pub draft: bool,
 }
 
 /// The metadata row describing these bytes at this path. The mime comes from

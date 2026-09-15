@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig,
+    AuthConfig, DomainEntry, GlobalConfig, ResponseFormat, ReviewMode, ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
@@ -52,6 +52,9 @@ struct Options {
     anonymous: bool,
     /// `service.read_only`: refuse every mutation.
     read_only: bool,
+    /// Serve a second file domain `rev` that reviews changes before they land,
+    /// carrying one reviewed attachment of its own.
+    review: bool,
 }
 
 struct Fixture {
@@ -59,6 +62,9 @@ struct Fixture {
     /// The temp directory the `eng` domain lives under, for a test asserting
     /// that an upload landed as a real file.
     root: std::path::PathBuf,
+    /// Where this engine keeps its overlays, so a test can say that a draft
+    /// file landed in its uploader's own folder and nowhere near the domain's.
+    state: std::path::PathBuf,
     /// Held for the test's duration: an attachment write marks its domain
     /// pending in the maintenance state file, and this redirects the state
     /// directory into a scratch home so nothing here reaches the developer's.
@@ -85,7 +91,7 @@ fn write_manifest(dir: &std::path::Path, name: &str) {
 /// attachment that was only ever uploaded through this API would leave them with
 /// nothing to fetch.
 async fn serve(opts: Options) -> Fixture {
-    let state = support::ScratchStateDir::acquire();
+    let scratch = support::ScratchStateDir::acquire();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -111,6 +117,15 @@ async fn serve(opts: Options) -> Fixture {
         .insert("eng".to_string(), DomainEntry::file(dir));
     cfg.domains
         .insert("scratch".to_string(), DomainEntry::virtual_domain());
+    if opts.review {
+        let rev = root.join("rev");
+        std::fs::create_dir_all(rev.join("assets")).unwrap();
+        write_manifest(&rev, "rev");
+        std::fs::write(rev.join("assets/shot.png"), PNG).unwrap();
+        let mut entry = DomainEntry::file(rev);
+        entry.review = Some(ReviewMode::Overlay);
+        cfg.domains.insert("rev".to_string(), entry);
+    }
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         read_only: Some(opts.read_only),
@@ -122,9 +137,11 @@ async fn serve(opts: Options) -> Fixture {
     let store = TursoStore::open_in_memory().await.unwrap();
     // `service.read_only` is resolved by the daemon rather than by the engine's
     // constructor, so the fixture applies it the way `serve` does.
+    let state = root.join("state");
     let engine = Arc::new(
         Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
-            .with_read_only(opts.read_only),
+            .with_read_only(opts.read_only)
+            .with_state_dir(state.clone()),
     );
     engine.sync(None).await.unwrap();
 
@@ -166,7 +183,8 @@ async fn serve(opts: Options) -> Fixture {
     Fixture {
         addr,
         root: tmp.path().to_path_buf(),
-        _state: state,
+        state,
+        _state: scratch,
         _tmp: tmp,
     }
 }
@@ -820,5 +838,154 @@ async fn a_read_only_instance_serves_reads_and_refuses_writes() {
     assert!(
         fx.root.join("eng/assets/shot.png").exists(),
         "and the bytes are still there"
+    );
+}
+
+/// **An upload into a domain that reviews changes is that account's draft.**
+///
+/// The one route a person adds a file through, on the one kind of domain where
+/// adding a file is not the same as giving it to the team: the answer says
+/// `draft`, the bytes come back to the account that sent them and to nobody
+/// else, and a deletion hides the reviewed file from its deleter alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_into_a_reviewing_domain_answers_draft_true_and_serves_it_to_its_uploader_only() {
+    let fx = serve(Options {
+        review: true,
+        ..Options::default()
+    })
+    .await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let root = login(fx.addr, "root", "rootpw").await;
+
+    let resp = put(
+        fx.addr,
+        &eddy,
+        "/api/v1/domains/rev/files/assets/plan.png",
+        PDF,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["draft"], serde_json::json!(true));
+    assert_eq!(body["path"], serde_json::json!("assets/plan.png"));
+    assert!(
+        !fx.root.join("rev/assets/plan.png").exists(),
+        "the folder the team reviewed never saw it"
+    );
+    assert!(
+        fx.state
+            .join("overlays/rev/eddy/files/assets/plan.png")
+            .is_file(),
+        "it stands in eddy's own files overlay"
+    );
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/rev/files/assets/plan.png",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "etag"),
+        format!("\"{}\"", body["sha256"].as_str().unwrap()),
+        "the validator is the checksum the upload answered"
+    );
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), PDF);
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/rev/files/assets/plan.png",
+        &root,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "another account is told there is nothing"
+    );
+
+    // The listing differs by session, which is the same statement said about
+    // the metadata surface rather than the bytes.
+    for (session, expected) in [
+        (&eddy, vec!["assets/plan.png", "assets/shot.png"]),
+        (&root, vec!["assets/shot.png"]),
+    ] {
+        let listed: serde_json::Value = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/rev/attachments",
+            session,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let paths: Vec<&str> = listed["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, expected);
+    }
+
+    // And a delete of the REVIEWED file: 204, absent for its deleter, exactly
+    // where it was for everybody else.
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/rev/files/assets/shot.png",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(fx.root.join("rev/assets/shot.png").is_file());
+    for (session, expected) in [(&eddy, 404), (&root, 200)] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/rev/files/assets/shot.png",
+            session,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), expected);
+    }
+}
+
+/// **A domain that takes changes directly answers exactly what it answered
+/// before the overlay existed**: four keys, no `draft`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_into_a_direct_domain_carries_no_draft_key() {
+    let fx = serve(Options::default()).await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = put(
+        fx.addr,
+        &eddy,
+        "/api/v1/domains/eng/files/assets/new.png",
+        PNG,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let mut keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["mime", "path", "sha256", "size"],
+        "no `draft` key on a direct domain's upload: {body}"
     );
 }

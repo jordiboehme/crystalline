@@ -243,6 +243,14 @@ pub(crate) fn entries(state_dir: &Path, domain: &str, actor: &str) -> FileRead {
 
 /// How many entries each actor holds in one domain's files overlay, files and
 /// sidecars alike, with the honesty flag beside them.
+///
+/// The counting twin of [`entries`], for the callers that only ever needed a
+/// number: the removal gate and the per-actor draft counts, which are the
+/// lifecycle's and land with it. Note what it is NOT twinned with:
+/// [`crate::overlay_journal::journal_counts`] counts drafts only, so a domain's
+/// journal count today under-reports what its removal actually sweeps by
+/// exactly what this function answers.
+#[allow(dead_code)]
 pub(crate) fn counts(state_dir: &Path, domain: &str) -> (BTreeMap<String, u64>, bool) {
     let mut per_actor: BTreeMap<String, u64> = BTreeMap::new();
     let mut unreadable = false;
@@ -286,7 +294,9 @@ pub(crate) fn counts(state_dir: &Path, domain: &str) -> (BTreeMap<String, u64>, 
 /// The counterpart of [`crate::overlay_journal::journal_remove_domain`] for one
 /// actor: the discard half of leaving review mode takes this folder with that
 /// actor's rows. A whole domain's files go with its journal folder already, by
-/// construction - this tree stands inside it.
+/// construction - this tree stands inside it, which is why there is a per-actor
+/// sweep here and no per-domain one.
+#[allow(dead_code)]
 pub(crate) fn remove_actor(state_dir: &Path, domain: &str, actor: &str) -> io::Result<u64> {
     let dir = files_dir(state_dir, domain, actor)?;
     let held = entries(state_dir, domain, actor).entries.len() as u64;

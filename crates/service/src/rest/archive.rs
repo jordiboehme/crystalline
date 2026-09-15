@@ -88,8 +88,6 @@
 //! REST-local mutex could not close it and would only queue uploads behind
 //! minutes-long admin work. Fixing it for real means fixing it in the engine.
 
-use std::collections::HashSet;
-
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};

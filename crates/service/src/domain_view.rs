@@ -1507,6 +1507,79 @@ impl<'a> DomainView<'a> {
         }
     }
 
+    /// Write this actor's own copy of one non-engram path.
+    ///
+    /// **Refuses on the base view.** A base view's write goes to the folder and
+    /// is [`Engine::attachment_write`]'s, never this - so reaching here without
+    /// an actor is a routing bug rather than a caller's mistake, and it says so
+    /// in [`EngineError::Internal`] instead of teaching a caller something they
+    /// cannot act on. Unreachable through a verb:
+    /// [`crate::engine::Engine::attachment_write_in`] takes the base arm
+    /// whenever the view has no actor.
+    ///
+    /// The row that comes back is built the way the folder's rows are built,
+    /// off the bytes and the file's own modification instant, so nothing
+    /// downstream can tell an overlay row from a base one by its shape.
+    pub(crate) async fn put_file(&self, path: &str, bytes: &[u8]) -> Result<AttachmentRow> {
+        let state_dir = self.files_state_dir()?;
+        let actor = self.files_writer()?;
+        crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes)
+            .map_err(|e| self.files_io(path, e))?;
+        self.overlay_attachment_row(&state_dir, actor, path)
+    }
+
+    /// Mark this actor's deletion of one non-engram path.
+    ///
+    /// Two shapes, decided by whether the folder holds the path at all. A
+    /// **reviewed** file is hidden behind a marker: the file stays where the
+    /// team put it and reads absent for this actor alone, until the deletion is
+    /// reviewed like any other change. A file **only this actor ever held**
+    /// simply goes, marker and all - there is nothing to hide, and a marker
+    /// standing over a base that was never there is exactly what convergence
+    /// would clear again. It is the same rule a draft-only engram's delete
+    /// follows when it drops the row rather than tombstoning it.
+    ///
+    /// "The folder holds it" is asked the way the delete itself asks it -
+    /// either half, the file or the row - so a hand-edited domain's
+    /// half-present pair is hidden rather than half-hidden.
+    ///
+    /// [`EngineError::NotFound`] when neither the overlay nor the folder holds
+    /// the path, which is the miss [`Engine::attachment_delete`] reports.
+    pub(crate) async fn tombstone_file(&self, path: &str) -> Result<()> {
+        let state_dir = self.files_state_dir()?;
+        let actor = self.files_writer()?;
+        let held = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?;
+        let base_holds = match self.engine.attachment_delete_size(&self.domain, path).await {
+            Ok(_) => true,
+            Err(EngineError::NotFound(_)) => false,
+            Err(e) => return Err(e),
+        };
+        if !base_holds && held == crate::overlay_files::Held::Nothing {
+            return Err(EngineError::NotFound(crate::engine::missing_attachment(
+                &self.domain,
+                path,
+            )));
+        }
+        let done = if base_holds {
+            crate::overlay_files::tombstone(&state_dir, &self.domain, actor, path)
+        } else {
+            crate::overlay_files::clear(&state_dir, &self.domain, actor, path)
+        };
+        done.map_err(|e| self.files_io(path, e))
+    }
+
+    /// Whose files overlay a write on this view lands in.
+    ///
+    /// One hop through [`crate::overlay_files::target_actor`], which is where
+    /// the join that will one day answer differently belongs - see its doc.
+    fn files_writer(&self) -> Result<&str> {
+        Ok(crate::overlay_files::target_actor(
+            self.writing_actor()?,
+            None,
+        ))
+    }
+
     /// This actor's own files overlay entries, files and deletions alike,
     /// ordered by path. Empty on the base view, which holds none by
     /// definition.

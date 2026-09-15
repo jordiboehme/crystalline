@@ -28,7 +28,6 @@
 //! a malformed path is a malformed request, not an unprocessable one.
 
 use axum::Json;
-use std::collections::HashSet;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -42,7 +41,6 @@ use super::{
     ApiError, ApiPath, ProblemDetail, REVALIDATE, RestState, if_none_match_matches,
     refuse_read_only, require_domain_read, require_domain_write,
 };
-use crate::domain_view::DomainView;
 use crate::engine::EngineError;
 
 /// The `Content-Security-Policy` every attachment is served under: no origin
@@ -118,6 +116,14 @@ pub struct UploadedAttachment {
     /// Lowercase hex SHA-256 of the stored bytes.
     #[schema(example = "9f2a1c05e2b7")]
     pub sha256: String,
+    /// Present and true only when the file landed as this account's own draft,
+    /// on a domain that reviews changes before they land: the bytes are in that
+    /// account's overlay, nobody else can read them yet, and they reach the
+    /// team when the draft is shared. Absent on a domain that takes changes
+    /// directly, where an upload is the domain's file the moment it lands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
+    pub draft: Option<bool>,
 }
 
 /// `GET /domains/{domain}/files/{*path}` - one attachment's bytes.
@@ -236,10 +242,9 @@ pub async fn read(
     // file they deleted reads absent for them and unchanged for everybody else.
     // The registered-set screen is the caller's own, composed ahead of the
     // actor dimension the way every other view here composes it.
-    let scope = identity.scope();
-    let hidden = state.engine.hidden_for(&scope).await?;
-    let (bytes, row) = DomainView::for_read(&state.engine, &domain, &hidden, &scope)?
-        .attachment_bytes(&path)
+    let (bytes, row) = state
+        .engine
+        .attachment_read_as(&domain, &path, &identity.scope())
         .await
         .map_err(malformed_path_is_a_bad_request)?;
     let etag = format!("\"{}\"", row.sha256);
@@ -365,16 +370,20 @@ pub async fn write(
 ) -> Result<Json<UploadedAttachment>, ApiError> {
     require_domain_write(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
-    let row = state
+    // Through this account's own view of the domain: on a domain that reviews
+    // changes the bytes land in that account's overlay and the folder the team
+    // reviewed is not touched, which is what `draft` in the answer says.
+    let written = state
         .engine
-        .attachment_write(&domain, &path, body.to_vec())
+        .attachment_write_as(&domain, &path, body.to_vec(), &identity.scope())
         .await
         .map_err(malformed_path_is_a_bad_request)?;
     Ok(Json(UploadedAttachment {
-        path: row.path,
-        mime: row.mime,
-        size: row.size,
-        sha256: row.sha256,
+        path: written.row.path,
+        mime: written.row.mime,
+        size: written.row.size,
+        sha256: written.row.sha256,
+        draft: written.draft.then_some(true),
     }))
 }
 
@@ -437,7 +446,7 @@ pub async fn remove(
     refuse_read_only(&state)?;
     state
         .engine
-        .attachment_delete(&domain, &path)
+        .attachment_delete_as(&domain, &path, &identity.scope())
         .await
         .map_err(malformed_path_is_a_bad_request)?;
     Ok(StatusCode::NO_CONTENT)
@@ -486,10 +495,9 @@ pub async fn list(
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<AttachmentsResponse>, ApiError> {
     require_domain_read(&state, &identity, &domain).await?;
-    let scope = identity.scope();
-    let hidden = state.engine.hidden_for(&scope).await?;
-    let rows = DomainView::for_read(&state.engine, &domain, &hidden, &scope)?
-        .attachments()
+    let rows = state
+        .engine
+        .attachment_list_as(&domain, &identity.scope())
         .await?;
     Ok(Json(AttachmentsResponse {
         attachments: rows.into_iter().map(AttachmentView::from).collect(),

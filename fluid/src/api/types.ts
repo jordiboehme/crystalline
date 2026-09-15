@@ -2720,6 +2720,15 @@ export interface components {
         /** @description The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry. */
         UploadedAttachment: {
             /**
+             * @description Present and true only when the file landed as this account's own draft,
+             *     on a domain that reviews changes before they land: the bytes are in that
+             *     account's overlay, nobody else can read them yet, and they reach the
+             *     team when the draft is shared. Absent on a domain that takes changes
+             *     directly, where an upload is the domain's file the moment it lands.
+             * @example true
+             */
+            draft?: boolean | null;
+            /**
              * @description The mime the bytes will be served under.
              * @example image/png
              */

@@ -10,10 +10,12 @@ mod support;
 
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
+use crystalline_core::config::{
+    DomainEntry, GlobalConfig, ResponseFormat, ReviewMode, ServiceConfig,
+};
 use crystalline_index::TursoStore;
 use crystalline_service::Scope;
-use crystalline_service::params::WriteParams;
+use crystalline_service::params::{DeleteParams, WriteParams};
 use crystalline_service::{Engine, EngineError};
 use tokio::sync::Mutex;
 
@@ -1907,4 +1909,592 @@ async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every
         "which is where they are: an attachment is shared state, not a draft"
     );
     drop(scratch);
+}
+
+// --- review mode: the files overlay -----------------------------------------
+//
+// A domain that reviews changes has one rule the whole mode rests on: the
+// folder on disk changes only by a pull. An engram write keeps it by landing as
+// a row in the writer's own dimension; an attachment has nowhere to be a row,
+// so it lands in that actor's files overlay under the state directory instead.
+// These tests are what say it does - and that a direct domain is byte for byte
+// what it was before the overlay existed.
+
+/// Alice, as a signed-in account drafts.
+fn alice() -> Scope {
+    Scope::User {
+        account: "alice".to_string(),
+        admin: false,
+    }
+}
+
+/// Bob, the stranger every one of these tests needs: somebody who may read the
+/// domain and may not see alice's drafts.
+fn bob() -> Scope {
+    Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    }
+}
+
+/// A reviewing file domain and a direct one on a single engine, with the state
+/// directory inside the temp tree so no files overlay can reach the real one.
+///
+/// The direct twin is not decoration: it is how a test says what a row from the
+/// overlay MEANS, by writing the same bytes where nothing is projected and
+/// comparing the two rows.
+async fn review_fixture(
+    reviewing: &str,
+    direct: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    support::ScratchStateDir,
+) {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+
+    let review_dir = root.join(reviewing);
+    std::fs::create_dir_all(review_dir.join("assets")).unwrap();
+    write_manifest(&review_dir, reviewing);
+    std::fs::write(review_dir.join("alpha.md"), ALPHA).unwrap();
+    std::fs::write(review_dir.join("assets/deck.png"), PNG).unwrap();
+    let mut entry = DomainEntry::file(review_dir.clone());
+    entry.review = Some(ReviewMode::Overlay);
+    cfg.domains.insert(reviewing.to_string(), entry);
+
+    let direct_dir = root.join(direct);
+    std::fs::create_dir_all(&direct_dir).unwrap();
+    write_manifest(&direct_dir, direct);
+    cfg.domains
+        .insert(direct.to_string(), DomainEntry::file(direct_dir.clone()));
+    cfg.domains
+        .insert(format!("{direct}-virtual"), DomainEntry::virtual_domain());
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let state = root.join("state");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(state.clone()),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine, review_dir, direct_dir, state, scratch)
+}
+
+/// **An upload in review mode never reaches the folder, and only its own
+/// account can read it back.**
+#[tokio::test]
+async fn an_attachment_written_in_review_mode_is_absent_from_the_folder_and_readable_by_its_actor_only()
+ {
+    let (_tmp, engine, review_dir, direct_dir, state, _scratch) =
+        review_fixture("rev-alone", "plain-alone").await;
+
+    let written = engine
+        .attachment_write_as("rev-alone", "assets/fresh.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    assert!(
+        written.draft,
+        "the receipt says the bytes landed as a draft"
+    );
+
+    assert!(
+        !review_dir.join("assets/fresh.png").exists(),
+        "the folder the team reviewed is untouched"
+    );
+    assert!(
+        !engine
+            .attachment_list("rev-alone")
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.path == "assets/fresh.png"),
+        "and no base row describes it either"
+    );
+    assert!(
+        state
+            .join("overlays/rev-alone/alice/files/assets/fresh.png")
+            .is_file(),
+        "the bytes stand in alice's own files overlay"
+    );
+
+    // The row means what a base row means. The proof is the direct twin: the
+    // same bytes written where nothing is projected carry the same checksum.
+    let twin = engine
+        .attachment_write("plain-alone", "assets/fresh.png", PNG.to_vec())
+        .await
+        .unwrap();
+    assert!(direct_dir.join("assets/fresh.png").is_file());
+
+    let (bytes, row) = engine
+        .attachment_read_as("rev-alone", "assets/fresh.png", &alice())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "alice reads her own bytes back");
+    assert_eq!(row.sha256, twin.sha256, "hashed like any other row");
+    assert_eq!(row.size, PNG.len() as u64);
+    assert_eq!(row.mime, "image/png");
+
+    for (who, scope) in [("bob", bob()), ("nobody", Scope::Anonymous)] {
+        let miss = engine
+            .attachment_read_as("rev-alone", "assets/fresh.png", &scope)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(miss, EngineError::NotFound(_)),
+            "{who} is answered the miss an absent file gets, not the bytes: {miss:?}"
+        );
+    }
+
+    let listed: Vec<String> = engine
+        .attachment_list_as("rev-alone", &alice())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    assert_eq!(listed, vec!["assets/deck.png", "assets/fresh.png"]);
+    let listed: Vec<String> = engine
+        .attachment_list_as("rev-alone", &bob())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["assets/deck.png"],
+        "bob sees the reviewed file and nothing of alice's"
+    );
+}
+
+/// **A replacement is a draft of the file, not the file.**
+#[tokio::test]
+async fn a_stranger_reads_the_reviewed_file_while_the_actor_reads_their_draft_of_it() {
+    let (_tmp, engine, review_dir, _direct, _state, _scratch) =
+        review_fixture("rev-over", "plain-over").await;
+
+    const REDRAWN: &[u8] = b"\x89PNG\r\n\x1a\n\x00redrawn\x00bytes";
+    let written = engine
+        .attachment_write_as("rev-over", "assets/deck.png", REDRAWN.to_vec(), &alice())
+        .await
+        .unwrap();
+    assert!(written.draft);
+
+    assert_eq!(
+        std::fs::read(review_dir.join("assets/deck.png")).unwrap(),
+        PNG,
+        "the reviewed file on disk is exactly as it was"
+    );
+    let (bytes, _) = engine
+        .attachment_read_as("rev-over", "assets/deck.png", &bob())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "bob reads the file the team reviewed");
+    let (bytes, row) = engine
+        .attachment_read_as("rev-over", "assets/deck.png", &alice())
+        .await
+        .unwrap();
+    assert_eq!(bytes, REDRAWN, "alice reads hers");
+    assert_eq!(row.size, REDRAWN.len() as u64);
+
+    let listed = engine
+        .attachment_list_as("rev-over", &alice())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "one row at the path, not two: a draft replaces its base"
+    );
+    assert_eq!(listed[0].size, REDRAWN.len() as u64);
+}
+
+/// **A deletion in review mode hides the file from its deleter and from
+/// nobody else.**
+#[tokio::test]
+async fn a_tombstoned_base_attachment_reads_absent_for_the_actor_and_present_for_a_stranger() {
+    let (_tmp, engine, review_dir, _direct, state, _scratch) =
+        review_fixture("rev-gone", "plain-gone").await;
+
+    let draft = engine
+        .attachment_delete_as("rev-gone", "assets/deck.png", &alice())
+        .await
+        .unwrap();
+    assert!(draft, "the delete landed as a draft");
+
+    assert_eq!(
+        std::fs::read(review_dir.join("assets/deck.png")).unwrap(),
+        PNG,
+        "the reviewed file is untouched"
+    );
+    assert_eq!(
+        engine.attachment_list("rev-gone").await.unwrap().len(),
+        1,
+        "and its base row stands"
+    );
+    assert!(
+        state
+            .join("overlays/rev-gone/alice/files/assets/deck.png.tombstone")
+            .is_file(),
+        "the deletion is a sidecar in alice's own overlay"
+    );
+
+    let miss = engine
+        .attachment_read_as("rev-gone", "assets/deck.png", &alice())
+        .await
+        .unwrap_err();
+    assert!(matches!(miss, EngineError::NotFound(_)), "{miss:?}");
+    assert!(
+        engine
+            .attachment_list_as("rev-gone", &alice())
+            .await
+            .unwrap()
+            .is_empty(),
+        "her listing omits what she deleted"
+    );
+    let (bytes, _) = engine
+        .attachment_read_as("rev-gone", "assets/deck.png", &bob())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "bob still reads it");
+
+    // And the preview of a delete answers the same three ways, which is what
+    // keeps it from being stricter - or laxer - than the act it previews.
+    let p = DeleteParams {
+        identifier: "assets/deck.png".to_string(),
+        domain: "rev-gone".to_string(),
+        expected_checksum: None,
+    };
+    let preview = engine.delete_preview_as(&p, &bob()).await.unwrap();
+    assert_eq!(preview["size"], serde_json::json!(PNG.len()));
+    let miss = engine.delete_preview_as(&p, &alice()).await.unwrap_err();
+    assert!(
+        matches!(miss, EngineError::NotFound(_)),
+        "alice has nothing left to delete there: {miss:?}"
+    );
+}
+
+/// **A file only its own actor ever held leaves no marker behind.**
+///
+/// A marker over a base nothing holds is exactly what convergence would clear
+/// again, so there is nothing to mark - the same rule a draft-only engram's
+/// delete follows when it drops the row instead of tombstoning it.
+#[tokio::test]
+async fn a_delete_of_an_overlay_only_file_removes_the_bytes_and_writes_no_sidecar() {
+    let (_tmp, engine, _review_dir, _direct, state, _scratch) =
+        review_fixture("rev-only", "plain-only").await;
+
+    engine
+        .attachment_write_as("rev-only", "assets/only.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    let draft = engine
+        .attachment_delete_as("rev-only", "assets/only.png", &alice())
+        .await
+        .unwrap();
+    assert!(draft);
+
+    assert!(
+        !state
+            .join("overlays/rev-only/alice/files/assets/only.png")
+            .exists(),
+        "the bytes went"
+    );
+    assert!(
+        !state
+            .join("overlays/rev-only/alice/files/assets/only.png.tombstone")
+            .exists(),
+        "and nothing was marked"
+    );
+    assert!(
+        !state.join("overlays/rev-only/alice/files").exists(),
+        "the files folder goes with the last entry under it"
+    );
+
+    let miss = engine
+        .attachment_delete_as("rev-only", "assets/only.png", &alice())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(miss, EngineError::NotFound(_)),
+        "deleting it again is a miss: {miss:?}"
+    );
+}
+
+/// **An upload with no identity is refused in the words an engram write is
+/// refused in.**
+#[tokio::test]
+async fn an_attachment_write_with_no_identity_refuses_with_the_same_sentence_an_engram_write_does()
+{
+    let (_tmp, engine, review_dir, _direct, state, _scratch) =
+        review_fixture("rev-anon", "plain-anon").await;
+
+    let refused = engine
+        .attachment_write_as(
+            "rev-anon",
+            "assets/fresh.png",
+            PNG.to_vec(),
+            &Scope::Anonymous,
+        )
+        .await
+        .unwrap_err();
+    match &refused {
+        EngineError::Refused(message) => assert_eq!(
+            message,
+            crystalline_service::engine::OVERLAY_NEEDS_IDENTITY,
+            "the same sentence, so a caller learns the same thing whatever they were writing"
+        ),
+        other => panic!("a write with no identity is refused: {other:?}"),
+    }
+    assert!(!review_dir.join("assets/fresh.png").exists());
+    assert!(!state.join("overlays").exists(), "and nothing was drafted");
+
+    let refused = engine
+        .attachment_delete_as("rev-anon", "assets/deck.png", &Scope::Anonymous)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, EngineError::Refused(m) if m == crystalline_service::engine::OVERLAY_NEEDS_IDENTITY),
+        "and so is a delete: {refused:?}"
+    );
+    assert!(
+        review_dir.join("assets/deck.png").is_file(),
+        "the reviewed file is where it was"
+    );
+}
+
+/// **A domain that takes changes directly is byte for byte what it was.**
+///
+/// Both entry points, the name-addressed substrate verb and the scope-addressed
+/// projection, and both kinds of domain: the same rows, the same bytes on disk,
+/// no `draft` anywhere and no overlay folder brought into existence.
+#[tokio::test]
+async fn a_direct_domains_attachment_verbs_are_byte_identical_through_the_view() {
+    let (_tmp, engine, _review_dir, direct_dir, state, _scratch) =
+        review_fixture("rev-direct", "plain-direct").await;
+
+    let named = engine
+        .attachment_write("plain-direct", "assets/one.png", PNG.to_vec())
+        .await
+        .unwrap();
+    let viewed = engine
+        .attachment_write_as(
+            "plain-direct",
+            "assets/two.png",
+            PNG.to_vec(),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(!viewed.draft, "a direct domain's upload is never a draft");
+    assert_eq!(viewed.row.sha256, named.sha256);
+    assert_eq!(viewed.row.mime, named.mime);
+    assert_eq!(
+        std::fs::read(direct_dir.join("assets/two.png")).unwrap(),
+        PNG,
+        "the bytes are in the folder, where a direct domain's bytes live"
+    );
+
+    assert_eq!(
+        engine.attachment_list("plain-direct").await.unwrap(),
+        engine
+            .attachment_list_as("plain-direct", &Scope::Unrestricted)
+            .await
+            .unwrap(),
+        "the two listings are one listing"
+    );
+    assert_eq!(
+        engine
+            .attachment_read("plain-direct", "assets/two.png")
+            .await
+            .unwrap(),
+        engine
+            .attachment_read_as("plain-direct", "assets/two.png", &Scope::Unrestricted)
+            .await
+            .unwrap(),
+        "and the two reads are one read"
+    );
+    let p = DeleteParams {
+        identifier: "assets/two.png".to_string(),
+        domain: "plain-direct".to_string(),
+        expected_checksum: None,
+    };
+    assert_eq!(
+        engine.delete_preview(&p).await.unwrap(),
+        engine
+            .delete_preview_as(&p, &Scope::Unrestricted)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .attachment_delete_as("plain-direct", "assets/two.png", &Scope::Unrestricted)
+            .await
+            .unwrap(),
+        "and the delete is not a draft either"
+    );
+    assert!(!direct_dir.join("assets/two.png").exists());
+
+    // A virtual domain has no folder and today no attachments, so nothing about
+    // it changes: its blob table answers both entry points the same way.
+    let written = engine
+        .attachment_write_as(
+            "plain-direct-virtual",
+            "assets/data.json",
+            b"{\"a\":1}".to_vec(),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(!written.draft);
+    assert_eq!(
+        engine
+            .attachment_read("plain-direct-virtual", "assets/data.json")
+            .await
+            .unwrap()
+            .0,
+        b"{\"a\":1}".to_vec()
+    );
+
+    assert!(
+        !state.join("overlays").exists(),
+        "and no overlay folder was ever brought into existence"
+    );
+}
+
+/// **The MCP-facing delete verb routes an `assets/` identifier the way it
+/// routes an engram.**
+#[tokio::test]
+async fn delete_engram_on_an_assets_path_in_review_mode_lands_as_a_draft_deletion() {
+    let (_tmp, engine, review_dir, _direct, _state, _scratch) =
+        review_fixture("rev-verb", "plain-verb").await;
+
+    // Round one first: a preview must never be stricter than the act it
+    // previews, and a file only alice holds is one the delete would really
+    // remove.
+    engine
+        .attachment_write_as("rev-verb", "assets/mine.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    let mine = DeleteParams {
+        identifier: "assets/mine.png".to_string(),
+        domain: "rev-verb".to_string(),
+        expected_checksum: None,
+    };
+    let preview = engine.delete_preview_as(&mine, &alice()).await.unwrap();
+    assert_eq!(preview["size"], serde_json::json!(PNG.len()));
+    assert!(
+        engine.delete_preview_as(&mine, &bob()).await.is_err(),
+        "and bob is previewing nothing, because he holds nothing there"
+    );
+
+    let receipt = engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "assets/deck.png".to_string(),
+                domain: "rev-verb".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["attachment"], serde_json::json!(true));
+    assert_eq!(receipt["deleted"], serde_json::json!(true));
+    assert_eq!(
+        receipt["draft"],
+        serde_json::json!(true),
+        "the receipt says the deletion is alice's draft of one"
+    );
+    assert!(
+        review_dir.join("assets/deck.png").is_file(),
+        "and the folder keeps the file"
+    );
+}
+
+/// **An engine that was never told where its state directory is reaches no
+/// files overlay at all.**
+///
+/// Pinned by the refusal rather than by looking for an `overlays/` folder under
+/// the developer's own state directory: the refusal is what makes reaching it
+/// impossible, where an absent folder would only mean nobody noticed.
+#[tokio::test]
+async fn an_engine_with_no_state_dir_reaches_no_files_overlay_in_a_test_build() {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("rev-unpinned");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "rev-unpinned");
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(ReviewMode::Overlay);
+    cfg.domains.insert("rev-unpinned".to_string(), entry);
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+
+    let refused = engine
+        .attachment_write_as("rev-unpinned", "assets/fresh.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap_err();
+    match &refused {
+        EngineError::Internal(message) => assert!(
+            message.contains("with_state_dir"),
+            "the refusal names what the fixture forgot: {message}"
+        ),
+        other => panic!("an engine with no state directory refuses: {other:?}"),
+    }
+    drop(scratch);
+}
+
+/// **A move out of a reviewing domain is refused before anything is carried.**
+///
+/// Which is why the cross-domain carry goes on reading and writing the
+/// substrate: the one path that could take a draft file across a domain
+/// boundary never runs.
+#[tokio::test]
+async fn a_move_out_of_a_reviewing_domain_is_refused_before_any_attachment_is_carried() {
+    let (_tmp, engine, review_dir, direct_dir, _state, _scratch) =
+        review_fixture("rev-move", "plain-move").await;
+
+    let refused = engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "alpha".to_string(),
+                domain: "rev-move".to_string(),
+                destination: "alpha.md".to_string(),
+                destination_domain: Some("plain-move".to_string()),
+                update_links: None,
+            },
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, EngineError::Refused(m) if m.contains("share the change first")),
+        "a draft moves only inside the domain it is drafted in: {refused:?}"
+    );
+    assert!(review_dir.join("alpha.md").is_file());
+    assert!(!direct_dir.join("alpha.md").exists());
 }

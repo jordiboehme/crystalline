@@ -17,6 +17,8 @@
 //! HTTP leg posts raw JSON-RPC at the daemon's own router with the era's
 //! `_meta` and standard headers, exactly as `tests/mcp_modern_era.rs` does.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -755,5 +757,186 @@ async fn the_whole_read_surface_is_served_over_streamable_http_too() {
     assert_eq!(
         links[1]["uri"].as_str(),
         Some("crystalline://eng/assets/deep/data.json")
+    );
+}
+
+// --- review mode: a draft file on the resource surface ----------------------
+
+/// A team domain that reviews changes, served over the daemon's real router
+/// with the MCP gate on, which is the only way to ask this surface a question
+/// as somebody in particular.
+///
+/// The domain holds one engram the team reviewed that references a file nobody
+/// has uploaded yet - a dangling reference, from the team's point of view. That
+/// is the shape the test needs: once alice drafts the file, the same engram
+/// resolves for her and goes on dangling for everybody else.
+struct ReviewHarness {
+    _tmp: tempfile::TempDir,
+    engine: Arc<Engine>,
+    addr: std::net::SocketAddr,
+    auth: Arc<crystalline_service::rest::AuthStore>,
+}
+
+const DECK: &str = r#"---
+type: engram
+title: Deck
+permalink: deck
+tags:
+  - team
+status: stable
+recorded_at: 2026-01-01
+---
+
+# Deck
+
+The quarter's deck: ![the deck](assets/deck.png).
+"#;
+
+async fn review_harness() -> ReviewHarness {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("deck.md"), DECK).unwrap();
+
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.auth = Some(crystalline_core::config::AuthConfig {
+        mcp: Some(true),
+        oauth: Some(false),
+        ..crystalline_core::config::AuthConfig::default()
+    });
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for who in ["alice", "bob"] {
+        auth.add_user(
+            who,
+            who,
+            None,
+            crystalline_service::rest::Role::Editor,
+            "pw12345678",
+        )
+        .await
+        .unwrap();
+    }
+    let router = http_router(
+        engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    ReviewHarness {
+        _tmp: tmp,
+        engine,
+        addr,
+        auth,
+    }
+}
+
+/// **A file somebody drafted is a resource for its author and nothing at all
+/// for anybody else.**
+///
+/// Both halves of the MCP read surface at once: `resources/read` hands alice
+/// the bytes and hands bob the same refusal an absent file earns, and the
+/// resource links a `read_engram` appends resolve the reviewed engram's
+/// reference for alice alone. The engram is the same engram in both answers -
+/// what differs is whose files stand over the folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_attachment_is_a_resource_for_its_author_and_unknown_to_everybody_else() {
+    let h = review_harness().await;
+
+    h.engine
+        .attachment_write_as(
+            "team",
+            "assets/deck.png",
+            PNG.to_vec(),
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let alice = support::McpTestSession::open(
+        &h.addr,
+        Some(&h.auth.issue_mcp_token("alice", "t").await.unwrap().token),
+    )
+    .await;
+    let bob = support::McpTestSession::open(
+        &h.addr,
+        Some(&h.auth.issue_mcp_token("bob", "t").await.unwrap().token),
+    )
+    .await;
+
+    let uri = json!({ "uri": "crystalline://team/assets/deck.png" });
+    let hers = payload(&alice.request("resources/read", uri.clone()).await);
+    assert_eq!(
+        hers["result"]["contents"][0]["blob"].as_str(),
+        Some(BASE64.encode(PNG).as_str()),
+        "alice reads the bytes she drafted: {hers}"
+    );
+    assert_eq!(
+        hers["result"]["contents"][0]["mimeType"].as_str(),
+        Some("image/png")
+    );
+
+    let his = payload(&bob.request("resources/read", uri).await);
+    assert_eq!(
+        his["error"]["code"].as_i64(),
+        Some(-32602),
+        "bob gets the refusal an absent file gets, with nothing in it about alice: {his}"
+    );
+
+    let args = json!({ "identifier": "deck", "domain": "team" });
+    let hers = payload(&alice.call_tool("read_engram", args.clone()).await);
+    let links = resource_links(&hers["result"]);
+    assert_eq!(links.len(), 1, "the reference resolves for alice: {hers}");
+    assert_eq!(
+        links[0]["uri"].as_str(),
+        Some("crystalline://team/assets/deck.png")
+    );
+    assert_eq!(links[0]["size"].as_u64(), Some(PNG.len() as u64));
+
+    let his = payload(&bob.call_tool("read_engram", args).await);
+    assert!(
+        resource_links(&his["result"]).is_empty(),
+        "and goes on dangling for bob, who has nothing at that path: {his}"
     );
 }

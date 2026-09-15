@@ -249,7 +249,6 @@
 //! `add_domain` through team mode, `share_changes`, `update_domain`,
 //! `origin_status` and `withdraw_proposal`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::Engine as _;

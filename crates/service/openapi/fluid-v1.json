@@ -9030,6 +9030,14 @@
           "sha256"
         ],
         "properties": {
+          "draft": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present and true only when the file landed as this account's own draft,\non a domain that reviews changes before they land: the bytes are in that\naccount's overlay, nobody else can read them yet, and they reach the\nteam when the draft is shared. Absent on a domain that takes changes\ndirectly, where an upload is the domain's file the moment it lands.",
+            "example": true
+          },
           "mime": {
             "type": "string",
             "description": "The mime the bytes will be served under.",

@@ -1664,11 +1664,21 @@ impl McpTestSession {
 
     /// Call `tool` on this session, handing back the raw response bytes.
     pub async fn call_tool(&self, tool: &str, arguments: serde_json::Value) -> String {
+        self.request(
+            "tools/call",
+            serde_json::json!({ "name": tool, "arguments": arguments }),
+        )
+        .await
+    }
+
+    /// Any JSON-RPC request on this session, for the surfaces that are not
+    /// tool calls - `resources/read` among them.
+    pub async fn request(&self, method: &str, params: serde_json::Value) -> String {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
-            "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments },
+            "method": method,
+            "params": params,
         })
         .to_string();
         raw_post(
