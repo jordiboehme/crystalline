@@ -220,3 +220,49 @@ fn enabling_review_without_an_origin_refuses_with_the_way_in() {
         "{refused}"
     );
 }
+
+/// Ending a reviewing domain from the command line: the operator's own drafts
+/// go without a question, and a name nobody here is drafting under is refused.
+///
+/// The machine operator drafts as `owner`, so the removal asks them nothing
+/// about their own unshared work - they are the one person in the room who
+/// already knows. What `--end-drafts` is for is everybody else, and a name that
+/// belongs to nobody is somebody meaning a different domain or a different
+/// moment rather than an answer about this one.
+#[test]
+fn domain_remove_ends_the_owners_own_drafts_and_refuses_a_stranger() {
+    let fx = Fixture::new();
+    let config = fx.config.to_str().unwrap().to_string();
+    fx.ok(&[
+        "--json",
+        "write",
+        "team",
+        "Retry backoff",
+        "--content",
+        "- [decision] the retry queue doubles its backoff #team",
+        "--config",
+        &config,
+    ]);
+
+    let refused = fx.fails(&[
+        "domain",
+        "remove",
+        "team",
+        "--end-drafts",
+        "nobody",
+        "--config",
+        &config,
+    ]);
+    assert!(
+        refused.contains("nobody"),
+        "the refusal says who nobody is: {refused}"
+    );
+
+    let report = fx.ok(&["--json", "domain", "remove", "team", "--config", &config]);
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(
+        report["drafts_swept"],
+        serde_json::json!(1),
+        "the operator's own draft went with the domain, unasked: {report}"
+    );
+}

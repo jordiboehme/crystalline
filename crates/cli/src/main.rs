@@ -2467,6 +2467,54 @@ fn ahead_line(d: &serde_json::Value) -> String {
     format!("  ahead: {total} local change(s) ({})", kinds.join(", "))
 }
 
+/// What a reviewing domain is holding that no share would pick up: this
+/// session's own drafts, and - for whoever holds the domain - who else is
+/// drafting in it.
+///
+/// The line exists because `ahead` cannot say this. In review mode a write
+/// joins its author's own draft and never reaches the folder the team shares,
+/// so a domain with four unshared drafts in it reports `ahead: 0 local
+/// change(s)`, which is true and reads as "there is nothing to share here".
+///
+/// Absent keys draw nothing at all, which is what a domain that takes changes
+/// directly sends: nobody can draft there, so there is nothing to say. A count
+/// of zero is silent for the same reason a zero conflict count is - reciting
+/// what is normally true teaches a reader to skim the line that one day says
+/// something - and a null count is the case that is neither, an index that
+/// could not be asked, which says so rather than reading as zero.
+///
+/// Names and counts only: what somebody has not shared is theirs until they do.
+fn draft_lines(d: &serde_json::Value) -> Vec<String> {
+    let Some(mine) = d.get("my_drafts") else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    match mine.as_u64() {
+        None => lines.push("  draft changes: unknown (the index could not be asked)".to_string()),
+        Some(0) => {}
+        Some(1) => lines.push("  1 draft change of yours awaits sharing".to_string()),
+        Some(n) => lines.push(format!("  {n} draft changes of yours await sharing")),
+    }
+    // Only where the server sent it, which is its answer to whether this caller
+    // may see who else is drafting here. Nothing on this side works that out.
+    if let Some(everyone) = d.get("drafts").and_then(serde_json::Value::as_array) {
+        let held: Vec<String> = everyone
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {}",
+                    row["actor"].as_str().unwrap_or("?"),
+                    row["entries"].as_u64().unwrap_or(0)
+                )
+            })
+            .collect();
+        if !held.is_empty() {
+            lines.push(format!("  drafts held here: {}", held.join(", ")));
+        }
+    }
+    lines
+}
+
 /// The `--files` block under one domain: the unshared paths grouped by what
 /// happened to each, then the folder listings that ride along as one quiet
 /// line, because a refreshed listing is derived from the files beside it and
@@ -2555,6 +2603,9 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
         let branch = d["branch"].as_str().unwrap_or("");
         println!("{name}: {repo}@{branch}");
         println!("{}", ahead_line(d));
+        for line in draft_lines(d) {
+            println!("{line}");
+        }
         if files {
             for line in unshared_file_lines(d) {
                 println!("{line}");
@@ -3962,6 +4013,55 @@ mod tests {
                 "generated_indexes": indexes,
             },
         })
+    }
+
+    /// A reviewing domain says what is waiting in this session's own draft,
+    /// and tells whoever holds the domain who else is holding work.
+    ///
+    /// The count is the whole point of the line. In review mode a write never
+    /// reaches the folder the team shares, so `ahead: 0 local change(s)` is
+    /// true and reads as "nothing to share" over a pile of unshared drafts.
+    #[test]
+    fn the_draft_lines_say_what_is_yours_and_who_else_is_holding_work() {
+        assert_eq!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": 3 })),
+            vec!["  3 draft changes of yours await sharing".to_string()],
+        );
+        assert_eq!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": 1 })),
+            vec!["  1 draft change of yours awaits sharing".to_string()],
+            "one draft is one change, and the sentence agrees with it"
+        );
+        assert!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": 0 })).is_empty(),
+            "a reviewing domain you are holding nothing in says nothing"
+        );
+        assert!(
+            draft_lines(&json!({ "domain": "advisor", "local_changes": 2 })).is_empty(),
+            "and a domain that takes changes directly has no draft line at all"
+        );
+
+        // The coordination half, which only whoever holds the domain is sent.
+        assert_eq!(
+            draft_lines(&json!({
+                "domain": "advisor",
+                "my_drafts": 1,
+                "drafts": [
+                    { "actor": "ada", "entries": 2 },
+                    { "actor": "owner", "entries": 1 },
+                ],
+            })),
+            vec![
+                "  1 draft change of yours awaits sharing".to_string(),
+                "  drafts held here: ada 2, owner 1".to_string(),
+            ],
+        );
+
+        // An index that could not be asked is not a count of zero.
+        assert_eq!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": Value::Null })),
+            vec!["  draft changes: unknown (the index could not be asked)".to_string()],
+        );
     }
 
     /// The line that misled a reader: two deletions counted as "2 local
