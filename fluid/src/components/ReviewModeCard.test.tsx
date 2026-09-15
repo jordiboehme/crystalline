@@ -85,6 +85,7 @@ function planResponse(overrides: Record<string, unknown> = {}) {
       },
     ],
     contested_paths: [],
+    contested_addresses: [],
     ...overrides,
   };
 }
@@ -209,6 +210,40 @@ describe("ReviewModeCard", () => {
         folds: { ada: "fold", bo: "discard" },
       });
     });
+  });
+
+  it("names both kinds of trouble a fold runs into", async () => {
+    serve({
+      "/domains/eng/review": (_path, init) =>
+        sent(init).folds === undefined
+          ? planResponse({
+              contested_paths: [{ path: "plan.md", actors: ["ada", "bo"] }],
+              contested_addresses: [
+                {
+                  permalink: "shared",
+                  paths: ["alpha.md", "beta.md"],
+                  actors: ["ada", "bo"],
+                },
+              ],
+            })
+          : {},
+    });
+    renderApp("/d/eng");
+
+    const region = await screen.findByRole("region", { name: "Review mode" });
+    await userEvent.click(
+      within(region).getByRole("button", { name: "Take review mode off" }),
+    );
+    await screen.findByText(/ada \(2\)/);
+    // A path two people are drafting, and an address two of their different
+    // paths both answer to. A plan that showed one and hid the other would
+    // read as clean and then be refused at the confirm.
+    expect(
+      within(region).getByText(/plan.md is drafted by ada and bo/),
+    ).toBeInTheDocument();
+    expect(
+      within(region).getByText(/alpha.md and beta.md/),
+    ).toBeInTheDocument();
   });
 
   it("shows the server's refusal in the server's own words", async () => {

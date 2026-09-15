@@ -12693,9 +12693,21 @@ impl Engine {
         // them in the index - and it refreshes the generated folder indexes on
         // the way. The routing cache is not its job, and a folded MANIFEST is
         // the domain's routing, so that one is refreshed here.
-        self.sync(Some(domain)).await?;
+        //
+        // **The refresh happens whether the sync succeeded or not**, and the
+        // error is carried past it rather than returned through it. A failed
+        // sync is the one tail this call cannot offer a repeat of: the rows are
+        // already dropped by then, so a second call finds an overlay-less
+        // domain that is no longer reviewing and the no-op above answers it
+        // without doing anything. The files are on disk either way and a later
+        // sync picks them up, but the routing cache is in this process's memory
+        // and nothing else would ever refresh it, so a folded MANIFEST would go
+        // on routing agents by what the domain said before the fold until the
+        // daemon restarted.
+        let synced = self.sync(Some(domain)).await;
         self.refresh_routing_cache().await;
         self.nudge_embed();
+        synced?;
 
         Ok(review::left_json(domain, folded, discarded, rooms_closed))
     }
@@ -12732,8 +12744,14 @@ impl Engine {
         let effective = self.overlay.apply(&file);
         *file_guard = file;
         *self.config.write().unwrap() = effective;
-        // A domain discovered after this engine started keeps its own cached
-        // entry, and that cache is what `domain_entry` answers from first.
+        // A domain discovered after this engine started keeps a cached entry of
+        // its own beside the two configs above, and `domain_entry` falls back
+        // to it when `self.config` has no such name. The effective config just
+        // written does hold the name (it is what this call persisted), so the
+        // fallback is not reached and this write changes no answer today; it is
+        // here so the cache cannot go on saying a domain reviews changes after
+        // this call decided it does not, whichever of the two a later reader
+        // happens to reach.
         if let Some(found) = self.discovered_domains.write().unwrap().get_mut(domain) {
             found.review = review;
         }

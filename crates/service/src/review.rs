@@ -288,7 +288,7 @@ pub(crate) fn choices(
 /// folder would hold if every fold in this answer landed, refused at the
 /// first path or address two engrams would share.
 ///
-/// Deliberately not [`Engine::refuse_permalink_held_elsewhere`], whose
+/// Deliberately not [`crate::engine::Engine::refuse_permalink_held_elsewhere`], whose
 /// tombstone exception is "a path THIS actor has deleted is free": that
 /// holds for a draft written into one actor's own dimension and does not
 /// transfer to a fold, where alice's deletion frees an address for bob only

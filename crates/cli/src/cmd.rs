@@ -957,16 +957,40 @@ pub fn print_domain_remove(name: &str, report: &serde_json::Value, json: bool) {
 /// every actor holding drafts, what each of them holds, and the two kinds of
 /// trouble a fold can run into.
 pub fn print_review_plan(plan: &serde_json::Value) {
+    for line in review_plan_lines(plan) {
+        println!("{line}");
+    }
+}
+
+/// The plan as lines, so what an operator reads is a value a test can hold.
+///
+/// Split out of [`print_review_plan`] rather than left inline because the plan
+/// carries TWO kinds of trouble a fold runs into and they arrive in different
+/// places - a path more than one person is drafting, and an address two of
+/// their different paths both answer to - and a printer that renders one and
+/// drops the other reads as a clean plan that is then refused at the confirm,
+/// which is the one outcome this whole direction exists to prevent. That is a
+/// thing to assert, not to eyeball.
+fn review_plan_lines(plan: &serde_json::Value) -> Vec<String> {
+    /// The string values of an array field, in order.
+    fn names(value: &serde_json::Value) -> Vec<&str> {
+        value
+            .as_array()
+            .map(|rows| rows.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
     let actors = plan["actors"].as_array().cloned().unwrap_or_default();
     if actors.is_empty() {
-        println!("Nobody is drafting in this domain, so leaving review mode ends nothing.");
-        return;
+        return vec![
+            "Nobody is drafting in this domain, so leaving review mode ends nothing.".to_string(),
+        ];
     }
-    println!("Leaving review mode ends every private draft in this domain:");
+    let mut out = vec!["Leaving review mode ends every private draft in this domain:".to_string()];
     for row in &actors {
         let actor = row["actor"].as_str().unwrap_or("?");
         let entries = row["entries"].as_u64().unwrap_or(0);
-        println!("  {actor} ({entries} draft(s))");
+        out.push(format!("  {actor} ({entries} draft(s))"));
         for draft in row["drafts"].as_array().cloned().unwrap_or_default() {
             let path = draft["path"].as_str().unwrap_or("?");
             let what = if draft["tombstone"].as_bool().unwrap_or(false) {
@@ -974,9 +998,9 @@ pub fn print_review_plan(plan: &serde_json::Value) {
             } else {
                 "drafted"
             };
-            println!("    {what} {path}");
+            out.push(format!("    {what} {path}"));
             if let Some(conflict) = draft["conflict"].as_str() {
-                println!("      cannot be folded: {conflict}");
+                out.push(format!("      cannot be folded: {conflict}"));
             }
         }
     }
@@ -986,19 +1010,30 @@ pub fn print_review_plan(plan: &serde_json::Value) {
         .unwrap_or_default()
     {
         let path = contested["path"].as_str().unwrap_or("?");
-        let who: Vec<&str> = contested["actors"]
-            .as_array()
-            .map(|rows| rows.iter().filter_map(|a| a.as_str()).collect())
-            .unwrap_or_default();
-        println!(
+        out.push(format!(
             "  {path} is drafted by {}, so at most one of them can be folded.",
-            who.join(" and ")
-        );
+            names(&contested["actors"]).join(" and ")
+        ));
     }
-    println!(
-        "Answer with --fold <actor> (write their drafts into the folder) or \
-         --discard <actor> (end them), one for each actor above."
+    for contested in plan["contested_addresses"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let permalink = contested["permalink"].as_str().unwrap_or("?");
+        out.push(format!(
+            "  {} answer to the address '{permalink}', drafted by {}, so at most one of them can \
+             be folded: one engram answers to one address.",
+            names(&contested["paths"]).join(" and "),
+            names(&contested["actors"]).join(" and ")
+        ));
+    }
+    out.push(
+        "Answer with --fold <actor> (write their drafts into the folder) or --discard <actor> \
+         (end them), one for each actor above."
+            .to_string(),
     );
+    out
 }
 
 /// What `domain review` says once the mode is what was asked for.
@@ -2716,6 +2751,50 @@ fn print_report(r: &crystalline_index::SyncReport) {
     );
     for (path, err) in &r.failed {
         println!("  failed: {path}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod review_plan_tests {
+    use super::review_plan_lines;
+
+    /// Both kinds of trouble a fold runs into reach the person answering the
+    /// plan, because a plan that shows one and hides the other is a clean plan
+    /// that then refuses - which is the one thing this whole direction is
+    /// built to avoid.
+    #[test]
+    fn the_plan_names_a_contested_path_and_a_contested_address() {
+        let plan = serde_json::json!({
+            "actors": [
+                { "actor": "ada", "entries": 1, "drafts": [
+                    { "path": "alpha.md", "permalink": "shared", "tombstone": false, "conflict": null }
+                ]},
+                { "actor": "bo", "entries": 1, "drafts": [
+                    { "path": "beta.md", "permalink": "shared", "tombstone": false, "conflict": null }
+                ]},
+            ],
+            "contested_paths": [{ "path": "plan.md", "actors": ["ada", "bo"] }],
+            "contested_addresses": [
+                { "permalink": "shared", "paths": ["alpha.md", "beta.md"], "actors": ["ada", "bo"] }
+            ],
+        });
+        let lines = review_plan_lines(&plan).join("\n");
+        assert!(
+            lines.contains("plan.md is drafted by ada and bo"),
+            "the contested path: {lines}"
+        );
+        assert!(
+            lines.contains("'shared'") && lines.contains("alpha.md") && lines.contains("beta.md"),
+            "the contested address names itself and both paths: {lines}"
+        );
+    }
+
+    /// A domain nobody is drafting in says so and asks for nothing.
+    #[test]
+    fn an_empty_plan_asks_for_no_answer() {
+        let lines = review_plan_lines(&serde_json::json!({ "actors": [] })).join("\n");
+        assert!(lines.contains("Nobody is drafting"), "{lines}");
+        assert!(!lines.contains("--fold"), "{lines}");
     }
 }
 

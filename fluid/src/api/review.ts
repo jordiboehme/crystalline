@@ -46,6 +46,22 @@ export interface ContestedPath {
   actors: string[];
 }
 
+/**
+ * An address two actors' different paths would both claim: at most one of them
+ * may be folded, because one engram answers to one address.
+ *
+ * The other kind of trouble a fold runs into, and it arrives separately because
+ * it is a different question: neither draft is in the folder for the other
+ * one's `conflict` to find, and the paths differ so `contested_paths` says
+ * nothing either. A surface that drew one of the two and not the other would
+ * show a clean plan for a fold that is then refused.
+ */
+export interface ContestedAddress {
+  permalink: string;
+  paths: string[];
+  actors: string[];
+}
+
 /** What leaving review mode would end. */
 export interface ReviewPlan {
   domain: string;
@@ -55,6 +71,7 @@ export interface ReviewPlan {
   applied: boolean;
   actors: PlannedActor[];
   contested_paths: ContestedPath[];
+  contested_addresses: ContestedAddress[];
 }
 
 /** What one actor's drafts become. */

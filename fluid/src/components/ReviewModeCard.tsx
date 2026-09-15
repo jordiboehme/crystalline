@@ -206,6 +206,24 @@ export function ReviewModeCard({
                     be written into the folder.
                   </p>
                 ))}
+                {/*
+                  The other kind of trouble, drawn beside the first because it
+                  is the one a reader would otherwise meet as a refusal after
+                  answering: two people whose different paths answer to one
+                  address. See `ContestedAddress`.
+                */}
+                {plan.contested_addresses.map((contested) => (
+                  <p
+                    key={contested.permalink}
+                    className="mt-2 text-sm text-red-700 dark:text-red-300"
+                  >
+                    {contested.paths.join(" and ")} answer to the address{" "}
+                    {contested.permalink}, drafted by{" "}
+                    {contested.actors.join(" and ")}, so at most one of them can
+                    be written into the folder: one engram answers to one
+                    address.
+                  </p>
+                ))}
               </>
             )}
             <div className="mt-3 flex gap-2">

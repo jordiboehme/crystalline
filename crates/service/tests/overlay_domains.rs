@@ -3742,6 +3742,15 @@ async fn a_room_that_takes_an_address_while_it_closes_refuses_with_nothing_folde
         words.contains("fresh.md") && words.contains("alice"),
         "the refusal names her path and her name: {words}"
     );
+    // And it says what happened, because the collision is not one the operator
+    // could have seen when they answered the plan: the folder moved under them
+    // while this call was closing its rooms.
+    assert!(
+        words.contains("The folder changed while this domain's co-editing rooms were being closed")
+            && words.contains("the domain reviews changes again")
+            && words.contains("out-of-band work"),
+        "the refusal says why it could not have been foreseen, and where the change went: {words}"
+    );
 
     // Nothing was folded, and the domain is reviewing again: the same call
     // works once somebody has given one of the two engrams an address of its

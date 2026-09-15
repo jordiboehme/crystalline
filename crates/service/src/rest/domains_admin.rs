@@ -2009,9 +2009,11 @@ pub struct ReviewBody {
     /// straight into the folder.
     #[schema(example = "overlay")]
     pub mode: ReviewModeArg,
-    /// One choice per actor holding drafts, keyed by the actor's name. Absent
-    /// asks for the plan and writes nothing; present makes the change and has
-    /// to name every actor the plan names, and nobody else.
+    /// One choice per actor holding drafts, keyed by the actor's name. Absent -
+    /// or an explicit `null`, which is what a client holding the field as
+    /// nullable sends when it has no answers - asks for the plan and writes
+    /// nothing; a map makes the change and has to name every actor the plan
+    /// names, and nobody else.
     #[serde(default)]
     pub folds: Option<std::collections::BTreeMap<String, FoldArg>>,
 }
@@ -2057,9 +2059,12 @@ pub struct ReviewBody {
                    this answers the plan and writes nothing: each actor, their \
                    drafts, which are deletions, which paths more than one of \
                    them is drafting and which drafts have nowhere to land. \
-                   WITH one it makes the change, and the key has to name every \
-                   actor the plan named and nobody else - `fold` writes that \
-                   actor's drafts into the folder, `discard` ends them. Two \
+                   WITH a `folds` map it makes the change, and the map has to \
+                   name every actor the plan named and nobody else - `fold` \
+                   writes that actor's drafts into the folder, `discard` ends \
+                   them. An explicit `\"folds\": null` is the absent key, not \
+                   an empty answer: a client holding the field as nullable is \
+                   saying it has none, which is the question. Two \
                    folded actors at one path, or a folded draft whose address \
                    another engram already holds, refuse before anything is \
                    written.\n\nAsking for a mode the domain already has changes \
@@ -2088,7 +2093,8 @@ pub struct ReviewBody {
                         { "path": "notes/gone.md", "permalink": "notes/gone.md", "tombstone": true, "conflict": null }
                     ]
                 }],
-                "contested_paths": []
+                "contested_paths": [],
+                "contested_addresses": []
             }),
         ),
         (
@@ -2124,8 +2130,9 @@ pub struct ReviewBody {
         ),
         (
             status = 422,
-            description = "`folds` on an `overlay` body: there are no drafts \
-                           to decide about on the way in.",
+            description = "A `folds` map on an `overlay` body: there are no \
+                           drafts to decide about on the way in. An explicit \
+                           null is not one, and is served.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -2144,9 +2151,12 @@ pub async fn set_review_mode(
     // (401) rather than that it is forbidden (403).
     identity.require_account()?;
     let (mode, confirm) = match (body.mode, body.folds) {
-        // Any `folds` key at all, not only a non-empty one: the rule a client
-        // reads is "folds are a question about leaving", and an empty map
-        // waved through would make it "folds with something in them are".
+        // Any `folds` MAP, not only a non-empty one: the rule a client reads is
+        // "folds are a question about leaving", and an empty map waved through
+        // would make it "folds with something in them are". An explicit
+        // `"folds": null` is not a map and is the absent key - a client that
+        // holds the field as nullable and sends what it holds is saying it has
+        // no answers, which is what absence means.
         (ReviewModeArg::Overlay, Some(_)) => {
             return Err(ApiError::unprocessable(
                 "folds say what happens to each actor's private drafts, which is a question about \

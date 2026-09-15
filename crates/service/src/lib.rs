@@ -26,7 +26,11 @@ pub mod overlay_journal;
 pub mod params;
 mod poller;
 pub mod rest;
-pub mod review;
+// Internal: only the two types below are anybody else's business, and they are
+// re-exported at the root. Kept `pub(crate)` so the module doc's links to its
+// own `pub(crate)` functions are consistent with what rustdoc publishes -
+// `pub mod` made every one of them a broken link for a reader of the docs.
+pub(crate) mod review;
 pub mod scope;
 pub mod settings;
 pub mod similar;

@@ -2566,6 +2566,25 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
     .unwrap();
     assert_eq!(refused.status(), 422);
 
+    // An explicit null is the absent key, not an empty answer: a client that
+    // holds `folds` as nullable and sends what it holds is asking the question.
+    let plan = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/review",
+        &admin,
+    )
+    .json(&serde_json::json!({"mode": "direct", "folds": null}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(plan.status(), 200);
+    assert_eq!(
+        plan.json::<serde_json::Value>().await.unwrap()["applied"],
+        serde_json::json!(false),
+        "a null folds key asks rather than answers"
+    );
+
     // The other direction with no `folds` key is the question rather than the
     // change: the plan comes back and nothing moves.
     let plan = as_session(

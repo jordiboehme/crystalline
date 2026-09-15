@@ -661,7 +661,7 @@ export interface paths {
          *
          *     mode `overlay` turns REVIEW MODE on: every write joins its author's own draft and the folder the team shares changes only through a reviewed proposal. It needs a GitHub origin (a reviewed change has to have somewhere to be proposed), a folder (so not a virtual domain) and a folder with nothing unshared in it already - each refused 409 naming what is in the way.
          *
-         *     mode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and writes nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting and which drafts have nowhere to land. WITH one it makes the change, and the key has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written.
+         *     mode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and writes nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting and which drafts have nowhere to land. WITH a `folds` map it makes the change, and the map has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. An explicit `"folds": null` is the absent key, not an empty answer: a client holding the field as nullable is saying it has none, which is the question. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written.
          *
          *     Asking for a mode the domain already has changes nothing and answers the same way.
          */
@@ -2494,9 +2494,11 @@ export interface components {
         /** @description The mode this domain takes changes in, and - when leaving review mode - what happens to each actor's private drafts. Omit `folds` to ask for the plan instead of making the change; `overlay` never takes one, since a domain that has not been reviewing yet holds no drafts for anybody to decide about. */
         ReviewBody: {
             /**
-             * @description One choice per actor holding drafts, keyed by the actor's name. Absent
-             *     asks for the plan and writes nothing; present makes the change and has
-             *     to name every actor the plan names, and nobody else.
+             * @description One choice per actor holding drafts, keyed by the actor's name. Absent -
+             *     or an explicit `null`, which is what a client holding the field as
+             *     nullable sends when it has no answers - asks for the plan and writes
+             *     nothing; a map makes the change and has to name every actor the plan
+             *     names, and nobody else.
              */
             folds?: {
                 [key: string]: components["schemas"]["FoldArg"];
@@ -5780,6 +5782,7 @@ export interface operations {
                      *         }
                      *       ],
                      *       "applied": false,
+                     *       "contested_addresses": [],
                      *       "contested_paths": [],
                      *       "domain": "eng",
                      *       "mode": "direct",
@@ -5825,7 +5828,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description `folds` on an `overlay` body: there are no drafts to decide about on the way in. */
+            /** @description A `folds` map on an `overlay` body: there are no drafts to decide about on the way in. An explicit null is not one, and is served. */
             422: {
                 headers: {
                     [name: string]: unknown;

@@ -3648,7 +3648,7 @@
           "domains"
         ],
         "summary": "Whether this domain reviews changes before they land.",
-        "description": "An instance admin, or a private domain's owner.\n\nmode `overlay` turns REVIEW MODE on: every write joins its author's own draft and the folder the team shares changes only through a reviewed proposal. It needs a GitHub origin (a reviewed change has to have somewhere to be proposed), a folder (so not a virtual domain) and a folder with nothing unshared in it already - each refused 409 naming what is in the way.\n\nmode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and writes nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting and which drafts have nowhere to land. WITH one it makes the change, and the key has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written.\n\nAsking for a mode the domain already has changes nothing and answers the same way.",
+        "description": "An instance admin, or a private domain's owner.\n\nmode `overlay` turns REVIEW MODE on: every write joins its author's own draft and the folder the team shares changes only through a reviewed proposal. It needs a GitHub origin (a reviewed change has to have somewhere to be proposed), a folder (so not a virtual domain) and a folder with nothing unshared in it already - each refused 409 naming what is in the way.\n\nmode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and writes nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting and which drafts have nowhere to land. WITH a `folds` map it makes the change, and the map has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. An explicit `\"folds\": null` is the absent key, not an empty answer: a client holding the field as nullable is saying it has none, which is the question. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written.\n\nAsking for a mode the domain already has changes nothing and answers the same way.",
         "operationId": "set_domain_review_mode",
         "parameters": [
           {
@@ -3701,6 +3701,7 @@
                     }
                   ],
                   "applied": false,
+                  "contested_addresses": [],
                   "contested_paths": [],
                   "domain": "eng",
                   "mode": "direct",
@@ -3750,7 +3751,7 @@
             }
           },
           "422": {
-            "description": "`folds` on an `overlay` body: there are no drafts to decide about on the way in.",
+            "description": "A `folds` map on an `overlay` body: there are no drafts to decide about on the way in. An explicit null is not one, and is served.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8685,7 +8686,7 @@
               "object",
               "null"
             ],
-            "description": "One choice per actor holding drafts, keyed by the actor's name. Absent\nasks for the plan and writes nothing; present makes the change and has\nto name every actor the plan names, and nobody else.",
+            "description": "One choice per actor holding drafts, keyed by the actor's name. Absent -\nor an explicit `null`, which is what a client holding the field as\nnullable sends when it has no answers - asks for the plan and writes\nnothing; a map makes the change and has to name every actor the plan\nnames, and nobody else.",
             "additionalProperties": {
               "$ref": "#/components/schemas/FoldArg"
             },
