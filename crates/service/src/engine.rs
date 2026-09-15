@@ -945,6 +945,95 @@ pub const OWNER_IDENTITY_NAME: &str = "owner";
 /// agent that reads it can act on it in one step.
 pub const OVERLAY_NEEDS_IDENTITY: &str = "this domain reviews changes before they land, so a write needs to know whose draft it joins - connect with your MCP token (issued in Fluid under profile > Agent access) and try again";
 
+/// The actor key a share acts in on a domain that reviews changes before they
+/// land.
+///
+/// The one mapping from a [`ShareActor`] - which is what every surface resolves
+/// a sharer into - to the key the overlay rows are written under, and it says
+/// the same three things [`crate::scope::overlay_actor`] says on the write side:
+/// the machine owner drafts as [`OWNER_IDENTITY_NAME`], an account drafts under
+/// its own login, and an agent over HTTP that never authenticated is nobody in
+/// particular. The two have to agree or the owner's CLI would share an overlay
+/// nothing ever writes into, which is why they are written as one answer each
+/// rather than derived from one another.
+///
+/// Nobody in particular is [`OVERLAY_NEEDS_IDENTITY`] here for the same reason
+/// it is a refusal there: with no identity there is no draft for the share to
+/// be of, and the one thing that must never happen instead is a share of the
+/// whole folder going out under nobody's name.
+fn overlay_share_actor(actor: &ShareActor) -> Result<String> {
+    match actor {
+        ShareActor::Owner => Ok(OWNER_IDENTITY_NAME.to_string()),
+        ShareActor::Account(account) => Ok(account.clone()),
+        ShareActor::HttpAgent => Err(EngineError::Refused(OVERLAY_NEEDS_IDENTITY.to_string())),
+    }
+}
+
+/// The folder under a domain's origin state directory that one share of a
+/// reviewing domain stages its tree in.
+const OVERLAY_STAGING_DIR: &str = "share-staging";
+
+/// The tree one share of a reviewing domain is detected against: the base
+/// snapshot's own content with the acting actor's drafts laid over it.
+///
+/// A share of a reviewing domain cannot be a walk of the folder on disk. Nothing
+/// a member writes is there - every write joins that member's own draft overlay
+/// and the folder goes on saying what the team reviewed - so a walk would find
+/// nothing, or find somebody's stray direct edit and propose that instead. The
+/// engine builds the tree the share really is about and hands THAT down as the
+/// domain root, which is what keeps `crystalline_remote` identity-unaware: it is
+/// handed a root and detects changes the one way it always has, and whose root
+/// it is was decided here.
+///
+/// Removed on every exit path, a refusal and a failed forge call included, by
+/// [`Drop`]: a staged tree is a copy of somebody's unreviewed knowledge, and one
+/// left behind would sit under the state directory until something happened to
+/// overwrite it.
+struct OverlayStaging {
+    root: PathBuf,
+}
+
+impl OverlayStaging {
+    /// The staged tree's root, to hand to `crystalline_remote::ops` in place of
+    /// the domain's folder.
+    fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for OverlayStaging {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                "the staged share tree at {} could not be removed: {e}",
+                self.root.display()
+            ),
+        }
+    }
+}
+
+/// Writes `bytes` at `rel` under `root`, creating the folders on the way.
+///
+/// `rel` is a domain-relative forward-slashed path whose containment the caller
+/// has already asserted; [`join_rel`] puts it together a segment at a time, so a
+/// separator that means something else on another platform cannot re-root the
+/// result.
+fn write_staged_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
+    let path = join_rel(root, rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| EngineError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, bytes).map_err(|source| EngineError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
 /// The refusal a write verb answers with in personal mode when the acting
 /// identity has connected no GitHub account of its own (spec section 6, and the
 /// locked decision behind it: no silent fallback to the instance token, ever).
@@ -14528,6 +14617,179 @@ impl Engine {
         })
     }
 
+    /// Whose drafts a share of `domain` is of, or `None` when the domain takes
+    /// changes directly and a share is the folder walk it always was.
+    ///
+    /// Asked FIRST by both share verbs, ahead of the credential and ahead of
+    /// every forge call: an agent with no identity holds no draft, so there is
+    /// nothing for a share to be of whatever this instance's GitHub
+    /// configuration says, and the refusal that teaches the way in is the one a
+    /// write already gets. Resolving a credential before saying so would answer
+    /// a question about the forge to a caller whose problem is that nobody knows
+    /// whose work this is.
+    fn overlay_share_identity(&self, domain: &str, actor: &ShareActor) -> Result<Option<String>> {
+        if !self.reviews_changes(domain) {
+            return Ok(None);
+        }
+        overlay_share_actor(actor).map(Some)
+    }
+
+    /// The tree a share or a preview of `domain` runs against, or `None` when
+    /// `drafting` is `None` and the folder on disk is the answer it always was.
+    ///
+    /// The single seam review mode adds to sharing, so the share and the preview
+    /// behind its confirmation question cannot describe two different things.
+    /// Two steps, in this order:
+    ///
+    /// 1. a pull of the REAL folder, which is the pull `ops::propose` would run
+    ///    for itself. It has to happen against the folder rather than the staged
+    ///    tree: a pull advances the base snapshot as it applies upstream work,
+    ///    so a pull into staging would leave the team's folder behind its own
+    ///    base and every later share would read those paths as deletions. Run
+    ///    here, the pull that `ops` then runs finds the base already current and
+    ///    writes nothing;
+    /// 2. the staged tree itself ([`Engine::stage_overlay_share`]).
+    ///
+    /// `origin` is what [`Engine::origin_spec_for_domain`] resolved, borrowed
+    /// whole: the spec, the domain's folder and its origin state directory.
+    async fn overlay_share_tree(
+        &self,
+        domain: &str,
+        drafting: Option<&str>,
+        provider: &dyn Provider,
+        origin: (&OriginSpec, &Path, &Path),
+        acting: Option<&str>,
+    ) -> Result<Option<OverlayStaging>> {
+        let Some(who) = drafting else {
+            return Ok(None);
+        };
+        let (spec, root, state_dir) = origin;
+        ops::pull(provider, spec, root, state_dir)
+            .await
+            .inspect_err(|e| self.drop_github_credential_on_auth(e))
+            .map_err(|e| enrich_write_error(e, acting, &spec.repo))?;
+        Ok(Some(
+            self.stage_overlay_share(domain, who, root, state_dir)
+                .await?,
+        ))
+    }
+
+    /// Stages the tree one actor's share of a reviewing domain is detected
+    /// against: the base snapshot's own content, with that actor's overlay rows
+    /// laid over it - a draft as the file's content, a tombstone as the file's
+    /// absence.
+    ///
+    /// **The rows are the source, never the journal beside them.** The journal
+    /// under the state directory is the durable mirror a rebuilt index is
+    /// restored from, and a mirror that had fallen behind would quietly change
+    /// what a share carries. The index is the live truth, so the index is read.
+    ///
+    /// **The base snapshot is the other side, never the folder.** Its content
+    /// lives under the state directory as the copies a pull recorded
+    /// (`crystalline_remote::state::read_base_file`), and reading those rather
+    /// than the files beside them is what makes "exactly this actor's draft"
+    /// true: a stray direct edit of the reviewed folder is nobody's draft and
+    /// takes no part in any share. Where a recorded path has no base copy - the
+    /// shape a repository subscribed before those copies existed leaves behind -
+    /// the working tree's own file stands in rather than the path being dropped,
+    /// since dropping it would propose deleting a file that is right there.
+    ///
+    /// Nothing is cleared: a shared draft is still a draft, and the entries stay
+    /// exactly as they stand until the merged work is pulled back and
+    /// convergence takes them out.
+    async fn stage_overlay_share(
+        &self,
+        domain: &str,
+        actor: &str,
+        root: &Path,
+        state_dir: &Path,
+    ) -> Result<OverlayStaging> {
+        let base = crystalline_remote::state::OriginState::load(state_dir)?
+            .ok_or_else(|| {
+                EngineError::Conflict(format!(
+                    "domain '{domain}' has no origin state; add the domain from its origin first"
+                ))
+            })?
+            .files;
+        let staging = OverlayStaging {
+            root: state_dir.join(OVERLAY_STAGING_DIR),
+        };
+        // A tree a previous run left behind - a process killed between the share
+        // and the guard's own cleanup - is not a tree this share may inherit.
+        match std::fs::remove_dir_all(staging.root()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(EngineError::Io {
+                    path: staging.root().display().to_string(),
+                    source,
+                });
+            }
+        }
+        std::fs::create_dir_all(staging.root()).map_err(|source| EngineError::Io {
+            path: staging.root().display().to_string(),
+            source,
+        })?;
+        for rel in base.keys() {
+            if !is_within_domain(rel) {
+                continue;
+            }
+            let recorded = crystalline_remote::state::read_base_file(state_dir, rel)?;
+            let content = match recorded {
+                Some(bytes) => bytes,
+                None => match std::fs::read(join_rel(root, rel)) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: join_rel(root, rel).display().to_string(),
+                            source,
+                        });
+                    }
+                },
+            };
+            write_staged_file(staging.root(), rel, &content)?;
+        }
+        let entries = {
+            let store = self.store.lock().await;
+            // The read-only id lookup: a share of a domain this index has never
+            // been told about holds no drafts, and asking must not register one.
+            let Some(domain_id) = store.domain_id(domain).await? else {
+                return Ok(staging);
+            };
+            store.overlay_entries(domain_id, actor).await?
+        };
+        for entry in entries {
+            // The write verbs normalize a draft's path before it becomes a row,
+            // so this is the second assertion rather than the first - and it is
+            // here because a path that escaped would write outside the staged
+            // tree, which is the one failure a share could not recover from.
+            if !is_contained_rel(&entry.path) {
+                return Err(EngineError::Conflict(format!(
+                    "draft '{}' in domain '{domain}' stands at a path that is not inside the \
+                     domain, so it cannot be shared",
+                    entry.path
+                )));
+            }
+            if entry.tombstone {
+                let path = join_rel(staging.root(), &entry.path);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: path.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+            } else {
+                write_staged_file(staging.root(), &entry.path, entry.content.as_bytes())?;
+            }
+        }
+        Ok(staging)
+    }
+
     /// Proposes one domain's local changes as a pull request against its
     /// origin, under its origin lock.
     ///
@@ -14584,12 +14846,29 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let drafting = self.overlay_share_identity(domain, &actor)?;
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
+        // In review mode the share is of the actor's own drafts, which are in
+        // the index and on nobody's disk, so the tree `ops` detects against is
+        // staged here. `None` is a domain that takes changes directly, whose
+        // share is the folder walk it always was.
+        let staging = self
+            .overlay_share_tree(
+                domain,
+                drafting.as_deref(),
+                provider.as_ref(),
+                (&spec, &root, &state_dir),
+                acting.as_deref(),
+            )
+            .await?;
+        let detect_in = staging
+            .as_ref()
+            .map_or(root.as_path(), OverlayStaging::root);
         match ops::propose(
             provider.as_ref(),
             &spec,
-            &root,
+            detect_in,
             domain,
             &state_dir,
             ops::ShareOptions {
@@ -14706,6 +14985,7 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let drafting = self.overlay_share_identity(domain, &actor)?;
         let (provider, login) = match self.resolve_share_provider(&actor) {
             Ok(resolved) => resolved,
             Err(e)
@@ -14717,10 +14997,25 @@ impl Engine {
             Err(e) => return Err(e),
         };
         let acting = self.personal_write_login(login.as_deref());
+        // The share's own staging, for the share's own reason: a preview that
+        // planned against the folder would promise a share of files nobody
+        // drafted (see `Engine::overlay_share_tree`).
+        let staging = self
+            .overlay_share_tree(
+                domain,
+                drafting.as_deref(),
+                provider.as_ref(),
+                (&spec, &root, &state_dir),
+                acting.as_deref(),
+            )
+            .await?;
+        let detect_in = staging
+            .as_ref()
+            .map_or(root.as_path(), OverlayStaging::root);
         let plan = ops::propose_preview(
             provider.as_ref(),
             &spec,
-            &root,
+            detect_in,
             domain,
             &state_dir,
             ops::ShareOptions {
@@ -14739,7 +15034,12 @@ impl Engine {
         .map_err(|e| enrich_write_error(e, acting.as_deref(), &spec.repo))?;
         self.index_what_the_share_pull_applied(domain, "previewing a share")
             .await;
-        Ok(origin::share_plan_json(&plan, &root))
+        // Provenance preselection is a guess at whose work a mixed delta holds,
+        // and in review mode there is nothing left to guess: every path in the
+        // plan is one of this actor's own drafts. So the plan is served without
+        // it rather than with a column answering a question nobody asked.
+        let provenance = drafting.is_none().then_some(root.as_path());
+        Ok(origin::share_plan_json(&plan, provenance))
     }
 
     /// Previews which proposal a withdrawal would take out, without touching

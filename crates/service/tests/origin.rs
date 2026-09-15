@@ -3081,3 +3081,430 @@ async fn hybrid_search_returns_hits_and_embeds_the_query_once() {
     let after = embedder.calls.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(after, before + 1, "the query was embedded exactly once");
 }
+
+// --- a share of a domain that reviews changes --------------------------------
+//
+// In review mode nothing a member writes is on disk: every write joins that
+// member's own draft overlay and the folder on disk goes on saying what the
+// team reviewed. So a share of such a domain cannot be a walk of the folder -
+// it would find nothing, or worse, somebody's stray direct edit. It is built
+// from the acting actor's own overlay rows, drafts as content and tombstones
+// as deletions, against the base snapshot.
+//
+// Every fixture here writes the overlay rows by hand, the way the write verbs
+// do, and deliberately writes no journal mirror: the rows are the live truth
+// and the plan is built from them, so a test that journals nothing and still
+// sees its drafts shared is the test that says so.
+
+/// The base engram the team already has, at `notes/plan.md`.
+fn team_plan() -> Vec<u8> {
+    engram("Plan", "plan", "the plan as the team has it")
+}
+
+/// One actor's draft of the same path: their private rewrite of it.
+const DRAFT_PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-02\n---\n\nthe plan as this actor would have it\n";
+
+/// A draft of a path no file holds: the sharp case, since nothing on disk
+/// could have produced it.
+const DRAFT_FRESH: &str = "---\ntype: engram\ntitle: Fresh\npermalink: fresh\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-02\n---\n\na page only this actor has\n";
+
+/// Another actor's draft, so a scenario can prove whose work travels.
+const DRAFT_ALICE: &str = "---\ntype: engram\ntitle: Alice\npermalink: alice\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-02\n---\n\na page only alice has\n";
+
+/// A draft standing at a generated folder listing's own path.
+const DRAFT_INDEX: &str = "---\ntype: index\ntitle: notes\npermalink: notes-index\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-02\n---\n\na listing this actor redrew\n";
+
+/// An index row the way a write verb builds one for a draft that is on nobody's
+/// disk: the markdown lives in the row's own `content` column, because the row
+/// is the only place the draft exists.
+fn overlay_record(text: &str, path: &str) -> crystalline_index::EngramRecord {
+    let mut record = crystalline_index::EngramRecord::from_engram(
+        &crystalline_core::parse_engram(text).unwrap(),
+        path,
+        crystalline_index::FileStamp {
+            mtime: 0,
+            size: text.len() as u64,
+            sha256: "0".repeat(64),
+        },
+    );
+    record.content = text.to_string();
+    record
+}
+
+/// A reviewing domain `team` connected to `acme/team`, its first pull already
+/// recorded, with `files` as the repository's own content.
+///
+/// Returns the engine, the working tree root and the origins directory. The
+/// temp directory is the caller's to hold: everything here lives under it.
+async fn reviewing_domain(
+    tmp: &Path,
+    mock: Arc<MockProvider>,
+    files: &[(&str, Vec<u8>)],
+) -> Engine {
+    let commit = mock.add_commit(commit_files(files));
+    mock.set_branch("main", &commit);
+    let root = tmp.join("team-knowledge");
+    let eng = engine_with(
+        &tmp.join("config.yaml"),
+        &tmp.join("origins"),
+        mock,
+        true,
+        false,
+    )
+    .await;
+    eng.origin_add(
+        "acme/team",
+        Some("team"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "team",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    eng
+}
+
+/// Write one actor's draft of `path` straight into the index, the way a write
+/// verb in review mode does: a row in that actor's dimension, and nothing on
+/// disk.
+async fn draft(eng: &Engine, actor: &str, path: &str, text: &str) {
+    let store = eng.store();
+    let store = store.lock().await;
+    let id = store
+        .domain_id("team")
+        .await
+        .unwrap()
+        .expect("team is indexed");
+    store
+        .upsert_overlay(id, actor, &overlay_record(text, path))
+        .await
+        .unwrap();
+}
+
+/// Write one actor's deletion of a base path: a tombstone row standing at that
+/// path, whose permalink is the path, exactly as `write_overlay_tombstone`
+/// records one.
+async fn tombstone(eng: &Engine, actor: &str, path: &str) {
+    let store = eng.store();
+    let store = store.lock().await;
+    let id = store
+        .domain_id("team")
+        .await
+        .unwrap()
+        .expect("team is indexed");
+    let mut record = overlay_record(DRAFT_PLAN, path);
+    record.tombstone = true;
+    record.permalink = path.to_string();
+    store.upsert_overlay(id, actor, &record).await.unwrap();
+}
+
+/// The delta a share carries is the actor's overlay and nothing else: a draft
+/// over a base file is an update, a draft of a path no file holds is an
+/// addition, a tombstone is a deletion - and a file somebody dropped into the
+/// reviewed folder by hand is not part of it at all, which is the whole point
+/// of review mode.
+#[tokio::test]
+async fn an_overlay_share_proposes_exactly_the_actors_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/plan.md", team_plan()),
+            ("notes/old.md", engram("Old", "old", "on its way out")),
+        ],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    tombstone(&eng, "owner", "notes/old.md").await;
+    // A stray direct edit of the reviewed folder. Nobody reviewed it, so no
+    // share carries it: a walk of the tree would, and this is how the test
+    // says the plan is not a walk.
+    std::fs::write(
+        root.join("notes/stray.md"),
+        engram("Stray", "stray", "written straight to disk"),
+    )
+    .unwrap();
+
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(result["added"], serde_json::json!(["notes/fresh.md"]));
+    assert_eq!(result["updated"], serde_json::json!(["notes/plan.md"]));
+    assert_eq!(result["deleted"], serde_json::json!(["notes/old.md"]));
+    assert!(
+        !result.to_string().contains("stray"),
+        "the stray direct edit is not part of anybody's draft: {result}"
+    );
+    // A share never touches the working tree, and in review mode that includes
+    // the draft: the folder still says what the team reviewed.
+    assert!(!root.join("notes/fresh.md").exists());
+    assert!(root.join("notes/old.md").exists());
+}
+
+/// Scoping a share selects within the acting actor's own overlay. A path
+/// somebody else is drafting is not among this actor's changes, so naming it
+/// refuses the share and says which path it was.
+#[tokio::test]
+async fn files_naming_another_actors_path_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+
+    let err = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            Some(&["notes/alice.md".to_string()]),
+            ShareActor::Owner,
+        )
+        .await
+        .expect_err("a path this actor is not drafting cannot be shared");
+    let text = err.to_string();
+    assert!(text.contains("notes/alice.md"), "{text}");
+
+    // The actor's own path still shares, so the refusal is about whose draft
+    // it is and not about scoping at all.
+    let result = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            Some(&["notes/fresh.md".to_string()]),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["added"], serde_json::json!(["notes/fresh.md"]));
+}
+
+/// The CLI is the machine owner, and the machine owner drafts under one name.
+/// A share it makes carries the owner's overlay and nobody else's.
+#[tokio::test]
+async fn the_owner_cli_shares_the_owner_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(result["added"], serde_json::json!(["notes/fresh.md"]));
+    assert!(
+        !result.to_string().contains("alice"),
+        "alice's draft is hers to share: {result}"
+    );
+
+    // And the same engine, asked as alice, carries hers and not the owner's.
+    let hers = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        hers.to_string().contains("notes/alice.md"),
+        "alice shares her own draft: {hers}"
+    );
+}
+
+/// An agent over HTTP on an instance that makes no agent authenticate has no
+/// identity, so there is no draft for a share to be of. It is refused with the
+/// one message the write verbs refuse with, which teaches the way in.
+#[tokio::test]
+async fn an_http_agent_without_identity_cannot_share_a_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+
+    let err = eng
+        .origin_share("team", None, None, None, None, ShareActor::HttpAgent)
+        .await
+        .expect_err("nobody's draft is every draft");
+    assert_eq!(
+        err.to_string(),
+        crystalline_service::OVERLAY_NEEDS_IDENTITY,
+        "the refusal is the constant itself"
+    );
+
+    // The preview refuses the same way, so no client is ever asked to confirm
+    // a share this instance would then refuse.
+    let err = eng
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::HttpAgent,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .expect_err("the preview carries the share's own gates");
+    assert_eq!(err.to_string(), crystalline_service::OVERLAY_NEEDS_IDENTITY);
+}
+
+/// A generated directory index is not a draft, and the domain's own
+/// `generated_indexes` policy decides whether it takes part in a share at all.
+/// The rule binds BOTH sides: the actor's entries and the base snapshot. Filter
+/// the entries alone and every index the repository already recorded turns into
+/// a proposed deletion of a file that is sitting right there.
+#[tokio::test]
+async fn an_overlay_share_respects_the_domains_generated_index_policy_on_both_sides() {
+    // Local listings: neither the draft of one nor the base's own key travels.
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/index.md", engram("notes", "notes-index", "listing")),
+        ],
+    )
+    .await;
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    draft(&eng, "owner", "notes/index.md", DRAFT_INDEX).await;
+
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["added"], serde_json::json!(["notes/fresh.md"]));
+    assert_eq!(result["updated"], serde_json::json!([]));
+    assert_eq!(
+        result["deleted"],
+        serde_json::json!([]),
+        "the base's own listing key is not a deletion: {result}"
+    );
+
+    // The same domain declaring `generated_indexes: shared`: both halves stay.
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[
+            ("MANIFEST.md", manifest_sharing_indexes()),
+            ("notes/index.md", engram("notes", "notes-index", "listing")),
+        ],
+    )
+    .await;
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    draft(&eng, "owner", "notes/index.md", DRAFT_INDEX).await;
+
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["added"], serde_json::json!(["notes/fresh.md"]));
+    assert_eq!(
+        result["updated"],
+        serde_json::json!(["notes/index.md"]),
+        "a domain that shares its listings carries the drafted one: {result}"
+    );
+}
+
+/// A share of a reviewing domain still pulls the team's FOLDER.
+///
+/// Every share pulls first, because a proposal has to be mergeable when it is
+/// opened. In review mode the tree the share is detected against is staged, and
+/// a pull that landed there instead would advance the base snapshot while the
+/// folder stayed where it was - leaving the team's own files behind their base,
+/// where every later share reads them as deletions. So the pull runs against the
+/// folder, and the share is staged afterwards.
+#[tokio::test]
+async fn a_review_mode_share_pulls_the_teams_folder_not_the_staged_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+
+    // The team merged somebody else's work while this draft was being written.
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", team_plan()),
+        ("notes/merged.md", engram("Merged", "merged", "already in")),
+    ]));
+    mock.set_branch("main", &moved);
+
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["added"], serde_json::json!(["notes/fresh.md"]));
+
+    // The merged file is in the team's folder, where the whole instance reads
+    // it, and not only in a staged tree that is gone by now.
+    assert!(
+        root.join("notes/merged.md").exists(),
+        "the pull landed in the folder the team shares"
+    );
+
+    // And the next share still proposes the draft alone: nothing the pull
+    // brought in reads as a deletion.
+    let again = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        again["deleted"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        0,
+        "the folder is level with its own base: {again}"
+    );
+}

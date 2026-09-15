@@ -602,7 +602,13 @@ pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWor
 /// from: the plan already names every changed file, so saying who last wrote
 /// each one costs one read per path and is what lets a browser preselect the
 /// person's own work out of a mixed delta (see [`last_author`]).
-pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: &Path) -> Value {
+///
+/// `None` is a domain that reviews changes before they land, and it means the
+/// plan is served with no provenance at all. Preselection is a guess at which
+/// files in a mixed delta are the caller's own, and a reviewing domain's plan is
+/// built from the caller's own drafts to begin with: every path in it is theirs,
+/// so there is nothing left to guess and nothing to read a file for.
+pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Value {
     let changes: Vec<Value> = plan
         .changes
         .changes
@@ -621,7 +627,8 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: &Path) -> Value {
                 // spelling, which is the name the repository knows and the
                 // name that travels upstream; on a case-sensitive filesystem
                 // it is not the name that opens the file.
-                "last_author": last_author(root, plan.changes.disk_path(c.path())),
+                "last_author": root
+                    .and_then(|root| last_author(root, plan.changes.disk_path(c.path()))),
             })
         })
         .collect();
@@ -1012,7 +1019,7 @@ mod tests {
             },
             effective_title: "Share".to_string(),
         };
-        let v = share_plan_json(&plan, root);
+        let v = share_plan_json(&plan, Some(root));
         assert_eq!(v["changes"][0]["path"], "notes/Alpha.md");
         assert_eq!(v["changes"][0]["last_author"], json!("human:ada"));
     }
@@ -1769,7 +1776,7 @@ mod tests {
             },
             effective_title: "Share updates from brand".to_string(),
         };
-        let v = share_plan_json(&plan, Path::new("/nowhere"));
+        let v = share_plan_json(&plan, Some(Path::new("/nowhere")));
         assert_eq!(v["action"], "update");
         assert_eq!(v["number"], 4);
         assert_eq!(v["url"], "https://github.com/acme/brand-knowledge/pull/4");
@@ -1831,7 +1838,7 @@ mod tests {
             },
             effective_title: "Share".to_string(),
         };
-        let v = share_plan_json(&plan, root);
+        let v = share_plan_json(&plan, Some(root));
         let authors: Vec<&Value> = v["changes"]
             .as_array()
             .unwrap()
@@ -1852,7 +1859,7 @@ mod tests {
     /// plans whose change lists are empty anyway: no path is read, so no
     /// fixture is needed to shape one.
     fn plan_json(plan: &ops::SharePlan) -> Value {
-        share_plan_json(plan, Path::new("/nowhere"))
+        share_plan_json(plan, Some(Path::new("/nowhere")))
     }
 
     #[test]
