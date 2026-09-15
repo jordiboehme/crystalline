@@ -87,12 +87,19 @@ fn pg_url() -> Option<String> {
 /// A distinct schema name per test invocation. The pid keeps runs apart, the
 /// counter keeps tests within a run apart; both stay well under Postgres's
 /// 63-byte identifier limit.
+/// A hash salt keeps a recycled pid from adopting a schema a panicking run left behind.
 #[cfg(feature = "postgres")]
 fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("ct_{}_{}", std::process::id(), n)
+    format!(
+        "ct_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
 }
 
 /// Run a parity body against Turso (always) and Postgres (when configured),

@@ -34,12 +34,19 @@ fn pg_url() -> Option<String> {
     }
 }
 
+/// A recycled pid must never adopt a schema a panicking run left behind.
 #[cfg(feature = "postgres")]
 fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("ctv_{}_{}", std::process::id(), n)
+    format!(
+        "ctv_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
 }
 
 /// Run a body against Turso (always) and Postgres (when configured), each with a
