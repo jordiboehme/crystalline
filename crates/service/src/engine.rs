@@ -2831,6 +2831,59 @@ impl Engine {
         left
     }
 
+    /// Settle one actor's recorded conflict at one FILE path, under the
+    /// domain's origin lock, and only when there is one to settle.
+    ///
+    /// **The lock is the point.** [`Engine::save_convergence`] writes the whole
+    /// record at once - the conflicts and the proposal owners beside them - so
+    /// two writers that both loaded before either saved lose one of the two
+    /// edits, and its doc states that every caller holds the domain's origin
+    /// lock. [`Engine::origin_resolve`] earns its place on that list by taking
+    /// one; an upload is not an origin verb and holds nothing of its own, so it
+    /// takes the lock here. Without it a draft upload racing a poller tick's
+    /// pull would drop another actor's conflicts, or the record of whose open
+    /// proposal is whose.
+    ///
+    /// **The read in front of it is not an optimization alone.** Every draft
+    /// upload would otherwise do a full read-modify-write of the record and
+    /// queue behind the domain's origin lock to do it, for a path that is not in
+    /// conflict at all - which is every upload but the rare one. A record this
+    /// read finds nothing in is a record this call has nothing to say about, and
+    /// a conflict that appears between the read and the lock is recorded by a
+    /// pull that has not finished yet, so the next write of the same path
+    /// settles it.
+    ///
+    /// **A lock that cannot be taken skips the settle rather than failing the
+    /// write.** A reviewing domain always has an origin (the mode requires one),
+    /// so this is the domain being unregistered underneath; losing somebody's
+    /// upload over a bookkeeping write would be the wrong way round.
+    async fn settle_file_convergence(&self, domain: &str, actor: &str, path: &str) {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return;
+        };
+        let record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        if !record
+            .conflicts
+            .get(actor)
+            .is_some_and(|paths| paths.iter().any(|held| held == path))
+        {
+            return;
+        }
+        let Ok(lock) = self.origin_lock_registered(domain) else {
+            tracing::warn!(
+                domain,
+                actor,
+                path,
+                "a draft file was written at a path recorded as a conflict, and the domain's \
+                 origin lock could not be taken to settle it; the record is behind until the \
+                 next write of this path"
+            );
+            return;
+        };
+        let _guard = lock.lock().await;
+        self.settle_convergence(domain, actor, path);
+    }
+
     /// Record which overlay actor a proposal belongs to, or forget one that has
     /// been withdrawn.
     ///
@@ -4413,7 +4466,8 @@ impl Engine {
             // uploading it again to keep your version or deleting it to take
             // the team's, so both of those take the path out of the recorded
             // conflicts on the way out.
-            self.settle_convergence(view.domain(), actor, path);
+            self.settle_file_convergence(view.domain(), actor, path)
+                .await;
             crate::maintenance::record_pending(view.domain());
             return Ok(WrittenAttachment { row, draft: true });
         }
@@ -4459,7 +4513,8 @@ impl Engine {
             view.tombstone_file(path).await?;
             // The other half of what settles a diverged file: see
             // [`Engine::attachment_write_in`].
-            self.settle_convergence(view.domain(), actor, path);
+            self.settle_file_convergence(view.domain(), actor, path)
+                .await;
             crate::maintenance::record_pending(view.domain());
             return Ok(true);
         }
@@ -12401,6 +12456,11 @@ impl Engine {
         // files with the drafts by construction, so what is missing without
         // this line is the NUMBER - a removal that swept files it never
         // mentioned in front of the person who confirmed it.
+        // Gated on the domain still reviewing changes, like every other reader
+        // of that count: a domain whose fold failed mid-way and left files
+        // behind reports a number that excludes them, while the journal sweep
+        // below still takes them. The same under-report the orphan collector
+        // beside it carries, and named here rather than hidden.
         let files_swept: u64 = self
             .overlay_file_counts(name)
             .flatten()
