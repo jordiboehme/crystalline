@@ -73,6 +73,15 @@ const UsersAdmin = lazy(() => import("./screens/UsersAdmin"));
  */
 const Profile = lazy(() => import("./screens/Profile"));
 
+/**
+ * Where a draft share-link lands. Lazy for the reason the two admin screens
+ * are: almost nobody ever opens it, and the app shell is paid for by
+ * everybody. It carries no editor and no graph engine of its own - a granted
+ * draft is one page handed over by its author - so the chunk is small and the
+ * wait is one request on a screen that is itself the arrival.
+ */
+const GrantedDraft = lazy(() => import("./screens/GrantedDraft"));
+
 const EDITOR_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">
     Loading the editor
@@ -99,6 +108,12 @@ const PROFILE_FALLBACK = (
  * two different loading shapes in a row would say otherwise.
  */
 const ENGRAM_FALLBACK = <Skeleton label="Loading the engram" rows={6} />;
+
+const GRANTED_DRAFT_FALLBACK = (
+  <p className="text-sm text-slate-500 dark:text-slate-400">
+    Opening the shared draft
+  </p>
+);
 
 export function AppRoutes() {
   return (
@@ -148,6 +163,22 @@ export function AppRoutes() {
             element={
               <Suspense fallback={ENGRAM_FALLBACK}>
                 <EngramPage />
+              </Suspense>
+            }
+          />
+          {/*
+            A link somebody was handed, which is the one address a person
+            arrives at from outside the app entirely. The token is opaque and
+            rides as one segment; presenting it is what binds the grant to the
+            account signed in here, so the route sits inside `RequireAuth`
+            like every other: a link binds to an account, and the anonymous
+            viewer has none.
+          */}
+          <Route
+            path="/draft/:token"
+            element={
+              <Suspense fallback={GRANTED_DRAFT_FALLBACK}>
+                <GrantedDraft />
               </Suspense>
             }
           />

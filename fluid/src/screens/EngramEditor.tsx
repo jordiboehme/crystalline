@@ -39,6 +39,7 @@ import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { DraftLinkDialog } from "../components/DraftLinkDialog";
 import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
 import { SimilarEngramsPanel } from "../components/SimilarEngramsPanel";
@@ -527,6 +528,9 @@ function Surface({
    */
   const [resolverBox] = useState(() => new Compartment());
   const [raw, setRaw] = useState(RAW_AT_MOUNT);
+  // Whether the share dialog is open. Mounted only while it is, so an editor
+  // nobody shares from never pays for the dialog primitive behind it.
+  const [sharing, setSharing] = useState(false);
   /**
    * Whether the caret is in a table, which is what the format bar's context
    * segment is drawn from. The listener inside the buffer reports crossings
@@ -1018,6 +1022,29 @@ function Surface({
               accessible name and the tooltip both still say Raw, and the
               document glyph says which of the two faces the buffer is wearing.
             */}
+            {/*
+              Sharing the draft, and only ever a draft: a link hands over work
+              the team has not seen, and there is nothing to hand over about a
+              page they all read already.
+
+              In this header row rather than in the right-hand column beside
+              it, because that column is not rendered at all at full width -
+              see the `<aside>` below. A control only half the app's readers
+              can reach is not a control.
+            */}
+            {engram.draft && engram.path && (
+              <Tooltip label="Share this draft with one person">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSharing(true);
+                  }}
+                  className={BUTTON.secondary}
+                >
+                  Share draft
+                </button>
+              </Tooltip>
+            )}
             <Tooltip label="Raw">
               <button
                 type="button"
@@ -1336,6 +1363,15 @@ function Surface({
           onClose={session.onConflictClose}
           onOverwrite={session.onConflictOverwrite}
           onTakeServer={session.onConflictTakeServer}
+        />
+      )}
+      {sharing && engram.path && (
+        <DraftLinkDialog
+          domain={engram.domain}
+          path={engram.path}
+          onClose={() => {
+            setSharing(false);
+          }}
         />
       )}
     </div>

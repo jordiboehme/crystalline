@@ -162,6 +162,15 @@ pub struct AcceptedDraft {
     /// caller only accepted the link and has not joined. Never stored beyond
     /// the session that holds it.
     pub join_key: Option<String>,
+    /// Whose draft a joined save just landed in, in the server's own words, or
+    /// null everywhere else.
+    ///
+    /// Only a save answers this shape with it filled in - opening a link and
+    /// joining one are not writes - and it is here rather than on a receipt
+    /// shape of its own because the granted-draft screen speaks this one
+    /// shape: a save that landed answers the draft as it now stands, plus the
+    /// sentence saying whose work it changed.
+    pub joined: Option<String>,
 }
 
 /// `POST /domains/{domain}/draft-links` - mint a link on one of the caller's
@@ -586,6 +595,7 @@ async fn open_link(
         content: draft.content,
         checksum: draft.checksum,
         join_key: None,
+        joined: None,
     })
 }
 

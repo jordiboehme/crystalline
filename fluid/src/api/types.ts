@@ -361,6 +361,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/draft-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The share-links standing on one of the caller's own drafts.
+         * @description Never carries a token: only hashes are stored, so a link handed over cannot be read back. A row says who redeemed it, if anybody has, and when it was made. Revoked and expired links are left out - the list is what still opens the draft.
+         */
+        get: operations["list_draft_links"];
+        put?: never;
+        /**
+         * Mint a share-link on one of the caller's own drafts.
+         * @description Answers the link once and never again: only its hash is stored. The link opens that one draft, for the first account that presents it and nobody else, until it is revoked or the draft is folded or discarded. 404 when the caller holds no draft at that path - including when somebody else does, because whose drafts exist is exactly what review mode does not say. Served on a read-only instance: a grant is account state rather than knowledge.
+         */
+        post: operations["mint_draft_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/drafts": {
         parameters: {
             query?: never;
@@ -864,6 +888,86 @@ export interface paths {
         put: operations["set_domain_visibility"];
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/draft-links/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Present a share-link and receive the draft it opens.
+         * @description Binds the link to the caller's account the first time, whatever their role, and answers the same thing every time after. The reply carries the draft itself and whether this account may edit it: a viewer opens it read-only with the reason beside it, because reading somebody's wording is exactly what a viewer is for. Editing is a second step - see `POST /draft-links/join`. 404 for an unknown, revoked, expired or already-taken link, for a domain this account may not read, and for a link whose draft is no longer there: a grant lasts as long as the thing it grants.
+         */
+        post: operations["accept_draft_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/draft-links/join": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start working inside the granted draft.
+         * @description Seeing a draft and editing it are two states, and this is the step between them. The reply carries a key this SESSION sends back with every write - never the account's, so a person joining a draft in one window has not joined it in another and has not joined it for their agent. While it is held, a save at the granted path lands in the owner's draft and an upload lands in the owner's files, to be folded or discarded with it. Refused with 403 when this account may not write on the domain, in the same words the read-only editor shows.
+         */
+        post: operations["join_draft_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/draft-links/leave": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop working inside somebody else's draft.
+         * @description Ends the join this session was holding. The link is untouched: the draft is still readable, and joining again is one press. Answers 204 for a key that names no open join of the caller's too - leaving something you are not inside is not a failure.
+         */
+        post: operations["leave_draft_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/draft-links/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one share-link.
+         * @description It stops opening anything at once, and the account it was redeemed by stops seeing the draft on its next request. 404 when the id names no link of the caller's, which is what somebody else's link and an invented id both answer: a revoke is never a probe for which links exist. Served on a read-only instance, like every other account-state route.
+         */
+        delete: operations["revoke_draft_link"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1536,6 +1640,51 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description One draft, handed over by its author: where it stands, whose it is, whether this account may edit it, and the text itself. */
+        AcceptedDraft: {
+            /**
+             * @description The version token a save of this draft presents as its
+             *     `expected_checksum`.
+             */
+            checksum: string;
+            /** @description The markdown as its author last left it, frontmatter and all. */
+            content: string;
+            /** @description The domain the draft lives in. */
+            domain: string;
+            /**
+             * @description Whether this account may edit it at all: `write_right` on the domain,
+             *     which is the same gate every other write on it passes.
+             */
+            editable: boolean;
+            /**
+             * @description The key this session works inside the draft under, or null when the
+             *     caller only accepted the link and has not joined. Never stored beyond
+             *     the session that holds it.
+             */
+            join_key?: string | null;
+            /**
+             * @description Whose draft a joined save just landed in, in the server's own words, or
+             *     null everywhere else.
+             *
+             *     Only a save answers this shape with it filled in - opening a link and
+             *     joining one are not writes - and it is here rather than on a receipt
+             *     shape of its own because the granted-draft screen speaks this one
+             *     shape: a save that landed answers the draft as it now stands, plus the
+             *     sentence saying whose work it changed.
+             */
+            joined?: string | null;
+            /** @description Whose draft it is. */
+            owner: string;
+            /** @description The domain-relative path it stands at. */
+            path: string;
+            /** @description The address it answers to, which is how a save of it is addressed. */
+            permalink: string;
+            /**
+             * @description Why not, in the server's own words, or null when it is editable. What
+             *     the editor shows above a buffer it opened read-only.
+             */
+            reason?: string | null;
+        };
         /** @description Acknowledge one finding on one engram: the engram by permalink, the rule id that fired, an optional note saying why it is intentional and, for a rule that fires more than once on an engram, the row's own `scope`. Omit the scope and the server picks the finding by running detection, which is the right answer for every rule that fires once. */
         AckBody: {
             /**
@@ -2044,6 +2193,11 @@ export interface components {
              */
             token: string;
         };
+        /** @description The key the join was opened under. */
+        LeaveBody: {
+            /** @description The key `POST /draft-links/join` answered with. */
+            key: string;
+        };
         /** @description What `POST /auth/login` takes. */
         LoginBody: {
             /**
@@ -2231,6 +2385,31 @@ export interface components {
              */
             visibility: string;
         };
+        /** @description Which of the caller's own drafts to mint a share-link on, and when the link should stop working. */
+        MintBody: {
+            /**
+             * @description RFC 3339, when the link should stop working, or absent for one that
+             *     lasts as long as the draft does.
+             */
+            expires_at?: string | null;
+            /**
+             * @description The domain-relative path of the caller's own draft.
+             * @example plan.md
+             */
+            path: string;
+        };
+        /** @description A freshly minted share-link. The token is readable exactly once, in this reply: only its hash is stored, so the listing can never hand it back. */
+        MintedLinkResponse: {
+            /**
+             * Format: int64
+             * @description The row id, which is what revokes this link.
+             */
+            id: number;
+            /** @description The path it opens, echoed so the reply is self-describing. */
+            path: string;
+            /** @description The link itself, `dl_` plus 64 hex characters. Hand it to one person. */
+            token: string;
+        };
         /** @description Move an engram to a new path, or into another registered domain. Inbound bare links are rewritten to the domain-prefixed form on a cross-domain move. */
         MoveBody: {
             /**
@@ -2307,6 +2486,44 @@ export interface components {
              * @example Contoso
              */
             name?: string | null;
+        };
+        /** @description One share-link on one draft: which draft it opens, who minted it, which account redeemed it, and the two dates that can end it. */
+        OverlayGrant: {
+            /** @description RFC 3339, when the link was minted. */
+            created_at: string;
+            /**
+             * @description The domain the drafted engram lives in.
+             * @example team
+             */
+            domain: string;
+            /**
+             * @description RFC 3339, when the link stops working on its own, or null for one that
+             *     lasts as long as the draft does.
+             */
+            expires_at?: string | null;
+            /**
+             * @description The account this link bound itself to, or null while nobody has opened
+             *     it yet. The first account to redeem it is that account for good.
+             * @example bob
+             */
+            grantee?: string | null;
+            /**
+             * Format: int64
+             * @description The row id, which is what revokes this link.
+             */
+            id: number;
+            /**
+             * @description The account whose draft it is: the actor the overlay entry belongs to.
+             * @example alice
+             */
+            owner: string;
+            /**
+             * @description The domain-relative path of the draft this link opens.
+             * @example plan.md
+             */
+            path: string;
+            /** @description RFC 3339, when its author took it back, or null while it stands. */
+            revoked_at?: string | null;
         };
         /** @description The account to hand this private domain to. It must be an existing, enabled account; its own membership row, if it had one, is dropped, since an owner holds every level already. */
         OwnerBody: {
@@ -2630,12 +2847,9 @@ export interface components {
              */
             location: string;
         };
-        /** @description A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is. */
+        /** @description A share-link, as it was handed over. */
         TokenBody: {
-            /**
-             * @description A GitHub personal access token. Write-only: no response ever echoes it.
-             * @example ghp_xxxxxxxxxxxxxxxxxxxx
-             */
+            /** @description The link, `dl_` plus 64 hex characters. */
             token: string;
         };
         /** @description A token request, sent as `application/x-www-form-urlencoded`. Which members are required depends on `grant_type`: `authorization_code` takes `code`, `redirect_uri`, `code_verifier` and `client_id`, `refresh_token` takes `refresh_token` and `client_id`. `resource` is optional on both. */
@@ -4087,6 +4301,103 @@ export interface operations {
                 };
             };
             /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_draft_links: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The domain the draft is in. */
+                domain: string;
+                /** @description The domain-relative path of the caller's own draft. */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The links on that draft. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OverlayGrant"][];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain for this caller, or no draft of theirs at that path. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    mint_draft_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The domain the draft is in. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MintBody"];
+            };
+        };
+        responses: {
+            /** @description The link, readable once. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MintedLinkResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A viewer account, a missing CSRF token, or a membership below editor on this domain. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain for this caller, or no draft of theirs at that path. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -6672,6 +6983,205 @@ export interface operations {
                 };
             };
             /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    accept_draft_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TokenBody"];
+            };
+        };
+        responses: {
+            /** @description The granted draft. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedDraft"];
+                };
+            };
+            /** @description No identity, or an anonymous one: a link binds to an account, and the anonymous viewer has none. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The link opens nothing for this account. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    join_draft_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TokenBody"];
+            };
+        };
+        responses: {
+            /** @description The granted draft, and the key to work in it. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedDraft"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account may only read the draft, or the request did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The link opens nothing for this account. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance is already holding as many joins as it will hold at once. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    leave_draft_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LeaveBody"];
+            };
+        };
+        responses: {
+            /** @description The session is no longer inside the draft. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    revoke_draft_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The link's row id. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The link is gone. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A viewer account, or a missing CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller minted no link with that id. */
             404: {
                 headers: {
                     [name: string]: unknown;

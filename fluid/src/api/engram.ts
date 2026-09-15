@@ -130,6 +130,17 @@ export interface EngramDetail {
   similar: SimilarEngram[];
   /** What to do about them, in the server's words; null when `similar` is empty. */
   guidance: string | null;
+  /**
+   * Whether this is the reader's OWN draft rather than the page the domain
+   * holds: true only on a domain that reviews changes, and only for the
+   * account whose overlay the row is in. Absent everywhere else, which is
+   * why it reads as false rather than as a missing key.
+   *
+   * What the editor needs it for is sharing: a draft is the only thing a
+   * share-link can be minted on, because a link hands over work the team has
+   * not seen and there is nothing to hand over about a page they all read.
+   */
+  draft: boolean;
 }
 
 /** One neighbour a write or save found itself close to. */
@@ -339,6 +350,7 @@ export function readEngramDetail(
       .map(readSimilar)
       .filter((entry): entry is SimilarEngram => entry !== null),
     guidance: asString(record?.guidance),
+    draft: record?.draft === true,
   };
 }
 

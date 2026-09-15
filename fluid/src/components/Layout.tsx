@@ -90,6 +90,7 @@ import { CreateDomainDialog } from "./CreateDomainDialog";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
+import { JoinedDraftBar } from "./JoinedDraftBar";
 import { ShareDialog } from "./ShareDialog";
 import { SharePickerDialog } from "./SharePickerDialog";
 import { ShatterGem } from "./ShatterGem";
@@ -597,6 +598,13 @@ export function Layout() {
           }}
           onShare={openShare}
         />
+        {/*
+          Above everything, on every screen, for as long as this window is
+          inside somebody else's draft. Working in another person's unfolded
+          work is a state the WINDOW is in rather than something one page
+          does, so it is drawn here and not by the screen that started it.
+        */}
+        <JoinedDraftBar />
         <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
           {/*
             The stored rail only reaches the sidebar where there is a sidebar

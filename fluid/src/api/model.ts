@@ -165,3 +165,16 @@ export type DecisionResponse = components["schemas"]["DecisionResponse"];
  * to show back.
  */
 export type OauthGrantInfo = components["schemas"]["OauthGrantInfo"];
+
+/**
+ * One draft handed over by its author: where it stands, whose it is, whether
+ * this account may edit it, and the text itself. The single payload that
+ * crosses between two actors' overlays.
+ */
+export type AcceptedDraft = components["schemas"]["AcceptedDraft"];
+
+/** A freshly minted share-link. Its token is readable in this reply and never again. */
+export type MintedLinkResponse = components["schemas"]["MintedLinkResponse"];
+
+/** One share-link standing on a draft: who redeemed it, and when it was made. */
+export type OverlayGrant = components["schemas"]["OverlayGrant"];

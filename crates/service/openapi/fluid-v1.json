@@ -7814,6 +7814,13 @@
             ],
             "description": "The key this session works inside the draft under, or null when the\ncaller only accepted the link and has not joined. Never stored beyond\nthe session that holds it."
           },
+          "joined": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Whose draft a joined save just landed in, in the server's own words, or\nnull everywhere else.\n\nOnly a save answers this shape with it filled in - opening a link and\njoining one are not writes - and it is here rather than on a receipt\nshape of its own because the granted-draft screen speaks this one\nshape: a save that landed answers the draft as it now stands, plus the\nsentence saying whose work it changed."
+          },
           "owner": {
             "type": "string",
             "description": "Whose draft it is."
