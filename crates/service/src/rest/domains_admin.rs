@@ -19,7 +19,8 @@ use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, Caller, ProblemDetail, RestState, refuse_read_only,
     require_domain_read, require_domain_write,
 };
-use crate::engine::{EngineError, FoldChoice, PreviewCredential, ReviewModeConfirm, ShareActor};
+use crate::engine::{EngineError, PreviewCredential, ShareActor};
+use crate::review::{FoldChoice, ReviewModeConfirm};
 use crate::scope::DomainRight;
 
 /// The caller, when they may drive this instance's share surfaces - the status

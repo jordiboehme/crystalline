@@ -324,9 +324,9 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 );
             }
             let confirm = if preview {
-                crate::engine::ReviewModeConfirm::Preview
+                crate::review::ReviewModeConfirm::Preview
             } else {
-                crate::engine::ReviewModeConfirm::Confirmed {
+                crate::review::ReviewModeConfirm::Confirmed {
                     folds: req
                         .get("folds")
                         .and_then(Value::as_object)
@@ -336,9 +336,9 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                                     (
                                         actor.clone(),
                                         if choice.as_str() == Some("fold") {
-                                            crate::engine::FoldChoice::Fold
+                                            crate::review::FoldChoice::Fold
                                         } else {
-                                            crate::engine::FoldChoice::Discard
+                                            crate::review::FoldChoice::Discard
                                         },
                                     )
                                 })

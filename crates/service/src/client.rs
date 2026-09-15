@@ -1059,18 +1059,18 @@ pub async fn domain_review(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let mode = overlay_mode.then_some(crystalline_core::config::ReviewMode::Overlay);
     let confirm = if preview {
-        crate::engine::ReviewModeConfirm::Preview
+        crate::review::ReviewModeConfirm::Preview
     } else {
-        crate::engine::ReviewModeConfirm::Confirmed {
+        crate::review::ReviewModeConfirm::Confirmed {
             folds: folds
                 .iter()
                 .map(|(actor, fold)| {
                     (
                         actor.clone(),
                         if *fold {
-                            crate::engine::FoldChoice::Fold
+                            crate::review::FoldChoice::Fold
                         } else {
-                            crate::engine::FoldChoice::Discard
+                            crate::review::FoldChoice::Discard
                         },
                     )
                 })

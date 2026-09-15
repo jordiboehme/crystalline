@@ -26,6 +26,7 @@ pub mod overlay_journal;
 pub mod params;
 mod poller;
 pub mod rest;
+pub mod review;
 pub mod scope;
 pub mod settings;
 pub mod similar;
@@ -53,9 +54,7 @@ pub use client::{
     tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
-pub use engine::{
-    Engine, EngineError, FoldChoice, OVERLAY_NEEDS_IDENTITY, ReviewModeConfirm, ShareActor,
-};
+pub use engine::{Engine, EngineError, OVERLAY_NEEDS_IDENTITY, ShareActor};
 pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };
@@ -66,6 +65,7 @@ pub use mcp_gate::{
 };
 pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
+pub use review::{FoldChoice, ReviewModeConfirm};
 pub use scope::{DomainAccess, DomainRight, DomainVisibility, Scope, overlay_actor};
 pub use similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarProbe};
 pub use stub::{DegradedServer, StubStatus};
