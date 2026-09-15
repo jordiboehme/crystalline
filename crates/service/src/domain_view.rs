@@ -52,7 +52,7 @@ use std::path::Path;
 use crystalline_core::{CrystallineUrl, parse_engram};
 use crystalline_index::{
     AttachmentRow, BrowseLevel, DomainId, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    RecentFilter, Store, StoredEngram,
+    OutboundRef, RecentFilter, StoredEngram,
 };
 use crystalline_remote::state::{self, BaseStamp};
 use serde_json::{Value, json};
@@ -463,8 +463,29 @@ impl<'a> DomainView<'a> {
         )?;
         let store = self.engine.store();
         let store = store.lock().await;
-        store.clear_overlay_entry(domain_id, actor, path).await?;
-        Ok(())
+        store.begin().await?;
+        let done = async {
+            store.clear_overlay_entry(domain_id, actor, path).await?;
+            // In the same transaction, because a row that is gone and an edge
+            // that still names it are one fact told two ways: this author's
+            // other drafts that pointed here fall back onto whatever they read
+            // at that address now - the base row where one stands, nothing
+            // where none does. The fold, the discard and a settled convergence
+            // all end a draft through here, so all three get it.
+            store.reresolve_actor_references(domain_id, actor).await?;
+            Ok::<(), EngineError>(())
+        }
+        .await;
+        match done {
+            Ok(()) => {
+                store.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = store.rollback().await;
+                Err(e)
+            }
+        }
     }
 
     /// [`Engine::resolve_in`] for a call that may be acting inside a draft
@@ -1133,86 +1154,83 @@ impl<'a> DomainView<'a> {
         out
     }
 
-    /// The dangling references in one actor's own drafts, as
-    /// [`crystalline_index::UnresolvedRef`] rows to stand beside the base ones.
+    /// Every reference leaving one engram, judged as this view judges it.
     ///
-    /// Two halves, and both are the same sentence read from different ends: the
-    /// references come off the draft's own row ([`Store::outbound_refs`], the
-    /// call `read_engram` makes for a draft's outbound edges), and whether each
-    /// one answers to anything is decided against `descs` - the shadowed
-    /// listing, which is base rows plus this actor's drafts with their deleted
-    /// paths already absent. The stored `resolved` flag cannot answer it: every
-    /// arm of the index's resolution is `actor = ''` by design, so it calls a
-    /// link between two of one author's drafts broken and a link to a path they
-    /// have deleted sound, and both are backwards for the person reading.
+    /// Two questions in one call and they are both the view's. WHOSE row the
+    /// references come off is [`DomainView::edge_id`]: a draft over a base row
+    /// resolves to the base descriptor, so one engram keeps one address, but
+    /// the relations and prose links in front of the reader are the ones their
+    /// own document wrote. And whether each one LANDS is asked in their view
+    /// too, which moves exactly two verdicts: a reference into a path they
+    /// have deleted dangles for them, and a dangling one their own draft
+    /// answers lands for them.
     ///
-    /// A reference into ANOTHER domain keeps the stored verdict. That domain's
-    /// rows are not in this listing, and a resolved edge there is a fact about
-    /// the domain rather than about a reader - which is the rule that stays,
-    /// deliberately, whatever this sweep does inside its own domain.
+    /// Inbound stays the base row's and is deliberately not here: who points
+    /// at an address is a fact about the address the team shares, and nobody
+    /// can write a reference to a draft only its author can read.
+    pub(crate) async fn outbound(&self, desc: &EngramDescriptor) -> Result<Vec<OutboundRef>> {
+        let edge_id = self.edge_id(desc).await?;
+        let store = self.engine.store();
+        let store = store.lock().await;
+        Ok(store.outbound_refs(edge_id, self.actor()).await?)
+    }
+
+    /// The dangling references in this view of a domain, as the sweep's `V102`
+    /// input.
     ///
-    /// Rows come back ordered the way both backends order the base rows - by
-    /// path, then line, then kind, then target (`turso/mod.rs` `ORDER BY 7, 6,
-    /// 2, 5`, and the matching Postgres form) - because `outbound_refs` orders
-    /// by line alone, which leaves two references on one line to the union's
-    /// own arm order. The `links_to` default for a prose wikilink is
-    /// [`crystalline_index::LINKS_TO`], the constant both backends spell into
-    /// their own queries, so the two never drift apart.
-    pub(crate) async fn draft_unresolved(
+    /// One query, one answer, and both halves of the reader's view are in it:
+    /// the base rows their drafts do not shadow, judged against what they hold
+    /// at each target's address, plus their own drafts' references judged the
+    /// same way. `None` is the domain's own queue, byte for byte what it was.
+    ///
+    /// This replaced a pass that re-implemented the resolution forms in Rust
+    /// over the shadowed listing. It could not see the colon-prefixed title
+    /// form at all, and it could not be asked about a base row - so a base
+    /// link one reader's draft had already answered was still raised at them.
+    /// Both are the same bug: a second answer to "does this link resolve".
+    pub(crate) async fn unresolved(
         &self,
-        store: &dyn Store,
-        descs: &[EngramDescriptor],
-        drafts: &HashMap<String, String>,
+        domain_id: DomainId,
     ) -> Result<Vec<crystalline_index::UnresolvedRef>> {
-        let domain = self.domain.as_str();
-        if drafts.is_empty() {
-            return Ok(Vec::new());
-        }
-        // The two readings the index tries inside one domain: the target as a
-        // permalink, then as a title, the second case-insensitively.
-        let permalinks: HashSet<&str> = descs.iter().map(|d| d.permalink.as_str()).collect();
-        let titles: HashSet<String> = descs.iter().map(|d| d.title.to_lowercase()).collect();
+        let store = self.engine.store();
+        let store = store.lock().await;
+        Ok(store.unresolved_refs(domain_id, self.actor()).await?)
+    }
 
-        let mut held: Vec<&EngramDescriptor> = descs
-            .iter()
-            .filter(|d| drafts.contains_key(&d.path))
-            .collect();
-        held.sort_by(|a, b| a.path.cmp(&b.path));
+    /// The vocabulary in use in this view of the domain.
+    ///
+    /// Base by default and by design: every surface that shows a PERSON the
+    /// vocabulary asks a base view, because a tag one author is trying out in
+    /// a draft is not yet the domain's agreement and the team's own clusters
+    /// are what an author should be reading either way. The one caller that
+    /// holds an actor view here is the sweep, whose tag-drift finding is about
+    /// what that author wrote.
+    pub(crate) async fn vocabulary(&self) -> Result<crystalline_index::Vocabulary> {
+        let store = self.engine.store();
+        let store = store.lock().await;
+        Ok(store.vocabulary(Some(&self.domain), self.actor()).await?)
+    }
 
-        let mut out: Vec<crystalline_index::UnresolvedRef> = Vec::new();
-        for d in held {
-            let mut refs: Vec<crystalline_index::UnresolvedRef> = Vec::new();
-            for reference in store.outbound_refs(d.id).await? {
-                let answered = match reference.to_domain.as_deref() {
-                    Some(named) if named != domain => reference.resolved,
-                    _ => {
-                        permalinks.contains(reference.to_target.as_str())
-                            || titles.contains(&reference.to_target.to_lowercase())
-                    }
-                };
-                if answered {
-                    continue;
-                }
-                refs.push(crystalline_index::UnresolvedRef {
-                    from: d.id,
-                    rel_type: reference
-                        .rel_type
-                        .unwrap_or_else(|| crystalline_index::LINKS_TO.to_string()),
-                    kind: reference.kind,
-                    target_domain: reference.to_domain,
-                    target: reference.to_target,
-                    line: Some(reference.line),
-                });
-            }
-            refs.sort_by(|a, b| {
-                a.line
-                    .cmp(&b.line)
-                    .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
-                    .then_with(|| a.target.cmp(&b.target))
-            });
-            out.extend(refs);
-        }
-        Ok(out)
+    /// This actor's own live draft at a path, or `None` on the base view, at a
+    /// path they hold nothing at, and at one they have deleted.
+    ///
+    /// The marker a read verb says "this is your draft" with. A deletion
+    /// answers `None` because there is no draft to be reading there: the verb
+    /// that meets one answers not-found, through [`DomainView::deletes`].
+    pub(crate) async fn draft_at(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+    ) -> Result<Option<StoredEngram>> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(None);
+        };
+        let store = self.engine.store();
+        let store = store.lock().await;
+        Ok(store
+            .overlay_entry(domain_id, actor, path)
+            .await?
+            .filter(|entry| !entry.tombstone))
     }
 
     /// One engram's exact text and identity, as this view sees it: what the

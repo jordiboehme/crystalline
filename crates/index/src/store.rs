@@ -69,8 +69,16 @@ pub struct ObservationRecord {
 ///
 /// One rule, shared by both backends and by both reference tables, because a
 /// second copy of it would be a second answer to "does this link resolve".
-/// `table` is `relation` or `link`; every construct here is spelled the same in
-/// both dialects, so only the caller's bind placeholder differs.
+/// `table` is `relation` or `link` (or the alias a statement gave one); every
+/// construct here is spelled the same in both dialects, so only the caller's
+/// bind placeholder differs - and the one predicate that is not, the actor
+/// screen, is handed in ready-made by the backend that owns its spelling.
+///
+/// `candidates` says whose rows may answer. [`ReferenceCandidates::Base`]
+/// emits the text this expression has always emitted, so a base row's
+/// references and a direct domain's index pass are byte for byte what they
+/// were; the other two read one actor's view, with that actor's own row
+/// preferred at an address the base also answers.
 ///
 /// Three readings, in the order [`crystalline_core::address::resolve`] tries
 /// them: the target as a permalink in the target domain, the target as a title
@@ -84,7 +92,7 @@ pub struct ObservationRecord {
 /// a softer answer: a prefix that does name a domain never reaches it, and a
 /// row written before `to_raw` existed compares against NULL, which is never
 /// true, so it resolves exactly as it did before until its engram is reindexed.
-pub(crate) fn reference_match(table: &str) -> String {
+pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
     let target_domain = format!(
         "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
     );
@@ -92,21 +100,55 @@ pub(crate) fn reference_match(table: &str) -> String {
         "{table}.to_domain IS NOT NULL \
          AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
     );
-    // Every arm resolves to a base row. A draft is one actor's private reading
-    // of a path, so a reference in somebody else's engram must never land on
-    // it - a resolved edge is a fact about the domain, not about a reader.
+    // Which rows may answer, and - when more than one may - which of them wins
+    // at the same address. `Base` is the literal base predicate and no
+    // preference, which is the text this expression has always emitted.
+    let (actor_screen, prefer) = match candidates {
+        ReferenceCandidates::Base => ("e.actor = ''", ""),
+        ReferenceCandidates::View { screen } | ReferenceCandidates::DraftsOnly { screen } => (
+            screen,
+            // The author's own row first. Said as an ordering rather than as a
+            // second COALESCE arm, so one arm stays one statement and no
+            // collation is involved: `0` sorts before `1` in every dialect.
+            " ORDER BY CASE WHEN e.actor = '' THEN 1 ELSE 0 END",
+        ),
+    };
     format!(
         "COALESCE(\
-         (SELECT e.id FROM engram e WHERE e.actor = '' AND e.permalink = {table}.to_target \
-          AND e.domain_id = {target_domain} LIMIT 1), \
-         (SELECT e.id FROM engram e WHERE e.actor = '' AND lower(e.title) = lower({table}.to_target) \
-          AND e.domain_id = {target_domain} LIMIT 1), \
-         (SELECT e.id FROM engram e WHERE e.actor = '' AND {unregistered} AND e.permalink = {table}.to_raw \
-          AND e.domain_id = {table}.domain_id LIMIT 1), \
-         (SELECT e.id FROM engram e WHERE e.actor = '' AND {unregistered} \
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND e.permalink = {table}.to_target \
+          AND e.domain_id = {target_domain}{prefer} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND lower(e.title) = lower({table}.to_target) \
+          AND e.domain_id = {target_domain}{prefer} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND {unregistered} AND e.permalink = {table}.to_raw \
+          AND e.domain_id = {table}.domain_id{prefer} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND {unregistered} \
           AND lower(e.title) = lower({table}.to_raw) \
-          AND e.domain_id = {table}.domain_id LIMIT 1))"
+          AND e.domain_id = {table}.domain_id{prefer} LIMIT 1))"
     )
+}
+
+/// Whose rows may answer a reference, for [`reference_match`].
+///
+/// Three candidate sets and no fourth. The share-link grants of a later task
+/// widen a set by adding one more `OR` to the screen a caller hands in here,
+/// never by adding a rule of their own, so this stays the one place that says
+/// what a reference may land on.
+pub(crate) enum ReferenceCandidates<'a> {
+    /// The base rows alone: what the domain's files say, which is what a base
+    /// row's own references resolve against and what every reader who names no
+    /// actor reads. There is one base and many readers, so a base row's edges
+    /// are never resolved in anybody's view.
+    Base,
+    /// One actor's view - their own live drafts laid over the base - with their
+    /// own row preferred wherever both answer at the same address. `screen` is
+    /// that actor's composed screen, built by the caller's own backend so the
+    /// tombstone column keeps each dialect's spelling; it excludes tombstones,
+    /// which is what makes a path its author deleted answer nothing they write.
+    View { screen: &'a str },
+    /// One actor's live drafts and nothing else: what a base reference that
+    /// binds to nothing may still reach at READ time for that one reader,
+    /// without the base fallback that is already stored in `to_id`.
+    DraftsOnly { screen: &'a str },
 }
 
 /// One relation bullet, ready to index. `to_id` is filled by
@@ -612,6 +654,11 @@ pub struct GraphNode {
     /// The engram's exact frontmatter status; feeds the retired-status fade in
     /// context ranking.
     pub status: String,
+    /// Whose row this is: empty for the base row the domain's files describe,
+    /// and the actor's key for one of their own drafts. A reader only ever
+    /// meets their own, so a non-empty value means "this is your draft" and is
+    /// what the graph verbs mark a node with.
+    pub actor: String,
 }
 
 /// Whether an edge came from a relation bullet or a prose wikilink.
@@ -1661,7 +1708,19 @@ pub trait Store: Send + Sync {
     /// Every relation and prose link that points out of the given engram, each
     /// carrying whether it currently resolves to a target in the index. Ordered
     /// by source line. Backs the `read_engram` resolution flags.
-    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>>;
+    ///
+    /// `actor` is who is asking. `None` reads the stored `to_id` and nothing
+    /// else, which is the domain's own verdict and the answer this gave before
+    /// the dimension existed. `Some(a)` reads it in that actor's view, which
+    /// moves exactly two verdicts and no others: a bound reference into a path
+    /// they have deleted reads unresolved for them, and an unbound one that
+    /// their own draft answers reads resolved. Both are read-time readings of
+    /// the same stored row - the row is never rewritten for a reader.
+    async fn outbound_refs(
+        &self,
+        engram_id: EngramId,
+        actor: Option<&str>,
+    ) -> Result<Vec<OutboundRef>>;
 
     /// Every relation and prose link written in a domain whose target the index
     /// could not bind, as the consolidation sweep's `V102` input.
@@ -1684,7 +1743,45 @@ pub trait Store: Send + Sync {
     /// the `idx_relation_unresolved` and `idx_link_unresolved` partial indexes,
     /// so the cost tracks the number of dangling references rather than the size
     /// of the domain.
-    async fn unresolved_refs(&self, domain: DomainId) -> Result<Vec<UnresolvedRef>>;
+    ///
+    /// `actor` is who is asking, the same dimension [`Store::outbound_refs`]
+    /// names. `None` is the domain's own queue: the rows its files hold, judged
+    /// by the stored `to_id`. `Some(a)` is that actor's queue - the base rows
+    /// their drafts do not shadow plus their own drafts - judged in their view,
+    /// so a base link their draft answers is not reported to them, a base link
+    /// into a path they deleted is, and their own drafts' dangling references
+    /// stand beside the domain's. Ordered the same way in both arms.
+    async fn unresolved_refs(
+        &self,
+        domain: DomainId,
+        actor: Option<&str>,
+    ) -> Result<Vec<UnresolvedRef>>;
+
+    /// Re-resolve one actor's own references in their own view, and answer how
+    /// many bound.
+    ///
+    /// Two statements per reference table, inside whatever transaction the
+    /// caller has open. First what dangles is unbound: a `to_id` naming a row
+    /// nobody holds any more is the trace of a draft that went away, and
+    /// leaving it would be an edge into nothing. Then what is pending is bound,
+    /// against [`ReferenceCandidates::View`] - their own drafts first, then the
+    /// base - so the author's links follow their own rows as those rows are
+    /// written, dropped and folded.
+    ///
+    /// Scoped to that actor's rows on purpose: the base resolvers
+    /// ([`Store::resolve_pending_relations`] and its twin) stay exactly as they
+    /// are and keep answering for the domain, because a base row's edges are a
+    /// fact about the domain rather than about a reader.
+    ///
+    /// An index-time binding can go stale where a read-time reading cannot: a
+    /// reference bound before its author tombstoned the target stays bound,
+    /// since a tombstone deletes nothing. The reader's screen is what settles
+    /// that case, at every surface that reads an edge, which is why there is no
+    /// third statement here trying to keep up with it.
+    ///
+    /// An empty `actor` is a [`crate::IndexError::Constraint`], like
+    /// [`Store::upsert_overlay`]: the empty string is the base row's own key.
+    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64>;
 
     /// Run a search and return one page of hits plus the total match count.
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
@@ -1949,7 +2046,13 @@ pub trait Store: Send + Sync {
     /// An unknown domain name yields empty vectors rather than an error, so a
     /// caller can probe a domain that holds no engrams yet. The vectors are
     /// sorted by usage in Rust for cross-backend determinism.
-    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary>;
+    ///
+    /// `actor` is who is asking. `None` - every caller that shows a person the
+    /// vocabulary - answers the team's own list, because a tag one author is
+    /// trying out in a draft is not yet the domain's agreement. `Some(a)` reads
+    /// that actor's view, and the one caller that passes it is the sweep's tag
+    /// drift rule, whose finding is about what that author wrote.
+    async fn vocabulary(&self, domain: Option<&str>, actor: Option<&str>) -> Result<Vocabulary>;
 
     // --- attachments ---------------------------------------------------------
     // Binary assets under a domain's `assets/` folder. The metadata row is the

@@ -1651,9 +1651,12 @@ async fn check_tags(store: Option<&dyn Store>, cfg: &GlobalConfig) -> Result<Opt
         .iter()
         .filter(|name| cfg.domains.contains_key(*name))
         .collect();
+    // The team's own list, whoever is drafting: `doctor` reports what the
+    // domain has agreed on, and a word one author is trying out in a draft is
+    // not that.
     let vocab = if registered.len() == indexed.len() {
         store
-            .vocabulary(None)
+            .vocabulary(None, None)
             .await
             .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?
     } else {
@@ -1661,7 +1664,7 @@ async fn check_tags(store: Option<&dyn Store>, cfg: &GlobalConfig) -> Result<Opt
         for name in registered {
             parts.push(
                 store
-                    .vocabulary(Some(name))
+                    .vocabulary(Some(name), None)
                     .await
                     .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?,
             );

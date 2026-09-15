@@ -245,6 +245,27 @@ pub(super) fn actor_screen_on(
     )
 }
 
+/// One actor's live drafts and nothing else, over a named alias.
+///
+/// The other half of the address map [`actor_screen_on`] builds: that one
+/// answers "which row stands at this path for this reader", this one answers
+/// "which of this reader's own pages answers to this name". A reference that
+/// binds to nothing in the index can still reach one of them, which is how a
+/// page only its author has written answers the domain's own dangling link for
+/// that one author. Tombstones are excluded here too - a draft deletion is
+/// never a page to arrive at.
+pub(super) fn drafts_only_on(
+    alias: &str,
+    actor: &str,
+    params: &mut Vec<Param>,
+    n: &mut usize,
+) -> String {
+    let ph = *n;
+    params.push(Param::Text(actor.to_string()));
+    *n += 1;
+    format!("{alias}.actor = ${ph} AND NOT {alias}.tombstone")
+}
+
 /// Load the lexical candidate rows and score them, sorted best first. Shared by
 /// the lexical modes and the lexical half of hybrid search: the retired-status
 /// fade is applied by each of those callers exactly once, over this function's
@@ -1141,11 +1162,66 @@ async fn matching_observation(
     query_first(conn, &sql, params).await
 }
 
+/// The frontier arm for references the index bound to nothing, which exists
+/// only when a reader is named.
+///
+/// A base row's reference resolves against the base and stays unbound when
+/// nothing there answers it - and one reader's own draft may answer it all the
+/// same. That reading is theirs alone and is never written into `to_id`, so it
+/// is made here, at the far end of the edge, against that actor's live drafts
+/// and nothing else. With no actor the arm is not emitted at all, so a
+/// traversal that names nobody is the statement that was always there.
+/// Eight arguments, like `push_edge` below and for the same reason: the two
+/// reference tables are one shape written twice, and a struct to carry the
+/// spelling differences would be a type nothing else ever holds.
+#[allow(clippy::too_many_arguments)]
+fn pending_arm(
+    select: &str,
+    table: &str,
+    alias: &str,
+    actor: Option<&str>,
+    list: &str,
+    src_screen: &str,
+    params: &mut Vec<Param>,
+    n: &mut usize,
+) -> String {
+    let Some(actor) = actor else {
+        return String::new();
+    };
+    let drafts = drafts_only_on("e", actor, params, n);
+    let reach = crate::store::reference_match(
+        alias,
+        crate::store::ReferenceCandidates::DraftsOnly { screen: &drafts },
+    );
+    format!(
+        " UNION ALL \
+         SELECT {select} FROM {table} {alias} \
+         JOIN engram src ON src.id={alias}.engram_id AND {src_screen} \
+         JOIN engram dst ON dst.id = {reach} \
+         WHERE {alias}.to_id IS NULL \
+           AND ({alias}.engram_id IN ({list}) OR dst.id IN ({list}))"
+    )
+}
+
 /// Traverse the neighborhood of the seed engrams up to `depth` hops, in
 /// `actor`'s view of the index: `None` walks the base rows alone and
 /// `Some(a)` walks that actor's shadowed view, their own drafts standing in
 /// for the rows they are drafts of and a path they have deleted reachable
 /// from nothing.
+///
+/// **Every edge arrives where the reader's own address map says.** The stored
+/// `to_id` names a row; the hop through `tgt` reads that row's address and the
+/// hop through `dst` reads what this reader holds there. So a team edge into a
+/// page they are drafting arrives at their draft, one into a page they have
+/// deleted arrives nowhere and is not drawn, and with no actor named `dst` is
+/// the row `to_id` named all along.
+///
+/// **Which edges are looked for is still keyed on the stored `to_id`.** An
+/// inbound edge is found when the row it was bound to is in the frontier, not
+/// when the reader's draft at that address is - the same sentence as
+/// `inbound_refs`: who points at an address is a fact about the address the
+/// team shares. Deliberate, and the reason a reader seeded on their own draft
+/// meets what it points at rather than what points at the page beneath it.
 pub(super) async fn neighbors(
     conn: &mut PgConnection,
     ids: &[EngramId],
@@ -1173,6 +1249,16 @@ pub(super) async fn neighbors(
         let mut rel_n = 1usize;
         let src_screen = actor_screen_on("src", actor, &mut rel_params, &mut rel_n);
         let dst_screen = actor_screen_on("dst", actor, &mut rel_params, &mut rel_n);
+        let rel_pending = pending_arm(
+            "r.engram_id, dst.id, r.rel_type",
+            "relation",
+            "r",
+            actor,
+            &list,
+            &src_screen,
+            &mut rel_params,
+            &mut rel_n,
+        );
         let rel_rows = query_all(
             conn,
             &format!(
@@ -1186,11 +1272,18 @@ pub(super) async fn neighbors(
                 // private draft. Both endpoints are screened, because an edge
                 // reaching INTO a row this reader may not see is as far
                 // outside their graph as one leaving it.
-                "SELECT r.engram_id, r.to_id, r.rel_type FROM relation r \
+                //
+                // `tgt` carries no screen and wants none: it is the row the
+                // reference was bound to, read for its address alone, and the
+                // screen that decides what this reader may meet is the one on
+                // `dst` beside it.
+                "SELECT r.engram_id, dst.id, r.rel_type FROM relation r \
                  JOIN engram src ON src.id=r.engram_id AND {src_screen} \
-                 JOIN engram dst ON dst.id=r.to_id AND {dst_screen} \
+                 JOIN engram tgt ON tgt.id=r.to_id \
+                 JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+                   AND {dst_screen} \
                  WHERE r.to_id IS NOT NULL \
-                   AND (r.engram_id IN ({list}) OR r.to_id IN ({list}))"
+                   AND (r.engram_id IN ({list}) OR r.to_id IN ({list})){rel_pending}"
             ),
             rel_params,
         )
@@ -1215,16 +1308,28 @@ pub(super) async fn neighbors(
         let mut link_n = 1usize;
         let src_screen = actor_screen_on("src", actor, &mut link_params, &mut link_n);
         let dst_screen = actor_screen_on("dst", actor, &mut link_params, &mut link_n);
+        let link_pending = pending_arm(
+            "l.engram_id, dst.id",
+            "link",
+            "l",
+            actor,
+            &list,
+            &src_screen,
+            &mut link_params,
+            &mut link_n,
+        );
         let link_rows = query_all(
             conn,
             &format!(
                 // The prose-link twin of the relation frontier above, and
-                // screened for the same reason.
-                "SELECT l.engram_id, l.to_id FROM link l \
+                // screened and redirected for the same reasons.
+                "SELECT l.engram_id, dst.id FROM link l \
                  JOIN engram src ON src.id=l.engram_id AND {src_screen} \
-                 JOIN engram dst ON dst.id=l.to_id AND {dst_screen} \
+                 JOIN engram tgt ON tgt.id=l.to_id \
+                 JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+                   AND {dst_screen} \
                  WHERE l.to_id IS NOT NULL \
-                   AND (l.engram_id IN ({list}) OR l.to_id IN ({list}))"
+                   AND (l.engram_id IN ({list}) OR l.to_id IN ({list})){link_pending}"
             ),
             link_params,
         )
@@ -1262,7 +1367,7 @@ pub(super) async fn neighbors(
             &format!(
                 "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
                  CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
-                 e.status \
+                 e.status, e.actor \
                  FROM engram e JOIN domain d ON d.id=e.domain_id \
                  WHERE {node_screen} AND e.id IN ({list}) ORDER BY e.id"
             ),
@@ -1278,6 +1383,7 @@ pub(super) async fn neighbors(
                 engram_type: cell_text(r, 4).unwrap_or_default(),
                 salience: cell_real(r, 5),
                 status: cell_text(r, 6).unwrap_or_default(),
+                actor: cell_text(r, 7).unwrap_or_default(),
             });
         }
     }

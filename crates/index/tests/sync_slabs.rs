@@ -190,7 +190,7 @@ async fn snapshot(store: &dyn Store, domain: crystalline_index::DomainId) -> Sna
                 job.text_hash.clone(),
             ));
         }
-        for r in store.outbound_refs(id).await.unwrap() {
+        for r in store.outbound_refs(id, None).await.unwrap() {
             refs.push((
                 permalink.clone(),
                 r.line,

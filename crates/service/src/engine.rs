@@ -823,6 +823,22 @@ enum ScopedDomains {
     Nothing,
 }
 
+/// Mark one graph node as the reader's own draft, and say nothing at all about
+/// a base row.
+///
+/// Emitted only when there is something to say, so a domain that takes changes
+/// directly answers the JSON it always answered, key for key - which is what
+/// the byte-identity test pins. A reader only ever meets their own drafts in a
+/// slice, so the flag needs no owner beside it.
+fn mark_draft(node_json: &mut Value, node: &GraphNode) {
+    if node.actor.is_empty() {
+        return;
+    }
+    if let Some(obj) = node_json.as_object_mut() {
+        obj.insert("draft".to_string(), json!(true));
+    }
+}
+
 /// Cut every node in a hidden domain out of a graph slice, and with it every
 /// edge that had an end there.
 ///
@@ -1693,6 +1709,13 @@ impl Engine {
     /// [`Engine::retag`], which prechecks a rename or a merge against it. Keep
     /// the two on this one seam: a tag the listing says is not there must not
     /// be a tag the merge says exists.
+    ///
+    /// **Base by design**, which is why every scan here names no actor. The
+    /// vocabulary is the agreement a domain has reached, so a word one author
+    /// is trying out in a draft is not in it, and a person shown the list is
+    /// shown the team's. The one surface that reads an actor's own view is the
+    /// sweep's tag-drift rule, through [`DomainView::vocabulary`], because that
+    /// finding is about what that one author wrote.
     async fn scoped_vocabulary(
         &self,
         domain: Option<&str>,
@@ -1701,14 +1724,14 @@ impl Engine {
         Ok(match (domain, hidden.is_empty()) {
             (_, true) => {
                 let store = self.store.lock().await;
-                store.vocabulary(domain).await?
+                store.vocabulary(domain, None).await?
             }
             (Some(domain), false) if hidden.contains(domain) => {
                 crystalline_index::Vocabulary::default()
             }
             (Some(domain), false) => {
                 let store = self.store.lock().await;
-                store.vocabulary(Some(domain)).await?
+                store.vocabulary(Some(domain), None).await?
             }
             (None, false) => {
                 let names = match self.scoped_domains(&[], hidden).await? {
@@ -1720,7 +1743,7 @@ impl Engine {
                 let store = self.store.lock().await;
                 let mut parts = Vec::with_capacity(names.len());
                 for name in &names {
-                    parts.push(store.vocabulary(Some(name)).await?);
+                    parts.push(store.vocabulary(Some(name), None).await?);
                 }
                 drop(store);
                 crystalline_index::merge_vocabularies(parts)
@@ -2330,8 +2353,14 @@ impl Engine {
                 )
             };
             store.replace_chunks(id, &chunks).await?;
-            store.resolve_pending_relations(domain_id).await?;
-            store.resolve_pending_links(domain_id).await?;
+            // This author's own rows, re-resolved in this author's own view -
+            // and the base resolvers deliberately NOT run here. They resolve
+            // against the base alone, so they could never bind what a draft
+            // write just created, and running them first would settle the new
+            // draft's links onto base rows before the author's own rows got
+            // their preference. There is nothing for them to do either way: an
+            // overlay write adds no base row.
+            store.reresolve_actor_references(domain_id, actor).await?;
             Ok::<(), EngineError>(())
         }
         .await;
@@ -2551,6 +2580,16 @@ impl Engine {
                         }
                     }
                 }
+            }
+            // Once this actor's entries have settled, their references are read
+            // again against what they hold now: a draft this pass ended takes
+            // its address back to the base row at that path, and one that moved
+            // with a renamed base carries its links to the new name. This is
+            // the spec's "re-resolved on the next convergence pass", and it is
+            // the one pass that sees every one of an actor's rows at once.
+            if !entries.is_empty() {
+                let store = self.store.lock().await;
+                store.reresolve_actor_references(domain_id, actor).await?;
             }
         }
         record.cleared = cleared;
@@ -5305,19 +5344,14 @@ impl Engine {
         // land, and who points back in. The descriptor carries the ids, so this
         // works for file, virtual and non-host reads alike.
         //
-        // Outbound is asked of the row this reader is actually looking at.
-        // A draft over a base row resolves to the BASE descriptor, so one
-        // engram keeps one address - but the relations and prose links in front
-        // of them are the ones their own document wrote, and those hang off
-        // their own row; asking the base row would report a relation they added
-        // as unresolved and one they removed as still there. Inbound stays the
-        // base row's, deliberately: who points here is a fact about the address
-        // the team shares, and nobody can write a reference to a draft only its
-        // author can read.
-        let edge_id = view.edge_id(&desc).await?;
-        let (outbound, inbound) = {
+        // Outbound is asked of the row this reader is actually looking at, and
+        // judged in their view - see [`DomainView::outbound`], which is both
+        // halves of that sentence. Inbound stays the base row's, deliberately:
+        // who points here is a fact about the address the team shares, and
+        // nobody can write a reference to a draft only its author can read.
+        let outbound = view.outbound(&desc).await?;
+        let inbound = {
             let store = self.store.lock().await;
-            let outbound = store.outbound_refs(edge_id).await?;
             let mut inbound = store
                 .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
                 .await?;
@@ -5328,7 +5362,7 @@ impl Engine {
             // from, and a count of references that cannot be shown would be a
             // second, quieter way of saying the domain is there.
             inbound.retain(|r| !hidden.contains(&r.src_domain));
-            (outbound, inbound)
+            inbound
         };
 
         // A parsed reference resolves when a matching indexed row (same source
@@ -5399,6 +5433,14 @@ impl Engine {
         let obj = value
             .as_object_mut()
             .expect("read_engram response is a JSON object");
+
+        // One line saying whose page this is. Emitted only when the reader is
+        // looking at a draft of their own - over a base row or at a path no
+        // file holds - so a direct domain's payload never grows a key, and a
+        // reader never sees the word about anybody else's work.
+        if view.draft_at(desc.domain_id, &desc.path).await?.is_some() {
+            obj.insert("draft".to_string(), json!(true));
+        }
 
         // Inbound summary: how many references point here, with a small capped
         // sample so a heavily linked engram never bloats the response. Omitted
@@ -7610,14 +7652,16 @@ impl Engine {
         {
             let is_seed = seed_ids.contains(&node.id.0);
             kept.insert(node.id.0);
-            nodes.push(json!({
+            let mut out = json!({
                 "id": node.id.0,
                 "domain": node.domain,
                 "permalink": node.permalink,
                 "title": node.title,
                 "type": node.engram_type,
                 "seed": is_seed,
-            }));
+            });
+            mark_draft(&mut out, node);
+            nodes.push(out);
         }
         let edges: Vec<Value> = slice
             .edges
@@ -7787,14 +7831,16 @@ impl Engine {
             .take(max_nodes)
         {
             kept.insert(node.id.0);
-            nodes.push(json!({
+            let mut out = json!({
                 "id": node.id.0,
                 "domain": node.domain,
                 "permalink": node.permalink,
                 "title": node.title,
                 "status": node.status,
                 "type": node.engram_type,
-            }));
+            });
+            mark_draft(&mut out, node);
+            nodes.push(out);
         }
         // An edge is only meaningful when both of its ends survived the cap; one
         // that lost an end would render as an arrow into nothing. The relation
@@ -9394,17 +9440,25 @@ impl Engine {
         // own guard and the sweep has no reason to hold both.
         let embedded = self.provider().is_some();
 
+        // One query in this caller's own dimension: the base rows their drafts
+        // do not shadow and their own drafts together, each judged against what
+        // they hold at the target's address. It replaced a pass that assembled
+        // the draft half in Rust beside this one - which could not see the
+        // colon-prefixed title form and could not be asked about a base row at
+        // all, so a base link a reader's own draft had already answered was
+        // still raised at them.
+        let unresolved = view.unresolved(domain_id).await?;
+        // The `vocabulary` TOOL stays shared and the V203 FINDING moved, which
+        // is the half of the Task 9 ruling that held and the half that did not.
+        // What a person is shown is still the domain's agreement - a word one
+        // author is trying out in a draft is not the team's vocabulary - but a
+        // drift finding is about what THAT author wrote, and reading it off the
+        // team's list told them their own new word was already established, or
+        // said nothing at all about the one beside it.
+        let vocab = view.vocabulary().await?;
+        // Both of those ask the view, which takes the store lock itself, so the
+        // lock is taken here rather than above them.
         let store = self.store.lock().await;
-        let mut unresolved = store.unresolved_refs(domain_id).await?;
-        // That query answers for the rows the domain itself holds, which is the
-        // base half of this caller's view. The other half is their own drafts,
-        // and it is assembled in their dimension rather than the domain's.
-        unresolved.extend(view.draft_unresolved(&*store, &descs, drafts).await?);
-        // Shared on purpose, and the one input to the sweep that is: `V203`
-        // speaks about the vocabulary a domain has agreed on, so a tag one
-        // actor is trying out in a draft is not yet drift and the team's own
-        // clusters are what an author should be reading either way.
-        let vocab = store.vocabulary(Some(name)).await?;
         // Metadata only, one query: the attachment rules compare paths,
         // sizes and hashes and never read a byte of any file.
         let attachments = store.list_attachments(domain_id).await?;
@@ -18675,6 +18729,7 @@ mod context_rank_tests {
             engram_type: "engram".to_string(),
             salience,
             status: "current".to_string(),
+            actor: String::new(),
         }
     }
 

@@ -35,8 +35,8 @@ use crate::store::{
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
-    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
-    Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
+    Page, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery, Store, StoreInfo,
+    StoredEngram, Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -537,6 +537,70 @@ async fn attachment_id(conn: &Connection, domain: DomainId, path: &str) -> Resul
     .ok_or_else(|| IndexError::Constraint(format!("no attachment row at `{path}`")))
 }
 
+/// Whether one reference row resolves, read in one actor's view, as one SQL
+/// expression per reference table. `None` when nobody is named, which is what
+/// keeps every statement below byte for byte the one that was there.
+///
+/// Two readings in one `CASE`, and they are the two halves of the spec's
+/// read-time shadowing. A BOUND reference resolves when this reader still
+/// holds something at the target's address - their own draft over it, or the
+/// base row where they hold nothing - and does not when they have deleted that
+/// path. An UNBOUND one resolves when one of their own live drafts answers the
+/// text, which is how a dangling team link is answered by the page only its
+/// reader has written. The stored `to_id` is never touched by either.
+fn view_verdicts(
+    actor: Option<&str>,
+    params: &mut Vec<Value>,
+    n: &mut usize,
+) -> Option<(String, String)> {
+    let actor = actor?;
+    let dst_screen = search::actor_screen_on("dst", Some(actor), params, n);
+    let drafts = search::drafts_only_on("e", actor, params, n);
+    let verdict = |alias: &str| {
+        let reach = reference_match(alias, ReferenceCandidates::DraftsOnly { screen: &drafts });
+        // `tgt` is the bound row, read for its address alone; `dst` beside it
+        // is the screen that says what this reader holds there.
+        format!(
+            "CASE WHEN {alias}.to_id IS NOT NULL THEN EXISTS (\
+             SELECT 1 FROM engram tgt \
+             JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+               AND {dst_screen} \
+             WHERE tgt.id = {alias}.to_id) \
+             ELSE ({reach} IS NOT NULL) END"
+        )
+    };
+    Some((verdict("r"), verdict("l")))
+}
+
+/// [`view_verdicts`] as the integer flag `outbound_refs` selects, one per
+/// table. The wrapping `CASE` is what keeps the column an integer in both
+/// dialects, where a bare `EXISTS` would be a boolean in one of them.
+fn actor_verdicts(actor: Option<&str>, params: &mut Vec<Value>, n: &mut usize) -> (String, String) {
+    match view_verdicts(actor, params, n) {
+        None => (
+            "CASE WHEN r.to_id IS NULL THEN 0 ELSE 1 END".to_string(),
+            "CASE WHEN l.to_id IS NULL THEN 0 ELSE 1 END".to_string(),
+        ),
+        Some((rel, link)) => (
+            format!("CASE WHEN {rel} THEN 1 ELSE 0 END"),
+            format!("CASE WHEN {link} THEN 1 ELSE 0 END"),
+        ),
+    }
+}
+
+/// [`view_verdicts`] as the predicate `unresolved_refs` filters on, one per
+/// table: a row is in the queue exactly when it does not resolve.
+fn pending_predicates(
+    actor: Option<&str>,
+    params: &mut Vec<Value>,
+    n: &mut usize,
+) -> (String, String) {
+    match view_verdicts(actor, params, n) {
+        None => ("r.to_id IS NULL".to_string(), "l.to_id IS NULL".to_string()),
+        Some((rel, link)) => (format!("NOT ({rel})"), format!("NOT ({link})")),
+    }
+}
+
 /// Decode one `outbound_refs` row: line, kind discriminator (0 relation, 1
 /// link), rel_type (NULL for a link), target text, target domain and resolved
 /// flag. The column layout is identical across both backends.
@@ -1009,7 +1073,7 @@ impl Store for TursoStore {
             "UPDATE relation SET to_id = {resolved} \
              WHERE relation.to_id IS NULL AND relation.domain_id = ?1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("relation")
+            resolved = reference_match("relation", ReferenceCandidates::Base)
         );
         let n = self
             .conn
@@ -1025,13 +1089,60 @@ impl Store for TursoStore {
             "UPDATE link SET to_id = {resolved} \
              WHERE link.to_id IS NULL AND link.domain_id = ?1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("link")
+            resolved = reference_match("link", ReferenceCandidates::Base)
         );
         let n = self
             .conn
             .execute(&sql, vec![Value::Integer(domain.0)])
             .await?;
         Ok(n)
+    }
+
+    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "a reference pass over an actor's own rows must name that actor; the empty \
+                 actor is the base row's own key"
+                    .to_string(),
+            ));
+        }
+        let mut bound = 0u64;
+        for table in ["relation", "link"] {
+            // What dangles is unbound. A `to_id` naming a row nobody holds any
+            // more is the trace of a draft that went away, and the existence
+            // probe deliberately asks about every actor's rows: whose the
+            // vanished row was does not change that this one now points at
+            // nothing.
+            let dangling = format!(
+                "UPDATE {table} SET to_id = NULL WHERE domain_id = ?1 AND to_id IS NOT NULL \
+                 AND engram_id IN (SELECT id FROM engram WHERE domain_id = ?1 AND actor = ?2) \
+                 AND NOT EXISTS (SELECT 1 FROM engram t WHERE t.id = {table}.to_id)"
+            );
+            self.conn
+                .execute(
+                    &dangling,
+                    vec![Value::Integer(domain.0), Value::Text(actor.to_string())],
+                )
+                .await?;
+            // Then what is pending is bound, in this actor's own view.
+            let mut params = vec![Value::Integer(domain.0), Value::Text(actor.to_string())];
+            let mut n = 3usize;
+            let actor_screen = search::actor_screen_on("e", Some(actor), &mut params, &mut n);
+            let view = reference_match(
+                table,
+                ReferenceCandidates::View {
+                    screen: &actor_screen,
+                },
+            );
+            let sql = format!(
+                "UPDATE {table} SET to_id = {view} \
+                 WHERE {table}.to_id IS NULL AND {table}.domain_id = ?1 \
+                 AND {table}.engram_id IN (SELECT id FROM engram WHERE domain_id = ?1 AND actor = ?2) \
+                 AND {view} IS NOT NULL"
+            );
+            bound += self.conn.execute(&sql, params).await?;
+        }
+        Ok(bound)
     }
 
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
@@ -1513,28 +1624,45 @@ impl Store for TursoStore {
         Ok(InboundPage { total, types, hits })
     }
 
-    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {
+    async fn outbound_refs(
+        &self,
+        engram_id: EngramId,
+        actor: Option<&str>,
+    ) -> Result<Vec<OutboundRef>> {
         // Relation rows then link rows for one engram, each row decoded
         // identically: line, kind discriminator, rel_type (NULL for a link),
         // target text, target domain and a resolved flag derived from whether the
         // forward reference has been bound to a `to_id`. Ordered by source line.
+        //
+        // With an actor the flag is derived in that actor's view instead, and
+        // the stored column is left exactly as it is: this is a reading of one
+        // row by one reader, never a rebinding.
+        let mut params = vec![Value::Integer(engram_id.0)];
+        let mut n = 2usize;
+        let (rel_resolved, link_resolved) = actor_verdicts(actor, &mut params, &mut n);
         let rows = query_all(
             &self.conn,
-            "SELECT r.line AS line, 0 AS kind, r.rel_type, r.to_target, r.to_domain, \
-                    CASE WHEN r.to_id IS NULL THEN 0 ELSE 1 END AS resolved \
+            &format!(
+                "SELECT r.line AS line, 0 AS kind, r.rel_type, r.to_target, r.to_domain, \
+                    {rel_resolved} AS resolved \
              FROM relation r WHERE r.engram_id=?1 \
              UNION ALL \
              SELECT l.line, 1, NULL, l.to_target, l.to_domain, \
-                    CASE WHEN l.to_id IS NULL THEN 0 ELSE 1 END \
+                    {link_resolved} \
              FROM link l WHERE l.engram_id=?1 \
-             ORDER BY line",
-            vec![Value::Integer(engram_id.0)],
+             ORDER BY line"
+            ),
+            params,
         )
         .await?;
         Ok(rows.iter().map(outbound_ref_from_row).collect())
     }
 
-    async fn unresolved_refs(&self, domain: DomainId) -> Result<Vec<UnresolvedRef>> {
+    async fn unresolved_refs(
+        &self,
+        domain: DomainId,
+        actor: Option<&str>,
+    ) -> Result<Vec<UnresolvedRef>> {
         // Relation rows then link rows, both filtered on `to_id IS NULL` and the
         // source domain so the pair of partial unresolved indexes carries the
         // scan. A prose link reports `links_to`, the same relation type the graph
@@ -1543,17 +1671,30 @@ impl Store for TursoStore {
         // because a compound select cannot name a column of a later arm. TEXT
         // sorts byte-wise here, which is the order the Postgres implementation
         // pins itself to with an explicit `COLLATE "C"`.
+        //
+        // With an actor the source join carries their screen - the base rows
+        // their drafts do not shadow, plus their own live drafts - and "is this
+        // dangling" is asked in their view rather than off the stored column,
+        // so the queue is about what they are reading. The partial indexes
+        // carry the base arm; the actor arm is bounded by that actor's own row
+        // count, which is what an overlay is.
+        let mut params = vec![Value::Integer(domain.0)];
+        let mut n = 2usize;
+        let src_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
+        let (rel_pending, link_pending) = pending_predicates(actor, &mut params, &mut n);
         let rows = query_all(
             &self.conn,
-            "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path \
+            &format!(
+                "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path \
              FROM relation r JOIN engram e ON e.id=r.engram_id \
-             WHERE e.actor = '' AND r.to_id IS NULL AND r.domain_id=?1 \
+             WHERE {src_screen} AND {rel_pending} AND r.domain_id=?1 \
              UNION ALL \
              SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path \
              FROM link l JOIN engram e ON e.id=l.engram_id \
-             WHERE e.actor = '' AND l.to_id IS NULL AND l.domain_id=?1 \
-             ORDER BY 7, 6, 2, 5",
-            vec![Value::Integer(domain.0)],
+             WHERE {src_screen} AND {link_pending} AND l.domain_id=?1 \
+             ORDER BY 7, 6, 2, 5"
+            ),
+            params,
         )
         .await?;
         Ok(rows.iter().map(unresolved_ref_from_row).collect())
@@ -2179,7 +2320,7 @@ impl Store for TursoStore {
         Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
     }
 
-    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {
+    async fn vocabulary(&self, domain: Option<&str>, actor: Option<&str>) -> Result<Vocabulary> {
         // Six grouped scans: engram tags, observation tags, observation
         // categories, relation types and the engram `type` and `status` columns.
         // When a domain is named each aggregate joins back to the owning
@@ -2187,9 +2328,20 @@ impl Store for TursoStore {
         // the vocabulary comes back empty. The maps are merged and every vector
         // sorted in Rust (see `build_vocabulary`) so the order does not depend on
         // SQL's grouping.
-        let dparam = || match domain {
-            Some(d) => vec![Value::Text(d.to_string())],
-            None => vec![],
+        //
+        // All six carry the same screen, and with no actor it is the base
+        // predicate each of them always carried. The domain name binds first
+        // when there is one, so the screen's own placeholder falls after it.
+        let mut screen_params: Vec<Value> = Vec::new();
+        let mut n = if domain.is_some() { 2usize } else { 1usize };
+        let actor_screen = search::actor_screen_on("e", actor, &mut screen_params, &mut n);
+        let dparam = || {
+            let mut out = match domain {
+                Some(d) => vec![Value::Text(d.to_string())],
+                None => vec![],
+            };
+            out.extend(screen_params.iter().cloned());
+            out
         };
         let decode = |rows: &[Row]| -> Vec<(String, i64)> {
             rows.iter()
@@ -2203,56 +2355,72 @@ impl Store for TursoStore {
         };
 
         let engram_tag_sql = if domain.is_some() {
-            "SELECT t.name, COUNT(*) FROM engram_tag et \
+            format!(
+                "SELECT t.name, COUNT(*) FROM engram_tag et \
              JOIN tag t ON t.id=et.tag_id \
              JOIN engram e ON e.id=et.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND d.name=?1 GROUP BY t.id"
+             WHERE {actor_screen} AND d.name=?1 GROUP BY t.id"
+            )
         } else {
-            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+            format!(
+                "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
              JOIN engram e ON e.id=et.engram_id \
-             WHERE e.actor = '' GROUP BY t.id"
+             WHERE {actor_screen} GROUP BY t.id"
+            )
         };
-        let engram_tags = decode(&query_all(&self.conn, engram_tag_sql, dparam()).await?);
+        let engram_tags = decode(&query_all(&self.conn, &engram_tag_sql, dparam()).await?);
 
         let obs_tag_sql = if domain.is_some() {
-            "SELECT t.name, COUNT(*) FROM observation_tag ot \
+            format!(
+                "SELECT t.name, COUNT(*) FROM observation_tag ot \
              JOIN tag t ON t.id=ot.tag_id \
              JOIN observation o ON o.id=ot.observation_id \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND d.name=?1 GROUP BY t.id"
+             WHERE {actor_screen} AND d.name=?1 GROUP BY t.id"
+            )
         } else {
-            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
+            format!(
+                "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
              JOIN observation o ON o.id=ot.observation_id \
              JOIN engram e ON e.id=o.engram_id \
-             WHERE e.actor = '' GROUP BY t.id"
+             WHERE {actor_screen} GROUP BY t.id"
+            )
         };
-        let observation_tags = decode(&query_all(&self.conn, obs_tag_sql, dparam()).await?);
+        let observation_tags = decode(&query_all(&self.conn, &obs_tag_sql, dparam()).await?);
 
         let category_sql = if domain.is_some() {
-            "SELECT o.category, COUNT(*) FROM observation o \
+            format!(
+                "SELECT o.category, COUNT(*) FROM observation o \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND o.category <> '' AND d.name=?1 GROUP BY o.category"
+             WHERE {actor_screen} AND o.category <> '' AND d.name=?1 GROUP BY o.category"
+            )
         } else {
-            "SELECT o.category, COUNT(*) FROM observation o \
+            format!(
+                "SELECT o.category, COUNT(*) FROM observation o \
              JOIN engram e ON e.id=o.engram_id \
-             WHERE o.category <> '' AND e.actor = '' GROUP BY o.category"
+             WHERE o.category <> '' AND {actor_screen} GROUP BY o.category"
+            )
         };
-        let categories = decode(&query_all(&self.conn, category_sql, dparam()).await?);
+        let categories = decode(&query_all(&self.conn, &category_sql, dparam()).await?);
 
         let rel_sql = if domain.is_some() {
-            "SELECT r.rel_type, COUNT(*) FROM relation r \
+            format!(
+                "SELECT r.rel_type, COUNT(*) FROM relation r \
              JOIN domain d ON d.id=r.domain_id \
              JOIN engram e ON e.id=r.engram_id \
-             WHERE d.name=?1 AND e.actor = '' GROUP BY r.rel_type"
+             WHERE d.name=?1 AND {actor_screen} GROUP BY r.rel_type"
+            )
         } else {
-            "SELECT r.rel_type, COUNT(*) FROM relation r \
+            format!(
+                "SELECT r.rel_type, COUNT(*) FROM relation r \
              JOIN engram e ON e.id=r.engram_id \
-             WHERE e.actor = '' GROUP BY r.rel_type"
+             WHERE {actor_screen} GROUP BY r.rel_type"
+            )
         };
-        let relation_types = decode(&query_all(&self.conn, rel_sql, dparam()).await?);
+        let relation_types = decode(&query_all(&self.conn, &rel_sql, dparam()).await?);
 
         // The engram `type` and `status` columns, counted as stored: no folding
         // of `stable` and `current` and no retirement filter, because this
@@ -2260,24 +2428,32 @@ impl Store for TursoStore {
         // guard matches the category scan; both columns default to `''`, and a
         // nameless entry would say nothing.
         let type_sql = if domain.is_some() {
-            "SELECT e.engram_type, COUNT(*) FROM engram e \
+            format!(
+                "SELECT e.engram_type, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND e.engram_type <> '' AND d.name=?1 GROUP BY e.engram_type"
+             WHERE {actor_screen} AND e.engram_type <> '' AND d.name=?1 GROUP BY e.engram_type"
+            )
         } else {
-            "SELECT e.engram_type, COUNT(*) FROM engram e \
-             WHERE e.actor = '' AND e.engram_type <> '' GROUP BY e.engram_type"
+            format!(
+                "SELECT e.engram_type, COUNT(*) FROM engram e \
+             WHERE {actor_screen} AND e.engram_type <> '' GROUP BY e.engram_type"
+            )
         };
-        let types = decode(&query_all(&self.conn, type_sql, dparam()).await?);
+        let types = decode(&query_all(&self.conn, &type_sql, dparam()).await?);
 
         let status_sql = if domain.is_some() {
-            "SELECT e.status, COUNT(*) FROM engram e \
+            format!(
+                "SELECT e.status, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND e.status <> '' AND d.name=?1 GROUP BY e.status"
+             WHERE {actor_screen} AND e.status <> '' AND d.name=?1 GROUP BY e.status"
+            )
         } else {
-            "SELECT e.status, COUNT(*) FROM engram e \
-             WHERE e.actor = '' AND e.status <> '' GROUP BY e.status"
+            format!(
+                "SELECT e.status, COUNT(*) FROM engram e \
+             WHERE {actor_screen} AND e.status <> '' GROUP BY e.status"
+            )
         };
-        let statuses = decode(&query_all(&self.conn, status_sql, dparam()).await?);
+        let statuses = decode(&query_all(&self.conn, &status_sql, dparam()).await?);
 
         // The last scan surfaces the derived tag aliases in effect. Scoped by
         // domain name like the counts; `build_vocabulary` dedupes and sorts.
@@ -2287,7 +2463,14 @@ impl Store for TursoStore {
         } else {
             "SELECT DISTINCT ta.alias, ta.canonical FROM tag_alias ta"
         };
-        let aliases: Vec<(String, String)> = query_all(&self.conn, alias_sql, dparam())
+        // The alias scan names no engram, so it takes the domain name alone:
+        // handing it the screen's placeholder would bind a parameter its text
+        // never mentions.
+        let dname = || match domain {
+            Some(d) => vec![Value::Text(d.to_string())],
+            None => vec![],
+        };
+        let aliases: Vec<(String, String)> = query_all(&self.conn, alias_sql, dname())
             .await?
             .iter()
             .map(|r| {

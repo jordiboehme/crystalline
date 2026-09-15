@@ -96,8 +96,8 @@ use crate::store::{
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
-    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
-    Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
+    Page, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery, Store, StoreInfo,
+    StoredEngram, Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -404,6 +404,11 @@ impl PostgresStore {
 /// A dynamically bound parameter for the query builder. The search planner and
 /// the filtered listings build their WHERE clause at runtime, so their binds are
 /// heterogeneous; the fixed-shape statements bind typed values directly instead.
+///
+/// `Clone` because a statement built once and run six times - the vocabulary
+/// scans - needs its binds once per run. The Turso twin gets this for free from
+/// `turso::Value`.
+#[derive(Clone)]
 pub(super) enum Param {
     Text(String),
     Int(i64),
@@ -566,6 +571,65 @@ fn descriptor_from_row(r: &PgRow) -> EngramDescriptor {
         title: cell_text(r, 5).unwrap_or_default(),
         engram_type: cell_text(r, 6).unwrap_or_default(),
         status: cell_text(r, 7).unwrap_or_default(),
+    }
+}
+
+/// Whether one reference row resolves, read in one actor's view, as one SQL
+/// expression per reference table. `None` when nobody is named, which is what
+/// keeps every statement below byte for byte the one that was there.
+///
+/// The Turso twin, predicate for predicate; see that one for what the two arms
+/// of the `CASE` mean.
+fn view_verdicts(
+    actor: Option<&str>,
+    params: &mut Vec<Param>,
+    n: &mut usize,
+) -> Option<(String, String)> {
+    let actor = actor?;
+    let dst_screen = search::actor_screen_on("dst", Some(actor), params, n);
+    let drafts = search::drafts_only_on("e", actor, params, n);
+    let verdict = |alias: &str| {
+        let reach = reference_match(alias, ReferenceCandidates::DraftsOnly { screen: &drafts });
+        // `tgt` is the bound row, read for its address alone; `dst` beside it
+        // is the screen that says what this reader holds there.
+        format!(
+            "CASE WHEN {alias}.to_id IS NOT NULL THEN EXISTS (\
+             SELECT 1 FROM engram tgt \
+             JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+               AND {dst_screen} \
+             WHERE tgt.id = {alias}.to_id) \
+             ELSE ({reach} IS NOT NULL) END"
+        )
+    };
+    Some((verdict("r"), verdict("l")))
+}
+
+/// [`view_verdicts`] as the integer flag `outbound_refs` selects, one per
+/// table. The wrapping `CASE` is what keeps the column an integer here, where
+/// a bare `EXISTS` is a boolean.
+fn actor_verdicts(actor: Option<&str>, params: &mut Vec<Param>, n: &mut usize) -> (String, String) {
+    match view_verdicts(actor, params, n) {
+        None => (
+            "CASE WHEN r.to_id IS NULL THEN 0 ELSE 1 END".to_string(),
+            "CASE WHEN l.to_id IS NULL THEN 0 ELSE 1 END".to_string(),
+        ),
+        Some((rel, link)) => (
+            format!("CASE WHEN {rel} THEN 1 ELSE 0 END"),
+            format!("CASE WHEN {link} THEN 1 ELSE 0 END"),
+        ),
+    }
+}
+
+/// [`view_verdicts`] as the predicate `unresolved_refs` filters on, one per
+/// table: a row is in the queue exactly when it does not resolve.
+fn pending_predicates(
+    actor: Option<&str>,
+    params: &mut Vec<Param>,
+    n: &mut usize,
+) -> (String, String) {
+    match view_verdicts(actor, params, n) {
+        None => ("r.to_id IS NULL".to_string(), "l.to_id IS NULL".to_string()),
+        Some((rel, link)) => (format!("NOT ({rel})"), format!("NOT ({link})")),
     }
 }
 
@@ -970,7 +1034,7 @@ impl Store for PostgresStore {
             "UPDATE relation SET to_id = {resolved} \
              WHERE relation.to_id IS NULL AND relation.domain_id = $1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("relation")
+            resolved = reference_match("relation", ReferenceCandidates::Base)
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -988,7 +1052,7 @@ impl Store for PostgresStore {
             "UPDATE link SET to_id = {resolved} \
              WHERE link.to_id IS NULL AND link.domain_id = $1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("link")
+            resolved = reference_match("link", ReferenceCandidates::Base)
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -997,6 +1061,54 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
         Ok(done.rows_affected())
+    }
+
+    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "a reference pass over an actor's own rows must name that actor; the empty \
+                 actor is the base row's own key"
+                    .to_string(),
+            ));
+        }
+        let mut conn = self.acquire().await?;
+        let mut bound = 0u64;
+        for table in ["relation", "link"] {
+            // What dangles is unbound. A `to_id` naming a row nobody holds any
+            // more is the trace of a draft that went away, and the existence
+            // probe deliberately asks about every actor's rows: whose the
+            // vanished row was does not change that this one now points at
+            // nothing.
+            let dangling = format!(
+                "UPDATE {table} SET to_id = NULL WHERE domain_id = $1 AND to_id IS NOT NULL \
+                 AND engram_id IN (SELECT id FROM engram WHERE domain_id = $1 AND actor = $2) \
+                 AND NOT EXISTS (SELECT 1 FROM engram t WHERE t.id = {table}.to_id)"
+            );
+            exec(
+                conn.as_mut(),
+                &dangling,
+                vec![Param::Int(domain.0), Param::Text(actor.to_string())],
+            )
+            .await?;
+            // Then what is pending is bound, in this actor's own view.
+            let mut params = vec![Param::Int(domain.0), Param::Text(actor.to_string())];
+            let mut n = 3usize;
+            let actor_screen = search::actor_screen_on("e", Some(actor), &mut params, &mut n);
+            let view = reference_match(
+                table,
+                ReferenceCandidates::View {
+                    screen: &actor_screen,
+                },
+            );
+            let sql = format!(
+                "UPDATE {table} SET to_id = {view} \
+                 WHERE {table}.to_id IS NULL AND {table}.domain_id = $1 \
+                 AND {table}.engram_id IN (SELECT id FROM engram WHERE domain_id = $1 AND actor = $2) \
+                 AND {view} IS NOT NULL"
+            );
+            bound += exec(conn.as_mut(), &sql, params).await?;
+        }
+        Ok(bound)
     }
 
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
@@ -1512,31 +1624,47 @@ impl Store for PostgresStore {
         Ok(InboundPage { total, types, hits })
     }
 
-    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>> {
+    async fn outbound_refs(
+        &self,
+        engram_id: EngramId,
+        actor: Option<&str>,
+    ) -> Result<Vec<OutboundRef>> {
         // Relation rows then link rows for one engram, each row decoded
         // identically: line, kind discriminator, rel_type (NULL for a link),
         // target text, target domain and a resolved flag derived from whether the
         // forward reference has been bound to a `to_id`. The integer literals are
         // cast to `int8` so `cell_i64` decodes them; ordered by source line.
+        //
+        // With an actor the flag is derived in that actor's view instead, and
+        // the stored column is left exactly as it is: this is a reading of one
+        // row by one reader, never a rebinding.
+        let mut params = vec![Param::Int(engram_id.0)];
+        let mut n = 2usize;
+        let (rel_resolved, link_resolved) = actor_verdicts(actor, &mut params, &mut n);
         let mut conn = self.acquire().await?;
-        let rows = sqlx::query(
-            "SELECT r.line AS line, 0::int8 AS kind, r.rel_type, r.to_target, r.to_domain, \
-                    (CASE WHEN r.to_id IS NULL THEN 0 ELSE 1 END)::int8 AS resolved \
+        let rows = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT r.line AS line, 0::int8 AS kind, r.rel_type, r.to_target, r.to_domain, \
+                    ({rel_resolved})::int8 AS resolved \
              FROM relation r WHERE r.engram_id=$1 \
              UNION ALL \
              SELECT l.line, 1::int8, NULL, l.to_target, l.to_domain, \
-                    (CASE WHEN l.to_id IS NULL THEN 0 ELSE 1 END)::int8 \
+                    ({link_resolved})::int8 \
              FROM link l WHERE l.engram_id=$1 \
-             ORDER BY line",
+             ORDER BY line"
+            ),
+            params,
         )
-        .bind(engram_id.0)
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
+        .await?;
         Ok(rows.iter().map(outbound_ref_from_row).collect())
     }
 
-    async fn unresolved_refs(&self, domain: DomainId) -> Result<Vec<UnresolvedRef>> {
+    async fn unresolved_refs(
+        &self,
+        domain: DomainId,
+        actor: Option<&str>,
+    ) -> Result<Vec<UnresolvedRef>> {
         // The Turso query, column for column. The kind discriminator is cast to
         // `int8` so `cell_i64` decodes it (a bare integer literal is `int4`), and
         // the prose arm reports `links_to`, the same relation type the graph gives
@@ -1551,25 +1679,34 @@ impl Store for PostgresStore {
         // different orders on any domain with a mixed-case path. Turso keeps the
         // flat form because BINARY is already its default. The sort is (path,
         // line, kind, target) on both.
+        //
+        // With an actor the source join carries their screen and "is this
+        // dangling" is asked in their view rather than off the stored column,
+        // exactly as in the Turso twin.
+        let mut params = vec![Param::Int(domain.0)];
+        let mut n = 2usize;
+        let src_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
+        let (rel_pending, link_pending) = pending_predicates(actor, &mut params, &mut n);
         let mut conn = self.acquire().await?;
-        let rows = sqlx::query(
-            "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path \
+        let rows = query_all(
+            conn.as_mut(),
+            &format!(
+                "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path \
              FROM ( \
                SELECT r.engram_id, 0::int8 AS kind, r.rel_type, r.to_domain, r.to_target, \
                       r.line, e.path \
                FROM relation r JOIN engram e ON e.id=r.engram_id \
-               WHERE e.actor = '' AND r.to_id IS NULL AND r.domain_id=$1 \
+               WHERE {src_screen} AND {rel_pending} AND r.domain_id=$1 \
                UNION ALL \
                SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path \
                FROM link l JOIN engram e ON e.id=l.engram_id \
-               WHERE e.actor = '' AND l.to_id IS NULL AND l.domain_id=$1 \
+               WHERE {src_screen} AND {link_pending} AND l.domain_id=$1 \
              ) u \
-             ORDER BY u.path COLLATE \"C\", u.line, u.kind, u.to_target COLLATE \"C\"",
+             ORDER BY u.path COLLATE \"C\", u.line, u.kind, u.to_target COLLATE \"C\""
+            ),
+            params,
         )
-        .bind(domain.0)
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
+        .await?;
         Ok(rows.iter().map(unresolved_ref_from_row).collect())
     }
 
@@ -2239,7 +2376,7 @@ impl Store for PostgresStore {
         Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
     }
 
-    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {
+    async fn vocabulary(&self, domain: Option<&str>, actor: Option<&str>) -> Result<Vocabulary> {
         // Six grouped scans mirroring the Turso backend exactly: engram tags,
         // observation tags, observation categories, relation types and the
         // engram `type` and `status` columns. When a domain is named each
@@ -2247,7 +2384,25 @@ impl Store for PostgresStore {
         // unknown name matches no rows and the vocabulary comes back empty. The
         // maps are merged and every vector sorted in Rust (see
         // `build_vocabulary`) so the order does not depend on SQL grouping.
-        let dparam = || match domain {
+        //
+        // All six carry the same screen, and with no actor it is the base
+        // predicate each of them always carried. The domain name binds first
+        // when there is one, so the screen's own placeholder falls after it.
+        let mut screen_params: Vec<Param> = Vec::new();
+        let mut n = if domain.is_some() { 2usize } else { 1usize };
+        let actor_screen = search::actor_screen_on("e", actor, &mut screen_params, &mut n);
+        let dparam = || {
+            let mut out = match domain {
+                Some(d) => vec![Param::Text(d.to_string())],
+                None => vec![],
+            };
+            out.extend(screen_params.iter().cloned());
+            out
+        };
+        // The alias scan names no engram, so it takes the domain name alone:
+        // handing it the screen's placeholder would bind a parameter its text
+        // never mentions.
+        let dname = || match domain {
             Some(d) => vec![Param::Text(d.to_string())],
             None => vec![],
         };
@@ -2263,48 +2418,64 @@ impl Store for PostgresStore {
         };
 
         let engram_tag_sql = if domain.is_some() {
-            "SELECT t.name, COUNT(*) FROM engram_tag et \
+            format!(
+                "SELECT t.name, COUNT(*) FROM engram_tag et \
              JOIN tag t ON t.id=et.tag_id \
              JOIN engram e ON e.id=et.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND d.name=$1 GROUP BY t.id"
+             WHERE {actor_screen} AND d.name=$1 GROUP BY t.id"
+            )
         } else {
-            "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
+            format!(
+                "SELECT t.name, COUNT(*) FROM engram_tag et JOIN tag t ON t.id=et.tag_id \
              JOIN engram e ON e.id=et.engram_id \
-             WHERE e.actor = '' GROUP BY t.id"
+             WHERE {actor_screen} GROUP BY t.id"
+            )
         };
         let obs_tag_sql = if domain.is_some() {
-            "SELECT t.name, COUNT(*) FROM observation_tag ot \
+            format!(
+                "SELECT t.name, COUNT(*) FROM observation_tag ot \
              JOIN tag t ON t.id=ot.tag_id \
              JOIN observation o ON o.id=ot.observation_id \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND d.name=$1 GROUP BY t.id"
+             WHERE {actor_screen} AND d.name=$1 GROUP BY t.id"
+            )
         } else {
-            "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
+            format!(
+                "SELECT t.name, COUNT(*) FROM observation_tag ot JOIN tag t ON t.id=ot.tag_id \
              JOIN observation o ON o.id=ot.observation_id \
              JOIN engram e ON e.id=o.engram_id \
-             WHERE e.actor = '' GROUP BY t.id"
+             WHERE {actor_screen} GROUP BY t.id"
+            )
         };
         let category_sql = if domain.is_some() {
-            "SELECT o.category, COUNT(*) FROM observation o \
+            format!(
+                "SELECT o.category, COUNT(*) FROM observation o \
              JOIN engram e ON e.id=o.engram_id \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND o.category <> '' AND d.name=$1 GROUP BY o.category"
+             WHERE {actor_screen} AND o.category <> '' AND d.name=$1 GROUP BY o.category"
+            )
         } else {
-            "SELECT o.category, COUNT(*) FROM observation o \
+            format!(
+                "SELECT o.category, COUNT(*) FROM observation o \
              JOIN engram e ON e.id=o.engram_id \
-             WHERE o.category <> '' AND e.actor = '' GROUP BY o.category"
+             WHERE o.category <> '' AND {actor_screen} GROUP BY o.category"
+            )
         };
         let rel_sql = if domain.is_some() {
-            "SELECT r.rel_type, COUNT(*) FROM relation r \
+            format!(
+                "SELECT r.rel_type, COUNT(*) FROM relation r \
              JOIN domain d ON d.id=r.domain_id \
              JOIN engram e ON e.id=r.engram_id \
-             WHERE d.name=$1 AND e.actor = '' GROUP BY r.rel_type"
+             WHERE d.name=$1 AND {actor_screen} GROUP BY r.rel_type"
+            )
         } else {
-            "SELECT r.rel_type, COUNT(*) FROM relation r \
+            format!(
+                "SELECT r.rel_type, COUNT(*) FROM relation r \
              JOIN engram e ON e.id=r.engram_id \
-             WHERE e.actor = '' GROUP BY r.rel_type"
+             WHERE {actor_screen} GROUP BY r.rel_type"
+            )
         };
         // The engram `type` and `status` columns, counted as stored: no folding
         // of `stable` and `current` and no retirement filter, because this
@@ -2312,20 +2483,28 @@ impl Store for PostgresStore {
         // guard matches the category scan; both columns default to `''`, and a
         // nameless entry would say nothing.
         let type_sql = if domain.is_some() {
-            "SELECT e.engram_type, COUNT(*) FROM engram e \
+            format!(
+                "SELECT e.engram_type, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND e.engram_type <> '' AND d.name=$1 GROUP BY e.engram_type"
+             WHERE {actor_screen} AND e.engram_type <> '' AND d.name=$1 GROUP BY e.engram_type"
+            )
         } else {
-            "SELECT e.engram_type, COUNT(*) FROM engram e \
-             WHERE e.actor = '' AND e.engram_type <> '' GROUP BY e.engram_type"
+            format!(
+                "SELECT e.engram_type, COUNT(*) FROM engram e \
+             WHERE {actor_screen} AND e.engram_type <> '' GROUP BY e.engram_type"
+            )
         };
         let status_sql = if domain.is_some() {
-            "SELECT e.status, COUNT(*) FROM engram e \
+            format!(
+                "SELECT e.status, COUNT(*) FROM engram e \
              JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND e.status <> '' AND d.name=$1 GROUP BY e.status"
+             WHERE {actor_screen} AND e.status <> '' AND d.name=$1 GROUP BY e.status"
+            )
         } else {
-            "SELECT e.status, COUNT(*) FROM engram e \
-             WHERE e.actor = '' AND e.status <> '' GROUP BY e.status"
+            format!(
+                "SELECT e.status, COUNT(*) FROM engram e \
+             WHERE {actor_screen} AND e.status <> '' GROUP BY e.status"
+            )
         };
         // The last scan surfaces the derived tag aliases in effect. Scoped by
         // domain name like the counts; `build_vocabulary` dedupes and sorts.
@@ -2337,13 +2516,13 @@ impl Store for PostgresStore {
         };
 
         let mut conn = self.acquire().await?;
-        let engram_tags = decode(&query_all(conn.as_mut(), engram_tag_sql, dparam()).await?);
-        let observation_tags = decode(&query_all(conn.as_mut(), obs_tag_sql, dparam()).await?);
-        let categories = decode(&query_all(conn.as_mut(), category_sql, dparam()).await?);
-        let relation_types = decode(&query_all(conn.as_mut(), rel_sql, dparam()).await?);
-        let types = decode(&query_all(conn.as_mut(), type_sql, dparam()).await?);
-        let statuses = decode(&query_all(conn.as_mut(), status_sql, dparam()).await?);
-        let aliases: Vec<(String, String)> = query_all(conn.as_mut(), alias_sql, dparam())
+        let engram_tags = decode(&query_all(conn.as_mut(), &engram_tag_sql, dparam()).await?);
+        let observation_tags = decode(&query_all(conn.as_mut(), &obs_tag_sql, dparam()).await?);
+        let categories = decode(&query_all(conn.as_mut(), &category_sql, dparam()).await?);
+        let relation_types = decode(&query_all(conn.as_mut(), &rel_sql, dparam()).await?);
+        let types = decode(&query_all(conn.as_mut(), &type_sql, dparam()).await?);
+        let statuses = decode(&query_all(conn.as_mut(), &status_sql, dparam()).await?);
+        let aliases: Vec<(String, String)> = query_all(conn.as_mut(), alias_sql, dname())
             .await?
             .iter()
             .map(|r| {

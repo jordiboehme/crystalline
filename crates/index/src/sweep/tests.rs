@@ -58,6 +58,7 @@ fn node_of(f: &EngramFacts) -> GraphNode {
         engram_type: f.engram_type.clone(),
         salience: f.salience,
         status: f.status.clone(),
+        actor: String::new(),
     }
 }
 

@@ -46,7 +46,7 @@
 //! and `actor` must additionally be a single segment, since neither names a
 //! tree.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -627,6 +627,9 @@ pub async fn restore_into(
     chunk_params: &ChunkParams,
 ) -> crystalline_index::Result<u64> {
     let mut restored = 0u64;
+    // Whose rows came back, so the trailing pass below runs once per actor in
+    // that actor's own view rather than once for the domain in nobody's.
+    let mut restored_actors: BTreeSet<String> = BTreeSet::new();
     let read = journal_entries(state_dir, domain_name);
     if read.unreadable {
         tracing::warn!(
@@ -687,16 +690,21 @@ pub async fn restore_into(
             }
         }
         restored += 1;
+        restored_actors.insert(entry.actor.clone());
     }
     // The restored rows' relations and links point at engrams that are already
     // in the index, so they resolve now rather than waiting for a write that
-    // may never come. Runs only when something was restored, and it is what
+    // may never come. Runs only where something was restored, and it is what
     // keeps the two callers equal: the engine's sync pass has a trailing
     // `resolve_forward_refs` that a restored row would ride on, and the CLI's
     // reindex has already run its own by the time the restore happens.
-    if restored > 0 {
-        store.resolve_pending_relations(domain).await?;
-        store.resolve_pending_links(domain).await?;
+    //
+    // Once per actor, in that actor's own view, because that is how the rows
+    // were written: a restore that resolved them against the base alone would
+    // rebuild a draft's links onto the pages it was NOT reading, and the
+    // mirror exists precisely so a wiped index comes back saying what it said.
+    for actor in restored_actors {
+        store.reresolve_actor_references(domain, &actor).await?;
     }
     Ok(restored)
 }
