@@ -1053,6 +1053,21 @@ pub const OVERLAY_NEEDS_IDENTITY: &str = "this domain reviews changes before the
 /// this refusal is not a wall, it is a fork, and it names both ways through -
 /// join the draft and the writing lands in its author's overlay where they
 /// will see it, or write your own and it lands in yours, where it always did.
+/// What somebody working inside a shared draft is told when they reach for a
+/// file that draft does not carry.
+///
+/// A fork rather than a wall, like [`granted_needs_join`] beside it, and it
+/// names the file: the two ways forward are asking the person whose work it is,
+/// which is the only way somebody else's staged file should ever change, and
+/// drafting one's own copy, which needs nobody's permission.
+pub fn joined_files_are_the_drafts(owner: &str, draft: &str, path: &str) -> String {
+    format!(
+        "this session is working inside {owner}'s draft of '{draft}', and a join carries that \
+         page and the files it points at - '{path}' is neither. It is somebody else's work: ask \
+         its author to change it, or draft your own copy in your own overlay."
+    )
+}
+
 pub fn granted_needs_join(owner: &str, path: &str) -> String {
     format!(
         "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step.          Join the draft and your changes land in {owner}'s copy, where {owner} reviews them; or          draft your own copy in your own overlay and leave theirs as it stands."
@@ -4314,6 +4329,104 @@ impl Engine {
         Ok(None)
     }
 
+    /// What a join may do to the OWNER's files, and what it may not.
+    ///
+    /// A join is into one page. The files overlay is not that page, so without
+    /// a rule here a session joined to one draft would hold a write capability
+    /// over every attachment its owner has - able to overwrite a picture staged
+    /// for a different draft of theirs, or to stage their deletion of a file the
+    /// team reviewed, to be folded later under their name. That is the one
+    /// cross-account write capability in the system, so it is bounded to the
+    /// work that was actually shared.
+    ///
+    /// **A join carries the granted engram and the attachments that engram
+    /// references**, and the two things that follow are the whole of the rule:
+    ///
+    /// * a path that stands nowhere - not in the folder the team reviewed and
+    ///   not in the owner's own overlay - may be created, because adding an
+    ///   illustration to the page you were invited into is the reason a join
+    ///   reaches the files at all;
+    /// * a path the granted draft references **at this moment** may be
+    ///   overwritten or deleted, because a page and the pictures it shows are
+    ///   one piece of work.
+    ///
+    /// Everything else is refused, in words that name the file and the two ways
+    /// forward. "At this moment" is deliberate and is why the draft is read
+    /// here rather than at join time: the reference set is whatever the shared
+    /// page says now, so a joiner who adds a reference and then uploads to it
+    /// is inside the rule, and one whose reference was removed by the author is
+    /// outside it again.
+    ///
+    /// A join whose draft has gone carries no references at all, so only the
+    /// create arm stays open - which is the same answer the freshness check
+    /// gives everywhere else, reached by the same reasoning.
+    async fn screen_joined_attachment(
+        &self,
+        domain: &str,
+        path: &str,
+        join: &crate::join::Join,
+        deleting: bool,
+    ) -> Result<()> {
+        let referenced = match self
+            .overlay_draft_at(domain, &join.owner, &join.path)
+            .await?
+        {
+            Some(draft) => parse_engram(&draft.content)
+                .map(|engram| crystalline_core::find_asset_refs(&engram.body))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if referenced.iter().any(|reference| reference == path) {
+            return Ok(());
+        }
+        // A deletion has no create arm: there is nothing to make at a path
+        // nothing stands at, and `attachment_delete_in` answers that miss on
+        // its own.
+        if !deleting
+            && !self
+                .anybody_holds_attachment(domain, &join.owner, path)
+                .await?
+        {
+            return Ok(());
+        }
+        Err(EngineError::Refused(joined_files_are_the_drafts(
+            &join.owner,
+            &join.path,
+            path,
+        )))
+    }
+
+    /// Whether anything stands at one attachment path as far as a join is
+    /// concerned: the folder the team reviewed, or the owner's own files
+    /// overlay.
+    ///
+    /// Both halves, because either one makes the path somebody else's work. A
+    /// path the owner has DELETED in their overlay still counts as standing,
+    /// since the file is in the folder and their deletion of it is a draft
+    /// change of theirs - which is exactly the kind of decision a join into a
+    /// different page must not reach around.
+    async fn anybody_holds_attachment(
+        &self,
+        domain: &str,
+        owner: &str,
+        path: &str,
+    ) -> Result<bool> {
+        match self.attachment_delete_size(domain, path).await {
+            Ok(_) => return Ok(true),
+            Err(EngineError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let state_dir = self.journal_state_dir()?;
+        match crate::overlay_files::held(&state_dir, domain, owner, path) {
+            Ok(crate::overlay_files::Held::Nothing) => Ok(false),
+            Ok(_) => Ok(true),
+            // A path this substrate refuses is one the write verb refuses a
+            // line later in words the caller already knows, so this screen
+            // says nothing about it and lets that refusal happen.
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Refuse a write that is inside the wrong draft, or inside one this
     /// caller may see and has not joined.
     ///
@@ -4770,13 +4883,20 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let view = DomainView::for_write_joined(self, domain, scope, join).await?;
-        // The no-join half of the screen only. A join is into one DRAFT, and
-        // an attachment does not stand at the draft's path - it stands beside
-        // it, in the files overlay - so the path equality the save enforces
-        // would refuse every upload made inside a join, which is the one thing
-        // a join is supposed to make possible.
-        if view.joined().is_none() {
-            self.screen_granted_path(domain, path, scope, None).await?;
+        // Two different screens, because a join and a grant bound two
+        // different things. An attachment does not stand at the draft's path -
+        // it stands beside it, in the files overlay - so the path equality the
+        // save enforces would refuse every upload made inside a join, which is
+        // the one thing a join is supposed to make possible. What bounds a
+        // JOINED write is which files the granted page carries; see
+        // [`Engine::screen_joined_attachment`]. What bounds an unjoined one is
+        // the grant, exactly as it bounds a save.
+        match (view.joined(), join) {
+            (Some(_), Some(join)) => {
+                self.screen_joined_attachment(domain, path, join, false)
+                    .await?
+            }
+            _ => self.screen_granted_path(domain, path, scope, None).await?,
         }
         self.attachment_write_in(&view, path, bytes).await
     }
@@ -4840,9 +4960,16 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let view = DomainView::for_write_joined(self, domain, scope, join).await?;
-        // The no-join half only, for the reason the upload gives.
-        if view.joined().is_none() {
-            self.screen_granted_path(domain, path, scope, None).await?;
+        // The same pair of screens the upload makes, and ahead of the delete
+        // rather than inside it: the deletion marker is what a fold would
+        // carry out, so a refused deletion that had staged one anyway would be
+        // a deletion nobody refused.
+        match (view.joined(), join) {
+            (Some(_), Some(join)) => {
+                self.screen_joined_attachment(domain, path, join, true)
+                    .await?
+            }
+            _ => self.screen_granted_path(domain, path, scope, None).await?,
         }
         self.attachment_delete_in(&view, path).await
     }

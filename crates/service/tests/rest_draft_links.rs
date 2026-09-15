@@ -38,6 +38,10 @@ struct Fixture {
     /// account may see without going through an admin screen this fixture has
     /// no admin for.
     auth: Arc<AuthStore>,
+    /// The instance root, so a test can look at the overlay tree itself: some
+    /// of what these routes must NOT do is only visible on disk, as a
+    /// deletion marker that was never written.
+    root: std::path::PathBuf,
     /// Held for the test's duration: every successful write marks its domain
     /// pending under the state directory, which this redirects into a scratch
     /// home. See `support::ScratchStateDir`.
@@ -53,6 +57,11 @@ async fn serve() -> Fixture {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("MANIFEST.md"), MANIFEST).unwrap();
     std::fs::write(dir.join("plan.md"), PLAN).unwrap();
+    // Two files the team reviewed, so a test can ask what a join may do to
+    // somebody else's attachments as well as to its own.
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    std::fs::write(dir.join("assets/shared.png"), b"the team's picture").unwrap();
+    std::fs::write(dir.join("assets/other.png"), b"another of the team's").unwrap();
 
     let mut entry = DomainEntry::file(dir);
     entry.review = Some(ReviewMode::Overlay);
@@ -113,6 +122,7 @@ async fn serve() -> Fixture {
         addr,
         engine,
         auth,
+        root,
         _state: state,
         _tmp: tmp,
     }
@@ -1170,4 +1180,235 @@ async fn a_grant_does_not_outlive_the_grantees_access_to_the_domain() {
         404,
         "and the link itself opens nothing either"
     );
+}
+
+/// The draft alice shares in the attachment tests: it references exactly one of
+/// the team's two files, which is what makes "referenced" and "not referenced"
+/// two different questions about one join.
+const ILLUSTRATED: &str = "A page only alice has.\n\n![Shot](assets/shared.png)\n";
+
+impl Fixture {
+    /// Alice drafts an illustrated page, shares it, and bob joins: the state
+    /// every attachment test below starts from. Answers bob's join key.
+    async fn joined_to_an_illustrated_draft(&self, alice: &Session, bob: &Session) -> String {
+        let path = self.draft("alice", "Fresh", ILLUSTRATED).await;
+        let token = self.mint(alice, &path).await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let joined: serde_json::Value = bob
+            .request(self.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+            .json(&serde_json::json!({"token": token}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        joined["join_key"].as_str().unwrap().to_string()
+    }
+
+    /// Whether alice's files overlay holds a deletion marker at `path`.
+    fn owner_tombstoned(&self, path: &str) -> bool {
+        self.root
+            .join("state/overlays/team/alice/files")
+            .join(format!("{path}.tombstone"))
+            .exists()
+    }
+}
+
+/// A join carries the page and the files that page points at, and stops there.
+///
+/// Adding an illustration to the draft you were invited into is the whole
+/// reason a join reaches the files overlay at all, so a file that stands
+/// nowhere yet is a file the join may make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_upload_of_a_new_file_lands_in_the_owners_overlay() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let key = f.joined_to_an_illustrated_draft(&alice, &bob).await;
+
+    let uploaded = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/files/assets/sketch.png",
+        )
+        .header("x-crystalline-join", &key)
+        .header("content-type", "image/png")
+        .body(b"bob's addition".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        uploaded.status(),
+        200,
+        "a path nothing stands at is the join's to make: {:?}",
+        uploaded.text().await
+    );
+    let hers: serde_json::Value = alice
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/attachments",
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        hers.to_string().contains("assets/sketch.png"),
+        "and it lands in the owner's overlay, to be folded with her draft: {hers}"
+    );
+}
+
+/// Replacing the picture the shared draft actually shows is the other half of
+/// what a join is for: the page and its own illustrations are one piece of
+/// work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_overwrite_of_a_referenced_attachment_lands() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let key = f.joined_to_an_illustrated_draft(&alice, &bob).await;
+
+    let replaced = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/files/assets/shared.png",
+        )
+        .header("x-crystalline-join", &key)
+        .header("content-type", "image/png")
+        .body(b"a clearer version".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        replaced.status(),
+        200,
+        "the draft points at this file, so it is part of what was shared: {:?}",
+        replaced.text().await
+    );
+    let bytes = alice
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/files/assets/shared.png",
+        )
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        b"a clearer version",
+        "and alice's own view of it is the replacement, held as her draft"
+    );
+}
+
+/// A join is not the run of somebody else's overlay.
+///
+/// The file the shared draft does not point at is another piece of work
+/// entirely - it may be staged for a different draft of alice's, or it may be
+/// the team's - and a join into one page must not be a way to overwrite it
+/// under her name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_overwrite_of_an_unreferenced_path_refuses() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let key = f.joined_to_an_illustrated_draft(&alice, &bob).await;
+
+    let refused = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/files/assets/other.png",
+        )
+        .header("x-crystalline-join", &key)
+        .header("content-type", "image/png")
+        .body(b"bob rewrites the team's file".to_vec())
+        .send()
+        .await
+        .unwrap();
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("assets/other.png") && detail.contains("ask its author"),
+        "the refusal names the file and the two ways forward: {problem}"
+    );
+    let bytes = alice
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/files/assets/other.png",
+        )
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        b"another of the team's",
+        "and the file is as the team left it"
+    );
+}
+
+/// And a join is certainly not a way to delete the team's files under somebody
+/// else's name.
+///
+/// The marker is what would be folded, so the assertion is about the tree
+/// rather than about the status: a deletion that was refused and staged anyway
+/// would be a deletion nobody refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_delete_of_an_unreferenced_file_refuses_and_leaves_no_tombstone() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let key = f.joined_to_an_illustrated_draft(&alice, &bob).await;
+
+    let refused = bob
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            "/api/v1/domains/team/files/assets/other.png",
+        )
+        .header("x-crystalline-join", &key)
+        .send()
+        .await
+        .unwrap();
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("assets/other.png"),
+        "refused, in words naming the file: {problem}"
+    );
+    assert!(
+        !f.owner_tombstoned("assets/other.png"),
+        "and nothing was staged under her name for the fold to carry out"
+    );
+    let bytes = alice
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/files/assets/other.png",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bytes.status(), 200, "the file is still there for her");
 }
