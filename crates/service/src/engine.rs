@@ -2502,25 +2502,68 @@ impl Engine {
         // The read-only id lookup, never an upserting one: a domain this index
         // has never been told about holds no drafts, and asking must not
         // register one.
-        let (domain_id, held) = {
+        let (domain_id, mut held) = {
             let store = self.store.lock().await;
             let Some(domain_id) = store.domain_id(domain).await? else {
                 return Ok(ConvergenceReport::default());
             };
-            let mut held: Vec<(String, Vec<StoredEngram>)> = Vec::new();
+            let mut held: Vec<ActorHolding> = Vec::new();
             for (actor, _) in store.overlay_counts(domain_id).await? {
                 let entries = store.overlay_entries(domain_id, &actor).await?;
-                held.push((actor, entries));
+                held.push(ActorHolding {
+                    actor,
+                    entries,
+                    files: Vec::new(),
+                });
             }
             (domain_id, held)
         };
+        // The files beside the rows, and the actor set is their UNION: an actor
+        // holding nothing but files is in no `overlay_counts` answer, so a pass
+        // drawn from the rows alone would never look at their files at all -
+        // neither to clear one the team has caught up with nor to record the
+        // conflict when it has not.
+        //
+        // A files overlay that could not be read is not an empty one, so this
+        // pass leaves those actors' files exactly where they stand rather than
+        // reporting them settled; the rows still converge, and the next pull
+        // looks again.
+        if let Some(files) = self.overlay_files_by_actor(domain) {
+            for (actor, read) in files {
+                if read.unreadable {
+                    tracing::warn!(
+                        domain,
+                        actor = actor.as_str(),
+                        "the files '{actor}' has drafted could not be listed, so this pull \
+                         converged their rows and left their files where they stand"
+                    );
+                    continue;
+                }
+                match held.iter_mut().find(|holding| holding.actor == actor) {
+                    Some(holding) => holding.files = read.entries,
+                    None => held.push(ActorHolding {
+                        actor,
+                        entries: Vec::new(),
+                        files: read.entries,
+                    }),
+                }
+            }
+        }
+        // **Two state directories, and they are not interchangeable.**
+        // `state_dir` above is this domain's own origin state, which is where
+        // the base snapshot's copies live; `journal_dir` is the machine's
+        // overlay root, which is where the drafts and their files live. A read
+        // of one under the other finds nothing and says so quietly.
         let journal_dir = self.journal_state_dir()?;
         let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
         // A conflict in a draft nobody holds any more is not a conflict. The
         // prune runs whatever the pass then decides, so an actor whose rows all
         // went away leaves no entry behind either.
         prune_settled_conflicts(&mut record, &held);
-        if held.iter().all(|(_, entries)| entries.is_empty()) {
+        if held
+            .iter()
+            .all(|holding| holding.entries.is_empty() && holding.files.is_empty())
+        {
             record.cleared = 0;
             let report = ConvergenceReport {
                 cleared: 0,
@@ -2533,7 +2576,12 @@ impl Engine {
         let addresses = pulled_addresses(&state_dir, &touched)?;
 
         let mut cleared = 0u64;
-        for (actor, entries) in &held {
+        for ActorHolding {
+            actor,
+            entries,
+            files,
+        } in &held
+        {
             // Named here because convergence answers to nobody: it is a
             // comparison of the base snapshot against each actor's entries, so
             // it reads BOTH sides raw and never through a projection of one
@@ -2579,6 +2627,39 @@ impl Engine {
                             }
                         }
                     }
+                }
+            }
+            // And their files, in the same pass and into the same record: a
+            // conflict is one actor's conflict at one path, whatever kind of
+            // thing stands there.
+            for file in files {
+                let base = crystalline_remote::state::read_base_file(&state_dir, &file.path)?;
+                let bytes = if file.tombstone {
+                    None
+                } else {
+                    crate::overlay_files::read(&journal_dir, domain, actor, &file.path).map_err(
+                        |source| EngineError::Io {
+                            path: format!("the files overlay of '{domain}' at '{}'", file.path),
+                            source,
+                        },
+                    )?
+                };
+                match settle_overlay_file(file, base.as_deref(), bytes.as_deref(), &touched) {
+                    Settle::Clear => {
+                        crate::overlay_files::clear(&journal_dir, domain, actor, &file.path)
+                            .map_err(|source| EngineError::Io {
+                                path: format!("the files overlay of '{domain}' at '{}'", file.path),
+                                source,
+                            })?;
+                        record.settle(actor, &file.path);
+                        cleared += 1;
+                    }
+                    Settle::Diverge => record.diverge(actor, &file.path),
+                    // A file answers to no address, so no rename can carry one:
+                    // `settle_overlay_file` never answers `MoveTo`, and if it
+                    // ever did the honest thing would be to leave the bytes
+                    // where their author put them.
+                    Settle::Leave | Settle::MoveTo(_) => {}
                 }
             }
             // Once this actor's entries have settled, their references are read
@@ -4324,8 +4405,15 @@ impl Engine {
                 bytes.len() as u64,
             )));
         }
-        if view.actor().is_some() {
+        if let Some(actor) = view.actor() {
             let row = view.put_file(path, &bytes).await?;
+            // The write IS the resolution, for a file. A conflict resolution
+            // settles an engram's markdown and `origin_resolve` says so to
+            // anybody who names an attachment path; what settles a file is
+            // uploading it again to keep your version or deleting it to take
+            // the team's, so both of those take the path out of the recorded
+            // conflicts on the way out.
+            self.settle_convergence(view.domain(), actor, path);
             crate::maintenance::record_pending(view.domain());
             return Ok(WrittenAttachment { row, draft: true });
         }
@@ -4367,8 +4455,11 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         validate_attachment_path(path)?;
-        if view.actor().is_some() {
+        if let Some(actor) = view.actor() {
             view.tombstone_file(path).await?;
+            // The other half of what settles a diverged file: see
+            // [`Engine::attachment_write_in`].
+            self.settle_convergence(view.domain(), actor, path);
             crate::maintenance::record_pending(view.domain());
             return Ok(true);
         }
@@ -18842,15 +18933,33 @@ fn proposal_number_of(receipt: &Value) -> Option<u64> {
 /// `held` is every actor with rows in this domain, and their rows.
 fn prune_settled_conflicts(
     record: &mut crate::overlay_journal::ConvergenceRecord,
-    held: &[(String, Vec<StoredEngram>)],
+    held: &[ActorHolding],
 ) {
     record.conflicts.retain(|actor, paths| {
-        let Some((_, entries)) = held.iter().find(|(who, _)| who == actor) else {
+        let Some(holding) = held.iter().find(|holding| &holding.actor == actor) else {
             return false;
         };
-        paths.retain(|at| entries.iter().any(|entry| &entry.path == at));
+        // Both lists, or a file conflict this pass recorded would be pruned by
+        // the next pull about something else: the entry IS still held, it is
+        // simply not a row. That is the window one tick wide this function's
+        // doc warns about, on the other kind of entry.
+        paths.retain(|at| {
+            holding.entries.iter().any(|entry| &entry.path == at)
+                || holding.files.iter().any(|file| &file.path == at)
+        });
         !paths.is_empty()
     });
+}
+
+/// Everything one actor holds in a domain's overlay: the rows they drafted and
+/// the files beside them.
+///
+/// One struct rather than a pair, because every reader of it needs both halves
+/// and a pair invited exactly the reading that dropped one of them.
+struct ActorHolding {
+    actor: String,
+    entries: Vec<StoredEngram>,
+    files: Vec<crate::overlay_files::FileEntry>,
 }
 
 /// What a pull leaves one overlay entry to be.
@@ -18918,7 +19027,47 @@ fn settle_overlay_entry(
     }
 }
 
-/// The addresses the base files a pull applied answer to, permalink to path.
+/// What one pull leaves one overlay FILE to be. Pure, beside
+/// [`settle_overlay_entry`] and answering the same four-way question with the
+/// two arms that cannot apply to a file left out.
+///
+/// `base` is the path's own bytes in the base snapshot AFTER the pull, `bytes`
+/// what this actor holds there (`None` for a deletion), and `touched` the paths
+/// the pull applied.
+///
+/// A file answers to no address, so there is no rename for it to follow and no
+/// address for another file to spend: the `MoveTo` and `elsewhere` arms of the
+/// row rule have nothing to read here. What is left is the pair that matters -
+/// the folder has caught up, or it has moved somewhere else.
+fn settle_overlay_file(
+    entry: &crate::overlay_files::FileEntry,
+    base: Option<&[u8]>,
+    bytes: Option<&[u8]>,
+    touched: &HashSet<&str>,
+) -> Settle {
+    let pulled = touched.contains(entry.path.as_str());
+    if entry.tombstone {
+        return match base {
+            // The team deleted it too, so the marker has nothing left to hide.
+            None => Settle::Clear,
+            Some(_) if pulled => Settle::Diverge,
+            Some(_) => Settle::Leave,
+        };
+    }
+    match (base, bytes) {
+        // The folder holds exactly these bytes now: the draft is the team's
+        // file, under any pull or none. Asked of every entry on every pass, so
+        // an author who uploads the team's own version again has it cleared by
+        // the next pass rather than left listed.
+        (Some(base), Some(bytes)) if base == bytes => Settle::Clear,
+        // The pull changed or removed what stood under this file, and what the
+        // actor holds is not it.
+        (_, _) if pulled => Settle::Diverge,
+        _ => Settle::Leave,
+    }
+}
+
+/// The addresses the base files a pull applied answer to, permalink to path./// The addresses the base files a pull applied answer to, permalink to path.
 ///
 /// Read from the base snapshot's own copies rather than the index rows, because
 /// this runs before the sync that refreshes those rows - in a share it runs

@@ -4134,6 +4134,184 @@ async fn a_merged_and_pulled_draft_converges_out_of_the_overlay() {
     assert_eq!(domain["my_drafts"], 1, "the count reads the rows: {status}");
 }
 
+/// What one actor's files overlay holds, as `(path, tombstone)` pairs ordered
+/// by path.
+fn files_held(tmp: &Path, actor: &str) -> Vec<(String, bool)> {
+    let dir = tmp.join("overlays/team").join(actor).join("files");
+    let mut out = Vec::new();
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, bool)>) {
+        let Ok(listed) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in listed.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.path().is_dir() {
+                walk(&entry.path(), &rel, out);
+            } else if let Some(base) = rel.strip_suffix(".tombstone") {
+                out.push((base.to_string(), true));
+            } else {
+                out.push((rel, false));
+            }
+        }
+    }
+    walk(&dir, "", &mut out);
+    out.sort();
+    out
+}
+
+/// A pull catches the folder up with a draft file, and the draft stops being
+/// one - both ways round.
+///
+/// A file whose bytes are now the team's own is settled exactly as a merged
+/// page is, and a deletion of a file the team has now deleted too is settled
+/// with nothing left to mark: a marker over a base nobody holds says nothing
+/// at all.
+#[tokio::test]
+async fn a_pull_converges_a_byte_equal_file_and_a_sidecar_of_a_gone_base_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/plan.md", team_plan()),
+            ("assets/old.png", OLD_PNG.to_vec()),
+        ],
+    )
+    .await;
+
+    file(&eng, "alice", "assets/deck.png", DECK_PNG).await;
+    delete_file(&eng, "alice", "assets/old.png").await;
+    assert_eq!(
+        files_held(tmp.path(), "alice"),
+        vec![
+            ("assets/deck.png".to_string(), false),
+            ("assets/old.png".to_string(), true),
+        ],
+        "both halves stand before the pull"
+    );
+
+    // The team merged her deck and deleted the old one.
+    let merged = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", team_plan()),
+        ("assets/deck.png", DECK_PNG.to_vec()),
+    ]));
+    mock.set_branch("main", &merged);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        files_held(tmp.path(), "alice"),
+        Vec::new(),
+        "the folder says what she said, so she is drafting neither of them now"
+    );
+    let status = eng
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let domain = &status["domains"][0];
+    assert_eq!(domain["converged"]["cleared"], 2, "{status}");
+    assert_eq!(domain["converged"]["diverged"], 0, "{status}");
+}
+
+/// The team changes a file under the actor drafting it, and that is their
+/// conflict and nobody else's - settled by the next write of the same path.
+#[tokio::test]
+async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    file(&eng, "alice", "assets/deck.png", DECK_PNG).await;
+    file(&eng, "bob", "assets/notes.png", DECK_PNG).await;
+
+    // Somebody else's deck landed at the same path instead.
+    let theirs = b"\x89PNG\r\n\x1a\n\x00the team's own deck".to_vec();
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", team_plan()),
+        ("assets/deck.png", theirs.clone()),
+    ]));
+    mock.set_branch("main", &moved);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    // Nothing was taken away from her.
+    assert_eq!(
+        files_held(tmp.path(), "alice"),
+        vec![("assets/deck.png".to_string(), false)],
+        "a conflict is reported, never resolved behind the author's back"
+    );
+
+    let hers = eng
+        .origin_status(Some("team"), false, &scope_of("alice"))
+        .await
+        .unwrap();
+    assert_eq!(
+        hers["domains"][0]["converged"]["mine"],
+        serde_json::json!(["assets/deck.png"]),
+        "her own conflict, named beside the pages: {hers}"
+    );
+    let his = eng
+        .origin_status(Some("team"), false, &scope_of("bob"))
+        .await
+        .unwrap();
+    assert_eq!(
+        his["domains"][0]["converged"]["mine"],
+        serde_json::json!([]),
+        "and nobody else's: {his}"
+    );
+
+    // A conflict resolution settles an engram, so it says what to do with a
+    // file instead of normalizing the path into a miss.
+    let refused = eng
+        .origin_resolve(
+            "team",
+            "assets/deck.png",
+            Some("mine"),
+            None,
+            ShareActor::Owner,
+        )
+        .await
+        .expect_err("a resolution settles an engram's markdown");
+    let text = refused.to_string();
+    assert!(
+        text.contains("upload the file again") && text.contains("delete it"),
+        "and it teaches the pair of verbs that do settle one: {text}"
+    );
+
+    // Her next write of the same path is what settles it.
+    file(&eng, "alice", "assets/deck.png", b"a third deck").await;
+    let hers = eng
+        .origin_status(Some("team"), false, &scope_of("alice"))
+        .await
+        .unwrap();
+    // Nothing converged on that pass and nothing conflicts any more, which is
+    // exactly what this key's absence means.
+    assert!(
+        hers["domains"][0]["converged"].is_null(),
+        "writing the path again is the answer, and it leaves the conflict list: {hers}"
+    );
+    assert!(
+        !hers.to_string().contains("assets/deck.png"),
+        "her conflict is named nowhere now: {hers}"
+    );
+}
+
 /// The folder moves under a draft and the draft is its author's conflict.
 ///
 /// Whoever owns the domain is told how many each actor is holding open, and
