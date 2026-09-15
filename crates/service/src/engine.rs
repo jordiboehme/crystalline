@@ -801,6 +801,34 @@ pub struct Engine {
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The sessions currently working inside somebody else's draft. Always
+    // present rather than a `OnceLock` like the resolver above: it is a plain
+    // in-memory registry with no store behind it, so an engine that nobody
+    // ever joins anything through simply holds an empty one. See
+    // [`crate::join`] for why a join belongs to a session and not to an
+    // account.
+    joins: Arc<crate::join::Joins>,
+}
+
+/// One drafted engram, as the share-link surface hands it to the account a
+/// link was redeemed by.
+///
+/// Four fields and no more, because this is the whole of what crosses between
+/// two actors' overlays: where the draft stands, what it answers to, what it
+/// says, and the version token a save of it has to present. No neighbours, no
+/// backlinks, no advisory - a granted draft is one page handed over by its
+/// author, not a corner of the index opened up.
+#[derive(Clone, Debug)]
+pub struct GrantedDraft {
+    /// The domain-relative path the draft stands at.
+    pub path: String,
+    /// The address it answers to, which is how a save of it is addressed.
+    pub permalink: String,
+    /// The markdown as its author last left it, frontmatter and all.
+    pub content: String,
+    /// The lowercase hex SHA-256 of `content`: the `expected_checksum` a save
+    /// of this draft presents, and the `ETag` a reader of it holds.
+    pub checksum: String,
 }
 
 /// What a scoped read hands the store as its domain filter, once the caller's
@@ -963,6 +991,20 @@ pub const OWNER_IDENTITY_NAME: &str = "owner";
 /// agent that reads it can act on it in one step.
 pub const OVERLAY_NEEDS_IDENTITY: &str = "this domain reviews changes before they land, so a write needs to know whose draft it joins - connect with your MCP token (issued in Fluid under profile > Agent access) and try again";
 
+/// What somebody who can SEE another person's draft is told when they try to
+/// write into it without having joined it.
+///
+/// A share-link and a join are two different things on purpose: being handed a
+/// draft to read is not agreeing to type into somebody else's work, and an
+/// agent holding its account's links has not been told to edit anything. So
+/// this refusal is not a wall, it is a fork, and it names both ways through -
+/// join the draft and the writing lands in its author's overlay where they
+/// will see it, or write your own and it lands in yours, where it always did.
+pub fn granted_needs_join(owner: &str, path: &str) -> String {
+    format!(
+        "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step.          Join the draft and your changes land in {owner}'s copy, where {owner} reviews them; or          draft your own copy in your own overlay and leave theirs as it stands."
+    )
+}
 /// What a share hears when its OWN proposal is already open in a domain that
 /// reviews changes.
 ///
@@ -1327,6 +1369,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            joins: Arc::new(crate::join::Joins::default()),
         }
     }
 
@@ -3797,11 +3840,41 @@ impl Engine {
     /// `scope` is the acting scope every write verb carries; see
     /// [`Engine::write_engram_as`].
     pub async fn save_engram(&self, p: &SaveParams, scope: &crate::scope::Scope) -> Result<Value> {
+        self.save_engram_joined(p, scope, None).await
+    }
+
+    /// [`Engine::save_engram`], with the join a session may be holding.
+    ///
+    /// The same verb, and the join is the only difference: a caller working
+    /// inside somebody else's draft (see [`crate::join`]) saves into the
+    /// OWNER's overlay rather than into their own, and the receipt says whose
+    /// draft it landed in. `None` is the ordinary save, which is what
+    /// [`Engine::save_engram`] passes and what every surface but the HTTP one
+    /// has.
+    ///
+    /// Two gates ride here rather than in the routes, so a second surface that
+    /// learns to join inherits both. A join is into ONE draft, so a save
+    /// addressed at anything else is refused rather than landing in the
+    /// owner's overlay at a path they never shared. And a save at a path this
+    /// caller was GRANTED but has not joined is refused too, in words that
+    /// name both ways forward: visibility and editing are two states, and a
+    /// save that silently forked the grantee's own copy would have decided
+    /// that for them.
+    pub async fn save_engram_joined(
+        &self,
+        p: &SaveParams,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
+        // The join as this view actually took it: one naming another domain,
+        // or a domain that has stopped reviewing changes, is not a join into
+        // this write at all and must not gate it.
+        let join = join.filter(|_| view.joined().is_some());
         // A document that is not an engram would poison the index on reindex,
         // so it is refused before anything is written. This is the one hard
         // gate, and it is deliberately narrow: the text must parse (clean
@@ -3825,7 +3898,27 @@ impl Engine {
                     .into(),
             ));
         }
-        let (desc, source) = view.resolve(&p.identifier).await?;
+        let (desc, source) = match view.resolve(&p.identifier).await {
+            Ok(resolved) => resolved,
+            // A name this caller's own view cannot resolve, when they are
+            // holding a link to a draft that answers to it: the miss IS the
+            // rule, since the granted draft is deliberately absent from every
+            // ordinary read they make, and answering "no such engram" to
+            // somebody who was handed that very page to read would be true and
+            // useless. So the refusal teaches instead, in the same words a
+            // save at a path they CAN resolve gets. Nothing about the draft is
+            // revealed that the link did not already hand over.
+            Err(EngineError::NotFound(missing)) => {
+                return match self
+                    .teach_granted_miss(&p.domain, &p.identifier, scope)
+                    .await?
+                {
+                    Some(teaching) => Err(EngineError::Refused(teaching)),
+                    None => Err(EngineError::NotFound(missing)),
+                };
+            }
+            Err(e) => return Err(e),
+        };
         // A reserved name never resolves to an engram today (sync skips both),
         // so this is defence in depth rather than a reachable branch: the
         // generated `index.md` is derived from its folder and would be
@@ -3842,6 +3935,8 @@ impl Engine {
         if is_assets_reserved(&desc.path) {
             return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
         }
+        self.screen_granted_path(&desc.domain, &desc.path, scope, join)
+            .await?;
 
         // The third place a save can land. The whole document goes into this
         // actor's draft verbatim, checked against the version they read - which
@@ -3892,6 +3987,13 @@ impl Engine {
                 "checksum": sha256_hex(p.content.as_bytes()),
                 "draft": true,
             });
+            // Whose draft it landed in, when that is not the caller's own. The
+            // one thing a joined save has to say that an ordinary one does
+            // not: somebody typing inside a colleague's draft is owed a
+            // receipt that names whose work they just changed.
+            if let Some(owner) = view.joined() {
+                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+            }
             note_unmirrored(&mut receipt, warning);
             return Ok(receipt);
         }
@@ -4112,6 +4214,93 @@ impl Engine {
             "path": path,
             "checksum": sha256_hex(content.as_bytes()),
         }))
+    }
+
+    /// The teaching sentence for a write that named a draft this caller holds
+    /// a link to but cannot resolve, or `None` when the name is nothing of the
+    /// sort.
+    ///
+    /// Asked only when an ordinary resolution has already missed, and only for
+    /// a caller holding at least one live link in this domain - which is
+    /// almost nobody, almost never. The name is matched against what the link
+    /// actually opens: the draft's own address, its path, and the path with
+    /// the suffix off, which are the three spellings the editor and the API
+    /// address an engram by.
+    async fn teach_granted_miss(
+        &self,
+        domain: &str,
+        identifier: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<String>> {
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Ok(None);
+        };
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        let held = access
+            .overlay_grants_held(&account, domain)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        for (path, owner) in held {
+            if owner == account {
+                continue;
+            }
+            let Some(draft) = self.overlay_draft_at(domain, &owner, &path).await? else {
+                continue;
+            };
+            let names = [
+                draft.permalink.as_str(),
+                path.as_str(),
+                path.trim_end_matches(".md"),
+            ];
+            if names.contains(&identifier) {
+                return Ok(Some(granted_needs_join(&owner, &path)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Refuse a write that is inside the wrong draft, or inside one this
+    /// caller may see and has not joined.
+    ///
+    /// Two refusals in one place, because they are two halves of one rule:
+    /// **a share-link grants visibility, and editing is a second, explicit
+    /// step.** The one caller who has taken that step gets a routed write at
+    /// exactly the path they took it for; everybody else who can see a draft
+    /// is told, in the same words, what their two ways forward are.
+    ///
+    /// Nothing happens at all for the common case - no join, no grant - and
+    /// the grant lookup is skipped entirely for a caller with no account,
+    /// since a link binds to an account and nobody else can hold one.
+    async fn screen_granted_path(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<()> {
+        if let Some(join) = join {
+            if join.path != path {
+                return Err(EngineError::Refused(format!(
+                    "this session is working inside {}'s draft of '{}', so a write to '{}' has \
+                     nowhere to land: leave that draft first, and the write goes back to being \
+                     your own",
+                    join.owner, join.path, path
+                )));
+            }
+            return Ok(());
+        }
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Ok(());
+        };
+        let Some(owner) = self.granted_owner(&account, domain, path).await? else {
+            return Ok(());
+        };
+        if owner == account {
+            return Ok(());
+        }
+        Err(EngineError::Refused(granted_needs_join(&owner, path)))
     }
 
     /// A registered domain's row id and content source, upserting the row the
@@ -4488,7 +4677,44 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let view = DomainView::for_write(self, domain, scope).await?;
+        self.attachment_write_joined(domain, path, bytes, scope, None)
+            .await
+    }
+
+    /// [`Engine::attachment_write_as`], with the join a session may be
+    /// holding.
+    ///
+    /// **Files follow the join**, which is the whole of the rule: an upload
+    /// made while working inside somebody else's draft lands in the OWNER's
+    /// files overlay, through
+    /// [`crate::overlay_files::target_actor`], and is staged, folded and
+    /// discarded with that draft. Anything else would put an image in one
+    /// overlay and the page that references it in another, so folding the
+    /// draft would land a page pointing at a file nobody folded.
+    ///
+    /// The path screen is the save's, for the same reason and in the same
+    /// words: a caller who can see a draft but has not joined it is told what
+    /// their two ways forward are rather than having one chosen for them.
+    pub async fn attachment_write_joined(
+        &self,
+        domain: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<WrittenAttachment> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let view = DomainView::for_write_joined(self, domain, scope, join).await?;
+        // The no-join half of the screen only. A join is into one DRAFT, and
+        // an attachment does not stand at the draft's path - it stands beside
+        // it, in the files overlay - so the path equality the save enforces
+        // would refuse every upload made inside a join, which is the one thing
+        // a join is supposed to make possible.
+        if view.joined().is_none() {
+            self.screen_granted_path(domain, path, scope, None).await?;
+        }
         self.attachment_write_in(&view, path, bytes).await
     }
 
@@ -4533,7 +4759,28 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let view = DomainView::for_write(self, domain, scope).await?;
+        self.attachment_delete_joined(domain, path, scope, None)
+            .await
+    }
+
+    /// [`Engine::attachment_delete_as`], with the join a session may be
+    /// holding. The deletion follows the join exactly as the upload does, and
+    /// for the same reason: see [`Engine::attachment_write_joined`].
+    pub async fn attachment_delete_joined(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let view = DomainView::for_write_joined(self, domain, scope, join).await?;
+        // The no-join half only, for the reason the upload gives.
+        if view.joined().is_none() {
+            self.screen_granted_path(domain, path, scope, None).await?;
+        }
         self.attachment_delete_in(&view, path).await
     }
 
@@ -12501,6 +12748,123 @@ impl Engine {
 
     // --- review mode -------------------------------------------------------
 
+    /// The sessions this process is holding joins for. See [`crate::join`].
+    pub fn joins(&self) -> &Arc<crate::join::Joins> {
+        &self.joins
+    }
+
+    /// One named actor's draft at one path, or `None` when they hold none
+    /// there.
+    ///
+    /// **The one read in this engine that answers about somebody else's draft
+    /// by name**, and it exists for the share-link surface alone: minting a
+    /// link has to know the author is holding what they are sharing, and
+    /// redeeming one has to hand the grantee the draft the link was for. Both
+    /// are the grant itself rather than a read that happened to widen, which
+    /// is why they go through a named seam instead of through a view.
+    ///
+    /// It is not a [`DomainView`] and deliberately cannot become one: it takes
+    /// a path rather than an identifier, so it can never resolve a name onto
+    /// somebody else's draft, and it answers one row rather than a listing, so
+    /// it can never be folded into a search. Its callers are the routes in
+    /// `rest::draft_links` and the write routing that checks a join against
+    /// the draft it was opened for.
+    ///
+    /// `None` for a domain that takes changes directly, for one this index has
+    /// never been told about, and for an actor holding nothing there - three
+    /// ways of saying the same thing, which is that there is no draft to
+    /// share.
+    pub async fn overlay_draft_at(
+        &self,
+        domain: &str,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<GrantedDraft>> {
+        if !self.reviews_changes(domain) {
+            return Ok(None);
+        }
+        let held = {
+            let store = self.store.lock().await;
+            // The read-only id lookup, never an upserting one: asking about a
+            // domain this index has never seen must not register it.
+            let Some(domain_id) = store.domain_id(domain).await? else {
+                return Ok(None);
+            };
+            store.overlay_entry(domain_id, actor, path).await?
+        };
+        let Some(entry) = held else {
+            return Ok(None);
+        };
+        // A tombstone is this actor's deletion of the base page, not a draft of
+        // it: there is nothing to open and nothing to edit, so it is not
+        // shareable and a link on a path that became one has nothing to give.
+        if entry.tombstone {
+            return Ok(None);
+        }
+        Ok(Some(GrantedDraft {
+            path: entry.path,
+            permalink: entry.permalink,
+            content: entry.content,
+            checksum: entry.sha256,
+        }))
+    }
+
+    /// Whose draft `account` may see at that path, or `None` for the ordinary
+    /// answer of nobody's.
+    ///
+    /// One hop into the accounts database, through the resolver the HTTP
+    /// surface installs. `None` when no resolver is installed at all - a
+    /// one-shot CLI command, the embedded stdio stack, a test engine - which
+    /// is the right answer rather than a missing one: those surfaces are the
+    /// machine owner, who has every draft on disk already and needs no link to
+    /// be handed one.
+    pub async fn granted_owner(
+        &self,
+        account: &str,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        access
+            .overlay_grant_for(account, domain, path)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// End every share-link and every join into one domain, because every
+    /// draft in it has just ended.
+    ///
+    /// Called by the fold, which is the one moment that ends all of them at
+    /// once: whatever each actor chose, folded or discarded, no draft in the
+    /// domain survives it, so no link on one and no session in one can stand.
+    /// A grant ends with the thing it grants.
+    ///
+    /// Silently does nothing about links when no accounts database is
+    /// installed - the CLI, the stdio stack, a test engine - for the reason
+    /// [`Engine::granted_owner`] answers `None` there: no link was ever minted
+    /// on such an instance. The joins are ended either way, since the registry
+    /// is this engine's own.
+    pub(crate) async fn end_domain_grants(&self, domain: &str) {
+        self.joins.end_domain(domain);
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.end_domain_overlay_grants(domain).await {
+            // A fold that happened is not unsaid by a link that outlived it,
+            // and the link opens nothing either way: `redeem_overlay_grant`
+            // hands back a path, and the draft at that path is gone. Reported
+            // rather than propagated, so the fold's own answer stays the
+            // fold's.
+            tracing::warn!(
+                domain = %domain,
+                error = %e,
+                "could not end the draft share-links of a domain that left review mode"
+            );
+        }
+    }
+
     /// Every actor's drafts in one domain, ordered by actor and by path.
     ///
     /// The one place a per-actor view of an overlay is derived, so the fold
@@ -12997,6 +13361,14 @@ impl Engine {
         // in a listing that asks a domain whether it reviews changes any more,
         // and theirs are exactly the bytes nothing else would ever reach.
         self.sweep_every_actors_files(domain);
+
+        // Every share-link on a draft here, and every session joined to one,
+        // ends with the drafts themselves. A grant lasts as long as the thing
+        // it grants: a folded draft is in the folder where everybody can read
+        // it anyway, and a discarded one is not there at all, so a link that
+        // outlived either would name a draft that is not there and a session
+        // still joined would be joined to nothing.
+        self.end_domain_grants(domain).await;
 
         // The folds are ordinary file writes, so the ordinary sync is what puts
         // them in the index - and it refreshes the generated folder indexes on

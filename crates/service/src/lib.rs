@@ -18,6 +18,7 @@ pub mod engine;
 pub mod harness_cli;
 mod index_files;
 pub mod instance;
+pub mod join;
 pub mod maintenance;
 pub mod mcp;
 pub mod mcp_gate;
@@ -69,6 +70,7 @@ pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };
 pub use instance::{EXIT_LOCK_HELD, HttpBinding, LockHeld, ServeIntent, StartMode};
+pub use join::{Join, Joins};
 pub use mcp::McpServer;
 pub use mcp_gate::{
     MCP_AUTH_REQUIRED, MCP_SESSION_IDENTITY_MISMATCH, McpGate, McpIdentity, SessionOwners,

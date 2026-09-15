@@ -364,6 +364,7 @@ pub async fn read(
 pub async fn write(
     State(state): State<RestState>,
     identity: Identity,
+    headers: axum::http::HeaderMap,
     ApiPath((domain, path)): ApiPath<(String, String)>,
     // Last, and the only extractor here that consumes the body.
     body: Bytes,
@@ -373,9 +374,20 @@ pub async fn write(
     // Through this account's own view of the domain: on a domain that reviews
     // changes the bytes land in that account's overlay and the folder the team
     // reviewed is not touched, which is what `draft` in the answer says.
+    //
+    // Unless this session is working inside somebody else's draft, in which
+    // case the bytes follow the join into the OWNER's files overlay, to be
+    // staged, folded and discarded with the draft that references them.
+    let join = super::draft_links::join_of(&state, &identity, &headers);
     let written = state
         .engine
-        .attachment_write_as(&domain, &path, body.to_vec(), &identity.scope())
+        .attachment_write_joined(
+            &domain,
+            &path,
+            body.to_vec(),
+            &identity.scope(),
+            join.as_ref(),
+        )
         .await
         .map_err(malformed_path_is_a_bad_request)?;
     Ok(Json(UploadedAttachment {
@@ -440,13 +452,16 @@ pub async fn write(
 pub async fn remove(
     State(state): State<RestState>,
     identity: Identity,
+    headers: axum::http::HeaderMap,
     ApiPath((domain, path)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_domain_write(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
+    // The deletion follows the join exactly as the upload does: see `write`.
+    let join = super::draft_links::join_of(&state, &identity, &headers);
     state
         .engine
-        .attachment_delete_as(&domain, &path, &identity.scope())
+        .attachment_delete_joined(&domain, &path, &identity.scope(), join.as_ref())
         .await
         .map_err(malformed_path_is_a_bad_request)?;
     Ok(StatusCode::NO_CONTENT)

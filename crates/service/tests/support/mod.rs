@@ -131,6 +131,12 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/me/mcp-tokens/{id}",
     "GET /api/v1/me/oauth-grants",
     "DELETE /api/v1/me/oauth-grants/{id}",
+    "GET /api/v1/domains/{domain}/draft-links",
+    "POST /api/v1/domains/{domain}/draft-links",
+    "DELETE /api/v1/draft-links/{id}",
+    "POST /api/v1/draft-links/accept",
+    "POST /api/v1/draft-links/join",
+    "POST /api/v1/draft-links/leave",
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.

@@ -234,6 +234,47 @@ impl DomainAccess {
         DomainAccess { auth }
     }
 
+    /// Whose draft `account` was granted at one path, or `None` for the
+    /// ordinary answer of nobody's.
+    ///
+    /// A narrow delegation rather than an accessor that hands out the whole
+    /// accounts store, and the narrowness is the point: this resolver is the
+    /// only way the engine reaches that database, and one question it can ask
+    /// is one question a later change cannot widen into a listing. Share-links
+    /// are the only cross-overlay visibility there is, and this is the seam
+    /// they reach through.
+    pub async fn overlay_grant_for(
+        &self,
+        account: &str,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        self.auth.overlay_grant_for(account, domain, path).await
+    }
+
+    /// Every live share-link `account` holds in one domain. See
+    /// [`AuthStore::overlay_grants_held`] for the one caller and why it is a
+    /// list rather than a lookup.
+    pub async fn overlay_grants_held(
+        &self,
+        account: &str,
+        domain: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .auth
+            .overlay_grants_held(account, domain)
+            .await?
+            .into_iter()
+            .map(|grant| (grant.path, grant.owner))
+            .collect())
+    }
+
+    /// End every share-link in one domain, because every draft in it has
+    /// ended. Answers how many were standing.
+    pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
+        self.auth.end_domain_overlay_grants(domain).await
+    }
+
     /// What `scope` may do on `domain`.
     pub async fn right(&self, scope: &Scope, domain: &str) -> Result<DomainRight> {
         Ok(self.resolved_right(scope, domain).await?.1)

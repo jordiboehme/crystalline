@@ -5495,6 +5495,14 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         ("engine.rs", "resolve_in_overlay"),
         // A share resolved through `ShareActor`.
         ("engine.rs", "stage_overlay_share"),
+        // A write made INSIDE somebody else's draft: the one write-side
+        // caller, and the only one there will be. A join is not something a
+        // request asserts - it is a record this process minted, for an account
+        // that presented a share-link the draft's own author minted on that
+        // draft - so the owner it names is the store's word rather than the
+        // caller's. See `DomainView::for_write_joined`, which spells out the
+        // three checks that still stand between a join and a write.
+        ("domain_view.rs", "for_write_joined"),
     ];
     /// The name a line declares a function under, if it declares one.
     fn declared_fn(line: &str) -> Option<&str> {

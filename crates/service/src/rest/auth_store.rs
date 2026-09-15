@@ -328,6 +328,83 @@ impl std::fmt::Debug for IssuedMcpToken {
     }
 }
 
+/// A freshly minted draft share-link. The `token` is the only copy in
+/// existence that is not hashed - it goes back to its author once, in the
+/// minting response, so they can hand it on, and is never written down here.
+#[derive(Clone)]
+pub struct MintedGrant {
+    /// The row id, which is what revokes this link later.
+    pub id: i64,
+    /// The link itself: [`DRAFT_LINK_PREFIX`] plus 64 hex characters.
+    pub token: String,
+}
+
+/// Hand-written for the reason [`IssuedMcpToken`]'s is: the id still prints,
+/// so a `tracing::debug!` or a failed assertion says something useful, while
+/// the one unhashed copy of a live credential never reaches a log line.
+impl std::fmt::Debug for MintedGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedGrant")
+            .field("id", &self.id)
+            .field("token", &"dl_[redacted]")
+            .finish()
+    }
+}
+
+/// One share-link on one draft, as the store holds it. Never carries the token:
+/// only its sha256 is written, so a listing can say who holds a link and when
+/// it was made and can never hand the link itself back out.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "One share-link on one draft: which draft it opens, \
+                        who minted it, which account redeemed it, and the two \
+                        dates that can end it.")]
+pub struct OverlayGrant {
+    /// The row id, which is what revokes this link.
+    pub id: i64,
+    /// The domain the drafted engram lives in.
+    #[schema(example = "team")]
+    pub domain: String,
+    /// The domain-relative path of the draft this link opens.
+    #[schema(example = "plan.md")]
+    pub path: String,
+    /// The account whose draft it is: the actor the overlay entry belongs to.
+    #[schema(example = "alice")]
+    pub owner: String,
+    /// The account this link bound itself to, or null while nobody has opened
+    /// it yet. The first account to redeem it is that account for good.
+    #[schema(example = "bob")]
+    pub grantee: Option<String>,
+    /// RFC 3339, when the link was minted.
+    pub created_at: String,
+    /// RFC 3339, when the link stops working on its own, or null for one that
+    /// lasts as long as the draft does.
+    pub expires_at: Option<String>,
+    /// RFC 3339, when its author took it back, or null while it stands.
+    pub revoked_at: Option<String>,
+}
+
+impl OverlayGrant {
+    /// Whether this grant still opens anything as of now: not revoked, and not
+    /// past its own window.
+    ///
+    /// The window is compared by parsing rather than by string order, because
+    /// an RFC 3339 instant carries its offset and two spellings of one moment
+    /// do not sort. An `expires_at` that cannot be parsed is treated as past:
+    /// a grant nobody can date is one nobody should be able to redeem.
+    fn is_live(&self) -> bool {
+        if self.revoked_at.is_some() {
+            return false;
+        }
+        match &self.expires_at {
+            None => true,
+            Some(at) => match chrono::DateTime::parse_from_rfc3339(at) {
+                Ok(at) => at > chrono::Utc::now(),
+                Err(_) => false,
+            },
+        }
+    }
+}
+
 /// A registered OAuth client, as the authorization server stores it. Public
 /// clients are the only kind here (`token_endpoint_auth_method: "none"`), so
 /// there is no secret in this record and nothing in it needs redacting: a
@@ -866,6 +943,21 @@ CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (user);
 CREATE INDEX IF NOT EXISTS oauth_grants_client ON oauth_grants (client_id);
 CREATE INDEX IF NOT EXISTS oauth_grants_previous_refresh
     ON oauth_grants (previous_refresh_hash);
+CREATE TABLE IF NOT EXISTS overlay_grant (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL,
+    path TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    grantee TEXT,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS overlay_grant_draft
+    ON overlay_grant (domain, owner, path);
+CREATE INDEX IF NOT EXISTS overlay_grant_grantee
+    ON overlay_grant (grantee, domain, path);
 ";
 
 /// Prefix every MCP token is minted with, so a token is recognizable at a
@@ -889,6 +981,17 @@ pub const OAUTH_REFRESH_PREFIX: &str = "cor_";
 /// authorizes with nothing but this id and PKCE - so its random half is 32 hex
 /// characters rather than 64.
 pub const OAUTH_CLIENT_PREFIX: &str = "coc_";
+
+/// Prefix on every draft share-link. The remainder is 64 lowercase hex
+/// characters, 32 bytes from the OS CSPRNG, exactly as an MCP token's is: a
+/// link that lets somebody read one of another person's unshared drafts is a
+/// credential, and it is sized like one.
+///
+/// Its own prefix rather than a reused one, for the reason the OAuth pair have
+/// two: these are presented at a different endpoint from every other token
+/// here, and a link pasted into the wrong box should be refused rather than
+/// looked up somewhere it could never match.
+pub const DRAFT_LINK_PREFIX: &str = "dl_";
 
 /// How long an OAuth access token lives, in seconds. One hour: long enough
 /// that a session is not a stream of refreshes, short enough that a leaked
@@ -2569,6 +2672,336 @@ impl AuthStore {
         Ok(IssuedMcpToken { id, token, label })
     }
 
+    /// Mint a share-link on one of `owner`'s drafts. The returned token is the
+    /// only unhashed copy; only its sha256 is written, through the same
+    /// [`token_hash`] helper every other credential here goes through.
+    ///
+    /// The store keeps no opinion about whether `owner` actually holds a draft
+    /// at `path`: that is a question about the overlay, which lives in the
+    /// index and not in this database, and the route that mints is where it is
+    /// asked (and answered 404 when the answer is no). What this layer owns is
+    /// the link itself - that it is unguessable, that it names one draft, and
+    /// that it can be taken back.
+    ///
+    /// `expires_at` is RFC 3339 or nothing at all. Nothing is the normal case
+    /// and means the link lasts exactly as long as the draft does, which is
+    /// the whole lifetime a draft has: [`AuthStore::end_overlay_grants`] ends
+    /// it when the draft is folded or discarded.
+    pub async fn mint_overlay_grant(
+        &self,
+        domain: &str,
+        path: &str,
+        owner: &str,
+        expires_at: Option<String>,
+    ) -> Result<MintedGrant> {
+        let owner = normalize_account_name(owner)?;
+        let token = format!("{DRAFT_LINK_PREFIX}{}", random_hex());
+        let hash = token_hash(&token);
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "INSERT INTO overlay_grant
+                     (domain, path, owner, grantee, token_hash, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                vec![
+                    Value::Text(domain.to_string()),
+                    Value::Text(path.to_string()),
+                    Value::Text(owner.clone()),
+                    Value::Text(hash),
+                    Value::Text(created_at),
+                    match expires_at {
+                        Some(at) => Value::Text(at),
+                        None => Value::Null,
+                    },
+                ],
+            )
+            .await
+            .with_context(|| format!("minting a draft share-link for '{owner}'"))?;
+        // Read after the insert, still under `self.guard` and on this
+        // connection: see `issue_mcp_token`'s matching comment.
+        Ok(MintedGrant {
+            id: self.conn.last_insert_rowid(),
+            token,
+        })
+    }
+
+    /// Present a link. `Some` when it opens something for `account`, `None`
+    /// for every way it does not.
+    ///
+    /// **The first account to present a live link is its grantee for good.**
+    /// That is the whole of the sharing rule: the author mints a link for a
+    /// draft rather than for a name, so they never have to know the login of
+    /// whoever they are handing it to, and the moment somebody opens it the
+    /// link stops being a bearer credential and becomes a grant to one
+    /// account. A second account is answered exactly as an invented token is -
+    /// a link that admitted a second reader would be a draft shared with
+    /// whoever the first reader forwarded it to.
+    ///
+    /// The read and the binding are one `BEGIN IMMEDIATE` transaction, for the
+    /// reason [`AuthStore::issue_mcp_token`]'s pair is: two accounts opening
+    /// one fresh link at the same instant must not both be told they bound it.
+    ///
+    /// An unknown, revoked or expired link is one answer, deliberately, the
+    /// way [`AuthStore::mcp_token_user`] answers one `None` to four misses.
+    pub async fn redeem_overlay_grant(
+        &self,
+        token: &str,
+        account: &str,
+    ) -> Result<Option<OverlayGrant>> {
+        let account = normalize_account_name(account)?;
+        let hash = token_hash(token);
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("redeeming a draft share-link")?;
+        let mut bound: Option<OverlayGrant> = None;
+        let result = async {
+            let row = self
+                .query_first(
+                    "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
+                     FROM overlay_grant WHERE token_hash = ?1",
+                    vec![Value::Text(hash)],
+                )
+                .await?;
+            let Some(grant) = row.as_ref().map(grant_from_row) else {
+                return Ok(());
+            };
+            if !grant.is_live() {
+                return Ok(());
+            }
+            match grant.grantee.as_deref() {
+                // Already this account's: presenting it again is how a second
+                // tab, or a reload, gets back what it already holds.
+                Some(held) if held == account => bound = Some(grant),
+                Some(_) => {}
+                None => {
+                    self.conn
+                        .execute(
+                            "UPDATE overlay_grant SET grantee = ?1
+                             WHERE id = ?2 AND grantee IS NULL",
+                            vec![Value::Text(account.clone()), Value::Integer(grant.id)],
+                        )
+                        .await
+                        .context("binding a draft share-link")?;
+                    bound = Some(OverlayGrant {
+                        grantee: Some(account.clone()),
+                        ..grant
+                    });
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        Ok(bound)
+    }
+
+    /// Every link standing on one of `owner`'s drafts, newest first. Revoked
+    /// and expired rows are left out: the author's list is what still opens
+    /// the draft, which is the only question the list is asked.
+    pub async fn overlay_grants_of(
+        &self,
+        owner: &str,
+        domain: &str,
+        path: &str,
+    ) -> Result<Vec<OverlayGrant>> {
+        let owner = normalize_account_name(owner)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
+                 FROM overlay_grant
+                 WHERE owner = ?1 AND domain = ?2 AND path = ?3 AND revoked_at IS NULL
+                 ORDER BY id DESC",
+                vec![
+                    Value::Text(owner.clone()),
+                    Value::Text(domain.to_string()),
+                    Value::Text(path.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing draft share-links for '{owner}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing draft share-links for '{owner}'"))?
+        {
+            let grant = grant_from_row(&row);
+            if grant.is_live() {
+                out.push(grant);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Take one link back. `false` when `id` names no link of `owner`'s, which
+    /// is what somebody else's link and an invented id both answer: a revoke
+    /// is never a probe for which links exist.
+    ///
+    /// The row is kept and stamped rather than deleted, so a link presented
+    /// after the fact is a link that was taken back rather than a token that
+    /// was never minted, and so the author's own audit of who they shared with
+    /// survives the revoke.
+    pub async fn revoke_overlay_grant(&self, owner: &str, id: i64) -> Result<bool> {
+        let owner = normalize_account_name(owner)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE overlay_grant SET revoked_at = ?1
+                 WHERE id = ?2 AND owner = ?3 AND revoked_at IS NULL",
+                vec![
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Integer(id),
+                    Value::Text(owner.clone()),
+                ],
+            )
+            .await
+            .with_context(|| format!("revoking a draft share-link for '{owner}'"))?;
+        Ok(changed > 0)
+    }
+
+    /// Whose draft `account` may see at that path, or `None` for the ordinary
+    /// case where the answer is nobody's.
+    ///
+    /// The one question the rest of the service asks this table, and it is
+    /// deliberately narrow: it names a path, so it can widen what one account
+    /// sees at exactly one address and can never be folded into a listing or a
+    /// search. Links are the only cross-overlay visibility there is, and this
+    /// is the whole of the seam they reach through.
+    pub async fn overlay_grant_for(
+        &self,
+        account: &str,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
+                 FROM overlay_grant
+                 WHERE grantee = ?1 AND domain = ?2 AND path = ?3 AND revoked_at IS NULL
+                 ORDER BY id DESC",
+                vec![
+                    Value::Text(account.clone()),
+                    Value::Text(domain.to_string()),
+                    Value::Text(path.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("reading a draft share-link for '{account}'"))?;
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("reading a draft share-link for '{account}'"))?
+        {
+            let grant = grant_from_row(&row);
+            if grant.is_live() {
+                return Ok(Some(grant.owner));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every live link `account` holds in one domain.
+    ///
+    /// The plural of [`AuthStore::overlay_grant_for`], and it exists for one
+    /// caller: a write addressed by NAME at a draft this account was granted.
+    /// A name cannot be resolved without a view, and the grantee's own view
+    /// does not carry the owner's draft, so the write path has to ask "is any
+    /// draft you hold a link to the one you just named" - which is this list,
+    /// and nothing wider. It carries no content and never leaves the write
+    /// path.
+    pub async fn overlay_grants_held(
+        &self,
+        account: &str,
+        domain: &str,
+    ) -> Result<Vec<OverlayGrant>> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
+                 FROM overlay_grant
+                 WHERE grantee = ?1 AND domain = ?2 AND revoked_at IS NULL
+                 ORDER BY id DESC",
+                vec![
+                    Value::Text(account.clone()),
+                    Value::Text(domain.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing the draft share-links of '{account}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing the draft share-links of '{account}'"))?
+        {
+            let grant = grant_from_row(&row);
+            if grant.is_live() {
+                out.push(grant);
+            }
+        }
+        Ok(out)
+    }
+
+    /// End every link standing on one draft, because the draft itself has
+    /// ended. Answers how many were standing.
+    ///
+    /// A grant lasts as long as the thing it grants. Folding a draft puts its
+    /// text in the folder where everybody can read it anyway, and discarding
+    /// one leaves nothing to read; either way the link now names a draft that
+    /// is not there, and a link nobody ended would be a row waiting for a path
+    /// of that name to be drafted again.
+    pub async fn end_overlay_grants(&self, domain: &str, owner: &str, path: &str) -> Result<u64> {
+        let owner = normalize_account_name(owner)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE overlay_grant SET revoked_at = ?1
+                 WHERE domain = ?2 AND owner = ?3 AND path = ?4 AND revoked_at IS NULL",
+                vec![
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(domain.to_string()),
+                    Value::Text(owner.clone()),
+                    Value::Text(path.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("ending the draft share-links of '{owner}'"))?;
+        Ok(changed)
+    }
+
+    /// End every link on every draft in one domain, because the domain has
+    /// stopped reviewing changes and no draft in it survived that.
+    ///
+    /// The bulk half of [`AuthStore::end_overlay_grants`], for the one moment
+    /// that ends every draft at once. Answers how many were standing.
+    pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE overlay_grant SET revoked_at = ?1
+                 WHERE domain = ?2 AND revoked_at IS NULL",
+                vec![
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(domain.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("ending the draft share-links of '{domain}'"))?;
+        Ok(changed)
+    }
+
     /// Register a public OAuth client and hand the record back, `client_id`
     /// and all. RFC 7591 dynamic registration is what calls this: a client
     /// nobody configured says what it is called and where it may be redirected
@@ -4045,6 +4478,25 @@ fn user_from_row(row: &Row) -> User {
         role: role_from_db(&cell_text(row, 3).unwrap_or_default()),
         disabled: matches!(row.get_value(4), Ok(Value::Integer(i)) if i != 0),
         last_seen: cell_text(row, 5),
+    }
+}
+
+/// Decode one `overlay_grant` row, in the column order every query above
+/// selects. One decoder rather than four, so a column added later cannot be
+/// read in two different orders.
+fn grant_from_row(row: &Row) -> OverlayGrant {
+    OverlayGrant {
+        id: match row.get_value(0) {
+            Ok(Value::Integer(id)) => id,
+            _ => 0,
+        },
+        domain: cell_text(row, 1).unwrap_or_default(),
+        path: cell_text(row, 2).unwrap_or_default(),
+        owner: cell_text(row, 3).unwrap_or_default(),
+        grantee: cell_text(row, 4),
+        created_at: cell_text(row, 5).unwrap_or_default(),
+        expires_at: cell_text(row, 6),
+        revoked_at: cell_text(row, 7),
     }
 }
 
@@ -8395,5 +8847,192 @@ mod tests {
             "case is the caller's business, not the store's"
         );
         assert_eq!(normalize_resource("/"), "");
+    }
+
+    /// Every account a share-link test needs: the author who holds a draft,
+    /// the colleague the link is for, and a third party who finds the link.
+    async fn grant_cast(store: &AuthStore) {
+        for name in ["alice", "bob", "carol"] {
+            store
+                .add_user(name, name, None, Role::Editor, "pw12345678")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A share-link is for one person, and the first one to open it is that
+    /// person for good.
+    ///
+    /// The whole of the sharing rule: a grant is minted for a draft rather
+    /// than for a name, so the author never has to know the login of whoever
+    /// they are handing it to - and the moment somebody opens it, it belongs
+    /// to that account and to nobody else. A second account presenting the
+    /// same token is told the same thing an invented one is told, because a
+    /// link that admitted a second reader would be a draft shared with
+    /// whoever the first reader forwarded it to.
+    #[tokio::test]
+    async fn a_grant_binds_its_first_redeemer_and_refuses_a_second() {
+        let (_dir, store) = store().await;
+        grant_cast(&store).await;
+        let minted = store
+            .mint_overlay_grant("team", "plan.md", "alice", None)
+            .await
+            .unwrap();
+        assert!(minted.token.starts_with(DRAFT_LINK_PREFIX));
+
+        let bound = store
+            .redeem_overlay_grant(&minted.token, "bob")
+            .await
+            .unwrap()
+            .expect("the first redeemer binds it");
+        assert_eq!(
+            (
+                bound.domain.as_str(),
+                bound.path.as_str(),
+                bound.owner.as_str()
+            ),
+            ("team", "plan.md", "alice")
+        );
+        assert_eq!(bound.grantee.as_deref(), Some("bob"));
+
+        assert!(
+            store
+                .redeem_overlay_grant(&minted.token, "bob")
+                .await
+                .unwrap()
+                .is_some(),
+            "and the person it bound to keeps it"
+        );
+        assert!(
+            store
+                .redeem_overlay_grant(&minted.token, "carol")
+                .await
+                .unwrap()
+                .is_none(),
+            "while anybody else is told what an invented token is told"
+        );
+        assert_eq!(
+            store
+                .overlay_grant_for("bob", "team", "plan.md")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("alice"),
+            "the bound account sees whose draft it is"
+        );
+        assert!(
+            store
+                .overlay_grant_for("carol", "team", "plan.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "and nobody else sees anything"
+        );
+    }
+
+    /// The two ways a grant ends, and they end it the same way: the token
+    /// still exists and resolves to nothing.
+    #[tokio::test]
+    async fn a_revoked_or_expired_grant_redeems_to_none() {
+        let (_dir, store) = store().await;
+        grant_cast(&store).await;
+
+        let revoked = store
+            .mint_overlay_grant("team", "plan.md", "alice", None)
+            .await
+            .unwrap();
+        let listed = store
+            .overlay_grants_of("alice", "team", "plan.md")
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "the author sees what they minted");
+        assert!(
+            !store.revoke_overlay_grant("bob", revoked.id).await.unwrap(),
+            "and nobody else can take it back"
+        );
+        assert!(
+            store
+                .revoke_overlay_grant("alice", revoked.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .redeem_overlay_grant(&revoked.token, "bob")
+                .await
+                .unwrap()
+                .is_none(),
+            "a revoked link admits nobody"
+        );
+
+        let expired = store
+            .mint_overlay_grant(
+                "team",
+                "plan.md",
+                "alice",
+                Some("2020-01-01T00:00:00Z".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .redeem_overlay_grant(&expired.token, "bob")
+                .await
+                .unwrap()
+                .is_none(),
+            "and neither does one whose window has closed"
+        );
+
+        let live = store
+            .mint_overlay_grant("team", "plan.md", "alice", None)
+            .await
+            .unwrap();
+        store
+            .redeem_overlay_grant(&live.token, "bob")
+            .await
+            .unwrap()
+            .expect("a live one still binds");
+        assert_eq!(
+            store
+                .end_overlay_grants("team", "alice", "plan.md")
+                .await
+                .unwrap(),
+            2,
+            "and ending the draft ends every link nobody had revoked: the live \
+             one and the expired one, whose window had closed but whose row was \
+             still open"
+        );
+        assert!(
+            store
+                .overlay_grant_for("bob", "team", "plan.md")
+                .await
+                .unwrap()
+                .is_none(),
+            "so the account it was bound to holds nothing any more"
+        );
+    }
+
+    /// The link is the credential, so it may never reach a log line - the rule
+    /// [`IssuedMcpToken`] already keeps, kept the same way and asserted on the
+    /// random half for the same reason.
+    #[tokio::test]
+    async fn minted_grant_debug_redacts_the_token() {
+        let (_dir, store) = store().await;
+        grant_cast(&store).await;
+        let minted = store
+            .mint_overlay_grant("team", "plan.md", "alice", None)
+            .await
+            .unwrap();
+        let secret = minted
+            .token
+            .strip_prefix(DRAFT_LINK_PREFIX)
+            .expect("a link carries the prefix");
+        let text = format!("{minted:?}");
+        assert!(!text.contains(secret), "the secret is redacted: {text}");
+        assert!(text.contains("redacted"), "and says so: {text}");
+        assert!(
+            text.contains(&minted.id.to_string()),
+            "while the id still prints: {text}"
+        );
     }
 }

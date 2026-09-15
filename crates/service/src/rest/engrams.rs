@@ -969,13 +969,56 @@ pub async fn save(
         expected_checksum: token,
     };
     let scope = identity.scope();
-    match state.engine.save_engram(&params, &scope).await {
+    // The join this session may be holding, which is what routes the save into
+    // somebody else's draft rather than into this caller's own. `None` for
+    // every ordinary save, which is nearly all of them; see
+    // `super::draft_links::join_of` and `crate::join`.
+    let join = super::draft_links::join_of(&state, &identity, &headers);
+    match state
+        .engine
+        .save_engram_joined(&params, &scope, join.as_ref())
+        .await
+    {
         // Read back from the receipt rather than reusing the URL's permalink:
         // the text landed verbatim, so an author who edited the `permalink`
         // line has moved the address, and the detail read has to follow it or
         // answer 404 for a write that succeeded.
         Ok(mut receipt) => {
             crate::maintenance::record_pending(&domain);
+            // A save made INSIDE somebody else's draft answers the draft
+            // itself rather than a detail read, and it has to: the read-back
+            // below is made as the CALLER, whose ordinary view deliberately
+            // does not carry the owner's draft, so it would answer 404 for a
+            // write that landed. The shape is the one
+            // `POST /draft-links/accept` answers, which is what the screen
+            // that opened the granted draft already speaks - and `body =
+            // Object` on this route is what lets it, rather than a second
+            // response type nobody asked for.
+            //
+            // The neighbours advisory is skipped here for the same reason it
+            // is not on the accept route: it is a search made as the caller,
+            // and a caller who was handed one page to edit is not asking what
+            // else in the domain is near it.
+            if let Some(join) = join.as_ref().filter(|_| receipt.get("joined").is_some()) {
+                let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
+                let body = serde_json::json!({
+                    "domain": domain,
+                    "path": join.path,
+                    "owner": join.owner,
+                    "permalink": receipt["permalink"],
+                    "editable": true,
+                    "reason": Value::Null,
+                    "content": params.content,
+                    "checksum": checksum,
+                    "join_key": Value::Null,
+                    "joined": receipt["joined"],
+                });
+                let mut resp = (StatusCode::OK, Json(body)).into_response();
+                if let Ok(tag) = axum::http::HeaderValue::from_str(&format!("\"{checksum}\"")) {
+                    resp.headers_mut().insert(ETAG, tag);
+                }
+                return Ok(resp);
+            }
             // Same contract as the create above: asked after the write, off the
             // saved document (the frontmatter is stripped before it is probed),
             // bounded, and silent when it finds nothing.

@@ -9,6 +9,7 @@ mod auth_store;
 mod discovery;
 mod domains;
 mod domains_admin;
+mod draft_links;
 mod engrams;
 mod error;
 mod evolve;
@@ -185,6 +186,12 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::token,
         identity_links::list,
         identity_links::unlink,
+        draft_links::mint,
+        draft_links::list,
+        draft_links::revoke,
+        draft_links::accept,
+        draft_links::join,
+        draft_links::leave,
     ),
     components(schemas(
         ProblemDetail,
@@ -227,6 +234,12 @@ use crate::scope::{DomainAccess, DomainRight};
         oidc::OidcProviderView,
         IdentityLink,
         identity_links::IdentityLinksResponse,
+        OverlayGrant,
+        draft_links::MintBody,
+        draft_links::MintedLinkResponse,
+        draft_links::TokenBody,
+        draft_links::LeaveBody,
+        draft_links::AcceptedDraft,
         users_api::CreateBody,
         users_api::PatchBody,
         users_api::PasswordBody,
@@ -800,6 +813,25 @@ pub fn router(state: RestState) -> Router {
             "/me/identity-links/{issuer}",
             delete(identity_links::unlink),
         )
+        // Share-links on a draft: the one seam through which a person sees,
+        // and then edits, a page somebody else has not shared with the team
+        // yet. The minting and listing halves are domain-addressed and
+        // author-only; redeeming, joining and leaving carry no domain in the
+        // path, because the link itself names the draft and asking the caller
+        // to repeat it would only make a second thing that could disagree.
+        // Every one of them is served on a read-only instance, on the
+        // settlement the token routes above carry: a grant is account state in
+        // the accounts database and a join is a record in this process's
+        // memory, and neither is knowledge. The write they enable is refused
+        // by read-only in the engine, exactly as it always was.
+        .route(
+            "/domains/{domain}/draft-links",
+            get(draft_links::list).post(draft_links::mint),
+        )
+        .route("/draft-links/{id}", delete(draft_links::revoke))
+        .route("/draft-links/accept", post(draft_links::accept))
+        .route("/draft-links/join", post(draft_links::join))
+        .route("/draft-links/leave", post(draft_links::leave))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.

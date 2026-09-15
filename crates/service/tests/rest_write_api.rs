@@ -2257,7 +2257,118 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Viewer,
             read_only_exempt: true,
         },
+        // The five mutating halves of the draft share-link surface, all on the
+        // same settlement as the tokens above: a grant is a row in the
+        // accounts database and a join is a record in this process's memory,
+        // so neither is knowledge and a read-only instance serves both. What
+        // read-only still refuses is the write a join enables, in the engine,
+        // where it always did.
+        //
+        // Minting and revoking are editor-level, because only somebody who may
+        // write on a domain can be holding a draft there to share. `eng` takes
+        // changes directly in this fixture, so nobody is holding one and every
+        // allowed leg answers 404 - past authorization, which is what this
+        // matrix asserts, and sharing nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/draft-links",
+            body: Some(serde_json::json!({"path": "alpha.md"})),
+            min_role: Role::Editor,
+            read_only_exempt: true,
+        },
+        // Id 11: the next free literal after the oauth consent row's `9` and
+        // the oauth-grant row's `10`. Nothing in this matrix mints a real
+        // grant, so there is no small id to collide with, and no fixture
+        // account holds one - so every allowed leg answers 404, revoking
+        // nothing.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/draft-links/11",
+            body: None,
+            min_role: Role::Editor,
+            read_only_exempt: true,
+        },
+        // Redeeming, joining and leaving are viewer-level: a link binds to
+        // whichever account presents it whatever its role, and a viewer opens
+        // the draft read-only with the server's reason. The token is one
+        // nobody minted, so the first two answer 404 on every allowed leg;
+        // leaving a join nobody is holding is a success, which is what the
+        // route says it is.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/draft-links/accept",
+            body: Some(serde_json::json!({"token": "dl_nobodyminted"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/draft-links/join",
+            body: Some(serde_json::json!({"token": "dl_nobodyminted"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/draft-links/leave",
+            body: Some(serde_json::json!({"key": "nobody is holding this"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
     ]
+}
+
+/// Every route of the share-link surface is in the router's own operation list
+/// and, for the mutating ones, in the write matrix beside it.
+///
+/// The check that keeps a route from shipping ungated: the enumeration test
+/// below fails by name for a mutating route with no matrix row, and this one
+/// fails first, naming the surface rather than a path. It also pins the two
+/// settlements that are this surface's own and cannot be read off a path -
+/// that redeeming and joining serve a viewer, and that a read-only instance
+/// serves all five - because both are decisions rather than consequences.
+#[test]
+fn draft_link_routes_are_in_the_write_matrix() {
+    for op in [
+        "POST /api/v1/domains/{domain}/draft-links",
+        "GET /api/v1/domains/{domain}/draft-links",
+        "DELETE /api/v1/draft-links/{id}",
+        "POST /api/v1/draft-links/accept",
+        "POST /api/v1/draft-links/join",
+        "POST /api/v1/draft-links/leave",
+    ] {
+        assert!(
+            support::MOUNTED_OPERATIONS.contains(&op),
+            "the router's own operation list carries {op}"
+        );
+    }
+    let rows: Vec<WriteOp> = write_ops()
+        .into_iter()
+        .filter(|op| op.path.contains("draft-links"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        5,
+        "every mutating half of the surface has a row: mint, revoke, accept, join, leave"
+    );
+    assert!(
+        rows.iter().all(|op| op.read_only_exempt),
+        "a grant is account state and a join is session state; neither is knowledge"
+    );
+    let viewer: Vec<&str> = rows
+        .iter()
+        .filter(|op| op.min_role == Role::Viewer)
+        .map(|op| op.path)
+        .collect();
+    assert_eq!(
+        viewer,
+        vec![
+            "/api/v1/draft-links/accept",
+            "/api/v1/draft-links/join",
+            "/api/v1/draft-links/leave",
+        ],
+        "a link binds whatever the role, and a viewer opens the draft read-only"
+    );
 }
 
 fn request_for(
@@ -2466,6 +2577,16 @@ fn canonicalize(path: &str) -> String {
     // above are.
     if path.starts_with("/api/v1/me/oauth-grants/") {
         return "/api/v1/me/oauth-grants/{id}".to_string();
+    }
+    // The share-link revoke route's id is a numeric grant row id, which the
+    // per-segment pass below cannot tell apart from the share surface's
+    // proposal number: named here for the same reason the token ids above are.
+    // The three bodyless `/draft-links/*` verbs beside it are ordinary
+    // segments and need no help.
+    if let Some(rest) = path.strip_prefix("/api/v1/draft-links/")
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return "/api/v1/draft-links/{id}".to_string();
     }
     // The identity-link route takes an issuer url percent-encoded into one
     // segment, which no per-segment name could match: it is spelled out here

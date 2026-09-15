@@ -86,6 +86,21 @@ pub(crate) struct DomainView<'a> {
     /// Whose drafts stand over the base here. `None` is the base view: a domain
     /// that takes changes directly, or a reader with no identity of their own.
     actor: Option<String>,
+    /// Whose draft this view is a JOIN into, when it is one: a caller working
+    /// inside somebody else's draft through a share-link they redeemed and a
+    /// join they opened. `None` on every ordinary view, which is nearly all of
+    /// them.
+    ///
+    /// Equal to `actor` by construction wherever it is set - a joined view IS
+    /// the owner's view, built through [`DomainView::for_actor`] - and kept
+    /// beside it rather than inferred from it because it is a different fact:
+    /// `actor` says whose rows these are, and this says that the caller is not
+    /// that person. Two things read it: the files seam, which passes it to
+    /// [`crate::overlay_files::target_actor`] so the one function that answers
+    /// "whose files overlay does this write land in" answers it from the join
+    /// rather than from an inference, and the receipt, which tells the caller
+    /// whose draft their work landed in.
+    joined: Option<String>,
 }
 
 impl<'a> DomainView<'a> {
@@ -104,6 +119,7 @@ impl<'a> DomainView<'a> {
             domain: domain.to_string(),
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: None,
+            joined: None,
         })
     }
 
@@ -134,6 +150,7 @@ impl<'a> DomainView<'a> {
             domain: domain.to_string(),
             base: Some(base),
             actor,
+            joined: None,
         })
     }
 
@@ -161,6 +178,7 @@ impl<'a> DomainView<'a> {
             domain: domain.to_string(),
             base: Some(engine.content_source_scoped(domain, hidden)?),
             actor: Some(actor.to_string()),
+            joined: None,
         })
     }
 
@@ -226,6 +244,7 @@ impl<'a> DomainView<'a> {
             domain: name.to_string(),
             base: engine.content_source(name).ok(),
             actor,
+            joined: None,
         };
         if !engine.reviews_changes(name) {
             return Ok(seen(None));
@@ -235,6 +254,55 @@ impl<'a> DomainView<'a> {
             Some(actor) => Ok(seen(Some(actor))),
             None => Err(EngineError::Refused(OVERLAY_NEEDS_IDENTITY.to_string())),
         }
+    }
+
+    /// This writer's view when the write is being made **inside somebody
+    /// else's draft**: the owner's overlay, not the caller's.
+    ///
+    /// The one place a join turns into a routing decision, exactly as
+    /// [`DomainView::for_write`] is the one place review mode does, and it is
+    /// deliberately the same shape: a verb that can be driven from inside a
+    /// join asks this instead of that, and everything downstream of it sees an
+    /// ordinary actor view.
+    ///
+    /// **This is the one caller allowed to build another actor's view from a
+    /// write path**, and `another_actors_view_is_reached_only_by_the_owner_gated_surfaces`
+    /// in crates/service/tests/overlay_domains.rs names it. What makes that
+    /// safe is that the join is not something a caller asserts: it is a record
+    /// this process minted, when an account presented a share-link its author
+    /// minted on that very draft, and it names the owner rather than taking
+    /// one from the request. Three things still stand between it and a write:
+    /// the caller's account is checked against the join on every use (see
+    /// [`crate::join::Joins::get`]), the domain has to be one this caller may
+    /// see at all (the hidden-domain screen below, for the reason `for_write`
+    /// gives), and the verb that called this checks that the path it resolved
+    /// is the path the join was opened for.
+    ///
+    /// A join naming another domain, or one into a domain that has since
+    /// stopped reviewing changes, is not an error and not a refusal: it is
+    /// simply not a join into THIS write, so the ordinary view answers. A
+    /// domain that left review mode has no drafts left to be inside of, and
+    /// `Engine::end_domain_grants` has already ended the join; this is the
+    /// belt to that braces.
+    pub(crate) async fn for_write_joined(
+        engine: &'a Engine,
+        name: &str,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<DomainView<'a>> {
+        let joined = join.filter(|j| j.domain == name && engine.reviews_changes(name));
+        let Some(join) = joined else {
+            return DomainView::for_write(engine, name, scope).await;
+        };
+        engine.refuse_hidden_domain(name, scope).await?;
+        let mut view = DomainView::for_actor(engine, name, &HashSet::new(), &join.owner)?;
+        view.joined = Some(join.owner.clone());
+        Ok(view)
+    }
+
+    /// Whose draft this view is a join into, or `None` on every ordinary one.
+    pub(crate) fn joined(&self) -> Option<&str> {
+        self.joined.as_deref()
     }
 
     /// What `actor` sees at `path`: their own draft when they hold one, the
@@ -1647,7 +1715,10 @@ impl<'a> DomainView<'a> {
                 self.domain
             )));
         };
-        Ok(crate::overlay_files::target_actor(actor, None))
+        Ok(crate::overlay_files::target_actor(
+            actor,
+            self.joined.as_deref(),
+        ))
     }
 
     /// This actor's own files overlay entries, files and deletions alike,
