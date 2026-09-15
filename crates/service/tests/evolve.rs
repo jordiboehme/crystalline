@@ -2594,6 +2594,157 @@ async fn dangling_attachments_for(engine: &Engine, scope: &Scope) -> Vec<String>
     out
 }
 
+/// **A file only one actor holds is theirs to be orphaned**, and nobody
+/// else's to hear about.
+///
+/// The orphan rule reads the actor view, so a file somebody drafted and
+/// referenced nowhere is reported to its author - which is the only person who
+/// could do anything about it - and is not in the team's list at all, because
+/// the team does not have it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v108_orphans_an_overlay_only_file_for_its_actor_alone() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    let team_only = vec!["assets/stray.png".to_string()];
+    assert_eq!(orphans_for(&engine, &alice).await, team_only);
+    assert_eq!(orphans_for(&engine, &bob).await, team_only);
+
+    let written = engine
+        .attachment_write_as(
+            "team",
+            "assets/mine.png",
+            b"PNG bytes of mine".to_vec(),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(written.draft, "the upload landed as alice's draft");
+
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        vec![
+            "assets/mine.png".to_string(),
+            "assets/stray.png".to_string()
+        ],
+        "her own unreferenced file is hers to answer for, beside the team's"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        team_only,
+        "and the team is told nothing about a file the team does not have"
+    );
+}
+
+/// **A file an actor deleted in review mode reads as absent for them**, and
+/// that absence speaks only about the text they are reading.
+///
+/// Her deletion is a draft like any other: the file is still the team's until
+/// the deletion is reviewed. So `V107` tells HER that the reviewed page still
+/// showing the deck points at a file she no longer has - which is the finding
+/// that would make her fix the page before she shares the deletion - and says
+/// nothing of the sort to anybody else. And `V108` never calls the deck an
+/// orphan for anybody: for her it is not a file she holds at all, and for the
+/// team it is referenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tombstoned_base_attachment_is_absent_for_the_actor_and_v107_says_so_for_their_text_only()
+{
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert!(dangling_attachments_for(&engine, &alice).await.is_empty());
+    let team_only = vec!["assets/stray.png".to_string()];
+    assert_eq!(orphans_for(&engine, &bob).await, team_only);
+
+    let draft = engine
+        .attachment_delete_as("team", "assets/deck.png", &alice)
+        .await
+        .unwrap();
+    assert!(draft, "the deletion landed as alice's draft");
+
+    assert_eq!(
+        dangling_attachments_for(&engine, &alice).await,
+        vec!["assets/deck.png".to_string()],
+        "the page she reads shows a file she has taken away"
+    );
+    assert!(
+        dangling_attachments_for(&engine, &bob).await.is_empty(),
+        "and nobody else's reading of the same page changed"
+    );
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        team_only,
+        "a file she is not holding is not a file of hers to be orphaned"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        team_only,
+        "and the team's sweep is what it was"
+    );
+}
+
+/// **The union rule survived the listing change.**
+///
+/// Task 9 pinned it against the base attachment listing: an author who drafts a
+/// reference away is never told the shared file is now unused. `V108` reads the
+/// actor view now, so the same claim has to be pinned again with an overlay
+/// file standing beside the shared one - the half that reads the actor's own
+/// dimension is the LISTING, and the half that asks "does anything reference
+/// this" is still the union of what this reader sees and what the domain's own
+/// text says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reference_dropped_only_in_a_draft_still_never_orphans_a_shared_file() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+
+    // An overlay file of her own, so the listing this rule reads is genuinely
+    // her dimension's rather than the base one.
+    engine
+        .attachment_write_as(
+            "team",
+            "assets/mine.png",
+            b"PNG bytes of mine".to_vec(),
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "deck".to_string(),
+                domain: "team".to_string(),
+                operation: "find_replace".to_string(),
+                find_text: Some("![Deck](assets/deck.png)".to_string()),
+                content: Some("the deck is elsewhere now".to_string()),
+                key: None,
+                value: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        vec![
+            "assets/mine.png".to_string(),
+            "assets/stray.png".to_string()
+        ],
+        "the deck is still referenced by the text the team has, so dropping the \
+         reference in a draft never orphans it: {:?}",
+        orphans_for(&engine, &alice).await
+    );
+}
+
 /// **A file somebody has drafted answers their own reference to it.**
 ///
 /// The sweep reads every other input in the caller's own dimension; its
