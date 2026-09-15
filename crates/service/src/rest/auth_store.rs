@@ -2952,39 +2952,15 @@ impl AuthStore {
         Ok(out)
     }
 
-    /// End every link standing on one draft, because the draft itself has
-    /// ended. Answers how many were standing.
-    ///
-    /// A grant lasts as long as the thing it grants. Folding a draft puts its
-    /// text in the folder where everybody can read it anyway, and discarding
-    /// one leaves nothing to read; either way the link now names a draft that
-    /// is not there, and a link nobody ended would be a row waiting for a path
-    /// of that name to be drafted again.
-    pub async fn end_overlay_grants(&self, domain: &str, owner: &str, path: &str) -> Result<u64> {
-        let owner = normalize_account_name(owner)?;
-        let _guard = self.guard.lock().await;
-        let changed = self
-            .conn
-            .execute(
-                "UPDATE overlay_grant SET revoked_at = ?1
-                 WHERE domain = ?2 AND owner = ?3 AND path = ?4 AND revoked_at IS NULL",
-                vec![
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                    Value::Text(domain.to_string()),
-                    Value::Text(owner.clone()),
-                    Value::Text(path.to_string()),
-                ],
-            )
-            .await
-            .with_context(|| format!("ending the draft share-links of '{owner}'"))?;
-        Ok(changed)
-    }
-
     /// End every link on every draft in one domain, because the domain has
     /// stopped reviewing changes and no draft in it survived that.
     ///
-    /// The bulk half of [`AuthStore::end_overlay_grants`], for the one moment
-    /// that ends every draft at once. Answers how many were standing.
+    /// Called when a domain leaves review mode, which is the one moment that
+    /// ends every draft in it at once. A draft that ends on its own - deleted,
+    /// moved, renamed - needs no row of its own ended: every surface that
+    /// reads a grant checks that the draft is still there first, so a link to
+    /// a draft that is gone already opens nothing and refuses nothing.
+    /// Answers how many were standing.
     pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
         let _guard = self.guard.lock().await;
         let changed = self
@@ -8993,14 +8969,11 @@ mod tests {
             .unwrap()
             .expect("a live one still binds");
         assert_eq!(
-            store
-                .end_overlay_grants("team", "alice", "plan.md")
-                .await
-                .unwrap(),
+            store.end_domain_overlay_grants("team").await.unwrap(),
             2,
-            "and ending the draft ends every link nobody had revoked: the live \
-             one and the expired one, whose window had closed but whose row was \
-             still open"
+            "and the domain leaving review mode ends every link nobody had \
+             revoked: the live one and the expired one, whose window had closed \
+             but whose row was still open"
         );
         assert!(
             store

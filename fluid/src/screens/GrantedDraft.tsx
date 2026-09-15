@@ -24,11 +24,13 @@
 
 import { useMutation } from "@tanstack/react-query";
 import type { ReactElement } from "react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams } from "react-router";
 
 import { problemDetail } from "../api/client";
+import type { HeldJoin } from "../api/draftLinks";
 import {
+  JOIN_CHANGED_EVENT,
   acceptDraftLink,
   heldJoin,
   joinDraft,
@@ -47,9 +49,26 @@ export default function GrantedDraft(): ReactElement {
   const [checksum, setChecksum] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  // Whether THIS window is inside this draft. Read from the same session
-  // storage the bar reads, so a reload of this page finds the join it left.
-  const [joined, setJoined] = useState(() => heldJoin() !== null);
+  // The draft this window is inside, if any - which need not be THIS one. A
+  // window joined to one draft and then sent a link to another must not draw
+  // the second as editable: a save would aim at the join actually held and
+  // write the wrong page. So the join is compared against the draft on screen
+  // rather than merely counted.
+  const [held, setHeld] = useState<HeldJoin | null>(() => heldJoin());
+  const joined = held !== null && draft !== null && held.path === draft.path;
+
+  // The same event the frame's bar fires on, because the bar is where Leave
+  // lives: a screen that did not listen would keep an editable buffer and a
+  // live Save button after the join behind them had ended.
+  const refreshHeld = useCallback(() => {
+    setHeld(heldJoin());
+  }, []);
+  useEffect(() => {
+    window.addEventListener(JOIN_CHANGED_EVENT, refreshHeld);
+    return () => {
+      window.removeEventListener(JOIN_CHANGED_EVENT, refreshHeld);
+    };
+  }, [refreshHeld]);
 
   /** Take what a link or a join answered with, and settle the whole screen on it. */
   const settle = (opened: AcceptedDraft): void => {
@@ -80,6 +99,9 @@ export default function GrantedDraft(): ReactElement {
     onSuccess: (opened) => {
       settle(opened);
       if (opened.join_key) {
+        // `rememberJoin` fires the change event and the listener above turns
+        // it into this screen's state: one path in, rather than a second copy
+        // set here that could disagree with what storage holds.
         rememberJoin({
           key: opened.join_key,
           domain: opened.domain,
@@ -87,7 +109,6 @@ export default function GrantedDraft(): ReactElement {
           owner: opened.owner,
           permalink: opened.permalink,
         });
-        setJoined(true);
       }
     },
     onError: (error: Error) => {
@@ -97,10 +118,15 @@ export default function GrantedDraft(): ReactElement {
 
   const save = useMutation({
     mutationFn: async () => {
-      const held = heldJoin();
-      if (!held)
-        throw new Error("this window is not inside the draft any more");
-      return saveJoinedDraft(held, buffer, checksum);
+      // Re-read rather than close over the state: Leave can have happened in
+      // the bar between the button being drawn and being pressed, and a save
+      // aimed at a join that has ended must fail here rather than at the
+      // server with a sentence about somebody else's page.
+      const now = heldJoin();
+      if (!now || !draft || now.path !== draft.path) {
+        throw new Error("this window is not inside that draft any more");
+      }
+      return saveJoinedDraft(now, buffer, checksum);
     },
     onSuccess: (saved) => {
       setChecksum(saved.checksum);

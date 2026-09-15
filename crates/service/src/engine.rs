@@ -831,6 +831,59 @@ pub struct GrantedDraft {
     pub checksum: String,
 }
 
+/// One granted draft as a read payload: the shape [`Engine::read_engram`]
+/// answers with, filled in for a page whose rows belong to somebody else.
+///
+/// Written out here rather than shared with the read path it mirrors, because
+/// half of what that path does cannot be done for a granted draft and the
+/// other half must not be. The inbound summary is absent (nothing points at a
+/// draft), the outbound edges are all unresolved (a grant widens one path, not
+/// a neighbourhood), and two keys are added that no other read carries:
+/// `draft` and `draft_owner`, which are what keep a draft standing where the
+/// team's page stands from being mistaken for it.
+fn granted_draft_json(domain: &str, owner: &str, draft: &GrantedDraft) -> Result<Value> {
+    let engram = parse_engram(&draft.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+    let relations: Vec<Value> = engram
+        .relations
+        .iter()
+        .map(|r| {
+            json!({
+                "line": r.line,
+                "rel_type": r.rel_type,
+                "target": r.target,
+                "resolved": false,
+            })
+        })
+        .collect();
+    let links: Vec<Value> = engram
+        .links
+        .iter()
+        .map(|l| json!({ "line": l.line, "target": l.target, "resolved": false }))
+        .collect();
+    let title = if engram.frontmatter.title.is_empty() {
+        draft.permalink.clone()
+    } else {
+        engram.frontmatter.title.clone()
+    };
+    Ok(json!({
+        "domain": domain,
+        "permalink": draft.permalink,
+        "title": title,
+        "type": engram.frontmatter.engram_type,
+        "status": engram.frontmatter.status.clone().unwrap_or_default(),
+        "path": draft.path,
+        "url": format!("crystalline://{domain}/{}", draft.permalink),
+        "content": draft.content,
+        "checksum": draft.checksum,
+        "frontmatter": engram.frontmatter,
+        "observations": engram.observations,
+        "relations": relations,
+        "links": links,
+        "draft": true,
+        "draft_owner": owner,
+    }))
+}
+
 /// What a scoped read hands the store as its domain filter, once the caller's
 /// own filter and the domains it may not see have been reconciled.
 ///
@@ -4300,6 +4353,16 @@ impl Engine {
         if owner == account {
             return Ok(());
         }
+        // **Only while there is still a draft to join.** A link outlives the
+        // draft it was for whenever its author takes that draft away without
+        // the domain leaving review mode - a deletion, a move, a rename - and
+        // a grantee still told to join it could neither join (the link answers
+        // that the draft is gone) nor write. A dead row would have taken a
+        // path away from somebody it was never about, so it takes nothing: the
+        // write goes back to being their own, which is what it always was.
+        if self.overlay_draft_at(domain, &owner, path).await?.is_none() {
+            return Ok(());
+        }
         Err(EngineError::Refused(granted_needs_join(&owner, path)))
     }
 
@@ -5859,8 +5922,107 @@ impl Engine {
     /// caller may not see is [`EngineError::NotFound`], the same miss an engram
     /// nobody wrote produces, and the inbound sample below never names a domain
     /// the caller cannot see.
+    /// The draft this caller holds a share-link to, when the identifier they
+    /// read names it - the ONE read in this engine that answers with another
+    /// actor's work.
+    ///
+    /// **Why a read widens at all.** A grant is visibility, and a person's
+    /// agent is that person: it signs in as the same account, and it has no
+    /// screen to open a link on. If only the browser could see a granted
+    /// draft, somebody could be handed a colleague's page and their own agent
+    /// could not be shown what they were looking at. So the account's agent
+    /// sees it where its person does - at the path the link was for.
+    ///
+    /// **And nowhere else.** The widening is this function and this function
+    /// only: search, listing, the reference candidate set and every other read
+    /// are untouched, so a grantee's view of the domain is exactly what it was
+    /// except at one path. That is the whole of ruling 1's "reads outside the
+    /// granted path never show it", and
+    /// `a_grantees_search_still_excludes_the_owners_draft` asserts it from the
+    /// other side.
+    ///
+    /// Three properties are deliberate and each is visible in the answer:
+    ///
+    /// * **it says whose it is.** `draft: true` and `draft_owner` ride on the
+    ///   payload, because a granted draft standing where the team's own page
+    ///   stands must never be mistaken for that page;
+    /// * **no transitivity.** The references are reported as they parse and
+    ///   nothing resolves: a link in the granted draft onto another of the
+    ///   owner's drafts names a page that was not shared, and resolving it
+    ///   would make one grant into a tour of an overlay. A link onto a page
+    ///   the team holds is unresolved here too, which is the cost of the rule
+    ///   and is stated rather than hidden;
+    /// * **nothing points at it.** A draft has no inbound references, because
+    ///   nobody can write a reference to a page only its author can read.
+    ///
+    /// `None` - the ordinary answer, for every caller and every identifier -
+    /// short-circuits before any store read when the caller has no account, so
+    /// the common path costs nothing.
+    async fn granted_read(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+        hidden: &HashSet<String>,
+    ) -> Result<Option<Value>> {
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Ok(None);
+        };
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        // Which domain the identifier is asking about. An absolute address
+        // names its own; otherwise the caller's `domain` does, and a read with
+        // neither is not a read this can answer - a grant names one domain,
+        // and guessing which is not something a widening may do.
+        let domain = match CrystallineUrl::parse(&p.identifier) {
+            Some(url) => url.domain,
+            None => match p.domain.as_deref() {
+                Some(named) => named.to_string(),
+                None => return Ok(None),
+            },
+        };
+        if hidden.contains(&domain) {
+            return Ok(None);
+        }
+        let held = access
+            .overlay_grants_held(&account, &domain)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let bare = CrystallineUrl::parse(&p.identifier)
+            .map(|url| url.permalink)
+            .unwrap_or_else(|| p.identifier.clone());
+        for (path, owner) in held {
+            if owner == account {
+                continue;
+            }
+            // The freshness check every other grant surface makes: a link
+            // whose draft has gone opens nothing, so it widens nothing.
+            let Some(draft) = self.overlay_draft_at(&domain, &owner, &path).await? else {
+                continue;
+            };
+            let names = [
+                draft.permalink.as_str(),
+                path.as_str(),
+                path.trim_end_matches(".md"),
+            ];
+            if !names.contains(&bare.as_str()) {
+                continue;
+            }
+            return Ok(Some(granted_draft_json(&domain, &owner, &draft)?));
+        }
+        Ok(None)
+    }
+
     pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
+        // The one path a read crosses between two overlays on: a draft this
+        // caller was handed a link to. Asked first, so the grant stands over
+        // whatever the team's own folder holds at that path - a draft always
+        // stands over the base for whoever may see it, and the link is what
+        // says they may. See `Engine::granted_read`.
+        if let Some(granted) = self.granted_read(p, scope, &hidden).await? {
+            return Ok(granted);
+        }
         let (desc, source, overlay) = self
             .resolve_shadowed(&p.identifier, p.domain.as_deref(), &hidden, scope)
             .await?;

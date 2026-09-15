@@ -194,6 +194,21 @@ impl Fixture {
         receipt["path"].as_str().unwrap().to_string()
     }
 
+    /// One account's own read of an engram, as the door resolved them.
+    async fn reads(&self, session: &Session, permalink: &str) -> serde_json::Value {
+        let resp = session
+            .request(
+                self.addr,
+                reqwest::Method::GET,
+                &format!("/api/v1/domains/team/engrams/{permalink}"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "reading '{permalink}'");
+        resp.json().await.unwrap()
+    }
+
     /// Mint a link on `owner`'s draft of `path`, as `owner`.
     async fn mint(&self, session: &Session, path: &str) -> serde_json::Value {
         let resp = session
@@ -472,7 +487,12 @@ async fn a_grantees_search_still_excludes_the_owners_draft() {
         "nor in his listing of the domain: {text}"
     );
 
-    let read = bob
+    // The granted path itself IS readable, and only it: that is the one
+    // widening a link makes, and it is asserted in full by
+    // `a_granted_read_answers_the_draft_and_names_whose`. What matters here is
+    // that it is the exception rather than the rule - the search and the
+    // listing above went on saying nothing.
+    let read: serde_json::Value = bob
         .request(
             f.addr,
             reqwest::Method::GET,
@@ -480,11 +500,14 @@ async fn a_grantees_search_still_excludes_the_owners_draft() {
         )
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
     assert_eq!(
-        read.status(),
-        404,
-        "nor readable at its own address by the ordinary route"
+        read["draft_owner"],
+        serde_json::json!("alice"),
+        "the granted path answers her draft, named as hers: {read}"
     );
 
     // Alice's own view is untouched by any of it.
@@ -601,7 +624,7 @@ async fn a_write_at_a_granted_path_needs_a_join_and_then_lands_in_the_owners_dra
         hers["content"].as_str().unwrap().contains("bob typed into"),
         "her draft is where it landed: {hers}"
     );
-    let his = bob
+    let his: serde_json::Value = bob
         .request(
             f.addr,
             reqwest::Method::GET,
@@ -609,11 +632,15 @@ async fn a_write_at_a_granted_path_needs_a_join_and_then_lands_in_the_owners_dra
         )
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
     assert_eq!(
-        his.status(),
-        404,
-        "and he is still not holding a draft of his own"
+        his["draft_owner"],
+        serde_json::json!("alice"),
+        "and what he reads at that path is still HER draft - he is holding \
+         none of his own, which is the whole point of a joined write: {his}"
     );
 
     // Leaving puts the write back where it was.
@@ -856,5 +883,215 @@ async fn folding_the_draft_ends_the_link_and_the_join() {
         412,
         "a stale token on an ordinary save, which is what this now is: {:?}",
         saved.text().await
+    );
+}
+
+/// A grant is visibility, and visibility reaches the account's agent too.
+///
+/// The user sees the granted draft on the screen the link lands on; the agent
+/// - which authenticates as the same account and has no screen at all - sees
+/// it by reading the path the link was for. Anything else would mean a person
+/// could be handed a colleague's draft and their own agent could not be shown
+/// what they were looking at.
+///
+/// The widening is exactly one path and nothing else: the reads around it
+/// answer what they always answered, which is what the search test beside this
+/// one asserts from the other side. Two things the read says out loud, because
+/// a granted draft must never be mistaken for the page the team holds: it is
+/// marked as a draft, and it names whose.
+///
+/// And it does not carry the rest of the owner's overlay with it. A link in
+/// the granted draft that points at another of the owner's drafts resolves to
+/// nothing for the grantee, because that draft was not shared: the grant
+/// widens one path, not a neighbourhood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_read_answers_the_draft_and_names_whose() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    // Two drafts of alice's, and only one of them is shared. The shared one
+    // points at the other, which is what makes the no-transitivity assertion
+    // possible at all.
+    f.draft("alice", "Secret", "A second page only alice has.")
+        .await;
+    let path = f
+        .draft(
+            "alice",
+            "Fresh",
+            "A page only alice has.\n\n- relates_to [[Secret]]",
+        )
+        .await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let carol = login(f.addr, "carol").await;
+
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200, "bob holds the grant");
+
+    let read: serde_json::Value = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("A page only alice has"),
+        "the read at the granted path answers the draft: {read}"
+    );
+    assert_eq!(read["draft"], serde_json::json!(true), "{read}");
+    assert_eq!(
+        read["draft_owner"],
+        serde_json::json!("alice"),
+        "and says whose, so it is never mistaken for the team's page: {read}"
+    );
+    assert_eq!(
+        read["relations"][0]["resolved"],
+        serde_json::json!(false),
+        "the link onto her OTHER draft resolves to nothing: that one was not \
+         shared, and a grant widens one path rather than a neighbourhood: {read}"
+    );
+
+    let unshared = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/secret",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unshared.status(),
+        404,
+        "and her other draft is still nobody else's"
+    );
+
+    let stranger = carol
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stranger.status(),
+        404,
+        "while somebody holding no link sees exactly what they saw before"
+    );
+}
+
+/// A grant whose draft has gone does not lock its grantee out of the path.
+///
+/// The refusal that teaches "join, or draft your own" is only true while there
+/// IS a draft to join. Once its author has taken theirs away, a grantee still
+/// being told to join it could neither join - the link answers that the draft
+/// is gone - nor write, and a dead row would have taken a path away from
+/// somebody it was never about.
+///
+/// Driven over the base page rather than over a draft-only one, because that
+/// is the shape where it bites: a draft-only path stops resolving for the
+/// grantee at all once its author drops it, so the refusal is never reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_whose_draft_is_gone_stops_refusing_the_grantees_own_write() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    // Alice redrafts the page the team holds, and shares that draft.
+    let base = f.reads(&alice, "plan").await;
+    let redrafted = base["content"]
+        .as_str()
+        .unwrap()
+        .replace("What the team agreed", "What alice would rather");
+    let saved = alice
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", base["checksum"].as_str().unwrap()),
+        )
+        .json(&serde_json::json!({"content": redrafted}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200, "{:?}", saved.text().await);
+    let token = f.mint(&alice, "plan.md").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200);
+
+    // Then she takes her draft away - her deletion of the page stands where
+    // her redraft did - while the domain goes on reviewing changes, so nothing
+    // has ended the grant row.
+    let hers = f.reads(&alice, "plan").await;
+    let deleted = alice
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", hers["checksum"].as_str().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204, "{:?}", deleted.text().await);
+
+    // Bob, who was never asked about any of that, redrafts the team's page in
+    // his own overlay exactly as anybody else may.
+    let his = f.reads(&bob, "plan").await;
+    let written = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", his["checksum"].as_str().unwrap()),
+        )
+        .json(&serde_json::json!({
+            "content": his["content"].as_str().unwrap().replace("agreed", "is weighing"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        written.status(),
+        200,
+        "a link to a draft that is gone refuses nothing: {:?}",
+        written.text().await
     );
 }

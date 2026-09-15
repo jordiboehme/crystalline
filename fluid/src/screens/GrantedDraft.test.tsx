@@ -9,13 +9,13 @@
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "../api/client";
-import { JOIN_KEY_STORAGE } from "../api/draftLinks";
+import { JOIN_KEY_STORAGE, rememberJoin } from "../api/draftLinks";
 import { LayoutWidthContext } from "../layoutWidth";
 import GrantedDraft from "./GrantedDraft";
 
@@ -124,6 +124,59 @@ describe.each([
     draw(fullWidth);
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "this draft link opens nothing",
+    );
+  });
+
+  it("stays read-only when this window is inside a DIFFERENT draft", async () => {
+    sessionStorage.setItem(
+      JOIN_KEY_STORAGE,
+      JSON.stringify({
+        key: "keyA",
+        domain: "team",
+        path: "somewhere-else.md",
+        owner: "carol",
+        permalink: "somewhere-else",
+      }),
+    );
+    apiMock.mockResolvedValue(DRAFT);
+    draw(fullWidth);
+    // Awaited, so the assertion is made against the draft on screen rather
+    // than against the moment before it arrived, when there is no Save button
+    // for any reason at all.
+    await screen.findByLabelText("alice's draft of plan.md");
+    // A join to another page is not a join to this one: a Save here would aim
+    // at the join actually held and write the wrong draft.
+    expect(
+      screen.queryByRole("button", { name: "Save" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Join this draft" }),
+    ).toBeVisible();
+  });
+
+  it("goes read-only again when the join ends somewhere else", async () => {
+    apiMock.mockImplementation((path: string) => {
+      if (path === "/draft-links/accept")
+        return Promise.resolve(DRAFT as never);
+      return Promise.resolve({ ...DRAFT, join_key: "key1" } as never);
+    });
+    const user = userEvent.setup();
+    draw(fullWidth);
+    await user.click(
+      await screen.findByRole("button", { name: "Join this draft" }),
+    );
+    expect(await screen.findByRole("button", { name: "Save" })).toBeVisible();
+    // What Leave in the frame's bar does: forget the join and say so.
+    act(() => {
+      rememberJoin(null);
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Save" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(screen.getByLabelText("alice's draft of plan.md")).toHaveAttribute(
+      "readonly",
     );
   });
 });
