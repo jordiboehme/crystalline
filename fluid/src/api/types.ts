@@ -7093,7 +7093,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description This instance is already holding as many joins as it will hold at once. */
+            /** @description This account, or this instance, is already holding as many drafts open at once as it keeps. The refusal says which and what to do. */
             409: {
                 headers: {
                     [name: string]: unknown;
