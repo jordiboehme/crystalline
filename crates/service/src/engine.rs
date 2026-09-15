@@ -12486,16 +12486,21 @@ impl Engine {
     /// Every actor's files-overlay entries in one domain, or `None` when the
     /// domain's own overlay folder could not be enumerated.
     ///
-    /// The listing twin of [`Engine::overlay_file_counts`], and gated the same
-    /// way: only a domain that reviews changes is walked, because nothing
-    /// writes a files overlay outside review mode.
+    /// The listing twin of [`Engine::overlay_file_counts`], and **deliberately
+    /// not gated the way that one is**: the tree is walked whatever mode the
+    /// domain is in.
+    ///
+    /// Its callers are the fold and the convergence pass, and the fold takes
+    /// the review key off in the middle of itself. A read that asked the key
+    /// would see an actor's files on the first call and not on a repeat - the
+    /// mid-fold recovery [`Engine::set_review_mode`] documents - so the repeat
+    /// would sweep files it had never folded. The count beside this one is
+    /// gated because its callers are listings of every domain, where a direct
+    /// domain must answer byte for byte what it always did.
     fn overlay_files_by_actor(
         &self,
         domain: &str,
     ) -> Option<BTreeMap<String, crate::overlay_files::FileRead>> {
-        if !self.reviews_changes(domain) {
-            return Some(BTreeMap::new());
-        }
         let Ok(state_dir) = self.journal_state_dir() else {
             tracing::warn!(
                 domain,
