@@ -236,6 +236,41 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
               </span>
             )}
           </p>
+          {/*
+            What no share would pick up. In review mode a write joins its
+            author's own draft and never reaches the folder the team shares, so
+            the line above is true at zero over a pile of unshared work; this is
+            the sentence that says so. Drawn only on a domain the server says
+            reviews changes - on any other one there is nothing to draw, since
+            nobody can draft there.
+          */}
+          {sync.reviewing && <p className="text-sm">{draftLine(sync)}</p>}
+          {/*
+            And the coordination half, on the presence of the key rather than on
+            anything this side works out: the server sends it to whoever holds
+            the domain and to nobody else, which is a per-domain answer a
+            browser cannot make. Names and counts, because a draft is unshared
+            by definition and what is in it is its author's until they share it.
+          */}
+          {sync.drafts !== null && sync.drafts.length > 0 && (
+            <table className="text-sm">
+              <caption className="text-left text-slate-500 dark:text-slate-400">
+                Drafts held here
+              </caption>
+              <tbody>
+                {sync.drafts.map((holder) => (
+                  <tr key={holder.actor}>
+                    <th scope="row" className="pr-4 text-left font-normal">
+                      {holder.actor}
+                    </th>
+                    <td className="tabular-nums">
+                      {plural(holder.entries, "draft", "drafts")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
           {/* Only when the origin is actually ahead: `behind` is null when
                 nothing probed it, and "not behind" is not a fact then. */}
           {sync.behind === true && (
@@ -270,6 +305,27 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
       )}
     </section>
   );
+}
+
+/**
+ * What this session is holding in a reviewing domain, in words.
+ *
+ * Zero says so out loud here rather than staying silent the way the exceptional
+ * counts above do, and the difference is what the reader is being told: a
+ * reviewing domain is one where work can be under way that the sync numbers
+ * cannot see, so "none of it is yours" is an answer somebody came here for. A
+ * count the index could not answer says that instead, because it is neither.
+ */
+function draftLine(sync: { myDrafts: number | null }): string {
+  if (sync.myDrafts === null) {
+    return "Your drafts here could not be counted.";
+  }
+  if (sync.myDrafts === 0) {
+    return "You are holding no drafts here.";
+  }
+  return sync.myDrafts === 1
+    ? "1 draft change of yours awaits sharing."
+    : `${String(sync.myDrafts)} draft changes of yours await sharing.`;
 }
 
 /**

@@ -409,6 +409,20 @@ export interface SyncConflict {
 }
 
 /** Where a team domain stands relative to its GitHub origin. */
+/**
+ * One actor's unshared drafts in a reviewing domain: a name and a count.
+ *
+ * Never a path and never a line of the work. A draft is unshared by definition
+ * - its author has not decided it is ready - so what a coordination view is
+ * allowed to say is that somebody is holding something and how much.
+ */
+export interface DraftHolder {
+  /** Whose drafts these are. */
+  actor: string;
+  /** How many they hold, deletions included. */
+  entries: number;
+}
+
 export interface SyncStatus {
   repo: string;
   branch: string | null;
@@ -433,6 +447,33 @@ export interface SyncStatus {
   declinedProposals: number;
   /** Files a pull could not merge and somebody has to settle, as a count. */
   conflicts: number;
+  /**
+   * Whether this domain reviews changes before they land.
+   *
+   * Read from the presence of the count below rather than from a flag of its
+   * own, because that is how the server says it: a domain that takes changes
+   * directly sends neither draft key at all, since nobody can draft there.
+   */
+  reviewing: boolean;
+  /**
+   * How many drafts this session's own account is holding here, or null when
+   * the server could not count them.
+   *
+   * Null and zero are different sentences, as they are for `ownedChanges`
+   * beside this: zero is "you are holding nothing here" and null is "this could
+   * not be read", and only one of them is safe to act on.
+   */
+  myDrafts: number | null;
+  /**
+   * Who is drafting here and how much, or null when this caller was not sent
+   * it.
+   *
+   * The presence of the key is the server's answer to whether this caller may
+   * see who else is holding work - the domain's owner, or an instance admin -
+   * so nothing on this side works that out. Null is "not sent", which draws
+   * nothing; an empty array is "nobody is drafting here", which is a fact.
+   */
+  drafts: DraftHolder[] | null;
   /** Whether the origin is ahead, or null when the probe could not say. */
   behind: boolean | null;
   /**
@@ -703,6 +744,18 @@ function readConflict(value: unknown): SyncConflict | null {
   };
 }
 
+/**
+ * One row of the per-actor view: a name and a count, or nothing.
+ *
+ * A row with no name is dropped rather than drawn as an empty cell beside a
+ * number, which would read as "somebody" and say nothing.
+ */
+function readDraftHolder(value: unknown): DraftHolder | null {
+  const record = asObject(value);
+  const actor = asString(record?.actor);
+  return actor === null ? null : { actor, entries: asCount(record?.entries) };
+}
+
 /** Read a sync status out of the engine's own per-domain report. */
 function readSyncStatus(payload: unknown): SyncStatus {
   const record = asObject(payload);
@@ -720,6 +773,19 @@ function readSyncStatus(payload: unknown): SyncStatus {
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
     conflicts: asCount(record?.conflicts),
+    // The key's presence is what says the domain reviews at all: the server
+    // leaves both draft keys out of a domain that takes changes directly,
+    // where `0 drafts` would read as "you could have some".
+    reviewing: record !== null && "my_drafts" in record,
+    myDrafts: asNumber(record?.my_drafts),
+    // An array or nothing. A caller who may not see who else is drafting is
+    // sent no key, and a count the index could not answer arrives as null:
+    // neither is an empty list, which would say "nobody else is drafting here".
+    drafts: Array.isArray(record?.drafts)
+      ? record.drafts
+          .map(readDraftHolder)
+          .filter((holder): holder is DraftHolder => holder !== null)
+      : null,
     behind: typeof record?.behind === "boolean" ? record.behind : null,
     probeError: asString(record?.probe_error),
     mode: asString(record?.mode),
