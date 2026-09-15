@@ -968,6 +968,7 @@ pub async fn collect_orphaned_domains(
 pub async fn domain_remove(
     name: &str,
     purge: bool,
+    end_drafts: &[String],
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -975,6 +976,7 @@ pub async fn domain_remove(
     if use_daemon(db, config_path)
         && let Some(data) = ctl_if_running(json!({
             "v": 1, "cmd": "domain_remove", "domain": name, "purge": purge,
+            "end_drafts": end_drafts,
         }))
         .await?
     {
@@ -1000,7 +1002,7 @@ pub async fn domain_remove(
         engine.set_domain_access(std::sync::Arc::new(crate::scope::DomainAccess::new(auth)));
     }
     let report = engine
-        .unregister_domain(name, &Scope::Unrestricted, purge)
+        .unregister_domain(name, &Scope::Unrestricted, purge, end_drafts)
         .await?;
     // Only when this removal edited the daemon's own config file: an explicit
     // --config edited a different one, whose domains that daemon never served.

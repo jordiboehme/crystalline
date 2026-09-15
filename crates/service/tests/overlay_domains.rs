@@ -521,7 +521,12 @@ async fn removing_a_domain_sweeps_every_actors_journal_and_names_the_counts() {
 
     let preview = f
         .engine
-        .domain_remove_preview("team", &Scope::Unrestricted, false)
+        .domain_remove_preview(
+            "team",
+            &Scope::Unrestricted,
+            false,
+            &named(&["alice", "bob"]),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -536,7 +541,12 @@ async fn removing_a_domain_sweeps_every_actors_journal_and_names_the_counts() {
 
     let report = f
         .engine
-        .unregister_domain("team", &Scope::Unrestricted, false)
+        .unregister_domain(
+            "team",
+            &Scope::Unrestricted,
+            false,
+            &named(&["alice", "bob"]),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -554,6 +564,286 @@ async fn removing_a_domain_sweeps_every_actors_journal_and_names_the_counts() {
         !f.state.join("overlays/team").exists(),
         "and the domain's journal folder is gone"
     );
+}
+
+/// The reviewed team domain with an accounts store behind it, so a scope can be
+/// somebody in particular: `owner` holds the domain, `mem` is an editor in it,
+/// and the domain is private, which is what makes membership decide anything.
+async fn screened_origin_fixture() -> Fixture {
+    let f = reviewed_origin_fixture().await;
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&f.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["owner", "mem"] {
+        auth.add_user(
+            name,
+            name,
+            None,
+            crystalline_service::rest::Role::Editor,
+            "pw12345678",
+        )
+        .await
+        .unwrap();
+    }
+    auth.set_domain_visibility("team", true, "owner")
+        .await
+        .unwrap();
+    auth.upsert_domain_member(
+        "team",
+        "mem",
+        crystalline_service::rest::MemberLevel::Editor,
+        "owner",
+    )
+    .await
+    .unwrap();
+    f.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+    f
+}
+
+/// A status tells everybody what they are holding and tells the domain's owner
+/// who else is holding anything.
+///
+/// The two halves are one rule: a count of your own unshared work is yours to
+/// know, and a count of somebody else's is the coordination view of whoever
+/// holds the domain. A member gets the first and not the second - not a
+/// refusal, just no key - because a member asking after their own drafts is
+/// not asking about anybody else's.
+#[tokio::test]
+async fn a_members_status_carries_only_its_own_count() {
+    let f = screened_origin_fixture().await;
+    f.draft("team", "mem", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "owner", "fresh.md", ALICE_NEW).await;
+    f.tombstone("team", "owner", "plan.md").await;
+
+    let mine = f
+        .engine
+        .origin_status(Some("team"), false, &account("mem"))
+        .await
+        .unwrap();
+    let entry = &mine["domains"][0];
+    assert_eq!(
+        entry["my_drafts"],
+        serde_json::json!(1),
+        "a member is told what a member is holding: {entry}"
+    );
+    assert!(
+        entry.get("drafts").is_none(),
+        "and nothing about anybody else: {entry}"
+    );
+
+    let theirs = f
+        .engine
+        .origin_status(Some("team"), false, &account("owner"))
+        .await
+        .unwrap();
+    let entry = &theirs["domains"][0];
+    assert_eq!(
+        entry["my_drafts"],
+        serde_json::json!(2),
+        "a deletion is unshared work like any other draft, so it counts: {entry}"
+    );
+    assert_eq!(
+        entry["drafts"],
+        serde_json::json!([
+            { "actor": "mem", "entries": 1 },
+            { "actor": "owner", "entries": 2 },
+        ]),
+        "the owner sees who is drafting here and how much: {entry}"
+    );
+    let text = entry.to_string();
+    for secret in ["plan.md", "fresh.md", "alice would have it"] {
+        assert!(
+            !text.contains(secret),
+            "counts are not content, and {secret} is in the report: {text}"
+        );
+    }
+}
+
+/// A domain that takes changes directly carries neither key.
+///
+/// `my_drafts: 0` on a domain nobody can draft in would say "you are holding
+/// nothing here", which reads as "you could be". The key's presence is what
+/// says the domain reviews at all, exactly as `out_of_band`'s is.
+#[tokio::test]
+async fn a_direct_domains_status_says_nothing_about_drafts() {
+    let f = origin_fixture().await;
+    let status = f
+        .engine
+        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let entry = &status["domains"][0];
+    assert!(
+        entry.get("my_drafts").is_none() && entry.get("drafts").is_none(),
+        "a domain that takes changes directly has no drafts to report: {entry}"
+    );
+}
+
+/// Actor names as a removal takes them, so a test reads as the call it makes.
+fn named(actors: &[&str]) -> Vec<String> {
+    actors.iter().map(|a| (*a).to_string()).collect()
+}
+
+/// The question a removal puts is answered from the rows, not from their
+/// mirror.
+///
+/// A draft row can land while its journal entry fails - `write_overlay_entry`
+/// reports that as a `draft_warning` and keeps the row - and the row is the
+/// draft. A preview counting the mirror would tell somebody that nobody is
+/// holding work in a domain where somebody is, in front of the one call that
+/// ends it for good.
+#[tokio::test]
+async fn the_removal_preview_counts_the_rows_not_the_mirror() {
+    let f = fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    // Bob's row, with no mirror beside it: the draft whose journal write did
+    // not land.
+    {
+        let store = f.store.lock().await;
+        let id = f.domain_id(&*store, "team").await;
+        store
+            .upsert_overlay(id, "bob", &record(ALICE_NEW, "fresh.md"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        overlay_journal::journal_counts(&f.state, "team")
+            .per_actor
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![("alice".to_string(), 1)],
+        "the mirror knows about alice alone, which is the whole point"
+    );
+
+    let preview = f
+        .engine
+        .domain_remove_preview(
+            "team",
+            &Scope::Unrestricted,
+            false,
+            &named(&["alice", "bob"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["drafts"],
+        serde_json::json!([
+            { "actor": "alice", "entries": 1 },
+            { "actor": "bob", "entries": 1 },
+        ]),
+        "the rows are the authority, mirror or no mirror: {preview}"
+    );
+    assert_eq!(preview["drafts_unknown"], serde_json::json!(false));
+}
+
+/// Ending a domain ends everybody's unshared work in it, so somebody else's is
+/// never ended by omission.
+///
+/// The same rule leaving review mode applies, with the one difference that
+/// makes it simpler: a removal has no fold to offer, so the answer is not what
+/// happens to each actor's drafts but that each actor's drafts are being
+/// ended. Naming them is the answer. The caller's OWN drafts need no naming -
+/// they are the one person in the room who already knows.
+#[tokio::test]
+async fn removing_a_domain_refuses_until_every_other_actors_drafts_are_named() {
+    let f = fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    f.tombstone("team", "bob", "plan.md").await;
+
+    let err = f
+        .engine
+        .unregister_domain("team", &Scope::Unrestricted, false, &[])
+        .await
+        .expect_err("somebody else's drafts are not ended by omission");
+    let text = err.to_string();
+    for expected in ["alice", "2 drafts", "bob", "1 draft", "end_drafts"] {
+        assert!(
+            text.contains(expected),
+            "the refusal names who and how many, and how to answer: {text}"
+        );
+    }
+    // Names and counts, never the work itself: a refusal is read by somebody
+    // who may end these drafts and may not read them.
+    for secret in [
+        "plan.md",
+        "fresh.md",
+        "alice would have it",
+        "only alice has",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "a count is not a disclosure, and {secret} is in the refusal: {text}"
+        );
+    }
+    assert!(
+        !overlay_journal::journal_entries(&f.state, "team")
+            .entries
+            .is_empty(),
+        "and nothing was swept on the way to refusing"
+    );
+    assert_eq!(f.held("team", "alice").await.len(), 2, "with its drafts");
+
+    // An actor who holds nothing here is somebody meaning a different domain
+    // or a different moment, exactly as it is on the way out of review mode.
+    let err = f
+        .engine
+        .unregister_domain(
+            "team",
+            &Scope::Unrestricted,
+            false,
+            &named(&["alice", "bob", "carol"]),
+        )
+        .await
+        .expect_err("naming a stranger is not an answer about this domain");
+    assert!(
+        err.to_string().contains("carol"),
+        "and the refusal says who nobody is: {err}"
+    );
+
+    // Named, and it goes.
+    let report = f
+        .engine
+        .unregister_domain(
+            "team",
+            &Scope::Unrestricted,
+            false,
+            &named(&["alice", "bob"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report["drafts_swept"], serde_json::json!(3));
+}
+
+/// Nobody is asked to confirm the ending of their own drafts.
+///
+/// A local session is the machine owner and drafts as `owner`. A removal that
+/// made them name themselves would be a question with one possible answer,
+/// asked of the person who just asked for the removal.
+#[tokio::test]
+async fn a_removal_asks_nothing_about_the_callers_own_drafts() {
+    let f = fixture().await;
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+
+    let preview = f
+        .engine
+        .domain_remove_preview("team", &Scope::Unrestricted, false, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["drafts"],
+        serde_json::json!([{ "actor": "owner", "entries": 1 }]),
+        "the preview still says what would be lost: {preview}"
+    );
+    let report = f
+        .engine
+        .unregister_domain("team", &Scope::Unrestricted, false, &[])
+        .await
+        .unwrap();
+    assert_eq!(report["drafts_swept"], serde_json::json!(1));
 }
 
 /// An engine that was never told where its state directory is reaches no
@@ -582,17 +872,25 @@ async fn an_engine_with_no_state_dir_reaches_no_journal_in_a_test_build() {
         "and the refusal names the method that fixes it: {text}"
     );
 
-    // The removal paths do not fail - they are best effort by design - but they
-    // sweep nothing and they say the count is unknown rather than zero.
+    // The removal paths do not fail - they are best effort by design - and they
+    // sweep nothing. The count is another matter since Task 8: it is read from
+    // the index rows rather than from the journal, so a journal nothing can
+    // reach is not a count nothing can read, and the preview answers honestly
+    // that nobody is drafting here.
     let preview = f
         .engine
-        .domain_remove_preview("team", &Scope::Unrestricted, false)
+        .domain_remove_preview("team", &Scope::Unrestricted, false, &[])
         .await
         .unwrap();
-    assert_eq!(preview["drafts_unknown"], serde_json::json!(true));
+    assert_eq!(preview["drafts"], serde_json::json!([]));
+    assert_eq!(
+        preview["drafts_unknown"],
+        serde_json::json!(false),
+        "the rows answered, whatever the journal could not do: {preview}"
+    );
     let report = f
         .engine
-        .unregister_domain("team", &Scope::Unrestricted, false)
+        .unregister_domain("team", &Scope::Unrestricted, false, &[])
         .await
         .unwrap();
     assert_eq!(report["drafts_swept"], serde_json::json!(0));
@@ -614,16 +912,20 @@ async fn an_unreadable_journal_is_never_read_as_nobody_drafting() {
     std::fs::create_dir_all(f.state.join("overlays")).unwrap();
     std::fs::write(f.state.join("overlays/team"), "not a folder").unwrap();
 
+    // The preview counts the rows, so an unreadable journal is not an
+    // unreadable count: nobody is drafting in `team`, and that is what it says.
+    // `drafts_unknown` still exists for the case that IS unknown - an index
+    // that could not be asked - which is the only thing left that can set it.
     let preview = f
         .engine
-        .domain_remove_preview("team", &Scope::Unrestricted, false)
+        .domain_remove_preview("team", &Scope::Unrestricted, false, &[])
         .await
         .unwrap();
     assert_eq!(preview["drafts"], serde_json::json!([]));
     assert_eq!(
         preview["drafts_unknown"],
-        serde_json::json!(true),
-        "a count nothing could read is not a count of zero: {preview}"
+        serde_json::json!(false),
+        "the rows are readable, so the count is: {preview}"
     );
 
     // The orphan sweep, same rule. `solo` holds one actor's draft and no base

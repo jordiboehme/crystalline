@@ -533,6 +533,13 @@ pub struct RemoveDomainParams {
     /// files are never touched either way.
     #[serde(default)]
     pub purge: bool,
+    /// Every OTHER actor holding private drafts in this domain, by name.
+    /// Required when anybody but you is drafting here: a removal ends their
+    /// unshared work and nothing brings it back, so it is named rather than
+    /// assumed. The refusal says who, and how many drafts each of them holds.
+    /// Your own drafts need no naming.
+    #[serde(default)]
+    pub end_drafts: Vec<String>,
 }
 
 /// Parameters for `share_changes`.

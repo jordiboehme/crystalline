@@ -1632,6 +1632,15 @@ async fn engine_with_provider(
     )
     .with_origin_provider(provider)
     .with_origins_dir(origins_dir.to_path_buf())
+    // Beside the origins directory and for the same reason: a write into a
+    // reviewing domain mirrors its draft into the state directory, and a test
+    // build refuses to guess at one rather than reach the developer's own.
+    .with_state_dir(
+        config_path
+            .parent()
+            .expect("the config path has a directory")
+            .join("state"),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2273,6 +2282,75 @@ async fn origin_status_tool_wires_through_to_origin_status() {
         named["domains"][0]["detail"]["added"],
         json!(["gone.md"]),
         "detail: true must reach the engine and survive the trim: {named}"
+    );
+}
+
+/// An agent asking after a reviewing domain is told what it is holding there.
+///
+/// In review mode the agent's own writes never reach the folder the team
+/// shares, so without this the one surface it uses to decide what to share next
+/// would say "nothing unshared" over a pile of its own unshared drafts. The key
+/// rides on the untyped JSON the status already answers with, so nothing about
+/// the tool's shape moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_status_names_the_drafts_a_reviewing_domain_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "brand",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &crystalline_service::Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let written = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "brand",
+            "title": "Colour rules",
+            "content": "- [decision] the accent is used once per page #brand",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        written["draft"],
+        json!(true),
+        "the write joined a draft: {written}"
+    );
+
+    let out = call(peer, "origin_status", json!({})).await.unwrap();
+    let entry = &out["domains"][0];
+    assert_eq!(
+        entry["my_drafts"],
+        json!(1),
+        "the status says what this session is holding here: {entry}"
+    );
+    assert_eq!(
+        entry["drafts"],
+        json!([{ "actor": "owner", "entries": 1 }]),
+        "and a local session, which is the machine owner, sees the whole domain: {entry}"
     );
 }
 

@@ -1080,6 +1080,13 @@ enum DomainCommand {
         /// domain never needs it, since its files are never touched.
         #[arg(long)]
         purge: bool,
+        /// One other actor holding private drafts in this domain, by name;
+        /// repeat the flag for several. Required when anybody but you is
+        /// drafting here: unregistering the domain ends their unshared work and
+        /// nothing brings it back, so it is named rather than assumed. The
+        /// refusal says who, and how many drafts each of them holds.
+        #[arg(long = "end-drafts", value_name = "ACTOR")]
+        end_drafts: Vec<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -3104,8 +3111,9 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
         DomainCommand::Remove {
             name,
             purge,
+            end_drafts,
             config,
-        } => on_runtime(move || domain_remove_dispatch(name, purge, config, db, json)),
+        } => on_runtime(move || domain_remove_dispatch(name, purge, end_drafts, config, db, json)),
         DomainCommand::Members { domain, command } => {
             on_runtime(move || members::run(domain, command, json))
         }
@@ -3674,12 +3682,19 @@ async fn domain_review_dispatch(
 async fn domain_remove_dispatch(
     name: String,
     purge: bool,
+    end_drafts: Vec<String>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let report =
-        crystalline_service::domain_remove(&name, purge, db.as_deref(), config.as_deref()).await?;
+    let report = crystalline_service::domain_remove(
+        &name,
+        purge,
+        &end_drafts,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
     cmd::print_domain_remove(&name, &report, json);
     Ok(())
 }

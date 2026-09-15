@@ -263,7 +263,7 @@ export interface paths {
         post?: never;
         /**
          * Unregister a domain. Files on disk are never touched.
-         * @description An instance admin, or a private domain's owner. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its engrams are DELETED with it: that case is refused 409 unless the request carries `?purge=true`, so a client confirms the loss in words before it sends. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
+         * @description An instance admin, or a private domain's owner. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its engrams are DELETED with it: that case is refused 409 unless the request carries `?purge=true`, so a client confirms the loss in words before it sends. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them. A domain where anybody but the caller holds private drafts is refused 409 until `end_drafts` names each of them: unregistering it ends their unshared work and nothing brings it back.
          */
         delete: operations["unregister_domain"];
         options?: never;
@@ -353,6 +353,26 @@ export interface paths {
          * @description Metadata only, ordered by path: no bytes are read, so listing a domain full of slide decks costs one query. Each row carries the path to fetch it by, its mime, its size, when it last changed and its checksum.
          */
         get: operations["list_attachments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/drafts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Who is drafting in this domain, and how much.
+         * @description An instance admin, or a private domain's owner. In review mode every write joins its author's own draft, and this is how the person answerable for the domain learns that somebody is holding unshared work in it. Names and counts only - never a path, a permalink or a line of the work itself - and a deletion counts as an entry like any other draft. A domain that takes changes directly answers with an empty list. Your OWN count is in the domain's sync status, which every caller who can read it gets.
+         */
+        get: operations["get_domain_drafts"];
         put?: never;
         post?: never;
         delete?: never;
@@ -3739,6 +3759,15 @@ export interface operations {
                  * @example true
                  */
                 purge?: boolean;
+                /**
+                 * @description Every OTHER actor holding private drafts here, comma separated
+                 *     (`?end_drafts=ada,bob`). Required when anybody but the caller is
+                 *     drafting in this domain: unregistering it ends their unshared work for
+                 *     good, so it is named rather than assumed. The 409 says who, and how many
+                 *     drafts each of them holds. The caller's own drafts need no naming.
+                 * @example ada,bob
+                 */
+                end_drafts?: string;
             };
             header?: never;
             path: {
@@ -3794,7 +3823,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The domain is defined by an environment variable, which owns it (unset the variable instead), or it is a virtual domain holding engrams and the request did not carry `purge=true`. */
+            /** @description The domain is defined by an environment variable, which owns it (unset the variable instead), it is a virtual domain holding engrams and the request did not carry `purge=true`, or somebody other than the caller is drafting here and `end_drafts` did not name them - the detail says who, and how many drafts each of them holds. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4048,6 +4077,66 @@ export interface operations {
                 };
             };
             /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_domain_drafts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every actor holding drafts here, by name and count, ordered by actor. Empty when nobody is. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "actors": [
+                     *         {
+                     *           "actor": "ada",
+                     *           "entries": 3
+                     *         }
+                     *       ]
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller may see the domain and is neither an instance admin nor its owner, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
             404: {
                 headers: {
                     [name: string]: unknown;

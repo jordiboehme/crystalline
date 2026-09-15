@@ -132,14 +132,14 @@ impl RestCtx {
     /// membership), `mgr` (instance editor, manager membership) and `boss`
     /// (instance admin).
     async fn two_domains() -> RestCtx {
-        RestCtx::build(false, false).await
+        RestCtx::build(false, false, false).await
     }
 
     /// The same domains on an instance serving the anonymous viewer tier, so
     /// the one identity that carries no account at all can be put to the same
     /// questions the accounts are.
     async fn anonymous_instance() -> RestCtx {
-        RestCtx::build(false, true).await
+        RestCtx::build(false, true, false).await
     }
 
     /// The same two domains, both carrying a GitHub origin, on an instance
@@ -149,10 +149,17 @@ impl RestCtx {
     /// it. Nothing here connects: the status read reports local state and says
     /// the connection is absent.
     async fn two_team_domains() -> RestCtx {
-        RestCtx::build(true, false).await
+        RestCtx::build(true, false, false).await
     }
 
-    async fn build(team: bool, anonymous: bool) -> RestCtx {
+    /// The same two team domains with `lab` in review mode, so a write by a
+    /// member joins that member's own draft rather than the folder - which is
+    /// what gives the drafts route something to count.
+    async fn a_reviewing_team_domain() -> RestCtx {
+        RestCtx::build(true, false, true).await
+    }
+
+    async fn build(team: bool, anonymous: bool, review: bool) -> RestCtx {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig {
@@ -213,6 +220,12 @@ impl RestCtx {
                         branch: None,
                         poll_secs: None,
                     }),
+                    // Written straight into the configuration rather than
+                    // turned on through the verb: what a reviewing domain
+                    // reports is what these tests are about, and a fixture that
+                    // had to satisfy the enabling gates would be testing those.
+                    review: (review && name == "lab")
+                        .then_some(crystalline_core::config::ReviewMode::Overlay),
                     ..DomainEntry::file(dir)
                 }
             } else {
@@ -1715,4 +1728,98 @@ async fn a_file_domain_needs_no_purge_over_rest() {
     let body = removed.text().await.unwrap();
     assert_eq!(status, 200, "no purge is asked for: {body}");
     assert!(body.contains("\"files_kept\":true"), "{body}");
+}
+
+/// Who is drafting in a domain is the coordination view of whoever holds it.
+///
+/// A member writing into a reviewing domain writes into their own draft, and
+/// nobody else can read it. What the domain's owner can know is that somebody
+/// is holding something and how much - which is what makes it possible to ask
+/// them about it - and that is the whole of what this route answers. An
+/// instance admin gets it too, for the same reason they may end the domain.
+#[tokio::test]
+async fn the_owner_sees_per_actor_counts_and_a_member_gets_403() {
+    let ctx = RestCtx::a_reviewing_team_domain().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Editor).await;
+
+    let mem = ctx.as_user("mem").await;
+    for title in ["Fresh", "Second"] {
+        let written = mem
+            .post_json(
+                "/api/v1/domains/lab/engrams",
+                json!({"title": title, "content": format!("# {title}\n")}),
+            )
+            .await;
+        assert_eq!(written.status(), 201, "{:?}", written.text().await);
+    }
+
+    let owner = ctx.as_user("owner").await;
+    assert_eq!(
+        owner.get_json("/api/v1/domains/lab/drafts").await,
+        json!({ "actors": [{ "actor": "mem", "entries": 2 }] }),
+        "the owner is told who is drafting here and how much"
+    );
+    let boss = ctx.as_user("boss").await;
+    assert_eq!(
+        boss.get_json("/api/v1/domains/lab/drafts").await["actors"][0]["actor"],
+        json!("mem"),
+        "and so is an instance admin"
+    );
+
+    // A member is not refused their own drafts - those are in the domain's
+    // status - but the question "who else" is not theirs to ask.
+    assert_eq!(mem.get("/api/v1/domains/lab/drafts").await.status(), 403);
+    // And a stranger is told what a stranger is always told about a domain
+    // they may not see.
+    let out = ctx.as_user("out").await;
+    assert_eq!(out.get("/api/v1/domains/lab/drafts").await.status(), 404);
+}
+
+/// Counts, and nothing that would let the counts be read as the work.
+///
+/// A draft is unshared by definition: its author has not decided it is ready,
+/// and a coordination view that leaked a path or a line of it would make
+/// "private draft" a promise the product does not keep.
+#[tokio::test]
+async fn the_drafts_route_never_returns_a_path_or_content() {
+    let ctx = RestCtx::a_reviewing_team_domain().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Editor).await;
+
+    let mem = ctx.as_user("mem").await;
+    let written = mem
+        .post_json(
+            "/api/v1/domains/lab/engrams",
+            json!({
+                "title": "Quarterly numbers",
+                "content": "# Quarterly numbers\n\n- [fact] revenue fell by a third #t\n",
+            }),
+        )
+        .await;
+    assert_eq!(written.status(), 201, "{:?}", written.text().await);
+
+    let body = ctx
+        .as_user("owner")
+        .await
+        .get_text("/api/v1/domains/lab/drafts", 200)
+        .await;
+    for secret in [
+        "quarterly-numbers",
+        "Quarterly numbers",
+        ".md",
+        "revenue fell",
+        "permalink",
+        "path",
+    ] {
+        assert!(
+            !body.contains(secret),
+            "a count is not a disclosure, and {secret} is in the answer: {body}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        json!({ "actors": [{ "actor": "mem", "entries": 1 }] }),
+        "what it does carry is a name and a number: {body}"
+    );
 }

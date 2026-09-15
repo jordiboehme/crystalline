@@ -465,6 +465,29 @@ pub struct RemoveQuery {
     #[serde(default)]
     #[param(example = true)]
     purge: bool,
+    /// Every OTHER actor holding private drafts here, comma separated
+    /// (`?end_drafts=ada,bob`). Required when anybody but the caller is
+    /// drafting in this domain: unregistering it ends their unshared work for
+    /// good, so it is named rather than assumed. The 409 says who, and how many
+    /// drafts each of them holds. The caller's own drafts need no naming.
+    #[serde(default)]
+    #[param(example = "ada,bob")]
+    end_drafts: Option<String>,
+}
+
+/// The actors a removal was told it may end the drafts of, as the query spells
+/// them: comma separated, empty entries dropped so a trailing comma is not a
+/// nameless actor.
+fn named_actors(query: &RemoveQuery) -> Vec<String> {
+    query
+        .end_drafts
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|actor| !actor.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// `DELETE /domains/{domain}` - unregister a domain: the registration and the
@@ -500,7 +523,11 @@ pub struct RemoveQuery {
                    that case is refused 409 unless the request carries \
                    `?purge=true`, so a client confirms the loss in words \
                    before it sends. Any open co-editing rooms in the domain \
-                   are saved and closed first; `rooms_closed` counts them.",
+                   are saved and closed first; `rooms_closed` counts them. A \
+                   domain where anybody but the caller holds private drafts is \
+                   refused 409 until `end_drafts` names each of them: \
+                   unregistering it ends their unshared work and nothing \
+                   brings it back.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         RemoveQuery,
@@ -544,9 +571,12 @@ pub struct RemoveQuery {
         (
             status = 409,
             description = "The domain is defined by an environment variable, \
-                           which owns it (unset the variable instead), or it \
+                           which owns it (unset the variable instead), it \
                            is a virtual domain holding engrams and the \
-                           request did not carry `purge=true`.",
+                           request did not carry `purge=true`, or somebody \
+                           other than the caller is drafting here and \
+                           `end_drafts` did not name them - the detail says \
+                           who, and how many drafts each of them holds.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -567,7 +597,12 @@ pub async fn remove(
     refuse_read_only(&state)?;
     let report = state
         .engine
-        .unregister_domain(&domain, &identity.scope(), query.purge)
+        .unregister_domain(
+            &domain,
+            &identity.scope(),
+            query.purge,
+            &named_actors(&query),
+        )
         .await
         .map_err(|e| {
             match e {
@@ -579,6 +614,95 @@ pub async fn remove(
             }
         })?;
     Ok(Json(report))
+}
+
+/// `GET /domains/{domain}/drafts` - who is drafting in this domain and how
+/// much.
+///
+/// The coordination view of a domain that reviews changes: in review mode
+/// every write joins its author's own draft, so work can be under way that
+/// nobody else can see, and the person answerable for the domain has to be able
+/// to ask whether anybody is holding anything before they plan around it.
+///
+/// **Names and counts, and nothing else.** No path, no permalink, no line of
+/// anybody's text. A draft is unshared by definition - its author has not
+/// decided it is ready - and a view that leaked what was in it would make the
+/// word "private" a promise this does not keep. A deletion counts as an entry
+/// like any other draft, because it is unshared work exactly as a new page is.
+///
+/// Gated exactly as unregistering the domain is - an instance admin, or a
+/// private domain's owner - and for the same reason: both are about the domain
+/// as a whole rather than about one engram in it. A member is answered 403,
+/// which is not a refusal of their own count: that rides on the domain's sync
+/// status, where every caller is told what they are holding.
+///
+/// A pure read, so it is served on a read-only instance, exactly like the sync
+/// status beside it. A domain that takes changes directly answers with an empty
+/// list rather than a 404: nobody can draft there, so nobody is, and a client
+/// asking the same question of every domain gets one shape back.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/drafts",
+    tag = "domains",
+    operation_id = "get_domain_drafts",
+    summary = "Who is drafting in this domain, and how much.",
+    description = "An instance admin, or a private domain's owner. In review \
+                   mode every write joins its author's own draft, and this is \
+                   how the person answerable for the domain learns that \
+                   somebody is holding unshared work in it. Names and counts \
+                   only - never a path, a permalink or a line of the work \
+                   itself - and a deletion counts as an entry like any other \
+                   draft. A domain that takes changes directly answers with an \
+                   empty list. Your OWN count is in the domain's sync status, \
+                   which every caller who can read it gets.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    responses(
+        (
+            status = 200,
+            description = "Every actor holding drafts here, by name and count, \
+                           ordered by actor. Empty when nobody is.",
+            body = Object,
+            example = json!({ "actors": [{ "actor": "ada", "entries": 3 }] }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller may see the domain and is neither an \
+                           instance admin nor its owner, or the \
+                           trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn drafts(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    // The same split `remove` makes, for the same reason: who holds a domain is
+    // the engine's rule, and the one thing the engine cannot see is that an
+    // anonymous identity has no account to be anybody's owner, so it is told to
+    // log in (401) rather than that it is forbidden (403).
+    identity.require_account()?;
+    // No refuse_read_only: a read, like the sync status beside it.
+    Ok(Json(
+        state
+            .engine
+            .domain_drafts(&domain, &identity.scope())
+            .await?,
+    ))
 }
 
 /// One domain's entry out of an aggregate origin report.

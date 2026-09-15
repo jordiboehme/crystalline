@@ -2663,7 +2663,7 @@ async fn a_team_domain_is_unregistered_and_its_repository_is_untouched() {
 
     let preview = ctx
         .engine
-        .domain_remove_preview("lab", &crystalline_service::Scope::Unrestricted, false)
+        .domain_remove_preview("lab", &crystalline_service::Scope::Unrestricted, false, &[])
         .await
         .unwrap();
     assert_eq!(

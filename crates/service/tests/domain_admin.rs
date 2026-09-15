@@ -728,7 +728,7 @@ async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_pur
     let engine = engine_over(&db, &root, "mind", "eng").await;
 
     let refused = engine
-        .unregister_domain("mind", &Scope::Unrestricted, false)
+        .unregister_domain("mind", &Scope::Unrestricted, false, &[])
         .await
         .expect_err("an unreadable count must not read as an empty domain");
     let text = refused.to_string();
@@ -753,7 +753,7 @@ async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_pur
     // A file domain loses no knowledge to a removal, so the same broken index
     // costs it only the number in its receipt.
     let removed = engine
-        .unregister_domain("eng", &Scope::Unrestricted, false)
+        .unregister_domain("eng", &Scope::Unrestricted, false, &[])
         .await
         .expect("a file domain never needed the count to decide anything");
     assert_eq!(removed["unregistered"], serde_json::json!(true));
@@ -767,7 +767,7 @@ async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_pur
     // rather than a gate, the preview says the number is missing instead of
     // letting the question fall silent about how much is at stake.
     let preview = engine
-        .domain_remove_preview("mind", &Scope::Unrestricted, true)
+        .domain_remove_preview("mind", &Scope::Unrestricted, true, &[])
         .await
         .expect("a confirmed removal previews even with the count unavailable");
     assert_eq!(preview["engrams"], serde_json::Value::Null);
@@ -780,7 +780,7 @@ async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_pur
     // With the loss already confirmed there is nothing left to ask about, so
     // the same unreadable count no longer stands in the way.
     let purged = engine
-        .unregister_domain("mind", &Scope::Unrestricted, true)
+        .unregister_domain("mind", &Scope::Unrestricted, true, &[])
         .await
         .expect("purge is the confirmation the refusal asked for");
     assert_eq!(purged["unregistered"], serde_json::json!(true));

@@ -12107,31 +12107,53 @@ impl Engine {
         Ok(counted)
     }
 
-    /// What private drafts a removal would end, as `[{ actor, entries }]`
-    /// ordered by actor, plus whether the count could be read at all.
+    /// Every actor's draft count in one domain, as the index rows have them,
+    /// or `None` when the index could not be asked at all.
     ///
-    /// **Counted from the overlay journal, not from the index rows**, and the
-    /// reason is what a preview is allowed to do rather than what is most
-    /// authoritative. `Store::overlay_counts` takes a `DomainId`, and the only
-    /// way to resolve one is `upsert_domain` - a write, in a verb that answers
-    /// a question and must stay answerable on a read-only instance. The mirror
-    /// is written with every draft row and swept with them, so the two agree
-    /// wherever it matters; where they do not, the mirror is the copy that
-    /// would have survived the removal, which is the loss worth naming.
+    /// **The rows are the authority and the journal is their mirror.** A draft
+    /// row can land while its journal entry fails - `write_overlay_entry`
+    /// reports that as a `draft_warning` and keeps the row - so a count read
+    /// from the mirror would quietly drop exactly those, in front of the calls
+    /// that end somebody's unshared work for good. This is the one place a
+    /// count is derived, so the removal's question, the status surfaces and the
+    /// drafts route cannot answer "who is drafting here" three different ways.
     ///
-    /// An empty list means nobody is drafting here. A journal that could not
-    /// even be located answers `(empty, true)`, and the caller says which.
-    fn removal_drafts(&self, name: &str) -> (Vec<Value>, bool) {
-        let Ok(state_dir) = self.journal_state_dir() else {
-            return (Vec::new(), true);
+    /// **A deletion counts as an entry.** A draft that takes a file away is
+    /// unshared work exactly as a draft that writes one is, and a count that
+    /// left it out would tell somebody they hold nothing while a removal is
+    /// still theirs to lose.
+    ///
+    /// A pure read, and deliberately: [`Store::domain_id`] is the read-only way
+    /// to a domain id, so a status call on a read-only instance can ask this
+    /// without registering anything. A domain the index holds no row for has no
+    /// drafts in it either - a registration nothing has synced yet - and that
+    /// is an honest empty rather than an unknown.
+    pub(crate) async fn overlay_counts_by_actor(&self, name: &str) -> Option<Vec<(String, u64)>> {
+        let store = self.store.lock().await;
+        let id = match store.domain_id(name).await {
+            Ok(Some(id)) => id,
+            Ok(None) => return Some(Vec::new()),
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    error = format!("{e:#}"),
+                    "the index could not say which domain '{name}' is, so nobody's drafts in \
+                     it can be counted"
+                );
+                return None;
+            }
         };
-        let counts = crate::overlay_journal::journal_counts(&state_dir, name);
-        let rows = counts
-            .per_actor
-            .into_iter()
-            .map(|(actor, entries)| json!({ "actor": actor, "entries": entries }))
-            .collect();
-        (rows, counts.unreadable)
+        match store.overlay_counts(id).await {
+            Ok(counts) => Some(counts),
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    error = format!("{e:#}"),
+                    "the drafts held in domain '{name}' could not be counted"
+                );
+                None
+            }
+        }
     }
 
     /// Sweep a domain's overlay journal as part of ending it, answering with
@@ -12215,14 +12237,67 @@ impl Engine {
         name: &str,
         scope: &crate::scope::Scope,
     ) -> Result<()> {
+        self.require_domain_owner_refusing(name, scope, Engine::removal_refusal(name))
+            .await
+    }
+
+    /// The same gate, worded for a call that is about the domain rather than
+    /// about ending it.
+    ///
+    /// One ladder, two sentences: the rule about who holds a domain is the same
+    /// whether they are ending it or reading who is drafting in it, and a
+    /// second copy of the ladder is how the two would drift apart. `refusal` is
+    /// built by the caller so its own verb is the one named in the answer.
+    async fn require_domain_owner_refusing(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+        refusal: EngineError,
+    ) -> Result<()> {
         self.require_domain(name, scope).await?;
         if matches!(scope, crate::scope::Scope::Anonymous) {
-            return Err(Engine::removal_refusal(name));
+            return Err(refusal);
         }
         if self.domain_right(scope, name).await? < crate::scope::DomainRight::Own {
-            return Err(Engine::removal_refusal(name));
+            return Err(refusal);
         }
         Ok(())
+    }
+
+    /// Who is drafting in one domain and how much, for whoever holds it.
+    ///
+    /// The coordination view: names and counts, never a path and never a line
+    /// of anybody's work. A draft is unshared by definition, and what its
+    /// author has not shared stays theirs until they do; what the person
+    /// answerable for the domain needs in order to coordinate is that somebody
+    /// is holding something and roughly how much, which is exactly this.
+    ///
+    /// A deletion counts as an entry, for the reason
+    /// [`Engine::overlay_counts_by_actor`] gives. A domain that takes changes
+    /// directly answers with an empty list rather than a refusal: nobody can
+    /// draft there, so nobody is, and a client asking the same question of
+    /// every domain gets one shape back.
+    ///
+    /// Gated exactly as unregistering it is - an instance admin, or a private
+    /// domain's owner - and a caller who may not see the domain is answered as
+    /// one naming a domain nobody registered.
+    pub async fn domain_drafts(&self, name: &str, scope: &crate::scope::Scope) -> Result<Value> {
+        self.require_domain_owner_refusing(
+            name,
+            scope,
+            EngineError::Forbidden(format!(
+                "who is drafting in domain '{name}' is for an instance admin, or for the owner \
+                 of a private domain; your own drafts are in this domain's status"
+            )),
+        )
+        .await?;
+        match self.overlay_counts_by_actor(name).await {
+            Some(counts) => Ok(json!({ "actors": crate::review::counts_json(&counts) })),
+            None => Err(EngineError::Internal(format!(
+                "who is drafting in domain '{name}' could not be read, because the index could \
+                 not be asked"
+            ))),
+        }
     }
 
     /// What a removal would end, for a surface that asks before it acts.
@@ -12234,14 +12309,16 @@ impl Engine {
     ///
     /// Every refusal the removal itself would raise is raised here first, in
     /// the same order - the gate, the environment conflict, the unconfirmed
-    /// purge - so a question is never put about a removal that would refuse
-    /// anyway. Advisory rather than authoritative: the removal re-decides all
-    /// of it under its own lock, which is where the decision has to hold.
+    /// purge, the unnamed drafts of other actors - so a question is never put
+    /// about a removal that would refuse anyway. Advisory rather than
+    /// authoritative: the removal re-decides all of it under its own lock,
+    /// which is where the decision has to hold.
     pub async fn domain_remove_preview(
         &self,
         name: &str,
         scope: &crate::scope::Scope,
         purge: bool,
+        end_drafts: &[String],
     ) -> Result<Value> {
         self.require_domain_owner(name, scope).await?;
         if let Some(conflict) = self.env_domain_conflict(name) {
@@ -12249,15 +12326,29 @@ impl Engine {
         }
         let entry = self.domain_entry(name)?;
         let engrams = self.removal_engrams(name, &entry, purge).await?;
-        let (drafts, drafts_unknown) = self.removal_drafts(name);
+        let counts = self.overlay_counts_by_actor(name).await;
+        crate::review::removal_choices(
+            name,
+            counts.as_deref(),
+            crate::scope::overlay_actor(scope).as_deref(),
+            end_drafts,
+        )?;
+        let (drafts, drafts_unknown) = match &counts {
+            Some(counts) => (crate::review::counts_json(counts), false),
+            None => (Vec::new(), true),
+        };
         Ok(json!({
             "domain": name,
             "kind": Engine::removal_kind(&entry),
             "drafts": drafts,
             // The same distinction `engrams_unknown` draws, for the same
-            // reason: nobody drafting here and "the journal could not be
-            // located" are different answers to a question about somebody's
-            // unshared work.
+            // reason: nobody drafting here and "the index could not be asked"
+            // are different answers to a question about somebody's unshared
+            // work. The counts come from the rows now
+            // ([`Engine::overlay_counts_by_actor`]), so this is set by an index
+            // that could not answer and by nothing else - a journal that cannot
+            // be read no longer makes a count unknown, because the count was
+            // never the journal's to give.
             "drafts_unknown": drafts_unknown,
             "engrams": engrams.as_json(),
             // Why the count is absent, so the question can say which: an index
@@ -12283,8 +12374,10 @@ impl Engine {
     ///    open and a join arriving one instant later would open a fresh room
     ///    over a domain that is about to vanish.
     /// 2. Every refusal is decided **inside** those guards: the gate
-    ///    ([`Engine::require_domain_owner`]), the environment conflict, and the
-    ///    unconfirmed purge of a virtual domain's engrams. That ordering is the
+    ///    ([`Engine::require_domain_owner`]), the environment conflict, the
+    ///    unconfirmed purge of a virtual domain's engrams, and the private
+    ///    drafts of every OTHER actor, which have to be named before they are
+    ///    ended ([`crate::review::removal_choices`]). That ordering is the
     ///    point of holding the lock at all - a gate decided outside it is a
     ///    check somebody's ownership transfer can land behind - and it is what
     ///    makes the preview above advisory rather than authoritative.
@@ -12313,6 +12406,7 @@ impl Engine {
         name: &str,
         scope: &crate::scope::Scope,
         purge: bool,
+        end_drafts: &[String],
     ) -> Result<Value> {
         // Ahead of the guards, and only this one: its answer is the same for
         // every caller and every name, so it discloses nothing and there is
@@ -12330,6 +12424,18 @@ impl Engine {
         // not have closed somebody's co-editing room on the way to refusing.
         let entry = self.domain_entry(name)?;
         self.removal_engrams(name, &entry, purge).await?;
+        // Beside the purge and for the same reason, and before the sweep for
+        // the same one again: a removal that is going to refuse must not have
+        // closed somebody's co-editing room on the way to refusing. The count
+        // is re-read here rather than carried from the preview, because the
+        // preview ran outside these guards and somebody may have started
+        // drafting since.
+        crate::review::removal_choices(
+            name,
+            self.overlay_counts_by_actor(name).await.as_deref(),
+            crate::scope::overlay_actor(scope).as_deref(),
+            end_drafts,
+        )?;
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
             Some(sessions) => sessions.dispose_domain(name).await,
             None => 0,
@@ -13807,10 +13913,26 @@ impl Engine {
         let targets = self.origin_targets(domain, &hidden)?;
         let connection = self.origin_status_connection().await?;
 
+        let actor = crate::scope::overlay_actor(scope);
         let mut domains = Vec::new();
         let mut errors = Vec::new();
         for (name, entry) in targets {
-            match self.origin_status_one(&name, &entry, detail).await {
+            // Read here rather than inside the per-domain body, and that is not
+            // tidiness: the body runs under this domain's origin lock, and
+            // taking the store lock inside it would invent a lock pair that
+            // exists nowhere else in the engine. The counts are a read of rows
+            // nobody else in this call touches, so taking them first costs
+            // nothing and orders nothing.
+            let view = crate::review::DraftView::new(
+                self.overlay_counts_by_actor(&name).await,
+                actor.clone(),
+                // Whoever owns the domain sees who else is drafting in it. One
+                // comparison covers the whole rule: an instance admin owns
+                // every domain, a private domain's owner owns theirs, and
+                // nobody else ever reaches `Own`.
+                self.domain_right(scope, &name).await? >= crate::scope::DomainRight::Own,
+            );
+            match self.origin_status_one(&name, &entry, detail, &view).await {
                 Ok(v) => domains.push(v),
                 Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
             }
@@ -13852,6 +13974,7 @@ impl Engine {
         name: &str,
         entry: &DomainEntry,
         detail: bool,
+        drafts: &crate::review::DraftView,
     ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
@@ -13893,6 +14016,18 @@ impl Engine {
                 && let Some(object) = value.as_object_mut()
             {
                 object.insert("out_of_band".to_string(), json!(paths));
+                // Under the same condition and for the same reason the block
+                // above gives: on a reviewing domain every caller is told what
+                // they are holding, and whoever owns the domain is told who
+                // else is holding anything. On a domain that takes changes
+                // directly neither key appears at all - `my_drafts: 0` there
+                // would say "you are holding nothing here", which reads as
+                // "you could be", and nobody can draft in a domain that is not
+                // reviewing.
+                object.insert("my_drafts".to_string(), drafts.mine());
+                if let Some(everyone) = drafts.everyone() {
+                    object.insert("drafts".to_string(), everyone);
+                }
             }
             value
         };

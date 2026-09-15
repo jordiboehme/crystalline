@@ -287,9 +287,28 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         "domain_remove" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let purge = req.get("purge").and_then(Value::as_bool).unwrap_or(false);
+            // Whose unshared work this removal was told it may end. Absent is
+            // an empty list, which is a removal that has confirmed nothing and
+            // refuses the moment anybody else is drafting here.
+            let end_drafts: Vec<String> = req
+                .get("end_drafts")
+                .and_then(Value::as_array)
+                .map(|actors| {
+                    actors
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             match shared
                 .engine
-                .unregister_domain(domain, &crate::scope::Scope::Unrestricted, purge)
+                .unregister_domain(
+                    domain,
+                    &crate::scope::Scope::Unrestricted,
+                    purge,
+                    &end_drafts,
+                )
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),

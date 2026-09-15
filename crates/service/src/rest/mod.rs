@@ -116,6 +116,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains_admin::create,
         domains_admin::remove,
         domains_admin::set_review_mode,
+        domains_admin::drafts,
         domains_admin::set_visibility,
         members::list,
         members::set_member,
@@ -580,6 +581,13 @@ pub fn router(state: RestState) -> Router {
             "/domains/{domain}/review",
             put(domains_admin::set_review_mode),
         )
+        // Who is drafting in the domain, for whoever holds it: the read half of
+        // the same card. Gated with the switch above rather than with the
+        // domain reads below it, because a count of somebody else's unshared
+        // work is the coordination view of the person answerable for the
+        // domain. A pure read, so a read-only instance serves it. See
+        // [`domains_admin::drafts`].
+        .route("/domains/{domain}/drafts", get(domains_admin::drafts))
         // Who may reach a private domain. The listing is open to anyone who
         // may see the domain at all (a viewer-level member sees who else is
         // here); inviting, re-levelling and evicting need `Manage`, with the

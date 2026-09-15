@@ -5554,7 +5554,10 @@ async fn domain_id_is_a_read(store: &dyn Store) {
         "and asking after an unregistered name registered nothing"
     );
 }
-parity!(domain_id_answers_without_registering_anything, domain_id_is_a_read);
+parity!(
+    domain_id_answers_without_registering_anything,
+    domain_id_is_a_read
+);
 
 /// A draft of `path`, parsed from markdown the way a write verb parses what it
 /// was handed, so a draft row carries the observations, tags and chunks-worth
