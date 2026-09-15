@@ -3217,6 +3217,145 @@ async fn tombstone(eng: &Engine, actor: &str, path: &str) {
     store.upsert_overlay(id, actor, &record).await.unwrap();
 }
 
+/// The scope one actor name means, as an authenticated surface resolves it.
+/// The machine owner drafts as `owner`, which is [`Scope::Unrestricted`]'s own
+/// overlay key, and anybody else drafts under their account.
+fn scope_of(actor: &str) -> Scope {
+    if actor == "owner" {
+        Scope::Unrestricted
+    } else {
+        Scope::User {
+            account: actor.to_string(),
+            admin: false,
+        }
+    }
+}
+
+/// Write one actor's draft file: an attachment written in review mode, which
+/// lands in that actor's files overlay and never in the folder.
+///
+/// It goes through `attachment_write_as` rather than through a `DomainView`,
+/// because `domain_view` is `pub(crate)` and an integration test cannot build
+/// one. The receipt's `draft` flag is asserted here so a fixture can never
+/// quietly write the team's folder instead.
+async fn file(eng: &Engine, actor: &str, path: &str, bytes: &[u8]) {
+    let written = eng
+        .attachment_write_as("team", path, bytes.to_vec(), &scope_of(actor))
+        .await
+        .unwrap();
+    assert!(written.draft, "a write in review mode is a draft: {path}");
+}
+
+/// One actor's deletion of a reviewed file: a marker in their files overlay,
+/// with the folder untouched.
+async fn delete_file(eng: &Engine, actor: &str, path: &str) {
+    let draft = eng
+        .attachment_delete_as("team", path, &scope_of(actor))
+        .await
+        .unwrap();
+    assert!(draft, "a deletion in review mode is a draft: {path}");
+}
+
+/// A file the team already has, and one only an actor's draft has.
+const OLD_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00the team's old deck";
+const DECK_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00a deck only alice has";
+
+/// A share carries the acting actor's overlay FILES beside their rows: the
+/// bytes of a file they drafted travel as an addition, their deletion of a
+/// reviewed file travels as a deletion, and the folder on disk is untouched by
+/// any of it.
+///
+/// A share that dropped a draft file would be worse than one that carried
+/// nothing: `ops::propose` detects against the staged tree, so a file left out
+/// of the staging reads as a file the actor deleted and the proposal would ask
+/// the team to delete their own copy.
+#[tokio::test]
+async fn an_overlay_share_stages_the_actors_files_and_the_proposal_carries_the_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/plan.md", team_plan()),
+            ("assets/old.png", OLD_PNG.to_vec()),
+        ],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    file(&eng, "owner", "assets/deck.png", DECK_PNG).await;
+    delete_file(&eng, "owner", "assets/old.png").await;
+
+    // Scoped to the deck alone: a staged overlay file is a detected change
+    // like any other, so `files` selects among them the way it always has.
+    let scoped = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            Some(&["assets/deck.png".to_string()]),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped["outcome"], "proposed", "{scoped}");
+    assert_eq!(scoped["added"], serde_json::json!(["assets/deck.png"]));
+    assert_eq!(scoped["updated"], serde_json::json!([]), "{scoped}");
+    assert_eq!(scoped["deleted"], serde_json::json!([]), "{scoped}");
+    let branch = scoped["branch"].as_str().unwrap().to_string();
+    let commit = mock
+        .branch_commit(&branch)
+        .expect("the share made a branch");
+    assert_eq!(
+        mock.commit_file(&commit, "assets/deck.png").as_deref(),
+        Some(DECK_PNG),
+        "the proposal carries the draft file's own bytes"
+    );
+
+    // And the whole delta: the draft, the new file and the deletion together.
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    // The second share amends the proposal the first one opened, so the delta
+    // rides under `proposal` rather than at the top level.
+    let amended = &result["proposal"];
+    assert_eq!(
+        amended["added"],
+        serde_json::json!(["assets/deck.png"]),
+        "{result}"
+    );
+    assert_eq!(amended["updated"], serde_json::json!(["notes/plan.md"]));
+    assert_eq!(amended["deleted"], serde_json::json!(["assets/old.png"]));
+    let branch = amended["branch"].as_str().unwrap().to_string();
+    let commit = mock
+        .branch_commit(&branch)
+        .expect("the share made a branch");
+    assert_eq!(
+        mock.commit_file(&commit, "assets/deck.png").as_deref(),
+        Some(DECK_PNG),
+        "the deck is in the tree the proposal points at"
+    );
+    assert!(
+        mock.commit_file(&commit, "assets/old.png").is_none(),
+        "and the file the actor deleted is not"
+    );
+
+    // A share never touches the working tree, in review mode least of all.
+    assert!(
+        !root.join("assets/deck.png").exists(),
+        "the draft file is nobody's folder file yet"
+    );
+    assert!(
+        root.join("assets/old.png").exists(),
+        "and the deletion is a draft too: the team's copy is where it was"
+    );
+}
+
 /// The delta a share carries is the actor's overlay and nothing else: a draft
 /// over a base file is an update, a draft of a path no file holds is an
 /// addition, a tombstone is a deletion - and a file somebody dropped into the

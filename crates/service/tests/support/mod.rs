@@ -433,6 +433,21 @@ impl MockProvider {
         self.inner.lock().unwrap().branches.get(branch).cloned()
     }
 
+    /// One file's bytes as `commit` holds them, or `None` when that commit
+    /// holds nothing at that path.
+    ///
+    /// What a proposal actually carries, read off the tree the share built:
+    /// a receipt naming a path says the share decided to carry it, and this
+    /// says the bytes travelled with the decision.
+    pub fn commit_file(&self, commit: &str, path: &str) -> Option<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .and_then(|c| c.files.get(path).cloned())
+    }
+
     /// The provider calls made so far, in order, for asserting the exact
     /// sequence a share-update or withdraw drives.
     pub fn calls(&self) -> Vec<String> {

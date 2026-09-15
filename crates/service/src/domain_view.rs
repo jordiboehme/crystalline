@@ -1806,6 +1806,68 @@ impl<'a> DomainView<'a> {
                 write_staged_file(staging.root(), &entry.path, entry.content.as_bytes())?;
             }
         }
+        self.stage_files(&staging)?;
         Ok(staging)
+    }
+
+    /// Lay this actor's files overlay over the staged tree, after the rows: a
+    /// file they wrote becomes the file at that path, a deletion marker takes
+    /// the staged file away.
+    ///
+    /// **Nothing here is ever skipped in silence**, which is the one property
+    /// this pass is built around. `ops::propose` detects the proposal against
+    /// this tree, so a file left out of it does not read as "not shared" - it
+    /// reads as a file the actor deleted, and the proposal would ask the team
+    /// to delete their own copy of it. An unreadable folder and an entry whose
+    /// bytes have gone are therefore both refusals naming the path, never an
+    /// omission.
+    ///
+    /// The base snapshot above already carries the team's own attachments (a
+    /// pull records every path it applies, not only the markdown), so this pass
+    /// is the actor's half and nothing else.
+    fn stage_files(&self, staging: &OverlayStaging) -> Result<()> {
+        let domain = self.domain.as_str();
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(());
+        };
+        let files = self.files()?;
+        if files.unreadable {
+            return Err(EngineError::Io {
+                path: format!("the files overlay of '{domain}' for '{actor}'"),
+                source: std::io::Error::other(
+                    "a share carries every file its author drafted, and one that could not be \
+                     listed would be proposed as a deletion of the team's own copy",
+                ),
+            });
+        }
+        let state_dir = self.files_state_dir()?;
+        for entry in &files.entries {
+            if entry.tombstone {
+                let path = join_rel(staging.root(), &entry.path);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: path.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+                continue;
+            }
+            let bytes = crate::overlay_files::read(&state_dir, domain, actor, &entry.path)
+                .map_err(|e| self.files_io(&entry.path, e))?
+                .ok_or_else(|| EngineError::Io {
+                    path: format!("the files overlay of '{domain}' at '{}'", entry.path),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "the file was listed and then could not be read, and a share that \
+                             dropped it would propose a deletion of the team's copy",
+                    ),
+                })?;
+            write_staged_file(staging.root(), &entry.path, &bytes)?;
+        }
+        Ok(())
     }
 }
