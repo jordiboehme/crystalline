@@ -1903,6 +1903,25 @@ async fn review_fixture() -> (tempfile::TempDir, Arc<Engine>) {
         reviewed("Runbook", "runbook", "How the team restarts the importer."),
     )
     .unwrap();
+    // One attachment the team's own text shows a reader, and one nothing
+    // references at all, so `V108` has something to say either way.
+    std::fs::write(
+        dir.join("deck.md"),
+        reviewed(
+            "Deck",
+            "deck",
+            "The quarter's numbers are in the deck below.\n\n![Deck](assets/deck.png)",
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    for name in ["deck.png", "stray.png"] {
+        std::fs::write(
+            dir.join("assets").join(name),
+            format!("PNG bytes of {name}"),
+        )
+        .unwrap();
+    }
 
     let mut cfg = GlobalConfig::default();
     let mut entry = DomainEntry::file(dir);
@@ -2081,5 +2100,208 @@ async fn a_base_finding_shows_for_every_actor() {
         dangling_for(&engine, &bob).await,
         charter,
         "and never for somebody who has not read it"
+    );
+}
+
+/// A date past every attachment's modified stamp, which is what lets the
+/// attachment rules speak: a file is left alone on the day it arrives, so the
+/// fixture's freshly written assets need a sweep dated after them.
+const AFTER_THE_UPLOAD: &str = "2027-01-01";
+
+/// The attachment paths `V108` calls orphaned for one actor, sorted. An
+/// attachment finding carries its path as the title, since no engram owns it.
+async fn orphans_for(engine: &Engine, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec!["V108".to_string()],
+                limit: Some(50),
+                today: Some(AFTER_THE_UPLOAD.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    let mut out: Vec<String> = v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["title"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Delete an engram as somebody, which in a reviewed domain lands as that
+/// person's own tombstone: the file stays and the path reads as absent for
+/// them alone.
+async fn delete_as(engine: &Engine, permalink: &str, scope: &Scope) {
+    let value = engine
+        .delete_engram_as(
+            &crystalline_service::params::DeleteParams {
+                identifier: permalink.to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["draft"], Value::Bool(true), "{value}");
+}
+
+/// An attachment is shared state and deleting one is a shared act, so the
+/// question `V108` asks - does anything in this domain reference this file -
+/// is asked of the union: what this reader sees plus what the domain still
+/// holds. An author who drops a reference in a draft is never told the file is
+/// now unused, and a reference only their draft carries counts for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_dropping_a_reference_never_orphans_a_shared_attachment() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    let stray = vec!["assets/stray.png".to_string()];
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        stray,
+        "the file nothing points at is the orphan, and the deck is not"
+    );
+
+    // Alice drafts the deck reference out of her copy.
+    engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "deck".to_string(),
+                domain: "team".to_string(),
+                operation: "find_replace".to_string(),
+                find_text: Some("![Deck](assets/deck.png)".to_string()),
+                content: Some("The deck moved to the shared drive.".to_string()),
+                ..EditParams::default()
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        stray,
+        "her unreviewed edit is no argument for deleting a file the team's own \
+         text still shows"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        stray,
+        "and it says nothing to anybody else either"
+    );
+
+    // The other direction: a reference only her draft carries answers for her.
+    append_as(
+        &engine,
+        "runbook",
+        "The stray shot is worth keeping: ![Stray](assets/stray.png)",
+        &alice,
+    )
+    .await;
+    assert!(
+        orphans_for(&engine, &alice).await.is_empty(),
+        "she is reading text that references it, so it is not unused for her"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        stray,
+        "and nothing she has not shared reaches his queue"
+    );
+}
+
+/// A reference is dangling when it answers to nothing the reader sees. For an
+/// author that is base plus their own drafts, so two drafts of theirs answer
+/// each other, and a path they have drafted a deletion of answers nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authors_own_drafts_resolve_each_others_links() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    // A draft-only engram of her own, linked from another of her drafts.
+    engine
+        .write_engram_as(
+            &crystalline_service::params::WriteParams {
+                domain: "team".to_string(),
+                title: "Restart Ladder".to_string(),
+                content: "The ladder the importer restart climbs.".to_string(),
+                tags: vec!["team".to_string()],
+                folder: None,
+                engram_type: None,
+                status: None,
+                metadata: None,
+                overwrite: false,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    append_as(
+        &engine,
+        "runbook",
+        "The ladder is in [[Restart Ladder]].",
+        &alice,
+    )
+    .await;
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "her link answers to an engram she is reading, so only the reviewed \
+         file's own broken reference is left"
+    );
+
+    // And the other way: a path she has drafted a deletion of answers nothing,
+    // however well the reviewed folder still answers it for everybody else.
+    delete_as(&engine, "charter", &alice).await;
+    append_as(&engine, "runbook", "History lives in [[Charter]].", &alice).await;
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["runbook".to_string()],
+        "the charter is gone from her view, so her link to it is the dangling one"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and the team still reads the charter, with its own broken reference"
+    );
+}
+
+/// A path an author has drafted a deletion of is absent from their sweep
+/// entirely: no engram, and so no finding about it. For everybody else the
+/// reviewed file stands, and so does what it is doing wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_an_author_deleted_carries_no_finding_for_them() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "the reviewed charter carries a broken reference for everybody"
+    );
+
+    delete_as(&engine, "charter", &alice).await;
+
+    assert!(
+        dangling_for(&engine, &alice).await.is_empty(),
+        "she has deleted the engram the finding was about, so there is nothing \
+         left to tell her"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and the deletion is hers alone until it is reviewed"
     );
 }

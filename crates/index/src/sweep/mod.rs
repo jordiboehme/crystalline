@@ -911,6 +911,20 @@ pub struct SweepInput {
     /// compare this list against what the engrams reference and claim, in both
     /// directions.
     pub attachments: Vec<AttachmentRow>,
+    /// Attachment paths the domain's own rows reference or claim at the paths
+    /// the facts above no longer speak for: what an actor is drafting, and
+    /// what they have drafted a deletion of. Empty for a sweep that is nobody's
+    /// in particular, where the facts already carry every reference the domain
+    /// holds.
+    ///
+    /// Read by `V108` alone, and that is the whole of the asymmetry: an
+    /// attachment is shared state and deleting one is a shared act, so "does
+    /// anything reference this file" is asked of the union - what this reader
+    /// sees plus what the domain still holds - or one author's unreviewed edit
+    /// becomes an argument for deleting a file the reviewed text still shows.
+    /// `V107`, which is about a reference pointing at nothing, stays the
+    /// reader's own: that one is about their text, not about the file.
+    pub shadowed_asset_refs: Vec<String>,
     /// What this domain owes its team origin, or `None` for a domain with no
     /// origin (and for one whose origin state could not be read, which is the
     /// same thing as far as a detector is concerned: nothing is known to be
@@ -938,6 +952,7 @@ impl SweepInput {
             tag_aliases: Vec::new(),
             known_domains: Vec::new(),
             attachments: Vec::new(),
+            shadowed_asset_refs: Vec::new(),
             share: None,
             include_acknowledged: false,
             options: SweepOptions::default(),
@@ -2393,7 +2408,16 @@ fn detect_attachments(input: &SweepInput, report: &mut SweepReport) {
 
     // Every path anything references or claims, whatever its status, plus the
     // two live-only views the acting rules need.
-    let mut referenced: BTreeSet<&str> = BTreeSet::new();
+    //
+    // Seeded with the references the domain still holds at the paths this
+    // sweep's facts replaced or removed, so `V108` asks its question of the
+    // union rather than of one reader's view. Empty unless the listing was
+    // shadowed.
+    let mut referenced: BTreeSet<&str> = input
+        .shadowed_asset_refs
+        .iter()
+        .map(String::as_str)
+        .collect();
     let mut claimed_live: BTreeSet<&str> = BTreeSet::new();
     let mut first_referent: BTreeMap<&str, &EngramFacts> = BTreeMap::new();
 

@@ -9922,25 +9922,12 @@ impl Engine {
             return Ok(None);
         };
 
-        // The text at each path in this caller's dimension, read once from the
-        // same overlay rows the listing was shadowed with. `overlay_visible_text`
-        // is the per-path form of the same answer and is what a single-engram
-        // verb uses; a sweep asks about every path at once, so it reads the set.
-        // Tombstones are dropped here because they are dropped from the listing
-        // above: a deletion is not an engram to assemble facts from.
-        let drafts: HashMap<String, String> = match overlay.as_deref() {
-            Some(actor) => {
-                let store = self.store.lock().await;
-                store
-                    .overlay_entries(domain_id, actor)
-                    .await?
-                    .into_iter()
-                    .filter(|entry| !entry.tombstone)
-                    .map(|entry| (entry.path, entry.content))
-                    .collect()
-            }
-            None => HashMap::new(),
-        };
+        let held = self.overlay_view(domain_id, overlay.as_deref()).await?;
+        let drafts = &held.text;
+        // What the domain's own rows reference at the paths this caller's view
+        // replaced or removed, which is the other half of the union `V108` asks
+        // its question of. Read from the base text, never from the draft.
+        let shadowed_asset_refs = self.shadowed_asset_refs(&source, domain_id, &held).await;
 
         // Traversed in the caller's dimension too, or every draft would come
         // back with no edges at all and `V104` would report the engrams
@@ -9959,56 +9946,14 @@ impl Engine {
 
         let store = self.store.lock().await;
         let mut unresolved = store.unresolved_refs(domain_id).await?;
-        // That query answers for the rows the team reviewed, which is the base
-        // half of this caller's view. The other half is their own drafts, whose
-        // references hang off their own rows: read the same way `read_engram`
-        // reads a draft's outbound edges, and kept to the drafts this listing
-        // already shadowed in, so nothing speaks for a path this caller does
-        // not hold.
-        //
-        // A base row that a draft stands over needs no removal here: the rule
-        // only speaks about a reference whose engram is among the facts, and
-        // that row is not - its draft took its place.
-        //
-        // Ordered the way both backends order the base rows - by path, then
-        // line, then kind, then target - so one queue is the same queue twice.
-        // `outbound_refs` orders by line alone, which leaves two references on
-        // one line (a relation and a wikilink, or two wikilinks in one
-        // sentence) to the union's own arm order, and a queue whose rows swap
-        // between sweeps is a page boundary that moves under a reader.
-        if !drafts.is_empty() {
-            let mut held: Vec<&EngramDescriptor> = descs
-                .iter()
-                .filter(|d| drafts.contains_key(&d.path))
-                .collect();
-            held.sort_by(|a, b| a.path.cmp(&b.path));
-            for d in held {
-                let mut refs: Vec<crystalline_index::UnresolvedRef> = store
-                    .outbound_refs(d.id)
-                    .await?
-                    .into_iter()
-                    .filter(|reference| !reference.resolved)
-                    .map(|reference| crystalline_index::UnresolvedRef {
-                        from: d.id,
-                        // A prose wikilink carries no relation type, and the
-                        // backends report `links_to` for one - the same type
-                        // the graph gives a wikilink edge.
-                        rel_type: reference.rel_type.unwrap_or_else(|| "links_to".to_string()),
-                        kind: reference.kind,
-                        target_domain: reference.to_domain,
-                        target: reference.to_target,
-                        line: Some(reference.line),
-                    })
-                    .collect();
-                refs.sort_by(|a, b| {
-                    a.line
-                        .cmp(&b.line)
-                        .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
-                        .then_with(|| a.target.cmp(&b.target))
-                });
-                unresolved.extend(refs);
-            }
-        }
+        // That query answers for the rows the domain itself holds, which is the
+        // base half of this caller's view. The other half is their own drafts,
+        // and it is assembled in their dimension rather than the domain's.
+        unresolved.extend(self.draft_unresolved(&*store, name, &descs, drafts).await?);
+        // Shared on purpose, and the one input to the sweep that is: `V203`
+        // speaks about the vocabulary a domain has agreed on, so a tag one
+        // actor is trying out in a draft is not yet drift and the team's own
+        // clusters are what an author should be reading either way.
         let vocab = store.vocabulary(Some(name)).await?;
         // Metadata only, one query: the attachment rules compare paths,
         // sizes and hashes and never read a byte of any file.
@@ -10141,6 +10086,7 @@ impl Engine {
             tag_aliases: vocab.aliases,
             known_domains: known_domains.to_vec(),
             attachments,
+            shadowed_asset_refs,
             share: self.share_facts(name).await,
             include_acknowledged,
             // The sweep module's own constants, never literals repeated here:
@@ -10177,6 +10123,145 @@ impl Engine {
             unshared: work.count(),
             oldest_change: work.oldest_change_date(),
         })
+    }
+
+    /// One actor's overlay rows over a domain, read in a single query.
+    ///
+    /// `None` - a domain that takes changes directly, or a caller with no
+    /// identity of their own - answers with an empty view, which is what makes
+    /// every reader of it degrade to the base behaviour without a branch of
+    /// their own.
+    async fn overlay_view(&self, domain_id: DomainId, actor: Option<&str>) -> Result<OverlayView> {
+        let Some(actor) = actor else {
+            return Ok(OverlayView::default());
+        };
+        let entries = {
+            let store = self.store.lock().await;
+            store.overlay_entries(domain_id, actor).await?
+        };
+        let mut view = OverlayView::default();
+        for entry in entries {
+            view.paths.push(entry.path.clone());
+            if !entry.tombstone {
+                view.text.insert(entry.path, entry.content);
+            }
+        }
+        Ok(view)
+    }
+
+    /// The attachment paths the domain's OWN text references or claims at the
+    /// paths one actor's view has replaced or removed.
+    ///
+    /// `V108`'s other half. An attachment is shared state and deleting one is a
+    /// shared act, so the question "does anything reference this file" is asked
+    /// of the union rather than of one reader: an author who drafts a reference
+    /// away is never told the file is now unused, and neither is anybody else.
+    /// The base document is what is read here - [`Engine::load_engram`] takes
+    /// the file for a file domain and the `actor = ''` row for a virtual one -
+    /// so a path only this actor's overlay holds contributes nothing, having no
+    /// shared text to speak for it.
+    ///
+    /// Best effort by construction: a base document that no longer parses is
+    /// skipped, which is the same answer the fact assembly gives it.
+    async fn shadowed_asset_refs(
+        &self,
+        source: &ContentSource,
+        domain_id: DomainId,
+        held: &OverlayView,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for path in &held.paths {
+            let Some(engram) = self.load_engram(source, domain_id, path).await else {
+                continue;
+            };
+            out.extend(crystalline_core::find_asset_refs(&engram.body));
+            out.extend(asset_claim(&engram.frontmatter));
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The dangling references in one actor's own drafts, as
+    /// [`crystalline_index::UnresolvedRef`] rows to stand beside the base ones.
+    ///
+    /// Two halves, and both are the same sentence read from different ends: the
+    /// references come off the draft's own row ([`Store::outbound_refs`], the
+    /// call `read_engram` makes for a draft's outbound edges), and whether each
+    /// one answers to anything is decided against `descs` - the shadowed
+    /// listing, which is base rows plus this actor's drafts with their deleted
+    /// paths already absent. The stored `resolved` flag cannot answer it: every
+    /// arm of the index's resolution is `actor = ''` by design, so it calls a
+    /// link between two of one author's drafts broken and a link to a path they
+    /// have deleted sound, and both are backwards for the person reading.
+    ///
+    /// A reference into ANOTHER domain keeps the stored verdict. That domain's
+    /// rows are not in this listing, and a resolved edge there is a fact about
+    /// the domain rather than about a reader - which is the rule that stays,
+    /// deliberately, whatever this sweep does inside its own domain.
+    ///
+    /// Rows come back ordered the way both backends order the base rows - by
+    /// path, then line, then kind, then target (`turso/mod.rs` `ORDER BY 7, 6,
+    /// 2, 5`, and the matching Postgres form) - because `outbound_refs` orders
+    /// by line alone, which leaves two references on one line to the union's
+    /// own arm order. The `links_to` default for a prose wikilink is
+    /// [`crystalline_index::LINKS_TO`], the constant both backends spell into
+    /// their own queries, so the two never drift apart.
+    async fn draft_unresolved(
+        &self,
+        store: &dyn Store,
+        domain: &str,
+        descs: &[EngramDescriptor],
+        drafts: &HashMap<String, String>,
+    ) -> Result<Vec<crystalline_index::UnresolvedRef>> {
+        if drafts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The two readings the index tries inside one domain: the target as a
+        // permalink, then as a title, the second case-insensitively.
+        let permalinks: HashSet<&str> = descs.iter().map(|d| d.permalink.as_str()).collect();
+        let titles: HashSet<String> = descs.iter().map(|d| d.title.to_lowercase()).collect();
+
+        let mut held: Vec<&EngramDescriptor> = descs
+            .iter()
+            .filter(|d| drafts.contains_key(&d.path))
+            .collect();
+        held.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let mut out: Vec<crystalline_index::UnresolvedRef> = Vec::new();
+        for d in held {
+            let mut refs: Vec<crystalline_index::UnresolvedRef> = Vec::new();
+            for reference in store.outbound_refs(d.id).await? {
+                let answered = match reference.to_domain.as_deref() {
+                    Some(named) if named != domain => reference.resolved,
+                    _ => {
+                        permalinks.contains(reference.to_target.as_str())
+                            || titles.contains(&reference.to_target.to_lowercase())
+                    }
+                };
+                if answered {
+                    continue;
+                }
+                refs.push(crystalline_index::UnresolvedRef {
+                    from: d.id,
+                    rel_type: reference
+                        .rel_type
+                        .unwrap_or_else(|| crystalline_index::LINKS_TO.to_string()),
+                    kind: reference.kind,
+                    target_domain: reference.to_domain,
+                    target: reference.to_target,
+                    line: Some(reference.line),
+                });
+            }
+            refs.sort_by(|a, b| {
+                a.line
+                    .cmp(&b.line)
+                    .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
+                    .then_with(|| a.target.cmp(&b.target))
+            });
+            out.extend(refs);
+        }
+        Ok(out)
     }
 
     /// The resolved graph around a whole domain, at depth 1 so every
@@ -17703,6 +17788,23 @@ fn asset_tail(path: &str) -> &str {
 /// `./` is stripped and the folder segment is folded to its canonical
 /// spelling, and anything that does not address the reserved folder at all is
 /// not a claim.
+/// One actor's overlay over one domain, as a sweep needs it once the listing
+/// has already been shadowed: the document they hold at each path, and every
+/// path where their view and the domain's diverge at all.
+///
+/// Read once per sweep rather than per engram, and empty for a sweep that is
+/// nobody's in particular.
+#[derive(Default)]
+struct OverlayView {
+    /// Path to this actor's own document. Tombstones are absent: a deletion is
+    /// not an engram to assemble facts from, and the listing has dropped it
+    /// too.
+    text: HashMap<String, String>,
+    /// Every path this actor holds a row at, tombstones included - which is
+    /// exactly where their view and the domain's own rows disagree.
+    paths: Vec<String>,
+}
+
 /// One domain's sweep: its report and how many of its engrams no longer parse.
 struct DomainSweep {
     /// The ranked findings for that domain, acknowledgments already applied.

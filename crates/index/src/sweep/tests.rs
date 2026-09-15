@@ -1591,6 +1591,31 @@ fn v108_flags_an_orphan_with_the_path_as_its_subject() {
     assert!(!fired(&report).contains(&"V007"));
 }
 
+/// A reference the domain still holds at a path one reader's view replaced
+/// keeps the file referenced. The facts are that reader's - their draft says
+/// nothing about the deck - and the domain's own rows are what
+/// `shadowed_asset_refs` carries.
+#[test]
+fn a_reference_the_domain_still_holds_keeps_an_attachment_referenced() {
+    let mut sweep = input(vec![fact(1, "the-deck-rewritten")]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert_eq!(
+        fired(&report),
+        vec!["V108"],
+        "with nothing referencing it the file is an orphan"
+    );
+
+    sweep.shadowed_asset_refs = vec!["assets/deck.png".to_string()];
+    let report = detect(&sweep);
+    assert!(
+        !fired(&report).contains(&"V108"),
+        "deleting it is a shared act, so the shared reference answers for it: {:?}",
+        fired(&report)
+    );
+}
+
 #[test]
 fn a_retired_engram_still_counts_as_a_referent() {
     let mut retired = fact(1, "old-deck-notes");

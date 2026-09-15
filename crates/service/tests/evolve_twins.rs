@@ -594,6 +594,14 @@ async fn sweep_team(engine: &Engine, scope: &Scope) -> Value {
 /// engram, and the pair the rule must never report cannot even form, because
 /// the row she is drafting over is not in her listing at all. The path skip in
 /// the rule stays as the second line of that defence.
+///
+/// The pair's scope names two addresses and a draft keeps the address of the
+/// row it stands over, so a scope assertion alone cannot tell a shadowed sweep
+/// from an unshadowed one. Her draft therefore carries a salience the reviewed
+/// file does not, which is what decides which of the two engrams a pair finding
+/// hangs off: for her the finding is on HER row, and for everybody else it is
+/// on the other engram. That is only true if the fact was assembled from her
+/// document.
 #[tokio::test]
 async fn a_draft_is_never_its_base_rows_twin() {
     let (_tmp, engine) = review_engine().await;
@@ -640,18 +648,78 @@ async fn a_draft_is_never_its_base_rows_twin() {
         .await
         .unwrap();
     assert_eq!(edited["draft"], Value::Bool(true), "{edited}");
+    // And marks her own version salient, which nothing the team reviewed is.
+    let marked = engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "retry-queue".to_string(),
+                domain: "team".to_string(),
+                operation: "set_frontmatter".to_string(),
+                key: Some("salience".to_string()),
+                value: Some("5".to_string()),
+                content: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(marked["draft"], Value::Bool(true), "{marked}");
     engine.embed_pending().await.unwrap();
 
-    let hers = pairs(&sweep_team(&engine, &alice).await);
+    // Which engram a pair finding hangs off, with the twin it names.
+    let reported = |value: &Value| -> Vec<(String, String)> {
+        value["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["rule"] == "V301")
+            .map(|f| {
+                (
+                    f["permalink"].as_str().unwrap_or_default().to_string(),
+                    f["finding"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    let hers = sweep_team(&engine, &alice).await;
     assert_eq!(
-        hers, team_pair,
+        pairs(&hers),
+        team_pair,
         "the path she is drafting is her own row: the one pair she is shown is \
          her draft against the other engram, never against the engram it is a \
          draft of"
     );
     assert_eq!(
-        pairs(&sweep_team(&engine, &bob).await),
+        reported(&hers),
+        vec![(
+            "retry-queue".to_string(),
+            "semantic twin of team/retry-backoff".to_string()
+        )],
+        "and the finding hangs off HER row, because the salience deciding that \
+         is in the document she is reading and in no file"
+    );
+
+    let theirs = sweep_team(&engine, &bob).await;
+    assert_eq!(
+        pairs(&theirs),
         team_pair,
-        "and her draft changed nothing about what the team's own sweep says"
+        "her draft changed nothing about what the team's own sweep says"
+    );
+    assert_eq!(
+        reported(&theirs),
+        vec![(
+            "retry-backoff".to_string(),
+            "semantic twin of team/retry-queue".to_string()
+        )],
+        "the team's pair hangs off the address that sorts first, as it did \
+         before she drafted anything"
     );
 }
