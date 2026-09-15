@@ -12492,9 +12492,17 @@ impl Engine {
     ) -> Result<Value> {
         let previewing = matches!(confirm, ReviewModeConfirm::Preview);
         // Ahead of the guards, and only this one: its answer is the same for
-        // every caller and every name, so it discloses nothing. A preview is a
-        // read and is served on a read-only instance like every other read.
-        if self.read_only && !previewing {
+        // every caller and every name, so it discloses nothing.
+        //
+        // **The preview is refused with everything else, deliberately.** It
+        // reads like a question, but `leave_review_mode` resolves the domain id
+        // through `upsert_domain` before it can ask anything, and that is a
+        // write. Serving it here would mean a route this surface declares
+        // `read_only_exempt: false` writing on a read-only instance, which is
+        // the kind of gap nothing downstream would ever notice. A read-only
+        // instance has nothing to answer about anyway: it refuses every write
+        // that could have made a draft.
+        if self.read_only {
             return Err(EngineError::ReadOnly);
         }
         let _admin = self.domain_admin().await;
@@ -12897,6 +12905,16 @@ impl Engine {
     /// Write a domain's `review` key through the file config and into the
     /// effective one, the write-lock-first order every config mutation here
     /// follows so no env value bakes into the saved file.
+    ///
+    /// A domain absent from the file snapshot answers
+    /// [`EngineError::UnknownDomain`], which is reachable in one shape and is
+    /// the same answer [`Engine::domain_remove`] gives it: a domain another
+    /// process registered in the config file after this engine started is in
+    /// [`Engine::discovered_domains`] (so [`Engine::domain_entry`] resolves it
+    /// and the gates above pass) and not in the snapshot this persists from.
+    /// The refusal is confusing rather than damaging - nothing is written - and
+    /// closing it means every config mutation here re-reading the file under
+    /// its own lock, which is a change to all of them rather than to this one.
     fn write_review_key(
         &self,
         domain: &str,
