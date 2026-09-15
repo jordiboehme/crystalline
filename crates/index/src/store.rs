@@ -1773,11 +1773,20 @@ pub trait Store: Send + Sync {
     /// are and keep answering for the domain, because a base row's edges are a
     /// fact about the domain rather than about a reader.
     ///
-    /// An index-time binding can go stale where a read-time reading cannot: a
-    /// reference bound before its author tombstoned the target stays bound,
-    /// since a tombstone deletes nothing. The reader's screen is what settles
-    /// that case, at every surface that reads an edge, which is why there is no
-    /// third statement here trying to keep up with it.
+    /// **A binding is made once and not revisited, and two cases follow from
+    /// that.** A reference bound before its author tombstoned the target stays
+    /// bound, since a tombstone deletes nothing - and that one the reader's own
+    /// screen settles at every surface that reads an edge, because the deleted
+    /// path is where the binding points. The other it does not: a reference
+    /// bound to a base row, whose author LATER writes a page of their own
+    /// answering to the same name at a different path, goes on naming the base
+    /// row. Neither statement here moves it (it does not dangle, and it is not
+    /// pending) and no screen can, because the two pages sit at two addresses.
+    /// A third statement that unbound every bound reference to see whether a
+    /// newer row of the author's would beat it is what that would take, and it
+    /// would rewrite an author's settled links on every write they make. The
+    /// binding is the reading that held when the reference was written, which
+    /// is the honest answer rather than the better one.
     ///
     /// An empty `actor` is a [`crate::IndexError::Constraint`], like
     /// [`Store::upsert_overlay`]: the empty string is the base row's own key.
