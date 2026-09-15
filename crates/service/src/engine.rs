@@ -7220,6 +7220,17 @@ impl Engine {
             after: p.after.clone(),
             min_similarity: p.min_similarity,
             path_prefix: folder.and_then(folder_prefix),
+            // Whose rows this search is entitled to: the base dimension plus
+            // this caller's own drafts. Asked of the scope rather than of the
+            // configuration, and asked unconditionally, because a search spans
+            // domains and only some of them review changes - the actor is one
+            // value for the whole query, so deriving it from "is any domain in
+            // range in review mode" would make one domain's mode decide another
+            // domain's answer. A domain nobody drafts in holds no overlay row,
+            // so the screen collapses back to the base row there and the answer
+            // is the answer it always was; a reader with no identity at all
+            // still names no actor and gets the base dimension alone.
+            actor: crate::scope::overlay_actor(scope),
             limit: p.limit.unwrap_or(10).clamp(1, MAX_PAGE_LIMIT),
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
@@ -7348,6 +7359,11 @@ impl Engine {
             mode: SearchMode::Semantic,
             query_embedding: Some(embedding),
             active_model: Some(self.model_id.clone()),
+            // The advisory is a search, so it is the same question about whose
+            // rows are in range. A writer in review mode whose neighbours are
+            // all still drafts would otherwise be told there is nothing near
+            // what they just wrote.
+            actor: crate::scope::overlay_actor(scope),
             // Pure cosine order: the fade would only reorder hits this drops.
             retired_weight: Some(1.0),
             limit: SIMILAR_PAGE,

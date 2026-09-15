@@ -1550,3 +1550,159 @@ impl Drop for ScratchStateDir {
         *slot = None;
     }
 }
+
+// --- one authenticated MCP conversation over the real transport ---------------
+//
+// Shared rather than duplicated: `mcp_auth.rs` drives the gate with it and
+// `overlay_domains.rs` drives an authenticated search through it, and both need
+// the identical handshake. Raw HTTP/1.1 rather than a client library for the
+// reason the session's own doc gives.
+
+/// The same handshake from a client naming itself `client`, which is the whole
+/// of what a client gets to say about its own identity and therefore the input
+/// the provenance composition has to be safe against.
+pub fn initialize_body_as(client: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": client, "version": "0.0.0" },
+        },
+    })
+    .to_string()
+}
+
+/// One authenticated MCP conversation over the real transport: the legacy
+/// handshake, the `notifications/initialized` that follows it, and the
+/// `tools/call` POSTs a test drives afterwards.
+///
+/// Raw HTTP/1.1 over a fresh connection per request, modelled on
+/// `tests/http_stream.rs`: a `tools/call` answer is a chunked SSE stream the
+/// transport leaves open for the session's own use, so there is no
+/// end-of-message a buffering client could wait for. Reading for a bounded
+/// window and asserting on substrings is what that shape allows.
+pub struct McpTestSession {
+    addr: std::net::SocketAddr,
+    session: String,
+    token: Option<String>,
+}
+
+impl McpTestSession {
+    /// Handshake at `addr` presenting `token`, then send the
+    /// `notifications/initialized` a client owes the session before its first
+    /// call.
+    pub async fn open(addr: &std::net::SocketAddr, token: Option<&str>) -> McpTestSession {
+        McpTestSession::open_as(addr, token, "mcp-auth-test").await
+    }
+
+    /// [`McpTestSession::open`] from a client that names itself `client`.
+    pub async fn open_as(
+        addr: &std::net::SocketAddr,
+        token: Option<&str>,
+        client: &str,
+    ) -> McpTestSession {
+        let handshake = raw_post(addr, &initialize_body_as(client), &[], token).await;
+        assert!(
+            handshake.starts_with("HTTP/1.1 200 "),
+            "the handshake must be served:\n{handshake}"
+        );
+        let session = raw_session_id(&handshake);
+        let ready = raw_post(
+            addr,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &[("Mcp-Session-Id", session.as_str())],
+            token,
+        )
+        .await;
+        assert!(
+            ready.starts_with("HTTP/1.1 2"),
+            "the initialized notification must be accepted:\n{ready}"
+        );
+        McpTestSession {
+            addr: *addr,
+            session,
+            token: token.map(str::to_string),
+        }
+    }
+
+    /// Call `tool` on this session, handing back the raw response bytes.
+    pub async fn call_tool(&self, tool: &str, arguments: serde_json::Value) -> String {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        })
+        .to_string();
+        raw_post(
+            &self.addr,
+            &body,
+            &[("Mcp-Session-Id", self.session.as_str())],
+            self.token.as_deref(),
+        )
+        .await
+    }
+}
+
+/// Send one raw HTTP/1.1 POST and read back whatever arrives within a bounded
+/// window (see [`McpTestSession`] for why the window is bounded rather than a
+/// read to EOF). `headers` carries whatever the shape under test needs beside
+/// the fixed ones - a session id for the legacy path, the era's standard
+/// headers for a stateless one.
+pub async fn raw_post(
+    addr: &std::net::SocketAddr,
+    body: &str,
+    headers: &[(&str, &str)],
+    token: Option<&str>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Connection: close\r\n"
+        .to_string();
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.flush().await;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The `mcp-session-id` header out of a raw response head, case-insensitively.
+pub fn raw_session_id(raw: &str) -> String {
+    for line in raw.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("mcp-session-id")
+        {
+            return value.trim().to_string();
+        }
+    }
+    panic!("no mcp-session-id header in response:\n{raw}");
+}

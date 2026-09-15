@@ -17,12 +17,16 @@ mod support;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig, ReviewMode};
+use crystalline_core::config::{
+    AuthConfig, DomainEntry, GlobalConfig, ResponseFormat, ReviewMode, ServiceConfig,
+};
 use crystalline_core::parse_engram;
 use crystalline_index::{DomainKind, EngramRecord, FileStamp, Store, TursoStore};
+use crystalline_service::daemon::http_router;
 use crystalline_service::engine::ConfigureAction;
 use crystalline_service::overlay_journal;
 use crystalline_service::params::{DeleteParams, EditParams, ReadParams, WriteParams};
+use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{Engine, Scope, SimilarProbe};
 use tokio::sync::Mutex;
 
@@ -37,6 +41,10 @@ const ALICE_DRAFT: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags
 /// deterministic fact rather than a hash collision.
 const RETRY_BODY: &str = "- [decision] the retry queue doubles its backoff on every failure #team\n- [decision] a dead-letter ttl bounds how long a retry waits #team";
 const RETRY_NEIGHBOUR: &str = "---\ntype: engram\ntitle: Retry backoff lesson\npermalink: retry-backoff-lesson\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Retry backoff lesson\n\n- [decision] retries wait on a backoff that doubles each time #team\n- [decision] the dead-letter ttl is the bound on a stuck retry #team\n";
+
+/// A base engram on the drafts' own topic: what an authenticated search must
+/// keep answering with whoever is asking.
+const LEDGER: &str = "---\ntype: engram\ntitle: Nightly ledger\npermalink: nightly-ledger\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Nightly ledger\n\n- [fact] the ledger reconciles nightly #team\n";
 
 /// A draft of a path no file holds: the sharp case, since nothing on disk
 /// could ever bring it back.
@@ -62,7 +70,7 @@ async fn fixture() -> Fixture {
 /// directory is. `false` is only ever used by the test that pins what an engine
 /// without one may do, which is nothing.
 async fn fixture_with_state_dir(pinned: bool) -> Fixture {
-    build_fixture(pinned, false, None).await
+    build_fixture(pinned, false, None, false).await
 }
 
 /// The same domain, in review mode: every write by every actor joins that
@@ -75,7 +83,7 @@ async fn fixture_with_state_dir(pinned: bool) -> Fixture {
 /// *does* once a domain carries it, so a fixture that had to satisfy the
 /// enabling gates would be testing those gates instead.
 async fn review_fixture() -> Fixture {
-    build_fixture(true, true, None).await
+    build_fixture(true, true, None, false).await
 }
 
 /// The review-mode domain with a deterministic embedding provider behind it,
@@ -83,13 +91,47 @@ async fn review_fixture() -> Fixture {
 /// provider the probe returns early and a test asserting `similar` would be
 /// asserting nothing.
 async fn review_fixture_with_provider() -> Fixture {
-    build_fixture(true, true, Some(Arc::new(support::TopicEmbedder))).await
+    build_fixture(true, true, Some(Arc::new(support::TopicEmbedder)), false).await
+}
+
+/// The review-mode domain served over the production HTTP router with the MCP
+/// gate on, which is the only way to ask a search question as somebody in
+/// particular: the account is resolved at the door, and everything below it -
+/// the scope, the actor, the rows a search is entitled to - follows from that
+/// one resolution.
+///
+/// Hands back the fixture (whose temp directory has to outlive the server), the
+/// address and the auth store, so a test can mint a personal token against the
+/// very store the gate reads.
+async fn served_review_instance() -> (Fixture, std::net::SocketAddr, Arc<AuthStore>) {
+    let f = build_fixture(true, true, None, true).await;
+    let auth = Arc::new(AuthStore::open(&f.root.join("web-auth.db")).await.unwrap());
+    let router = http_router(
+        f.engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (f, addr, auth)
 }
 
 async fn build_fixture(
     pinned: bool,
     review: bool,
     provider: Option<Arc<dyn crystalline_index::EmbeddingProvider>>,
+    auth: bool,
 ) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -107,6 +149,20 @@ async fn build_fixture(
         entry.review = Some(ReviewMode::Overlay);
     }
     cfg.domains.insert("team".to_string(), entry);
+    if auth {
+        // The MCP gate on, OAuth explicitly off (it would otherwise derive back
+        // on), and plain JSON out so an assertion reads the hits rather than
+        // the framing.
+        cfg.auth = Some(AuthConfig {
+            mcp: Some(true),
+            oauth: Some(false),
+            ..AuthConfig::default()
+        });
+        cfg.service = Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        });
+    }
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
 
@@ -1100,6 +1156,84 @@ async fn a_write_receipt_says_draft_and_still_carries_similar() {
         after.contains(&"retry-backoff-lesson"),
         "an edit of a draft-only engram probes like any other edit: {edited}"
     );
+
+    // And the other half, which needed the actor threaded into search: a draft
+    // finding another draft. Both of these exist only in alice's overlay - no
+    // file on disk is about docking clamps at all - so a base-only advisory has
+    // nothing to answer with, which is exactly what a writer in review mode
+    // would have been told about every neighbour they had.
+    let probe = |session: &Scope, title: &str, body: &str| {
+        let engine = f.engine.clone();
+        let session = session.clone();
+        let title = title.to_string();
+        let body = body.to_string();
+        async move {
+            let mut receipt = engine
+                .write_engram_as(&write_params("team", &title, &body), who, &session)
+                .await
+                .unwrap();
+            engine.embed_pending().await.unwrap();
+            engine
+                .attach_similar(
+                    &mut receipt,
+                    SimilarProbe::Write {
+                        title: &title,
+                        description: None,
+                        body: &body,
+                    },
+                    &session,
+                )
+                .await;
+            receipt
+        }
+    };
+    probe(
+        &alice,
+        "Docking clamps",
+        "- [decision] the docking clamp holds the bay through the thrust burn #team",
+    )
+    .await;
+    let second = probe(
+        &alice,
+        "Clamp seating",
+        "- [decision] the clamps seat before thrust and the bay reports it #team",
+    )
+    .await;
+    let alices: Vec<&str> = second["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r["permalink"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        alices.contains(&"docking-clamps"),
+        "one draft is a neighbour of the next, for their own author: {second}"
+    );
+
+    // And for nobody else. Bob writes on the same topic and is told nothing
+    // about what alice is drafting.
+    let bobs_receipt = probe(
+        &account("bob"),
+        "Clamp inspection",
+        "- [decision] the bay clamps are inspected after every thrust test #team",
+    )
+    .await;
+    let bobs: Vec<&str> = bobs_receipt["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r["permalink"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !bobs
+            .iter()
+            .any(|p| p.starts_with("docking-clamps") || p.starts_with("clamp-seating")),
+        "and another actor's drafts are no part of his advisory: {bobs_receipt}"
+    );
 }
 
 /// The other four write verbs, in one test, because the failure they share is
@@ -2044,5 +2178,98 @@ async fn a_tombstone_is_honoured_for_an_identifier_that_names_no_domain() {
             .await
             .is_ok(),
         "and it is still there for everybody else"
+    );
+}
+
+/// **An authenticated search answers out of the caller's own drafts, and out of
+/// nobody else's.**
+///
+/// Driven through the real transport rather than at the engine seam, because
+/// the whole claim is about an identity: the account is resolved once at the
+/// door, `overlay_actor` reads it off the scope that resolution produced, and
+/// the store's actor screen reads that. Two accounts on one domain in review
+/// mode is the shape that fails if any link in that chain answers with the
+/// machine owner instead of the caller.
+///
+/// Three things are asserted for each of the two accounts, because a predicate
+/// that got one of them wrong would still look right from the other two: the
+/// caller's own draft is in the answer, the other caller's draft is not, and
+/// the engram the team actually reviewed is in both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authenticated_search_finds_the_callers_draft_and_nobody_elses() {
+    let (f, addr, auth) = served_review_instance().await;
+    // A base engram the team has, on the same topic as the drafts, so the
+    // answer has something in it that is nobody's draft.
+    std::fs::write(f.domain_root("team").join("ledger.md"), LEDGER).unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    for who in ["alice", "bob"] {
+        auth.add_user(who, who, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    let alice = support::McpTestSession::open(
+        &addr,
+        Some(&auth.issue_mcp_token("alice", "t").await.unwrap().token),
+    )
+    .await;
+    let bob = support::McpTestSession::open(
+        &addr,
+        Some(&auth.issue_mcp_token("bob", "t").await.unwrap().token),
+    )
+    .await;
+
+    // Each writes into the domain, and review mode routes each write into its
+    // own author's draft.
+    for (session, title, body) in [
+        (
+            &alice,
+            "Ledger rota",
+            "- [decision] alice takes the ledger rota next quarter #team",
+        ),
+        (
+            &bob,
+            "Ledger freeze",
+            "- [decision] bob freezes the ledger before the audit #team",
+        ),
+    ] {
+        let receipt = session
+            .call_tool(
+                "write_engram",
+                serde_json::json!({
+                    "domain": "team",
+                    "title": title,
+                    "content": body,
+                }),
+            )
+            .await;
+        // The receipt rides inside an SSE frame, so the JSON arrives escaped.
+        assert!(
+            receipt.contains(r#"\"draft\":true"#),
+            "the write landed in a draft: {receipt}"
+        );
+    }
+
+    let search = serde_json::json!({ "query": "ledger", "domains": ["team"] });
+    let hers = alice.call_tool("search_engrams", search.clone()).await;
+    assert!(
+        hers.contains("ledger-rota"),
+        "alice's search finds alice's draft: {hers}"
+    );
+    assert!(!hers.contains("ledger-freeze"), "and never bob's: {hers}");
+    assert!(
+        hers.contains("nightly-ledger"),
+        "and the engram the team reviewed is still in it: {hers}"
+    );
+
+    let his = bob.call_tool("search_engrams", search).await;
+    assert!(
+        his.contains("ledger-freeze"),
+        "bob's search finds bob's draft: {his}"
+    );
+    assert!(!his.contains("ledger-rota"), "and never alice's: {his}");
+    assert!(
+        his.contains("nightly-ledger"),
+        "and the engram the team reviewed is in his answer too: {his}"
     );
 }
