@@ -1842,6 +1842,20 @@ impl<'a> DomainView<'a> {
         }
         let state_dir = self.files_state_dir()?;
         for entry in &files.entries {
+            // The second assertion rather than the first, exactly as the rows
+            // pass above makes it and for the same reason: a path that escaped
+            // would write outside the staged tree, which is the one failure a
+            // share could not recover from. It holds by construction here -
+            // `overlay_files::collect` drops anything `validate_asset_path`
+            // rejects - and the rows pass has the same guarantee from its write
+            // verbs and asserts anyway.
+            if !is_within_domain(&entry.path) {
+                return Err(EngineError::Conflict(format!(
+                    "the draft file '{}' in domain '{domain}' stands at a path that is not \
+                     inside the domain, so it cannot be shared",
+                    entry.path
+                )));
+            }
             if entry.tombstone {
                 let path = join_rel(staging.root(), &entry.path);
                 match std::fs::remove_file(&path) {
