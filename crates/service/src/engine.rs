@@ -623,12 +623,6 @@ pub struct Engine {
     // added mid-session is served from the database, not mistaken for a file
     // domain with an empty root.
     discovered_domains: std::sync::RwLock<HashMap<String, DomainEntry>>,
-    // What the last pull's convergence pass did to each reviewing domain's
-    // drafts, so `origin_status` can report it without re-reading a single base
-    // file. In memory on purpose and only here: it is a fact about a pull this
-    // process ran, so a restart forgetting it is correct - the next pull
-    // recomputes the whole of it, and nothing durable depends on it.
-    converged: std::sync::RwLock<HashMap<String, Converged>>,
     // Told about domains discovered this way so the daemon's watcher can pick
     // them up without a restart. `None` outside the daemon.
     watch_tx: Option<tokio::sync::mpsc::UnboundedSender<WatchEvent>>,
@@ -950,11 +944,26 @@ pub const OWNER_IDENTITY_NAME: &str = "owner";
 /// is the write falling through onto the folder the team reviewed. So the verb
 /// refuses, and the refusal teaches the way in rather than stating a rule: an
 /// agent that reads it can act on it in one step.
-/// What a share hears when it would stack a layer on an open one in a domain
-/// that reviews changes. See [`Engine::refuse_stacking_while_reviewing`].
-pub const REVIEW_NO_STACKING: &str = "this domain reviews changes; stacking on an open layer is not supported while it does - share a fresh proposal instead";
-
 pub const OVERLAY_NEEDS_IDENTITY: &str = "this domain reviews changes before they land, so a write needs to know whose draft it joins - connect with your MCP token (issued in Fluid under profile > Agent access) and try again";
+
+/// What a share hears when its OWN proposal is already open in a domain that
+/// reviews changes.
+///
+/// The next share would stack a layer on that one, which review mode cannot
+/// serve (`Engine::refuse_open_proposal_while_reviewing` gives the two
+/// reasons), so the way through is to withdraw what is open and share again -
+/// which this actor may do, because the proposal is theirs.
+pub const REVIEW_NO_STACKING: &str = "this domain reviews changes; stacking on an open layer is not supported while it does - withdraw it and share again";
+
+/// What a share hears when SOMEBODY ELSE's proposal is open in a domain that
+/// reviews changes: a `{actor}` slot and the wait.
+///
+/// A separate string from [`REVIEW_NO_STACKING`] because the way forward is
+/// different in kind. This actor cannot withdraw a proposal that is not theirs,
+/// so telling them to would be telling them to do something they may not do -
+/// and telling them to "share a fresh proposal instead" would be telling them
+/// to do the very thing being refused.
+const REVIEW_PROPOSAL_IS_ANOTHERS: &str = "a proposal by {actor} is open, and this domain takes one proposal at a time while it reviews changes - wait for theirs to merge, or ask them to withdraw it, then share again";
 
 /// The refusal a write verb answers with in personal mode when the acting
 /// identity has connected no GitHub account of its own (spec section 6, and the
@@ -1268,7 +1277,6 @@ impl Engine {
             overlay: EnvOverlay::default(),
             config_path,
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
-            converged: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
             embed_tx: None,
             embed_gate: Arc::default(),
@@ -2640,10 +2648,25 @@ impl Engine {
     /// overlay, and count what is left standing against a base that moved.
     ///
     /// The clear-only pass: with no pull to attribute a divergence to, this
-    /// ends what has landed and reports nothing as a conflict. The pull paths
-    /// call [`Engine::converge_pulled_overlays`] with what the pull applied,
-    /// which is the same walk with the conflicts switched on.
+    /// ends what has landed and finds no new conflicts. The pull paths run the
+    /// same walk with what the pull applied, which is what switches the
+    /// conflicts on.
+    ///
+    /// **It settles nothing it did not clear.** Every conflict standing in the
+    /// domain's record is left exactly as it was, and only the paths this pass
+    /// took out of the overlay leave it: a maintenance sweep that ended landed
+    /// drafts must never be the reason an actor's surfaced conflict disappears.
+    ///
+    /// Takes the domain's origin lock, which the inner pass deliberately does
+    /// not: every other writer of the convergence record - the two pull paths,
+    /// a share, a withdrawal and a resolution - is already inside it, and the
+    /// record is saved as one whole struct, so a writer outside the lock could
+    /// load it before somebody else's edit and save over it afterwards. This is
+    /// the one entry point with no caller holding the lock for it, so it takes
+    /// it itself.
     pub async fn converge_overlays(&self, domain: &str) -> Result<ConvergenceReport> {
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
         self.converge_pulled_overlays(domain, &[]).await
     }
 
@@ -2709,6 +2732,26 @@ impl Engine {
     /// address for a rename to be recognized by, and the base it deleted is
     /// gone. The page reappears for that actor under its new name.
     ///
+    /// **The record is MERGED, never rebuilt.** A conflict is a fact about one
+    /// actor's draft, not about the pull that happened to notice it, so a path
+    /// this pass did not touch keeps whatever it was: a path that converged
+    /// leaves the record, a path this pass found diverged goes in (replacing
+    /// only its own entry), and a path standing from an earlier pull stays
+    /// standing. Rebuilding it would mean the next pull about an unrelated file
+    /// silently dropping a conflict the machinery had already surfaced, which
+    /// on a ticking poller is a window one tick wide. The only other ways out
+    /// of the record are the entry itself going away - an actor who no longer
+    /// holds a row at a path has no conflict there - and a resolution
+    /// (`Engine::settle_convergence`).
+    ///
+    /// A recorded conflict cannot go stale while it stands. Byte-equality is
+    /// asked of EVERY entry on every pass, whatever the pull touched (see
+    /// `settle_overlay_entry`'s first arm), so an author who edits their draft
+    /// until it says what the folder says has it cleared by the next pass
+    /// rather than left listed. What a merge preserves is only the case that is
+    /// still true: a draft that still differs from the base that moved under
+    /// it.
+    ///
     /// A domain that takes changes directly returns at the first line and
     /// touches nothing - no store read, no base file, no journal.
     async fn converge_pulled_overlays(
@@ -2739,17 +2782,27 @@ impl Engine {
             }
             (domain_id, held)
         };
+        let journal_dir = self.journal_state_dir()?;
+        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        // A conflict in a draft nobody holds any more is not a conflict. The
+        // prune runs whatever the pass then decides, so an actor whose rows all
+        // went away leaves no entry behind either.
+        prune_settled_conflicts(&mut record, &held);
         if held.iter().all(|(_, entries)| entries.is_empty()) {
-            self.record_convergence(domain, Converged::default());
-            return Ok(ConvergenceReport::default());
+            record.cleared = 0;
+            let report = ConvergenceReport {
+                cleared: 0,
+                diverged: record.diverged(),
+            };
+            self.save_convergence(&journal_dir, domain, &record);
+            return Ok(report);
         }
         let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
         let addresses = pulled_addresses(&state_dir, &touched)?;
 
-        let mut record = Converged::default();
+        let mut cleared = 0u64;
         for (actor, entries) in &held {
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-            let mut diverged: Vec<String> = Vec::new();
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
                 match settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own) {
@@ -2757,9 +2810,10 @@ impl Engine {
                     Settle::Clear => {
                         self.drop_overlay_entry(domain, domain_id, actor, &entry.path)
                             .await?;
-                        record.report.cleared += 1;
+                        record.settle(actor, &entry.path);
+                        cleared += 1;
                     }
-                    Settle::Diverge => diverged.push(entry.path.clone()),
+                    Settle::Diverge => record.diverge(actor, &entry.path),
                     Settle::MoveTo(dest) => {
                         match self
                             .move_draft_with_the_base(
@@ -2767,8 +2821,15 @@ impl Engine {
                             )
                             .await
                         {
-                            Ok(true) => record.report.cleared += 1,
-                            Ok(false) => {}
+                            // The draft stands somewhere else now, or it has
+                            // become the folder: either way nothing is left at
+                            // the old path for a conflict to be about.
+                            Ok(landed) => {
+                                record.settle(actor, &entry.path);
+                                if landed {
+                                    cleared += 1;
+                                }
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     domain,
@@ -2777,20 +2838,47 @@ impl Engine {
                                     "the base moved to '{dest}' and this draft could not follow \
                                      it, so it stands where it was: {e}"
                                 );
-                                diverged.push(entry.path.clone());
+                                record.diverge(actor, &entry.path);
                             }
                         }
                     }
                 }
             }
-            if !diverged.is_empty() {
-                record.report.diverged += diverged.len() as u64;
-                record.by_actor.insert(actor.clone(), diverged);
-            }
         }
-        let report = record.report;
-        self.record_convergence(domain, record);
+        record.cleared = cleared;
+        let report = ConvergenceReport {
+            cleared,
+            diverged: record.diverged(),
+        };
+        self.save_convergence(&journal_dir, domain, &record);
         Ok(report)
+    }
+
+    /// Write one domain's convergence record, and never fail a pull over it.
+    ///
+    /// The record is a report, and the rows and mirrors it describes have
+    /// already moved by the time it is written: a record this machine could not
+    /// save is a status that is behind, which the next pass corrects, and
+    /// failing here would turn that into a failed pull over work that landed.
+    ///
+    /// **Every caller holds the domain's origin lock.** The whole struct is
+    /// written at once - the conflicts and the proposal owners beside them - so
+    /// two writers that both loaded before either saved would lose one of the
+    /// two edits, and the lock is what makes that impossible. The writers are
+    /// the two pull paths ([`Engine::origin_update_one`] and the pull a share
+    /// opens with), a share recording whose the proposal is, a withdrawal
+    /// forgetting it, a resolution settling one path, and
+    /// [`Engine::converge_overlays`], which takes the lock itself because
+    /// nothing takes it for that one.
+    fn save_convergence(
+        &self,
+        journal_dir: &Path,
+        domain: &str,
+        record: &crate::overlay_journal::ConvergenceRecord,
+    ) {
+        if let Err(e) = crate::overlay_journal::journal_save_record(journal_dir, domain, record) {
+            tracing::warn!(domain, "the convergence record could not be saved: {e}");
+        }
     }
 
     /// Move one draft from the path the pull emptied to the path the same
@@ -2803,6 +2891,14 @@ impl Engine {
     /// destination puts the source back - through the unchecked writer, since
     /// what it restores is the state the check had already allowed and the
     /// text lives in that row and nowhere else.
+    ///
+    /// The destination's mirror is the one half that can fail on its own
+    /// without unsaying anything: [`Engine::put_overlay_entry`] writes the row
+    /// first and answers a failed mirror as a warning, which is the convention
+    /// every overlay write in this file follows. So the move is row-and-mirror
+    /// together in intent and the warning is logged rather than swallowed; the
+    /// row is what the index serves, and the next `reindex --wipe` is what
+    /// would notice the difference.
     async fn move_draft_with_the_base(
         &self,
         domain: &str,
@@ -2821,44 +2917,46 @@ impl Engine {
             // the folder now, under its new name.
             return Ok(true);
         }
-        if let Err(e) = self
+        match self
             .write_overlay_entry(domain, domain_id, actor, dest, &entry.content)
             .await
         {
-            if let Err(undo) = self
-                .write_overlay_entry_unchecked(
-                    domain,
-                    domain_id,
-                    actor,
-                    &entry.path,
-                    &entry.content,
-                )
-                .await
-            {
-                tracing::error!(
-                    domain,
-                    actor,
-                    path = entry.path.as_str(),
-                    "a draft could not follow the base to '{dest}' and could not be put back \
-                     either: {undo}"
-                );
+            Ok(None) => {}
+            // The row landed and its mirror did not. Logged rather than
+            // swallowed: the index serves the row either way, and it is the
+            // next `reindex --wipe` that would notice the difference.
+            Ok(Some(warning)) => tracing::warn!(domain, actor, path = dest, "{warning}"),
+            Err(e) => {
+                if let Err(undo) = self
+                    .write_overlay_entry_unchecked(
+                        domain,
+                        domain_id,
+                        actor,
+                        &entry.path,
+                        &entry.content,
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        domain,
+                        actor,
+                        path = entry.path.as_str(),
+                        "a draft could not follow the base to '{dest}' and could not be put back \
+                         either: {undo}"
+                    );
+                }
+                return Err(e);
             }
-            return Err(e);
         }
         Ok(false)
     }
 
-    /// Remember what a pull's convergence did, replacing whatever the pull
-    /// before it left.
-    fn record_convergence(&self, domain: &str, record: Converged) {
-        self.converged
-            .write()
-            .unwrap()
-            .insert(domain.to_string(), record);
-    }
-
-    /// What the last pull's convergence has to say to one caller, or `None`
-    /// when no pull has run against this domain in this process.
+    /// What the last convergence has to say to one caller, or `None` when
+    /// nothing has ever converged this domain.
+    ///
+    /// Read off the record beside the journal rather than out of memory, which
+    /// is what makes a conflict survive a restart: the pass that found it may
+    /// have run in a process that is long gone.
     ///
     /// The counts are the domain's; the paths are the caller's own and nobody
     /// else's. Whoever holds the domain additionally sees how many each actor
@@ -2867,19 +2965,27 @@ impl Engine {
     /// somebody's unsettled work is a coordination fact, and what the draft
     /// says is theirs alone.
     fn converged_json(&self, domain: &str, actor: Option<&str>, everyone: bool) -> Option<Value> {
-        let held = self.converged.read().unwrap();
-        let record = held.get(domain)?;
+        let journal_dir = self.journal_state_dir().ok()?;
+        let record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        // Absent until a convergence pass has actually run here. The record can
+        // exist for another reason - it also remembers whose open proposal is
+        // whose - and a key that appeared the moment somebody shared would say
+        // "a pull converged nothing" where nothing had looked yet, which is the
+        // distinction this key's absence carries.
+        if record.cleared == 0 && record.conflicts.is_empty() {
+            return None;
+        }
         let mine: &[String] = actor
-            .and_then(|who| record.by_actor.get(who))
+            .and_then(|who| record.conflicts.get(who))
             .map_or(&[], Vec::as_slice);
         let mut value = json!({
-            "cleared": record.report.cleared,
-            "diverged": record.report.diverged,
+            "cleared": record.cleared,
+            "diverged": record.diverged(),
             "mine": mine,
         });
         if everyone && let Some(object) = value.as_object_mut() {
             let counts: Vec<(String, u64)> = record
-                .by_actor
+                .conflicts
                 .iter()
                 .map(|(actor, paths)| (actor.clone(), paths.len() as u64))
                 .collect();
@@ -2893,25 +2999,42 @@ impl Engine {
     /// this runs for every arm.
     ///
     /// `cleared` beside it is deliberately left alone: it counts what the last
-    /// pull took out of the overlay, which a later resolution cannot change, so
-    /// after a resolve the two numbers no longer sum to what the pull saw and
-    /// that is the honest arithmetic rather than a drift.
+    /// convergence pass took out of the overlay, which a later resolution
+    /// cannot change, so after a resolve the two numbers no longer sum to what
+    /// that pass saw and that is the honest arithmetic rather than a drift.
     fn settle_convergence(&self, domain: &str, actor: &str, path: &str) -> u64 {
-        let mut held = self.converged.write().unwrap();
-        let Some(record) = held.get_mut(domain) else {
+        let Ok(journal_dir) = self.journal_state_dir() else {
             return 0;
         };
-        let Some(paths) = record.by_actor.get_mut(actor) else {
-            return 0;
-        };
-        let before = paths.len();
-        paths.retain(|held| held != path);
-        record.report.diverged -= (before - paths.len()) as u64;
-        let left = paths.len() as u64;
-        if paths.is_empty() {
-            record.by_actor.remove(actor);
-        }
+        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        let left = record.settle(actor, path);
+        self.save_convergence(&journal_dir, domain, &record);
         left
+    }
+
+    /// Record which overlay actor a proposal belongs to, or forget one that has
+    /// been withdrawn.
+    ///
+    /// Best effort: what this feeds is the wording of a refusal, never a write
+    /// of anybody's knowledge, and a proposal whose owner is not recorded reads
+    /// as somebody else's - which is the safe way round, since it never tells
+    /// one actor to withdraw a proposal that is not theirs.
+    fn record_proposal_actor(&self, domain: &str, number: u64, actor: Option<&str>) {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return;
+        };
+        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        match actor {
+            Some(actor) => {
+                record
+                    .proposals
+                    .insert(number.to_string(), actor.to_string());
+            }
+            None => {
+                record.proposals.remove(&number.to_string());
+            }
+        }
+        self.save_convergence(&journal_dir, domain, &record);
     }
 
     /// The content source to read a resolved engram through: a locally
@@ -14906,10 +15029,22 @@ impl Engine {
         // This pull advances the base like any other, so the same convergence
         // runs on it - and it runs BEFORE the tree is staged, so a draft the
         // team has already merged is not proposed straight back at them.
-        if !report.up_to_date
-            && let Err(e) = self.converge_pulled_overlays(domain, &report.applied).await
-        {
-            tracing::warn!("converging the drafts in '{domain}' before sharing failed: {e}");
+        //
+        // The sync in front of it is what makes the two call sites one rule
+        // rather than two. A rename finishes through `write_overlay_entry`,
+        // whose address check reads index rows; against rows that still
+        // describe the pre-pull folder the old base row would still hold the
+        // draft's address and the destination write would be refused, so the
+        // same rename would come out a move here and a divergence there. The
+        // scan is incremental, and the share's own tail syncs again after the
+        // proposal, where a second pass over unchanged files costs a walk.
+        if !report.up_to_date {
+            if let Err(e) = self.sync(Some(domain)).await {
+                tracing::warn!("indexing what the pull before sharing '{domain}' applied: {e}");
+            }
+            if let Err(e) = self.converge_pulled_overlays(domain, &report.applied).await {
+                tracing::warn!("converging the drafts in '{domain}' before sharing failed: {e}");
+            }
         }
         Ok(Some(
             self.stage_overlay_share(domain, who, state_dir).await?,
@@ -15009,8 +15144,8 @@ impl Engine {
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let drafting = self.overlay_share_identity(domain, &actor)?;
-        if drafting.is_some() && stacks_allowed {
-            self.refuse_stacking_while_reviewing(&state_dir)?;
+        if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
+            self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
@@ -15065,7 +15200,17 @@ impl Engine {
             Ok(outcome) => {
                 self.index_what_the_share_pull_applied(domain, "sharing")
                     .await;
-                Ok(origin::propose_outcome_json(&outcome))
+                let receipt = origin::propose_outcome_json(&outcome);
+                // Whose the proposal is, in the sense review mode means it. The
+                // forge record cannot say (see
+                // `Engine::refuse_open_proposal_while_reviewing`), so it is
+                // recorded here, beside the drafts it carried.
+                if let Some(who) = drafting.as_deref()
+                    && let Some(number) = proposal_number_of(&receipt)
+                {
+                    self.record_proposal_actor(domain, number, Some(who));
+                }
+                Ok(receipt)
             }
             Err(RemoteError::ConflictsPending { count }) => {
                 // The conflicts refusal is the loudest case for syncing: the
@@ -15090,7 +15235,7 @@ impl Engine {
     }
 
     /// Refuse a share that would stack a layer on an open one while the domain
-    /// reviews changes.
+    /// reviews changes - in the words of whose that open proposal is.
     ///
     /// Two things a stacked layer needs are not there in review mode. A layer
     /// is detected against the CHAIN TIP, which may be another actor's open
@@ -15100,26 +15245,59 @@ impl Engine {
     /// layer's content at all: the folder says what the team reviewed, and
     /// every layer lives in somebody's overlay.
     ///
-    /// So it is refused in words that name the way through, rather than served
-    /// on a guess. The refusal is narrow on purpose: it needs a forge that
-    /// actually serves stacks (probed once and recorded) and a layer already
-    /// open, so the first share of a domain, and every share on a forge that
-    /// stacks nothing, goes through exactly as it did.
-    fn refuse_stacking_while_reviewing(&self, state_dir: &Path) -> Result<()> {
-        let stacked = crystalline_remote::state::OriginState::load(state_dir)
+    /// **So a reviewing domain carries one proposal at a time, and that costs
+    /// two different refusals rather than one.** The proposal is this actor's
+    /// own, and withdrawing it is a thing they may do
+    /// ([`REVIEW_NO_STACKING`]); or it is somebody else's, and it is not
+    /// theirs to withdraw, so the honest answer names whose it is and what to
+    /// wait for ([`REVIEW_PROPOSAL_IS_ANOTHERS`]). One refusal for both would
+    /// tell a member who has never shared anything to "share a fresh proposal
+    /// instead", which is precisely what they were doing.
+    ///
+    /// **Whose it is comes from the journal's own record**, not from the forge
+    /// record's `author_login`: that names the GitHub account a share's
+    /// credential was connected as, and in the default instance identity mode
+    /// every actor's share goes out on one login. A proposal opened before this
+    /// was recorded, or by another machine, has no owner here and reads as
+    /// somebody else's - the safe way round, since it never tells one actor to
+    /// withdraw a proposal that is not theirs.
+    ///
+    /// The refusal stays narrow: it needs a forge that actually serves stacks
+    /// (probed once and recorded) and a layer already open, so the first share
+    /// of a domain, and every share on a forge that stacks nothing, goes
+    /// through exactly as it did.
+    fn refuse_open_proposal_while_reviewing(
+        &self,
+        domain: &str,
+        state_dir: &Path,
+        actor: &str,
+    ) -> Result<()> {
+        let Some(state) = crystalline_remote::state::OriginState::load(state_dir)
             .ok()
             .flatten()
-            .is_some_and(|state| {
-                state.stacks_available == Some(true)
-                    && state
-                        .proposals
-                        .iter()
-                        .any(|p| p.status == crystalline_remote::state::ProposalStatus::Open)
-            });
-        if stacked {
+            .filter(|state| state.stacks_available == Some(true))
+        else {
+            return Ok(());
+        };
+        let Some(open) = state
+            .proposals
+            .iter()
+            .find(|p| p.status == crystalline_remote::state::ProposalStatus::Open)
+        else {
+            return Ok(());
+        };
+        let record = self
+            .journal_state_dir()
+            .map(|dir| crate::overlay_journal::journal_record(&dir, domain))
+            .unwrap_or_default();
+        let owner = record.proposals.get(&open.number.to_string());
+        if owner.is_some_and(|who| who == actor) {
             return Err(EngineError::Refused(REVIEW_NO_STACKING.to_string()));
         }
-        Ok(())
+        let named = owner.map_or("another member", String::as_str);
+        Err(EngineError::Refused(
+            REVIEW_PROPOSAL_IS_ANOTHERS.replace("{actor}", named),
+        ))
     }
 
     /// Indexes whatever the pull inside a share or a preview wrote to the
@@ -15195,10 +15373,10 @@ impl Engine {
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let drafting = self.overlay_share_identity(domain, &actor)?;
-        if drafting.is_some() && stacks_allowed {
+        if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
             // The preview carries the share's own gates, so nobody is asked to
             // confirm a share this instance would then refuse.
-            self.refuse_stacking_while_reviewing(&state_dir)?;
+            self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
         let (provider, login) = match self.resolve_share_provider(&actor) {
             Ok(resolved) => resolved,
@@ -15390,6 +15568,11 @@ impl Engine {
         .inspect_err(|e| self.drop_github_credential_on_auth(e))
         .map_err(|e| enrich_write_error(e, acting.as_deref(), &spec.repo))?;
 
+        if drafting.is_some() {
+            // The proposal is gone from the chain, so whose it was is no longer
+            // a question anything asks.
+            self.record_proposal_actor(domain, report.number, None);
+        }
         if let (Some(who), true) = (drafting.as_deref(), revert) {
             self.revert_into_overlay(domain, who, &open_before, &mut report)
                 .await?;
@@ -15422,6 +15605,15 @@ impl Engine {
     /// actor held nothing at these paths" - a proposed addition, a proposed
     /// rewrite and a proposed deletion all go back to the same thing, which is
     /// the base showing through again.
+    ///
+    /// **It reverts the ACTING actor's overlay, whosever the proposal was.**
+    /// Nothing in this task restricts a withdrawal to the proposal's author, so
+    /// an actor withdrawing somebody else's proposal finds none of its paths in
+    /// their own overlay and reverts nothing - an empty `restored` and
+    /// `deleted` beside a withdrawal that did happen. That is the honest
+    /// outcome of the two rules meeting (a revert is per actor, a withdrawal is
+    /// not) and not a silent failure of either; who may withdraw whose proposal
+    /// is a question the program has not answered yet.
     ///
     /// **A draft edited since it was shared is never touched**, the rule
     /// [`ops::withdraw`]'s own revert keeps for a file: the recorded digest is
@@ -15594,22 +15786,26 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        // One spelling from here down. A caller who names `notes/plan` and a
+        // caller who names `notes/plan.md` mean one engram, and the draft
+        // lookup, the recorded-conflict lookup and `ops::resolve` have to be
+        // asked about the same one or a missing suffix would turn a resolution
+        // into a refusal.
+        let path = &normalize_md(path);
         if let Some(who) = self.overlay_share_identity(domain, &actor)? {
-            let drafted = normalize_md(path);
             let held = {
                 let store = self.store.lock().await;
                 match store.domain_id(domain).await? {
-                    Some(domain_id) => Some((
-                        domain_id,
-                        store.overlay_entry(domain_id, &who, &drafted).await?,
-                    )),
+                    Some(domain_id) => {
+                        Some((domain_id, store.overlay_entry(domain_id, &who, path).await?))
+                    }
                     None => None,
                 }
             };
             match held {
                 Some((domain_id, Some(_))) => {
                     return self
-                        .resolve_in_overlay(domain, domain_id, &who, &drafted, resolution)
+                        .resolve_in_overlay(domain, domain_id, &who, path, resolution)
                         .await;
                 }
                 // Nothing of this caller's stands here. A conflict the pull
@@ -15624,7 +15820,7 @@ impl Engine {
                 // a draft is somebody else's row entirely.
                 _ if !self.folder_conflict_at(&state_dir, path)? => {
                     return Err(EngineError::NotFound(format!(
-                        "you are not drafting '{drafted}' in domain '{domain}', and no conflict \
+                        "you are not drafting '{path}' in domain '{domain}', and no conflict \
                          stands there either. This domain reviews changes, so what a resolution \
                          settles is your own draft: draft the change first, then settle it"
                     )));
@@ -15671,6 +15867,14 @@ impl Engine {
     /// The domain's own conflict records are deliberately untouched: those are
     /// [`ops::resolve`]'s, they belong to the folder every actor shares, and
     /// clearing one from inside a draft would settle it on everybody's behalf.
+    ///
+    /// **No recorded conflict is required**, and that is a widening worth
+    /// naming: any path this actor is drafting can be resolved, whether or not
+    /// a pull ever flagged it. Requiring the record would make a conflict
+    /// unsettleable whenever the record could not be read, and the arms are
+    /// what a draft's author may already do to their own draft anyway - the
+    /// merged arm is `write_engram` by another name, and the `theirs` arm is
+    /// their own deletion of their own draft.
     async fn resolve_in_overlay(
         &self,
         domain: &str,
@@ -19195,17 +19399,12 @@ fn overwrite_from_draft(row: &mut EngramDescriptor, draft: &crystalline_index::S
     }
 }
 
-/// A synthesized file stamp for a virtual write: the current epoch seconds, the
-/// content byte length and its SHA-256. The sha doubles as the CAS token, so a
-/// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
-/// without ever touching a filesystem.
 /// What one pull's convergence pass did to the drafts standing over a domain
 /// that reviews changes before they land.
 ///
-/// Two numbers about one pull: how many drafts ended because the folder now
-/// says what they said, and how many their authors are left to settle against a
-/// base that moved under them. [`Engine::converge_pulled_overlays`] is where
-/// each of the two is decided.
+/// How many drafts ended because the folder now says what they said, and how
+/// many stand unsettled against a base that moved under them.
+/// `Engine::converge_pulled_overlays` is where each of the two is decided.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConvergenceReport {
     /// Entries taken out of the overlay, row and mirror together.
@@ -19214,16 +19413,31 @@ pub struct ConvergenceReport {
     pub diverged: u64,
 }
 
-/// The last pull's convergence for one domain, as `origin_status` reports it.
+/// The proposal number a share receipt names, whichever outcome it carried: a
+/// fresh proposal reports it at the top level, an update inside the `proposal`
+/// it rewrote.
+fn proposal_number_of(receipt: &Value) -> Option<u64> {
+    receipt["number"]
+        .as_u64()
+        .or_else(|| receipt["proposal"]["number"].as_u64())
+}
+
+/// Drop every recorded conflict whose entry is no longer there: an actor who
+/// stopped holding a row at a path has no conflict at it, and an actor holding
+/// nothing at all has none anywhere.
 ///
-/// The per-actor paths are kept beside the counts so a status can name a
-/// caller's own conflicts without re-reading a single base file, and so one
-/// actor's list is never reachable from another's report.
-#[derive(Debug, Clone, Default)]
-struct Converged {
-    report: ConvergenceReport,
-    /// Whose entries diverged and where they stand, one list per actor.
-    by_actor: BTreeMap<String, Vec<String>>,
+/// `held` is every actor with rows in this domain, and their rows.
+fn prune_settled_conflicts(
+    record: &mut crate::overlay_journal::ConvergenceRecord,
+    held: &[(String, Vec<StoredEngram>)],
+) {
+    record.conflicts.retain(|actor, paths| {
+        let Some((_, entries)) = held.iter().find(|(who, _)| who == actor) else {
+            return false;
+        };
+        paths.retain(|at| entries.iter().any(|entry| &entry.path == at));
+        !paths.is_empty()
+    });
 }
 
 /// What a pull leaves one overlay entry to be.
@@ -19317,6 +19531,10 @@ fn pulled_addresses(state_dir: &Path, touched: &HashSet<&str>) -> Result<HashMap
     Ok(addresses)
 }
 
+/// A synthesized file stamp for a virtual write: the current epoch seconds, the
+/// content byte length and its SHA-256. The sha doubles as the CAS token, so a
+/// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
+/// without ever touching a filesystem.
 pub(crate) fn virtual_stamp(content: &str) -> FileStamp {
     FileStamp {
         mtime: chrono::Utc::now().timestamp(),

@@ -4328,45 +4328,6 @@ async fn an_http_agent_without_identity_cannot_resolve_or_withdraw_a_draft() {
     assert_eq!(err.to_string(), crystalline_service::OVERLAY_NEEDS_IDENTITY);
 }
 
-/// Stacking a second layer on an open one is refused while the domain reviews.
-///
-/// A layer is detected against the chain tip, and in review mode the tip may be
-/// somebody else's open layer while the tree the amend reads from holds no
-/// layer content at all. Refusing teaches the way through instead of guessing.
-#[tokio::test]
-async fn stacking_on_an_open_layer_is_refused_while_the_domain_reviews() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mock = Arc::new(MockProvider::new());
-    mock.enable_stacks();
-    let eng = reviewing_domain(
-        tmp.path(),
-        mock,
-        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
-    )
-    .await;
-
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
-    let first = eng
-        .origin_share("team", None, None, None, None, ShareActor::Owner)
-        .await
-        .unwrap();
-    assert_eq!(first["outcome"], "proposed", "{first}");
-
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
-    mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    let err = eng
-        .origin_share("team", None, None, None, None, ShareActor::Owner)
-        .await
-        .expect_err("a stacked layer is not served while the domain reviews");
-    let text = err.to_string();
-    assert!(
-        text.contains("this domain reviews changes")
-            && text.contains("share a fresh proposal instead"),
-        "{text}"
-    );
-}
-
 /// A domain that takes changes directly holds no drafts, so the pass a pull
 /// runs has nothing to do and touches nothing.
 #[tokio::test]
@@ -4546,5 +4507,306 @@ async fn an_out_of_band_conflict_is_still_settled_against_the_folder() {
     assert!(
         text.contains("not drafting") && text.contains("draft the change first"),
         "{text}"
+    );
+}
+
+// --- the convergence record survives the pulls that are about something else -
+//
+// A conflict is a fact about one actor's draft, not about the pull that
+// happened to notice it. So the record is merged rather than rebuilt, and it
+// lives beside the journal that mirrors the drafts it describes, which is what
+// makes it survive a restart.
+
+/// A pull about an unrelated path leaves a standing conflict standing.
+#[tokio::test]
+async fn an_unrelated_pull_leaves_a_standing_conflict_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[
+            ("MANIFEST.md", manifest()),
+            ("notes/plan.md", team_plan()),
+            (
+                "notes/other.md",
+                engram("Other", "other", "untouched so far"),
+            ),
+        ],
+    )
+    .await;
+
+    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
+
+    // Pull A moves the page ada is drafting: her draft is a conflict.
+    let first = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/plan.md",
+            engram("Plan", "plan", "the team moved it on"),
+        ),
+        (
+            "notes/other.md",
+            engram("Other", "other", "untouched so far"),
+        ),
+    ]));
+    mock.set_branch("main", &first);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    let status = eng.origin_status(Some("team"), false, &ada).await.unwrap();
+    assert_eq!(
+        status["domains"][0]["converged"]["mine"],
+        serde_json::json!(["notes/plan.md"]),
+        "{status}"
+    );
+
+    // Pull B is about a page nobody is drafting.
+    let second = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/plan.md",
+            engram("Plan", "plan", "the team moved it on"),
+        ),
+        (
+            "notes/other.md",
+            engram("Other", "other", "changed upstream"),
+        ),
+    ]));
+    mock.set_branch("main", &second);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    let status = eng.origin_status(Some("team"), false, &ada).await.unwrap();
+    assert_eq!(
+        status["domains"][0]["converged"]["mine"],
+        serde_json::json!(["notes/plan.md"]),
+        "a pull about another page does not settle ada's conflict: {status}"
+    );
+    assert_eq!(status["domains"][0]["converged"]["diverged"], 1, "{status}");
+}
+
+/// The clear-only pass ends what has landed and leaves every conflict standing.
+#[tokio::test]
+async fn the_clear_only_pass_leaves_the_conflicts_it_did_not_settle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
+
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/plan.md",
+            engram("Plan", "plan", "the team moved it on"),
+        ),
+    ]));
+    mock.set_branch("main", &moved);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    // Somebody else's draft has since become the folder, and a maintenance
+    // sweep ends it. Ada's conflict is nobody's business of that sweep's.
+    draft(
+        &eng,
+        "bo",
+        "notes/plan.md",
+        &String::from_utf8(engram("Plan", "plan", "the team moved it on")).unwrap(),
+    )
+    .await;
+    mirror(
+        tmp.path(),
+        "bo",
+        "notes/plan.md",
+        &String::from_utf8(engram("Plan", "plan", "the team moved it on")).unwrap(),
+    );
+    let swept = eng.converge_overlays("team").await.unwrap();
+    assert_eq!(swept.cleared, 1, "bo's draft is the folder now");
+
+    let status = eng
+        .origin_status(
+            Some("team"),
+            false,
+            &Scope::User {
+                account: "ada".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["converged"]["mine"],
+        serde_json::json!(["notes/plan.md"]),
+        "the sweep settled nothing of ada's: {status}"
+    );
+}
+
+/// The record lives beside the journal, so a restart still knows the conflicts.
+#[tokio::test]
+async fn a_restart_still_names_the_conflicts_the_last_pull_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
+    let moved = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/plan.md",
+            engram("Plan", "plan", "the team moved it on"),
+        ),
+    ]));
+    mock.set_branch("main", &moved);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    // A second engine over the same database, the same config file and the
+    // same state directory: this process forgot everything it held in memory.
+    let restarted = Engine::new(
+        eng.store(),
+        config(true),
+        None,
+        Some(tmp.path().join("config.yaml")),
+    )
+    .with_origin_provider(mock.clone())
+    .with_origins_dir(tmp.path().join("origins"))
+    .with_state_dir(tmp.path().to_path_buf());
+
+    let status = restarted
+        .origin_status(
+            Some("team"),
+            false,
+            &Scope::User {
+                account: "ada".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["converged"]["mine"],
+        serde_json::json!(["notes/plan.md"]),
+        "a restart reads the conflicts off disk: {status}"
+    );
+}
+
+/// While a domain reviews, an open proposal is somebody's, and the refusal says
+/// whose.
+///
+/// Two different answers, because there are two different ways forward: the
+/// proposal is yours and you may withdraw it, or it is somebody else's and it
+/// is not yours to withdraw.
+#[tokio::test]
+async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    mock.enable_stacks();
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock,
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+
+    draft(&eng, "ada", "notes/ada.md", DRAFT_FRESH).await;
+    mirror(tmp.path(), "ada", "notes/ada.md", DRAFT_FRESH);
+    let first = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("ada".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+
+    // Bo has never shared anything. The refusal must not tell him to do the
+    // thing he is doing.
+    draft(&eng, "bo", "notes/bo.md", DRAFT_ALICE).await;
+    mirror(tmp.path(), "bo", "notes/bo.md", DRAFT_ALICE);
+    let err = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("bo".to_string()),
+        )
+        .await
+        .expect_err("somebody else's proposal is open");
+    let text = err.to_string();
+    assert!(
+        text.contains("ada") && text.contains("one proposal at a time"),
+        "the refusal names whose it is and what to wait for: {text}"
+    );
+    assert!(
+        !text.contains("share a fresh proposal instead"),
+        "and never tells him to do what he was doing: {text}"
+    );
+
+    // Ada's own second share is the one that may withdraw and share again.
+    draft(&eng, "ada", "notes/more.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "ada", "notes/more.md", DRAFT_PLAN);
+    let err = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("ada".to_string()),
+        )
+        .await
+        .expect_err("stacking on her own open layer is not served while the domain reviews");
+    let text = err.to_string();
+    assert!(
+        text.contains("this domain reviews changes")
+            && text.contains("withdraw it and share again"),
+        "{text}"
+    );
+
+    // The record is written whole, the conflicts and the proposal owners beside
+    // them, so a pass that only settles drafts must not forget whose the
+    // proposal was.
+    eng.converge_overlays("team").await.unwrap();
+    let err = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("ada".to_string()),
+        )
+        .await
+        .expect_err("her own proposal is still open");
+    assert!(
+        err.to_string().contains("withdraw it and share again"),
+        "a convergence pass did not write over who owns the proposal: {err}"
     );
 }

@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 
 use crystalline_core::{config, parse_engram};
 use crystalline_index::{ChunkParams, DomainId, EngramRecord, Store, chunk_engram};
+use serde::{Deserialize, Serialize};
 
 use crate::engine::{is_contained_rel, is_within_domain, virtual_stamp};
 
@@ -60,6 +61,88 @@ pub const JOURNAL_DIR: &str = "overlays";
 
 /// The suffix marking a tombstone sidecar.
 const TOMBSTONE_SUFFIX: &str = ".tombstone";
+
+/// The file one domain's convergence record lives in, inside that domain's
+/// journal folder.
+///
+/// A leading dot so it can never be mistaken for an actor: the walk both
+/// readers share takes only directories as actor folders, so a file here is
+/// skipped whatever it is called, and the dot makes the name unreachable for a
+/// sanitized login besides. Inside the domain folder rather than beside it, so
+/// [`journal_remove_domain`]'s one `remove_dir_all` sweeps the record with the
+/// drafts it describes - a record that outlived them would name conflicts in
+/// drafts nobody holds any more.
+const RECORD_FILE: &str = ".convergence.json";
+
+/// What one domain's pulls have left unsettled, and whose open proposals are
+/// whose.
+///
+/// Kept beside the drafts it is about and for the same reason they are: it is
+/// primary data that nothing on disk otherwise says. A conflict is a fact about
+/// one actor's draft standing against a base that moved under it, not about the
+/// pull that happened to notice it, so it survives every later pull that is
+/// about something else - and, because it is here rather than in memory, it
+/// survives a restart too.
+///
+/// Per machine, exactly like the drafts: a conflict recorded here is
+/// unreachable from another instance sharing the same database, which is the
+/// same thing the journal's own module doc says about a mirrored draft.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergenceRecord {
+    /// Every path still standing as a conflict, per actor, each list ordered
+    /// and free of duplicates.
+    #[serde(default)]
+    pub conflicts: BTreeMap<String, Vec<String>>,
+    /// How many entries the last convergence pass took out of the overlay.
+    /// A fact about that pass alone, which is why it is a plain number beside
+    /// the merged map rather than part of it.
+    #[serde(default)]
+    pub cleared: u64,
+    /// Which overlay actor opened each open proposal, keyed by the proposal
+    /// number as text.
+    ///
+    /// The forge record carries `author_login`, which is the GitHub account a
+    /// share's credential was connected as and not the actor whose drafts it
+    /// carried - in the default instance identity mode every actor's share goes
+    /// out on one login. So whose a proposal is, in the sense review mode means
+    /// it, is recorded here. A number this map does not name is somebody else's
+    /// as far as anything can tell, which is the safe way round: it never tells
+    /// one actor to withdraw a proposal that is not theirs.
+    #[serde(default)]
+    pub proposals: BTreeMap<String, String>,
+}
+
+impl ConvergenceRecord {
+    /// Record that `actor` has a conflict at `path`, once.
+    pub fn diverge(&mut self, actor: &str, path: &str) {
+        let paths = self.conflicts.entry(actor.to_string()).or_default();
+        if let Err(at) = paths.binary_search(&path.to_string()) {
+            paths.insert(at, path.to_string());
+        }
+    }
+
+    /// Take `path` out of `actor`'s conflicts, answering how many they have
+    /// left. An actor with none left leaves no entry behind.
+    pub fn settle(&mut self, actor: &str, path: &str) -> u64 {
+        let Some(paths) = self.conflicts.get_mut(actor) else {
+            return 0;
+        };
+        paths.retain(|held| held != path);
+        let left = paths.len() as u64;
+        if paths.is_empty() {
+            self.conflicts.remove(actor);
+        }
+        left
+    }
+
+    /// Every conflict standing, across every actor.
+    pub fn diverged(&self) -> u64 {
+        self.conflicts
+            .values()
+            .map(|paths| paths.len() as u64)
+            .sum()
+    }
+}
 
 /// One mirrored overlay entry: whose it is, which path it stands at, and the
 /// draft's markdown - or `None`, which is this actor's deletion of the base row
@@ -429,6 +512,56 @@ fn collect(
         });
     }
     unreadable
+}
+
+/// The convergence record one domain's journal holds.
+///
+/// Never errors: a domain nobody has pulled yet has no record, and a record
+/// this machine cannot read or parse is answered as an empty one with a warning
+/// rather than as a failure. The whole of it is derived again by the next pull,
+/// so an unreadable record costs a report and never a draft.
+pub fn journal_record(state_dir: &Path, domain: &str) -> ConvergenceRecord {
+    let Ok(file) = record_path(state_dir, domain) else {
+        return ConvergenceRecord::default();
+    };
+    let bytes = match std::fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return ConvergenceRecord::default(),
+        Err(e) => {
+            tracing::warn!(domain, "the convergence record could not be read: {e}");
+            return ConvergenceRecord::default();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::warn!(domain, "the convergence record could not be parsed: {e}");
+            ConvergenceRecord::default()
+        }
+    }
+}
+
+/// Write one domain's convergence record, creating the journal folder for it.
+///
+/// A record with nothing in it removes the file instead of writing an empty
+/// one, so "this domain has nothing unsettled" and "nobody has pulled here yet"
+/// read the same way they always did: as no record at all.
+pub fn journal_save_record(
+    state_dir: &Path,
+    domain: &str,
+    record: &ConvergenceRecord,
+) -> io::Result<()> {
+    let file = record_path(state_dir, domain)?;
+    if record == &ConvergenceRecord::default() {
+        return remove_if_present(&file);
+    }
+    let bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
+    save(&file, &bytes)
+}
+
+/// The file one domain's convergence record lives in.
+fn record_path(state_dir: &Path, domain: &str) -> io::Result<PathBuf> {
+    Ok(domain_dir(state_dir, domain)?.join(RECORD_FILE))
 }
 
 /// Drop a whole domain's journal, answering with how many entries it held.
