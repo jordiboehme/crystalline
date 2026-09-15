@@ -785,6 +785,57 @@ async fn a_drafts_receipt_never_lists_its_own_base_row() {
         named.contains(&"retry-backoff-lesson"),
         "what the team has elsewhere on the topic is still the advice: {receipt}"
     );
+
+    // And again through the other verb, which is where the two halves come
+    // apart: an edit's receipt names the engram by the address the TEAM knows
+    // it by, because a draft over a base row resolves to the base descriptor,
+    // while the row a search answers with carries the address her document
+    // gave it. Excluding only what the receipt says would hand her her own
+    // draft as a neighbour, under guidance that tells her to merge into it.
+    let appended =
+        "and a retry that exhausts its backoff is parked in the dead-letter queue for the ttl";
+    let mut edited = engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "retry-queue-gotcha".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some(format!("- [decision] {appended} #team")),
+                key: None,
+                value: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    engine
+        .attach_similar(
+            &mut edited,
+            SimilarProbe::Edit { new_text: appended },
+            &alice,
+        )
+        .await;
+    let after: Vec<&str> = edited["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r["permalink"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !after.contains(&"retry-queue-notes") && !after.contains(&"retry-queue-gotcha"),
+        "an edit of the same draft names neither the draft nor the row it stands \
+         over, whichever address each of them answers to: {edited}"
+    );
 }
 
 /// An author's own drafts can fill the advisory, and the cut stands.

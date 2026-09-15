@@ -3260,6 +3260,27 @@ impl Engine {
             .unwrap_or(desc.id))
     }
 
+    /// The address one actor's own draft at `path` answers to, or `None` when
+    /// they hold no draft there (or hold a deletion, which answers to no
+    /// address at all).
+    async fn draft_permalink_at(
+        &self,
+        domain: &str,
+        actor: &str,
+        path: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let (domain_id, _) = self.domain_source(domain).await?;
+        let store = self.store.lock().await;
+        Ok(store
+            .overlay_entry(domain_id, actor, path)
+            .await?
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| entry.permalink))
+    }
+
     /// [`Engine::resolve`] with the domains the caller may not see subtracted.
     ///
     /// A hidden domain resolves as an empty one rather than as a refusal: the
@@ -7610,8 +7631,9 @@ impl Engine {
     /// so a draft never lists the engram it is a draft of - it would be told to
     /// merge its own work into the team's wording of it. And `exclude` is
     /// matched by address across every actor's rows, because a hit says which
-    /// engram it is and never whose row carried it, so the engram that was just
-    /// written drops out however it is keyed.
+    /// engram it is and never whose row carried it - so the caller has to hand
+    /// in the address the ROW answers to, which is not always the one its
+    /// receipt names; [`Engine::attach_similar`] resolves that and says why.
     ///
     /// **A writer's own drafts can fill the list, and the cut stands.** The
     /// drafts are not additional, they are rows on one ladder, so an author
@@ -7735,6 +7757,13 @@ impl Engine {
         ) else {
             return;
         };
+        // The path the receipt names, for the overlay verbs that carry one. A
+        // receipt without it is a direct domain's, which has no draft to
+        // resolve an address against.
+        let receipt_path = receipt
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let work = async {
             let text = match probe {
                 SimilarProbe::Write {
@@ -7762,8 +7791,25 @@ impl Engine {
             let Some(text) = text else {
                 return Ok(Vec::new());
             };
+            // The address to exclude is the one the row a search would answer
+            // with carries, which is not always the one the receipt names. A
+            // draft over a base row resolves to the BASE descriptor, so an
+            // edit's receipt names the address the team knows the engram by,
+            // while the draft's own row carries whatever address its
+            // frontmatter gave it. Excluding the receipt's alone hands the
+            // writer their own draft as a neighbour, under guidance that tells
+            // them to merge into it. Excluding the draft's loses nothing:
+            // wherever a draft stands at a path, the base row at that path is
+            // shadowed out of the candidate set anyway.
+            let exclude = match self.overlay_for_read(&domain, scope) {
+                Some(actor) => self
+                    .draft_permalink_at(&domain, &actor, receipt_path.as_deref())
+                    .await?
+                    .unwrap_or_else(|| permalink.clone()),
+                None => permalink.clone(),
+            };
             self.await_embed_backlog(SIMILAR_BACKLOG_WAIT).await;
-            self.similar_engrams(&text, Some((&domain, &permalink)), scope)
+            self.similar_engrams(&text, Some((&domain, &exclude)), scope)
                 .await
         };
         match tokio::time::timeout(SIMILAR_TIMEOUT, work).await {
