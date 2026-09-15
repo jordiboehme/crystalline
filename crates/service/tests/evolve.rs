@@ -2305,3 +2305,265 @@ async fn a_path_an_author_deleted_carries_no_finding_for_them() {
         "and the deletion is hers alone until it is reviewed"
     );
 }
+
+// --- Task 11c: the sweep reads references in the caller's own view ----------
+
+/// Write one engram as somebody, which in a reviewed domain lands as that
+/// person's own draft.
+async fn write_as(engine: &Engine, title: &str, body: &str, scope: &Scope) {
+    let value = engine
+        .write_engram_as(
+            &crystalline_service::params::WriteParams {
+                domain: "team".to_string(),
+                title: title.to_string(),
+                content: body.to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec!["team".to_string()],
+                status: None,
+                metadata: None,
+                overwrite: false,
+            },
+            None,
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["draft"], Value::Bool(true), "{value}");
+}
+
+/// Add one file to the folder the team shares, and index it.
+async fn reviewed_file(engine: &Engine, dir: &std::path::Path, name: &str, text: &str) {
+    std::fs::write(dir.join(name), text).unwrap();
+    engine.sync(None).await.unwrap();
+}
+
+/// The rules one actor's sweep fires, for the finding shapes that carry no
+/// engram of their own.
+async fn rules_for(engine: &Engine, rule: &str, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec![rule.to_string()],
+                limit: Some(50),
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["rule"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A finding about a team link that one reader's own draft answers is not
+/// raised for that reader.
+///
+/// The sweep is what an author runs before sharing, so it has to speak about
+/// the archive they are actually reading. Told that the charter's link is
+/// broken when the page it names is open in front of them, they would go and
+/// write it twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_links_finding_that_only_the_readers_draft_resolves_is_not_raised_for_them() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "before she writes it, the charter's link is hers to fix like everybody's"
+    );
+
+    write_as(
+        &engine,
+        "Nobody Ever Wrote This Down",
+        "- [decision] somebody did after all #team",
+        &alice,
+    )
+    .await;
+
+    assert!(
+        dangling_for(&engine, &alice).await.is_empty(),
+        "she has answered the team's link, so it is no longer her finding"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and it is still everybody else's, because her page is hers alone"
+    );
+}
+
+/// A finding about a team link into a page one reader has deleted is raised for
+/// that reader and for nobody else.
+///
+/// The other end of the same sentence. The file is whole and the link lands for
+/// the team; for her the page it names is gone, and a sweep that said otherwise
+/// would be reading somebody else's archive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_link_into_a_path_the_reader_deleted_is_raised_for_them_alone() {
+    let (tmp, engine) = review_fixture().await;
+    let dir = tmp.path().join("team");
+    let alice = account("alice");
+    let bob = account("bob");
+    reviewed_file(
+        &engine,
+        &dir,
+        "guide.md",
+        &reviewed(
+            "Guide",
+            "guide",
+            "Start at the runbook.\n\n- relates_to [[Runbook]]",
+        ),
+    )
+    .await;
+
+    let charter = vec!["charter".to_string()];
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        charter,
+        "the guide's link lands for everybody while the runbook is there"
+    );
+
+    engine
+        .delete_engram_as(
+            &crystalline_service::params::DeleteParams {
+                identifier: "runbook".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string(), "guide".to_string()],
+        "her deletion is what broke the guide's link, and only for her"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        charter,
+        "the team's own guide still points at the team's own runbook"
+    );
+}
+
+/// A draft titled with a colon answers its author's own link, in the sweep.
+///
+/// `[[Log: Weekly]]` splits like `[[domain:Target]]` and only the registry
+/// settles it, which is the reading the sweep's own draft pass never had: it
+/// re-implemented the permalink and title forms in Rust and stopped there. It
+/// is one resolver now, so the form the index has always understood is the form
+/// the finding understands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_colon_titled_draft_answers_a_drafts_link_in_the_sweep() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+
+    append_as(
+        &engine,
+        "runbook",
+        "The week's numbers are in [[Log: Weekly]].",
+        &alice,
+    )
+    .await;
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string(), "runbook".to_string()],
+        "her draft names a page nobody has written"
+    );
+
+    write_as(
+        &engine,
+        "Log: Weekly",
+        "- [fact] what the week did #team",
+        &alice,
+    )
+    .await;
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "and now she has written it, under the title she linked to"
+    );
+}
+
+/// The tag drift rule reads the tags its reader sees; the `vocabulary` tool
+/// goes on answering the team's own list.
+///
+/// The two halves of the Task 9 ruling, and only one of them held. What a
+/// person is SHOWN is the domain's agreement, because a word one author is
+/// trying out in a draft is not the team's vocabulary. But a drift FINDING is
+/// about what that author wrote, and read off the team's list it could only
+/// ever say nothing about the spelling they had just invented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v203_reads_the_tags_the_author_sees() {
+    let (tmp, engine) = review_fixture().await;
+    let dir = tmp.path().join("team");
+    let alice = account("alice");
+    let bob = account("bob");
+    std::fs::write(
+        dir.join("schema.md"),
+        "---\ntype: engram\ntitle: Schema\npermalink: schema\ntags:\n  - database\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nHow the tables are laid out.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    assert!(
+        rules_for(&engine, "V203", &alice).await.is_empty(),
+        "the team spells it one way and nothing has drifted"
+    );
+
+    append_as(
+        &engine,
+        "runbook",
+        "- [decision] the importer writes straight to the store #data-base",
+        &alice,
+    )
+    .await;
+
+    assert_eq!(
+        rules_for(&engine, "V203", &alice).await,
+        vec!["V203".to_string()],
+        "her own draft is where the second spelling is, so the drift is hers"
+    );
+    assert!(
+        rules_for(&engine, "V203", &bob).await.is_empty(),
+        "and nobody else is told about a word they cannot read"
+    );
+
+    let listed = async |scope: &Scope| {
+        engine
+            .vocabulary(
+                &crystalline_service::params::VocabularyParams {
+                    domain: Some("team".to_string()),
+                },
+                scope,
+            )
+            .await
+            .unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    for scope in [&alice, &bob] {
+        assert!(
+            listed(scope).await.contains(&"database".to_string()),
+            "the tool answers the team's own vocabulary"
+        );
+        assert!(
+            !listed(scope).await.contains(&"data-base".to_string()),
+            "and never a word one person is trying out in a draft"
+        );
+    }
+}
