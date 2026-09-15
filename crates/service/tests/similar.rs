@@ -642,3 +642,235 @@ async fn back_to_back_writes_see_each_other() {
         "the probe waited for the worker: {receipt}"
     );
 }
+
+// --- Task 6: the advisory is the writer's own view of the domain -------------
+
+/// The frontmatter of a base engram the team has reviewed.
+fn team_engram(title: &str, permalink: &str, body: &str) -> String {
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# {title}\n\n{body}\n"
+    )
+}
+
+/// A file domain `team` in review mode holding exactly `files`, with the topic
+/// provider installed and a state directory of its own so a draft can be
+/// mirrored.
+///
+/// Review mode is written straight into the configuration, as Task 4's
+/// fixtures do: turning it on through a verb is Task 7's, and a fixture that
+/// had to satisfy the enabling gates would be testing those instead.
+async fn review_engine(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n",
+    )
+    .unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            cfg,
+            Some(Arc::new(support::TopicEmbedder)),
+            Some(config_path),
+        )
+        .with_state_dir(tmp.path().join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// One account, as an authenticated surface resolves it.
+fn account(name: &str) -> Scope {
+    Scope::User {
+        account: name.to_string(),
+        admin: false,
+    }
+}
+
+/// The advisory on a draft's receipt never names the base row that draft
+/// stands over, and never names the draft itself.
+///
+/// Two rules meet here and the test needs both. The candidate set is the
+/// writer's shadowed view, so the base row at the path she is drafting is not
+/// a candidate at all - without that she would be told her own engram is close
+/// to what she just wrote, with the team's wording, which is exactly the merge
+/// advice she must not act on. And the exclusion of the engram that was just
+/// written is by address across every actor's rows, so her own draft drops out
+/// of its own advisory however its row is keyed.
+///
+/// Her draft moves the permalink, which is what makes the first rule
+/// observable: while the addresses agree, the exclusion alone would hide the
+/// base row and the shadow would never be tested.
+#[tokio::test]
+async fn a_drafts_receipt_never_lists_its_own_base_row() {
+    let (_tmp, engine) = review_engine(&[
+        (
+            "retry-queue-gotcha.md",
+            &team_engram("Retry queue gotcha", "retry-queue-gotcha", RETRY),
+        ),
+        (
+            "retry-backoff-lesson.md",
+            &team_engram("Retry backoff lesson", "retry-backoff-lesson", RETRY_AGAIN),
+        ),
+    ])
+    .await;
+    let alice = account("alice");
+
+    let read = engine
+        .read_engram(
+            &crystalline_service::params::ReadParams {
+                identifier: "retry-queue-gotcha".to_string(),
+                domain: Some("team".to_string()),
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+    let saved_text = team_engram("Retry queue notes", "retry-queue-notes", RETRY);
+    let mut receipt = engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "retry-queue-gotcha".to_string(),
+                content: saved_text.clone(),
+                expected_checksum: read["checksum"].as_str().unwrap().to_string(),
+            },
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["draft"], serde_json::json!(true), "{receipt}");
+    engine.embed_pending().await.unwrap();
+    engine
+        .attach_similar(
+            &mut receipt,
+            SimilarProbe::Markdown { text: &saved_text },
+            &alice,
+        )
+        .await;
+
+    let named: Vec<&str> = receipt["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r["permalink"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !named.contains(&"retry-queue-gotcha"),
+        "the base row she is drafting over is not a neighbour of her draft: {receipt}"
+    );
+    assert!(
+        !named.contains(&"retry-queue-notes"),
+        "and neither is the draft itself, whatever address it answers to: {receipt}"
+    );
+    assert!(
+        named.contains(&"retry-backoff-lesson"),
+        "what the team has elsewhere on the topic is still the advice: {receipt}"
+    );
+}
+
+/// An author's own drafts can fill the advisory, and the cut stands.
+///
+/// The neighbours are rows competing on one ladder, not two lists merged: a
+/// draft sits where its own text puts it and nothing reserves a slot for the
+/// domain's files. So an author drafting several engrams on one topic is told
+/// about their own drafts and not about the reviewed engram further away -
+/// which is the ranking answering the question it was asked, "what is nearest
+/// to what you just wrote", rather than the advisory failing.
+///
+/// The crowding is a page-boundary effect rather than a `SIMILAR_LIMIT` one:
+/// the page is one wider than the receipt and the write itself spends a slot,
+/// so it takes three nearer drafts to push the base row out of the page
+/// entirely. The colleague's half of the test is what says the base row is
+/// findable at all: bob, who drafts nothing, is told about it from the very
+/// same probe text.
+#[tokio::test]
+async fn an_authors_own_drafts_can_fill_the_advisory_and_the_cut_stands() {
+    // The one base engram on the topic is deliberately further away than any
+    // draft: it mixes the docking markers into the retry ones, so its lead
+    // vector sits off the axis every draft below is exactly on. A base row at
+    // the same distance would make which four rows reach the page a tie rather
+    // than a fact.
+    let (_tmp, engine) = review_engine(&[(
+        "retry-clamp-runbook.md",
+        &team_engram(
+            "Retry clamp runbook",
+            "retry-clamp-runbook",
+            "The retry queue doubles its backoff and the dead-letter ttl bounds a retry.\nThe docking clamp seats in the bay before thrust and the clamps hold.",
+        ),
+    )])
+    .await;
+    let alice = account("alice");
+
+    let probe = async |title: &str, body: &str, scope: &Scope| {
+        let params = write("team", title, body, None);
+        let mut receipt = engine.write_engram_as(&params, None, scope).await.unwrap();
+        engine.embed_pending().await.unwrap();
+        engine
+            .attach_similar(&mut receipt, SimilarProbe::for_write(&params), scope)
+            .await;
+        receipt
+    };
+    let named = |receipt: &serde_json::Value| -> Vec<String> {
+        receipt["similar"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| r["permalink"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Her first draft is told about the engram the team reviewed: one draft
+    // does not crowd anything.
+    let first = probe("Retry ttl note", RETRY, &alice).await;
+    assert_eq!(
+        named(&first),
+        vec!["retry-clamp-runbook".to_string()],
+        "with nothing of her own on the topic, the team's engram is the advice: {first}"
+    );
+
+    probe("Retry backoff note", RETRY_AGAIN, &alice).await;
+    probe("Retry queue note", RETRY, &alice).await;
+    let fourth = probe("Retry dead-letter note", RETRY_AGAIN, &alice).await;
+    let mut hers = named(&fourth);
+    hers.sort();
+    assert_eq!(
+        hers,
+        vec![
+            "retry-backoff-note".to_string(),
+            "retry-queue-note".to_string(),
+            "retry-ttl-note".to_string()
+        ],
+        "her three nearer drafts fill the page, and the cut stands: {fourth}"
+    );
+
+    // And the base row is findable, which is what makes the line above a
+    // crowding rather than a distance: the same probe text answers bob, who
+    // is drafting nothing, with the engram the team has.
+    let bobs = probe("Retry ledger note", RETRY_AGAIN, &account("bob")).await;
+    assert_eq!(
+        named(&bobs),
+        vec!["retry-clamp-runbook".to_string()],
+        "his advisory is the team's engram, and names no draft of hers: {bobs}"
+    );
+}

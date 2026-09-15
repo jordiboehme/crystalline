@@ -7565,6 +7565,31 @@ impl Engine {
     /// dropped after the page comes back, which is why the page is one wider
     /// than the list. Ranking only: no score leaves this function.
     ///
+    /// **The candidate set is the writer's own view of the index.** The
+    /// advisory is a search, so it asks the same question about whose rows are
+    /// in range: a writer in review mode whose neighbours are all still drafts
+    /// would otherwise be told there is nothing near what they just wrote. Two
+    /// consequences, and both are the shape rather than an accident.
+    ///
+    /// The base row at a path the writer is drafting is not a candidate at all,
+    /// so a draft never lists the engram it is a draft of - it would be told to
+    /// merge its own work into the team's wording of it. And `exclude` is
+    /// matched by address across every actor's rows, because a hit says which
+    /// engram it is and never whose row carried it, so the engram that was just
+    /// written drops out however it is keyed.
+    ///
+    /// **A writer's own drafts can fill the list, and the cut stands.** The
+    /// drafts are not additional, they are rows on one ladder, so an author
+    /// holding several drafts on a topic is told about those and not about the
+    /// reviewed engram further away. That is the ranking answering the question
+    /// it was asked. Reserving a slot for a base row, or marking which
+    /// neighbours are the caller's own drafts, both need a fact no hit carries -
+    /// whether the row behind it was a draft - and putting it on
+    /// [`crystalline_index::SearchHit`] would widen every search answer on
+    /// every surface for this one advisory. So the policy is the cut, stated
+    /// here and pinned by
+    /// `an_authors_own_drafts_can_fill_the_advisory_and_the_cut_stands`.
+    ///
     /// The scoping reconciliation, the mode decision and the phasing that never
     /// holds the store lock across the embed call are all
     /// [`Engine::search_engrams_under`]'s, repeated here rather than shared: the
