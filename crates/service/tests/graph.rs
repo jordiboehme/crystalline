@@ -365,3 +365,68 @@ async fn a_bad_anchor_is_refused_by_kind() {
         "{unknown:?}"
     );
 }
+
+/// A domain that takes changes directly answers every reader the same bytes.
+///
+/// The `None` arm of every actor-aware statement, pinned where it is visible:
+/// an identified caller carries an actor into the traversal, a domain that
+/// reviews nothing has no draft for it to mean, and the two payloads have to be
+/// the same payload - key for key, so the draft marker is absent rather than
+/// false, and node for node, so no statement quietly answers a different set of
+/// rows to somebody who happens to be signed in.
+#[tokio::test]
+async fn a_direct_domains_graph_is_byte_identical_whoever_asks() {
+    let engine = chain().await;
+
+    for anchor in ["crystalline://notes/beta", "crystalline://notes/*"] {
+        let owner = engine
+            .graph_neighborhood(anchor, 2, 100, &Scope::Unrestricted)
+            .await
+            .unwrap();
+        let nobody = engine
+            .graph_neighborhood(anchor, 2, 100, &Scope::Anonymous)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&owner).unwrap(),
+            serde_json::to_string(&nobody).unwrap(),
+            "the graph of {anchor} is one graph"
+        );
+
+        let owner = engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(2),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let nobody = engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(2),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                &Scope::Anonymous,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&owner).unwrap(),
+            serde_json::to_string(&nobody).unwrap(),
+            "and the context around {anchor} is one context"
+        );
+        assert!(
+            !serde_json::to_string(&owner).unwrap().contains("draft"),
+            "with no word about drafts in it: {owner}"
+        );
+    }
+}

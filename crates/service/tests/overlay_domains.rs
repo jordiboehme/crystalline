@@ -4720,3 +4720,476 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
          surfaces; a read verb that reaches it answers one reader with another reader's drafts"
     );
 }
+
+// --- Task 11c: links resolve onto the author's own drafts -------------------
+
+/// A base engram that points at the plan, for the tests about what a team link
+/// means to a reader who has redrafted or deleted what it points at.
+const CHARTER: &str = "---\ntype: engram\ntitle: Charter\npermalink: charter\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Charter\n\n- relates_to [[Plan]]\n- cites [[Nobody Wrote This]]\n";
+
+impl Fixture {
+    /// One base file written into the folder the team shares, and indexed.
+    async fn base_file(&self, domain: &str, path: &str, text: &str) {
+        std::fs::write(self.domain_root(domain).join(path), text).unwrap();
+        self.engine.sync(None).await.unwrap();
+    }
+
+    /// One reader's whole `read_engram` answer.
+    async fn reads_json(&self, identifier: &str, scope: &Scope) -> serde_json::Value {
+        self.engine
+            .read_engram(&read(identifier), scope)
+            .await
+            .unwrap()
+    }
+
+    /// One reader's context slice around an anchor.
+    async fn context(
+        &self,
+        anchor: &str,
+        scope: &Scope,
+    ) -> crystalline_service::engine::Result<serde_json::Value> {
+        self.engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(1),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                scope,
+            )
+            .await
+    }
+}
+
+/// The permalinks of a slice's nodes, sorted, each marked when the payload
+/// calls it the reader's own draft.
+fn slice_nodes(value: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = value["nodes"]
+        .as_array()
+        .expect("the slice lists nodes")
+        .iter()
+        .map(|n| {
+            let mark = if n["draft"] == serde_json::json!(true) {
+                "*"
+            } else {
+                ""
+            };
+            format!("{}{mark}", n["permalink"].as_str().unwrap())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Whether each relation and prose link of a read answers to something, in the
+/// order the document wrote them.
+fn ref_verdicts(value: &serde_json::Value) -> Vec<bool> {
+    value["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(value["links"].as_array().unwrap())
+        .map(|r| r["resolved"] == serde_json::json!(true))
+        .collect()
+}
+
+/// Two drafts that point at each other are an edge, for the one person who can
+/// read both of them.
+///
+/// The case the whole task exists for: somebody drafting several pages at once
+/// works the way they work in a direct domain, so the link between two of their
+/// own drafts has to be a link. It is theirs alone, because a draft is one
+/// person's private reading of a page and an edge onto one would tell everybody
+/// else that it exists.
+#[tokio::test]
+async fn two_drafts_linking_each_other_form_an_edge_for_their_author_only() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    for (title, body) in [
+        (
+            "Fresh",
+            "- [idea] the first half #team\n\n- relates_to [[Plan Two]]",
+        ),
+        (
+            "Plan Two",
+            "- [idea] the second half #team\n\n- relates_to [[Fresh]]",
+        ),
+    ] {
+        f.engine
+            .write_engram_as(&write_params("team", title, body), None, &alice)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        slice_nodes(&f.context("crystalline://team/fresh", &alice).await.unwrap()),
+        vec!["fresh*".to_string(), "plan-two*".to_string()],
+        "from one of her drafts she reaches the other, and both say they are hers"
+    );
+    assert_eq!(
+        slice_nodes(
+            &f.context("crystalline://team/plan-two", &alice)
+                .await
+                .unwrap()
+        ),
+        vec!["fresh*".to_string(), "plan-two*".to_string()],
+        "and the same from the other end"
+    );
+
+    for stranger in [&bob, &Scope::Anonymous] {
+        assert!(
+            f.context("crystalline://team/fresh", stranger)
+                .await
+                .is_err(),
+            "her draft is no anchor of theirs"
+        );
+        assert_eq!(
+            slice_nodes(
+                &f.context("crystalline://team/plan", stranger)
+                    .await
+                    .unwrap()
+            ),
+            vec!["plan".to_string()],
+            "and neither draft is anywhere in the graph the team's files draw"
+        );
+    }
+}
+
+/// A team link into a page one reader has deleted is broken for that reader and
+/// sound for everybody else.
+///
+/// The link is written in a file nobody has touched. What differs is the view it
+/// is read in: her deletion is a deletion, so the page it names is not there for
+/// her, and saying otherwise would be the deletion undone by a link.
+#[tokio::test]
+async fn a_base_link_into_a_path_the_reader_tombstoned_reads_unresolved_for_them_and_resolved_for_a_stranger()
+ {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+    f.base_file("team", "charter.md", CHARTER).await;
+
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ref_verdicts(&f.reads_json("charter", &alice).await),
+        vec![false, false],
+        "the charter's link to the plan dangles for her, and so does the one \
+         nobody ever wrote"
+    );
+    assert_eq!(
+        ref_verdicts(&f.reads_json("charter", &bob).await),
+        vec![true, false],
+        "and for him the plan is where it always was"
+    );
+
+    let graph = async |scope: &Scope| {
+        f.engine
+            .graph_neighborhood("crystalline://team/charter", 1, 50, scope)
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        slice_nodes(&graph(&alice).await),
+        vec!["charter".to_string()],
+        "her graph draws no arrow into a page she has deleted"
+    );
+    assert_eq!(
+        slice_nodes(&graph(&bob).await),
+        vec!["charter".to_string(), "plan".to_string()],
+        "his draws the one the file describes"
+    );
+}
+
+/// A team link nobody could answer is answered by the reader's own draft.
+///
+/// The other end of the same sentence. The charter names a page that does not
+/// exist; alice writes it, as a draft; for her the link lands, and the sweep
+/// and the graph follow it there.
+#[tokio::test]
+async fn an_unresolved_base_link_that_only_the_readers_draft_answers_reads_resolved_for_them() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+    f.base_file("team", "charter.md", CHARTER).await;
+
+    f.engine
+        .write_engram_as(
+            &write_params(
+                "team",
+                "Nobody Wrote This",
+                "- [idea] somebody did after all #team",
+            ),
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ref_verdicts(&f.reads_json("charter", &alice).await),
+        vec![true, true],
+        "both of the charter's links land for her now"
+    );
+    assert_eq!(
+        ref_verdicts(&f.reads_json("charter", &bob).await),
+        vec![true, false],
+        "and the second still dangles for everybody else"
+    );
+    assert_eq!(
+        slice_nodes(
+            &f.context("crystalline://team/charter", &alice)
+                .await
+                .unwrap()
+        ),
+        vec![
+            "charter".to_string(),
+            "nobody-wrote-this*".to_string(),
+            "plan".to_string()
+        ],
+        "and her slice walks the team's link onto the page she wrote"
+    );
+}
+
+/// A draft reached by following a link says it is the reader's own, and a base
+/// row beside it says nothing at all.
+///
+/// One line in the payload, and the silence beside it is the other half: a
+/// domain that takes changes directly answers the JSON it always answered.
+#[tokio::test]
+async fn a_draft_reached_through_build_context_is_marked_the_readers_own() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+
+    f.engine
+        .write_engram_as(
+            &write_params(
+                "team",
+                "Fresh",
+                "- [idea] a page only alice has #team\n\n- relates_to [[Plan]]",
+            ),
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        slice_nodes(&f.context("crystalline://team/plan", &alice).await.unwrap()),
+        vec!["fresh*".to_string(), "plan".to_string()],
+        "the base anchor reaches her draft through the draft's own link back, \
+         and only the draft is marked"
+    );
+
+    let hers = f.reads_json("fresh", &alice).await;
+    assert_eq!(
+        hers["draft"],
+        serde_json::json!(true),
+        "reading the draft says the same thing: {hers}"
+    );
+    let theirs = f.reads_json("plan", &alice).await;
+    assert!(
+        theirs.get("draft").is_none(),
+        "and reading the team's own page says nothing about drafts: {theirs}"
+    );
+}
+
+/// A reference never lands on somebody else's draft, in any verb.
+///
+/// The rule that keeps a reviewing domain honest: a resolved edge onto a page
+/// only its author can read would tell everybody else the page exists. Task 12's
+/// share-link grants are the one thing that will ever widen this, and they widen
+/// the candidate set rather than adding a second rule.
+#[tokio::test]
+async fn another_actors_draft_is_never_a_link_target() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    f.engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] a page only alice has #team"),
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    f.engine
+        .write_engram_as(
+            &write_params(
+                "team",
+                "Bobs idea",
+                "- [idea] a page only bob has #team\n\n- relates_to [[Fresh]]",
+            ),
+            None,
+            &bob,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ref_verdicts(&f.reads_json("bobs-idea", &bob).await),
+        vec![false],
+        "his link names a page he cannot read, so it names nothing"
+    );
+    assert_eq!(
+        slice_nodes(
+            &f.context("crystalline://team/bobs-idea", &bob)
+                .await
+                .unwrap()
+        ),
+        vec!["bobs-idea*".to_string()],
+        "and his graph has no edge to draw"
+    );
+    assert!(
+        f.engine
+            .read_engram(&read("bobs-idea"), &alice)
+            .await
+            .is_err(),
+        "and his page is not hers to read at all, which is the same rule said \
+         from the other side"
+    );
+}
+
+/// A draft that goes away takes the links that named it with it, back onto
+/// whatever stands at that address now.
+///
+/// Her own page answered to the title `Plan` while it stood, because her rows
+/// come first in her own view. Deleting it drops the row - there is no file
+/// underneath to tombstone - and the link she wrote falls back onto the team's
+/// page of that name in the same transaction, rather than being left naming a
+/// row nobody holds.
+#[tokio::test]
+async fn a_discarded_draft_releases_the_links_that_pointed_at_it() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+
+    // A page of her own answering to the team's own title, at a path no file
+    // holds. Written as a row directly, because the address gate is what stops
+    // a verb from spending an address the folder already holds.
+    f.draft(
+        "team",
+        "alice",
+        "her-plan.md",
+        "---\ntype: engram\ntitle: Plan\npermalink: her-plan\ntags:\n  - team\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\n# Plan\n\n- [idea] her own plan #team\n",
+    )
+    .await;
+    f.engine
+        .write_engram_as(
+            &write_params(
+                "team",
+                "Fresh",
+                "- [idea] a page only alice has #team\n\n- relates_to [[Plan]]",
+            ),
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        slice_nodes(&f.context("crystalline://team/fresh", &alice).await.unwrap()),
+        vec!["fresh*".to_string(), "her-plan*".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "while her page stands, her link means her page"
+    );
+
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "her-plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ref_verdicts(&f.reads_json("fresh", &alice).await),
+        vec![true],
+        "her link still lands"
+    );
+    assert_eq!(
+        slice_nodes(&f.context("crystalline://team/fresh", &alice).await.unwrap()),
+        vec!["fresh*".to_string(), "plan".to_string()],
+        "on the team's page of that name, which is what she reads there now"
+    );
+}
+
+/// A fold leaves every link bound, against the folder the team shares.
+///
+/// Two drafts that pointed at each other become two files that point at each
+/// other, and the answer is the same answer read in a different view: nobody's
+/// drafts, nobody's marker, and both links still landing.
+#[tokio::test]
+async fn a_fold_leaves_every_link_bound_against_the_folder() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+
+    for (title, body) in [
+        (
+            "Fresh",
+            "- [idea] the first half #team\n\n- relates_to [[Plan Two]]",
+        ),
+        (
+            "Plan Two",
+            "- [idea] the second half #team\n\n- relates_to [[Fresh]]",
+        ),
+    ] {
+        f.engine
+            .write_engram_as(&write_params("team", title, body), None, &alice)
+            .await
+            .unwrap();
+    }
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["applied"], serde_json::json!(true), "{receipt}");
+    f.engine.sync(None).await.unwrap();
+
+    for permalink in ["fresh", "plan-two"] {
+        let value = f.reads_json(permalink, &alice).await;
+        assert_eq!(
+            ref_verdicts(&value),
+            vec![true],
+            "{permalink} still points at something the team holds: {value}"
+        );
+        assert!(
+            value.get("draft").is_none(),
+            "and nobody is drafting it any more: {value}"
+        );
+    }
+    assert_eq!(
+        slice_nodes(&f.context("crystalline://team/fresh", &alice).await.unwrap()),
+        vec!["fresh".to_string(), "plan-two".to_string()],
+        "the pair is the team's graph now"
+    );
+}
