@@ -508,6 +508,96 @@ parity!(
     forward_reference_resolves_by_title
 );
 
+/// `reference_match`'s title-match arm with two candidates: two engrams share
+/// a title, so a `[[Same Title]]` reference has more than one row it could
+/// bind to. `z-target.md` (permalink `zulu-target`) is synced alone first, so
+/// it gets the lower id; `a-target.md` (permalink `alpha-target`) arrives in a
+/// later sync alongside the reference itself, so it gets the higher id and
+/// its path sorts byte-lower than `z-target.md`'s. Without a secondary sort
+/// key on the tie, `LIMIT 1` is free to answer whichever row insertion order
+/// or physical layout hands it first - the higher-id, byte-higher row here -
+/// which is exactly what a bare `LIMIT 1` with no `ORDER BY` does. The fix
+/// pins the tie to the byte-lower path on both backends, so the reference
+/// binds to `a-target.md` regardless of which candidate existed first.
+async fn reference_match_tie_break_prefers_the_byte_lower_path(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    write(
+        root,
+        "z-target.md",
+        &engram("Same Title", "zulu-target", "engram", "", "z body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    write(
+        root,
+        "a-target.md",
+        &engram("Same Title", "alpha-target", "engram", "", "a body\n"),
+    );
+    write(
+        root,
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "- depends_on [[Same Title]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let a_target = store.lookup_id("d", "alpha-target").await.unwrap().unwrap();
+    let z_target = store.lookup_id("d", "zulu-target").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let a_page = store
+        .inbound_page(&InboundQuery {
+            engram_id: a_target,
+            domain_id: domain,
+            permalink: "alpha-target",
+            title: "Same Title",
+            q: None,
+            rel: None,
+            exclude_domains: &[],
+            page: 1,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let z_page = store
+        .inbound_page(&InboundQuery {
+            engram_id: z_target,
+            domain_id: domain,
+            permalink: "zulu-target",
+            title: "Same Title",
+            q: None,
+            rel: None,
+            exclude_domains: &[],
+            page: 1,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        a_page.total, 1,
+        "the reference binds to the byte-lower path, a-target.md: {a_page:?}"
+    );
+    assert_eq!(
+        z_page.total, 0,
+        "not to the byte-higher path, z-target.md, even though it was inserted first: {z_page:?}"
+    );
+}
+parity!(
+    reference_resolves_to_the_same_row_on_both_backends,
+    reference_match_tie_break_prefers_the_byte_lower_path
+);
+
 /// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
 /// mentioned in prose (no relation type) stays unresolved until its target
 /// appears, then resolves on the later sync into a `links_to` graph edge. This

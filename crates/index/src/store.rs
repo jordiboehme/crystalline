@@ -70,15 +70,25 @@ pub struct ObservationRecord {
 /// One rule, shared by both backends and by both reference tables, because a
 /// second copy of it would be a second answer to "does this link resolve".
 /// `table` is `relation` or `link` (or the alias a statement gave one); every
-/// construct here is spelled the same in both dialects, so only the caller's
-/// bind placeholder differs - and the one predicate that is not, the actor
-/// screen, is handed in ready-made by the backend that owns its spelling.
+/// construct here is spelled the same in both dialects but one - the path
+/// tie-break's collation, which `postgres` selects - and only the caller's
+/// bind placeholder differs otherwise, and the one predicate that is not, the
+/// actor screen, is handed in ready-made by the backend that owns its
+/// spelling.
+///
+/// `postgres` is true when the caller is building this for the Postgres
+/// backend, false for Turso. Turso 0.7.2 sorts TEXT byte-wise on its own and
+/// rejects an unregistered `COLLATE "C"` outright (it reads any collation name
+/// it does not already know as an ICU locale tag, and `"C"` is not one), so
+/// the tie-break names the bare column there; Postgres needs the explicit
+/// collation to match that same byte order under a locale-collated database,
+/// exactly as [`crate::postgres::PostgresStore::find_engram`] already pins it.
 ///
 /// `candidates` says whose rows may answer. [`ReferenceCandidates::Base`]
-/// emits the text this expression has always emitted, so a base row's
-/// references and a direct domain's index pass are byte for byte what they
-/// were; the other two read one actor's view, with that actor's own row
-/// preferred at an address the base also answers.
+/// emits the text this expression has always emitted plus the new tie-break,
+/// so a base row's references and a direct domain's index pass are otherwise
+/// byte for byte what they were; the other two read one actor's view, with
+/// that actor's own row preferred at an address the base also answers.
 ///
 /// Three readings, in the order [`crystalline_core::address::resolve`] tries
 /// them: the target as a permalink in the target domain, the target as a title
@@ -92,7 +102,11 @@ pub struct ObservationRecord {
 /// a softer answer: a prefix that does name a domain never reaches it, and a
 /// row written before `to_raw` existed compares against NULL, which is never
 /// true, so it resolves exactly as it did before until its engram is reindexed.
-pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
+pub(crate) fn reference_match(
+    table: &str,
+    candidates: ReferenceCandidates<'_>,
+    postgres: bool,
+) -> String {
     let target_domain = format!(
         "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
     );
@@ -100,17 +114,29 @@ pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) 
         "{table}.to_domain IS NOT NULL \
          AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
     );
+    // The path tie-break itself: a bare `LIMIT 1` with no secondary sort key
+    // leaves a tie between two candidate rows unpinned, and the row it hands
+    // back then depends on physical layout rather than on the address. This is
+    // the same tie-break `find_engram` uses, so a reference and a lookup that
+    // could both land on either row agree, and the two backends agree with
+    // each other even though only one of them spells the collation.
+    let path_order = if postgres {
+        "e.path COLLATE \"C\""
+    } else {
+        "e.path"
+    };
     // Which rows may answer, and - when more than one may - which of them wins
     // at the same address. `Base` is the literal base predicate and no
-    // preference, which is the text this expression has always emitted.
+    // preference beyond the path tie-break.
     let (actor_screen, prefer) = match candidates {
-        ReferenceCandidates::Base => ("e.actor = ''", ""),
+        ReferenceCandidates::Base => ("e.actor = ''", format!(" ORDER BY {path_order}")),
         ReferenceCandidates::View { screen } | ReferenceCandidates::DraftsOnly { screen } => (
             screen,
-            // The author's own row first. Said as an ordering rather than as a
-            // second COALESCE arm, so one arm stays one statement and no
-            // collation is involved: `0` sorts before `1` in every dialect.
-            " ORDER BY CASE WHEN e.actor = '' THEN 1 ELSE 0 END",
+            // The author's own row first, said as an ordering rather than as
+            // a second COALESCE arm so one arm stays one statement; `0` sorts
+            // before `1` in every dialect and needs no collation of its own.
+            // The path tie-break settles a further tie within that class.
+            format!(" ORDER BY CASE WHEN e.actor = '' THEN 1 ELSE 0 END, {path_order}"),
         ),
     };
     format!(

@@ -589,7 +589,11 @@ fn view_verdicts(
     let dst_screen = search::actor_screen_on("dst", Some(actor), params, n);
     let drafts = search::drafts_only_on("e", actor, params, n);
     let verdict = |alias: &str| {
-        let reach = reference_match(alias, ReferenceCandidates::DraftsOnly { screen: &drafts });
+        let reach = reference_match(
+            alias,
+            ReferenceCandidates::DraftsOnly { screen: &drafts },
+            true,
+        );
         // `tgt` is the bound row, read for its address alone; `dst` beside it
         // is the screen that says what this reader holds there.
         format!(
@@ -1034,7 +1038,7 @@ impl Store for PostgresStore {
             "UPDATE relation SET to_id = {resolved} \
              WHERE relation.to_id IS NULL AND relation.domain_id = $1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("relation", ReferenceCandidates::Base)
+            resolved = reference_match("relation", ReferenceCandidates::Base, true)
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -1052,7 +1056,7 @@ impl Store for PostgresStore {
             "UPDATE link SET to_id = {resolved} \
              WHERE link.to_id IS NULL AND link.domain_id = $1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("link", ReferenceCandidates::Base)
+            resolved = reference_match("link", ReferenceCandidates::Base, true)
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -1099,6 +1103,7 @@ impl Store for PostgresStore {
                 ReferenceCandidates::View {
                     screen: &actor_screen,
                 },
+                true,
             );
             let sql = format!(
                 "UPDATE {table} SET to_id = {view} \

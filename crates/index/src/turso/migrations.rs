@@ -773,8 +773,11 @@ mod tests {
 
         let sql = format!(
             "UPDATE relation SET to_id = {resolved} WHERE relation.to_id IS NULL AND {resolved} IS NOT NULL",
-            resolved =
-                crate::store::reference_match("relation", crate::store::ReferenceCandidates::Base)
+            resolved = crate::store::reference_match(
+                "relation",
+                crate::store::ReferenceCandidates::Base,
+                false,
+            )
         );
         conn.execute(&sql, ()).await.unwrap();
 

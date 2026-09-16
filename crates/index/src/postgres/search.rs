@@ -1192,6 +1192,7 @@ fn pending_arm(
     let reach = crate::store::reference_match(
         alias,
         crate::store::ReferenceCandidates::DraftsOnly { screen: &drafts },
+        true,
     );
     format!(
         " UNION ALL \
