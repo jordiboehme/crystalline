@@ -1833,6 +1833,39 @@ impl McpServer {
         self.engine.attach_similar(&mut receipt, probe, scope).await;
         receipt
     }
+
+    /// A finished write result with the ride-along ask appended to it, when one
+    /// is due for the caller ([`crate::nudge::write_verb_trailer`]).
+    ///
+    /// **Last, on every write verb.** It runs after the receipt is whole -
+    /// after the neighbours advisory, after the live-document keys, after the
+    /// link the verb attaches - because it is addressed to the agent rather
+    /// than to the receipt: nothing downstream reads it, and a trailer that
+    /// moved earlier would sit inside a shape somebody parses.
+    ///
+    /// Only the first content block is touched, and only when it is text: that
+    /// block is the receipt, and the blocks after it are the resource links a
+    /// client follows. A result whose first block is not text (none today) is
+    /// handed back unchanged rather than grown a block of its own, since a
+    /// second text block would read as a second receipt.
+    ///
+    /// Never on a refusal and never on a question: both are answered before a
+    /// write happens, so neither reaches this.
+    async fn nudged(
+        &self,
+        mut result: CallToolResult,
+        ctx: &RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let Some(trailer) =
+            crate::nudge::write_verb_trailer(&self.engine, mcp_account(ctx).as_deref()).await
+        else {
+            return result;
+        };
+        if let Some(ContentBlock::Text(text)) = result.content.first_mut() {
+            text.text.push_str(&format!("\n\n---\n{trailer}"));
+        }
+        result
+    }
 }
 
 #[tool_router]
@@ -1951,7 +1984,7 @@ impl McpServer {
                     let receipt = self
                         .with_similar(receipt, SimilarProbe::for_write(&confirmed_write), &scope)
                         .await;
-                    return ok_written(receipt).map(CallToolResponse::from);
+                    return Ok(self.nudged(ok_written(receipt)?, &ctx).await.into());
                 }
             }
         }
@@ -1983,7 +2016,7 @@ impl McpServer {
             let receipt = self
                 .with_similar(receipt, SimilarProbe::for_write(&p), &scope)
                 .await;
-            return ok_written(receipt).map(CallToolResponse::from);
+            return Ok(self.nudged(ok_written(receipt)?, &ctx).await.into());
         };
 
         match resolved_overwrite(&responses.0) {
@@ -2016,7 +2049,7 @@ impl McpServer {
                 let receipt = self
                     .with_similar(receipt, SimilarProbe::for_write(&retry), &scope)
                     .await;
-                ok_written(receipt).map(CallToolResponse::from)
+                Ok(self.nudged(ok_written(receipt)?, &ctx).await.into())
             }
         }
     }
@@ -2142,7 +2175,7 @@ impl McpServer {
             Some(probe) => self.with_similar(receipt, probe, &scope).await,
             None => receipt,
         };
-        ok_written(receipt).map(CallToolResponse::from)
+        Ok(self.nudged(ok_written(receipt)?, &ctx).await.into())
     }
 
     #[tool(
@@ -2185,11 +2218,12 @@ impl McpServer {
                 return refuse(refusal);
             }
         }
-        self.engine
+        let receipt = self
+            .engine
             .move_engram(&p, &scope)
             .await
-            .map_err(to_error)
-            .and_then(ok_moved)
+            .map_err(to_error)?;
+        Ok(self.nudged(ok_moved(receipt)?, &ctx).await)
     }
 
     #[tool(
@@ -2214,11 +2248,12 @@ impl McpServer {
         if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
             return refuse(refusal);
         }
-        self.engine
+        let receipt = self
+            .engine
             .split_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
             .await
-            .map_err(to_error)
-            .and_then(ok_split)
+            .map_err(to_error)?;
+        Ok(self.nudged(ok_split(receipt)?, &ctx).await)
     }
 
     #[tool(
@@ -2265,12 +2300,12 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
+        let receipt = self
+            .engine
             .delete_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+            .map_err(to_error)?;
+        Ok(self.nudged(ok(receipt)?, &ctx).await.into())
     }
 
     #[tool(

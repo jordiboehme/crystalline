@@ -3266,3 +3266,247 @@ async fn an_oauth_authenticated_agents_write_records_the_account_it_acts_for() {
         "and still names the client that asked: {written}"
     );
 }
+
+// --- the nudges a write receipt carries ---------------------------------------
+//
+// The Stop hook gives a person two asks at the end of a session: share what the
+// team has not seen, and run the maintenance sweep when it is due. An agent over
+// MCP never meets a Stop hook, so the same asks ride along on its write
+// receipts - once per cooldown per identity, so two agents on one daemon each
+// keep their own clock.
+//
+// The maintenance ask is armed here the way a person's write through Fluid arms
+// it, by putting a domain on the backlog in the file the daemon and the hook
+// share. Under test that file lives in the engine's own temporary state
+// directory, so nothing here reaches the developer's machine.
+
+/// Put `eng` on the maintenance backlog, which is the pending arm of the
+/// maintenance ask: a human wrote to a domain and no sweep has looked at it.
+fn arm_the_maintenance_ask(root: &std::path::Path) {
+    let path = root.join("state").join("hooks").join("maintenance.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "v": 1,
+            "pending_domains": ["eng"],
+            "pending_since": "2026-09-01T09:00:00Z",
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// How many nudge lines a response carries. The prefix is what marks the
+/// knowledge base's own voice inside a receipt, and at most one ever appears.
+fn nudge_lines(raw: &str) -> usize {
+    raw.matches(crystalline_service::nudge::MCP_NUDGE_PREFIX)
+        .count()
+}
+
+/// Ada's first write carries the ask; her second, inside the cooldown, does
+/// not. One line, never two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adas_write_carries_one_trailer_and_her_next_is_throttled() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    arm_the_maintenance_ask(guard.path());
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+    let session = McpTestSession::open(&addr, Some(&token)).await;
+
+    let first = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "First Capture",
+                "content": "- [fact] one",
+            }),
+        )
+        .await;
+    assert!(
+        first.contains(crystalline_service::nudge::MCP_EVOLVE_NUDGE),
+        "the maintenance ask rides along on the receipt:\n{first}"
+    );
+    assert_eq!(
+        nudge_lines(&first),
+        1,
+        "one ask per receipt and never two:\n{first}"
+    );
+
+    let second = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Second Capture",
+                "content": "- [fact] two",
+            }),
+        )
+        .await;
+    assert_eq!(
+        nudge_lines(&second),
+        0,
+        "the same ask inside the cooldown is silent:\n{second}"
+    );
+}
+
+/// Bob has his own clock: ada's ask does not spend his quiet hours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bobs_cadence_is_independent_of_adas() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    arm_the_maintenance_ask(guard.path());
+    let (ada, bob) = two_agents(&store).await;
+
+    let hers = McpTestSession::open(&addr, Some(&ada)).await;
+    let answer = hers
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Ada Capture",
+                "content": "- [fact] ada wrote this",
+            }),
+        )
+        .await;
+    assert_eq!(nudge_lines(&answer), 1, "ada is asked once:\n{answer}");
+
+    let his = McpTestSession::open(&addr, Some(&bob)).await;
+    let answer = his
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Bob Capture",
+                "content": "- [fact] bob wrote this",
+            }),
+        )
+        .await;
+    assert!(
+        answer.contains(crystalline_service::nudge::MCP_EVOLVE_NUDGE),
+        "and so is bob, on his own clock:\n{answer}"
+    );
+}
+
+/// A read never carries an ask. The trailer belongs to the write verbs, and a
+/// search that met one would neither have earned it nor been able to act on it
+/// - and it must not spend the cadence the next write is owed either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_result_never_carries_a_trailer() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    arm_the_maintenance_ask(guard.path());
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+    let session = McpTestSession::open(&addr, Some(&token)).await;
+
+    let found = session
+        .call_tool("search_engrams", serde_json::json!({ "query": "anything" }))
+        .await;
+    assert_eq!(
+        nudge_lines(&found),
+        0,
+        "a search result carries no ask:\n{found}"
+    );
+
+    let written = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "After The Search",
+                "content": "- [fact] still owed",
+            }),
+        )
+        .await;
+    assert_eq!(
+        nudge_lines(&written),
+        1,
+        "and the search did not spend what the next write was owed:\n{written}"
+    );
+}
+
+/// Every write verb carries it, split included: the trailer is attached after
+/// the receipt each verb builds for itself, not inside one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_split_receipt_carries_the_trailer_too() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    arm_the_maintenance_ask(guard.path());
+    let (ada, bob) = two_agents(&store).await;
+
+    // Ada writes the bundle, which spends her own cadence and nobody else's.
+    let hers = McpTestSession::open(&addr, Some(&ada)).await;
+    let seeded = hers
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Coolant Bundle",
+                "content": "- [fact] the loop purges before a mix swap\n- [fact] the pump is rated for 12 bar\n- [fact] the mix is checked weekly\n\n## Extra\n\nThe purge log lives in the ops binder.\n",
+            }),
+        )
+        .await;
+    assert!(
+        seeded.contains("\"result\""),
+        "the bundle must be written:\n{seeded}"
+    );
+
+    let his = McpTestSession::open(&addr, Some(&bob)).await;
+    let split = his
+        .call_tool(
+            "split_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "identifier": "coolant-bundle",
+                "title": "Purge Log",
+                "sections": ["## Extra"],
+            }),
+        )
+        .await;
+    assert!(
+        split.contains("purge-log"),
+        "the split must be served, not refused:\n{split}"
+    );
+    assert!(
+        split.contains(crystalline_service::nudge::MCP_EVOLVE_NUDGE),
+        "a split receipt carries the ask like every other write:\n{split}"
+    );
+}
+
+/// Nothing due, nothing said: an install with no backlog, no sweep overdue and
+/// no team domain owing anything meets a bare receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_due_means_no_trailer() {
+    let (addr, _guard, store) = serve_with_mcp_auth(true).await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+    let session = McpTestSession::open(&addr, Some(&token)).await;
+
+    let answer = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Quiet Capture",
+                "content": "- [fact] nothing is owed",
+            }),
+        )
+        .await;
+    assert!(
+        answer.contains("\"result\""),
+        "the write must be served:\n{answer}"
+    );
+    assert_eq!(
+        nudge_lines(&answer),
+        0,
+        "with nothing due the receipt says nothing:\n{answer}"
+    );
+}

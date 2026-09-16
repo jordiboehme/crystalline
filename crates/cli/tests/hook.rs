@@ -785,3 +785,50 @@ fn an_unmeasured_or_unknown_harness_gets_the_line_it_always_got() {
         );
     }
 }
+
+/// **The MCP write receipts ask for a share in exactly these words.**
+///
+/// An agent over MCP never meets a Stop hook, so `crystalline_service::nudge`
+/// carries the same sharing ask on its write receipts. `crates/service` sits
+/// below `crates/cli` and cannot import this constant, so the sentence is
+/// copied there - and a copy nobody pins is two dialects of one ask waiting to
+/// happen.
+///
+/// The pin reads this crate's own source rather than a third copy of the
+/// sentence: a literal repeated here would drift together with the one it is
+/// supposed to catch. Unlike the black-box constants above, that is exactly the
+/// right instrument for this claim - the question is not what the subprocess
+/// printed but whether two constants in two crates are the same bytes.
+#[test]
+fn the_mcp_share_nudge_mirrors_the_hook_byte_for_byte() {
+    const DECL: &str = "pub const SHARE_NUDGE_REASON: &str = \"";
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hook.rs"),
+    )
+    .expect("the hook's own source");
+    assert_eq!(
+        source.matches(DECL).count(),
+        1,
+        "exactly one declaration of SHARE_NUDGE_REASON is scannable; \
+         teach this test the new shape before changing it"
+    );
+    let literal = source
+        .split_once(DECL)
+        .expect("the declaration")
+        .1
+        .split_once("\";")
+        .expect("the literal ends on the same line it starts")
+        .0;
+    assert!(
+        !literal.is_empty() && !literal.contains('\n') && !literal.contains('\\'),
+        "the scanner only reads a plain one-line literal, and read this instead: {literal:?}"
+    );
+    assert_eq!(
+        crystalline_service::nudge::MCP_SHARE_NUDGE_REASON,
+        literal,
+        "the MCP receipt's sharing ask and the Stop hook's are one sentence; \
+         change both or neither"
+    );
+}

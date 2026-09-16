@@ -154,7 +154,13 @@ async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value,
                 .pointer("/content/0/text")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            Ok(serde_json::from_str(text).unwrap_or(Value::String(text.to_string())))
+            // A write receipt may carry a ride-along ask after its payload
+            // (`crystalline_service::nudge`), set off by a rule on its own
+            // line. The payload is the compact JSON in front of it - which can
+            // hold no raw newline of its own - so cutting at the rule is what
+            // keeps a receipt parseable for a caller that reads its keys.
+            let payload = text.split_once("\n\n---\n").map_or(text, |(head, _)| head);
+            Ok(serde_json::from_str(payload).unwrap_or(Value::String(payload.to_string())))
         }
         Err(e) => Err(e.to_string()),
     }

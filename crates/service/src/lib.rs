@@ -22,6 +22,7 @@ pub mod join;
 pub mod maintenance;
 pub mod mcp;
 pub mod mcp_gate;
+pub mod nudge;
 mod origin;
 pub mod overlay;
 pub(crate) mod overlay_files;

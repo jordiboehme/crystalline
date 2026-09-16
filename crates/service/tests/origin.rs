@@ -5307,3 +5307,72 @@ async fn a_convergence_that_makes_the_draft_the_folder_ends_its_links() {
         "and the link ended with the draft it was a link to"
     );
 }
+
+/// **A team domain owing work puts the sharing ask on the next write receipt,
+/// ahead of the maintenance one** - and each ask lands once.
+///
+/// The order is the point. Both are armed here: the domain holds one
+/// substantive change nobody has proposed, and a domain sits on the
+/// maintenance backlog. The first receipt carries the sharing ask, because
+/// unshared work is the team's problem until it is shared; the second carries
+/// the maintenance one, because the first spent only the ask it emitted; the
+/// third carries nothing, both being inside their cooldown.
+#[tokio::test]
+async fn unshared_team_work_puts_the_share_ask_on_a_write_receipt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_indexes())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // One substantive change the team has not seen.
+    std::fs::write(
+        root.join("added.md"),
+        engram("Added", "added", "written here, never shared"),
+    )
+    .unwrap();
+
+    // And a backlog, so the maintenance ask is armed beside it. The state
+    // directory is the tempdir this engine was built with, never the machine's.
+    let maintenance = tmp.path().join("hooks").join("maintenance.json");
+    std::fs::create_dir_all(maintenance.parent().unwrap()).unwrap();
+    std::fs::write(
+        &maintenance,
+        serde_json::json!({ "v": 1, "pending_domains": ["brand"] }).to_string(),
+    )
+    .unwrap();
+
+    let first = crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+        .await
+        .expect("a receipt with work to share carries the sharing ask");
+    assert_eq!(
+        first,
+        crystalline_service::nudge::share_nudge_line(1, &["brand".to_string()]),
+        "the sharing ask names the one domain and counts the one change"
+    );
+
+    let second = crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+        .await
+        .expect("the maintenance ask was not spent by the sharing one");
+    assert_eq!(second, crystalline_service::nudge::MCP_EVOLVE_NUDGE);
+
+    assert!(
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+            .await
+            .is_none(),
+        "both asks are inside their cooldown now"
+    );
+}

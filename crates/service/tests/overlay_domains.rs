@@ -6288,3 +6288,31 @@ async fn a_fold_leaves_every_link_bound_against_the_folder() {
         "the pair is the team's graph now"
     );
 }
+
+/// **In a domain that reviews changes before they land, the sharing ask on a
+/// write receipt counts the ACTING identity's own drafts and nobody else's.**
+///
+/// The folder on disk says what the team reviewed, so there is no unshared work
+/// in it to count; what one person owes the team is their own overlay delta.
+/// Counted from the index rows, never by staging the share: staging pulls, and
+/// a write receipt is no place for a network call.
+#[tokio::test]
+async fn the_share_ask_counts_only_the_acting_identitys_drafts() {
+    let f = reviewed_origin_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+
+    let hers = crystalline_service::nudge::write_verb_trailer(&f.engine, Some("alice"))
+        .await
+        .expect("alice holds a draft nobody has reviewed");
+    assert_eq!(
+        hers,
+        crystalline_service::nudge::share_nudge_line(1, &["team".to_string()]),
+        "her one draft is the one change the ask counts"
+    );
+    assert!(
+        crystalline_service::nudge::write_verb_trailer(&f.engine, Some("bob"))
+            .await
+            .is_none(),
+        "bob holds nothing, and alice's draft is not his to share"
+    );
+}

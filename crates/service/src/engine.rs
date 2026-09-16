@@ -11398,12 +11398,46 @@ impl Engine {
     async fn share_facts(&self, name: &str) -> Option<ShareFacts> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
+        self.share_facts_locked(name)
+    }
+
+    /// [`Engine::share_facts`]'s body, assuming the caller already holds the
+    /// domain's origin lock. Split out because the two callers wait for that
+    /// lock on different terms - a sweep queues for it, a write receipt does
+    /// not - and the walk itself must not be written twice.
+    fn share_facts_locked(&self, name: &str) -> Option<ShareFacts> {
         let (_spec, root, state_dir) = self.origin_spec_for_domain(name).ok()?;
         let work = origin::unshared_work(&root, &state_dir)?;
         Some(ShareFacts {
             unshared: work.count(),
             oldest_change: work.oldest_change_date(),
         })
+    }
+
+    /// How many substantive changes one team domain holds that the team has
+    /// not seen, for the share ask a write receipt carries
+    /// ([`crate::nudge::write_verb_trailer`]).
+    ///
+    /// [`Engine::share_facts`] narrowed to its count, which is what keeps the
+    /// receipt's answer and the sweep's `V009` one reading: the same offline
+    /// walk and the same substantive-changes-only filter.
+    ///
+    /// **It never waits for the origin lock.** That lock is held across the
+    /// network by a pull, a share and a connect, and the poller takes it on a
+    /// timer, so waiting for it here would hold a write receipt - for a write
+    /// that already succeeded - until somebody else's forge call came back. A
+    /// domain whose origin is mid-operation therefore contributes nothing, on
+    /// the same terms as a domain whose tree cannot be walked: nothing is KNOWN
+    /// to be unshared, and a delta that cannot be read is no reason to speak.
+    /// Taking it at all is what keeps the walk off a half-written pair
+    /// (see [`Engine::share_facts`]).
+    ///
+    /// `None` for a domain with no origin, no recorded origin state, no
+    /// readable working tree, or an origin operation in flight.
+    pub(crate) fn unshared_change_count(&self, name: &str) -> Option<u64> {
+        let lock = self.origin_lock(name);
+        let _guard = lock.try_lock().ok()?;
+        self.share_facts_locked(name).map(|f| f.unshared as u64)
     }
 
     /// The resolved graph around a whole domain, at depth 1 so every
