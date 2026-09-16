@@ -2540,6 +2540,31 @@ impl Engine {
         reviewing.then_some(actor)
     }
 
+    /// The open document's text for this engram, when a room is open over it in
+    /// this view: the one probe the verbs that guard on a checksum share.
+    ///
+    /// **Why it is shared.** `read_engram` answers from the room while one is
+    /// open, and the checksum it hands back is the LIVE text's - that is what
+    /// makes read-then-edit work while somebody is typing. A verb that then
+    /// compared the caller's checksum against the stored text would refuse
+    /// exactly the caller who did what the receipt told them to do, and send
+    /// them back to a read that answers the same value again. So the read, the
+    /// split and the delete ask this one question and compare against one
+    /// answer.
+    ///
+    /// **It must be called above every file lock.** The room's saver holds the
+    /// session state lock across `Engine::save_engram`, which takes the file
+    /// lock, so a probe under that lock closes a cycle nothing times out of.
+    /// `no_engine_function_composes_into_a_room_under_a_file_write_lock` scans
+    /// for exactly that and names `.live_text(` among its needles, so a caller
+    /// that gets this wrong fails the suite rather than the field.
+    async fn live_text_at(&self, desc: &EngramDescriptor, view: &DomainView<'_>) -> Option<String> {
+        let rooms = self.collab_rooms()?;
+        rooms
+            .live_text(&desc.domain, &desc.permalink, view.actor())
+            .await
+    }
+
     /// [`Engine::actor`] for a write that joins a draft overlay: the identity
     /// the calling surface composed, and never the configured
     /// `identity.actor`.
@@ -6210,11 +6235,11 @@ impl Engine {
 
         // -- target: status, optional valid_to, optional superseded_by line --
         //
-        // In review mode both arms below are replaced by the shared edit path's
-        // overlay arm, which reads this actor's own text, applies the very same
-        // retirement edit and writes it back into their draft. Going through
-        // that one arm rather than a third copy here is what keeps a retired
-        // draft the same shape as an edited one.
+        // The retirement itself, as one closure the shared edit path applies to
+        // whatever text it reads: a draft in review mode, the open document
+        // while somebody has the page up, the file or the row otherwise. One
+        // copy of the edit and one path to write it back is what keeps a
+        // retired draft the same shape as an edited one.
         let retire_target = |current: &str| -> Result<String> {
             Ok(Self::build_retirement_edit(
                 current,
@@ -6225,81 +6250,19 @@ impl Engine {
                 &actor,
             ))
         };
-        let mut warning = None;
-        if overlay.is_some() {
-            warning = self
-                .apply_source_edit(&desc, &source, &view, None, &actor, None, retire_target)
-                .await?;
-        } else {
-            match &source {
-                ContentSource::File { root } => {
-                    let abs = join_rel(root, &desc.path);
-                    // Held across the read, the retirement edit and the write, for
-                    // the reason `edit_engram_as` gives: this is a read-modify-write
-                    // with nothing to refuse a concurrent change on, so serializing
-                    // is what stops one from being dropped. See `Engine::write_lock`.
-                    let lock = self.write_lock(&abs);
-                    let _guard = lock.lock().await;
-                    let current =
-                        std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        })?;
-                    let edited = Self::build_retirement_edit(
-                        &current,
-                        &p.status,
-                        valid_to,
-                        successor_permalink.as_deref(),
-                        successor_title.as_deref(),
-                        &actor,
-                    );
-                    let edited = Self::enforce_temporal(edited)?;
-                    write_file(&abs, &edited)?;
-                    let store = self.store.lock().await;
-                    self.reindex_file(&*store, desc.domain_id, root, &desc.path)
-                        .await?;
-                }
-                ContentSource::Virtual => {
-                    let current = {
-                        let store = self.store.lock().await;
-                        store
-                            .engram_content(desc.domain_id, &desc.path)
-                            .await?
-                            .ok_or_else(|| {
-                                EngineError::NotFound(format!(
-                                    "no content stored for '{}' in domain '{}'",
-                                    desc.permalink, desc.domain
-                                ))
-                            })?
-                    };
-                    let edited = Self::build_retirement_edit(
-                        &current,
-                        &p.status,
-                        valid_to,
-                        successor_permalink.as_deref(),
-                        successor_title.as_deref(),
-                        &actor,
-                    );
-                    let edited = Self::enforce_temporal(edited)?;
-                    let stamp = virtual_stamp(&edited);
-                    let store = self.store.lock().await;
-                    self.index_markdown(
-                        &*store,
-                        desc.domain_id,
-                        &desc.path,
-                        &edited,
-                        stamp,
-                        None,
-                        true,
-                    )
-                    .await?;
-                }
-            }
-            if matches!(source, ContentSource::Virtual) {
-                self.refresh_routing_cache().await;
-            }
-            self.refresh_index_files(&desc.domain).await;
-        }
+        // **One arm, for every kind of domain and whoever is in the room.** The
+        // shared edit path reads this actor's own text - their draft in review
+        // mode, the open document while somebody has the page up, the file or
+        // the row otherwise - applies the retirement to it and writes it back
+        // where it came from. A direct-mode retirement used to be a raw
+        // read-edit-write of the file beside the room, so a person typing had
+        // the page retired underneath them and their next save came back as a
+        // three-way merge or a conflict they had to settle by hand. Now a
+        // retirement composes like every other in-place rewrite, and
+        // `a_retirement_in_a_direct_domain_composes_into_the_open_room` says so.
+        let mut warning = self
+            .apply_source_edit(&desc, &source, &view, None, &actor, None, retire_target)
+            .await?;
 
         // -- successor: reciprocal supersedes line, appended once --
         if let Some((succ_desc, succ_source)) = &successor {
@@ -6309,91 +6272,32 @@ impl Engine {
             let already = |current: &str| {
                 Self::declares(current, "supersedes", &desc.permalink, Some(&desc.title))
             };
-            // The successor's side of the pair joins the same actor's draft,
-            // for the same reason the target's did: in review mode nothing this
-            // verb writes belongs in the folder the team reviewed.
-            if overlay.is_some() {
-                let current = view.text_at(succ_source, succ_desc).await?.ok_or_else(|| {
-                    EngineError::NotFound(format!(
-                        "no engram '{}' in domain '{}'",
-                        succ_desc.permalink, succ_desc.domain
-                    ))
-                })?;
-                if !already(&current) {
-                    let succ_warning = self
-                        .apply_source_edit(succ_desc, succ_source, &view, None, &actor, None, |c| {
-                            Ok(append_body(c, &line))
-                        })
-                        .await?;
-                    warning = warning.or(succ_warning);
-                }
-            } else {
-                match succ_source {
-                    ContentSource::File { root } => {
-                        let abs = join_rel(root, &succ_desc.path);
-                        // The successor's own file, under its own lock: appending
-                        // the reciprocal line is another read-modify-write. Taken
-                        // after the target's has been released, never with it, so
-                        // two retirements naming each other cannot deadlock.
-                        let lock = self.write_lock(&abs);
-                        let _guard = lock.lock().await;
-                        let current =
-                            std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                                path: abs.display().to_string(),
-                                source,
-                            })?;
-                        if !already(&current) {
-                            let edited = touch_generated(
-                                &append_body(&current, &line),
-                                &actor,
-                                None,
-                                now_offset(),
-                            );
-                            write_file(&abs, &edited)?;
-                            let store = self.store.lock().await;
-                            self.reindex_file(&*store, succ_desc.domain_id, root, &succ_desc.path)
-                                .await?;
-                        }
-                    }
-                    ContentSource::Virtual => {
-                        let current = {
-                            let store = self.store.lock().await;
-                            store
-                                .engram_content(succ_desc.domain_id, &succ_desc.path)
-                                .await?
-                                .ok_or_else(|| {
-                                    EngineError::NotFound(format!(
-                                        "no content stored for '{}' in domain '{}'",
-                                        succ_desc.permalink, succ_desc.domain
-                                    ))
-                                })?
-                        };
-                        if !already(&current) {
-                            let edited = touch_generated(
-                                &append_body(&current, &line),
-                                &actor,
-                                None,
-                                now_offset(),
-                            );
-                            let stamp = virtual_stamp(&edited);
-                            let store = self.store.lock().await;
-                            self.index_markdown(
-                                &*store,
-                                succ_desc.domain_id,
-                                &succ_desc.path,
-                                &edited,
-                                stamp,
-                                None,
-                                true,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-                if matches!(succ_source, ContentSource::Virtual) {
-                    self.refresh_routing_cache().await;
-                }
-                self.refresh_index_files(&succ_desc.domain).await;
+            // The successor's side of the pair goes through the same one arm,
+            // for the same reasons: in review mode nothing this verb writes
+            // belongs in the folder the team reviewed, and a successor
+            // somebody has open is a document rather than a file. The text the
+            // "already said this" test reads is that same text, so a
+            // re-retirement appends nothing twice whichever of the three the
+            // successor is living in at that moment.
+            let current = match self.live_text_at(succ_desc, &view).await {
+                Some(live) => live,
+                None => match overlay {
+                    Some(_) => view.text_at(succ_source, succ_desc).await?.ok_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "no engram '{}' in domain '{}'",
+                            succ_desc.permalink, succ_desc.domain
+                        ))
+                    })?,
+                    None => self.load_content(succ_source, succ_desc).await?,
+                },
+            };
+            if !already(&current) {
+                let succ_warning = self
+                    .apply_source_edit(succ_desc, succ_source, &view, None, &actor, None, |c| {
+                        Ok(append_body(c, &line))
+                    })
+                    .await?;
+                warning = warning.or(succ_warning);
             }
         }
         self.nudge_embed();
@@ -6541,17 +6445,29 @@ impl Engine {
         let actor = self.actor_for(client, overlay);
         let (desc, source) = view.resolve(&p.identifier).await?;
         // The text the split moves observations out of is what this actor sees
-        // there: their own draft when they hold one, the reviewed file
-        // otherwise. Splitting the base under a draft would move lines the
-        // splitter is not looking at.
-        let content = match overlay {
-            Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
-                EngineError::NotFound(format!(
-                    "no engram '{}' in domain '{}'",
-                    p.identifier, p.domain
-                ))
-            })?,
-            None => self.load_content(&source, &desc).await?,
+        // there: the open document when somebody has this page up, their own
+        // draft when they hold one, the reviewed file otherwise. Splitting the
+        // base under a draft would move lines the splitter is not looking at,
+        // and splitting the file under an open room would plan against a
+        // version the room has already moved past - the staged edit below
+        // composes into that room and compares this very checksum against it,
+        // so a plan made from the stored text could never land while anybody
+        // was typing. The probe stands here, above every lock this verb reaches.
+        // See `Engine::live_text_at`.
+        let stored = || async {
+            match overlay {
+                Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
+                    EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        p.identifier, p.domain
+                    ))
+                }),
+                None => self.load_content(&source, &desc).await,
+            }
+        };
+        let content = match self.live_text_at(&desc, &view).await {
+            Some(live) => live,
+            None => stored().await?,
         };
         let checksum = sha256_hex(content.as_bytes());
         if let Some(expected) = p.expected_checksum.as_deref()
@@ -7078,13 +6994,9 @@ impl Engine {
         // guarded with it is guarded against the document rather than against
         // the file - which is what makes read-then-edit work at all while
         // somebody is in there.
-        let live = match self.collab_rooms().filter(|_| live_wins) {
-            Some(rooms) => {
-                rooms
-                    .live_text(&desc.domain, &desc.permalink, view.actor())
-                    .await
-            }
-            None => None,
+        let live = match live_wins {
+            true => self.live_text_at(&desc, &view).await,
+            false => None,
         };
         let present = match &live {
             Some(_) => {
@@ -8846,6 +8758,17 @@ impl Engine {
             return Ok(receipt);
         }
         let (desc, source) = view.resolve(&p.identifier).await?;
+        // **The open document outranks both substrates, and the probe is above
+        // the lock.** A caller's `expected_checksum` came from a read, and a
+        // read of a page somebody has open answers the live text and its
+        // checksum - so comparing against the file here would refuse the
+        // caller who did exactly what the read told them to, for as long as
+        // the person kept typing, with a re-read that answers the same value
+        // again. The deletion itself still takes the file or the row: a delete
+        // does not compose into a document, it ends the engram the document is
+        // of, and the room is closed by the removal that follows. See
+        // `Engine::live_text_at` for why this cannot move below the lock.
+        let live = self.live_text_at(&desc, &view).await;
         // Held across the comparison and the removal, so a guarded delete
         // cannot check a text that a concurrent save then rewrites underneath
         // it - the draft's own lock when this deletion lands in an overlay, the
@@ -8862,11 +8785,15 @@ impl Engine {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        // The text the guard compares against is the one this caller read,
-        // which in review mode is their own draft where they hold one.
-        let visible = match overlay {
-            Some(_) => view.text_at(&source, &desc).await?,
-            None => Some(self.load_content(&source, &desc).await?),
+        // The text the guard compares against is the one this caller read: the
+        // open document where there is one, and in review mode their own draft
+        // where they hold one.
+        let visible = match &live {
+            Some(live) => Some(live.clone()),
+            None => match overlay {
+                Some(_) => view.text_at(&source, &desc).await?,
+                None => Some(self.load_content(&source, &desc).await?),
+            },
         };
         if let Some(expected) = &p.expected_checksum {
             let current = visible.clone().ok_or_else(|| {

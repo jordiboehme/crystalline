@@ -230,6 +230,30 @@ fn append_edit(content: &str, expected_checksum: Option<&str>) -> EditParams {
     }
 }
 
+/// The checksum of a stored document, the way the engine computes one.
+fn sha256_hex_of(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The one-based line a read's observation list reports for the bullet
+/// carrying `needle`, which is how `split_engram` names the lines it moves.
+fn line_of(read: &Value, needle: &str) -> usize {
+    read["observations"]
+        .as_array()
+        .expect("a read lists observations")
+        .iter()
+        .find(|o| o["content"].as_str().unwrap_or_default().contains(needle))
+        .and_then(|o| o["line"].as_u64())
+        .expect("the typed observation is in the read") as usize
+}
+
 /// **The brief's first test.** A person is typing in the room; the agent's
 /// edit composes with what they typed rather than over it, lands in the live
 /// document, and says so in the receipt.
@@ -280,6 +304,195 @@ async fn an_agent_edit_composes_with_a_typed_line_and_lands_live() {
     let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
     assert!(
         on_disk.contains("a person typed this") && on_disk.contains("and the agent added that"),
+        "and then the file carries both: {on_disk:?}"
+    );
+}
+
+/// A guarded split of a page somebody is typing in is guarded against the
+/// document, not against the file.
+///
+/// `read_engram` answers a live page from the room and hands back the LIVE
+/// text's checksum - that is what makes read-then-edit work while somebody is
+/// in there. The split used to read the file, refuse that checksum as stale,
+/// and tell the caller to re-read - which answered the same value again. Worse,
+/// with no checksum at all it planned the split against the file and then had
+/// its own staged edit refuse it, because the staged edit compares against the
+/// document: the verb could not run while anybody was typing, and it created
+/// and rolled back an engram on every attempt.
+#[tokio::test]
+async fn a_guarded_split_of_a_live_engram_takes_the_live_checksum() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    // Enough typed lines that what stays behind still passes the verify rule
+    // a split has to leave the source under.
+    for line in [
+        "- [fact] the first thing they typed #eng",
+        "- [fact] the second thing they typed #eng",
+        "- [fact] the third thing they typed #eng",
+        "- [decision] a person typed this one #eng",
+    ] {
+        append_line(&joined, &doc, line).await;
+    }
+
+    let stored = sha256_hex_of(ALPHA);
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["live"], json!(true), "the page is open: {read}");
+    let live = read["checksum"].as_str().unwrap().to_string();
+    assert_ne!(live, stored, "and the room has moved past the file");
+
+    let split = async |checksum: &str| {
+        engine
+            .split_engram(&crystalline_service::params::SplitParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                title: "Typed Line".to_string(),
+                observations: vec![line_of(&read, "a person typed this one")],
+                expected_checksum: Some(checksum.to_string()),
+                ..Default::default()
+            })
+            .await
+    };
+
+    let refused = split(&stored).await.expect_err("the stored text is stale");
+    assert!(
+        refused.to_string().contains("stale"),
+        "and it is told so in the words a stale edit uses: {refused}"
+    );
+
+    let receipt = split(&live).await.expect("the live checksum is the one");
+    assert_eq!(
+        receipt["new"]["permalink"],
+        json!("typed-line"),
+        "{receipt}"
+    );
+
+    resync(&joined, &doc).await;
+    let text = client_text(&doc);
+    assert!(
+        !text.contains("a person typed this one"),
+        "the line left the open document rather than the file behind it: {text:?}"
+    );
+    assert!(
+        text.contains("- split_into [[typed-line]]"),
+        "and the document carries the link to where it went: {text:?}"
+    );
+}
+
+/// A guarded delete of a page somebody is typing in reads the same checksum
+/// back.
+///
+/// The delete does not compose into the document - it ends the engram the
+/// document is of - but the checksum a caller presents came from a read, and a
+/// read of a live page answers the room. Comparing it against the file refused
+/// the careful caller and pushed them towards the unguarded delete, which is
+/// the call the guard exists to prevent.
+#[tokio::test]
+async fn a_guarded_delete_of_a_live_engram_takes_the_live_checksum() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed but never saved").await;
+
+    let stored = sha256_hex_of(ALPHA);
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let live = read["checksum"].as_str().unwrap().to_string();
+    assert_ne!(live, stored);
+
+    let delete = async |checksum: &str| {
+        engine
+            .delete_engram(&crystalline_service::params::DeleteParams {
+                identifier: "alpha".to_string(),
+                domain: "eng".to_string(),
+                expected_checksum: Some(checksum.to_string()),
+            })
+            .await
+    };
+
+    let refused = delete(&stored).await.expect_err("the stored text is stale");
+    assert!(
+        refused.to_string().contains("stale"),
+        "and says so the way every stale guard says it: {refused}"
+    );
+    let receipt = delete(&live).await.expect("the live checksum is the one");
+    assert_eq!(receipt["deleted"], json!(true), "{receipt}");
+}
+
+/// A retirement in a direct domain composes into the open room.
+///
+/// The verb had two arms: in review mode it went through the shared edit path,
+/// which composes; in a direct domain it read the file, rewrote it and wrote it
+/// back beside the room. The person typing then had their page retired
+/// underneath them - their next save came back as a three-way merge notice, or
+/// as a conflict they had to settle by hand. One arm now, so one answer.
+#[tokio::test]
+async fn a_retirement_in_a_direct_domain_composes_into_the_open_room() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed while it was being retired").await;
+
+    engine
+        .retire_engram(&crystalline_service::params::RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "deprecated".to_string(),
+            successor: None,
+            valid_to: None,
+        })
+        .await
+        .expect("the retirement lands");
+
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains("status: deprecated"),
+        "the retirement is in the document the person is looking at: {live:?}"
+    );
+    assert!(
+        live.contains("typed while it was being retired"),
+        "and what they typed is still there: {live:?}"
+    );
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(
+        on_disk, ALPHA,
+        "nothing was written behind the room's back; its saver is what lands this"
+    );
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(
+        on_disk.contains("status: deprecated")
+            && on_disk.contains("typed while it was being retired"),
         "and then the file carries both: {on_disk:?}"
     );
 }
