@@ -1463,7 +1463,15 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
             .iter()
             .any(|needle| code.contains(needle))
         {
-            composed.entry(current.clone()).or_insert(i);
+            // The LAST room call, not the first: a function is safe only if
+            // EVERY room call inside it comes before the lock, and the first
+            // occurrence alone would go blind the moment a cheap read (a
+            // `has_live_room` or `live_text` probe, which is the idiomatic
+            // shape - decide first, then take the lock) sits above the lock
+            // while the write moves below it. The comparison below is then
+            // "any needle after any lock", which is what the discipline
+            // actually requires.
+            composed.insert(current.clone(), i);
         }
     }
 

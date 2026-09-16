@@ -816,15 +816,20 @@ async fn tool_descriptions_teach_review_mode() {
     // "live document" alone does not bite: the description carried it before
     // this sentence existed ("Reading a live document is not a private
     // act"), so a reword that dropped "live editor" while keeping that older
-    // sentence would still pass a conjunction of only those two. "participant
-    // strip" is the word the OLD text lacked, so the pin now needs the new
-    // sentence, not just the old one it sits beside.
+    // sentence would still pass a conjunction of only those two.
+    // "participant strip" does not bite either - it entered `read_engram` in
+    // Task 15 (an ancestor of Task 18, the commit this pin means to bite on)
+    // and is already pinned by
+    // `tool_descriptions_teach_that_working_in_an_open_document_is_seen`. "so
+    // you always see what the person sees" is the phrase that came in WITH
+    // Task 18's sentence and nowhere else, so it is what actually strengthens
+    // this conjunction against a reword of that sentence.
     assert!(
         read.contains("live editor")
             && read.contains("live document")
-            && read.contains("participant strip"),
+            && read.contains("so you always see what the person sees"),
         "read_engram teaches that a live editor is read through the live document, \
-         and that doing so is seen: {read}"
+         and that doing so always shows the person's own text: {read}"
     );
 
     let share = description_of("share_changes");

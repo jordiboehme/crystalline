@@ -3030,7 +3030,11 @@ impl Engine {
         // exist for another reason - it also remembers whose open proposal is
         // whose - and a key that appeared the moment somebody shared would say
         // "a pull converged nothing" where nothing had looked yet, which is the
-        // distinction this key's absence carries.
+        // distinction this key's absence is FOR. It cannot always keep that
+        // promise, though: a pass that ran and genuinely cleared nothing,
+        // raising no conflict, leaves `cleared == 0` with `conflicts` empty
+        // exactly like a domain nobody has ever pulled - this check answers
+        // `None` for either, and the two conflate here.
         if record.cleared == 0 && record.conflicts.is_empty() {
             return None;
         }
