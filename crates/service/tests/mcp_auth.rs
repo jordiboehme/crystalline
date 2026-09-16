@@ -174,6 +174,75 @@ async fn serve_with(
     (addr, tmp, store)
 }
 
+/// A team domain in review mode - `review: overlay`, with the origin and
+/// `github.enabled` review mode requires, since a domain that reviews changes
+/// with nothing to propose to is a gate with no door - served on an instance
+/// where `auth.mcp` is left off. That is the default install's legacy open
+/// tier: nobody authenticates, so an HTTP agent reaches every tool as
+/// [`crystalline_service::Scope::Anonymous`], which is exactly the shape that
+/// puts a review-mode domain's missing-identity refusal in a write's path
+/// without ever tripping the member-level gate `refuse_unwritable` guards.
+async fn serve_reviewed_domain_with_mcp_auth_off()
+-> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- Everything about team\n\n## When to Use\n\n- Route here for team questions\n",
+    )
+    .unwrap();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    entry.origin = Some(OriginConfig {
+        repo: "acme/team".to_string(),
+        path: None,
+        branch: Some("main".to_string()),
+        poll_secs: None,
+    });
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.github = Some(GitHubConfig {
+        enabled: Some(true),
+        ..GitHubConfig::default()
+    });
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    // `auth.mcp` deliberately left unset: the default install this test is
+    // about never turns it on.
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
+    let router = http_router(
+        engine,
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (addr, tmp, auth)
+}
+
 /// Serve a team instance that shares with personal GitHub identities, with the
 /// gate on and nobody connected to anything.
 ///
@@ -455,6 +524,45 @@ async fn with_auth_off_the_legacy_open_tier_still_serves() {
     let (addr, _guard, _store) = serve_with_mcp_auth(false).await;
     let resp = post_initialize_with_token(&addr, None).await;
     assert_eq!(resp.status(), 200);
+}
+
+/// **An unauthenticated agent's write into a review-mode domain is refused in
+/// words a model can read, not a protocol error it renders opaquely.**
+///
+/// `refuse_unwritable` lets this caller through exactly as
+/// `with_auth_off_the_legacy_open_tier_still_serves` shows it does: the
+/// legacy open tier has no accounts to hold a member level, so review mode is
+/// not a question that gate answers. What review mode still needs is
+/// somebody to hold the draft `write_engram` would otherwise open, and an
+/// unauthenticated HTTP agent has nobody. The engine refuses with
+/// `OVERLAY_NEEDS_IDENTITY`, and this is the test that pins how that refusal
+/// must arrive: as a `CallToolResult` with `isError`, the same shape
+/// `refusal_is_readable` already checks for the domain-removal gate, and
+/// never as the JSON-RPC error `to_error`'s default mapping would otherwise
+/// give every other `Refused` message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_agents_overlay_write_answers_the_teaching_text() {
+    let (addr, _guard, _store) = serve_reviewed_domain_with_mcp_auth_off().await;
+    let session = McpTestSession::open(&addr, None).await;
+    let raw = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "team",
+                "title": "Anon Trace",
+                "content": "- [fact] traced",
+            }),
+        )
+        .await;
+    refusal_is_readable(&raw, "an unauthenticated overlay write");
+    let payload = payload_of(&raw);
+    let text = payload["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains(crystalline_service::OVERLAY_NEEDS_IDENTITY),
+        "the teaching text names the fix: {text}"
+    );
 }
 
 /// Every way of failing the gate answers the same bytes. A refusal that said

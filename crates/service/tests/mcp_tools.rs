@@ -756,6 +756,85 @@ async fn tool_descriptions_teach_that_a_wholesale_overwrite_asks_first() {
     );
 }
 
+/// Review mode is a routing decision every write-facing tool's description
+/// has to teach on its own, since a model reads one tool's copy at a time:
+/// every write verb (`write_engram`, `edit_engram`, `move_engram`,
+/// `delete_engram`, `split_engram`) names where its write lands and what a
+/// `draft` receipt means, `read_engram` names that a live editor is read
+/// through the live document, `share_changes` names what a review-mode share
+/// carries and `evolve_engrams` names that the sweep covers an agent's own
+/// drafts too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_review_mode() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    // share_changes is one of the five collaboration tools withheld from
+    // tools/list while github.enabled is off; turn it on so its description
+    // is there to read, the same way
+    // flipping_github_enabled_moves_the_tool_list_by_exactly_the_five does.
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "github.enabled": "true" } }),
+    )
+    .await
+    .unwrap();
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+
+    let description_of = |name: &str| {
+        tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} tool present"))
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+    };
+
+    for name in [
+        "write_engram",
+        "edit_engram",
+        "move_engram",
+        "delete_engram",
+        "split_engram",
+    ] {
+        let text = description_of(name);
+        assert!(
+            text.contains("review mode") && text.contains("private draft"),
+            "{name} teaches where a write in a review-mode domain lands: {text}"
+        );
+        assert!(
+            text.contains("share_changes proposes exactly your drafts"),
+            "and that share_changes is what proposes it for review: {text}"
+        );
+        assert!(
+            text.contains("receipt marked draft means the tree did not move"),
+            "and what a draft receipt means: {text}"
+        );
+    }
+
+    let read = description_of("read_engram");
+    assert!(
+        read.contains("live editor") && read.contains("live document"),
+        "read_engram teaches that a live editor is read through the live document: {read}"
+    );
+
+    let share = description_of("share_changes");
+    assert!(
+        share.contains("review-mode domain") && share.contains("exactly your draft entries"),
+        "share_changes teaches what a review-mode share carries: {share}"
+    );
+
+    let evolve = description_of("evolve_engrams");
+    assert!(
+        evolve.contains("review-mode domain") && evolve.contains("your own drafts too"),
+        "evolve_engrams teaches that the sweep covers an agent's own drafts too: {evolve}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_descriptions_teach_folders() {
     let h = Harness::new(&["eng"]).await;
