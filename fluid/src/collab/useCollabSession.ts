@@ -114,6 +114,15 @@ export interface CollabSessionOptions {
   account: string;
   displayName: string;
   enabled: boolean;
+  /**
+   * Whose draft this session is over, when it is not this account's own.
+   *
+   * Set only where a share-link and a live join have put this window inside
+   * somebody else's work: the server refuses an owner nobody handed this
+   * caller, and a room opened without it would be a room over this account's
+   * own page under a header naming the other person.
+   */
+  overlay?: string | undefined;
   /** Test seam, threaded to the provider; production callers omit it. */
   socketFactory?: SocketFactory;
 }
@@ -134,6 +143,7 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
     account,
     displayName,
     enabled,
+    overlay,
     socketFactory,
   } = options;
   // One doc/awareness/provider generation per (address, epoch-reset). The
@@ -408,7 +418,7 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
       },
     };
     const provider = new CollabProvider(
-      collabUrl(domain, address),
+      collabUrl(domain, address, overlay),
       doc,
       awareness,
       handlers,
@@ -438,7 +448,10 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
       setBound(null);
       setParticipants([]);
     };
-  }, [generation, domain, address, enabled, socketFactory]);
+    // `overlay` among the dependencies because it is part of WHICH document
+    // this generation is bound to: an owner that changed is a different room,
+    // and a live session over the old one would keep saving into it.
+  }, [generation, domain, address, enabled, overlay, socketFactory]);
 
   // The mid-conflict joiner (see the JOINED_* details above): a greeting that
   // says "conflict" with nothing on screen to resolve is a dead banner, so

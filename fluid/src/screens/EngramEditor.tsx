@@ -26,6 +26,7 @@ import * as Y from "yjs";
 
 import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
+import { heldJoin } from "../api/draftLinks";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramDetail, SimilarEngram } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
@@ -403,12 +404,43 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   // Anonymous can never reach this screen (`canWrite` gates it above); the
   // fallback only satisfies the types.
   const account = user?.name ?? "anonymous";
+  /**
+   * Whose document this surface opens a room over, and whether there is a
+   * room to open at all.
+   *
+   * A granted draft stands at the same address the team's own page stands at,
+   * and the read says whose it is. The room has to agree: a session opened
+   * with no owner named would be a room over THIS reader's own draft of that
+   * page, saving every keystroke into it while the header says the work
+   * belongs to somebody else.
+   *
+   * Editing somebody's draft is the second step after seeing it, and the join
+   * is what took it - so the owner is sent only where this window holds a
+   * join to exactly this draft. Without one there is no room: the buffer is
+   * the draft the read handed over, and a save is refused by the server with
+   * the sentence that says how to join. Read once for this surface, which is
+   * keyed by address and is one editing session.
+   */
+  const [room] = useState<{ owner?: string; open: boolean }>(() => {
+    const owner = engram.draftOwner;
+    if (!owner) {
+      return { open: true };
+    }
+    const join = heldJoin();
+    const inside =
+      join !== null &&
+      join.domain === engram.domain &&
+      join.permalink === engram.permalink &&
+      join.owner === owner;
+    return inside ? { owner, open: true } : { open: false };
+  });
   const collab = useCollabSession({
     domain: engram.domain,
     permalink: engram.permalink,
     account,
     displayName: user?.display ?? user?.name ?? "someone",
-    enabled: true,
+    enabled: room.open,
+    overlay: room.owner,
   });
   if (
     collab.mode === "connecting" ||

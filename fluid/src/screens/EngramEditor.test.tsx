@@ -18,6 +18,7 @@ import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { ApiProblem, api } from "../api/client";
+import { JOIN_KEY_STORAGE } from "../api/draftLinks";
 import { TEXT_NAME } from "../collab/provider";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
@@ -324,6 +325,9 @@ beforeEach(() => {
   // as the screen behaved before there was a session to join.
   collabMock.mockReturnValue(soloCollabSession());
   localStorage.clear();
+  // The join lives in session storage, and a leftover one would put the next
+  // test's editor inside somebody else's draft.
+  sessionStorage.clear();
 });
 
 describe("the engram editor", () => {
@@ -1980,6 +1984,88 @@ describe("the engram editor", () => {
     expect(
       screen.queryByRole("button", { name: "Share draft" }),
     ).not.toBeInTheDocument();
+  });
+
+  /** The join this window holds, as the `/draft/<token>` screen stores it. */
+  function holdJoin(overrides: Record<string, string> = {}) {
+    sessionStorage.setItem(
+      JOIN_KEY_STORAGE,
+      JSON.stringify({
+        key: "k1",
+        domain: "eng",
+        path: "alpha.md",
+        owner: "alice",
+        permalink: "alpha",
+        ...overrides,
+      }),
+    );
+  }
+
+  /** The options the screen last asked the session hook for. */
+  function askedFor(): Record<string, unknown> {
+    const call = collabMock.mock.calls.at(-1);
+    if (!call) {
+      throw new Error("the screen opened no session");
+    }
+    return call[0] as unknown as Record<string, unknown>;
+  }
+
+  // The header says whose draft this is; the room has to be over the same
+  // document, or every keystroke lands in a draft of this reader's own while
+  // the screen says otherwise.
+  it("opens the owner's room on a granted draft this window joined", async () => {
+    holdJoin();
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(askedFor().overlay).toBe("alice");
+    expect(askedFor().enabled).toBe(true);
+  });
+
+  // Seeing a draft and editing it are two steps: with no join there is no
+  // room to open at all, and the buffer stays the draft the read handed over.
+  it("opens no room on a granted draft this window has not joined", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          draft: true,
+          draft_owner: "alice",
+          content: CONTENT.replace("A rule.", "What alice has not shared yet."),
+        }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(askedFor().overlay).toBeUndefined();
+    expect(askedFor().enabled).toBe(false);
+    // And what stands in the buffer is her draft, which is what the read
+    // handed over: the property the room binding exists to keep true.
+    await openBuffer("What alice has not shared yet.");
+  });
+
+  // A join to a different page is not a join to this one.
+  it("opens no room when the held join names another document", async () => {
+    holdJoin({ permalink: "beta", path: "beta.md" });
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(askedFor().overlay).toBeUndefined();
+    expect(askedFor().enabled).toBe(false);
+  });
+
+  // Nothing changes for an ordinary page: this account's own document, which
+  // is what a room with no owner named is.
+  it("opens this account's own room on a page nobody granted", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    expect(askedFor().overlay).toBeUndefined();
+    expect(askedFor().enabled).toBe(true);
   });
 });
 

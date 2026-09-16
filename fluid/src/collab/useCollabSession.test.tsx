@@ -87,7 +87,7 @@ const SESSION_TEXT = "---\ntitle: A\n---\n\nbody\n";
 /** The mounted hook, so the assertions can read what it last returned. */
 let mounted: { result: { current: CollabSession } } | null = null;
 
-function mount(enabled = true) {
+function mount(enabled = true, overlay?: string) {
   mounted = renderHook(() =>
     useCollabSession({
       domain: "eng",
@@ -95,6 +95,7 @@ function mount(enabled = true) {
       account: "ada",
       displayName: "Ada Lovelace",
       enabled,
+      overlay,
       socketFactory: fakeSocketFactory,
     }),
   );
@@ -182,6 +183,20 @@ describe("fileSpace", () => {
 });
 
 describe("useCollabSession", () => {
+  // The room a grantee opens is the room over the OWNER's draft, and the only
+  // place that is said is the socket's own URL: a session opened without it
+  // would be a room over this account's own document under a header naming
+  // somebody else's.
+  it("opens the owner's document when a granted draft is named", () => {
+    mount(true, "alice");
+    expect(socketAt(0).url).toBe("/api/v1/collab/eng/alpha?overlay=alice");
+  });
+
+  it("opens this account's own document when no owner is named", () => {
+    mount();
+    expect(socketAt(0).url).toBe("/api/v1/collab/eng/alpha");
+  });
+
   it("falls back to solo when the first connect never lands", () => {
     mount();
     expect(session().mode).toBe("connecting");

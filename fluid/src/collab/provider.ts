@@ -96,8 +96,22 @@ export interface ProviderHandlers {
 
 export type SocketFactory = (url: string) => WebSocket;
 
-export function collabUrl(domain: string, permalink: string): string {
-  return `${API_BASE}/collab/${encodeSegment(domain)}/${encodePermalink(permalink)}`;
+/**
+ * The socket path for one document.
+ *
+ * `overlay` names whose draft of this page the room is over, and is sent only
+ * when a share-link and a live join put this window inside somebody else's
+ * work; left out, the room is over this account's own document, which is what
+ * every ordinary edit asks for. The query is the server's own parameter: it
+ * decides the room before it upgrades anything.
+ */
+export function collabUrl(
+  domain: string,
+  permalink: string,
+  overlay?: string,
+): string {
+  const path = `${API_BASE}/collab/${encodeSegment(domain)}/${encodePermalink(permalink)}`;
+  return overlay ? `${path}?overlay=${encodeURIComponent(overlay)}` : path;
 }
 
 /**
