@@ -4146,6 +4146,47 @@ impl Engine {
         }))
     }
 
+    /// Save a co-editing room's text into the overlay document the room is a
+    /// room over.
+    ///
+    /// The room's counterpart of [`Engine::save_engram`], and the difference
+    /// between them is where the actor comes from. A request carries a scope
+    /// and the write is routed from it; a room carries a view it built from
+    /// the key it was opened under, which names the owner whose draft this
+    /// room IS. Everything after that is the same write, through the same
+    /// function, with the same compare-and-swap.
+    ///
+    /// Two gates a request meets are deliberately absent, because neither is
+    /// about this caller: the teaching refusal for a name only a share-link
+    /// resolves (a room resolves through the owner's own view, where the page
+    /// is simply there), and the grant-and-join screen (the door that opened
+    /// the room made that decision once, at the upgrade, rather than four
+    /// times a second).
+    ///
+    /// The receipt is the overlay one: `draft: true`, and the permalink the
+    /// draft answers to after the write, which an author who edited the
+    /// frontmatter line has just moved.
+    pub(crate) async fn save_engram_in_overlay(
+        &self,
+        view: &DomainView<'_>,
+        p: &SaveParams,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        refuse_not_an_engram(&p.content)?;
+        let (desc, source) = view.resolve(&p.identifier).await?;
+        // The same two reserved screens the request-driven save makes, on the
+        // resolved path, which is the authority on what would be written.
+        if crystalline_core::is_reserved_path(&desc.path) {
+            return Err(EngineError::Invalid(reserved_name_error(&desc.path)));
+        }
+        if is_assets_reserved(&desc.path) {
+            return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
+        }
+        self.save_into_overlay(view, p, &desc, &source).await
+    }
+
     /// The overlay arm of a save: the whole document into the view's own
     /// actor's draft of `desc.path`, verbatim, checked against the version the
     /// caller read - which in review mode is their own draft where they hold
@@ -4248,6 +4289,27 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let view = DomainView::for_write(self, domain, scope).await?;
+        self.restore_engram_in_view(&view, domain, path, content)
+            .await
+    }
+
+    /// [`Engine::restore_engram`] through a view somebody already built.
+    ///
+    /// The split exists for the co-editing room, which has a view of its own -
+    /// the overlay document it is a room over, or the one a direct domain
+    /// keeps - and no scope to derive one from. A request reaches it through
+    /// the verb above, with the view its scope routed to; both write exactly
+    /// what they always wrote.
+    pub(crate) async fn restore_engram_in_view(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
         let overlay = view.actor();
         refuse_not_an_engram(content)?;
         // Normalized and screened before the two reserved checks read it, the
@@ -13511,14 +13573,18 @@ impl Engine {
     ///    a call that is going to refuse.
     /// 2. The key comes off, and only then are the co-editing rooms swept
     ///    ([`crate::collab::session::CollabSessions::dispose_domain`]). **That
-    ///    pair is the reason this step exists at all**: a room saves through
-    ///    [`Engine::save_engram`] as the machine owner, so a room swept while
-    ///    the domain is still reviewing lands its unsaved text in the OWNER's
-    ///    draft - a draft created after the plan was drawn, which no answer
-    ///    covers and which the fold would leave stranded in a domain that no
-    ///    longer reviews anything. Swept one instant later, the same save lands
-    ///    in the file, which is exactly what the removal path means by sweeping
-    ///    while the domain is still registered.
+    ///    pair is the reason this step exists at all**: a room is a room over
+    ///    one overlay document, so a room swept while the domain is still
+    ///    reviewing lands its unsaved text in a DRAFT row - refreshing one the
+    ///    plan was drawn against, or making one for an actor no answer covers -
+    ///    and step 4 drops every actor's rows a moment later, so that text
+    ///    would be typed into a bin. Swept one instant after the key comes off,
+    ///    the same save lands in the file: the room's view falls back to the
+    ///    folder's own text the moment the domain stops reviewing changes (see
+    ///    `crate::collab::session`'s `room_view`), which is exactly what the
+    ///    removal path means by sweeping while the domain is still
+    ///    registered - there, the drafts are what unregistering ends, so a
+    ///    swept room's save goes into the draft and out with it.
     /// 3. The folds land as ordinary file writes and deletions, over the files
     ///    those saves just landed in. Where a fold and a room are about the same
     ///    path the fold is the last word - which is the answer the plan was
@@ -13720,9 +13786,9 @@ impl Engine {
         };
 
         // **And the same question again, of the folder those rooms just wrote
-        // into.** A room saves through `save_engram`, so a participant who
-        // edited the frontmatter's permalink line has moved a base engram's
-        // address between the check above and this line; a fold validated
+        // into.** The key is off, so every swept room wrote into the folder,
+        // and a participant who edited the frontmatter's permalink line has
+        // moved a base engram's address between the check above and this line; a fold validated
         // against the older folder would write a second engram at that address
         // and the first thing to notice would be the `sync` at the end - by
         // which time the files are written, every actor's rows are dropped and

@@ -171,7 +171,7 @@ async fn next_control(rx: &mut tokio::sync::broadcast::Receiver<Frame>) -> Contr
 async fn a_pause_lands_the_save_with_the_separator_reapplied() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
-    let mut joined = sessions.join("eng", "crlf").await.unwrap();
+    let mut joined = sessions.join("eng", "crlf", None).await.unwrap();
     let doc = sync_client(&joined).await;
     append_line(&joined, &doc, "hello from the session").await;
 
@@ -210,7 +210,7 @@ async fn an_untouched_session_never_writes() {
     let before = std::fs::read(tmp.path().join("eng/crlf.md")).unwrap();
     let maintenance_before = crystalline_service::maintenance::load();
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "crlf").await.unwrap();
+    let joined = sessions.join("eng", "crlf", None).await.unwrap();
     let _doc = sync_client(&joined).await;
     // Open, sync, leave: the byte-fidelity property for a no-op session.
     assert!(joined.session.remove_conn(joined.conn).await);
@@ -235,7 +235,7 @@ async fn a_joining_client_alone_never_arms_a_save() {
     let path = tmp.path().join("eng/alpha.md");
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     // The client's own state, echoed back at the server: no edit inside.
     let echo = doc
@@ -265,7 +265,7 @@ async fn a_joining_client_alone_never_arms_a_save() {
 async fn the_last_leave_lands_the_final_save() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     append_line(&joined, &doc, "a final thought").await;
     assert!(joined.session.remove_conn(joined.conn).await);
@@ -280,7 +280,7 @@ async fn the_last_leave_lands_the_final_save() {
 async fn a_flush_request_saves_now_not_after_the_debounce() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     append_line(&joined, &doc, "save this now").await;
     joined
@@ -299,7 +299,7 @@ async fn a_tick_inside_the_debounce_window_holds_the_save_back() {
     // writes nothing, and the one past it writes everything.
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     append_line(&joined, &doc, "still typing").await;
 
@@ -322,7 +322,7 @@ async fn a_tick_inside_the_debounce_window_holds_the_save_back() {
 async fn a_refused_save_blocks_saving_not_editing_and_recovers() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
 
     // Wreck the document: delete everything, so it has no frontmatter and the
@@ -388,7 +388,7 @@ async fn a_joiner_into_a_blocked_room_is_greeted_with_the_standing_refusal() {
     // second author reads "Saved" over an engram nothing has written since.
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut first = sessions.join("eng", "alpha").await.unwrap();
+    let mut first = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&first).await;
     replace_all(&first, &doc, "no frontmatter at all").await;
     first
@@ -400,7 +400,7 @@ async fn a_joiner_into_a_blocked_room_is_greeted_with_the_standing_refusal() {
         panic!("the refusal is broadcast to the room that was there")
     };
 
-    let second = sessions.join("eng", "alpha").await.unwrap();
+    let second = sessions.join("eng", "alpha", None).await.unwrap();
     let Message::Custom(tag, payload) = &messages_of(&second.greeting)[0] else {
         panic!("the greeting opens with the hello control")
     };
@@ -425,7 +425,7 @@ async fn a_joiner_into_a_blocked_room_is_greeted_with_the_standing_refusal() {
 async fn a_frontmatter_rename_moves_the_session_and_the_receipt_says_so() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     // Replace the whole text with a version whose permalink line says beta.
     replace_all(
@@ -481,11 +481,11 @@ async fn a_rename_moves_the_registry_key_so_the_new_permalink_finds_the_same_roo
     // fight over one CAS token.
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     rename_to_beta(&joined, &doc).await;
 
-    let rejoined = sessions.join("eng", "beta").await.unwrap();
+    let rejoined = sessions.join("eng", "beta", None).await.unwrap();
     assert!(
         Arc::ptr_eq(&joined.session, &rejoined.session),
         "the rename followed the engram, so beta is the live room"
@@ -500,11 +500,11 @@ async fn the_old_permalink_stops_resolving_after_a_rename() {
     // solo editing, instead of adopting a room whose content is now beta.
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     rename_to_beta(&joined, &doc).await;
 
-    let refused = sessions.join("eng", "alpha").await.unwrap_err();
+    let refused = sessions.join("eng", "alpha", None).await.unwrap_err();
     assert!(
         matches!(
             refused,
@@ -519,7 +519,7 @@ async fn the_old_permalink_stops_resolving_after_a_rename() {
 async fn a_renamed_session_still_disposes_cleanly() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     rename_to_beta(&joined, &doc).await;
 
@@ -541,7 +541,7 @@ async fn a_blocked_session_backs_off_instead_of_hammering_the_engine() {
     // the author leaves the frontmatter broken.
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
 
     // The failing attempt happens at a synthetic instant far enough ahead that
@@ -591,7 +591,7 @@ async fn a_blocked_session_backs_off_instead_of_hammering_the_engine() {
 async fn a_flush_retries_a_blocked_save_immediately() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
 
     let failed_at = Instant::now() + Duration::from_secs(10);
@@ -634,7 +634,7 @@ async fn a_poisoned_session_closes_the_room_and_never_saves_again() {
     // session stops writing, and no later join can adopt the dead room.
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     append_line(&joined, &doc, "never lands").await;
 
@@ -659,7 +659,7 @@ async fn a_poisoned_session_closes_the_room_and_never_saves_again() {
     );
 
     // And a fresh join gets a fresh room rather than the saver-less corpse.
-    let again = sessions.join("eng", "alpha").await.unwrap();
+    let again = sessions.join("eng", "alpha", None).await.unwrap();
     assert_ne!(again.session.epoch(), joined.session.epoch());
     assert_eq!(sessions.session_count().await, 1, "the corpse was replaced");
 }
@@ -672,8 +672,8 @@ async fn a_poisoned_session_closes_the_room_and_never_saves_again() {
 async fn dispose_domain_saves_then_closes_only_that_domains_rooms() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
-    let mut joined_eng = sessions.join("eng", "alpha").await.unwrap();
-    let joined_oak = sessions.join("oak", "oak-note").await.unwrap();
+    let mut joined_eng = sessions.join("eng", "alpha", None).await.unwrap();
+    let joined_oak = sessions.join("oak", "oak-note", None).await.unwrap();
     assert_eq!(sessions.session_count().await, 2);
 
     let doc = sync_client(&joined_eng).await;
@@ -710,7 +710,7 @@ async fn a_second_refusal_with_a_new_reason_reaches_the_room() {
     // keeps reading the refusal before last.
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
 
     // First: a document with no frontmatter at all.
@@ -768,13 +768,17 @@ async fn a_second_refusal_with_a_new_reason_reaches_the_room() {
 
 // --- the room's text in a reviewing domain -----------------------------------
 
-/// A co-editing room in a domain that reviews changes opens on the text the
-/// team reviewed, whoever else is drafting.
+/// A room over the document a direct domain keeps - `overlay: None` - opens on
+/// the text the team reviewed even where the domain reviews changes, whoever
+/// else is drafting.
 ///
-/// This pins TODAY's answer rather than proposing one: the session reads its
-/// document through the engine's base text seam, which carries no actor. A room
-/// save then lands in the saver's own draft, which is the seam Task 13 moves -
-/// so this test is what makes that change visible as a change.
+/// The other half of the key, said from the side nobody is drafting on: the
+/// owner component is what makes a room somebody's draft, and a room opened
+/// without one reads and writes exactly what every room read and wrote before
+/// drafts existed. What a room over an OVERLAY document opens on, and where
+/// its save lands, is
+/// `an_overlay_sessions_save_lands_in_the_overlay_row_and_never_the_tree`
+/// below.
 #[tokio::test]
 async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
     let scratch = support::ScratchStateDir::acquire();
@@ -835,7 +839,7 @@ async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
     );
 
     let sessions = CollabSessions::new(engine.clone());
-    let joined = sessions.join("team", "alpha").await.unwrap();
+    let joined = sessions.join("team", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     let text = doc.get_or_insert_text("content");
     let opened = text.get_string(&doc.transact());
@@ -844,4 +848,108 @@ async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
         "and the room opens on it, not on anybody's draft"
     );
     drop(scratch);
+}
+
+/// A reviewing domain's room over one actor's overlay document: its text is
+/// that actor's draft, and its save is a draft of theirs.
+async fn review_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "team");
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    // A second domain, taking changes directly, so a sweep over `team` has a
+    // neighbour it must leave alone.
+    let oak = root.join("oak");
+    std::fs::create_dir_all(&oak).unwrap();
+    write_manifest(&oak, "oak");
+    std::fs::write(oak.join("oak-note.md"), OAK_NOTE).unwrap();
+    cfg.domains
+        .insert("oak".to_string(), DomainEntry::file(oak));
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine, scratch)
+}
+
+/// What a room over an overlay document writes: the owner's draft row, and
+/// never the folder the team reviewed.
+///
+/// The seam Task 13 moves, said as the two facts that matter to whoever is
+/// typing: their work is theirs, and the page the team holds is untouched
+/// until somebody folds it in.
+#[tokio::test]
+async fn an_overlay_sessions_save_lands_in_the_overlay_row_and_never_the_tree() {
+    let (tmp, engine, _scratch) = review_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined = sessions.join("team", "alpha", Some("alice")).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "alice typed this").await;
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 1))
+        .await;
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Saved { .. }
+    ));
+
+    let draft = engine
+        .overlay_draft_at("team", "alice", "alpha.md")
+        .await
+        .unwrap()
+        .expect("her draft is where the room's text landed");
+    assert!(draft.content.contains("alice typed this"), "{draft:?}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("team/alpha.md")).unwrap(),
+        ALPHA,
+        "and the folder still says what the team reviewed"
+    );
+    assert!(
+        engine
+            .overlay_draft_at("team", "owner", "alpha.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing landed in the machine owner's draft, which is where it used to go"
+    );
+}
+
+/// A sweep is about a domain, whatever the rooms in it are rooms over: the
+/// owner component of the key must not hide a room from the verb that closes
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispose_domain_sweeps_every_overlay_owners_room() {
+    let (_tmp, engine, _scratch) = review_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    let alice = sessions.join("team", "alpha", Some("alice")).await.unwrap();
+    let bob = sessions.join("team", "alpha", Some("bob")).await.unwrap();
+    let oak = sessions.join("oak", "oak-note", None).await.unwrap();
+    assert_eq!(sessions.session_count().await, 3);
+
+    assert_eq!(
+        sessions.dispose_domain("team").await,
+        2,
+        "both owners' rooms are the domain's rooms"
+    );
+    assert!(alice.session.is_disposed());
+    assert!(bob.session.is_disposed());
+    assert!(!oak.session.is_disposed(), "and oak was not swept");
+    assert_eq!(sessions.session_count().await, 1);
 }

@@ -1041,7 +1041,7 @@ async fn a_refused_removal_closes_no_co_editing_room() {
     let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
     f.engine.set_collab_sessions(&sessions);
     f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
-    let _joined = sessions.join("team", "plan").await.unwrap();
+    let _joined = sessions.join("team", "plan", None).await.unwrap();
     assert_eq!(sessions.session_count().await, 1, "the room is open");
 
     f.engine
@@ -4658,7 +4658,7 @@ async fn a_fold_closes_open_rooms_first() {
     // order they run in, which says nothing about the order. Here the room's
     // save is its own change to the tree, and the question the assertion asks
     // is whether the sync at the end of the fold saw it.
-    let joined = sessions.join("team", "plan").await.unwrap();
+    let joined = sessions.join("team", "plan", None).await.unwrap();
     let doc = Doc::with_options(yrs::Options {
         offset_kind: yrs::OffsetKind::Utf16,
         ..yrs::Options::default()
@@ -4954,7 +4954,7 @@ async fn a_room_that_takes_an_address_while_it_closes_refuses_with_nothing_folde
     // Her draft answers to 'fresh', which nothing in the folder holds yet.
     f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
 
-    let joined = sessions.join("team", "plan").await.unwrap();
+    let joined = sessions.join("team", "plan", None).await.unwrap();
     let doc = Doc::with_options(yrs::Options {
         offset_kind: yrs::OffsetKind::Utf16,
         ..yrs::Options::default()
@@ -5070,7 +5070,7 @@ async fn leaving_a_domain_that_never_reviewed_changes_nothing() {
     let f = fixture().await;
     let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
     f.engine.set_collab_sessions(&sessions);
-    let _joined = sessions.join("team", "plan").await.unwrap();
+    let _joined = sessions.join("team", "plan", None).await.unwrap();
 
     let receipt = f
         .engine
@@ -5592,6 +5592,15 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         // caller's. See `DomainView::for_write_joined`, which spells out the
         // three checks that still stand between a join and a write.
         ("domain_view.rs", "for_write_joined"),
+        // The co-editing saver: a room is a room over ONE overlay document,
+        // and this is the view it reads and writes that document through. The
+        // owner never comes from the socket - it comes from the key the room
+        // was opened under, and the collab upgrade route is what decided that
+        // key: your own document needs nothing, and somebody else's needs a
+        // live share-link of that author's naming you plus a live join this
+        // session opened on it. See `room_view` in
+        // crates/service/src/collab/session.rs.
+        ("session.rs", "room_view"),
     ];
     only_these_reach(
         "for_actor(",

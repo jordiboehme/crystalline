@@ -82,7 +82,7 @@ pub async fn join(
     // `CollabSessions::dispose_domain`).
     let joined = {
         let _pass = state.join_pass().await;
-        state.collab.join(&domain, &permalink).await
+        state.collab.join(&domain, &permalink, None).await
     }
     .map_err(join_error)?;
     let sessions = state.collab.clone();

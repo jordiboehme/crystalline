@@ -1,6 +1,17 @@
 //! The in-memory session registry and the per-session document room. The file
 //! stays the source of truth: a session is a live LF-space view of it, and
 //! everything durable flows back through the engine (Tasks 6-7).
+//!
+//! **A room is one DOCUMENT, and in a domain that reviews changes a document
+//! belongs to somebody.** The registry key carries that third component: the
+//! domain, the permalink, and the overlay owner whose draft of it this room is
+//! (`None` for the document a direct domain keeps, which is the folder's own
+//! and everybody's). Two authors drafting one page are two rooms, each opening
+//! on its own author's text and saving into that author's draft row - never
+//! into the folder the team reviewed and never into somebody else's overlay.
+//! Who may open a room over whose document is decided at the door, in
+//! [`super::ws::join`]: your own needs nothing, and somebody else's needs the
+//! share-link their author minted plus the join this session opened on it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -109,10 +120,19 @@ impl std::fmt::Debug for Joined {
     }
 }
 
-/// The registry of open documents, keyed by (domain, permalink).
+/// Where one room is filed: the domain, the permalink it answers to, and the
+/// overlay owner whose document it is.
+///
+/// `None` in the third slot is the document a domain that takes changes
+/// directly keeps - the folder's own text, which is what every room was before
+/// drafts existed. `Some(actor)` is that actor's draft of the page, which is
+/// the only kind of document a reviewing domain has.
+pub type RoomKey = (String, String, Option<String>);
+
+/// The registry of open documents, keyed by [`RoomKey`].
 pub struct CollabSessions {
     engine: Arc<Engine>,
-    sessions: Mutex<HashMap<(String, String), Arc<CollabSession>>>,
+    sessions: Mutex<HashMap<RoomKey, Arc<CollabSession>>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
 }
@@ -134,12 +154,21 @@ impl CollabSessions {
     /// back to the registry: a frontmatter rename has to move its key, and the
     /// session is the only one who learns about the rename (from the save
     /// receipt).
+    /// `overlay` is whose document to open: `None` for the one a direct domain
+    /// keeps, `Some(actor)` for that actor's draft of the page. It is the
+    /// caller's job to have decided that the caller may be in that document -
+    /// see [`super::ws::join`], which is the one surface that opens rooms.
     pub async fn join(
         self: &Arc<Self>,
         domain: &str,
         permalink: &str,
+        overlay: Option<&str>,
     ) -> Result<Joined, JoinError> {
-        let key = (domain.to_string(), permalink.to_string());
+        let key = (
+            domain.to_string(),
+            permalink.to_string(),
+            overlay.map(str::to_string),
+        );
         // The registry lock is held across open AND the membership check, so a
         // stampede of joins can neither open the same document twice nor
         // overshoot MAX_PARTICIPANTS between the check and the add.
@@ -264,7 +293,13 @@ impl CollabSessions {
     pub async fn dispose_domain(&self, domain: &str) -> usize {
         let victims: Vec<Arc<CollabSession>> = {
             let mut sessions = self.sessions.lock().await;
-            let keys: Vec<(String, String)> = sessions
+            // The DOMAIN component alone, whatever document each room is a
+            // room over: leaving review mode ends every draft in the domain,
+            // so a room over any of them is a room over nothing a moment
+            // later. `rooms_closed` counts exactly what it always counted -
+            // the rooms this domain had open - and the owner component neither
+            // hides one from the sweep nor adds one to it.
+            let keys: Vec<RoomKey> = sessions
                 .keys()
                 .filter(|key| key.0 == domain)
                 .cloned()
@@ -289,11 +324,13 @@ impl CollabSessions {
     /// Called with no session guard held: the lock order is registry ->
     /// session, never the reverse. `epoch` identifies the session that renamed
     /// itself, so an entry that was replaced meanwhile is left alone.
-    async fn rekey(&self, from: &(String, String), to_permalink: &str, epoch: &str) {
+    async fn rekey(&self, from: &RoomKey, to_permalink: &str, epoch: &str) {
         if from.1 == to_permalink {
             return;
         }
-        let to = (from.0.clone(), to_permalink.to_string());
+        // The permalink moves and nothing else does: a rename is a new address
+        // for the same document, and whose document it is has not changed.
+        let to = (from.0.clone(), to_permalink.to_string(), from.2.clone());
         let mut sessions = self.sessions.lock().await;
         if sessions.get(from).is_none_or(|held| held.epoch() != epoch) {
             return; // disposed or replaced meanwhile: not ours to move
@@ -348,6 +385,11 @@ pub struct CollabSession {
     /// always where the registry holds this session. A std mutex, never held
     /// across an await.
     key_permalink: std::sync::Mutex<String>,
+    /// Whose document this room is a room over: `Some(actor)` for that actor's
+    /// draft of the page, `None` for the one a direct domain keeps. Fixed for
+    /// the life of the room - a rename moves the permalink, never the owner -
+    /// and read by everything this room reads and writes through.
+    overlay: Option<String>,
     /// The registry this room lives in, for the rename move. Weak because the
     /// registry owns the session and never the other way round.
     registry: Weak<CollabSessions>,
@@ -431,17 +473,61 @@ impl SaveStateTag {
     }
 }
 
+/// The view a room over `overlay` reads and writes through.
+///
+/// One function, so the open, the external-change probe, the merge and the
+/// restore cannot disagree about whose document a room is. `None` is the
+/// document a direct domain keeps and answers exactly what it answered before
+/// drafts existed: the folder's own text through the base view.
+///
+/// **This is the co-editing saver's seam onto another actor's rows**, and the
+/// allow-list guard `another_actors_view_is_reached_only_by_the_owner_gated_surfaces`
+/// in crates/service/tests/overlay_domains.rs names it. What makes it safe is
+/// where the owner comes from: never from the socket, never from a path
+/// segment, only from the key the room was opened under - and that key was
+/// decided by [`super::ws::join`], which lets a caller name somebody else's
+/// document only when a live share-link of that author's names them and this
+/// session holds a live join on it.
+///
+/// **The seam Task 14 needs is this same key.** An agent joining a draft
+/// through its MCP session opens the join record that route reads, so a room
+/// asked for over that draft carries the owner here by exactly the path a
+/// browser's does; nothing in this module has to learn what an MCP session is.
+/// **A domain that has stopped reviewing changes has no overlay documents
+/// left, so a room over one falls back to the base view** - the same reading
+/// [`DomainView::for_write_joined`] takes of a join into a domain that left
+/// review mode. It is load bearing during a fold: the key comes off, then the
+/// rooms are swept, and the sweep's final save has to land in the folder the
+/// folds are about to be written over. Landing it in a draft row instead would
+/// put an actor's last typing somewhere the fold drops a moment later. The
+/// other half of that pair is worth saying too: an UNREGISTRATION sweeps while
+/// the domain is still registered and still reviewing, so a room over a draft
+/// saves into that draft and goes with it - which is what unregistering a
+/// reviewing domain promises, rather than spilling unreviewed work into a
+/// folder that stays on disk.
+fn room_view<'a>(
+    engine: &'a Engine,
+    domain: &str,
+    overlay: Option<&str>,
+) -> Result<DomainView<'a>, EngineError> {
+    match overlay.filter(|_| engine.reviews_changes(domain)) {
+        Some(owner) => DomainView::for_actor(engine, domain, &HashSet::new(), owner),
+        None => DomainView::base(engine, domain, &HashSet::new()),
+    }
+}
+
 impl CollabSession {
     async fn open(
         engine: Arc<Engine>,
-        key: (String, String),
+        key: RoomKey,
         epoch: String,
         registry: Weak<CollabSessions>,
     ) -> Result<Arc<CollabSession>, JoinError> {
-        // The base view: a room opens on the text the team reviewed, whoever
-        // else is drafting in the domain. The domain was screened by the
-        // surface that asked for the room.
-        let loaded = DomainView::base(&engine, &key.0, &HashSet::new())
+        // Read through the room's own view: the owner's draft where the room
+        // is a room over one, the text the team reviewed where it is not. The
+        // domain was screened by the surface that asked for the room, and so
+        // was the right to be in this document.
+        let loaded = room_view(&engine, &key.0, key.2.as_deref())
             .map_err(JoinError::Engine)?
             .engram_text(&key.1)
             .await
@@ -466,6 +552,7 @@ impl CollabSession {
             epoch,
             domain: key.0,
             key_permalink: std::sync::Mutex::new(key.1),
+            overlay: key.2,
             registry,
             engine,
             tx,
@@ -700,13 +787,28 @@ impl CollabSession {
         self.disposed.store(true, Ordering::Relaxed);
     }
 
-    /// The registry key this room is filed under right now: `(domain,
-    /// permalink)`, with the permalink a frontmatter rename may have moved.
-    pub fn key(&self) -> (String, String) {
+    /// The registry key this room is filed under right now: the domain, the
+    /// permalink a frontmatter rename may have moved, and whose document it
+    /// is.
+    pub fn key(&self) -> RoomKey {
         (
             self.domain.clone(),
             self.key_permalink.lock().expect("key mutex").clone(),
+            self.overlay.clone(),
         )
+    }
+
+    /// Whose document this room is a room over, or `None` for the one a direct
+    /// domain keeps.
+    pub fn overlay(&self) -> Option<&str> {
+        self.overlay.as_deref()
+    }
+
+    /// The view this room reads and writes through, built fresh per use the
+    /// way every other engine caller builds one: a view is a lens over the
+    /// engine for the length of one operation, never something to hold.
+    fn view(&self) -> Result<DomainView<'_>, EngineError> {
+        room_view(&self.engine, &self.domain, self.overlay.as_deref())
     }
 
     /// Record the permalink the registry just re-filed this room under.
@@ -852,14 +954,14 @@ impl CollabSession {
                     return None;
                 }
                 SaveOutcome::External(detail) => {
-                    let base = match DomainView::base(&self.engine, &self.domain, &HashSet::new()) {
-                        Ok(base) => base,
+                    let view = match self.view() {
+                        Ok(view) => view,
                         Err(err) => {
                             self.fail_save(state, err.to_string());
                             return None;
                         }
                     };
-                    let theirs = match base.engram_text(&state.permalink).await {
+                    let theirs = match view.engram_text(&state.permalink).await {
                         Ok(theirs) => theirs,
                         // The engram the CAS refused is not there to read: the
                         // write and the delete raced, so this is the deletion.
@@ -913,22 +1015,33 @@ impl CollabSession {
             return SaveOutcome::Done(None);
         }
         state.last_attempt = Some(now);
-        let receipt = self
-            .engine
-            .save_engram(
-                &crate::params::SaveParams {
-                    domain: self.domain.clone(),
-                    identifier: state.permalink.clone(),
-                    content: file.clone(),
-                    expected_checksum: state.checksum.clone(),
-                },
-                // The room saves as the machine owner for now. A room is one
-                // shared document rather than one actor's draft, so the scope
-                // that belongs here is the editing participant's, and wiring
-                // that up is the co-editing half of the overlay work.
-                &crate::scope::Scope::Unrestricted,
-            )
-            .await;
+        let params = crate::params::SaveParams {
+            domain: self.domain.clone(),
+            identifier: state.permalink.clone(),
+            content: file.clone(),
+            expected_checksum: state.checksum.clone(),
+        };
+        // Whose save this is, which is whose document the room is over. A room
+        // over one actor's draft writes that actor's row and nothing else -
+        // not the folder the team reviewed, and not the draft of whoever
+        // happens to be typing. A room over the document a direct domain keeps
+        // saves as the machine owner, exactly as every room did before there
+        // was anything else to be: the surface that opened it is the gate, as
+        // it is for every other write on this instance.
+        let receipt = match self.view() {
+            // The VIEW decides, never the key on its own: a domain that has
+            // stopped reviewing changes has no draft left for this room to be
+            // over, and its text belongs in the folder (see `room_view`).
+            Ok(view) if view.actor().is_some() => {
+                self.engine.save_engram_in_overlay(&view, &params).await
+            }
+            Ok(_) => {
+                self.engine
+                    .save_engram(&params, &crate::scope::Scope::Unrestricted)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         match receipt {
             Ok(receipt) => {
                 // A human just taught this domain something through the editor,
@@ -1082,10 +1195,10 @@ impl CollabSession {
             return None;
         }
         state.last_probe = Some(now);
-        let Ok(base) = DomainView::base(&self.engine, &self.domain, &HashSet::new()) else {
+        let Ok(view) = self.view() else {
             return None;
         };
-        match base.engram_text(&state.permalink).await {
+        match view.engram_text(&state.permalink).await {
             Ok(theirs) if theirs.checksum != state.checksum => {
                 let detail = format!(
                     "'{}' changed on disk while this session was idle",
@@ -1197,10 +1310,10 @@ impl CollabSession {
     /// re-opens as an edit conflict instead. A session never silently
     /// overwrites external work.
     async fn restore_mine(&self, state: &mut SessionState) -> Option<String> {
-        let Ok(base) = DomainView::base(&self.engine, &self.domain, &HashSet::new()) else {
+        let Ok(view) = self.view() else {
             return None;
         };
-        match base.engram_text_at_path(&state.path).await {
+        match view.engram_text_at_path(&state.path).await {
             Ok(Some(theirs)) if theirs.content != state.last_saved_text => {
                 let detail = format!(
                     "'{}' is on disk again with somebody else's text, so restoring \
@@ -1230,14 +1343,13 @@ impl CollabSession {
         // save_engram refuses a missing file by design, so the room's text
         // goes back through the restore verb instead.
         let file = Self::file_text_locked(state);
+        // Through the room's own view, for the reason the save goes through
+        // it: a room over one actor's draft puts its text back in that
+        // actor's draft, and a room over the document a direct domain keeps
+        // puts it back in the folder.
         match self
             .engine
-            .restore_engram(
-                &self.domain,
-                &state.path,
-                &file,
-                &crate::scope::Scope::Unrestricted,
-            )
+            .restore_engram_in_view(&view, &self.domain, &state.path, &file)
             .await
         {
             Ok(receipt) => {
