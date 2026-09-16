@@ -1036,9 +1036,11 @@ type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
 /// ([`crate::join::Holder::McpSession`]), so "the session ended" has to be able
 /// to end it. The service object's own drop ends it on the path where that drop
 /// happens, which is a client `DELETE`; an idle keep-alive or a worker error
-/// gives no such guarantee, and that holder has no idle limit of its own to
-/// fall back on. Threading the registry through here makes one rule of the
-/// three endings.
+/// gives no such guarantee. The registry's own window
+/// ([`crate::join::IDLE_JOIN_LIMIT`]) is the floor under all of it, but half an
+/// hour of an author's draft holding a guest who cannot come back is a floor
+/// rather than an answer. Threading the registry through here makes one rule of
+/// the three endings, and makes each of them immediate.
 pub(crate) struct CountingSessions<M> {
     inner: M,
     created: Arc<AtomicUsize>,
@@ -1100,10 +1102,9 @@ impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
         self.sessions.release(id);
         // And the drafts that session had joined end with it, for the same
         // reason and on the same three paths. A join held by a session that is
-        // gone is a key nobody can present and nothing can expire -
-        // `Holder::McpSession` has no idle limit, because a session's ending is
-        // supposed to be its ending - so leaving one here would leave an
-        // author's draft holding a guest who cannot come back.
+        // gone is a key nobody can present, so leaving one here would leave an
+        // author's draft holding a guest who cannot come back until the
+        // registry's idle window swept it half an hour later.
         self.joins
             .end_holder(&crate::join::Holder::McpSession(id.to_string()));
         self.inner.close_session(id)
@@ -2375,10 +2376,10 @@ mod tests {
     /// also go through `SessionJoins`' own drop. The other two endings - the 300
     /// second idle keep-alive and a worker error - reach `close_session` from
     /// inside `spawn_session_worker` with no drop of ours guaranteed alongside,
-    /// and `Holder::McpSession` is not idle-limited, so a join left behind on
-    /// those would have nothing at all to end it. This is the seam all three
-    /// arrive at, which is why the registry is threaded through here beside the
-    /// claim map rather than left to the service object's lifetime.
+    /// so a join left behind on those would stand until the registry's idle
+    /// window swept it half an hour later. This is the seam all three arrive
+    /// at, which is why the registry is threaded through here beside the claim
+    /// map rather than left to the service object's lifetime.
     #[tokio::test]
     async fn closing_a_session_ends_the_draft_joins_it_held() {
         use rmcp::transport::streamable_http_server::session::SessionManager;
@@ -2406,6 +2407,7 @@ mod tests {
                     domain: "eng".to_string(),
                     path: "notes".to_string(),
                     owner: "ada".to_string(),
+                    expires_at: None,
                 })
                 .unwrap();
         }

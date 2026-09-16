@@ -755,6 +755,30 @@ impl Review {
         resp.json().await.unwrap()
     }
 
+    /// The same, on a link that stops working on its own at `expires_at`.
+    ///
+    /// The window is the author's to set at mint time and is never moved
+    /// afterwards, which is what lets a join carry it rather than re-read it.
+    async fn mint_until(
+        &self,
+        session: &(String, String),
+        path: &str,
+        expires_at: &str,
+    ) -> serde_json::Value {
+        let resp = self
+            .request(
+                session,
+                reqwest::Method::POST,
+                "/api/v1/domains/team/draft-links",
+            )
+            .json(&serde_json::json!({ "path": path, "expires_at": expires_at }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "minting a link with a window on it");
+        resp.json().await.unwrap()
+    }
+
     /// Redeem a link and then open a join on it: the two steps a person takes
     /// between being handed a draft and being allowed to type in it.
     async fn accept_and_join(&self, session: &(String, String), token: &str) -> serde_json::Value {
@@ -1092,6 +1116,52 @@ async fn a_grantee_who_leaves_the_draft_is_closed_out_of_its_room() {
     )
     .await
     .expect("a join is a join, however many times it is opened");
+}
+
+/// **A link that runs out puts the socket outside the draft**, the way taking
+/// it back does.
+///
+/// A grant lasts as long as its window says, and until this the window ended
+/// only what came THROUGH it: a person already inside the draft went on typing
+/// in somebody else's work for as long as they kept the page open, because
+/// nothing in the registry knew the link had run out. The join carries the
+/// window now, so the saver's next pass finds the join over and closes the
+/// room the same way a revocation does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grantee_whose_link_runs_out_is_closed_out_of_its_room() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    // Long enough to be live through the join and the upgrade, short enough
+    // that the saver's four-times-a-second pass reaches it inside the test.
+    let until = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+    let minted = fx.mint_until(&alice, &path, &until).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .expect("the link is live, so the room opens");
+    let _ = next_binary(&mut his).await;
+
+    let closed = wait_for_control(&mut his, "closed").await;
+    assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
+
+    // And the link is over rather than merely put down: rejoining it opens
+    // nothing, which is what an expired grant has always answered.
+    let rejoined = fx
+        .request(&bob, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejoined.status(), 404, "a link that ran out opens nothing");
 }
 
 /// A link opens the draft it was minted on and no other of its author's.

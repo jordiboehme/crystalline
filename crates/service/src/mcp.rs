@@ -1156,39 +1156,74 @@ fn display_client(raw: &str) -> Option<String> {
 /// [`acting_actor`]'s hyphenated OKF token and is untouched by this; what a
 /// person SEES beside their own name while an agent is in their document is
 /// this, and the two are built from the same two halves so they can never
-/// name different agents. The account leads because that is who the work is
+/// name different agents. The name leads because that is who the work is
 /// being done for, and the harness follows it in the parenthesis because a
 /// person watching two agents work needs to tell them apart.
 ///
 /// `None` when no ACCOUNT is known, whatever the client calls itself: see
 /// [`presence_label`].
 fn agent_peer(ctx: &RequestContext<RoleServer>, scope: &crate::scope::Scope) -> Option<AgentPeer> {
-    // The account the gate resolved, or - on a local session, where there is
-    // no gate - the identity that session acts with, which is the same name
-    // its drafts are filed under.
     presence_label(
-        mcp_account(ctx).or_else(|| crate::scope::overlay_actor(scope)),
+        presence_identity(mcp_account(ctx), scope),
         client_actor(ctx).and_then(|client| display_client(&client)),
     )
 }
 
+/// The word a local agent is drawn under, where the only person who can be
+/// reading the strip is the person it is working for.
+const PRESENCE_SELF: &str = "you";
+
+/// Who a chip is for and what it is called: the account presence is KEYED by,
+/// and the name a person READS.
+///
+/// The two are one string almost always, and the case where they part is the
+/// machine owner's own session. A local stdio agent has no gate to resolve an
+/// account, so the identity it acts with is
+/// [`crate::engine::OWNER_IDENTITY_NAME`] - the name that session's drafts are
+/// filed under, which is the right key and the wrong word. Drawn as it stands
+/// it tells the owner that somebody called `owner` is in their document, and
+/// that somebody is themselves; [`PRESENCE_SELF`] is what it is instead, with
+/// the harness still following so two agents of one person are told apart.
+///
+/// **Decided here, where the two sources are still apart.** An account the
+/// gate resolved that happens to be named `owner` is a remote person like any
+/// other and keeps their own name in everybody's strip: only the absence of a
+/// gate, on a session acting unrestricted, is you. Keying presence by the
+/// account either way is what keeps a slot stable across the substitution -
+/// the strip's key is who the work is filed under, never what it is captioned.
+fn presence_identity(
+    gate_account: Option<String>,
+    scope: &crate::scope::Scope,
+) -> Option<(String, String)> {
+    match gate_account {
+        Some(account) => Some((account.clone(), account)),
+        None => match scope {
+            crate::scope::Scope::Unrestricted => Some((
+                crate::engine::OWNER_IDENTITY_NAME.to_string(),
+                PRESENCE_SELF.to_string(),
+            )),
+            other => crate::scope::overlay_actor(other).map(|actor| (actor.clone(), actor)),
+        },
+    }
+}
+
 /// The two halves composed, and the rule about which of them may lead.
 ///
-/// **The account is what makes a chip worth drawing, so without one there is
+/// **The identity is what makes a chip worth drawing, so without one there is
 /// no chip.** A name in somebody's participant strip says "this is who is in
 /// your document", and on an instance with MCP authentication off the client
 /// half is whatever an unauthenticated caller typed into its handshake - so a
 /// label led by it would let anybody put any name beside a person's own. The
-/// harness may only ever follow an account the server resolved.
+/// harness may only ever follow a name the server resolved
+/// ([`presence_identity`]).
 ///
-/// The account alone is a complete answer: an agent whose client sent no
-/// usable name is "<account> (agent)", which says the true thing and says who
-/// it is for.
-fn presence_label(account: Option<String>, client: Option<String>) -> Option<AgentPeer> {
-    let account = account?;
+/// That name alone is a complete answer: an agent whose client sent no usable
+/// name is "<name> (agent)", which says the true thing and says who it is for.
+fn presence_label(identity: Option<(String, String)>, client: Option<String>) -> Option<AgentPeer> {
+    let (account, shown) = identity?;
     let label = match client {
-        Some(client) => format!("{account} (agent: {client})"),
-        None => format!("{account} (agent)"),
+        Some(client) => format!("{shown} (agent: {client})"),
+        None => format!("{shown} (agent)"),
     };
     Some(AgentPeer { account, label })
 }
@@ -5054,19 +5089,71 @@ mod tests {
     fn an_unauthenticated_caller_gets_no_chip_however_it_names_itself() {
         // What `agent_peer` resolves on that tier: no gate identity at all,
         // and no draft identity either.
-        let account = crate::scope::overlay_actor(&Scope::Anonymous);
-        assert_eq!(account, None, "the open tier holds nobody in particular");
+        let nobody = presence_identity(None, &Scope::Anonymous);
+        assert!(nobody.is_none(), "the open tier holds nobody in particular");
         assert!(
-            presence_label(account, display_client("Grace Hopper")).is_none(),
+            presence_label(nobody, display_client("Grace Hopper")).is_none(),
             "so there is nobody to put in the strip"
         );
         // An account is what earns one, and the harness then follows it.
-        let peer = presence_label(Some("ada".to_string()), display_client("claude-code/2.0"))
-            .expect("an authenticated caller is a peer");
+        let peer = presence_label(
+            presence_identity(Some("ada".to_string()), &Scope::Anonymous),
+            display_client("claude-code/2.0"),
+        )
+        .expect("an authenticated caller is a peer");
         assert_eq!(peer.account, "ada");
         assert_eq!(peer.label, "ada (agent: claude-code/2.0)");
-        let bare = presence_label(Some("ada".to_string()), None).expect("an account is enough");
+        let bare = presence_label(
+            presence_identity(Some("ada".to_string()), &Scope::Anonymous),
+            None,
+        )
+        .expect("an account is enough");
         assert_eq!(bare.label, "ada (agent)");
+    }
+
+    /// **A local agent is "you" in the strip, never the owner's filing name.**
+    ///
+    /// A stdio session has no gate to resolve an account, so the identity it
+    /// acts with is the machine owner's - the name that session's drafts are
+    /// filed under. Drawn as it stands, the only person who can be reading
+    /// that strip is told somebody called `owner` is in their document, which
+    /// is themselves. The word for that is "you", and the harness still
+    /// follows it so two agents of one person are told apart.
+    ///
+    /// **The substitution is made where the two sources are still apart.** An
+    /// account the gate resolved that happens to be named `owner` is a remote
+    /// person like anybody else and keeps their own name; only the local
+    /// session with no gate at all is you.
+    #[test]
+    fn a_local_sessions_agent_is_you_in_the_owners_own_strip() {
+        let peer = presence_label(
+            presence_identity(None, &Scope::Unrestricted),
+            display_client("claude-code/2.0"),
+        )
+        .expect("a local session acts as somebody");
+        assert_eq!(peer.label, "you (agent: claude-code/2.0)");
+        assert_eq!(
+            peer.account,
+            crate::engine::OWNER_IDENTITY_NAME,
+            "while presence stays keyed by the identity the work is filed under"
+        );
+        let bare = presence_label(presence_identity(None, &Scope::Unrestricted), None)
+            .expect("an identity is enough");
+        assert_eq!(bare.label, "you (agent)");
+
+        let remote = presence_label(
+            presence_identity(
+                Some(crate::engine::OWNER_IDENTITY_NAME.to_string()),
+                &Scope::Anonymous,
+            ),
+            None,
+        )
+        .expect("an authenticated account is a peer");
+        assert_eq!(
+            remote.label,
+            format!("{} (agent)", crate::engine::OWNER_IDENTITY_NAME),
+            "an account the gate resolved is never you, whatever it is called"
+        );
     }
 
     /// A join a server object opened ends when THAT OBJECT ends - and only
@@ -5086,6 +5173,7 @@ mod tests {
             domain: "team".to_string(),
             path: "fresh.md".to_string(),
             owner: "alice".to_string(),
+            expires_at: None,
         };
         let browsers = crate::join::Join {
             holder: crate::join::Holder::Browser("csrf-bob".to_string()),
@@ -5135,6 +5223,7 @@ mod tests {
             domain: "team".to_string(),
             path: "fresh.md".to_string(),
             owner: "alice".to_string(),
+            expires_at: None,
         };
         let key = registry.open(join.clone()).unwrap();
 
@@ -5182,6 +5271,7 @@ mod tests {
                 domain: "team".to_string(),
                 path: "fresh.md".to_string(),
                 owner: "alice".to_string(),
+                expires_at: None,
             })
             .unwrap();
         let agent = SessionJoins::new(registry.clone());

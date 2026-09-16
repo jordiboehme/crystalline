@@ -73,6 +73,24 @@ pub fn overlay_actor(scope: &Scope) -> Option<String> {
     }
 }
 
+/// What presenting a share-link opened: which draft, and how long the link
+/// goes on opening it.
+///
+/// The redeeming caller needs both - the address to route the work to, and the
+/// window to stamp onto the join it opens - and neither is meaningful without
+/// the other here.
+pub struct RedeemedLink {
+    /// The domain the draft lives in.
+    pub domain: String,
+    /// Whose draft it is: the actor whose overlay the writes land in.
+    pub owner: String,
+    /// The domain-relative path of the draft the link was minted on.
+    pub path: String,
+    /// RFC 3339, when the link stops working on its own, or `None` for one
+    /// that lasts as long as the draft does.
+    pub expires_at: Option<String>,
+}
+
 /// What a scope may do on one domain. Ordered least to most privileged, so a
 /// caller writes `right >= DomainRight::Write` rather than matching every arm.
 ///
@@ -280,25 +298,36 @@ impl DomainAccess {
         self.auth.overlay_grant_domain(token).await
     }
 
-    /// Present a share-link as `account` and answer the draft it opens, as
-    /// `(domain, owner, path)`.
+    /// Present a share-link as `account` and answer the draft it opens, with
+    /// the window the link itself stands on.
     ///
     /// Binds the link to that account the first time and answers the same
     /// thing every time after; `None` for an unknown, revoked, expired or
-    /// already-taken link, deliberately one answer for all four. The tuple
-    /// rather than the row, for the reason every delegation here is narrow:
-    /// this resolver is the engine's only way to that database, and one
-    /// question it can ask is one question a later change cannot widen.
+    /// already-taken link, deliberately one answer for all four. Four named
+    /// fields rather than the row, for the reason every delegation here is
+    /// narrow: this resolver is the engine's only way to that database, and
+    /// one question it can ask is one question a later change cannot widen.
+    ///
+    /// **The window travels with the address** because a join has to end when
+    /// the link does, and the join registry measures in this process's memory:
+    /// stamping the moment onto the join at open time is what keeps the
+    /// co-editing saver's four-times-a-second pass from re-asking the database
+    /// something the grant answered once. See [`crate::join::Join::expires_at`].
     pub async fn redeem_overlay_grant(
         &self,
         token: &str,
         account: &str,
-    ) -> Result<Option<(String, String, String)>> {
+    ) -> Result<Option<RedeemedLink>> {
         Ok(self
             .auth
             .redeem_overlay_grant(token, account)
             .await?
-            .map(|grant| (grant.domain, grant.owner, grant.path)))
+            .map(|grant| RedeemedLink {
+                domain: grant.domain,
+                owner: grant.owner,
+                path: grant.path,
+                expires_at: grant.expires_at,
+            }))
     }
 
     /// End every share-link standing on one draft, because that draft has

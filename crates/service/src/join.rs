@@ -32,9 +32,24 @@
 //! - a **token identity**, which is what a modern-era peer on streamable HTTP
 //!   has instead of a session: it is routed statelessly, so every request of
 //!   its is a fresh server object and nothing on that path can be the end of
-//!   anything. That holder's joins are ended by IDLENESS instead
-//!   ([`IDLE_JOIN_LIMIT`], refreshed by every use), which is why this is the
-//!   one kind [`Joins::end_holder`] must never be asked to end for somebody.
+//!   anything. It is the one kind [`Joins::end_holder`] must never be asked to
+//!   end for somebody, because there is no ending to report.
+//!
+//! **Every join ends by IDLENESS too** ([`IDLE_JOIN_LIMIT`], refreshed by
+//! every use), and the holder's own ending is the FAST PATH rather than the
+//! only one. Three of the four kinds do end, and when they do the sweep is
+//! immediate - but nothing in this process can assert that the ending was
+//! reported: a legacy session whose transport never called back, a browser
+//! whose sign-out never reached us, a connection dropped mid-flight would each
+//! leave a join standing for as long as the daemon does. With the window over
+//! all four, the worst of that is half an hour of an author's draft holding
+//! somebody who is not there, and the one holder that has no ending at all is
+//! no longer a special case but the case the rule was written for.
+//!
+//! **A join opened on a share-link also ends when the link's own window
+//! does** ([`Join::expires_at`]). The window is carried in at open time rather
+//! than re-read, so nothing on the saver's four-times-a-second path asks the
+//! database a question the grant answered once.
 //!
 //! Every question this registry answers is asked with a holder, so two holders
 //! of one account are two callers here however identical their credentials
@@ -95,14 +110,21 @@ pub enum JoinRefusal {
     AccountFull,
 }
 
-/// How long a [`Holder::Token`] join survives with nothing using it.
+/// How long ANY join survives with nothing using it.
 ///
-/// The one holder that cannot be ended by its own ending, because it has no
-/// ending: a modern-era peer on streamable HTTP is routed statelessly, so its
-/// server object lives for one request. Idleness is what stands in, and it is
-/// refreshed by every use - `get`, `holds` and `held_by` all touch - so an
-/// agent that goes on working in a draft stays in it and one that walked away
-/// half an hour ago does not.
+/// It is refreshed by every use - `get`, `holds` and `held_by` all touch - so
+/// a caller that goes on working in a draft stays in it and one that walked
+/// away half an hour ago does not. An open room refreshes on its own: the
+/// saver asks [`Joins::holds`] about every guest four times a second, so a
+/// person reading somebody's draft without typing is using their join the
+/// whole time they have it open.
+///
+/// **Over every holder, not only [`Holder::Token`].** That holder has no
+/// ending of its own and this is the whole of what ends it; the other three do
+/// end, and their ending is the fast path. What the window adds for them is
+/// the guarantee that a reported ending is not the ONLY way out - an ending
+/// that never arrives leaves a join standing for half an hour rather than for
+/// as long as this process runs.
 pub const IDLE_JOIN_LIMIT: Duration = Duration::from_secs(30 * 60);
 
 /// Who is holding a join: the thing whose ending ends it.
@@ -125,19 +147,27 @@ pub enum Holder {
     Process(u64),
     /// A modern-era peer with no session at all, named by the account its
     /// token resolved to. Ended by idleness ([`IDLE_JOIN_LIMIT`]) and by
-    /// nothing else: see [`Holder::ends_with_its_holder`].
+    /// nothing else, because it has no ending of its own to be swept on: see
+    /// [`Holder::ends_with_its_holder`].
     Token(String),
 }
 
 impl Holder {
-    /// Whether the thing holding this join can be the end of it.
+    /// Whether [`Joins::end_holder`] may sweep for this holder: whether the
+    /// thing holding the join is an object whose ending somebody can report.
     ///
-    /// True for every holder that is an object with a lifetime somebody can
-    /// observe. False for [`Holder::Token`], which is an identity rather than
-    /// an object: on the stateless path a fresh server is built per request,
-    /// so ending its joins when it goes would end them after one call - and,
-    /// were the dedup ever account-shaped again, would end somebody's browser
-    /// join from inside their agent's request.
+    /// **A fast path rather than the only path.** Every join is idle-limited
+    /// ([`IDLE_JOIN_LIMIT`]), so this decides how QUICKLY a join ends, not
+    /// whether it does. True for every holder that is an object with a
+    /// lifetime somebody can observe, and the sweep on its ending is what
+    /// makes a signed-out window leave the draft at once instead of half an
+    /// hour later.
+    ///
+    /// False for [`Holder::Token`], which is an identity rather than an
+    /// object: on the stateless path a fresh server is built per request, so
+    /// ending its joins when it goes would end them after one call - and, were
+    /// the dedup ever account-shaped again, would end somebody's browser join
+    /// from inside their agent's request.
     pub fn ends_with_its_holder(&self) -> bool {
         !matches!(self, Holder::Token(_))
     }
@@ -145,7 +175,7 @@ impl Holder {
 
 /// One holder working inside one draft that is not its own.
 ///
-/// The five fields are the whole of it, and each is load bearing: `account` is
+/// The six fields are the whole of it, and each is load bearing: `account` is
 /// who the join was opened for and is checked on every use, so a key that
 /// leaked to somebody else opens nothing; `holder` is WHICH of that account's
 /// callers is inside the draft, so one window's join is not another's and an
@@ -164,6 +194,58 @@ pub struct Join {
     pub path: String,
     /// Whose draft it is: the actor whose overlay the writes land in.
     pub owner: String,
+    /// When the share-link this join was opened on runs out, on this
+    /// process's clock, or `None` for a link with no window at all.
+    ///
+    /// **The grant's window, carried rather than re-read.** A revoked link
+    /// ends its joins where the revocation happens, and a folded, discarded or
+    /// renamed draft ends them where that happens - an expiry is the one
+    /// ending nothing announces, because it is a moment passing rather than
+    /// somebody acting. So the moment travels with the join and
+    /// [`Joins::expire_idle`] reads it, which keeps the saver's pass asking
+    /// this process's memory rather than the database four times a second.
+    ///
+    /// Stamped once, at [`Joins::open`], and sound because a grant is
+    /// immutable apart from being revoked: its window is set when the author
+    /// mints the link and is never moved afterwards. See [`grant_deadline`].
+    pub expires_at: Option<Instant>,
+}
+
+/// When a join opened on a share-link stops being one, on this process's
+/// clock, or `None` for a link that lasts as long as the draft does.
+///
+/// The grant's `expires_at` is RFC 3339 wall-clock and this registry measures
+/// in [`Instant`]s, so the window is converted once, here, where the link is
+/// presented. An instant that cannot be parsed reads as already over, which is
+/// the rule the store itself redeems by - a grant nobody can date is one
+/// nobody may work inside - and is unreachable from a redeemed grant, since
+/// that check has already refused it.
+pub fn grant_deadline(expires_at: Option<&str>) -> Option<Instant> {
+    let at = expires_at?;
+    let now = Instant::now();
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(at) else {
+        return Some(now);
+    };
+    let left = at.signed_duration_since(chrono::Utc::now());
+    Some(now + left.to_std().unwrap_or(Duration::ZERO))
+}
+
+/// The later of two link windows, where `None` is a link with no window.
+///
+/// What a holder rejoining one draft on a second link stands on: they hold
+/// both links, so their access ends when the last of the two does. Taking the
+/// newer window instead would let presenting a short-lived link shorten a
+/// standing join the holder already had another reason to keep.
+///
+/// A link with no window keeping the join unbounded is not a way to outlive a
+/// revocation: taking a link back ends every join on that draft outright
+/// ([`Joins::end_draft`]), so the only thing a window has to bound is the case
+/// where nothing else ends it at all.
+fn later(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (None, _) | (_, None) => None,
+        (Some(a), Some(b)) => Some(a.max(b)),
+    }
 }
 
 /// The joins this process is holding, keyed by the key each holder presents.
@@ -235,6 +317,7 @@ impl Joins {
                 && existing.join.path == join.path
             {
                 existing.last_used = now;
+                existing.join.expires_at = later(existing.join.expires_at, join.expires_at);
                 return Ok(key.clone());
             }
         }
@@ -376,12 +459,17 @@ impl Joins {
 
     /// End every join ONE holder is inside, because that holder has ended.
     ///
-    /// Answers how many were open. A [`Holder::Token`] is refused rather than
-    /// swept, and the refusal is the point: that holder is an identity rather
-    /// than an object, so "it ended" is never a true thing for a caller to
-    /// say about it - the per-request server object that would say it is not
-    /// the end of anything, and sweeping on it would put an agent out of a
-    /// draft after one call. Idleness is that holder's ending; see
+    /// Answers how many were open. **The fast path out of a draft**, not the
+    /// only one: every join is idle-limited as well ([`IDLE_JOIN_LIMIT`]), so
+    /// a holder whose ending is never reported leaves the draft half an hour
+    /// later instead of never. This is what makes the ordinary case immediate.
+    ///
+    /// A [`Holder::Token`] is refused rather than swept, and the refusal is
+    /// the point: that holder is an identity rather than an object, so "it
+    /// ended" is never a true thing for a caller to say about it - the
+    /// per-request server object that would say it is not the end of
+    /// anything, and sweeping on it would put an agent out of a draft after
+    /// one call. Idleness is that holder's only ending; see
     /// [`Joins::expire_idle`].
     pub fn end_holder(&self, holder: &Holder) -> usize {
         if !holder.ends_with_its_holder() {
@@ -420,8 +508,13 @@ impl Joins {
         before - open.len()
     }
 
-    /// End every idle-limited join nothing has used for [`IDLE_JOIN_LIMIT`],
-    /// as of `now`. Answers how many were ended.
+    /// End every join that has run out as of `now`: one nothing has used for
+    /// [`IDLE_JOIN_LIMIT`], and one whose share-link's own window has passed.
+    /// Answers how many were ended.
+    ///
+    /// **Whatever holds it.** A holder that can report its ending still ends
+    /// its joins the moment it does ([`Joins::end_holder`]); this is what
+    /// happens when no such report ever comes.
     ///
     /// Takes `now` rather than reading the clock, so a test drives the window
     /// as a value instead of waiting half an hour - the same shape the
@@ -436,8 +529,8 @@ impl Joins {
     fn expire_locked(open: &mut HashMap<String, Held>, now: Instant) -> usize {
         let before = open.len();
         open.retain(|_, held| {
-            held.join.holder.ends_with_its_holder()
-                || now.saturating_duration_since(held.last_used) < IDLE_JOIN_LIMIT
+            now.saturating_duration_since(held.last_used) < IDLE_JOIN_LIMIT
+                && held.join.expires_at.is_none_or(|at| now < at)
         });
         before - open.len()
     }
@@ -469,6 +562,7 @@ mod tests {
             domain: "team".to_string(),
             path: "plan.md".to_string(),
             owner: "alice".to_string(),
+            expires_at: None,
         }
     }
 
@@ -598,8 +692,8 @@ mod tests {
             "plan.md"
         ));
 
-        // The agent's holder ending - which for a token identity is never -
-        // and the browser's are separate events.
+        // The agent's holder ending - which for a token identity never
+        // happens - and the browser's are separate events.
         assert_eq!(joins.end_holder(&browser("bob")), 1);
         assert_eq!(
             joins.get(&in_browser, "bob"),
@@ -639,6 +733,12 @@ mod tests {
 
     /// What ends a token identity's join instead: half an hour of nothing,
     /// and every use pushes that half hour out again.
+    ///
+    /// The window is the same for a holder that HAS an ending of its own - the
+    /// browser join here goes with it - which is the rule stated from the
+    /// other side in `a_session_holders_join_ends_when_nothing_uses_it_either`:
+    /// the ending is the fast path, and idleness is the floor under all four
+    /// kinds.
     #[test]
     fn a_token_identitys_join_expires_when_nothing_uses_it() {
         let joins = Joins::default();
@@ -657,11 +757,117 @@ mod tests {
         assert!(joins.get(&key, "bob").is_some());
 
         let past = Instant::now() + IDLE_JOIN_LIMIT + Duration::from_secs(1);
-        assert_eq!(joins.expire_idle(past), 1);
+        assert_eq!(
+            joins.expire_idle(past),
+            2,
+            "the agent's and the window nobody touched either"
+        );
         assert_eq!(joins.get(&key, "bob"), None, "idle, so it is over");
+        assert_eq!(joins.get(&browsers, "bob"), None, "and so is the other");
+    }
+
+    /// A join opened on a link that runs out is over when the link is, however
+    /// busy the person inside it has been.
+    ///
+    /// The half idleness cannot cover: somebody typing in a colleague's draft
+    /// refreshes their join with every keystroke, so a window that only
+    /// measured quiet would keep them inside the draft long after the link
+    /// they were let in on stopped opening anything.
+    #[test]
+    fn a_join_ends_when_the_link_it_was_opened_on_runs_out() {
+        let joins = Joins::default();
+        let window = Instant::now() + Duration::from_secs(10 * 60);
+        let key = joins
+            .open(Join {
+                expires_at: Some(window),
+                ..join("bob")
+            })
+            .unwrap();
+        let forever = joins
+            .open(Join {
+                path: "charter.md".to_string(),
+                ..join("bob")
+            })
+            .unwrap();
+
+        // Busy right up to the last moment, which is what makes this a
+        // different question from idleness.
+        let inside = window - Duration::from_secs(1);
+        assert_eq!(joins.expire_idle(inside), 0, "the link still opens it");
+        assert!(joins.get(&key, "bob").is_some());
+
+        let after = window + Duration::from_secs(1);
+        assert_eq!(joins.expire_idle(after), 1);
+        assert_eq!(
+            joins.get(&key, "bob"),
+            None,
+            "the link ran out, so it is over"
+        );
         assert!(
-            joins.get(&browsers, "bob").is_some(),
-            "while a holder that has an ending of its own waits for it"
+            joins.get(&forever, "bob").is_some(),
+            "while a link with no window on it is untouched"
+        );
+    }
+
+    /// A second link into one draft leaves the holder inside it for as long as
+    /// the LONGER of the two says, because they hold both.
+    #[test]
+    fn rejoining_on_a_second_link_keeps_the_longer_window() {
+        let joins = Joins::default();
+        let soon = Instant::now() + Duration::from_secs(60);
+        let later_on = Instant::now() + Duration::from_secs(20 * 60);
+        let key = joins
+            .open(Join {
+                expires_at: Some(later_on),
+                ..join("bob")
+            })
+            .unwrap();
+        let again = joins
+            .open(Join {
+                expires_at: Some(soon),
+                ..join("bob")
+            })
+            .unwrap();
+        assert_eq!(key, again, "one holder inside one draft is one join");
+        assert_eq!(
+            joins.expire_idle(soon + Duration::from_secs(1)),
+            0,
+            "the shorter link running out does not put them outside the draft"
+        );
+        assert_eq!(joins.expire_idle(later_on + Duration::from_secs(1)), 1);
+    }
+
+    /// **Every holder's join ends when nothing uses it**, not only a token
+    /// identity's.
+    ///
+    /// The belt to the drop's brace. A legacy MCP session's joins are swept
+    /// when the transport ends the session, and nothing in this process can
+    /// assert that sweep ran: if it does not, a join with no idle limit stands
+    /// for as long as the daemon does, holding an author's draft open for
+    /// somebody who cannot come back. With the window over every holder, the
+    /// worst that happens is half an hour of it.
+    #[test]
+    fn a_session_holders_join_ends_when_nothing_uses_it_either() {
+        let joins = Joins::default();
+        let holder = Holder::McpSession("session-1".to_string());
+        let key = joins
+            .open(Join {
+                holder: holder.clone(),
+                ..join("bob")
+            })
+            .unwrap();
+
+        let nearly = Instant::now() + IDLE_JOIN_LIMIT - Duration::from_secs(60);
+        assert_eq!(joins.expire_idle(nearly), 0, "inside the window it stands");
+        // And that lookup is a use, so the window starts again from it.
+        assert!(joins.get(&key, "bob").is_some());
+
+        let past = Instant::now() + IDLE_JOIN_LIMIT + Duration::from_secs(1);
+        assert_eq!(joins.expire_idle(past), 1, "past it, the join is over");
+        assert_eq!(joins.get(&key, "bob"), None);
+        assert!(
+            holder.ends_with_its_holder(),
+            "while the session's own ending is still the fast path"
         );
     }
 

@@ -4848,7 +4848,12 @@ impl Engine {
         if self.domain_entry_scoped(&named, &hidden).is_err() {
             return Err(dead());
         }
-        let (domain, owner, path) = access
+        let crate::scope::RedeemedLink {
+            domain,
+            owner,
+            path,
+            expires_at,
+        } = access
             .redeem_overlay_grant(token, &account)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?
@@ -4897,6 +4902,10 @@ impl Engine {
             domain,
             path,
             owner,
+            // The link's own window, stamped on once: an expiry is the one way
+            // a grant ends that nobody announces, so the join carries the
+            // moment rather than the saver re-reading the row.
+            expires_at: crate::join::grant_deadline(expires_at.as_deref()),
         };
         // A cap met is the same shape as the read-only answer above and for
         // the same reason: the link bound, the draft is readable, and the join

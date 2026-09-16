@@ -1103,11 +1103,25 @@ impl CollabSession {
     ///
     /// A join ends in one place - the registry - however it ended: the author
     /// took the link back (which ends the joins on that draft), the draft was
-    /// folded, discarded or renamed, the person pressed Leave, or the daemon
-    /// was restarted under them. So this asks one question per guest per tick,
-    /// of a map in this process's memory, and never reads the grant rows: a
-    /// revocation is already an ending, and asking the database four times a
-    /// second would be asking it something it has already answered.
+    /// folded, discarded or renamed, the person pressed Leave, the link's own
+    /// window ran out, or the daemon was restarted under them. So this asks one
+    /// question per guest per tick, of a map in this process's memory, and
+    /// never reads the grant rows: a revocation is already an ending, and
+    /// asking the database four times a second would be asking it something it
+    /// has already answered.
+    ///
+    /// **An expiry is the one ending nobody announces**, and it is covered the
+    /// same way rather than by a second question: the link's window is stamped
+    /// onto the join when it is opened
+    /// ([`crate::join::Join::expires_at`]), so the moment it passes the
+    /// registry answers no here and the socket is closed on the next pass -
+    /// out of the same map, at the same cost.
+    ///
+    /// **And this pass is what keeps an open room's join alive.** The question
+    /// is a use, so a person reading somebody's draft without typing a word
+    /// refreshes their join four times a second for as long as the room is
+    /// open, and the registry's idle window
+    /// ([`crate::join::IDLE_JOIN_LIMIT`]) never reaches them.
     ///
     /// The frame is addressed to that connection alone. The owner is not a
     /// guest and is never in this map, so their socket stands through every

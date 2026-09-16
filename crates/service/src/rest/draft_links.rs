@@ -484,7 +484,7 @@ pub async fn accept(
     identity: Identity,
     ApiJson(body): ApiJson<TokenBody>,
 ) -> Result<Json<AcceptedDraft>, ApiError> {
-    let opened = open_link(&state, &identity, &body.token).await?;
+    let (opened, _window) = open_link(&state, &identity, &body.token).await?;
     Ok(Json(opened))
 }
 
@@ -542,7 +542,7 @@ pub async fn join(
     identity: Identity,
     ApiJson(body): ApiJson<TokenBody>,
 ) -> Result<Json<AcceptedDraft>, ApiError> {
-    let mut opened = open_link(&state, &identity, &body.token).await?;
+    let (mut opened, window) = open_link(&state, &identity, &body.token).await?;
     let user = identity.require_account()?;
     if !opened.editable {
         return Err(ApiError::forbidden(opened.reason.clone().unwrap_or_else(
@@ -566,6 +566,10 @@ pub async fn join(
             domain: opened.domain.clone(),
             path: opened.path.clone(),
             owner: opened.owner.clone(),
+            // The link's own window, so the room this join opens is closed
+            // when the link runs out rather than left standing on a grant
+            // that stopped opening anything.
+            expires_at: crate::join::grant_deadline(window.as_deref()),
         })
         .map_err(|refusal| match refusal {
             JoinRefusal::AccountFull => ApiError::conflict(
@@ -631,7 +635,9 @@ pub async fn leave(
 ///
 /// One function, so accepting and joining cannot disagree about what a link
 /// opens, about what the draft says, or about whether this account may edit
-/// it. The refusals are all 404 and all the same 404, deliberately: an
+/// it. The grant's own window rides beside the answer for the joining route,
+/// which stamps it onto the join it opens ([`crate::join::Join::expires_at`]);
+/// accepting has no join to stamp and ignores it. The refusals are all 404 and all the same 404, deliberately: an
 /// invented link, a revoked one, an expired one, one already bound to somebody
 /// else, one into a domain this account may not read, and one whose draft has
 /// since been folded, discarded, deleted or renamed away are six different
@@ -640,7 +646,7 @@ async fn open_link(
     state: &RestState,
     identity: &Identity,
     token: &str,
-) -> Result<AcceptedDraft, ApiError> {
+) -> Result<(AcceptedDraft, Option<String>), ApiError> {
     let user = identity.require_account()?;
     if !token.starts_with(DRAFT_LINK_PREFIX) {
         return Err(dead_link());
@@ -691,18 +697,21 @@ async fn open_link(
             ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
         })?;
     let editable = right >= DomainRight::Write;
-    Ok(AcceptedDraft {
-        domain: grant.domain,
-        path: grant.path,
-        owner: grant.owner,
-        permalink: draft.permalink,
-        editable,
-        reason: (!editable).then(|| read_only_reason(&right)),
-        content: draft.content,
-        checksum: draft.checksum,
-        join_key: None,
-        joined: None,
-    })
+    Ok((
+        AcceptedDraft {
+            domain: grant.domain,
+            path: grant.path,
+            owner: grant.owner,
+            permalink: draft.permalink,
+            editable,
+            reason: (!editable).then(|| read_only_reason(&right)),
+            content: draft.content,
+            checksum: draft.checksum,
+            join_key: None,
+            joined: None,
+        },
+        grant.expires_at,
+    ))
 }
 
 /// Why the editor opened read-only, in words that say what would change it.
