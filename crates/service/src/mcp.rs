@@ -1377,21 +1377,43 @@ impl McpServer {
     ///
     /// **Both halves of the session test are load bearing, and the first is
     /// the one that is easy to get wrong.** rmcp decides whether a request is
-    /// served by a per-session object from the BODY - `is_legacy_request`
-    /// reads `initialize`, the era's `_meta` keys and the version, and never
-    /// touches the session header - so an era-shaped `tools/call` carrying a
-    /// session id is routed statelessly and its server object lives for that
-    /// one request. Naming it a session here would put its join on an object
-    /// that is about to be dropped, which is exactly the failure the holder
-    /// exists to close, reached through a dual-era client or a proxy that
-    /// echoes the header. So the shape is asked first, in the same terms rmcp
-    /// asks it: this request's own revision, negotiated or from its `_meta`.
+    /// served by a per-session object from the BODY and never from the session
+    /// header, so an era-shaped `tools/call` carrying a session id is routed
+    /// statelessly and its server object lives for that one request. Naming it
+    /// a session here would put its join on an object that is about to be
+    /// dropped, which is exactly the failure the holder exists to close,
+    /// reached through a dual-era client or a proxy that echoes the header.
     ///
-    /// The second half is that the id has to be one this process is actually
-    /// serving. An id nothing minted has no session behind it and no ending to
-    /// wait for; the gate refuses a claim belonging to somebody ELSE with a
-    /// 403, and an unclaimed one it lets through, so this is where an
-    /// unclaimed one stops being a holder.
+    /// So the shape is decided by rmcp's own rule, `uses_legacy_lifecycle`
+    /// (rmcp 3.2.0 `service.rs:202-207`, reached from
+    /// `tower.rs`'s `is_legacy_request`), which this mirrors clause for clause.
+    /// It reads TWO things from the request and they are not the same thing:
+    ///
+    /// 1. **whether the era's required `_meta` keys are present at all** -
+    ///    `protocolVersion` and `clientCapabilities`, tested by
+    ///    `RequestMetaObject::missing_required_keys`, which checks presence and
+    ///    never what revision the first of them names. A request carrying both
+    ///    is stateless for rmcp EVEN WHEN it names a pre-era revision, and that
+    ///    clause overrules the version.
+    /// 2. **the version**, this request's own: from its `_meta` if it has one,
+    ///    otherwise the negotiated one. Only consulted when the first clause
+    ///    did not already answer.
+    ///
+    /// Reading the version alone was the bug of the round before this one: a
+    /// dual-era harness that holds a legacy session and still attaches its
+    /// SEP-2575 client context to later requests sends exactly the request the
+    /// two clauses disagree about.
+    /// `an_era_meta_call_naming_a_legacy_revision_is_stateless_on_a_minted_session`
+    /// is that request on the wire.
+    ///
+    /// rmcp's third input, an `initialize` body, needs no clause here: a
+    /// handshake reaches no tool and so never asks who holds a join.
+    ///
+    /// The second half of the session test is that the id has to be one this
+    /// process is actually serving. An id nothing minted has no session behind
+    /// it and no ending to wait for; the gate refuses a claim belonging to
+    /// somebody ELSE with a 403, and an unclaimed one it lets through, so this
+    /// is where an unclaimed one stops being a holder.
     ///
     /// `None` when the request carries no account at all, which is the
     /// anonymous open tier: a share-link binds to an account, so there is no
@@ -1405,9 +1427,14 @@ impl McpServer {
             Transport::Stdio => Some(crate::join::Holder::Process(self.server)),
             Transport::Http => {
                 let account = mcp_account(ctx)?;
-                let legacy_shaped = ctx
-                    .protocol_version()
-                    .is_none_or(|version| version < ProtocolVersion::V_2026_07_28);
+                let era_meta = ctx
+                    .meta
+                    .missing_required_keys(&ProtocolVersion::V_2026_07_28)
+                    .is_empty();
+                let legacy_shaped = !era_meta
+                    && ctx
+                        .protocol_version()
+                        .is_none_or(|version| version < ProtocolVersion::V_2026_07_28);
                 if legacy_shaped
                     && let Some(session) = session_header(ctx)
                     && let Some(owners) = &self.sessions

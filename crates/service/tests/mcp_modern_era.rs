@@ -4276,6 +4276,124 @@ async fn an_era_call_carrying_a_session_id_is_still_a_stateless_peer() {
     );
 }
 
+/// **The era's `_meta` decides the shape, and the version it names does not
+/// get to overrule it.**
+///
+/// The half of rmcp's rule a version comparison alone cannot see.
+/// `uses_legacy_lifecycle` is `!uses_discover_lifecycle && is_legacy_version`,
+/// and `uses_discover_lifecycle` asks only whether the era's two required
+/// `_meta` keys are PRESENT - never what revision the first of them names
+/// (rmcp 3.2.0 `tower.rs:390-398`, `model/meta.rs:518-530`). So a request
+/// carrying both keys is routed statelessly even when it names `2025-11-25`,
+/// and its server object lives for that one call.
+///
+/// This is the shape half of the classifier pinned ALONE, which
+/// `an_era_call_carrying_a_session_id_is_still_a_stateless_peer` cannot do: the
+/// session id there is one nothing minted, so the ownership clause defeats it
+/// too. Here the id is minted by a real handshake and claimed for this very
+/// account, so the ownership clause passes and only the shape can save the
+/// join. Calling this a session would put the key on an object rmcp drops at
+/// the end of the request, and the second POST below would find nothing.
+///
+/// The client shape it describes is a real one: a dual-era harness that holds
+/// a legacy session and still attaches its SEP-2575 client context to every
+/// request it sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_era_meta_call_naming_a_legacy_revision_is_stateless_on_a_minted_session() {
+    let fx = serve_review_instance().await;
+
+    // A real handshake, so the id below is one this process minted and the gate
+    // claimed for bob. Both halves of the ownership clause hold.
+    let opened = post_as_at(
+        fx.addr,
+        &support::initialize_body_as("dual-era-client"),
+        "initialize",
+        None,
+        &fx.bearer,
+        None,
+        "2025-06-18",
+    )
+    .await;
+    let session = minted_session_id(&opened);
+    let negotiated = payload(&opened)["result"]["protocolVersion"]
+        .as_str()
+        .expect("the handshake names the revision it settled on")
+        .to_string();
+    let ready = post_as_at(
+        fx.addr,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "notifications/initialized",
+        None,
+        &fx.bearer,
+        Some(&session),
+        &negotiated,
+    )
+    .await;
+    assert!(ready.contains("202") || ready.contains("200"), "{ready}");
+
+    // The call in question: the era's two required keys present, a pre-era
+    // revision named in them and in the header to match, and the minted session
+    // id riding along.
+    let mut params = json!({
+        "name": "read_engram",
+        "arguments": {
+            "identifier": "fresh",
+            "domain": "team",
+            "share_link": fx.token,
+        }
+    });
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": LEGACY,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "dual-era-client", "version": "9.9.9" },
+    });
+    let body = request(11, "tools/call", params).to_string();
+    let read = post_as_at(
+        fx.addr,
+        &body,
+        "tools/call",
+        Some("read_engram"),
+        &fx.bearer,
+        Some(&session),
+        LEGACY,
+    )
+    .await;
+    assert!(
+        read.contains("A page only alice has"),
+        "the link opens her draft: {read}"
+    );
+    assert!(
+        fx.engine.joins().holds(
+            "bob",
+            &crystalline_service::Holder::Token("bob".to_string()),
+            "team",
+            "alice",
+            &fx.path
+        ),
+        "and the join is the token identity's, because an era `_meta` is a \
+         stateless request whatever revision it names"
+    );
+
+    // And the proof that matters: a later POST still finds it.
+    let edited = call_as(
+        fx.addr,
+        12,
+        "edit_engram",
+        json!({
+            "identifier": "fresh",
+            "domain": "team",
+            "operation": "append",
+            "content": "the dual-era client added this",
+        }),
+        &fx.bearer,
+    )
+    .await;
+    assert!(
+        said(&edited).contains("landed in alice's draft"),
+        "the join outlived the request that opened it: {edited}"
+    );
+}
+
 /// The session id a response minted, off the raw head.
 fn minted_session_id(raw: &str) -> String {
     raw.split("\r\n")
