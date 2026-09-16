@@ -1280,3 +1280,114 @@ async fn a_rooms_save_at_another_path_is_refused_and_the_room_stays_open() {
     his.send(binary(step1(&doc))).await.unwrap();
     let _ = next_sync_step2(&mut his).await;
 }
+
+/// Leaving review mode by DISCARDING an actor's drafts must not publish what a
+/// room over one of them was holding.
+///
+/// The sweep runs one step after the key comes off, so the room's view has
+/// already fallen back to the folder and its final save is an ordinary file
+/// write. For a fold that is right - those bytes are about to be written
+/// anyway. For a discard it is the opposite of what was asked: the rows are
+/// dropped without being written, and the unsaved typing would have gone into
+/// the reviewed tree a moment earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discarding_leave_closes_the_room_without_publishing_its_text() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+
+    // Alice redrafts the team's page, close enough to it that the merge the
+    // sweep's save runs comes out clean - which is the shape where the text
+    // reaches the folder rather than stalling in a conflict.
+    let read = fx
+        .engine
+        .read_engram(
+            &crystalline_service::params::ReadParams {
+                identifier: "plan".to_string(),
+                domain: Some("team".to_string()),
+            },
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    fx.engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                content: TEAM_PLAN.replace("status: stable", "status: draft"),
+                expected_checksum: read["checksum"].as_str().unwrap().to_string(),
+            },
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .expect("her redraft is a draft of hers");
+
+    let minted = fx.mint(&alice, "plan.md").await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/plan?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut his).await;
+    let doc = client_doc();
+    his.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut his).await;
+    apply(&doc, &step2);
+    let update = append_line(&doc, "typed but never flushed");
+    his.send(binary(update_frame(&update))).await.unwrap();
+    // A barrier rather than a flush: one socket's frames are processed in
+    // order, so this answer proves the update above reached the room before
+    // the leave below.
+    his.send(binary(step1(&doc))).await.unwrap();
+    let _ = next_sync_step2(&mut his).await;
+
+    let receipt = fx
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            crystalline_service::ReviewModeConfirm::Confirmed {
+                folds: vec![(
+                    "alice".to_string(),
+                    crystalline_service::FoldChoice::Discard,
+                )],
+            },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .expect("the domain stops reviewing changes");
+    assert_eq!(
+        receipt["rooms_closed"],
+        serde_json::json!(1),
+        "the room over her draft was swept: {receipt}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(fx.domain_dir.join("plan.md")).unwrap(),
+        TEAM_PLAN,
+        "and nothing of the discarded draft reached the folder"
+    );
+    assert!(
+        fx.engine
+            .overlay_draft_at("team", "alice", "plan.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "her draft is gone, which is what discarding means"
+    );
+
+    let closed = wait_for_control(&mut his, "closed").await;
+    assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
+}

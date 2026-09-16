@@ -13655,6 +13655,12 @@ impl Engine {
     ///    removal path means by sweeping while the domain is still
     ///    registered - there, the drafts are what unregistering ends, so a
     ///    swept room's save goes into the draft and out with it.
+    ///    The sweep is told which actors are being DISCARDED and closes a room
+    ///    over one of their drafts WITHOUT saving it: discard means those rows
+    ///    are dropped unwritten, and a room whose view has just fallen back to
+    ///    the folder would otherwise publish the very text this call said must
+    ///    not reach it. What was unsaved ends with the draft it was typed
+    ///    into, which is what discarding it means.
     /// 3. The folds land as ordinary file writes and deletions, over the files
     ///    those saves just landed in. Where a fold and a room are about the same
     ///    path the fold is the last word - which is the answer the plan was
@@ -13849,14 +13855,28 @@ impl Engine {
 
         // The key comes off first, and then the rooms go, and that pair is the
         // whole of step 2: see the ordering on [`Engine::set_review_mode`].
+        //
+        // The sweep is told which actors are being DISCARDED, and a room over
+        // one of their drafts is closed without being saved. Every other room
+        // saves first, as it always did. Discard means the rows are dropped
+        // unwritten, so a room over one of them - with the key already off,
+        // and its view already fallen back to the folder - would otherwise
+        // publish into the reviewed tree the one text this call said must not
+        // go there.
         self.write_review_key(domain, None)?;
+        let discarded: HashSet<String> = choices
+            .iter()
+            .filter(|(_, choice)| **choice == FoldChoice::Discard)
+            .map(|(actor, _)| actor.clone())
+            .collect();
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
-            Some(sessions) => sessions.dispose_domain(domain).await,
+            Some(sessions) => sessions.dispose_domain_discarding(domain, &discarded).await,
             None => 0,
         };
 
-        // **And the same question again, of the folder those rooms just wrote
-        // into.** The key is off, so every swept room wrote into the folder,
+        // **And the same question again, of the folder the folded rooms just
+        // wrote into.** The key is off, so every swept room that saved wrote
+        // into the folder,
         // and a participant who edited the frontmatter's permalink line has
         // moved a base engram's address between the check above and this line; a fold validated
         // against the older folder would write a second engram at that address

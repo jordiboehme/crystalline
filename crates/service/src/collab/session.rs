@@ -300,6 +300,34 @@ impl CollabSessions {
     /// side; the visible behavior (the editor closes, the room is unusable) is
     /// right either way.
     pub async fn dispose_domain(&self, domain: &str) -> usize {
+        self.dispose_domain_discarding(domain, &HashSet::new())
+            .await
+    }
+
+    /// [`CollabSessions::dispose_domain`], told which actors' drafts are being
+    /// DISCARDED rather than folded.
+    ///
+    /// A room over one of those drafts is closed **without being saved**. Every
+    /// other room saves first, exactly as it always did: an unregistration
+    /// saves every room (the files stay on disk), and a fold saves every room
+    /// because the folder is about to take those bytes anyway.
+    ///
+    /// Why the exception is not optional. The sweep runs one step after the
+    /// review key comes off, so a room over a draft has already fallen back to
+    /// the folder ([`room_view`]) and its final save is an ordinary file
+    /// write. Discard is the one fold choice whose whole meaning is "this
+    /// never reaches the tree" - the rows are dropped unwritten - so saving
+    /// such a room would publish, into the reviewed folder, the one text the
+    /// operator just said must not go there. It can be a grantee's text, typed
+    /// inside a share-link, which is the sharpest form of the same thing.
+    ///
+    /// The unsaved text ends with the draft it was typed into, which is what
+    /// discarding that draft means.
+    pub async fn dispose_domain_discarding(
+        &self,
+        domain: &str,
+        discarded: &HashSet<String>,
+    ) -> usize {
         let victims: Vec<Arc<CollabSession>> = {
             let mut sessions = self.sessions.lock().await;
             // The DOMAIN component alone, whatever document each room is a
@@ -317,9 +345,16 @@ impl CollabSessions {
         };
         let closed = victims.len();
         for session in victims {
+            let discarding = session
+                .key()
+                .2
+                .is_some_and(|owner| discarded.contains(&owner));
             // The save comes FIRST: poison disposes the session, and a
-            // disposed session's save paths are all no-ops.
-            session.final_save().await;
+            // disposed session's save paths are all no-ops. Which is exactly
+            // how a discarded actor's room is closed without one.
+            if !discarding {
+                session.final_save().await;
+            }
             session.poison().await;
         }
         closed
