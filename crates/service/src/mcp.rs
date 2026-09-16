@@ -2804,7 +2804,7 @@ impl McpServer {
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
                 None => {
-                    let preview = self
+                    let preview = match self
                         .engine
                         .origin_share_preview(
                             &p.domain,
@@ -2824,7 +2824,15 @@ impl McpServer {
                             PreviewCredential::ActingIdentity,
                         )
                         .await
-                        .map_err(to_error)?;
+                    {
+                        Ok(preview) => preview,
+                        // A caller with no identity holds no draft, and the
+                        // preview resolves that first: the question it could
+                        // not ask is answered with the teaching text rather
+                        // than with a protocol error, exactly as the confirmed
+                        // call below answers it.
+                        Err(e) => return overlay_write_error(e),
+                    };
                     if share_plan_needs_confirmation(preview["action"].as_str()) {
                         return Ok(confirm_question(share_question(&preview)).into());
                     }
@@ -2835,7 +2843,14 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
+        // The refusal an agent with no identity meets here is teaching text -
+        // "connect with your MCP token and try again" - and it is the same
+        // sentence a write of that domain answers, so it goes back the same
+        // way: `isError` with the words in it, never a protocol error the
+        // client renders opaquely. Every other engine error keeps the shape it
+        // had.
+        match self
+            .engine
             .origin_share(
                 &p.domain,
                 p.title.as_deref(),
@@ -2845,9 +2860,10 @@ impl McpServer {
                 self.share_actor(&ctx),
             )
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        {
+            Ok(shared) => ok(shared).map(CallToolResponse::from),
+            Err(e) => overlay_write_error(e),
+        }
     }
 
     #[tool(
@@ -4882,7 +4898,14 @@ fn refusal_or_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
 /// see - "connect with your MCP token and try again" - not a mistake to
 /// retry blindly, so it goes back as a tool error the client renders, the
 /// same way [`refusal_or_error`] already reads `Forbidden` and
-/// `ConfirmationRequired`. `refuse_unwritable` already let this caller
+/// `ConfirmationRequired`.
+///
+/// **A share of a reviewing domain reads its errors through this too**, and
+/// for the same reason rather than by analogy: a share of such a domain is a
+/// share of somebody's draft, so an agent with no identity has nothing to
+/// share and is told how to get one. The tool descriptions teach that
+/// sentence, so a caller that meets this refusal did what it was told, and an
+/// opaque protocol error would leave it nothing to do next. `refuse_unwritable` already let this caller
 /// through by the time a write reaches this: the legacy open tier has no
 /// accounts to hold a member level, so that gate is not the one a
 /// review-mode domain's missing identity trips. Every other `Refused`

@@ -562,6 +562,39 @@ async fn an_unauthenticated_agents_overlay_write_answers_the_teaching_text() {
     );
 }
 
+/// **An unauthenticated agent's share of a review-mode domain is refused in
+/// the same teaching words its write is, not in a protocol error.**
+///
+/// Task 18 taught `share_changes` to say that a share of a reviewing domain is
+/// a share of somebody's draft, so an agent that follows that sentence and
+/// calls the verb with no identity has done exactly what it was told. The
+/// engine answers `OVERLAY_NEEDS_IDENTITY` - the same refusal the write path
+/// answers - and it has to arrive the same way: a `CallToolResult` carrying
+/// `isError` and the text, rather than the JSON-RPC error `to_error` gives
+/// every other `Refused` message, which a client renders opaquely and a model
+/// cannot act on.
+///
+/// The identity is resolved ahead of the credential and ahead of every forge
+/// call (`Engine::overlay_share_identity`), so this refusal is reached with
+/// nothing connected and no network touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_agents_share_answers_the_teaching_text() {
+    let (addr, _tmp, _store) = serve_reviewed_domain_with_mcp_auth_off().await;
+    let session = McpTestSession::open(&addr, None).await;
+    let raw = session
+        .call_tool("share_changes", serde_json::json!({ "domain": "team" }))
+        .await;
+    refusal_is_readable(&raw, "an unauthenticated share of a reviewing domain");
+    let payload = payload_of(&raw);
+    let text = payload["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains(crystalline_service::OVERLAY_NEEDS_IDENTITY),
+        "the teaching text names the fix: {text}"
+    );
+}
+
 /// Every way of failing the gate answers the same bytes. A refusal that said
 /// "malformed token" for one input and "unknown token" for another would tell a
 /// caller which half of a guess landed; there is exactly one refusal here, and
