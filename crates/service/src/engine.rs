@@ -4537,7 +4537,7 @@ impl Engine {
         token: &str,
         scope: &crate::scope::Scope,
         holder: &crate::join::Holder,
-    ) -> Result<(String, crate::join::Join)> {
+    ) -> Result<OpenedLink> {
         let Some(account) = crate::scope::overlay_actor(scope) else {
             return Err(EngineError::Refused(
                 "a draft share-link binds to an account, and this session has none: sign in \
@@ -4604,7 +4604,11 @@ impl Engine {
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         if right < crate::scope::DomainRight::Write {
-            return Err(EngineError::Refused(format!(
+            // Bound, readable, and not joined - which is a whole answer rather
+            // than a failure. A read crossed the grant and got what the grant
+            // is for; only a write needed the second step, and only a write is
+            // refused by this sentence.
+            return Ok(OpenedLink::ReadOnly(format!(
                 "you may read {owner}'s draft of '{path}' and not edit it: your access on \
                  '{domain}' is {}, and editing somebody's draft needs the same editor access \
                  that writing anything else here needs. Suggest changes to whoever shared it, \
@@ -4624,19 +4628,27 @@ impl Engine {
             path,
             owner,
         };
-        let key = self.joins().open(join.clone()).map_err(|refusal| {
-            EngineError::Refused(match refusal {
-                crate::join::JoinRefusal::AccountFull => "you are already working inside as many \
-                     drafts as this instance keeps open for one account: leave one of them and \
-                     this one will open"
-                    .to_string(),
-                crate::join::JoinRefusal::InstanceFull => "this instance is already holding as \
-                     many drafts open as it will hold at once, across everybody: leave one of \
-                     yours, or try again shortly"
-                    .to_string(),
-            })
-        })?;
-        Ok((key, join))
+        // A cap met is the same shape as the read-only answer above and for
+        // the same reason: the link bound, the draft is readable, and the join
+        // is what could not be opened.
+        let key = match self.joins().open(join.clone()) {
+            Ok(key) => key,
+            Err(crate::join::JoinRefusal::AccountFull) => {
+                return Ok(OpenedLink::ReadOnly(
+                    "you are already working inside as many drafts as this instance keeps open \
+                     for one account: leave one of them and this one will open"
+                        .to_string(),
+                ));
+            }
+            Err(crate::join::JoinRefusal::InstanceFull) => {
+                return Ok(OpenedLink::ReadOnly(
+                    "this instance is already holding as many drafts open as it will hold at \
+                     once, across everybody: leave one of yours, or try again shortly"
+                        .to_string(),
+                ));
+            }
+        };
+        Ok(OpenedLink::Joined { key, join })
     }
 
     /// The draft this caller holds a live link to that `identifier` names, as
@@ -19244,6 +19256,28 @@ fn host_refusal(name: &str, host: &DomainHost) -> String {
         "domain '{name}' is hosted by instance {} (last heartbeat {}); this instance serves it read-from-database only. Pass --take-over to migrate hosting here.",
         host.instance_id, host.heartbeat_at
     )
+}
+
+/// What presenting a draft share-link did.
+///
+/// Two answers rather than an answer and an error, because binding the link and
+/// joining the draft are two steps and only the first of them decides whether
+/// the caller may SEE the draft. A reader who may not edit it, and one already
+/// working in as many drafts as this instance keeps open for one account, have
+/// each redeemed the link and may read what it opens; a read that failed on
+/// either would be answering a question nobody asked. Every way the link itself
+/// fails to open anything stays an error, because that caller has to be told.
+pub enum OpenedLink {
+    /// The link bound and this holder is inside the draft.
+    Joined {
+        /// The key this holder presents the join with.
+        key: String,
+        /// The join itself, which is what routes a write.
+        join: crate::join::Join,
+    },
+    /// The link bound and the draft is readable; the join was refused, and the
+    /// sentence says why. A write is refused with it; a read is not.
+    ReadOnly(String),
 }
 
 /// What one source edit did: the mirror warning it may owe, and - when a

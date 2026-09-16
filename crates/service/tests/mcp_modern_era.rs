@@ -3973,12 +3973,31 @@ async fn serve_review_instance() -> ReviewInstance {
 
 /// [`post`] with an `Authorization: Bearer` header, which everything below
 /// needs and nothing above does: the gate is off in [`Harness`].
-async fn post_as(
+/// [`post`] with an `Authorization: Bearer` header and, optionally, a session
+/// id: the two things a dual-era client or a header-echoing proxy can vary
+/// independently of the body, which is what the holder classifier has to be
+/// right about. Everything below needs the header and nothing above does - the
+/// gate is off in [`Harness`].
+async fn post_as_session(
     addr: std::net::SocketAddr,
     body: &str,
     method: &str,
     name: Option<&str>,
     bearer: &str,
+    session: Option<&str>,
+) -> String {
+    post_as_at(addr, body, method, name, bearer, session, ERA).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn post_as_at(
+    addr: std::net::SocketAddr,
+    body: &str,
+    method: &str,
+    name: Option<&str>,
+    bearer: &str,
+    session: Option<&str>,
+    version: &str,
 ) -> String {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut head = format!(
@@ -3988,9 +4007,12 @@ async fn post_as(
          Accept: application/json, text/event-stream\r\n\
          Connection: close\r\n\
          Authorization: Bearer {bearer}\r\n\
-         MCP-Protocol-Version: {ERA}\r\n\
+         MCP-Protocol-Version: {version}\r\n\
          Mcp-Method: {method}\r\n"
     );
+    if let Some(session) = session {
+        head.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
+    }
     if let Some(name) = name {
         head.push_str(&format!("Mcp-Name: {name}\r\n"));
     }
@@ -4022,13 +4044,27 @@ async fn call_as(
     arguments: Value,
     bearer: &str,
 ) -> Value {
+    call_as_session(addr, id, tool, arguments, bearer, None).await
+}
+
+/// [`call_as`] sending a session id the peer has no business having: an era
+/// body still routes statelessly, which is exactly what the classifier has to
+/// agree with.
+async fn call_as_session(
+    addr: std::net::SocketAddr,
+    id: u32,
+    tool: &str,
+    arguments: Value,
+    bearer: &str,
+    session: Option<&str>,
+) -> Value {
     let body = modern(
         id,
         "tools/call",
         json!({ "name": tool, "arguments": arguments }),
     )
     .to_string();
-    let raw = post_as(addr, &body, "tools/call", Some(tool), bearer).await;
+    let raw = post_as_session(addr, &body, "tools/call", Some(tool), bearer, session).await;
     assert!(
         !has_session_header(&raw),
         "this era is sessionless, and the fixture depends on it:\n{}",
@@ -4077,6 +4113,7 @@ async fn a_stateless_peers_draft_join_outlives_its_request_and_expires_idle() {
     );
     assert!(
         fx.engine.joins().holds(
+            "bob",
             &crystalline_service::Holder::Token("bob".to_string()),
             "team",
             "alice",
@@ -4166,11 +4203,279 @@ async fn a_read_only_grantee_presenting_a_link_is_answered_the_draft() {
     );
     assert!(
         !fx.engine.joins().holds(
+            "vera",
             &crystalline_service::Holder::Token("vera".to_string()),
             "team",
             "alice",
             &fx.path
         ),
         "and she is inside nothing: editing is a second state she has no right to"
+    );
+}
+
+/// **An era-shaped call is a stateless call whatever header rides beside it.**
+///
+/// rmcp decides whether a request is served by a per-session object from the
+/// BODY (`is_legacy_request`: `initialize`, the era's `_meta` keys, the
+/// version) and never from `Mcp-Session-Id`. A holder classifier that read the
+/// header instead would call this request a session, keep its key on the
+/// per-request server object, and close the join at the end of the very call
+/// that opened it - which is the bug the holder exists to close, reached
+/// through a dual-era client or a proxy that echoes the header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_era_call_carrying_a_session_id_is_still_a_stateless_peer() {
+    let fx = serve_review_instance().await;
+
+    // POST one presents the link, and names a session this process never
+    // minted. rmcp routes it statelessly all the same.
+    let read = call_as_session(
+        fx.addr,
+        1,
+        "read_engram",
+        json!({
+            "identifier": "fresh",
+            "domain": "team",
+            "share_link": fx.token,
+        }),
+        &fx.bearer,
+        Some("a-session-nobody-minted"),
+    )
+    .await;
+    assert!(
+        said(&read).contains("A page only alice has"),
+        "the link opens her draft: {read}"
+    );
+    assert!(
+        fx.engine.joins().holds(
+            "bob",
+            &crystalline_service::Holder::Token("bob".to_string()),
+            "team",
+            "alice",
+            &fx.path
+        ),
+        "and the join is the token identity's, because that is what this request is"
+    );
+
+    // POST two, no header at all: the same holder, so the join is still there.
+    let edited = call_as(
+        fx.addr,
+        2,
+        "edit_engram",
+        json!({
+            "identifier": "fresh",
+            "domain": "team",
+            "operation": "append",
+            "content": "bob's agent added this",
+        }),
+        &fx.bearer,
+    )
+    .await;
+    assert!(
+        said(&edited).contains("landed in alice's draft"),
+        "the join outlived the request that opened it: {edited}"
+    );
+}
+
+/// The session id a response minted, off the raw head.
+fn minted_session_id(raw: &str) -> String {
+    raw.split("\r\n")
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("mcp-session-id")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_else(|| panic!("a legacy handshake mints a session:\n{}", head_of(raw)))
+}
+
+/// One raw DELETE at the endpoint, which is how a client ends its session.
+async fn delete_session(addr: std::net::SocketAddr, session: &str, bearer: &str, version: &str) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "DELETE / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Connection: close\r\n\
+         Authorization: Bearer {bearer}\r\n\
+         MCP-Protocol-Version: {version}\r\n\
+         Mcp-Session-Id: {session}\r\n\
+         Content-Length: 0\r\n\r\n"
+    );
+    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.flush().await;
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(1500), stream.read_to_end(&mut sink)).await;
+}
+
+/// **A legacy session's join is that session's, and ends with it.**
+///
+/// The other half of what `holder_of` has to get right, and the one the fix
+/// round could not show before: a legacy-shaped request on a session this
+/// process minted IS served by a per-session object, so its join belongs to
+/// that session and the transport ending the session is what ends it. Driven
+/// over the wire end to end - handshake, tool call, DELETE - rather than by
+/// calling `end_holder` by hand, because the question is whether production
+/// ever reaches that ending at all.
+///
+/// The browser's join stands through all of it, which is the same property
+/// `an_agents_join_ending_leaves_the_browsers_key_alone` pins from the REST
+/// side, here against a session the transport really closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_sessions_draft_join_ends_when_the_transport_ends_the_session() {
+    let fx = serve_review_instance().await;
+
+    // A browser session of bob's, inside the same draft, which nothing below
+    // may touch.
+    let browser = crystalline_service::Holder::Browser("csrf-bob".to_string());
+    let (browser_key, _) = match fx
+        .engine
+        .open_share_link(
+            &fx.token,
+            &crystalline_service::Scope::User {
+                account: "bob".to_string(),
+                admin: false,
+            },
+            &browser,
+        )
+        .await
+        .expect("his window opens the link too")
+    {
+        crystalline_service::engine::OpenedLink::Joined { key, join } => (key, join),
+        crystalline_service::engine::OpenedLink::ReadOnly(reason) => {
+            panic!("his window is an editor and joins: {reason}")
+        }
+    };
+
+    // The legacy handshake, which is the only shape that gets a session.
+    let opened = post_as_at(
+        fx.addr,
+        &support::initialize_body_as("legacy-join-test"),
+        "initialize",
+        None,
+        &fx.bearer,
+        None,
+        "2025-06-18",
+    )
+    .await;
+    let session = minted_session_id(&opened);
+    let negotiated = payload(&opened)["result"]["protocolVersion"]
+        .as_str()
+        .expect("the handshake names the revision it settled on")
+        .to_string();
+    let ready = post_as_at(
+        fx.addr,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "notifications/initialized",
+        None,
+        &fx.bearer,
+        Some(&session),
+        &negotiated,
+    )
+    .await;
+    assert!(ready.contains("202") || ready.contains("200"), "{ready}");
+
+    // A legacy-shaped tool call on that session presents the link.
+    let body = request(
+        7,
+        "tools/call",
+        json!({
+            "name": "read_engram",
+            "arguments": {
+                "identifier": "fresh",
+                "domain": "team",
+                "share_link": fx.token,
+            }
+        }),
+    )
+    .to_string();
+    let read = post_as_at(
+        fx.addr,
+        &body,
+        "tools/call",
+        Some("read_engram"),
+        &fx.bearer,
+        Some(&session),
+        &negotiated,
+    )
+    .await;
+    assert!(
+        read.contains("A page only alice has"),
+        "the link opens her draft on the session: {read}"
+    );
+    assert!(
+        fx.engine.joins().holds(
+            "bob",
+            &crystalline_service::Holder::McpSession(session.clone()),
+            "team",
+            "alice",
+            &fx.path
+        ),
+        "and the join belongs to the session that is serving it"
+    );
+
+    // The client ends its session. The join goes with it.
+    delete_session(fx.addr, &session, &fx.bearer, &negotiated).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while fx.engine.joins().holds(
+        "bob",
+        &crystalline_service::Holder::McpSession(session.clone()),
+        "team",
+        "alice",
+        &fx.path,
+    ) && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !fx.engine.joins().holds(
+            "bob",
+            &crystalline_service::Holder::McpSession(session),
+            "team",
+            "alice",
+            &fx.path
+        ),
+        "the session ended, so its join did"
+    );
+    assert!(
+        fx.engine.joins().get(&browser_key, "bob").is_some(),
+        "and his window is still working in the draft it joined"
+    );
+}
+
+/// A caller with no account presenting a link is told so, not answered the
+/// page the domain holds.
+///
+/// The read verb tolerates a refused JOIN - a grantee who may only read, an
+/// account already working in as many drafts as this instance keeps open for
+/// one - because the grant is what a read crosses on and those callers asked
+/// for exactly what their grant is for. It must not tolerate a refusal that
+/// says the link opened NOTHING: answering the base page in silence would let
+/// an agent report somebody's draft when it read the team's page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_that_opens_nothing_is_said_out_loud_rather_than_read_past() {
+    let fx = Harness::new().await;
+    let addr = fx.http().await;
+    let raw = modern_post(
+        addr,
+        1,
+        "tools/call",
+        json!({
+            "name": "read_engram",
+            "arguments": {
+                "identifier": "manifest",
+                "domain": "eng",
+                "share_link": "dl_0000000000000000000000000000000000000000000000000000000000000000",
+            }
+        }),
+    )
+    .await;
+    let answer = payload(&raw).to_string();
+    assert!(
+        answer.contains("binds to an account"),
+        "the caller is told the link opened nothing for them: {answer}"
+    );
+    assert!(
+        !answer.contains("Route here for eng questions"),
+        "and is NOT quietly answered the page the domain holds: {answer}"
     );
 }

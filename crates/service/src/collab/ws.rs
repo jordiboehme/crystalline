@@ -154,8 +154,11 @@ pub async fn join(
     // keeps the one signature the whole surface calls; the cost is that a tick
     // landing in this instant looks past one connection, and it looks again a
     // quarter of a second later.
-    if let Some(holder) = &room.guest {
-        joined.session.watch_guest(joined.conn, holder).await;
+    if let Some((account, holder)) = &room.guest {
+        joined
+            .session
+            .watch_guest(joined.conn, account, holder)
+            .await;
     }
     let sessions = state.collab.clone();
     // The failure twin of on_upgrade: the connection is REGISTERED in the
@@ -190,7 +193,7 @@ struct Room {
     /// what the saver's eviction has to ask the registry about on every tick:
     /// this browser session's join ending is what puts this socket out, and
     /// another holder of the same account is nothing to do with it.
-    guest: Option<crate::join::Holder>,
+    guest: Option<(String, crate::join::Holder)>,
     /// The path of the draft the caller's share-link was minted on, when a
     /// link is what got them in. The room has to land on this exact path or it
     /// is not the document the link opened.
@@ -263,7 +266,11 @@ async fn whose_document(
     let holder = identity
         .holder()
         .unwrap_or_else(|| crate::join::Holder::Browser(format!("account:{mine}")));
-    if !state.engine.joins().holds(&holder, domain, &owner, &path) {
+    if !state
+        .engine
+        .joins()
+        .holds(&mine, &holder, domain, &owner, &path)
+    {
         return Err(
             crate::engine::EngineError::Refused(crate::engine::granted_needs_join(&owner, &path))
                 .into(),
@@ -271,7 +278,7 @@ async fn whose_document(
     }
     Ok(Room {
         overlay: Some(owner),
-        guest: Some(holder),
+        guest: Some((mine, holder)),
         granted: Some(path),
     })
 }

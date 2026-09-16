@@ -1527,6 +1527,18 @@ async fn a_discarded_draft_evicts_its_guest_and_leaves_its_author_the_conflict()
     assert_eq!(conflict_kind, "deleted");
 }
 
+/// The key and the join a presented link opened, or a panic naming the other
+/// answer. Every call below presents a link that opens a joinable draft, so
+/// `ReadOnly` here is a failure rather than a case.
+fn joined(opened: crystalline_service::engine::OpenedLink) -> (String, crystalline_service::Join) {
+    match opened {
+        crystalline_service::engine::OpenedLink::Joined { key, join } => (key, join),
+        crystalline_service::engine::OpenedLink::ReadOnly(reason) => {
+            panic!("the link was expected to open a join: {reason}")
+        }
+    }
+}
+
 /// The holder a stateless agent is: a modern-era peer on streamable HTTP has
 /// no session at all, so its joins are keyed by the identity its token
 /// resolved to.
@@ -1569,11 +1581,12 @@ async fn a_joined_agent_edit_composes_into_the_owners_open_document() {
         account: "bob".to_string(),
         admin: false,
     };
-    let (_key, join) = fx
-        .engine
-        .open_share_link(&token, &bobs_scope, &agent_holder("bob"))
-        .await
-        .expect("the link opens alice's draft for bob");
+    let (_key, join) = joined(
+        fx.engine
+            .open_share_link(&token, &bobs_scope, &agent_holder("bob"))
+            .await
+            .expect("the link opens alice's draft for bob"),
+    );
     assert_eq!(join.owner, "alice");
     let receipt = fx
         .engine
@@ -1760,7 +1773,7 @@ async fn an_agents_join_never_opens_the_browsers_room() {
             .await
             .expect("the link opens alice's draft for his agent");
         assert!(
-            fx.engine.joins().held_by(&agent, "team").len() == 1,
+            fx.engine.joins().held_by("bob", &agent, "team").len() == 1,
             "{agent:?} is inside it"
         );
 

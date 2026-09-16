@@ -2484,6 +2484,18 @@ fn as_account(name: &str) -> Scope {
     }
 }
 
+/// The key and the join a presented link opened, or a panic naming the other
+/// answer. Every call below presents a link that opens a joinable draft, so
+/// `ReadOnly` here is a failure rather than a case.
+fn joined(opened: crystalline_service::engine::OpenedLink) -> (String, crystalline_service::Join) {
+    match opened {
+        crystalline_service::engine::OpenedLink::Joined { key, join } => (key, join),
+        crystalline_service::engine::OpenedLink::ReadOnly(reason) => {
+            panic!("the link was expected to open a join: {reason}")
+        }
+    }
+}
+
 /// The holder a stateless agent is: a modern-era peer on streamable HTTP has
 /// no session at all, so its joins are keyed by the identity its token
 /// resolved to and ended by idleness.
@@ -2521,11 +2533,12 @@ async fn an_agent_presenting_a_share_link_edits_inside_the_owners_draft() {
         .unwrap()
         .to_string();
 
-    let (_key, join) = f
-        .engine
-        .open_share_link(&token, &as_account("bob"), &agent_holder("bob"))
-        .await
-        .expect("the link opens alice's draft for bob");
+    let (_key, join) = joined(
+        f.engine
+            .open_share_link(&token, &as_account("bob"), &agent_holder("bob"))
+            .await
+            .expect("the link opens alice's draft for bob"),
+    );
     assert_eq!(join.owner, "alice");
     assert_eq!(join.path, path);
     assert_eq!(join.account, "bob");
@@ -2603,13 +2616,13 @@ async fn a_browser_join_is_not_the_agents_and_an_unjoined_edit_is_taught() {
     assert!(
         f.engine
             .joins()
-            .holds(&browser_holder(&bob), "team", "alice", &path),
+            .holds("bob", &browser_holder(&bob), "team", "alice", &path),
         "the window that pressed the button is inside the draft"
     );
     assert!(
         !f.engine
             .joins()
-            .holds(&agent_holder("bob"), "team", "alice", &path),
+            .holds("bob", &agent_holder("bob"), "team", "alice", &path),
         "and his agent, which authenticates as the same account, is not"
     );
 
@@ -2661,7 +2674,7 @@ async fn an_agents_join_ending_leaves_the_browsers_key_alone() {
         .unwrap()
         .to_string();
 
-    let joined: serde_json::Value = bob
+    let opened: serde_json::Value = bob
         .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
         .json(&serde_json::json!({"token": token}))
         .send()
@@ -2670,16 +2683,17 @@ async fn an_agents_join_ending_leaves_the_browsers_key_alone() {
         .json()
         .await
         .unwrap();
-    let browser_key = joined["join_key"].as_str().unwrap().to_string();
+    let browser_key = opened["join_key"].as_str().unwrap().to_string();
 
     // His agent presents the same link. A legacy MCP session is a holder whose
     // ending is observable, which is what makes this test able to end it.
     let agent = crystalline_service::Holder::McpSession("session-1".to_string());
-    let (agent_key, _join) = f
-        .engine
-        .open_share_link(&token, &as_account("bob"), &agent)
-        .await
-        .expect("the link opens alice's draft for his agent too");
+    let (agent_key, _join) = joined(
+        f.engine
+            .open_share_link(&token, &as_account("bob"), &agent)
+            .await
+            .expect("the link opens alice's draft for his agent too"),
+    );
     assert_ne!(
         agent_key, browser_key,
         "two holders of one account are two joins"
@@ -2699,7 +2713,7 @@ async fn an_agents_join_ending_leaves_the_browsers_key_alone() {
     assert!(
         f.engine
             .joins()
-            .holds(&browser_holder(&bob), "team", "alice", &path),
+            .holds("bob", &browser_holder(&bob), "team", "alice", &path),
         "which the co-editing upgrade still agrees with"
     );
 }

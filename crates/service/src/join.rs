@@ -279,19 +279,35 @@ impl Joins {
     /// join into the draft it is being asked to open, rather than asking it to
     /// prove one.
     ///
+    /// **The account rides along as defence rather than as the question.** A
+    /// holder is unique to one principal on every path that mints one, so the
+    /// account clause can never be what decides this - but the account binding
+    /// of a routed write used to rest on [`Joins::get`], which checks it, and
+    /// asking the holder alone would have left that binding resting on holder
+    /// uniqueness and nothing else. One comparison keeps it stated where it is
+    /// relied on.
+    ///
     /// **It is the holder that is asked, never the account.** An agent that
     /// joined a draft has not opened a room in its person's browser, and a
     /// window that joined one has not opened a room in the window beside it;
     /// each of those is a different holder, and each has to join for itself.
     /// That is the same triple [`Joins::open`] dedups on, so one holder is
     /// inside one draft once, whatever key it holds.
-    pub fn holds(&self, holder: &Holder, domain: &str, owner: &str, path: &str) -> bool {
+    pub fn holds(
+        &self,
+        account: &str,
+        holder: &Holder,
+        domain: &str,
+        owner: &str,
+        path: &str,
+    ) -> bool {
         let now = Instant::now();
         let mut open = self.lock();
         Self::expire_locked(&mut open, now);
         let mut found = false;
         for held in open.values_mut() {
-            if &held.join.holder == holder
+            if held.join.account == account
+                && &held.join.holder == holder
                 && held.join.domain == domain
                 && held.join.owner == owner
                 && held.join.path == path
@@ -303,7 +319,11 @@ impl Joins {
         found
     }
 
-    /// Every join this HOLDER is inside in one domain.
+    /// Every join this HOLDER is inside in one domain, of `account`'s.
+    ///
+    /// The account is the same defence it is in [`Joins::holds`]: the holder
+    /// decides, and the account is what a routed write's binding used to rest
+    /// on and now goes on resting on here too.
     ///
     /// The registry rather than a list the caller kept, and that is the whole
     /// of the stateless story: a modern-era peer is a fresh server object per
@@ -311,13 +331,16 @@ impl Joins {
     /// forgotten. Asking here means its second request finds the join its
     /// first one opened, and finds it ended the moment a revoke, a rename, a
     /// discard or a fold ended it.
-    pub fn held_by(&self, holder: &Holder, domain: &str) -> Vec<Join> {
+    pub fn held_by(&self, account: &str, holder: &Holder, domain: &str) -> Vec<Join> {
         let now = Instant::now();
         let mut open = self.lock();
         Self::expire_locked(&mut open, now);
         let mut found = Vec::new();
         for held in open.values_mut() {
-            if &held.join.holder == holder && held.join.domain == domain {
+            if held.join.account == account
+                && &held.join.holder == holder
+                && held.join.domain == domain
+            {
                 held.last_used = now;
                 found.push(held.join.clone());
             }
@@ -501,8 +524,9 @@ mod tests {
             in_browser, agents,
             "one key per holder, and these are two holders"
         );
-        assert!(joins.holds(&browser("bob"), "team", "alice", "plan.md"));
+        assert!(joins.holds("bob", &browser("bob"), "team", "alice", "plan.md"));
         assert!(joins.holds(
+            "bob",
             &Holder::Token("bob".to_string()),
             "team",
             "alice",
@@ -604,12 +628,12 @@ mod tests {
             })
             .unwrap();
 
-        let here = joins.held_by(&holder, "team");
+        let here = joins.held_by("bob", &holder, "team");
         assert_eq!(here.len(), 1, "{here:?}");
         assert_eq!(here[0].owner, "alice");
         assert_eq!(here[0].path, "plan.md");
         assert!(
-            joins.held_by(&browser("bob"), "team").is_empty(),
+            joins.held_by("bob", &browser("bob"), "team").is_empty(),
             "another holder of the same account is inside nothing"
         );
     }
@@ -697,13 +721,18 @@ mod tests {
     fn holding_a_join_is_asked_by_the_holder_rather_than_by_the_key() {
         let joins = Joins::default();
         let key = joins.open(join("bob")).unwrap();
-        assert!(joins.holds(&browser("bob"), "team", "alice", "plan.md"));
+        assert!(joins.holds("bob", &browser("bob"), "team", "alice", "plan.md"));
         assert!(
-            !joins.holds(&browser("carol"), "team", "alice", "plan.md"),
+            !joins.holds("carol", &browser("carol"), "team", "alice", "plan.md"),
             "somebody else is not inside it"
         );
         assert!(
+            !joins.holds("bob", &browser("carol"), "team", "alice", "plan.md"),
+            "and neither is somebody else's window under this account's name"
+        );
+        assert!(
             !joins.holds(
+                "bob",
                 &Holder::Token("bob".to_string()),
                 "team",
                 "alice",
@@ -711,12 +740,12 @@ mod tests {
             ),
             "and neither is another holder of the same account"
         );
-        assert!(!joins.holds(&browser("bob"), "team", "carol", "plan.md"));
-        assert!(!joins.holds(&browser("bob"), "other", "alice", "plan.md"));
-        assert!(!joins.holds(&browser("bob"), "team", "alice", "charter.md"));
+        assert!(!joins.holds("bob", &browser("bob"), "team", "carol", "plan.md"));
+        assert!(!joins.holds("bob", &browser("bob"), "other", "alice", "plan.md"));
+        assert!(!joins.holds("bob", &browser("bob"), "team", "alice", "charter.md"));
         joins.close(&key, "bob");
         assert!(
-            !joins.holds(&browser("bob"), "team", "alice", "plan.md"),
+            !joins.holds("bob", &browser("bob"), "team", "alice", "plan.md"),
             "and leaving ends it"
         );
     }

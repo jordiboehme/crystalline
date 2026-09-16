@@ -1461,7 +1461,13 @@ fn http_base(
         None
     };
     let service = StreamableHttpService::new(
-        move || Ok(McpServer::new_http(engine.clone())),
+        {
+            // The live-session map goes to every server object this factory
+            // builds, so a request naming a session can be told from one this
+            // process is actually serving - see `McpServer::holder_of`.
+            let owners = session_owners.clone();
+            move || Ok(McpServer::new_http(engine.clone()).with_session_owners(owners.clone()))
+        },
         session_manager,
         http_config(allowed_hosts),
     );

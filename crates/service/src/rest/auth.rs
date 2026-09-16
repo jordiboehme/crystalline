@@ -364,12 +364,16 @@ impl Identity {
     /// `None` for a request with no account: a link binds to an account, so
     /// there is no join for an anonymous caller to hold.
     ///
-    /// The fallback is for the header-auth modes, where an identity can be
-    /// real while no session row has been minted for it yet (nothing has
-    /// called `/auth/me`). Those requests are named by the account, which is
-    /// the granularity a forward-auth proxy gives them anyway - the proxy IS
-    /// the session there - and it can never collide with a minted token, which
-    /// is random hex.
+    /// The fallback is for a real identity with no session row anywhere to
+    /// take a token from. In the header-auth modes that is rarer than it
+    /// sounds: [`header_mode_csrf`] prefers the cookie's token and otherwise
+    /// falls back to that account's newest live session, so those requests
+    /// usually carry a minted token - and two windows of that account then
+    /// share it, which is one browser holder per account in those modes and is
+    /// what a forward-auth proxy gives them anyway, the proxy being the
+    /// session there. Only an account with no live session at all reaches this
+    /// line, and naming it by the account can never collide with a minted
+    /// token, which is random hex and carries no colon.
     pub fn holder(&self) -> Option<crate::join::Holder> {
         let user = self.user.as_ref()?;
         Some(crate::join::Holder::Browser(match &self.csrf {

@@ -1258,6 +1258,21 @@ impl Drop for SessionJoins {
     }
 }
 
+/// The `Mcp-Session-Id` a request carried, if any.
+///
+/// Read off the HTTP parts rmcp injects into the request extensions, the same
+/// place [`mcp_identity`] reads the gate's answer from. Carrying a session id
+/// is not on its own what makes a request a session - see
+/// [`McpServer::holder_of`], which is this function's only caller.
+fn session_header(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.headers.get("mcp-session-id"))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Numbers one `McpServer` apart from another on the transports where the
 /// server object IS the holder. A daemon serves many stdio-shaped connections
 /// at once, so the process id alone would make them one holder and any one of
@@ -1298,6 +1313,13 @@ pub struct McpServer {
     /// This server object's number, which is the holder id on the transports
     /// where the object is the holder. See [`SessionJoins`].
     server: u64,
+    /// The legacy sessions this process has minted and not yet ended, so
+    /// [`McpServer::holder_of`] can tell a session id this server is actually
+    /// serving from one a client simply sent. `None` on every construction
+    /// that has no session manager behind it - stdio, the daemon's socket, a
+    /// test building a server directly - where no request is a legacy session
+    /// anyway.
+    sessions: Option<Arc<crate::mcp_gate::SessionOwners>>,
 }
 
 impl McpServer {
@@ -1319,7 +1341,20 @@ impl McpServer {
             harness_onboarded: false,
             joins,
             server: NEXT_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            sessions: None,
         }
+    }
+
+    /// Hand this server the map of live legacy sessions, so it can tell one it
+    /// is serving from an id a client sent. Called by the streamable-HTTP
+    /// service factory, which is the one construction that has a session
+    /// manager behind it.
+    pub fn with_session_owners(
+        mut self,
+        sessions: Arc<crate::mcp_gate::SessionOwners>,
+    ) -> McpServer {
+        self.sessions = Some(sessions);
+        self
     }
 
     /// Which holder this call's joins belong to, and so what ends them.
@@ -1333,12 +1368,30 @@ impl McpServer {
     /// * **stdio, and the daemon's own socket, are a process**, numbered per
     ///   server object so a daemon serving several at once keeps them apart.
     ///   Its joins end when the object does, which is when the connection does.
-    /// * **an HTTP request carrying an `Mcp-Session-Id` is that session.** The
-    ///   legacy lifecycle: the transport owns the session's ending, and the
-    ///   server object built for it goes with it.
-    /// * **an HTTP request with no session is a token identity**, which is
-    ///   what the 2026-07-28 era has instead of a session. Nothing on that
-    ///   path is an ending, so the registry ends those by idleness.
+    /// * **a legacy-shaped HTTP request on a session this process minted is
+    ///   that session.** The legacy lifecycle: the transport owns the
+    ///   session's ending, and the server object built for it goes with it.
+    /// * **every other HTTP request is a token identity**, which is what the
+    ///   2026-07-28 era has instead of a session. Nothing on that path is an
+    ///   ending, so the registry ends those by idleness.
+    ///
+    /// **Both halves of the session test are load bearing, and the first is
+    /// the one that is easy to get wrong.** rmcp decides whether a request is
+    /// served by a per-session object from the BODY - `is_legacy_request`
+    /// reads `initialize`, the era's `_meta` keys and the version, and never
+    /// touches the session header - so an era-shaped `tools/call` carrying a
+    /// session id is routed statelessly and its server object lives for that
+    /// one request. Naming it a session here would put its join on an object
+    /// that is about to be dropped, which is exactly the failure the holder
+    /// exists to close, reached through a dual-era client or a proxy that
+    /// echoes the header. So the shape is asked first, in the same terms rmcp
+    /// asks it: this request's own revision, negotiated or from its `_meta`.
+    ///
+    /// The second half is that the id has to be one this process is actually
+    /// serving. An id nothing minted has no session behind it and no ending to
+    /// wait for; the gate refuses a claim belonging to somebody ELSE with a
+    /// 403, and an unclaimed one it lets through, so this is where an
+    /// unclaimed one stops being a holder.
     ///
     /// `None` when the request carries no account at all, which is the
     /// anonymous open tier: a share-link binds to an account, so there is no
@@ -1347,16 +1400,18 @@ impl McpServer {
         match self.transport {
             Transport::Stdio => Some(crate::join::Holder::Process(self.server)),
             Transport::Http => {
-                if let Some(session) = ctx
-                    .extensions
-                    .get::<axum::http::request::Parts>()
-                    .and_then(|parts| parts.headers.get("mcp-session-id"))
-                    .and_then(|value| value.to_str().ok())
-                    .filter(|value| !value.is_empty())
+                let account = mcp_account(ctx)?;
+                let legacy_shaped = ctx
+                    .protocol_version()
+                    .is_none_or(|version| version < ProtocolVersion::V_2026_07_28);
+                if legacy_shaped
+                    && let Some(session) = session_header(ctx)
+                    && let Some(owners) = &self.sessions
+                    && owners.owner(&session).as_deref() == Some(account.as_str())
                 {
-                    return Some(crate::join::Holder::McpSession(session.to_string()));
+                    return Some(crate::join::Holder::McpSession(session));
                 }
-                mcp_account(ctx).map(crate::join::Holder::Token)
+                Some(crate::join::Holder::Token(account))
             }
         }
     }
@@ -1373,7 +1428,7 @@ impl McpServer {
         scope: &Scope,
         ctx: &RequestContext<RoleServer>,
         token: &str,
-    ) -> std::result::Result<crate::join::Join, crate::engine::EngineError> {
+    ) -> std::result::Result<crate::engine::OpenedLink, crate::engine::EngineError> {
         let Some(holder) = self.holder_of(ctx) else {
             return Err(crate::engine::EngineError::Refused(
                 "a draft share-link binds to an account, and this session has none: authenticate \
@@ -1381,9 +1436,32 @@ impl McpServer {
                     .to_string(),
             ));
         };
-        let (key, join) = self.engine.open_share_link(token, scope, &holder).await?;
-        self.joins.remember(&join, key);
-        Ok(join)
+        let opened = self.engine.open_share_link(token, scope, &holder).await?;
+        if let crate::engine::OpenedLink::Joined { key, join } = &opened {
+            self.joins.remember(join, key.clone());
+        }
+        Ok(opened)
+    }
+
+    /// Present a link on a WRITE: the join it opened, or the refusal that says
+    /// why this caller may read the draft and not write in it.
+    ///
+    /// The other half of [`crate::engine::OpenedLink`]'s two answers. A read
+    /// takes `ReadOnly` as an answer; a write asked to land inside the draft
+    /// and cannot, so for it the sentence is the refusal it always was.
+    async fn joined_by(
+        &self,
+        scope: &Scope,
+        ctx: &RequestContext<RoleServer>,
+        token: &str,
+    ) -> Result<crate::join::Join, ErrorData> {
+        match self.enter_draft(scope, ctx, token).await {
+            Ok(crate::engine::OpenedLink::Joined { join, .. }) => Ok(join),
+            Ok(crate::engine::OpenedLink::ReadOnly(reason)) => {
+                Err(to_error(crate::engine::EngineError::Refused(reason)))
+            }
+            Err(err) => Err(to_error(err)),
+        }
     }
 
     /// The join this session holds that `identifier` names, or `None`.
@@ -1408,11 +1486,12 @@ impl McpServer {
         domain: &str,
         identifier: &str,
     ) -> Option<crate::join::Join> {
+        let account = crate::scope::overlay_actor(scope)?;
         let holder = self.holder_of(ctx)?;
         // The registry, not a list kept on this object: a stateless peer's
         // second request is a different object, so anything this one
         // remembered it would have forgotten. See [`SessionJoins`].
-        let held = self.engine.joins().held_by(&holder, domain);
+        let held = self.engine.joins().held_by(&account, &holder, domain);
         for join in held {
             let named = self
                 .engine
@@ -1673,11 +1752,7 @@ impl McpServer {
         // verb derives its destination from the title rather than resolving a
         // page, so there is no identifier to work out which draft was meant.
         let join = match p.share_link.as_deref() {
-            Some(token) => Some(
-                self.enter_draft(&scope, &ctx, token)
-                    .await
-                    .map_err(to_error)?,
-            ),
+            Some(token) => Some(self.joined_by(&scope, &ctx, token).await?),
             None => None,
         };
 
@@ -1779,19 +1854,21 @@ impl McpServer {
         // that was handed a link and is reading with it has decided both, the
         // same way a person pressing the button in a browser has.
         //
-        // **A refusal to JOIN therefore does not fail the READ.** A grantee
-        // who may read the draft and not edit it, and one already working in
-        // as many drafts as this instance keeps open for one account, have
-        // each redeemed the link and asked for exactly what their grant is
-        // for; failing the read would answer a question nobody asked. A link
-        // that opens NOTHING is the other case and is raised: that caller is
-        // reading a page they were told they had been given, and the sentence
-        // saying the link is dead is the only useful answer there is.
-        if let Some(token) = p.share_link.as_deref()
-            && let Err(err) = self.enter_draft(&scope, &ctx, token).await
-            && !matches!(err, crate::engine::EngineError::Refused(_))
-        {
-            return Err(to_error(err));
+        // **A refused JOIN is not a failed READ, and the type is what says so.**
+        // A grantee who may read the draft and not edit it, and one already
+        // working in as many drafts as this instance keeps open for one
+        // account, are [`crate::engine::OpenedLink::ReadOnly`] rather than
+        // errors: each redeemed the link and asked for exactly what their
+        // grant is for. Every way the link itself opens NOTHING is still an
+        // error and is raised here - a dead link, a draft that has gone, a
+        // caller with no account at all - because that caller is reading a
+        // page they were told they had been given, and answering them the
+        // domain's own page in silence would let them report it as somebody's
+        // draft.
+        if let Some(token) = p.share_link.as_deref() {
+            self.enter_draft(&scope, &ctx, token)
+                .await
+                .map_err(to_error)?;
         }
         let value = self
             .engine
@@ -1853,11 +1930,7 @@ impl McpServer {
         // the identifier names. An edit of anything else in that domain is the
         // session's own, exactly as it was before it joined anything.
         let join = match p.share_link.as_deref() {
-            Some(token) => Some(
-                self.enter_draft(&scope, &ctx, token)
-                    .await
-                    .map_err(to_error)?,
-            ),
+            Some(token) => Some(self.joined_by(&scope, &ctx, token).await?),
             None => {
                 self.joined_for(&scope, &ctx, &p.domain, &p.identifier)
                     .await
@@ -4580,6 +4653,7 @@ mod tests {
             "and the person's browser is still inside the draft it joined"
         );
         assert!(registry.holds(
+            "bob",
             &crate::join::Holder::Browser("csrf-bob".to_string()),
             "team",
             "alice",
@@ -4622,7 +4696,11 @@ mod tests {
         // The next POST, a different object, finds it in the registry.
         let second = SessionJoins::new(registry.clone());
         assert_eq!(
-            registry.held_by(&crate::join::Holder::Token("bob".to_string()), "team"),
+            registry.held_by(
+                "bob",
+                &crate::join::Holder::Token("bob".to_string()),
+                "team"
+            ),
             vec![join],
             "which is where a stateless peer's second request looks"
         );
@@ -4651,12 +4729,16 @@ mod tests {
         let agent = SessionJoins::new(registry.clone());
         assert!(
             registry
-                .held_by(&crate::join::Holder::Token("bob".to_string()), "team")
+                .held_by(
+                    "bob",
+                    &crate::join::Holder::Token("bob".to_string()),
+                    "team"
+                )
                 .is_empty(),
             "the agent's holder opened nothing, so it is inside nothing"
         );
         assert!(
-            registry.holds(&browser, "team", "alice", "fresh.md"),
+            registry.holds("bob", &browser, "team", "alice", "fresh.md"),
             "while the window that joined it is inside it"
         );
         drop(agent);

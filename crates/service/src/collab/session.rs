@@ -612,14 +612,16 @@ struct SessionState {
     /// Awareness client ids seen per connection, nulled on its disconnect.
     conns: HashMap<ConnId, HashSet<ClientID>>,
     /// The connections that are in this room as somebody's guest, and the
-    /// join holder each of them is inside on. Empty in every room over a
-    /// document its participants own, which is nearly all of them.
+    /// account and join holder each of them is inside on. Empty in every room
+    /// over a document its participants own, which is nearly all of them.
     ///
-    /// The holder rather than the account: a join belongs to one browser
-    /// session, so the question "is this socket still inside the draft" is
-    /// about that session's join and not about whatever else the account may
-    /// have joined from somewhere else.
-    guests: HashMap<ConnId, crate::join::Holder>,
+    /// The holder rather than the account decides: a join belongs to one
+    /// browser session, so the question "is this socket still inside the
+    /// draft" is about that session's join and not about whatever else the
+    /// account may have joined from somewhere else. The account is carried
+    /// beside it because the registry asks for both - see
+    /// [`crate::join::Joins::holds`], where it is the same defence.
+    guests: HashMap<ConnId, (String, crate::join::Holder)>,
     dirty: bool,
     /// When the most recent update landed: the debounce timer's input.
     last_edit: Option<Instant>,
@@ -931,9 +933,11 @@ impl CollabSession {
     ///
     /// Called by the upgrade route once it has decided the connection may be
     /// here at all; a room over nobody's draft never has one.
-    pub async fn watch_guest(&self, conn: ConnId, holder: &crate::join::Holder) {
+    pub async fn watch_guest(&self, conn: ConnId, account: &str, holder: &crate::join::Holder) {
         let mut state = self.state.lock().await;
-        state.guests.insert(conn, holder.clone());
+        state
+            .guests
+            .insert(conn, (account.to_string(), holder.clone()));
         self.has_guests.store(true, Ordering::Relaxed);
     }
 
@@ -964,7 +968,9 @@ impl CollabSession {
         let ended: Vec<ConnId> = state
             .guests
             .iter()
-            .filter(|(_, holder)| !joins.holds(holder, &self.domain, owner, &path))
+            .filter(|(_, (account, holder))| {
+                !joins.holds(account, holder, &self.domain, owner, &path)
+            })
             .map(|(conn, _)| *conn)
             .collect();
         for conn in ended {
