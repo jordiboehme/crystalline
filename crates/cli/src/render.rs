@@ -404,7 +404,16 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "{}", crystalline_service::engine::EVOLVE_GUIDANCE)
 }
 
-/// `write`: a single confirmation line carrying the new engram's address.
+/// `write`: a confirmation line carrying the new engram's address, and where
+/// the text actually landed when that is not the plain answer.
+///
+/// **Where it landed is part of the receipt, not a detail of the machinery.**
+/// A write on a domain that reviews changes joins this account's own draft and
+/// the folder the team reads does not move; a write over a page somebody has
+/// open in the editor composes into their document while they are looking at
+/// it. Both are what the spec's receipt clause asks to be said out loud, and
+/// the terminal is where the person who typed the command is looking. `--json`
+/// carries the keys themselves for anything reading this by machine.
 pub fn render_write(v: &Value, out: &mut impl Write) -> io::Result<()> {
     let (Some(domain), Some(permalink)) = (
         v.get("domain").and_then(Value::as_str),
@@ -413,7 +422,46 @@ pub fn render_write(v: &Value, out: &mut impl Write) -> io::Result<()> {
         return pretty_fallback(v, out);
     };
     let action = v.get("action").and_then(Value::as_str).unwrap_or("wrote");
-    writeln!(out, "{action} crystalline://{domain}/{permalink}")
+    writeln!(out, "{action} crystalline://{domain}/{permalink}")?;
+    if v.get("landed").and_then(Value::as_str) == Some("live") {
+        // Who is about to watch the page change under them, named because
+        // this is the one write that reaches a document somebody is inside.
+        let present: Vec<&str> = v
+            .get("present")
+            .and_then(Value::as_array)
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        match names_in_words(&present) {
+            Some(names) => writeln!(
+                out,
+                "  landed in the open document; {names} have it open right now"
+            )?,
+            None => writeln!(out, "  landed in the open document")?,
+        }
+    }
+    // Whose draft, before whether it is a draft at all: a write routed into
+    // somebody else's shared draft is a draft too, and calling it this
+    // account's own would be the one thing the receipt must never say.
+    if let Some(joined) = v.get("joined").and_then(Value::as_str) {
+        writeln!(out, "  {joined}")?;
+    } else if v.get("draft") == Some(&Value::Bool(true)) {
+        writeln!(
+            out,
+            "  landed in your private draft; the shared tree did not move"
+        )?;
+    }
+    Ok(())
+}
+
+/// A list of people as a sentence says one: "Ada", "Ada and Bo", "Ada, Bo and
+/// Cy". `None` when there is nobody to name, which is a sentence that has to
+/// be written differently rather than one with a hole in it.
+fn names_in_words(names: &[&str]) -> Option<String> {
+    match names {
+        [] => None,
+        [one] => Some((*one).to_string()),
+        [rest @ .., last] => Some(format!("{} and {last}", rest.join(", "))),
+    }
 }
 
 #[cfg(test)]
@@ -769,6 +817,91 @@ mod tests {
 
     #[test]
     fn write_confirms_action_and_address() {
+        let v = json!({ "domain": "eng", "permalink": "zeta", "action": "created" });
+        let out = render_to_string(render_write, &v);
+        assert_eq!(out, "created crystalline://eng/zeta\n");
+    }
+
+    // Spec section 14: a write that landed in a live document says so and
+    // names who is present. The terminal is where the person who typed it is
+    // looking, so it is where that has to be said.
+    #[test]
+    fn write_says_it_landed_in_the_open_document_and_who_is_in_there() {
+        let v = json!({
+            "domain": "team",
+            "permalink": "plan",
+            "action": "wrote",
+            "landed": "live",
+            "present": ["Ada Lovelace", "Grace Hopper"],
+        });
+        let out = render_to_string(render_write, &v);
+        assert_eq!(
+            out,
+            concat!(
+                "wrote crystalline://team/plan\n",
+                "  landed in the open document; Ada Lovelace and Grace Hopper ",
+                "have it open right now\n"
+            )
+        );
+    }
+
+    #[test]
+    fn write_says_the_open_document_even_when_nobody_is_named() {
+        let v = json!({
+            "domain": "team",
+            "permalink": "plan",
+            "action": "wrote",
+            "landed": "live",
+            "present": [],
+        });
+        let out = render_to_string(render_write, &v);
+        assert_eq!(
+            out,
+            "wrote crystalline://team/plan\n  landed in the open document\n"
+        );
+    }
+
+    // A domain that reviews changes: the write is real and the folder the team
+    // reads did not move. A receipt that said only "wrote" would leave the
+    // operator with no way to learn that from the terminal at all.
+    #[test]
+    fn write_says_a_draft_did_not_move_the_shared_tree() {
+        let v = json!({
+            "domain": "team",
+            "permalink": "plan",
+            "action": "wrote",
+            "draft": true,
+        });
+        let out = render_to_string(render_write, &v);
+        assert_eq!(
+            out,
+            concat!(
+                "wrote crystalline://team/plan\n",
+                "  landed in your private draft; the shared tree did not move\n"
+            )
+        );
+    }
+
+    // And a write into somebody else's shared draft says whose it is rather
+    // than calling it this account's own.
+    #[test]
+    fn write_says_whose_draft_a_joined_one_landed_in() {
+        let v = json!({
+            "domain": "team",
+            "permalink": "plan",
+            "action": "wrote",
+            "draft": true,
+            "joined": "landed in alice's draft",
+        });
+        let out = render_to_string(render_write, &v);
+        assert_eq!(
+            out,
+            "wrote crystalline://team/plan\n  landed in alice's draft\n"
+        );
+    }
+
+    #[test]
+    fn write_says_nothing_extra_about_an_ordinary_page() {
         let v = json!({ "domain": "eng", "permalink": "zeta", "action": "created" });
         let out = render_to_string(render_write, &v);
         assert_eq!(out, "created crystalline://eng/zeta\n");

@@ -410,7 +410,10 @@ enum Command {
         /// Extra frontmatter as a JSON object.
         #[arg(long)]
         metadata: Option<String>,
-        /// Overwrite an existing engram with the same permalink.
+        /// Overwrite an existing engram with the same permalink. Where
+        /// somebody has that page open in the web editor, the new text lands
+        /// in their open document while they are looking at it; the receipt
+        /// says so and names who is in there.
         #[arg(long)]
         overwrite: bool,
         /// Load the global config from this file instead of the default path.
