@@ -965,7 +965,7 @@ export interface paths {
         post?: never;
         /**
          * Revoke one share-link.
-         * @description It stops opening anything at once, and the account it was redeemed by stops seeing the draft on its next request. 404 when the id names no link of the caller's, which is what somebody else's link and an invented id both answer: a revoke is never a probe for which links exist. Served on a read-only instance, like every other account-state route.
+         * @description It stops opening anything at once, and the account it was redeemed by stops seeing the draft on its next request. A session that was working inside the draft is put back outside it, so a grantee who had already joined stops writing into it rather than carrying on until they leave; anybody else holding a live link to the same draft is put outside it too and joins again in one press. 404 when the id names no link of the caller's, which is what somebody else's link and an invented id both answer: a revoke is never a probe for which links exist. Served on a read-only instance, like every other account-state route.
          */
         delete: operations["revoke_draft_link"];
         options?: never;

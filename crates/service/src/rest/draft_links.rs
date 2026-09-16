@@ -22,9 +22,11 @@
 //!   for good (`AuthStore::redeem_overlay_grant`), so a link forwarded on
 //!   opens nothing for whoever it was forwarded to.
 //! - **Revocable, and it ends with its draft.** Its author can take it back at
-//!   any time, and folding or discarding the draft ends every link on it
-//!   (`Engine::end_domain_grants`): a grant lasts as long as the thing it
-//!   grants.
+//!   any time - which ends the sessions working inside that draft as well as
+//!   the row, so "not you, not any more" is true at once rather than at the
+//!   grantee's convenience - and folding or discarding the draft ends every
+//!   link on it (`Engine::end_domain_grants`): a grant lasts as long as the
+//!   thing it grants.
 //! - **Seeing is not editing.** Redeeming a link lets the grantee READ the
 //!   draft. Typing into it needs a second, explicit step - a **join**, which
 //!   belongs to a session rather than to the account (see [`crate::join`]) -
@@ -364,7 +366,12 @@ pub async fn list(
     params(("id" = i64, Path, description = "The link's row id.")),
     summary = "Revoke one share-link.",
     description = "It stops opening anything at once, and the account it was \
-                   redeemed by stops seeing the draft on its next request. \
+                   redeemed by stops seeing the draft on its next request. A \
+                   session that was working inside the draft is put back \
+                   outside it, so a grantee who had already joined stops \
+                   writing into it rather than carrying on until they leave; \
+                   anybody else holding a live link to the same draft is put \
+                   outside it too and joins again in one press. \
                    404 when the id names no link of the caller's, which is \
                    what somebody else's link and an invented id both answer: \
                    a revoke is never a probe for which links exist. Served on \
@@ -404,11 +411,29 @@ pub async fn revoke(
         .revoke_overlay_grant(&user.name, id)
         .await
         .map_err(|e| ApiError::internal(format!("{e:#}")))?;
-    if !removed {
+    let Some(ended) = removed else {
         return Err(ApiError::not_found(
             "you minted no draft share-link with that id",
         ));
-    }
+    };
+    // **And the sessions inside the draft end with it.** Revoking is the
+    // author saying "not you, not any more", and a row that stops opening the
+    // draft while an already-open join goes on writing into it would have said
+    // only half of that: the grantee would keep typing into her work until
+    // they happened to leave. Ended here rather than in the store, because a
+    // join belongs to this process and to the session holding it - see
+    // [`crate::join`] - and there is nothing about it in any database.
+    //
+    // Ended by the DRAFT rather than by the grantee, because that is the only
+    // thing a join names. A second grantee whose own link stands is put
+    // outside the draft too and is one press from being back in it, which is
+    // the nudge this trades for never leaving a revoked session inside. The
+    // GRANTS on the draft are deliberately untouched: ending those would turn
+    // taking one link back into taking everybody's back.
+    state
+        .engine
+        .joins()
+        .end_draft(&ended.domain, &ended.owner, &ended.path);
     Ok(StatusCode::NO_CONTENT)
 }
 

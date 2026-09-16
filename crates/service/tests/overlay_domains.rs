@@ -5648,6 +5648,64 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
     );
 }
 
+/// The THIRD seam, and the one the other two say nothing about: where an
+/// overlay row goes away, which is where its share-links and its joins have to
+/// go away with it.
+///
+/// A grant lasts exactly as long as the thing it grants. A row that is taken
+/// away while a link on it stands leaves that link merely dormant, to spring
+/// back onto whatever its author drafts at the path next - a different text,
+/// written after they took the first one back, handed to somebody neither of
+/// them would have told - and leaves whoever was inside it writing into an
+/// entry that is not there. So the ending is not a thing each verb remembers:
+/// it lives at the two places a row can stop being a draft, and this pins that
+/// there are still only two.
+///
+/// * **Removed** - the row goes, which only [`DomainView::drop`] does. The
+///   discard, the fold, a withdrawal, a conflict resolution, a settled
+///   convergence and both of a rename's undo paths all reach it, and each
+///   inherits the ending rather than repeating it.
+/// * **Replaced** - the row stays and stops being a draft of the page,
+///   standing as this actor's deletion of what the team holds instead. Two
+///   verbs do that, the delete and the move's source half, and each ends the
+///   grants itself beside its call to the drop.
+///
+/// The WRITER is deliberately no such seam: a draft being saved is the same
+/// draft, and ending its links on every save would mean a grant that survived
+/// only until its author next typed.
+///
+/// A source scan for the reason the two guards above are one - the failure it
+/// pins is a call site added later in the wrong place, which no request can be
+/// written to provoke in advance. It walks `crates/service/src` alone, which is
+/// the frame that matters: the index crate holds the two backend
+/// implementations of the clearing statement, and a caller that took a row away
+/// without ending its grants would be added here, above them.
+#[test]
+fn an_overlay_row_goes_away_only_where_its_grants_and_joins_end() {
+    only_these_reach(
+        "clear_overlay_entry(",
+        // The one remover. `DomainView::drop` ends the grants and the joins
+        // after its transaction commits; every verb that undoes a draft goes
+        // through it.
+        &[("domain_view.rs", "drop")],
+        "an overlay row is cleared from a function that is not the drop seam; a draft taken away          there keeps its share-links, which spring back onto whatever its author drafts at that          path next, and keeps the sessions that were writing inside it",
+    );
+    only_these_reach(
+        "write_overlay_tombstone(",
+        &[
+            // The seam itself.
+            ("engine.rs", "write_overlay_tombstone"),
+            // This actor's deletion of the page the team holds, standing where
+            // their draft of it stood. Ends the grants beside it.
+            ("engine.rs", "delete_engram_as"),
+            // The source half of a rename, which is the same replacement at
+            // the path the draft left. Ends the grants beside it too.
+            ("domain_view.rs", "move_within"),
+        ],
+        "a draft is replaced by a tombstone from a function that does not end its grants and          joins; the row is no longer a draft of that page, so a link on it opens something its          author never shared and a session inside it is inside somebody's deletion",
+    );
+}
+
 // --- Task 11c: links resolve onto the author's own drafts -------------------
 
 /// A base engram that points at the plan, for the tests about what a team link

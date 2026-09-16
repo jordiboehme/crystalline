@@ -2837,31 +2837,61 @@ impl AuthStore {
         Ok(out)
     }
 
-    /// Take one link back. `false` when `id` names no link of `owner`'s, which
-    /// is what somebody else's link and an invented id both answer: a revoke
-    /// is never a probe for which links exist.
+    /// Take one link back, and answer the row it was. `None` when `id` names no
+    /// link of `owner`'s, which is what somebody else's link and an invented id
+    /// both answer: a revoke is never a probe for which links exist.
+    ///
+    /// **The row rather than a yes**, because taking a link back is not only a
+    /// fact about the row: a session may be working inside the draft it opened
+    /// at this moment, and the caller has to be told which draft that is to put
+    /// them back outside it. Read here rather than asked for separately, since
+    /// the row is this store's own word about the draft - already normalized,
+    /// and already the one the update matched.
     ///
     /// The row is kept and stamped rather than deleted, so a link presented
     /// after the fact is a link that was taken back rather than a token that
     /// was never minted, and so the author's own audit of who they shared with
-    /// survives the revoke.
-    pub async fn revoke_overlay_grant(&self, owner: &str, id: i64) -> Result<bool> {
+    /// survives the revoke. The record answered carries the stamp, so what the
+    /// caller reads is the link as it now stands.
+    pub async fn revoke_overlay_grant(&self, owner: &str, id: i64) -> Result<Option<OverlayGrant>> {
         let owner = normalize_account_name(owner)?;
+        let revoked_at = chrono::Utc::now().to_rfc3339();
         let _guard = self.guard.lock().await;
-        let changed = self
+        // Read and then stamp, both under the one guard and both naming the
+        // same normalized owner: a row the read matched and the update did not
+        // would be a revoke that answered a draft it never took a link off.
+        let mut rows = self
             .conn
+            .query(
+                "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
+                 FROM overlay_grant
+                 WHERE id = ?1 AND owner = ?2 AND revoked_at IS NULL",
+                vec![Value::Integer(id), Value::Text(owner.clone())],
+            )
+            .await
+            .with_context(|| format!("revoking a draft share-link for '{owner}'"))?;
+        let found = rows
+            .next()
+            .await
+            .with_context(|| format!("revoking a draft share-link for '{owner}'"))?
+            .map(|row| grant_from_row(&row));
+        let Some(mut grant) = found else {
+            return Ok(None);
+        };
+        self.conn
             .execute(
                 "UPDATE overlay_grant SET revoked_at = ?1
                  WHERE id = ?2 AND owner = ?3 AND revoked_at IS NULL",
                 vec![
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(revoked_at.clone()),
                     Value::Integer(id),
                     Value::Text(owner.clone()),
                 ],
             )
             .await
             .with_context(|| format!("revoking a draft share-link for '{owner}'"))?;
-        Ok(changed > 0)
+        grant.revoked_at = Some(revoked_at);
+        Ok(Some(grant))
     }
 
     /// Whose draft `account` may see at that path, or `None` for the ordinary
@@ -8976,14 +9006,38 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1, "the author sees what they minted");
         assert!(
-            !store.revoke_overlay_grant("bob", revoked.id).await.unwrap(),
+            store
+                .revoke_overlay_grant("bob", revoked.id)
+                .await
+                .unwrap()
+                .is_none(),
             "and nobody else can take it back"
+        );
+        let taken = store
+            .revoke_overlay_grant("alice", revoked.id)
+            .await
+            .unwrap()
+            .expect("its author takes it back");
+        assert_eq!(
+            (
+                taken.domain.as_str(),
+                taken.owner.as_str(),
+                taken.path.as_str()
+            ),
+            ("team", "alice", "plan.md"),
+            "and the row says which draft it was on, which is what ends the sessions inside it"
+        );
+        assert!(
+            taken.revoked_at.is_some(),
+            "answered as it now stands, taken back"
         );
         assert!(
             store
                 .revoke_overlay_grant("alice", revoked.id)
                 .await
                 .unwrap()
+                .is_none(),
+            "and taking back what is already back is nothing at all"
         );
         assert!(
             store

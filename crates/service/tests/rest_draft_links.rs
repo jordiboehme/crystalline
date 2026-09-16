@@ -2116,3 +2116,237 @@ async fn two_authors_drafts_of_one_page_are_two_joins() {
         );
     }
 }
+
+/// Taking a link back ends the session that was working inside it.
+///
+/// Revoking is the author saying "not you, not any more", and until it reaches
+/// the joins it only half said it: the row stops opening the draft on the next
+/// request, and a session that had already joined went on typing into her work
+/// until it happened to leave. So the revoke ends the joins on that draft the
+/// same way every other ending does.
+///
+/// Three things are asserted, and the middle one is the fix: the join was live
+/// and landing in her draft before, the registry holds nothing after, and the
+/// next write still presenting the key lands nowhere - her draft says exactly
+/// what it said when she took the link back.
+///
+/// **What that write is told is the ordinary miss**, not the "join it, or draft
+/// your own" teaching a grantee gets: the teaching is read off the links this
+/// account holds, and bob holds none any more. Telling him to join would be
+/// telling him her draft is still there, which is the one thing review mode
+/// does not say to somebody who was never in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_link_ends_the_join_that_was_open_on_it() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    let path = f
+        .draft("alice", "Fresh", "The thing alice is drafting.")
+        .await;
+    let minted = f.mint(&alice, &path).await;
+    let id = minted["id"].as_i64().unwrap();
+    let token = minted["token"].as_str().unwrap().to_string();
+    let joined: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key = joined["join_key"].as_str().unwrap().to_string();
+    let checksum = joined["checksum"].as_str().unwrap().to_string();
+
+    // The join is live, and a write through it lands in her draft: this is the
+    // state the revoke has to end, asserted rather than assumed.
+    let landed = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .header("if-match", format!("\"{checksum}\""))
+        .header("x-crystalline-join", &key)
+        .json(&serde_json::json!({"content": joined["content"]
+            .as_str()
+            .unwrap()
+            .replace("The thing alice is drafting", "Bob was welcome here")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(landed.status(), 200, "{:?}", landed.text().await);
+    let after_write = f.reads(&alice, "fresh").await;
+    let fresh_checksum = after_write["checksum"].as_str().unwrap().to_string();
+
+    // Alice takes the link back.
+    let revoked = bob
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/draft-links/{id}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        revoked.status(),
+        404,
+        "and it is hers to take back and nobody else's"
+    );
+    let revoked = alice
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/draft-links/{id}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 204, "{:?}", revoked.text().await);
+
+    // The registry is what the bar at the top of bob's screen reads on its
+    // next look, and it holds nothing.
+    assert!(
+        f.engine.joins().get(&key, "bob").is_none(),
+        "the join ended with the link it was opened on"
+    );
+
+    // And the write still presenting the key reaches nothing of hers.
+    let written = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .header("if-match", format!("\"{fresh_checksum}\""))
+        .header("x-crystalline-join", &key)
+        // A whole document, so the save reaches the resolution this is about
+        // rather than stopping at the parse gate in front of it.
+        .json(&serde_json::json!({"content": after_write["content"]
+            .as_str()
+            .unwrap()
+            .replace("Bob was welcome here", "bob types into a draft he was taken off")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        written.status(),
+        404,
+        "a key whose link was revoked routes nothing"
+    );
+    let problem: serde_json::Value = written.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("no engram 'fresh' in domain 'team'") && !detail.contains("Join the draft"),
+        "and he is told what anybody with no link is told, rather than that her draft is still \
+         there to join: {problem}"
+    );
+    let hers = f.reads(&alice, "fresh").await;
+    let text = hers["content"].as_str().unwrap();
+    assert!(
+        text.contains("Bob was welcome here"),
+        "her draft keeps what he wrote while he was welcome: {hers}"
+    );
+    assert!(
+        !text.contains("taken off"),
+        "and carries nothing he wrote after she took the link back: {hers}"
+    );
+}
+
+/// Revoking one link ends the sessions on that draft, not that person's alone -
+/// and the other grantee is one press from being back.
+///
+/// The registry ends joins by the draft they are into, which is the only thing
+/// a join names. So the second grantee, whose own link alice did not touch, is
+/// put outside the draft as well. That is a nudge rather than a loss: their
+/// link still opens the draft, joining it again is the same one press it was
+/// the first time, and the write lands where it always landed. Pinned here
+/// because it is the visible edge of the ending being per-draft, and a reader
+/// meeting it in the UI should find it written down rather than surprising.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_one_link_leaves_the_other_grantee_one_press_away() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let carol = login(f.addr, "carol").await;
+
+    let path = f
+        .draft("alice", "Fresh", "The thing alice is drafting.")
+        .await;
+    let for_bob = f.mint(&alice, &path).await;
+    let for_carol = f.mint(&alice, &path).await;
+    let mut keys = Vec::new();
+    for (who, name, minted) in [(&bob, "bob", &for_bob), (&carol, "carol", &for_carol)] {
+        let joined: serde_json::Value = who
+            .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+            .json(&serde_json::json!({"token": minted["token"].as_str().unwrap()}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        keys.push((name, joined["join_key"].as_str().unwrap().to_string()));
+    }
+
+    let revoked = alice
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/draft-links/{}", for_bob["id"].as_i64().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 204, "{:?}", revoked.text().await);
+    for (name, key) in &keys {
+        assert!(
+            f.engine.joins().get(key, name).is_none(),
+            "the ending is about the draft, so {name} is outside it too"
+        );
+    }
+
+    // Carol's link was not touched, so one press puts her back in, and the
+    // write lands in alice's draft exactly as it did before.
+    let rejoined: serde_json::Value = carol
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({"token": for_carol["token"].as_str().unwrap()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key = rejoined["join_key"].as_str().unwrap().to_string();
+    let saved = carol
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", rejoined["checksum"].as_str().unwrap()),
+        )
+        .header("x-crystalline-join", &key)
+        .json(&serde_json::json!({"content": rejoined["content"]
+            .as_str()
+            .unwrap()
+            .replace("The thing alice is drafting", "Carol is still welcome")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200, "{:?}", saved.text().await);
+    let hers = f.reads(&alice, "fresh").await;
+    assert!(
+        hers["content"]
+            .as_str()
+            .unwrap()
+            .contains("Carol is still welcome"),
+        "and it landed in her draft: {hers}"
+    );
+}
