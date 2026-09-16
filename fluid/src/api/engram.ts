@@ -62,6 +62,11 @@ export interface EngramObservation {
 export interface VerifiedEntry {
   /** The actor that checked the knowledge, absent on a legacy date. */
   by: string | null;
+  /**
+   * The model the verifying agent reported, or null where it reported none.
+   * A person's verification never carries one.
+   */
+  model: string | null;
   /** When it was checked. */
   at: string | null;
 }
@@ -90,6 +95,12 @@ export interface EngramFrontmatter {
    * absence is absence rather than an unknown writer.
    */
   generatedBy: string | null;
+  /**
+   * The model out of `generated.model`: what produced the words, as the agent
+   * that wrote them reported it, or null where the block names none. A block
+   * written before the key existed carries none, and so does a person's.
+   */
+  generatedModel: string | null;
 }
 
 /** One of the capped inbound references the detail payload samples. */
@@ -253,14 +264,15 @@ function readVerified(record: Record<string, unknown> | null): VerifiedEntry[] {
       const entry = asObject(value);
       const by = asString(entry?.by);
       const at = asString(entry?.at);
-      return by === null && at === null ? null : { by, at };
+      const model = asString(entry?.model);
+      return by === null && at === null ? null : { by, model, at };
     })
     .filter((entry): entry is VerifiedEntry => entry !== null);
   if (entries.length > 0) {
     return entries;
   }
   const legacy = asString(record?.last_verified);
-  return legacy === null ? [] : [{ by: null, at: legacy }];
+  return legacy === null ? [] : [{ by: null, model: null, at: legacy }];
 }
 
 /** Read the frontmatter block. */
@@ -285,6 +297,9 @@ function readFrontmatter(
     // Write provenance is a `{ by, at }` mapping, so the actor is a field
     // inside it rather than a key of its own.
     generatedBy: asString(asObject(record?.generated)?.by),
+    // The model sits beside the actor inside the same mapping, and is left out
+    // of a block whose writer reported none.
+    generatedModel: asString(asObject(record?.generated)?.model),
   };
 }
 

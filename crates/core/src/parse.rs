@@ -345,7 +345,15 @@ fn set_generated(
                 .get(serde_yaml_ng::Value::String("at".into()))
                 .and_then(|v| v.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
-            *field = Some(Generated { by, at });
+            // The model the writer reported, when it reported one. Absent,
+            // blank or non-scalar all read as absence: the block still names
+            // the actor, which is what the spec requires of it.
+            let model = map
+                .get(serde_yaml_ng::Value::String("model".into()))
+                .and_then(scalar_string)
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty());
+            *field = Some(Generated { by, model, at });
             return;
         }
     }

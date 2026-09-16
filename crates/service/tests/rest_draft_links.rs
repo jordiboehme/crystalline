@@ -194,6 +194,7 @@ impl Fixture {
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         };
         let receipt = self
             .engine

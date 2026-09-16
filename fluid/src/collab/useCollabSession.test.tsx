@@ -68,6 +68,7 @@ function detailOf(content: string): EngramDetail {
       staleAfter: null,
       verified: [],
       generatedBy: null,
+      generatedModel: null,
     },
     observations: [],
     relations: [],

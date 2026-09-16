@@ -3925,6 +3925,7 @@ async fn serve_review_instance() -> ReviewInstance {
                 metadata: None,
                 overwrite: false,
                 share_link: None,
+                model: None,
             },
             None,
             &crystalline_service::Scope::User {

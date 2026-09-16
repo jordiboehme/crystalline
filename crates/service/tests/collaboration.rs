@@ -104,6 +104,7 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         metadata: None,
         overwrite: false,
         share_link: None,
+        model: None,
     }
 }
 
@@ -127,6 +128,7 @@ fn edit_params(
         expected_checksum,
         ack_scope: None,
         share_link: None,
+        model: None,
     }
 }
 

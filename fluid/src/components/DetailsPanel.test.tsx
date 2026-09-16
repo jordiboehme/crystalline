@@ -25,6 +25,7 @@ const FRONTMATTER: EngramFrontmatter = {
   staleAfter: null,
   verified: [],
   generatedBy: null,
+  generatedModel: null,
 };
 
 function draw(overrides: Partial<EngramFrontmatter> = {}) {
@@ -68,8 +69,8 @@ describe("DetailsPanel", () => {
   test("the latest verification is the stamp that speaks for the engram", () => {
     draw({
       verified: [
-        { by: "human:ada", at: "2026-01-01T09:00:00+01:00" },
-        { by: "human:jordi", at: "2026-02-01T10:00:00+01:00" },
+        { by: "human:ada", model: null, at: "2026-01-01T09:00:00+01:00" },
+        { by: "human:jordi", model: null, at: "2026-02-01T10:00:00+01:00" },
       ],
     });
     expect(screen.getByText("human:jordi on 2026-02-01")).toBeInTheDocument();
@@ -79,6 +80,31 @@ describe("DetailsPanel", () => {
     draw({ generatedBy: "human:jordi" });
     expect(screen.getByText("Captured by")).toBeInTheDocument();
     expect(screen.getByText("jordi (human)")).toBeInTheDocument();
+  });
+
+  test("shows the model beside the writer", () => {
+    draw({
+      generatedBy: "claude-code/2.1.271",
+      generatedModel: "claude-opus-5",
+    });
+    expect(
+      screen.getByText("claude-code (agent, 2.1.271) with claude-opus-5"),
+    ).toBeInTheDocument();
+  });
+
+  test("shows a verification's model", () => {
+    draw({
+      verified: [
+        {
+          by: "claude-code/2.1.271",
+          model: "claude-opus-5",
+          at: "2026-02-01T10:00:00+01:00",
+        },
+      ],
+    });
+    expect(
+      screen.getByText("claude-code/2.1.271 with claude-opus-5 on 2026-02-01"),
+    ).toBeInTheDocument();
   });
 
   test("an engram that records no writer is attributed to nobody", () => {

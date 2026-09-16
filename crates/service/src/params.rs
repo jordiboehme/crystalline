@@ -71,6 +71,10 @@ pub struct WriteParams {
     /// Overwrite an existing engram with the same permalink instead of erroring.
     #[serde(default)]
     pub overwrite: bool,
+    /// Your model id, for example claude-opus-5; recorded beside who wrote it
+    /// so a reader can weigh the page. Omit it only if you do not know it.
+    #[serde(default)]
+    pub model: Option<String>,
     /// A draft share-link somebody handed you (`dl_...`), to work inside the
     /// draft it opens instead of writing your own copy. Pass it when you were
     /// given a link and mean to compose into its author's draft: it binds the
@@ -164,6 +168,10 @@ pub struct EditParams {
     /// last-write-wins.
     #[serde(default)]
     pub expected_checksum: Option<String>,
+    /// Your model id, for example claude-opus-5; recorded beside who wrote it
+    /// so a reader can weigh the page. Omit it only if you do not know it.
+    #[serde(default)]
+    pub model: Option<String>,
     /// The pair an `evolve_ack` assignment names, for the one rule that is
     /// acknowledged per pair rather than per engram.
     ///

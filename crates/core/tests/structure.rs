@@ -63,6 +63,44 @@ fn generated_provenance_is_typed_and_drives_recency() {
     assert!(fm.extra.is_empty());
 }
 
+/// The model that produced the words is a sibling key inside `generated`, so a
+/// block carrying one parses into the model and emits again with the key in
+/// place, between `by` and `at` exactly as the spec writes it.
+#[test]
+fn a_generated_block_round_trips_its_model() {
+    let source = "---\ntype: engram\ntitle: X\npermalink: x\nstatus: stable\ngenerated: { by: claude-code/2.1.271, model: claude-opus-5, at: 2026-09-16T09:59:22+00:00 }\n---\n\nA body long enough to say something.\n";
+    let e = parse_engram(source).unwrap();
+    let g = e.frontmatter.generated.as_ref().expect("generated parses");
+    assert_eq!(g.by, "claude-code/2.1.271");
+    assert_eq!(g.model.as_deref(), Some("claude-opus-5"));
+    assert!(e.frontmatter.extra.is_empty());
+    assert!(
+        crystalline_core::emit_engram(&e).contains(
+            "generated: { by: claude-code/2.1.271, model: claude-opus-5, at: 2026-09-16T09:59:22+00:00 }"
+        ),
+        "the model must emit between the actor and the instant"
+    );
+}
+
+/// A verification records the model of the agent that checked the knowledge,
+/// the same sibling key in the same place.
+#[test]
+fn a_verified_entry_carries_its_model() {
+    let source = "---\ntype: engram\ntitle: X\npermalink: x\nstatus: stable\nverified: { by: claude-code/2.1.271, model: claude-opus-5, at: 2026-09-16T10:04:01+00:00 }\n---\n\nA body long enough to say something.\n";
+    let e = parse_engram(source).unwrap();
+    let [only] = e.frontmatter.verified.as_slice() else {
+        panic!("one verification parses: {:?}", e.frontmatter.verified);
+    };
+    assert_eq!(only.by, "claude-code/2.1.271");
+    assert_eq!(only.model.as_deref(), Some("claude-opus-5"));
+    assert!(
+        crystalline_core::emit_engram(&e).contains(
+            "verified: { by: claude-code/2.1.271, model: claude-opus-5, at: 2026-09-16T10:04:01+00:00 }"
+        ),
+        "the model must emit between the actor and the instant"
+    );
+}
+
 #[test]
 fn a_generated_block_without_an_actor_is_kept_verbatim() {
     // `by` is required by OKF v0.2, so a block without one is preserved as an

@@ -150,6 +150,7 @@ async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap_err();
@@ -204,6 +205,7 @@ async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -281,6 +283,7 @@ async fn a_stale_edit_is_a_conflict_on_file_and_virtual_domains() {
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -1315,6 +1318,7 @@ async fn split_works_on_a_virtual_domain_too() {
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -1560,6 +1564,7 @@ async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_o
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -1669,6 +1674,7 @@ async fn every_write_verb(scope: &Scope) -> Vec<(&'static str, serde_json::Value
                     metadata: None,
                     overwrite: false,
                     share_link: None,
+                    model: None,
                 },
                 Some(ACTOR),
                 scope,

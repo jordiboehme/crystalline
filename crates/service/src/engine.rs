@@ -251,6 +251,35 @@ pub(crate) fn sanitize_actor(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+/// The model a write records beside the actor it is recording, or `None` when
+/// none was reported and whenever the actor is a person.
+///
+/// **A `human:` actor never carries a model.** The prefix is what OKF's trust
+/// tier and the evolve sweep read as "a person wrote this", so a model reported
+/// beside it would say a model produced words a person typed. Every other actor
+/// takes the model as reported, a client-composed one and a configured agent
+/// identity like `team-bot/1.0` alike.
+///
+/// **The drop lives here rather than at the surface that takes the parameter**,
+/// because this is the first place the actor is actually known: `identity.actor`
+/// can pin a `human:` form that no caller can see ([`Engine::actor`]). The
+/// value is sanitized with [`sanitize_actor`] on the way through, so a reported
+/// id can no more break the flow mapping it is written into than an actor can,
+/// and an id that sanitizes away is absence.
+///
+/// The prefix is matched the way the sweep matches it: case-insensitively, over
+/// a byte slice taken with `get` so an actor whose sixth byte lands inside a
+/// multi-byte character simply does not match.
+pub(crate) fn stamped_model(actor: &str, model: Option<&str>) -> Option<String> {
+    if actor
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("human:"))
+    {
+        return None;
+    }
+    model.map(sanitize_actor).filter(|m| !m.is_empty())
+}
+
 /// The default host-lock heartbeat interval, seconds. Overridable via
 /// `CRYSTALLINE_HEARTBEAT_SECS` (used to drive fast multi-instance verification).
 const DEFAULT_HEARTBEAT_SECS: i64 = 30;
@@ -3902,6 +3931,9 @@ impl Engine {
         // engram is better refused with no lock in hand.
         let today = chrono::Utc::now().date_naive();
         let now = now_offset();
+        // The model the agent reported, held against the actor this write
+        // records: a person's write never carries one (`stamped_model`).
+        let model = stamped_model(&actor, p.model.as_deref());
         let markdown = build_markdown(
             &engram_type,
             &p.title,
@@ -3910,6 +3942,7 @@ impl Engine {
             &status,
             &today.format("%Y-%m-%d").to_string(),
             &actor,
+            model.as_deref(),
             now,
             p.metadata.as_ref(),
             &p.content,
@@ -6012,7 +6045,7 @@ impl Engine {
         let mut warning = None;
         if overlay.is_some() {
             warning = self
-                .apply_source_edit(&desc, &source, &view, None, &actor, retire_target)
+                .apply_source_edit(&desc, &source, &view, None, &actor, None, retire_target)
                 .await?;
         } else {
             match &source {
@@ -6105,7 +6138,7 @@ impl Engine {
                 })?;
                 if !already(&current) {
                     let succ_warning = self
-                        .apply_source_edit(succ_desc, succ_source, &view, None, &actor, |c| {
+                        .apply_source_edit(succ_desc, succ_source, &view, None, &actor, None, |c| {
                             Ok(append_body(c, &line))
                         })
                         .await?;
@@ -6130,6 +6163,7 @@ impl Engine {
                             let edited = touch_generated(
                                 &append_body(&current, &line),
                                 &actor,
+                                None,
                                 now_offset(),
                             );
                             write_file(&abs, &edited)?;
@@ -6155,6 +6189,7 @@ impl Engine {
                             let edited = touch_generated(
                                 &append_body(&current, &line),
                                 &actor,
+                                None,
                                 now_offset(),
                             );
                             let stamp = virtual_stamp(&edited);
@@ -6221,7 +6256,7 @@ impl Engine {
                 edited = append_body(&edited, &line);
             }
         }
-        touch_generated(&edited, actor, now_offset())
+        touch_generated(&edited, actor, None, now_offset())
     }
 
     /// Whether the text already declares this relation to this engram, in
@@ -6373,6 +6408,7 @@ impl Engine {
                     // nobody's shared draft: a link presented on the split
                     // would be a link to the page being split, not to this.
                     share_link: None,
+                    model: None,
                 },
                 client,
                 // The splitter's own scope: the new engram is written by
@@ -6407,6 +6443,9 @@ impl Engine {
                 &view,
                 Some(&checksum),
                 &actor,
+                // A split moves words it did not write, so its tail records
+                // the agent without a model, exactly as it records the actor.
+                None,
                 None,
                 move |_| Ok(remaining),
             )
@@ -7249,6 +7288,9 @@ impl Engine {
         // The staged form rather than the shorthand, for the one thing it
         // reports that this verb says out loud: whether the edit composed into
         // a live co-editing document instead of a file or a row.
+        // The model the agent reported, held against the actor this edit
+        // records: a person's edit never carries one (`stamped_model`).
+        let model = stamped_model(&actor, p.model.as_deref());
         let edited = self
             .apply_source_edit_staged(
                 &desc,
@@ -7256,8 +7298,18 @@ impl Engine {
                 &view,
                 p.expected_checksum.as_deref(),
                 &actor,
+                model.as_deref(),
                 peer,
-                |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
+                |current| {
+                    self.apply_edit(
+                        current,
+                        p,
+                        &desc.permalink,
+                        &actor,
+                        model.as_deref(),
+                        ack.as_ref(),
+                    )
+                },
             )
             .await
             .map_err(|failure| failure.error)?;
@@ -7307,6 +7359,7 @@ impl Engine {
     /// silently dropping it. For a virtual domain the store's own compare and
     /// swap plays that part, with the checksum of what was just read standing
     /// in when the caller presents none.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_source_edit<F>(
         &self,
         desc: &EngramDescriptor,
@@ -7314,6 +7367,7 @@ impl Engine {
         view: &DomainView<'_>,
         expected_checksum: Option<&str>,
         actor: &str,
+        model: Option<&str>,
         apply: F,
     ) -> Result<Option<String>>
     where
@@ -7330,10 +7384,19 @@ impl Engine {
         // verbs carry no peer to name, because none of their surfaces resolves
         // one. The text still composes into the open room; what an author does
         // not get is a chip for the agent that retired the page under them.
-        self.apply_source_edit_staged(desc, source, view, expected_checksum, actor, None, apply)
-            .await
-            .map(|edited| edited.warning)
-            .map_err(|failure| failure.error)
+        self.apply_source_edit_staged(
+            desc,
+            source,
+            view,
+            expected_checksum,
+            actor,
+            model,
+            None,
+            apply,
+        )
+        .await
+        .map(|edited| edited.warning)
+        .map_err(|failure| failure.error)
     }
 
     /// [`Engine::apply_source_edit`], reporting whether the source's bytes were
@@ -7353,6 +7416,7 @@ impl Engine {
         view: &DomainView<'_>,
         expected_checksum: Option<&str>,
         actor: &str,
+        model: Option<&str>,
         peer: Option<&AgentPeer>,
         apply: F,
     ) -> std::result::Result<SourceEdited, SourceEditFailure>
@@ -7399,7 +7463,7 @@ impl Engine {
                 // order. An edit that skipped them would put a document in
                 // front of a person that the saver then refuses, minutes
                 // later, for a reason nobody watching could connect to this.
-                let edited = touch_generated(&edited, actor, now_offset());
+                let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let applied = rooms
                     .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor, peer)
@@ -7455,7 +7519,7 @@ impl Engine {
                 }
             }
             let edited = apply(&current).map_err(SourceEditFailure::before)?;
-            let edited = touch_generated(&edited, actor, now_offset());
+            let edited = touch_generated(&edited, actor, model, now_offset());
             let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
             if self.take_armed_failure() {
                 return Err(SourceEditFailure::before(EngineError::Internal(
@@ -7499,7 +7563,7 @@ impl Engine {
                     }
                 }
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
-                let edited = touch_generated(&edited, actor, now_offset());
+                let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 // The last step that can fail with the file as it was:
                 // `write_bytes` renames a sibling temp into place, and a rename
@@ -7534,7 +7598,7 @@ impl Engine {
                     .map(str::to_string)
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
                 let edited = apply(&current).map_err(SourceEditFailure::before)?;
-                let edited = touch_generated(&edited, actor, now_offset());
+                let edited = touch_generated(&edited, actor, model, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let stamp = virtual_stamp(&edited);
                 // The seam, on this arm: a token nothing can match, so the
@@ -7591,12 +7655,14 @@ impl Engine {
     /// text. Content-agnostic: the same logic serves file and virtual edits.
     /// `actor` is the resolved editor identity, which `set_frontmatter` stamps
     /// into a verification when the caller names no other one.
+    #[allow(clippy::too_many_arguments)]
     fn apply_edit(
         &self,
         source: &str,
         p: &EditParams,
         permalink: &str,
         actor: &str,
+        model: Option<&str>,
         ack: Option<&AckDraft>,
     ) -> Result<String> {
         Ok(match p.operation.as_str() {
@@ -7641,7 +7707,9 @@ impl Engine {
                 let section = self.require_section(p)?;
                 insert_after_section(source, section, content).map_err(section_err)?
             }
-            "set_frontmatter" => Self::apply_set_frontmatter(source, p, permalink, actor, ack)?,
+            "set_frontmatter" => {
+                Self::apply_set_frontmatter(source, p, permalink, actor, model, ack)?
+            }
             other => {
                 return Err(EngineError::Invalid(format!(
                     "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
@@ -7658,11 +7726,13 @@ impl Engine {
     ///
     /// An absent or empty value clears the field, except on `status`, which is
     /// required, and on `verified`, which stamps a verification instead.
+    #[allow(clippy::too_many_arguments)]
     fn apply_set_frontmatter(
         source: &str,
         p: &EditParams,
         permalink: &str,
         actor: &str,
+        model: Option<&str>,
         ack: Option<&AckDraft>,
     ) -> Result<String> {
         let key = p
@@ -7755,6 +7825,10 @@ impl Engine {
                     .unwrap_or_else(|| actor.to_string());
                 let entry = crystalline_core::Verified {
                     by,
+                    // The model of the agent doing the verifying, which is the
+                    // caller's whether it named itself as the verifier or let
+                    // its own identity stand in.
+                    model: model.map(str::to_string),
                     at: Some(now_offset()),
                 };
                 // Keep other actors' verifications and replace this actor's, so
@@ -8118,8 +8192,12 @@ impl Engine {
                     if !text.contains(&needle) {
                         continue;
                     }
-                    let replaced =
-                        touch_generated(&text.replace(&needle, &prefixed), &actor, now_offset());
+                    let replaced = touch_generated(
+                        &text.replace(&needle, &prefixed),
+                        &actor,
+                        None,
+                        now_offset(),
+                    );
                     write_file(&linker_abs, &replaced)?;
                     let store = self.store.lock().await;
                     self.reindex_file(&*store, r.src_domain_id, &root, &r.src_path)
@@ -8135,8 +8213,12 @@ impl Engine {
                     if !text.contains(&needle) {
                         continue;
                     }
-                    let replaced =
-                        touch_generated(&text.replace(&needle, &prefixed), &actor, now_offset());
+                    let replaced = touch_generated(
+                        &text.replace(&needle, &prefixed),
+                        &actor,
+                        None,
+                        now_offset(),
+                    );
                     let stamp = virtual_stamp(&replaced);
                     let store = self.store.lock().await;
                     self.index_markdown(
@@ -11088,7 +11170,7 @@ impl Engine {
         }
         // The answer here is a bool, so a mirror warning has nowhere to ride
         // out; `write_overlay_entry` has already logged it.
-        self.apply_source_edit(&desc, &source, &view, None, &actor, |current| {
+        self.apply_source_edit(&desc, &source, &view, None, &actor, None, |current| {
             Ok(without_ack(current, &rule, scope))
         })
         .await?;
@@ -21087,6 +21169,7 @@ fn build_markdown(
     status: &str,
     recorded_at: &str,
     actor: &str,
+    model: Option<&str>,
     now: DateTime<FixedOffset>,
     metadata: Option<&Value>,
     body: &str,
@@ -21102,6 +21185,7 @@ fn build_markdown(
     fm.recorded_at = chrono::NaiveDate::parse_from_str(recorded_at, "%Y-%m-%d").ok();
     fm.generated = Some(crystalline_core::Generated {
         by: actor.to_string(),
+        model: model.map(str::to_string),
         at: Some(now),
     });
     // Models routinely double-encode nested tool arguments, so an object
@@ -21553,6 +21637,7 @@ mod lock_tests {
                     metadata: None,
                     overwrite: false,
                     share_link: None,
+                    model: None,
                 })
                 .await
         });

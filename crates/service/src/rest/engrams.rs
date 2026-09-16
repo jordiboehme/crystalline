@@ -750,6 +750,7 @@ pub async fn create(
         // Nor from this one: a browser inside somebody's draft holds a join
         // key and sends that, through the routes that take one.
         share_link: None,
+        model: None,
     };
     let mut written = state
         .engine

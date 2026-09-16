@@ -1269,6 +1269,7 @@ async fn a_wholesale_overwrite_in_a_reviewing_domain_lands_in_the_draft_room() {
                 metadata: None,
                 overwrite: true,
                 share_link: None,
+                model: None,
             },
             None,
             &crystalline_service::Scope::Unrestricted,
@@ -1369,6 +1370,7 @@ fn wholesale_capture(title: &str, content: &str, overwrite: bool) -> WriteParams
         metadata: None,
         overwrite,
         share_link: None,
+        model: None,
     }
 }
 

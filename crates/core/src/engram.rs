@@ -137,6 +137,17 @@ pub struct Frontmatter {
 pub struct Generated {
     /// The actor that wrote this revision.
     pub by: String,
+    /// The model that produced the words, as the agent reports it, or `None`
+    /// when none was reported.
+    ///
+    /// A sibling key rather than a third slash segment of `by`, because `by` is
+    /// `<producer>/<version>` and a reader that splits on the first slash would
+    /// otherwise read the version as `2.1.271/claude-opus-5`. Absent means
+    /// absent: a write that reports no model emits the two-key form exactly as
+    /// it always did, and the key is left out of the serialized form too rather
+    /// than sent as a null nobody can read anything out of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// When it was written, RFC 3339 with offset.
     pub at: Option<DateTime<FixedOffset>>,
 }
@@ -152,8 +163,23 @@ pub struct Generated {
 pub struct Verified {
     /// The actor that verified the knowledge.
     pub by: String,
+    /// The model the verifying agent reported, or `None` when it reported
+    /// none. Read, written and serialized exactly like [`Generated::model`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// When it was verified, RFC 3339 with offset.
     pub at: Option<DateTime<FixedOffset>>,
+}
+
+/// The model reported inside a provenance mapping: a non-empty scalar, or
+/// `None`.
+///
+/// An empty or all-blank value reads as absence rather than as a model nobody
+/// can name, which is how the write path treats one too, so the two ends agree
+/// about what "no model" looks like.
+pub(crate) fn reported_model(value: Option<&YamlValue>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 impl Verified {
@@ -185,6 +211,7 @@ impl Verified {
         };
         Some(Verified {
             by: by.to_string(),
+            model: reported_model(map.get("model")),
             at,
         })
     }

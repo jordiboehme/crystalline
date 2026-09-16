@@ -1523,6 +1523,7 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         metadata: None,
         overwrite: false,
         share_link: None,
+        model: None,
     }
 }
 
@@ -1615,6 +1616,7 @@ async fn overlay_writes_never_touch_the_tree_and_reads_shadow_per_actor() {
                 expected_checksum: None,
                 ack_scope: None,
                 share_link: None,
+                model: None,
             },
             Some("claude-code/2.0-for-alice"),
             &alice,
@@ -1801,6 +1803,7 @@ async fn no_identity_no_overlay_writes_refuse_with_teaching_text() {
                 expected_checksum: None,
                 ack_scope: None,
                 share_link: None,
+                model: None,
             },
             None,
             &Scope::Anonymous,
@@ -2013,6 +2016,7 @@ async fn a_write_receipt_says_draft_and_still_carries_similar() {
                 expected_checksum: None,
                 ack_scope: None,
                 share_link: None,
+                model: None,
             },
             who,
             &alice,
@@ -2751,6 +2755,7 @@ async fn a_mirror_that_fails_never_unsays_a_draft_that_landed() {
                 expected_checksum: None,
                 ack_scope: None,
                 share_link: None,
+                model: None,
             },
             who,
             &alice,
@@ -3568,6 +3573,7 @@ async fn a_drafts_own_relations_are_what_its_author_reads() {
                 expected_checksum: None,
                 ack_scope: None,
                 share_link: None,
+                model: None,
             },
             None,
             &alice,

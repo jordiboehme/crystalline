@@ -885,6 +885,7 @@ mod tests {
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         }
     }
 

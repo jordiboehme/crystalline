@@ -101,6 +101,7 @@ fn write_params(title: &str, content: &str) -> WriteParams {
         metadata: None,
         overwrite: false,
         share_link: None,
+        model: None,
     }
 }
 
@@ -151,6 +152,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
             expected_checksum: None,
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -263,6 +265,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             expected_checksum: None,
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -283,6 +286,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             expected_checksum: Some(stale_checksum),
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await;
     assert!(
@@ -323,6 +327,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             expected_checksum: Some(fresh),
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -353,6 +358,7 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
             expected_checksum: None,
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -395,6 +401,7 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
             expected_checksum: Some(checksum),
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -440,6 +447,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             expected_checksum: None,
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap_err();
@@ -480,6 +488,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             expected_checksum: Some(before_checksum),
             ack_scope: None,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -664,6 +673,7 @@ fn tagged(title: &str, content: &str, tags: Vec<&str>) -> WriteParams {
         metadata: None,
         overwrite: false,
         share_link: None,
+        model: None,
     }
 }
 

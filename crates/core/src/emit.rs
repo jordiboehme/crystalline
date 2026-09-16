@@ -73,6 +73,11 @@ pub fn emit_engram(engram: &Engram) -> String {
 /// and RFC 3339 forms read exactly like the spec's examples.
 fn generated_flow(g: &Generated) -> String {
     let mut out = format!("generated: {{ by: {}", flow_scalar(&g.by));
+    // Between the actor and the instant, and only when one was reported, so a
+    // block without a model is the two-key line it has always been.
+    if let Some(model) = &g.model {
+        out.push_str(&format!(", model: {}", flow_scalar(model)));
+    }
     if let Some(at) = g.at {
         out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
     }
@@ -98,6 +103,9 @@ fn verified_block(entries: &[Verified]) -> String {
 /// Render one `verified` entry as an OKF flow mapping, without the key.
 fn verified_flow(v: &Verified) -> String {
     let mut out = format!("{{ by: {}", flow_scalar(&v.by));
+    if let Some(model) = &v.model {
+        out.push_str(&format!(", model: {}", flow_scalar(model)));
+    }
     if let Some(at) = v.at {
         out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
     }
@@ -560,8 +568,10 @@ pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
     )
 }
 
-/// Record a write in the original source: set `generated` to `actor` and `now`
-/// as the OKF v0.2 flow mapping, leaving every other byte untouched.
+/// Record a write in the original source: set `generated` to `actor`, the
+/// `model` it reported when it reported one, and `now` as the OKF v0.2 flow
+/// mapping, leaving every other byte untouched. A `None` model emits the
+/// two-key form byte for byte as it always did.
 ///
 /// An engram that still carries the legacy `timestamp` key and no `generated`
 /// block migrates here, lazily: the `timestamp` line is replaced in place by
@@ -575,9 +585,15 @@ pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
 /// the flow mapping above two orphaned indented lines - not YAML, so the engram
 /// would stop parsing and go invisible to the sweep, to reads and to search.
 /// The old value goes whole, whatever shape it was written in.
-pub fn touch_generated(source: &str, actor: &str, now: DateTime<FixedOffset>) -> String {
+pub fn touch_generated(
+    source: &str,
+    actor: &str,
+    model: Option<&str>,
+    now: DateTime<FixedOffset>,
+) -> String {
     let line = generated_flow(&Generated {
         by: actor.to_string(),
+        model: model.map(str::to_string),
         at: Some(now),
     });
     set_frontmatter_block_line(source, &["generated", "timestamp"], line)
@@ -954,6 +970,7 @@ mod tests {
             "---\ntype: engram\n{}\n---\n\nbody\n",
             generated_flow(&Generated {
                 by: "Some Client (beta), v2".to_string(),
+                model: None,
                 at: DateTime::parse_from_rfc3339("2026-07-27T09:15:00+00:00").ok(),
             })
         );
@@ -967,6 +984,7 @@ mod tests {
     fn generated_flow_omits_an_absent_instant() {
         let line = generated_flow(&Generated {
             by: "human:jordi".to_string(),
+            model: None,
             at: None,
         });
         assert_eq!(line, "generated: { by: human:jordi }");

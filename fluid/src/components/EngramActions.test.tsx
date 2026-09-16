@@ -31,6 +31,7 @@ const ENGRAM = {
     staleAfter: null,
     verified: [],
     generatedBy: null,
+    generatedModel: null,
   },
   observations: [],
   relations: [],

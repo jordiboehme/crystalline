@@ -4773,6 +4773,249 @@ async fn edit_engram_migrates_a_legacy_timestamp_to_generated() {
     assert!(generated.at.unwrap().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00");
 }
 
+/// The agent reports the model that produced the words, and it lands beside the
+/// actor in the provenance block: the client says which harness wrote, the
+/// model says with what, and a later reader weighs the page by both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_records_the_reported_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "With a model",
+            "content": "Who wrote this, and with what.",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let expected = {
+        let info = rmcp::model::ClientInfo::default().client_info;
+        format!("{}/{}", info.name, info.version)
+    };
+    let text = std::fs::read_to_string(h.root.join("eng/with-a-model.md")).unwrap();
+    assert!(
+        text.contains(&format!(
+            "generated: {{ by: {expected}, model: claude-opus-5, at: "
+        )),
+        "expected the reported model beside the client: {text}"
+    );
+    let g = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .generated
+        .unwrap();
+    assert_eq!(g.model.as_deref(), Some("claude-opus-5"));
+}
+
+/// An edit refreshes the provenance block, so the model of the agent that made
+/// the change is what the refreshed block records - not the one the capture
+/// was written with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_records_the_model_on_the_generated_block_it_touches() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Refreshed",
+            "content": "A first pass.",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "refreshed",
+            "operation": "append",
+            "content": "A sharper second pass.",
+            "model": "claude-haiku-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/refreshed.md")).unwrap();
+    assert!(
+        text.contains("model: claude-haiku-5"),
+        "the editing agent's model must win: {text}"
+    );
+    assert!(
+        !text.contains("claude-opus-5"),
+        "exactly one provenance block, carrying one model: {text}"
+    );
+}
+
+/// A verification records the model of the agent that checked the knowledge,
+/// the same sibling key the `generated` block carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verification_by_an_agent_records_its_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked", "content": "A fact worth re-checking." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked.md")).unwrap();
+    let entries = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .verified;
+    let [only] = entries.as_slice() else {
+        panic!("one verification: {entries:?}");
+    };
+    assert_eq!(only.model.as_deref(), Some("claude-opus-5"));
+    assert!(
+        text.contains(&format!(
+            "verified: {{ by: {}, model: claude-opus-5, at: ",
+            only.by
+        )),
+        "the model belongs between the verifier and the instant: {text}"
+    );
+}
+
+/// A write that reports no model is byte-identical to one made before the key
+/// existed: the two-key flow mapping, and the word nowhere in the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_without_a_model_is_byte_identical_to_before() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Silent", "content": "Nobody said which one wrote it." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "silent",
+            "operation": "append",
+            "content": "And the edit says nothing about it either.",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let expected = {
+        let info = rmcp::model::ClientInfo::default().client_info;
+        format!("{}/{}", info.name, info.version)
+    };
+    let text = std::fs::read_to_string(h.root.join("eng/silent.md")).unwrap();
+    assert!(
+        text.contains(&format!("generated: {{ by: {expected}, at: ")),
+        "the two-key form, unchanged: {text}"
+    );
+    assert!(!text.contains("model"), "no model was reported: {text}");
+}
+
+/// A person's write never carries a model, whoever reports one. The `human:`
+/// prefix is what the trust tier and the sweep read as "a person wrote this",
+/// and the actor is resolved inside the engine - an `identity.actor` of that
+/// form is invisible to the caller that passed the parameter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_actor_never_carries_a_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "identity.actor": "human:jordi" } }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "By a person",
+            "content": "Typed by somebody.",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/by-a-person.md")).unwrap();
+    assert!(
+        text.contains("generated: { by: human:jordi, at: "),
+        "a person's provenance block stays as it was: {text}"
+    );
+    assert!(
+        !text.contains("model"),
+        "a person writes with no model: {text}"
+    );
+}
+
+/// The two write verbs teach the parameter, because a parameter nobody is told
+/// to fill is filled about never: an agent reports its own model id only if the
+/// description it reads asks for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_the_reported_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    for name in ["write_engram", "edit_engram"] {
+        let tool = tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} tool present"));
+        let text = tool.description.as_deref().unwrap_or("");
+        assert!(
+            text.contains("model"),
+            "{name} must teach the model parameter: {text}"
+        );
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(
+            schema.contains("\"model\""),
+            "{name} must advertise the model parameter: {schema}"
+        );
+    }
+}
+
 // --- evolve_engrams: name, gating and the encoded queue -----------------------
 
 /// The router advertises the sweep under exactly `EVOLVE_TOOL_NAME`.
@@ -5227,6 +5470,7 @@ async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it(
             metadata: None,
             overwrite: false,
             share_link: None,
+            model: None,
         })
         .await
         .unwrap();

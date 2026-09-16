@@ -56,7 +56,15 @@ export function DetailsPanel({
   body,
   canDelete = false,
 }: DetailsPanelProps) {
-  const { type, status, tags, salience, verified, generatedBy } = frontmatter;
+  const {
+    type,
+    status,
+    tags,
+    salience,
+    verified,
+    generatedBy,
+    generatedModel,
+  } = frontmatter;
   const validity = validityOf(frontmatter);
   const stamp = latestVerification(verified);
 
@@ -104,7 +112,7 @@ export function DetailsPanel({
           )}
           {generatedBy !== null && (
             <Row label="Captured by">
-              <span>{formatActor(generatedBy)}</span>
+              <span>{withModel(formatActor(generatedBy), generatedModel)}</span>
             </Row>
           )}
           {stamp !== null && (
@@ -259,5 +267,17 @@ function latestVerification(entries: VerifiedEntry[]): string | null {
   if (latest.by === null) {
     return day;
   }
-  return day === null ? latest.by : `${latest.by} on ${day}`;
+  const who = withModel(latest.by, latest.model);
+  return day === null ? who : `${who} on ${day}`;
+}
+
+/**
+ * A writer with the model it reported, or the writer alone.
+ *
+ * Who wrote a page and with which model is one fact a reader weighs together,
+ * so it reads as one phrase rather than as a second row nobody connects to the
+ * first. A block that names no model says nothing about one.
+ */
+function withModel(who: string, model: string | null): string {
+  return model === null ? who : `${who} with ${model}`;
 }

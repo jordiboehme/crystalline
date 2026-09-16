@@ -141,6 +141,7 @@ fn write(domain: &str, title: &str, content: &str, status: Option<&str>) -> Writ
         metadata: None,
         overwrite: false,
         share_link: None,
+        model: None,
     }
 }
 
@@ -812,6 +813,7 @@ async fn a_drafts_receipt_never_lists_its_own_base_row() {
                 expected_checksum: None,
                 ack_scope: None,
                 share_link: None,
+                model: None,
             },
             None,
             &alice,
