@@ -327,20 +327,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             // three surfaces answer one malformed request one way: folds say
             // what happens to each actor's drafts, which is a question about
             // leaving review mode.
-            if overlay
-                && req
-                    .get("folds")
-                    .and_then(Value::as_object)
-                    .is_some_and(|folds| !folds.is_empty())
-            {
-                return (
-                    envelope_err(
-                        "folds say what happens to each actor's private drafts, which is a \
-                         question about LEAVING review mode: a domain on its way in has none yet"
-                            .to_string(),
-                    ),
-                    false,
-                );
+            if folds_on_the_way_in(req) {
+                return (envelope_err(FOLDS_ON_THE_WAY_IN.to_string()), false);
             }
             let confirm = if preview {
                 crate::review::ReviewModeConfirm::Preview
@@ -679,6 +667,25 @@ fn optional_string_list(req: &Value, key: &str) -> Result<Option<Vec<String>>, S
     }
 }
 
+/// What every surface says to fold answers sent on the way IN to review mode.
+/// One string rather than three copies: the sentence a client reads must be
+/// the same sentence wherever it meets the rule.
+const FOLDS_ON_THE_WAY_IN: &str = "folds say what happens to each actor's private drafts, which is a question about LEAVING \
+     review mode: a domain on its way in has none yet. Send mode 'overlay' on its own";
+
+/// Whether a `domain_review` request carries fold answers on the way IN.
+///
+/// Any `folds` MAP, not only a non-empty one, exactly as the JSON API reads it
+/// (`rest::domains_admin::set_review_mode`): the rule a client learns is
+/// "folds are a question about leaving", and an empty map waved through here
+/// would make it "folds with something in them are" on this socket and the
+/// other rule everywhere else. An explicit null is not a map and is the absent
+/// key.
+fn folds_on_the_way_in(req: &Value) -> bool {
+    req.get("mode").and_then(Value::as_str) == Some("overlay")
+        && req.get("folds").is_some_and(Value::is_object)
+}
+
 fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
@@ -723,6 +730,37 @@ mod tests {
                 "{envelope}"
             );
         }
+    }
+
+    /// The one malformed `domain_review` request, refused the same way on all
+    /// three surfaces.
+    ///
+    /// Any `folds` MAP, not only a non-empty one, exactly as the JSON API
+    /// reads it: the rule a client learns is "folds are a question about
+    /// leaving", and an empty map waved through here would make it "folds with
+    /// something in them are" on this socket and the other rule everywhere
+    /// else. An explicit null is not a map and is the absent key - a client
+    /// holding the field as nullable and sending what it holds is saying it
+    /// has no answers, which is what absence means.
+    #[test]
+    fn folds_on_the_way_in_are_refused_exactly_as_the_api_refuses_them() {
+        assert!(folds_on_the_way_in(
+            &json!({ "mode": "overlay", "folds": {} })
+        ));
+        assert!(folds_on_the_way_in(
+            &json!({ "mode": "overlay", "folds": { "ada": "fold" } })
+        ));
+        assert!(!folds_on_the_way_in(&json!({ "mode": "overlay" })));
+        assert!(!folds_on_the_way_in(
+            &json!({ "mode": "overlay", "folds": Value::Null })
+        ));
+        // On the way OUT the answers are the whole point of the request.
+        assert!(!folds_on_the_way_in(
+            &json!({ "mode": "direct", "folds": { "ada": "discard" } })
+        ));
+        assert!(!folds_on_the_way_in(
+            &json!({ "mode": "direct", "folds": {} })
+        ));
     }
 
     /// Which credential a forget addresses: absent is the machine's own, so a

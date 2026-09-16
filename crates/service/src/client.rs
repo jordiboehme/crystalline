@@ -1027,6 +1027,43 @@ pub async fn domain_remove(
 /// `folds` carries the per-actor answers when there are any; an empty slice
 /// with `preview` false is the answer for a domain nobody is drafting in.
 /// `preview` asks for the plan and writes nothing.
+///
+/// The socket request omits the key entirely when there are no answers, which
+/// is how the daemon reads "none": the surfaces agree that fold answers are a
+/// question about LEAVING review mode, so a request on the way IN must carry
+/// no `folds` at all rather than an empty one.
+/// The socket request one `domain_review` call sends.
+///
+/// Its own function so the shape can be asserted without a daemon: what is
+/// load bearing is the ABSENCE of `folds` when there are no answers, and an
+/// absent key is exactly what a test of a live round trip would not notice.
+fn review_request(
+    name: &str,
+    overlay_mode: bool,
+    preview: bool,
+    folds: &[(String, bool)],
+) -> Value {
+    use serde_json::json;
+    let mut request = json!({
+        "v": 1, "cmd": "domain_review", "domain": name,
+        "mode": if overlay_mode { "overlay" } else { "direct" },
+        "preview": preview,
+    });
+    if !folds.is_empty() {
+        request["folds"] = folds
+            .iter()
+            .map(|(actor, fold)| {
+                (
+                    actor.clone(),
+                    Value::from(if *fold { "fold" } else { "discard" }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>()
+            .into();
+    }
+    request
+}
+
 pub async fn domain_review(
     name: &str,
     overlay_mode: bool,
@@ -1035,24 +1072,9 @@ pub async fn domain_review(
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
-    use serde_json::json;
-    let folds_json: Value = folds
-        .iter()
-        .map(|(actor, fold)| {
-            (
-                actor.clone(),
-                Value::from(if *fold { "fold" } else { "discard" }),
-            )
-        })
-        .collect::<serde_json::Map<String, Value>>()
-        .into();
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
-            "v": 1, "cmd": "domain_review", "domain": name,
-            "mode": if overlay_mode { "overlay" } else { "direct" },
-            "preview": preview, "folds": folds_json,
-        }))
-        .await?
+        && let Some(data) =
+            ctl_if_running(review_request(name, overlay_mode, preview, folds)).await?
     {
         return Ok(data);
     }
@@ -1697,6 +1719,35 @@ mod tests {
 
     fn lines_from(bytes: &'static [u8]) -> tokio::io::Lines<BufReader<&'static [u8]>> {
         BufReader::new(bytes).lines()
+    }
+
+    /// Turning review ON carries no fold answers, and the request has to say
+    /// that the way the daemon and the JSON API both read it: by not carrying
+    /// the key at all. An empty map is a map, and the surfaces refuse any map
+    /// here - so a client that sent one would meet a refusal for a question it
+    /// never asked.
+    #[test]
+    fn a_request_on_the_way_in_carries_no_folds_at_all() {
+        let going_in = review_request("team", true, false, &[]);
+        assert_eq!(going_in["mode"], serde_json::json!("overlay"));
+        assert!(
+            going_in.get("folds").is_none(),
+            "a domain on its way in holds no drafts to answer for: {going_in}"
+        );
+
+        let leaving = review_request("team", false, false, &[("ada".to_string(), true)]);
+        assert_eq!(
+            leaving["folds"],
+            serde_json::json!({ "ada": "fold" }),
+            "and on the way out the answers are the request: {leaving}"
+        );
+
+        let plan = review_request("team", false, true, &[]);
+        assert_eq!(plan["preview"], serde_json::json!(true));
+        assert!(
+            plan.get("folds").is_none(),
+            "asking for the plan answers nothing yet: {plan}"
+        );
     }
 
     // --- the resolved skill-surface answer ------------------------------------
