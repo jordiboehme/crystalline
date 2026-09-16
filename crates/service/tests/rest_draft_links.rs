@@ -1890,3 +1890,229 @@ async fn a_rename_ends_a_live_join_at_the_old_path() {
     );
 }
 
+/// After an overlay rename, the address keeps answering for everybody the
+/// rename was not about.
+///
+/// The round-2 report recorded a 404 here and called it a defect. It is not:
+/// the read that answered 404 was the MOVING ACTOR's own, at a path she had
+/// just tombstoned by moving her draft away from it, which is exactly what her
+/// own view is supposed to say. The concern misattributed it to a non-grantee.
+/// This test is what that claim should have been checked against, and it pins
+/// the rule from all three sides so the next reader does not have to re-derive
+/// it:
+///
+/// * a reader with no draft of their own resolves the permalink to the BASE
+///   row, wherever any actor's overlay has moved their own copy of it;
+/// * a grantee whose link has just ended by the rename is exactly that reader;
+/// * the actor who moved it reads their own rows - nothing at the path they
+///   tombstoned, their draft at the path they moved it to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overlay_rename_leaves_the_base_permalink_answering_for_everybody_else() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let carol = login(f.addr, "carol").await;
+
+    // Alice redrafts the team's page and hands it to bob, who joins it.
+    let base = f.reads(&alice, "plan").await;
+    let checksum = base["checksum"].as_str().unwrap().to_string();
+    let redrafted = base["content"]
+        .as_str()
+        .unwrap()
+        .replace("What the team agreed", "What alice would rather");
+    let saved = alice
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header("if-match", format!("\"{checksum}\""))
+        .json(&serde_json::json!({"content": redrafted}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200, "{:?}", saved.text().await);
+    let token = f.mint(&alice, "plan.md").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let joined = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), 200);
+
+    // Alice moves her draft of it away. The document travels verbatim, so it
+    // keeps the address the base row also answers to.
+    let moved = alice
+        .request(f.addr, reqwest::Method::POST, "/api/v1/domains/team/move")
+        .json(&serde_json::json!({"permalink": "plan", "destination": "notes/plan"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200, "{:?}", moved.text().await);
+
+    for (who, name) in [
+        (&bob, "the grantee whose link just ended"),
+        (&carol, "a reader who was never in it"),
+    ] {
+        let read = f.reads(who, "plan").await;
+        assert_eq!(
+            read["path"],
+            serde_json::json!("plan.md"),
+            "{name} resolves the address to the base row: {read}"
+        );
+        assert!(
+            read["content"]
+                .as_str()
+                .unwrap()
+                .contains("What the team agreed"),
+            "and reads the team's own words there: {read}"
+        );
+        assert!(
+            read.get("draft_owner").is_none(),
+            "with nothing said about anybody's draft: {read}"
+        );
+    }
+
+    // And alice reads her own rows: nothing where she tombstoned it, her draft
+    // where she put it.
+    let gone = alice
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/plan.md",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        gone.status(),
+        404,
+        "the path she moved it off holds nothing for her: {:?}",
+        gone.text().await
+    );
+    let hers = f.reads(&alice, "plan").await;
+    assert_eq!(
+        hers["path"],
+        serde_json::json!("notes/plan.md"),
+        "and the address finds her draft where she moved it: {hers}"
+    );
+}
+
+/// One account holding links to two authors' drafts of the same page joins two
+/// different drafts, and each joined write lands in its own author's overlay.
+///
+/// Two authors routinely hold a draft at one path - an overlay row is keyed by
+/// actor as well as by path - so "which draft is this join to" has to name the
+/// author. A join keyed on the path alone would hand the second link the first
+/// author's key, and the writing carol thought she was doing in alice's draft
+/// would land in dave's, under his name, for the wrong person to review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_authors_drafts_of_one_page_are_two_joins() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let dave = login(f.addr, "dave").await;
+    let carol = login(f.addr, "carol").await;
+
+    // Both authors redraft the team's page, each in their own overlay.
+    let base = f.reads(&alice, "plan").await;
+    let checksum = base["checksum"].as_str().unwrap().to_string();
+    for (who, phrase) in [(&alice, "alices wording"), (&dave, "daves wording")] {
+        let redrafted = base["content"]
+            .as_str()
+            .unwrap()
+            .replace("What the team agreed", phrase);
+        let saved = who
+            .request(
+                f.addr,
+                reqwest::Method::PUT,
+                "/api/v1/domains/team/engrams/plan",
+            )
+            .header("if-match", format!("\"{checksum}\""))
+            .json(&serde_json::json!({"content": redrafted}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 200, "{:?}", saved.text().await);
+    }
+
+    // Carol is handed both, and joins both.
+    let mut opened: Vec<(String, String, String)> = Vec::new();
+    for owner in [&alice, &dave] {
+        let token = f.mint(owner, "plan.md").await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let joined: serde_json::Value = carol
+            .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+            .json(&serde_json::json!({"token": token}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        opened.push((
+            joined["owner"].as_str().unwrap().to_string(),
+            joined["join_key"].as_str().unwrap().to_string(),
+            joined["checksum"].as_str().unwrap().to_string(),
+        ));
+    }
+    assert_eq!(
+        opened
+            .iter()
+            .map(|(owner, _, _)| owner.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alice", "dave"],
+        "each link opened its own author's draft"
+    );
+    assert_ne!(
+        opened[0].1, opened[1].1,
+        "and each is a join of its own: {opened:?}"
+    );
+
+    // A write under each key, and each lands where its key says.
+    for (owner, key, checksum) in &opened {
+        let saved = carol
+            .request(
+                f.addr,
+                reqwest::Method::PUT,
+                "/api/v1/domains/team/engrams/plan",
+            )
+            .header("if-match", format!("\"{checksum}\""))
+            .header("x-crystalline-join", key)
+            .json(&serde_json::json!({
+                "content": format!(
+                    "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Plan\n\ncarol edited {owner}s copy.\n"
+                ),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), 200, "{:?}", saved.text().await);
+        let receipt: serde_json::Value = saved.json().await.unwrap();
+        assert_eq!(
+            receipt["joined"],
+            serde_json::json!(format!("landed in {owner}'s draft")),
+            "the receipt names whose draft it landed in: {receipt}"
+        );
+    }
+
+    // And each author reads their own copy, carrying carol's words for them
+    // and nobody else's.
+    for (who, owner) in [(&alice, "alice"), (&dave, "dave")] {
+        let theirs = f.reads(who, "plan").await;
+        assert!(
+            theirs["content"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("carol edited {owner}s copy")),
+            "{owner} reads what carol wrote in THEIR draft: {theirs}"
+        );
+    }
+}

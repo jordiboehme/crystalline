@@ -3415,9 +3415,16 @@ impl Engine {
             let view = DomainView::for_read(self, &desc.domain, hidden, scope)?;
             if let Some(actor) = view.actor() {
                 if view.deletes(desc.domain_id, &desc.path).await? {
-                    return Err(EngineError::NotFound(format!(
-                        "no engram matches '{identifier}'"
-                    )));
+                    // Their own drafts before the miss, for the reason the
+                    // named-domain branch below gives at length: a tombstone
+                    // says this PATH holds nothing for them, and the address
+                    // may well have moved to another path of their own.
+                    return match view.resolve_draft(identifier).await? {
+                        Some((desc, source)) => Ok((desc, source, Some(actor.to_string()))),
+                        None => Err(EngineError::NotFound(format!(
+                            "no engram matches '{identifier}'"
+                        ))),
+                    };
                 }
                 let actor = actor.to_string();
                 return Ok((desc, source, Some(actor)));
@@ -3431,9 +3438,24 @@ impl Engine {
         match self.resolve_scoped(identifier, domain, hidden).await {
             Ok((desc, source)) => {
                 if view.deletes(desc.domain_id, &desc.path).await? {
-                    return Err(EngineError::NotFound(format!(
-                        "no engram '{identifier}' in domain '{name}'"
-                    )));
+                    // **A tombstone is about a PATH, and an address can move
+                    // off it.** Renaming a draft of a page the team holds
+                    // leaves this actor a tombstone where the base row is and
+                    // their own row, carrying the same address, somewhere else
+                    // - a document travels verbatim, so the permalink travels
+                    // with it. Answering the miss here would lose the address
+                    // for its own author while the team went on reading it,
+                    // which is the one reader whose view must show their own
+                    // work. So their drafts are asked before the miss, exactly
+                    // as they are when the base knew nothing at all; a plain
+                    // deletion still answers the miss, because no draft of
+                    // theirs answers to that address any more.
+                    return match view.resolve_draft(identifier).await? {
+                        Some((desc, source)) => Ok((desc, source, Some(actor.to_string()))),
+                        None => Err(EngineError::NotFound(format!(
+                            "no engram '{identifier}' in domain '{name}'"
+                        ))),
+                    };
                 }
                 Ok((desc, source, Some(actor.to_string())))
             }

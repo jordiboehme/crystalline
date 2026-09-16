@@ -2211,9 +2211,19 @@ async fn every_write_verb_lands_in_the_draft_and_none_of_them_touches_the_tree()
         vec![("archive/plan.md", false), ("plan.md", true)],
         "a move is a tombstone at the source and an entry at the destination: {held:?}"
     );
+    // The tombstone is about the PATH: nothing of the team's shows through at
+    // `plan.md` for her any more. The address is a different question, and it
+    // travelled with the document she moved, which is what the read below says.
     assert!(
-        f.reads("plan", &alice).await.is_err(),
+        f.reads("plan.md", &alice).await.is_err(),
         "alice no longer sees it where the team's file is"
+    );
+    assert!(
+        f.reads("plan", &alice)
+            .await
+            .expect("while the address finds her draft where she moved it")
+            .contains("status: archived"),
+        "which is her own copy rather than the team's"
     );
     assert!(
         f.reads("plan", &account("bob"))
@@ -2792,8 +2802,19 @@ async fn a_mirror_that_fails_never_unsays_a_draft_that_landed() {
         "four writes, four rows: {held:?}"
     );
     assert!(
-        f.reads("notes", &alice).await.is_err() && f.reads("plan", &alice).await.is_err(),
-        "and the two deletions are deletions for her"
+        f.reads("notes", &alice).await.is_err(),
+        "the deletion is a deletion for her"
+    );
+    // The move is not a deletion, and the tombstone it left at the source does
+    // not make it one: a document travels verbatim, so the address travelled to
+    // `archive/plan.md` with it, and her own view is the one view that has to
+    // find her own work where she put it.
+    assert!(
+        f.reads("plan", &alice)
+            .await
+            .expect("the address follows her draft")
+            .contains("and alice would add this"),
+        "and the move moved it rather than ending it"
     );
 
     // And nothing at all was mirrored, which the journal says rather than
