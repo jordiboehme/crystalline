@@ -557,11 +557,7 @@ fn view_verdicts(
     let dst_screen = search::actor_screen_on("dst", Some(actor), params, n);
     let drafts = search::drafts_only_on("e", actor, params, n);
     let verdict = |alias: &str| {
-        let reach = reference_match(
-            alias,
-            ReferenceCandidates::DraftsOnly { screen: &drafts },
-            false,
-        );
+        let reach = reference_match(alias, ReferenceCandidates::DraftsOnly { screen: &drafts });
         // `tgt` is the bound row, read for its address alone; `dst` beside it
         // is the screen that says what this reader holds there.
         format!(
@@ -790,6 +786,28 @@ fn observation_insert_sql(count: usize) -> String {
     format!(
         "INSERT INTO observation(engram_id, line, category, content, context) VALUES {} RETURNING id, line",
         value_rows(5, count, None)
+    )
+}
+
+/// The resolve pass over one reference table: bind every row whose `to_id` is
+/// still NULL to the engram its bracket text names.
+///
+/// One statement. Target domain is `to_domain` when set, else the row's own
+/// domain. Prefer a permalink match, then a title match, then the whole
+/// bracket text at home - see `reference_match`.
+///
+/// Built here rather than inline in the two trait methods so the plan guard
+/// `the_reference_resolve_pass_seeks_the_title_index` can explain the
+/// statement this store actually issues. The pass runs on every sync of every
+/// domain and is O(dangling references), so each of its four arms has to be an
+/// index seek; a hand-copied literal in a test is what let the title arm lose
+/// its index once already.
+fn resolve_pending_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET to_id = {resolved} \
+         WHERE {table}.to_id IS NULL AND {table}.domain_id = ?1 \
+         AND {resolved} IS NOT NULL",
+        resolved = reference_match(table, ReferenceCandidates::Base)
     )
 }
 
@@ -1070,18 +1088,12 @@ impl Store for TursoStore {
     }
 
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
-        // One statement. Target domain is `to_domain` when set, else the
-        // relation's own domain. Prefer a permalink match, then a title match,
-        // then the whole bracket text at home - see `reference_match`.
-        let sql = format!(
-            "UPDATE relation SET to_id = {resolved} \
-             WHERE relation.to_id IS NULL AND relation.domain_id = ?1 \
-             AND {resolved} IS NOT NULL",
-            resolved = reference_match("relation", ReferenceCandidates::Base, false)
-        );
         let n = self
             .conn
-            .execute(&sql, vec![Value::Integer(domain.0)])
+            .execute(
+                &resolve_pending_sql("relation"),
+                vec![Value::Integer(domain.0)],
+            )
             .await?;
         Ok(n)
     }
@@ -1089,15 +1101,9 @@ impl Store for TursoStore {
     async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
         // The wikilink twin of resolve_pending_relations over the `link` table,
         // matching by the same rule. Links carry no rel_type.
-        let sql = format!(
-            "UPDATE link SET to_id = {resolved} \
-             WHERE link.to_id IS NULL AND link.domain_id = ?1 \
-             AND {resolved} IS NOT NULL",
-            resolved = reference_match("link", ReferenceCandidates::Base, false)
-        );
         let n = self
             .conn
-            .execute(&sql, vec![Value::Integer(domain.0)])
+            .execute(&resolve_pending_sql("link"), vec![Value::Integer(domain.0)])
             .await?;
         Ok(n)
     }
@@ -1137,7 +1143,6 @@ impl Store for TursoStore {
                 ReferenceCandidates::View {
                     screen: &actor_screen,
                 },
-                false,
             );
             let sql = format!(
                 "UPDATE {table} SET to_id = {view} \
@@ -2783,6 +2788,57 @@ mod tests {
             }
         }
         map.into_iter().collect()
+    }
+
+    /// The resolve pass seeks the title index on the arm that needs it.
+    ///
+    /// The statement is the one `resolve_pending_sql` builds, not a copy of it:
+    /// the guard this replaces asserted on a hand-copied literal, went on
+    /// explaining a statement the store had stopped issuing, and stayed green
+    /// while the shipped title arm lost its index to a path tie-break. A guard
+    /// that reads the shipped builder cannot go stale that way.
+    ///
+    /// What is at stake: `COALESCE` evaluates lazily, so a reference that
+    /// resolves by permalink never reaches the title arm - but a reference the
+    /// pass actually works on is by definition one that did NOT resolve, so it
+    /// falls through to the title arms every time. A scan there is a scan of
+    /// the whole domain per dangling reference, measured at 2.4 s for 500 of
+    /// them where the seek takes 25 ms.
+    #[tokio::test]
+    async fn the_reference_resolve_pass_seeks_the_title_index() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let domain = store
+            .upsert_domain("d", Some("/tmp/d"), DomainKind::File)
+            .await
+            .unwrap();
+        // One row in each table, so the planner is choosing over a real schema
+        // rather than an empty one.
+        let record = record_with_observations(Vec::new());
+        store.upsert_engram(domain, &record).await.unwrap();
+
+        for table in ["relation", "link"] {
+            let plan = store
+                .explain_query_plan(&resolve_pending_sql(table))
+                .await
+                .unwrap()
+                .join(" | ");
+            assert!(
+                plan.contains("idx_engram_title_lower"),
+                "the {table} resolve pass must seek the title index, plan was: {plan}"
+            );
+            assert!(
+                !plan.contains("SCAN engram") && !plan.contains("SCAN e "),
+                "no arm of the {table} resolve pass may scan the engram table, \
+                 plan was: {plan}"
+            );
+            assert!(
+                plan.contains(&format!(
+                    "SEARCH {table} USING INDEX idx_{table}_unresolved"
+                )),
+                "the {table} pass itself stays bounded by the unresolved index, \
+                 plan was: {plan}"
+            );
+        }
     }
 
     #[tokio::test]

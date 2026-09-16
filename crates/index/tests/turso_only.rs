@@ -3,11 +3,15 @@
 //! index-seek check (a Turso-only diagnostic). The behavioral parity suite lives
 //! in `store.rs` and runs against both backends.
 //!
-//! It is also where the query-shape guards live - the plans and the source
-//! scans that keep a wide column out of an unbounded sorter. Two of them read
-//! plans, which only Turso can produce; the third reads source, and scans both
-//! backends, because the shape it guards is a twin and a Turso-only check would
-//! catch half of it.
+//! It is also where the query-shape guards that can be written from outside the
+//! crate live - the plans over statements a test can spell in full, and the
+//! source scans that keep a wide column out of an unbounded sorter. The two
+//! guards over statements the store BUILDS (the reference resolve pass and the
+//! lexical candidate scan) sit in `src` beside their builders instead, in
+//! `turso/mod.rs` and `turso/search.rs`: they used to live here over
+//! hand-copied literals, and a copy stops guarding the moment the shipped
+//! statement moves, which is how the resolve pass lost its title index for a
+//! whole wave while its guard stayed green.
 
 use std::path::Path;
 
@@ -45,38 +49,6 @@ async fn store_info_reports_turso_schema_version() {
 }
 
 #[tokio::test]
-async fn title_match_resolution_seeks_the_promoted_index() {
-    let store = open().await;
-    // Seed a domain so the query is over a real table.
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "a.md",
-        &engram("Alpha", "a", "engram", "", "b\n"),
-    );
-    sync_domain(&store, "d", dir.path()).await.unwrap();
-
-    // The correlated title subquery shape `resolve_pending_relations` runs to
-    // match a relation target by lowercased title within a domain. Without the
-    // expression index this is a full engram scan per unresolved reference.
-    let plan = store
-        .explain_query_plan(
-            "SELECT e.id FROM engram e WHERE lower(e.title) = lower('Alpha') AND e.domain_id = 1 LIMIT 1",
-        )
-        .await
-        .unwrap();
-    let joined = plan.join(" | ");
-    assert!(
-        joined.contains("USING INDEX") && joined.contains("idx_engram_title_lower"),
-        "title match should seek the promoted index, plan was: {joined}"
-    );
-    assert!(
-        !joined.contains("SCAN engram") || joined.contains("USING INDEX"),
-        "title match should not be a bare full scan, plan was: {joined}"
-    );
-}
-
-#[tokio::test]
 async fn temporal_current_filter_uses_the_promoted_index() {
     let store = open().await;
     // Seed a domain so the query is over a real table.
@@ -98,73 +70,6 @@ async fn temporal_current_filter_uses_the_promoted_index() {
     assert!(
         !joined.contains("SCAN engram") || joined.contains("USING INDEX"),
         "current filter should not be a bare full scan, plan was: {joined}"
-    );
-}
-
-/// The lexical candidate scan keeps its index order under a folder filter.
-///
-/// This is the one query in the tree that carries full bodies (`e.content`,
-/// `e.description`) past a plan decision: it loads up to
-/// `LEXICAL_CANDIDATE_CAP` rows and ranks them in Rust. `ORDER BY e.id` is
-/// served from the table's own rowid order, so nothing sorts those bodies, and
-/// the folder prefix the listing pushes into the same `WHERE` is bound here on
-/// purpose - it is the newest predicate on this query, and a predicate is
-/// exactly what can talk a planner out of an index-ordered scan. It does not:
-/// the plan stays a rowid-ordered scan of `engram`.
-///
-/// What this test also records, because it is measured rather than assumed: a
-/// **domain-scoped** candidate query does open a sorter. `d.name IN (...)`
-/// drives the join from `domain` and reaches `engram` through
-/// `idx_engram_domain`, whose order is not rowid order, so turso sorts. That is
-/// older than the folder filter - the probe above puts the flip on the domain
-/// predicate alone, with and without the path clause - and it is bounded by the
-/// candidate cap in the same statement, which is the property
-/// [`the_candidate_projection_is_never_unbounded`] pins. Recorded here so the
-/// next reader of the "never reaches a sorter" comment beside the query knows
-/// which shape it was written about.
-///
-/// **The SQL below is a hand-copy of the shipped statement and only guards what
-/// it copies.** It mirrors `scored_lexical` in `src/turso/search.rs`: the
-/// `CANDIDATE_COLUMNS` projection, the folder filter `build_scalar_filters`
-/// pushes in (both sides lowered, since a path filter folds case), one term
-/// group over title, description and content, `ORDER BY e.id` and the candidate
-/// cap. Change the shipped filter and this literal has to be re-derived from it
-/// in the same commit, or the guard goes on explaining a query the code no
-/// longer issues: it stays green and quietly stops guarding.
-///
-/// It also spells as literals what the shipped statement BINDS, and a binding is
-/// itself a plan input - a planner may treat a parameter differently from a
-/// constant it can see. So this pins the plan for the shape, not for the exact
-/// statement the store executes.
-#[tokio::test]
-async fn the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter() {
-    let store = open().await;
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "notes/a.md",
-        &engram("A", "notes/a", "engram", "", "b\n"),
-    );
-    sync_domain(&store, "d", dir.path()).await.unwrap();
-
-    let plan = store
-        .explain_query_plan(
-            "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
-                    e.description, e.content, CAST(json_extract(e.metadata, '$.salience') AS REAL) \
-             FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE lower(e.path) LIKE lower('notes/%') ESCAPE '\\' \
-               AND (lower(e.title) LIKE '%term%' ESCAPE '\\' \
-                    OR lower(e.description) LIKE '%term%' ESCAPE '\\' \
-                    OR lower(e.content) LIKE '%term%' ESCAPE '\\') \
-             ORDER BY e.id LIMIT 5000",
-        )
-        .await
-        .unwrap();
-    let joined = plan.join(" | ");
-    assert!(
-        !joined.contains("SORTER") && !joined.contains("TEMP B-TREE"),
-        "a folder filter must not cost the candidate scan its rowid order, \
-         plan was: {joined}"
     );
 }
 

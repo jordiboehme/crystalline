@@ -70,19 +70,20 @@ pub struct ObservationRecord {
 /// One rule, shared by both backends and by both reference tables, because a
 /// second copy of it would be a second answer to "does this link resolve".
 /// `table` is `relation` or `link` (or the alias a statement gave one); every
-/// construct here is spelled the same in both dialects but one - the path
-/// tie-break's collation, which `postgres` selects - and only the caller's
-/// bind placeholder differs otherwise, and the one predicate that is not, the
-/// actor screen, is handed in ready-made by the backend that owns its
-/// spelling.
+/// construct here is spelled the same in both dialects, and the one predicate
+/// that is not, the actor screen, is handed in ready-made by the backend that
+/// owns its spelling.
 ///
-/// `postgres` is true when the caller is building this for the Postgres
-/// backend, false for Turso. Turso 0.7.2 sorts TEXT byte-wise on its own and
-/// rejects an unregistered `COLLATE "C"` outright (it reads any collation name
-/// it does not already know as an ICU locale tag, and `"C"` is not one), so
-/// the tie-break names the bare column there; Postgres needs the explicit
-/// collation to match that same byte order under a locale-collated database,
-/// exactly as [`crate::postgres::PostgresStore::find_engram`] already pins it.
+/// The tie-break is `e.id` on both backends, and it is `e.id` for two reasons
+/// rather than one. It is collation-free - an integer sorts the same way under
+/// every locale, so neither dialect has to spell a collation to agree with the
+/// other. And it is free of an index cost that a path tie-break is not: turso
+/// can satisfy `ORDER BY e.path` from `idx_engram_path_actor`, so naming the
+/// path here talked the planner out of the title index and turned the title
+/// arm of every unresolved reference into a scan of the whole domain (measured
+/// at 2.4 s for 500 dangling references where the seek takes 25 ms, and the
+/// resolve pass runs on every sync of every domain, reviewed or not). Ordering
+/// by the primary key costs no sorter at all, on either arm.
 ///
 /// `candidates` says whose rows may answer. [`ReferenceCandidates::Base`]
 /// emits the text this expression has always emitted plus the new tie-break,
@@ -102,11 +103,7 @@ pub struct ObservationRecord {
 /// a softer answer: a prefix that does name a domain never reaches it, and a
 /// row written before `to_raw` existed compares against NULL, which is never
 /// true, so it resolves exactly as it did before until its engram is reindexed.
-pub(crate) fn reference_match(
-    table: &str,
-    candidates: ReferenceCandidates<'_>,
-    postgres: bool,
-) -> String {
+pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
     let target_domain = format!(
         "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
     );
@@ -114,29 +111,31 @@ pub(crate) fn reference_match(
         "{table}.to_domain IS NOT NULL \
          AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
     );
-    // The path tie-break itself: a bare `LIMIT 1` with no secondary sort key
-    // leaves a tie between two candidate rows unpinned, and the row it hands
-    // back then depends on physical layout rather than on the address. This is
-    // the same tie-break `find_engram` uses, so a reference and a lookup that
-    // could both land on either row agree, and the two backends agree with
-    // each other even though only one of them spells the collation.
-    let path_order = if postgres {
-        "e.path COLLATE \"C\""
-    } else {
-        "e.path"
-    };
+    // The tie-break itself: a bare `LIMIT 1` with no secondary sort key leaves
+    // a tie between two candidate rows unpinned, and the row it hands back
+    // then depends on physical layout rather than on the address. The row with
+    // the lower id wins, which is deterministic, spelled the same in both
+    // dialects and served from the primary key.
+    //
+    // `find_engram` pins its own tie to the byte-lower path instead, so the two
+    // can name different rows where two engrams in one domain share a title -
+    // the oldest of them answers a reference, the byte-first of them answers a
+    // lookup. Both are deterministic and locale-free, which is what a tie-break
+    // owes; making them the same key would cost the lookup the same index the
+    // path ordering costs this one, so they are two answers on purpose.
+    let id_order = "e.id";
     // Which rows may answer, and - when more than one may - which of them wins
     // at the same address. `Base` is the literal base predicate and no
-    // preference beyond the path tie-break.
+    // preference beyond the id tie-break.
     let (actor_screen, prefer) = match candidates {
-        ReferenceCandidates::Base => ("e.actor = ''", format!(" ORDER BY {path_order}")),
+        ReferenceCandidates::Base => ("e.actor = ''", format!(" ORDER BY {id_order}")),
         ReferenceCandidates::View { screen } | ReferenceCandidates::DraftsOnly { screen } => (
             screen,
             // The author's own row first, said as an ordering rather than as
             // a second COALESCE arm so one arm stays one statement; `0` sorts
             // before `1` in every dialect and needs no collation of its own.
-            // The path tie-break settles a further tie within that class.
-            format!(" ORDER BY CASE WHEN e.actor = '' THEN 1 ELSE 0 END, {path_order}"),
+            // The id tie-break settles a further tie within that class.
+            format!(" ORDER BY CASE WHEN e.actor = '' THEN 1 ELSE 0 END, {id_order}"),
         ),
     };
     format!(

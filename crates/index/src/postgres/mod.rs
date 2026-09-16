@@ -589,11 +589,7 @@ fn view_verdicts(
     let dst_screen = search::actor_screen_on("dst", Some(actor), params, n);
     let drafts = search::drafts_only_on("e", actor, params, n);
     let verdict = |alias: &str| {
-        let reach = reference_match(
-            alias,
-            ReferenceCandidates::DraftsOnly { screen: &drafts },
-            true,
-        );
+        let reach = reference_match(alias, ReferenceCandidates::DraftsOnly { screen: &drafts });
         // `tgt` is the bound row, read for its address alone; `dst` beside it
         // is the screen that says what this reader holds there.
         format!(
@@ -1038,7 +1034,7 @@ impl Store for PostgresStore {
             "UPDATE relation SET to_id = {resolved} \
              WHERE relation.to_id IS NULL AND relation.domain_id = $1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("relation", ReferenceCandidates::Base, true)
+            resolved = reference_match("relation", ReferenceCandidates::Base)
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -1056,7 +1052,7 @@ impl Store for PostgresStore {
             "UPDATE link SET to_id = {resolved} \
              WHERE link.to_id IS NULL AND link.domain_id = $1 \
              AND {resolved} IS NOT NULL",
-            resolved = reference_match("link", ReferenceCandidates::Base, true)
+            resolved = reference_match("link", ReferenceCandidates::Base)
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -1103,7 +1099,6 @@ impl Store for PostgresStore {
                 ReferenceCandidates::View {
                     screen: &actor_screen,
                 },
-                true,
             );
             let sql = format!(
                 "UPDATE {table} SET to_id = {view} \
@@ -3119,17 +3114,25 @@ mod tests {
         }
     }
 
-    /// `reference_match`'s path tie-break (`crates/index/src/store.rs`) is
-    /// interpolated into a `path_order` variable rather than written out as
+    /// `reference_match`'s tie-break (`crates/index/src/store.rs`) is
+    /// interpolated into an `id_order` variable rather than written out as
     /// literal text in this file, so `every_text_order_by_is_collation_pinned`'s
     /// static scan of `postgres/mod.rs` and `postgres/search.rs` can never see
-    /// it: the source line only ever carries the placeholder token
-    /// `{path_order}`, which is not a column `TEXT_COLUMNS` knows about.
-    /// Adding `store.rs` to that scan's `sources` would pass vacuously and
-    /// leave the statement covered by nothing at all while looking covered,
-    /// so this closes the gap by scanning the RENDERED output instead, for
-    /// both backend flags and all three candidate sets `reference_match`
-    /// takes.
+    /// it: the source line only ever carries the placeholder token, which is
+    /// not a column `TEXT_COLUMNS` knows about. Adding `store.rs` to that
+    /// scan's `sources` would pass vacuously and leave the statement covered by
+    /// nothing at all while looking covered, so this closes the gap by scanning
+    /// the RENDERED output instead, for all three candidate sets
+    /// `reference_match` takes.
+    ///
+    /// What it pins is that the tie-break needs no collation, which is the
+    /// stronger form of pinning one: the key is the primary key on both
+    /// backends, so the two dialects agree on the row without either of them
+    /// spelling a collation. A text key here would have to carry `COLLATE "C"`
+    /// on Postgres and must not carry it on Turso - and, as the wave measured,
+    /// a path key also costs the title arm its index on Turso, so this guard
+    /// stands beside `the_reference_resolve_pass_seeks_the_title_index` in
+    /// `turso/mod.rs` rather than alone.
     ///
     /// One rendering is a single long line carrying four `ORDER BY`
     /// occurrences, one per `COALESCE` arm, so every occurrence is walked
@@ -3137,60 +3140,54 @@ mod tests {
     /// each occurrence's tail is fed through the same `sort_keys` the static
     /// scan uses.
     #[test]
-    fn reference_match_tie_break_is_collation_pinned() {
-        for postgres in [false, true] {
-            for (label, candidates) in [
-                ("Base", crate::store::ReferenceCandidates::Base),
-                (
-                    "View",
-                    crate::store::ReferenceCandidates::View {
-                        screen: "e.actor = 'a'",
-                    },
-                ),
-                (
-                    "DraftsOnly",
-                    crate::store::ReferenceCandidates::DraftsOnly {
-                        screen: "e.actor = 'a'",
-                    },
-                ),
-            ] {
-                let rendered = crate::store::reference_match("relation", candidates, postgres);
-                let mut path_keys = 0usize;
-                for (pos, _) in rendered.match_indices("ORDER BY ") {
-                    for key in sort_keys(&rendered[pos + "ORDER BY ".len()..]) {
-                        assert!(
-                            !key.chars().all(|c| c.is_ascii_digit()),
-                            "reference_match(postgres={postgres}, {label}) orders by the \
-                             positional key `{key}`, which cannot carry a collation."
-                        );
-                        if !key.contains("path") {
-                            continue;
-                        }
-                        path_keys += 1;
-                        if postgres {
-                            assert!(
-                                key.contains("COLLATE"),
-                                "reference_match(postgres=true, {label}) orders by `{key}` \
-                                 without a collation. Pin it with COLLATE \"C\" so it \
-                                 matches Turso's byte order."
-                            );
-                        } else {
-                            assert!(
-                                !key.contains("COLLATE"),
-                                "reference_match(postgres=false, {label}) orders by `{key}` \
-                                 with a collation Turso does not understand; Turso already \
-                                 sorts TEXT byte-wise on its own, so the bare column is \
-                                 correct there."
-                            );
-                        }
+    fn reference_match_ties_break_on_a_collation_free_key() {
+        for (label, candidates) in [
+            ("Base", crate::store::ReferenceCandidates::Base),
+            (
+                "View",
+                crate::store::ReferenceCandidates::View {
+                    screen: "e.actor = 'a'",
+                },
+            ),
+            (
+                "DraftsOnly",
+                crate::store::ReferenceCandidates::DraftsOnly {
+                    screen: "e.actor = 'a'",
+                },
+            ),
+        ] {
+            let rendered = crate::store::reference_match("relation", candidates);
+            let mut id_keys = 0usize;
+            for (pos, _) in rendered.match_indices("ORDER BY ") {
+                for key in sort_keys(&rendered[pos + "ORDER BY ".len()..]) {
+                    assert!(
+                        !key.chars().all(|c| c.is_ascii_digit()),
+                        "reference_match({label}) orders by the positional key `{key}`, \
+                         which names no column at all."
+                    );
+                    if key == "e.id" {
+                        id_keys += 1;
+                        continue;
                     }
+                    // The only other key either form carries is the leading
+                    // `CASE`, which sorts two integers.
+                    assert!(
+                        key.starts_with("CASE WHEN") && key.ends_with("END"),
+                        "reference_match({label}) orders by `{key}`: the tie-break is \
+                         `e.id` so that neither dialect has to spell a collation, and a \
+                         text key here would also cost the title arm its index on Turso."
+                    );
+                    assert!(
+                        !key.contains("COLLATE"),
+                        "reference_match({label}) collates `{key}`, which sorts integers."
+                    );
                 }
-                assert_eq!(
-                    path_keys, 4,
-                    "reference_match(postgres={postgres}, {label}) should carry the path \
-                     tie-break on every one of its four COALESCE arms: {rendered}"
-                );
             }
+            assert_eq!(
+                id_keys, 4,
+                "reference_match({label}) should carry the id tie-break on every one of \
+                 its four COALESCE arms: {rendered}"
+            );
         }
     }
 

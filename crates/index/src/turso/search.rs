@@ -300,21 +300,8 @@ async fn scored_lexical(
     } else {
         format!("AND {}", clauses.join(" AND "))
     };
-    // `ORDER BY e.id` is the cheapest order this wide projection can be given:
-    // unscoped, or scoped by path alone, it is satisfied from the table's own
-    // rowid order and no sorter opens at all. Scoped to a domain it does sort -
-    // `d.name IN (...)` drives the join from `domain` and reaches `engram`
-    // through `idx_engram_domain`, whose order is not rowid order - and what
-    // holds that sorter down is the `LIMIT` in this same statement, which lets
-    // turso keep `candidate_cap` records rather than the match set. Both
-    // properties are pinned by `EXPLAIN QUERY PLAN` and a source scan in
-    // `tests/turso_only.rs`. Keep the bound and keep the order: any other
-    // ordering here, or a `GROUP BY`, would spill every matched body to disk.
     let actor_screen = actor_screen(query.actor.as_deref(), &mut params, &mut n);
-    let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
-    );
+    let sql = lexical_candidate_sql(&actor_screen, &and_filters, candidate_cap);
     let rows = query_all(conn, &sql, params).await?;
 
     // Consume the raw rows by value so each row's buffers are freed as its
@@ -612,6 +599,33 @@ const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_ty
 /// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
 /// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins)
 /// and costs nothing: it is the grouping key, already in the sorter record.
+/// The lexical candidate prefilter: every row matching the reader's terms and
+/// filters, capped, ranked afterwards in Rust.
+///
+/// `ORDER BY e.id` is the cheapest order this wide projection can be given:
+/// unscoped, or scoped by path alone, it is satisfied from the table's own
+/// rowid order and no sorter opens at all. Scoped to a domain it does sort -
+/// `d.name IN (...)` drives the join from `domain` and reaches `engram`
+/// through `idx_engram_domain`, whose order is not rowid order - and what
+/// holds that sorter down is the `LIMIT` in this same statement, which lets
+/// turso keep `candidate_cap` records rather than the match set. Both
+/// properties are pinned by `EXPLAIN QUERY PLAN` beside this builder
+/// ([`the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter`])
+/// and by a source scan in `tests/turso_only.rs`. Keep the bound and keep the
+/// order: any other ordering here, or a `GROUP BY`, would spill every matched
+/// body to disk.
+///
+/// Built here rather than inline so the plan guard explains the statement this
+/// store issues rather than a copy of it: the copy it used to explain had lost
+/// the actor screen and the `WHERE {actor_screen} {and_filters}` restructuring
+/// the wave gave the shipped one.
+fn lexical_candidate_sql(actor_screen: &str, and_filters: &str, candidate_cap: usize) -> String {
+    format!(
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
+    )
+}
+
 fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
     format!(
         "SELECT c.engram_id, min(vector_distance_cos(c.embedding, ?1)) AS dist \
@@ -1205,7 +1219,6 @@ fn pending_arm(
     let reach = crate::store::reference_match(
         alias,
         crate::store::ReferenceCandidates::DraftsOnly { screen: &drafts },
-        false,
     );
     format!(
         " UNION ALL \
@@ -1598,6 +1611,74 @@ mod tests {
             CANDIDATE_COLUMNS,
             "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
      e.description, e.content, CAST(json_extract(e.metadata, '$.salience') AS REAL)"
+        );
+    }
+
+    /// The lexical candidate scan keeps its index order under a folder filter.
+    ///
+    /// This is the one query in the tree that carries full bodies (`e.content`,
+    /// `e.description`) past a plan decision: it loads up to
+    /// `LEXICAL_CANDIDATE_CAP` rows and ranks them in Rust. `ORDER BY e.id` is
+    /// served from the table's own rowid order, so nothing sorts those bodies,
+    /// and the folder prefix the listing pushes into the same `WHERE` is bound
+    /// here on purpose - it is the newest predicate on this query, and a
+    /// predicate is exactly what can talk a planner out of an index-ordered
+    /// scan. It does not: the plan stays a rowid-ordered scan of `engram`.
+    ///
+    /// What this test also records, because it is measured rather than assumed:
+    /// a **domain-scoped** candidate query does open a sorter. `d.name IN (...)`
+    /// drives the join from `domain` and reaches `engram` through
+    /// `idx_engram_domain`, whose order is not rowid order, so turso sorts. That
+    /// is older than the folder filter and it is bounded by the candidate cap in
+    /// the same statement, which is the property
+    /// `the_candidate_projection_is_never_unbounded` pins. Recorded here so the
+    /// next reader of the "never reaches a sorter" comment beside the query
+    /// knows which shape it was written about.
+    ///
+    /// **The statement is the shipped one**, built by `lexical_candidate_sql`
+    /// out of the actor screen and the filters `build_scalar_filters` produces,
+    /// with only the term group written out here. Its predecessor lived in
+    /// `tests/turso_only.rs` and copied the statement by hand, which meant it
+    /// went on explaining a query without the actor screen long after the
+    /// shipped one had grown one.
+    #[tokio::test]
+    async fn the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter() {
+        let store = crate::TursoStore::open_in_memory().await.unwrap();
+
+        let query = SearchQuery {
+            path_prefix: Some("notes/".to_string()),
+            ..SearchQuery::default()
+        };
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        let mut n = 1usize;
+        build_scalar_filters(
+            &query,
+            &mut clauses,
+            &mut params,
+            &mut n,
+            &crate::alias::AliasMap::default(),
+        );
+        // One term group over the three lexical columns, exactly as
+        // `scored_lexical` composes it for a full-text mode.
+        let mut ors: Vec<String> = Vec::new();
+        for col in ["title", "description", "content"] {
+            ors.push(format!("lower(e.{col}) LIKE ?{n} ESCAPE '\\'"));
+            n += 1;
+        }
+        clauses.push(format!("({})", ors.join(" OR ")));
+        let and_filters = format!("AND {}", clauses.join(" AND "));
+        let actor_screen = actor_screen(None, &mut params, &mut n);
+
+        let plan = store
+            .explain_query_plan(&lexical_candidate_sql(&actor_screen, &and_filters, 5000))
+            .await
+            .unwrap()
+            .join(" | ");
+        assert!(
+            !plan.to_uppercase().contains("SORTER") && !plan.contains("TEMP B-TREE"),
+            "a folder filter must not cost the candidate scan its rowid order, \
+             plan was: {plan}"
         );
     }
 

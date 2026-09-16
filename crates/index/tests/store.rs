@@ -513,15 +513,23 @@ parity!(
 /// bind to. `alpha-target.md` (permalink `alpha-target`) is synced alone
 /// first, so it gets the lower id; `Zulu-target.md` (permalink
 /// `zulu-target`) arrives in a later sync alongside the reference itself, so
-/// it gets the higher id. The three orderings a wrong fix could follow all
-/// disagree here, which is the point: insertion order (an unordered `LIMIT 1`
-/// answering whichever row it sees first) picks `alpha-target.md`; a locale
-/// collation, case-insensitive at the primary level, also picks
-/// `alpha-target.md`; only byte order picks `Zulu-target.md`, since `'Z'` is
-/// `0x5A` and `'a'` is `0x61`. The fix pins the tie to byte order on both
-/// backends, so the reference binds to `Zulu-target.md` regardless of which
-/// candidate existed first and regardless of the database's locale.
-async fn reference_match_tie_break_prefers_the_byte_lower_path(store: &dyn Store) {
+/// it gets the higher id.
+///
+/// The fixture is built so the candidate orderings disagree, which is the
+/// point: byte order over the path picks `Zulu-target.md` (`'Z'` is `0x5A`,
+/// `'a'` is `0x61`), a locale collation picks `alpha-target.md`, and the id
+/// order the tie-break is pinned to picks `alpha-target.md` too - but for a
+/// reason a locale cannot supply, since the id is an integer no collation
+/// touches. So this asserts the tie lands on the lower id on BOTH backends,
+/// which is what makes the two answers the same answer whatever the database's
+/// locale is and whatever order the rows physically sit in.
+///
+/// It was written for a path tie-break and rebaselined when that key cost the
+/// title arm its index on turso (a bare `ORDER BY e.path` is satisfiable from
+/// `idx_engram_path_actor`, so the planner abandoned `idx_engram_title_lower`
+/// and scanned the domain once per dangling reference). The property under
+/// test did not change: a tie is decided by the address, not by the layout.
+async fn reference_match_tie_break_prefers_the_lower_id(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
@@ -587,17 +595,17 @@ async fn reference_match_tie_break_prefers_the_byte_lower_path(store: &dyn Store
         .unwrap();
 
     assert_eq!(
-        zulu_page.total, 1,
-        "the reference binds to the byte order winner, Zulu-target.md: {zulu_page:?}"
+        alpha_page.total, 1,
+        "the reference binds to the lower id, alpha-target.md: {alpha_page:?}"
     );
     assert_eq!(
-        alpha_page.total, 0,
-        "not to the locale order winner or the insertion order winner, alpha-target.md: {alpha_page:?}"
+        zulu_page.total, 0,
+        "not to the byte order winner, Zulu-target.md: {zulu_page:?}"
     );
 }
 parity!(
     reference_resolves_to_the_same_row_on_both_backends,
-    reference_match_tie_break_prefers_the_byte_lower_path
+    reference_match_tie_break_prefers_the_lower_id
 );
 
 /// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
