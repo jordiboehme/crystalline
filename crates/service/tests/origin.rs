@@ -5376,3 +5376,69 @@ async fn unshared_team_work_puts_the_share_ask_on_a_write_receipt() {
         "both asks are inside their cooldown now"
     );
 }
+
+/// **A team domain that owes nothing is walked at most once a minute**, however
+/// many receipts go out in between.
+///
+/// Nothing is recorded when nothing is emitted - that rule is what keeps the
+/// ask landing on the first write after there IS something to say - so the
+/// sharing arm stays open on a machine whose team domains are fully shared, and
+/// without a memo every single receipt would pay for a full tree read and hash.
+/// The memo is what bounds that: the walk is paid once, and the receipts behind
+/// it answer from what it found.
+///
+/// The file written between the two calls is the assertion that earns the test:
+/// a second walk would have found it, so a second receipt that still says
+/// nothing can only be the memo answering.
+#[tokio::test]
+async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_indexes())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let before = crystalline_service::nudge::share_walks();
+    assert!(
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+            .await
+            .is_none(),
+        "a domain that owes nothing has nothing to ask about"
+    );
+    assert_eq!(
+        crystalline_service::nudge::share_walks() - before,
+        1,
+        "the first receipt pays for the walk"
+    );
+
+    std::fs::write(
+        root.join("added.md"),
+        engram("Added", "added", "written here, never shared"),
+    )
+    .unwrap();
+
+    assert!(
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+            .await
+            .is_none(),
+        "the second receipt answers from the memo, which has not seen the new file"
+    );
+    assert_eq!(
+        crystalline_service::nudge::share_walks() - before,
+        1,
+        "and it pays for no second walk inside the memo window"
+    );
+}

@@ -4039,6 +4039,15 @@ fn attachment_contents(uri: &str, bytes: Vec<u8>, mime: &str) -> ResourceContent
 
 /// Wrap an engine value as a successful tool result. The compact JSON is the
 /// single text content block; callers that need structured data re-parse it.
+///
+/// **On the five write verbs that text can carry a trailer**, and a caller that
+/// re-parses one has to cut before it: a receipt may end with a horizontal rule
+/// on its own line (`\n\n---\n`) and one ride-along sentence after it
+/// ([`crate::nudge`]). The JSON in front of the rule is compact and therefore
+/// holds no raw newline of its own, so the first occurrence of that sequence is
+/// the cut. Nothing promises the text is JSON at the protocol level - these
+/// tools declare no output schema and set no structured content - so the rule
+/// is the contract.
 fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     let text = serde_json::to_string(&value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;

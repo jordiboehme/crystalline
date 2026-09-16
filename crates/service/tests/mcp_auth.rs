@@ -3336,6 +3336,14 @@ async fn adas_write_carries_one_trailer_and_her_next_is_throttled() {
         1,
         "one ask per receipt and never two:\n{first}"
     );
+    // The separator is part of the contract, not a detail of the formatting: a
+    // caller that re-parses a receipt cuts at this rule, so it is pinned here
+    // rather than left to the first client that notices it moved. Escaped
+    // exactly as the JSON-RPC frame carries it.
+    assert!(
+        first.contains("\\n\\n---\\n[crystalline] "),
+        "the ask follows the payload after a rule on its own line:\n{first}"
+    );
 
     let second = session
         .call_tool(

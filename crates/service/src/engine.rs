@@ -11398,14 +11398,6 @@ impl Engine {
     async fn share_facts(&self, name: &str) -> Option<ShareFacts> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
-        self.share_facts_locked(name)
-    }
-
-    /// [`Engine::share_facts`]'s body, assuming the caller already holds the
-    /// domain's origin lock. Split out because the two callers wait for that
-    /// lock on different terms - a sweep queues for it, a write receipt does
-    /// not - and the walk itself must not be written twice.
-    fn share_facts_locked(&self, name: &str) -> Option<ShareFacts> {
         let (_spec, root, state_dir) = self.origin_spec_for_domain(name).ok()?;
         let work = origin::unshared_work(&root, &state_dir)?;
         Some(ShareFacts {
@@ -11420,24 +11412,46 @@ impl Engine {
     ///
     /// [`Engine::share_facts`] narrowed to its count, which is what keeps the
     /// receipt's answer and the sweep's `V009` one reading: the same offline
-    /// walk and the same substantive-changes-only filter.
+    /// walk ([`crate::origin::unshared_work`]) and the same
+    /// substantive-changes-only filter.
+    ///
+    /// Two things separate it from the sweep's version, and both are about
+    /// where it runs: on the path of a write that has already succeeded.
     ///
     /// **It never waits for the origin lock.** That lock is held across the
     /// network by a pull, a share and a connect, and the poller takes it on a
-    /// timer, so waiting for it here would hold a write receipt - for a write
-    /// that already succeeded - until somebody else's forge call came back. A
-    /// domain whose origin is mid-operation therefore contributes nothing, on
-    /// the same terms as a domain whose tree cannot be walked: nothing is KNOWN
-    /// to be unshared, and a delta that cannot be read is no reason to speak.
-    /// Taking it at all is what keeps the walk off a half-written pair
-    /// (see [`Engine::share_facts`]).
+    /// timer, so waiting for it here would hold a receipt until somebody else's
+    /// forge call came back. A domain whose origin is mid-operation therefore
+    /// contributes nothing, on the same terms as a domain whose tree cannot be
+    /// walked: nothing is KNOWN to be unshared, and a delta that cannot be read
+    /// is no reason to speak. Taking the lock at all is what keeps the walk off
+    /// a half-written pair (see [`Engine::share_facts`]).
+    ///
+    /// **And it never runs on a runtime thread.** The walk reads and hashes
+    /// every file in the domain root, which is blocking I/O measured in
+    /// hundreds of milliseconds on a large or networked tree; run inline it
+    /// would occupy a tokio worker and, with the guard held across it, queue a
+    /// real share or the poller's pull behind a question about one sentence.
+    /// The owned guard travels into the blocking task and is released with it,
+    /// so the lock is held for exactly the walk and not a moment of scheduling
+    /// either side of it.
+    ///
+    /// The caller memoizes this per domain
+    /// ([`crate::nudge`]), so a machine whose team domains are fully
+    /// shared pays for the walk once a minute rather than once a write.
     ///
     /// `None` for a domain with no origin, no recorded origin state, no
-    /// readable working tree, or an origin operation in flight.
-    pub(crate) fn unshared_change_count(&self, name: &str) -> Option<u64> {
-        let lock = self.origin_lock(name);
-        let _guard = lock.try_lock().ok()?;
-        self.share_facts_locked(name).map(|f| f.unshared as u64)
+    /// readable working tree, an origin operation in flight, or a blocking task
+    /// that panicked.
+    pub(crate) async fn unshared_change_count(&self, name: &str) -> Option<u64> {
+        let guard = self.origin_lock(name).try_lock_owned().ok()?;
+        let (_spec, root, state_dir) = self.origin_spec_for_domain(name).ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            origin::unshared_work(&root, &state_dir).map(|work| work.count() as u64)
+        })
+        .await
+        .ok()?
     }
 
     /// The resolved graph around a whole domain, at depth 1 so every

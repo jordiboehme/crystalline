@@ -295,9 +295,13 @@ pub fn record_first_seen(now: DateTime<Utc>) {
 /// that gap has to survive.
 ///
 /// Resolves the machine's own state directory, like every public recorder
-/// here. The write path inside the daemon records against the engine's state
-/// directory instead ([`crate::nudge`]), which is the same file in production
-/// and a test's own temporary one under test.
+/// here - and that is the whole of what it adds. **Nothing in this workspace
+/// calls it today**: the one writer, the receipt trailer, records against the
+/// engine's state directory instead (`crate::nudge`), which is the same file in
+/// production and a test's own temporary one under test. It stands as the entry
+/// point for a caller that has no engine to ask - another process on this
+/// machine, the way the Stop hook reaches [`record_nudge`] - and a reader
+/// looking for what writes this field should read `record_mcp_nudge_at`.
 pub fn record_mcp_nudge(kind: NudgeKind, identity: &str) {
     if let Err(e) = path().and_then(|p| record_mcp_nudge_at(&p, kind, identity, Utc::now())) {
         tracing::debug!("maintenance state not stamped with the mcp nudge: {e}");
