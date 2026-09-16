@@ -2053,7 +2053,7 @@ impl McpServer {
                         .await
                     {
                         Ok(receipt) => receipt,
-                        Err(e) => return overlay_write_error(e),
+                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
                     };
                     let receipt = self
                         .with_similar(receipt, SimilarProbe::for_write(&confirmed_write), &scope)
@@ -2088,7 +2088,7 @@ impl McpServer {
         let Some(permalink) = collision else {
             let receipt = match written {
                 Ok(receipt) => receipt,
-                Err(e) => return overlay_write_error(e),
+                Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
             };
             let receipt = self
                 .with_similar(receipt, SimilarProbe::for_write(&p), &scope)
@@ -2124,7 +2124,7 @@ impl McpServer {
                     .await
                 {
                     Ok(receipt) => receipt,
-                    Err(e) => return overlay_write_error(e),
+                    Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
                 };
                 let receipt = self
                     .with_similar(receipt, SimilarProbe::for_write(&retry), &scope)
@@ -2264,7 +2264,7 @@ impl McpServer {
             .await
         {
             Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error(e),
+            Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
         };
         // `for_edit` is `None` for `set_frontmatter` and for any operation that
         // carried no content, which is what keeps a lifecycle flip silent.
@@ -2317,7 +2317,7 @@ impl McpServer {
         }
         let receipt = match self.engine.move_engram(&p, &scope).await {
             Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error_plain(e),
+            Err(e) => return overlay_write_error(e),
         };
         Ok(self.nudged(ok_moved(receipt)?, &ctx).await)
     }
@@ -2350,7 +2350,7 @@ impl McpServer {
             .await
         {
             Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error_plain(e),
+            Err(e) => return overlay_write_error(e),
         };
         Ok(self.nudged(ok_split(receipt)?, &ctx).await)
     }
@@ -2405,7 +2405,7 @@ impl McpServer {
             .await
         {
             Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error(e),
+            Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
         };
         Ok(self.nudged(ok(receipt)?, &ctx).await.into())
     }
@@ -2866,7 +2866,7 @@ impl McpServer {
                         // not ask is answered with the teaching text rather
                         // than with a protocol error, exactly as the confirmed
                         // call below answers it.
-                        Err(e) => return overlay_write_error(e),
+                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
                     };
                     if share_plan_needs_confirmation(preview["action"].as_str()) {
                         return Ok(confirm_question(share_question(&preview)).into());
@@ -2897,7 +2897,7 @@ impl McpServer {
             .await
         {
             Ok(shared) => ok(shared).map(CallToolResponse::from),
-            Err(e) => overlay_write_error(e),
+            Err(e) => overlay_write_error(e).map(CallToolResponse::from),
         }
     }
 
@@ -3035,12 +3035,17 @@ impl McpServer {
                 ));
             }
         };
-        self.engine
+        // The same teaching refusal a share answers: settling a conflict in a
+        // reviewing domain settles it in somebody's draft, so an agent with no
+        // identity is told how to get one rather than handed a protocol error.
+        match self
+            .engine
             .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor(&ctx))
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        {
+            Ok(settled) => ok(settled).map(CallToolResponse::from),
+            Err(e) => overlay_write_error(e).map(CallToolResponse::from),
+        }
     }
 
     #[tool(
@@ -3077,7 +3082,7 @@ impl McpServer {
                     // call, so a target that cannot be named is reported here
                     // as the error it is rather than turned into a question
                     // about a proposal that does not exist.
-                    let preview = self
+                    let preview = match self
                         .engine
                         .origin_withdraw_preview(
                             &p.domain,
@@ -3086,7 +3091,14 @@ impl McpServer {
                             self.share_actor(&ctx),
                         )
                         .await
-                        .map_err(to_error)?;
+                    {
+                        Ok(preview) => preview,
+                        // A caller with no identity holds no draft, and the
+                        // preview resolves that first, so the question it could
+                        // not ask is answered with the teaching text the
+                        // withdrawal itself would answer.
+                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                    };
                     return Ok(confirm_question(withdraw_question(&preview)).into());
                 }
                 Some(false) => {
@@ -3095,12 +3107,17 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
+        // Teaching text rather than a protocol error, for the reason
+        // `share_changes` answers it that way: a withdrawal in a reviewing
+        // domain is a withdrawal of somebody's proposal of their draft.
+        match self
+            .engine
             .origin_withdraw(&p.domain, p.proposal, revert, self.share_actor(&ctx))
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        {
+            Ok(withdrawn) => ok(withdrawn).map(CallToolResponse::from),
+            Err(e) => overlay_write_error(e).map(CallToolResponse::from),
+        }
     }
 
     #[tool(
@@ -4933,37 +4950,31 @@ fn refusal_or_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
 /// see - "connect with your MCP token and try again" - not a mistake to
 /// retry blindly, so it goes back as a tool error the client renders, the
 /// same way [`refusal_or_error`] already reads `Forbidden` and
-/// `ConfirmationRequired`.
+/// `ConfirmationRequired`. `refuse_unwritable` already let this caller through
+/// by the time a write reaches this: the legacy open tier has no accounts to
+/// hold a member level, so that gate is not the one a review-mode domain's
+/// missing identity trips. Every other `Refused` message keeps [`to_error`]'s
+/// protocol shape, unchanged.
 ///
-/// **A share of a reviewing domain reads its errors through this too**, and
-/// for the same reason rather than by analogy: a share of such a domain is a
-/// share of somebody's draft, so an agent with no identity has nothing to
-/// share and is told how to get one. The tool descriptions teach that
-/// sentence, so a caller that meets this refusal did what it was told, and an
-/// opaque protocol error would leave it nothing to do next. `refuse_unwritable` already let this caller
-/// through by the time a write reaches this: the legacy open tier has no
-/// accounts to hold a member level, so that gate is not the one a
-/// review-mode domain's missing identity trips. Every other `Refused`
-/// message keeps [`to_error`]'s protocol shape, unchanged.
+/// **Every verb that resolves a sharer's identity reads its errors through
+/// this**, not only the write verbs: a share, a withdrawal and a conflict
+/// resolution in a reviewing domain are all about somebody's draft, so an
+/// agent with no identity has nothing to share, withdraw or settle and is told
+/// how to get one. The tool descriptions teach that sentence, so a caller that
+/// meets this refusal did what it was told, and an opaque protocol error would
+/// leave it nothing to do next.
 ///
-/// [`overlay_write_error`] is this, for the tool functions that answer
-/// [`CallToolResponse`] rather than the bare [`CallToolResult`] this reads:
-/// the two differ only in which shape wraps the same refusal.
-fn overlay_write_error_plain(e: EngineError) -> Result<CallToolResult, ErrorData> {
+/// **One helper, and the shape is the call site's.** A tool function that
+/// answers [`CallToolResponse`] rather than the bare [`CallToolResult`] this
+/// reads adds `.map(CallToolResponse::from)` where it knows which it is; a
+/// second helper that did only that wrapping was one name for no decision.
+fn overlay_write_error(e: EngineError) -> Result<CallToolResult, ErrorData> {
     match &e {
         EngineError::Refused(message) if message == OVERLAY_NEEDS_IDENTITY => {
             refuse(message.clone())
         }
         _ => Err(to_error(e)),
     }
-}
-
-/// [`overlay_write_error_plain`], for the write verbs whose tool function
-/// answers [`CallToolResponse`] rather than the bare [`CallToolResult`] -
-/// every overlay write except `move_engram` and `split_engram`, neither of
-/// which takes an elicitation round.
-fn overlay_write_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
-    overlay_write_error_plain(e).map(CallToolResponse::from)
 }
 
 /// Map an engine error to an rmcp tool error with an actionable message.

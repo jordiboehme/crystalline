@@ -989,7 +989,7 @@ pub async fn save(
     // somebody else's draft rather than into this caller's own. `None` for
     // every ordinary save, which is nearly all of them; see
     // `super::draft_links::join_of` and `crate::join`.
-    let join = super::draft_links::join_of(&state, &identity, &headers);
+    let join = super::draft_links::join_of(&state, &identity, &headers)?;
     match state
         .engine
         .save_engram_joined(&params, &scope, join.as_ref())

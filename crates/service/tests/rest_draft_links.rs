@@ -227,6 +227,28 @@ impl Fixture {
         resp.json().await.unwrap()
     }
 
+    /// Mint a link on `owner`'s draft of `path` that stops working at
+    /// `expires_at` (RFC 3339), as `owner`.
+    async fn mint_until(
+        &self,
+        session: &Session,
+        path: &str,
+        expires_at: &str,
+    ) -> serde_json::Value {
+        let resp = session
+            .request(
+                self.addr,
+                reqwest::Method::POST,
+                "/api/v1/domains/team/draft-links",
+            )
+            .json(&serde_json::json!({"path": path, "expires_at": expires_at}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "minting a link with a window on it");
+        resp.json().await.unwrap()
+    }
+
     /// Mint a link on `owner`'s draft of `path`, as `owner`.
     async fn mint(&self, session: &Session, path: &str) -> serde_json::Value {
         let resp = session
@@ -681,13 +703,22 @@ async fn a_write_at_a_granted_path_needs_a_join_and_then_lands_in_the_owners_dra
         .send()
         .await
         .unwrap();
+    assert_eq!(
+        after.status(),
+        403,
+        "a key that has been left is not a join, and a save presenting one is \
+         refused rather than quietly made his own"
+    );
     let problem: serde_json::Value = after.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap_or_default();
     assert!(
-        problem["detail"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Join the draft"),
-        "a key that has been left is not a join: {problem}"
+        detail.contains("join the draft"),
+        "and the cheap way back is named first, because her link still stands: {problem}"
+    );
+    assert!(
+        detail.contains("fresh link"),
+        "with the other way named after it, since the refusal may not say which \
+         of the two this is: {problem}"
     );
 }
 
@@ -734,9 +765,19 @@ async fn another_accounts_join_key_is_not_a_join() {
         .unwrap();
     assert_eq!(
         refused.status(),
-        404,
-        "the key is not hers, so the page is one she cannot see: {:?}",
+        403,
+        "a key that is not hers names no join of hers, which is the one answer \
+         every key that names nothing gets: {:?}",
         refused.text().await
+    );
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not open to you any more"),
+        "the same sentence a key of her own that had ended would get, so nothing \
+         here says whether this key is anybody's: {problem}"
     );
     let hers: serde_json::Value = alice
         .request(
@@ -882,8 +923,10 @@ async fn folding_the_draft_ends_the_link_and_the_join() {
         .unwrap();
     assert_eq!(dead.status(), 404, "the link ended with the draft");
 
-    // And the key is not a join any more: the page is in the folder now, so a
-    // save of it is an ordinary save that lands where every other one does.
+    // And the key is not a join any more: the draft it was into was folded into
+    // the folder the team shares. A save still presenting it is refused in the
+    // words that say so, rather than falling through to an ordinary save of a
+    // page he never opened.
     let saved = bob
         .request(
             f.addr,
@@ -898,9 +941,17 @@ async fn folding_the_draft_ends_the_link_and_the_join() {
         .unwrap();
     assert_eq!(
         saved.status(),
-        412,
-        "a stale token on an ordinary save, which is what this now is: {:?}",
+        403,
+        "a key whose join has ended routes nothing and saves nothing: {:?}",
         saved.text().await
+    );
+    let problem: serde_json::Value = saved.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not open to you any more"),
+        "in the one sentence every ending answers: {problem}"
     );
 }
 
@@ -2357,15 +2408,21 @@ async fn revoking_a_link_ends_the_join_that_was_open_on_it() {
         .unwrap();
     assert_eq!(
         written.status(),
-        404,
-        "a key whose link was revoked routes nothing"
+        403,
+        "a key whose link was revoked routes nothing and saves nothing: {:?}",
+        written.text().await
     );
     let problem: serde_json::Value = written.json().await.unwrap();
     let detail = problem["detail"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("no engram 'fresh' in domain 'team'") && !detail.contains("Join the draft"),
-        "and he is told what anybody with no link is told, rather than that her draft is still \
-         there to join: {problem}"
+        detail.contains("not open to you any more") && detail.contains("fresh link"),
+        "he is told the draft he was inside is not open to him any more, which is \
+         the one sentence every ended key gets: {problem}"
+    );
+    assert!(
+        !detail.contains("alice") && !detail.contains("stale edit"),
+        "it names neither her nor a checksum, so it says nothing about whether her \
+         draft is still there to join: {problem}"
     );
     let hers = f.reads(&alice, "fresh").await;
     let text = hers["content"].as_str().unwrap();
@@ -2376,6 +2433,122 @@ async fn revoking_a_link_ends_the_join_that_was_open_on_it() {
     assert!(
         !text.contains("taken off"),
         "and carries nothing he wrote after she took the link back: {hers}"
+    );
+}
+
+/// **A save on a link that has run out is refused in the link's own words**,
+/// rather than quietly becoming a save of the grantee's own.
+///
+/// The case the browser's grantee screen meets and the room never does: that
+/// screen is a textarea over REST saves with no socket, so the close frame an
+/// ended join sends a room never reaches it, and the first thing it learns is
+/// what its next save answers. Left to fall through, that save is an ORDINARY
+/// save: the address resolves the base row the draft was shadowing, the
+/// checksum the grantee is holding is the author's draft, and they are told
+/// their document changed underneath them - two hashes of a page they never
+/// opened. Worse, where the two texts agree byte for byte there is no checksum
+/// to disagree and the author's text lands silently in the grantee's own
+/// draft, under their name.
+///
+/// So a key that names no join of this caller's is refused before any save
+/// path, and the refusal says the true thing: the link ended, nothing was
+/// written, ask for a fresh one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_on_a_link_that_ran_out_is_refused_in_the_links_own_words() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    // Her draft OVER a page the team already reviewed, which is what makes the
+    // fall-through resolve to something rather than to nothing.
+    let base = f.reads(&alice, "plan").await;
+    let hers = base["content"]
+        .as_str()
+        .unwrap()
+        .replace("What the team agreed.", "What alice is proposing instead.");
+    let drafted = alice
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", base["checksum"].as_str().unwrap()),
+        )
+        .json(&serde_json::json!({"content": hers}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(drafted.status(), 200, "{:?}", drafted.text().await);
+
+    let until = (chrono::Utc::now() + chrono::Duration::milliseconds(900)).to_rfc3339();
+    let token = f.mint_until(&alice, "plan.md", &until).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let joined: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key = joined["join_key"].as_str().unwrap().to_string();
+    let checksum = joined["checksum"].as_str().unwrap().to_string();
+    let his = joined["content"].as_str().unwrap().replace(
+        "What alice is proposing instead.",
+        "Bob read this for an hour.",
+    );
+
+    // He reads and types for longer than the link lasts.
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+    let refused = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header("if-match", format!("\"{checksum}\""))
+        .header("x-crystalline-join", &key)
+        .json(&serde_json::json!({"content": his}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        403,
+        "the link ran out, so the save is refused rather than rerouted: {:?}",
+        refused.text().await
+    );
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("not open to you any more") && detail.contains("fresh link"),
+        "and the refusal teaches what to do next: {problem}"
+    );
+    assert!(
+        !detail.contains("stale edit") && !detail.contains("changed since it was read"),
+        "never a sentence about a document he never opened: {problem}"
+    );
+
+    // Nothing of his reached either draft: not hers, and not one of his own
+    // quietly opened under his name.
+    let still_hers = f.reads(&alice, "plan").await;
+    assert!(
+        still_hers["content"]
+            .as_str()
+            .unwrap()
+            .contains("What alice is proposing instead."),
+        "her draft is as she left it: {still_hers}"
+    );
+    assert!(
+        !f.root.join("state/overlays/team/bob").exists(),
+        "and he was given no draft of his own"
     );
 }
 

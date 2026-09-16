@@ -378,7 +378,7 @@ pub async fn write(
     // Unless this session is working inside somebody else's draft, in which
     // case the bytes follow the join into the OWNER's files overlay, to be
     // staged, folded and discarded with the draft that references them.
-    let join = super::draft_links::join_of(&state, &identity, &headers);
+    let join = super::draft_links::join_of(&state, &identity, &headers)?;
     let written = state
         .engine
         .attachment_write_joined(
@@ -458,7 +458,7 @@ pub async fn remove(
     require_domain_write(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The deletion follows the join exactly as the upload does: see `write`.
-    let join = super::draft_links::join_of(&state, &identity, &headers);
+    let join = super::draft_links::join_of(&state, &identity, &headers)?;
     state
         .engine
         .attachment_delete_joined(&domain, &path, &identity.scope(), join.as_ref())

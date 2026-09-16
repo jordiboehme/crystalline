@@ -66,21 +66,78 @@ use crate::scope::DomainRight;
 /// helper.
 pub const JOIN_HEADER: &str = "X-Crystalline-Join";
 
+/// What a caller is told when the key they presented names no join of theirs.
+///
+/// **One sentence for every way that happens** - the link ran out, its author
+/// took it back, the draft was folded, discarded or renamed, this session
+/// pressed Leave, the daemon restarted, the key was never this account's -
+/// because the registry answers one `None` to all of them, and a caller who
+/// could tell them apart would be learning about a key that is not theirs.
+///
+/// It is the same thing [`dead_link`] says about a link that opens nothing,
+/// said to somebody who was already inside: they know there was a draft and
+/// they know they were in it, so the sentence names the ending rather than the
+/// draft, and says what to do next. It promises nothing about whether the
+/// author's draft is still there, which is exactly what this surface never
+/// tells anybody who does not hold a live link.
+///
+/// **Both ways forward are named because the refusal may not choose between
+/// them.** A join that was merely left, or that went idle while its link
+/// stands, is opened again by pressing the button; a link that ran out or was
+/// taken back needs a fresh one. Saying which would be saying whether a live
+/// grant stands, so the sentence offers the cheap step first and the other
+/// after it, and the caller learns which by trying the first.
+pub(crate) const JOINED_LINK_HAS_ENDED: &str = "the draft you were working inside is not open to you any more: you may have left it, the \
+     link may have run out or been taken back, or the draft may have been folded, discarded or \
+     renamed. Nothing of yours was written. Keep a copy of your changes; if the link still \
+     works, open it again and join the draft, and otherwise ask whoever shared it for a fresh \
+     link.";
+
+/// [`JOINED_LINK_HAS_ENDED`] as the answer a route gives.
+fn joined_link_has_ended() -> ApiError {
+    ApiError::forbidden(JOINED_LINK_HAS_ENDED)
+}
+
 /// The join this request is being made inside, if any.
 ///
-/// `None` for the overwhelming majority of requests, which carry no header at
-/// all, and also for a key that names no open join and for one belonging to
-/// another account - deliberately one answer for all three, since none of them
-/// is a join and a caller learning which it was would learn whether a key
-/// exists.
+/// `Ok(None)` for the overwhelming majority of requests, which carry no header
+/// at all.
+///
+/// **A key that names no join is a refusal rather than an ordinary write**,
+/// and that is the whole reason this answers a `Result`. A save presenting a
+/// key is a save somebody made INSIDE a draft that is not theirs; if the join
+/// behind it has ended - the link ran out, the author took it back - then
+/// letting it fall through would turn it into a save of their own, at an
+/// address that resolves the base row the draft was shadowing. What they would
+/// meet is a stale-edit answer about a document they never opened, and where
+/// the two texts happen to agree byte for byte there is no checksum to
+/// disagree and the author's text lands in the caller's own draft under their
+/// name. A room is told the same thing by its close frame; this surface has no
+/// socket, so the refusal is where it learns.
+///
+/// The three ways a key names no join - ended, invented, somebody else's - are
+/// one answer ([`JOINED_LINK_HAS_ENDED`]), since a caller learning which it was
+/// would learn whether a key exists.
 ///
 /// Called by the write routes that can be driven from inside a join; see
 /// [`crate::join`] for why the answer belongs to the session rather than to
 /// the account.
-pub(super) fn join_of(state: &RestState, identity: &Identity, headers: &HeaderMap) -> Option<Join> {
-    let key = headers.get(JOIN_HEADER)?.to_str().ok()?;
-    let account = identity.user.as_ref()?;
-    state.engine.joins().get(key, &account.name)
+pub(super) fn join_of(
+    state: &RestState,
+    identity: &Identity,
+    headers: &HeaderMap,
+) -> Result<Option<Join>, ApiError> {
+    let Some(presented) = headers.get(JOIN_HEADER) else {
+        return Ok(None);
+    };
+    let key = presented.to_str().map_err(|_| joined_link_has_ended())?;
+    let account = identity.user.as_ref().ok_or_else(joined_link_has_ended)?;
+    state
+        .engine
+        .joins()
+        .get(key, &account.name)
+        .map(Some)
+        .ok_or_else(joined_link_has_ended)
 }
 
 /// What minting a link asks for.
@@ -741,6 +798,9 @@ fn dead_link() -> ApiError {
          discarded. Ask whoever shared it for a fresh one.",
     )
 }
+
+// The same ending said to somebody who was already inside is
+// [`JOINED_LINK_HAS_ENDED`], above.
 
 #[cfg(test)]
 mod tests {

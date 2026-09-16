@@ -595,6 +595,61 @@ async fn an_unauthenticated_agents_share_answers_the_teaching_text() {
     );
 }
 
+/// **The other two verbs that resolve a sharer's identity answer the same
+/// teaching refusal**, for the same reason `share_changes` does.
+///
+/// A withdrawal in a reviewing domain withdraws somebody's proposal of their
+/// draft, and a conflict resolution settles somebody's draft against the
+/// team's copy: both ask `Engine::overlay_share_identity` first, and an agent
+/// with no identity holds no draft to withdraw or settle. The refusal is the
+/// one that says how to get an identity, so it has to arrive readable -
+/// `isError` with the text - rather than as the JSON-RPC error every other
+/// `Refused` message keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_agents_withdrawal_answers_the_teaching_text() {
+    let (addr, _tmp, _store) = serve_reviewed_domain_with_mcp_auth_off().await;
+    let session = McpTestSession::open(&addr, None).await;
+    let raw = session
+        .call_tool("withdraw_proposal", serde_json::json!({ "domain": "team" }))
+        .await;
+    refusal_is_readable(&raw, "an unauthenticated withdrawal in a reviewing domain");
+    let payload = payload_of(&raw);
+    let text = payload["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains(crystalline_service::OVERLAY_NEEDS_IDENTITY),
+        "the teaching text names the fix: {text}"
+    );
+}
+
+/// [`an_unauthenticated_agents_withdrawal_answers_the_teaching_text`]'s
+/// sibling, for the verb that settles a conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_agents_conflict_resolution_answers_the_teaching_text() {
+    let (addr, _tmp, _store) = serve_reviewed_domain_with_mcp_auth_off().await;
+    let session = McpTestSession::open(&addr, None).await;
+    let raw = session
+        .call_tool(
+            "resolve_conflict",
+            serde_json::json!({
+                "domain": "team",
+                "path": "plan.md",
+                "resolution": "mine",
+            }),
+        )
+        .await;
+    refusal_is_readable(&raw, "an unauthenticated conflict resolution");
+    let payload = payload_of(&raw);
+    let text = payload["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        text.contains(crystalline_service::OVERLAY_NEEDS_IDENTITY),
+        "the teaching text names the fix: {text}"
+    );
+}
+
 /// Every way of failing the gate answers the same bytes. A refusal that said
 /// "malformed token" for one input and "unknown token" for another would tell a
 /// caller which half of a guess landed; there is exactly one refusal here, and
