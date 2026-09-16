@@ -287,6 +287,11 @@ impl Joins {
     /// uniqueness and nothing else. One comparison keeps it stated where it is
     /// relied on.
     ///
+    /// It is a live comparison on every path, including stdio: a stdio caller's
+    /// scope is `Scope::Unrestricted`, whose `overlay_actor` is the owner
+    /// identity rather than nothing, so that caller opens joins under an
+    /// account like any other and is compared here like any other.
+    ///
     /// **It is the holder that is asked, never the account.** An agent that
     /// joined a draft has not opened a room in its person's browser, and a
     /// window that joined one has not opened a room in the window beside it;
