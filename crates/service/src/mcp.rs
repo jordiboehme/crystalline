@@ -1508,7 +1508,7 @@ impl McpServer {
     /// fails the build over a drift here - it has to be re-checked by hand
     /// every time: re-read both of rmcp's clauses (the `_meta` presence test
     /// and the version comparison) against this function's two branches and
-    /// update the doc comment above with the new line numbers. See the
+    /// adjust the branches, and the doc comment above, wherever rmcp's shape moved. See the
     /// `SERVED_PROTOCOL_VERSIONS` and `newest_legacy_handshake_version` doc
     /// comments near the top of this file for the sibling places an rmcp bump
     /// touches.

@@ -55,7 +55,7 @@ When the user asks what the archive itself needs - what has gone stale, what is 
 
 ## Write-result nudges
 
-A write result may end with a '[crystalline]' nudge line - treat it as the standing practice the Stop hook teaches: propose sharing or run maintenance, and wait for a yes. It shows up at most once per write, after a `---` rule, and only when a session works through MCP with no Stop hook of its own to ask at the end - so it is the one place that standing practice reaches you, not a new kind of instruction.
+A write result may end with a '[crystalline]' nudge line - treat it as the standing practice the Stop hook teaches: propose sharing or run maintenance, and wait for a yes. It reaches you only when a session works through MCP with no Stop hook of its own to ask at the end - so it is the one place that standing practice reaches you, not a new kind of instruction.
 
 ## Read-only deployments
 
