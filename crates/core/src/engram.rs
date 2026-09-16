@@ -171,12 +171,13 @@ pub struct Verified {
     pub at: Option<DateTime<FixedOffset>>,
 }
 
-/// The model reported inside a provenance mapping: a non-empty scalar, or
+/// The model reported inside a provenance mapping: a non-empty string, or
 /// `None`.
 ///
-/// An empty or all-blank value reads as absence rather than as a model nobody
-/// can name, which is how the write path treats one too, so the two ends agree
-/// about what "no model" looks like.
+/// An empty, all-blank or non-string value reads as absence rather than as a
+/// model nobody can name, which is how the write path treats one too and how
+/// `generated` reads the same key (`crate::parse`), so one value means one
+/// thing wherever it is written.
 pub(crate) fn reported_model(value: Option<&YamlValue>) -> Option<String> {
     let text = value?.as_str()?.trim();
     (!text.is_empty()).then(|| text.to_string())

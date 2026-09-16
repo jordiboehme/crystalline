@@ -1889,9 +1889,13 @@ impl McpServer {
     ) -> Result<CallToolResponse, ErrorData> {
         // The model an agent reports is client-supplied text exactly as the
         // client identity is, so it is sanitized the same way and an id that
-        // sanitizes away counts as none reported. Whether it is recorded at
-        // all is the engine's call rather than this one: it resolves the actor
-        // the write lands under, and a person's write never carries a model.
+        // sanitizes away counts as none reported. Belt and braces rather than
+        // the load-bearing pass: `Engine::stamped_model` sanitizes whatever
+        // reaches it, which is what covers the surfaces that never come through
+        // here (the CLI and the control socket decode these params themselves).
+        // Whether the model is recorded at all is the engine's call rather than
+        // this one either: it resolves the actor the write lands under, and a
+        // person's write never carries a model.
         p.model = p
             .model
             .as_deref()
@@ -2141,9 +2145,13 @@ impl McpServer {
     ) -> Result<CallToolResponse, ErrorData> {
         // The model an agent reports is client-supplied text exactly as the
         // client identity is, so it is sanitized the same way and an id that
-        // sanitizes away counts as none reported. Whether it is recorded at
-        // all is the engine's call rather than this one: it resolves the actor
-        // the write lands under, and a person's write never carries a model.
+        // sanitizes away counts as none reported. Belt and braces rather than
+        // the load-bearing pass: `Engine::stamped_model` sanitizes whatever
+        // reaches it, which is what covers the surfaces that never come through
+        // here (the CLI and the control socket decode these params themselves).
+        // Whether the model is recorded at all is the engine's call rather than
+        // this one either: it resolves the actor the write lands under, and a
+        // person's write never carries a model.
         p.model = p
             .model
             .as_deref()

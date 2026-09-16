@@ -7301,12 +7301,17 @@ impl Engine {
                 model.as_deref(),
                 peer,
                 |current| {
+                    // The REPORTED model here, not the one resolved against
+                    // this actor: the block this call stamps is held against
+                    // the actor it records (above), and a `verified` entry is
+                    // held against the actor IT records, which only the arm
+                    // that builds it knows.
                     self.apply_edit(
                         current,
                         p,
                         &desc.permalink,
                         &actor,
-                        model.as_deref(),
+                        p.model.as_deref(),
                         ack.as_ref(),
                     )
                 },
@@ -7655,6 +7660,11 @@ impl Engine {
     /// text. Content-agnostic: the same logic serves file and virtual edits.
     /// `actor` is the resolved editor identity, which `set_frontmatter` stamps
     /// into a verification when the caller names no other one.
+    ///
+    /// `model` is the model the caller REPORTED, not one already held against
+    /// an actor: the only operation that records it here is a verification, and
+    /// a verification is held against the actor it names rather than the one
+    /// making the call ([`stamped_model`]).
     #[allow(clippy::too_many_arguments)]
     fn apply_edit(
         &self,
@@ -7725,7 +7735,9 @@ impl Engine {
     /// engram's address or its write history.
     ///
     /// An absent or empty value clears the field, except on `status`, which is
-    /// required, and on `verified`, which stamps a verification instead.
+    /// required, and on `verified`, which stamps a verification instead. That
+    /// verification carries `model` - the reported one - only where the actor
+    /// it names is not a person; see the arm.
     #[allow(clippy::too_many_arguments)]
     fn apply_set_frontmatter(
         source: &str,
@@ -7823,12 +7835,16 @@ impl Engine {
                     .map(sanitize_actor)
                     .filter(|a| !a.is_empty())
                     .unwrap_or_else(|| actor.to_string());
+                // The model is held against the entry's OWN actor rather than
+                // the one this call is acting as, because that is the actor the
+                // record ends up claiming wrote the check. A caller may name
+                // somebody else as the verifier, and where that somebody is a
+                // person the entry carries no model, exactly as a person's
+                // `generated` block carries none.
+                let model = stamped_model(&by, model);
                 let entry = crystalline_core::Verified {
                     by,
-                    // The model of the agent doing the verifying, which is the
-                    // caller's whether it named itself as the verifier or let
-                    // its own identity stand in.
-                    model: model.map(str::to_string),
+                    model,
                     at: Some(now_offset()),
                 };
                 // Keep other actors' verifications and replace this actor's, so

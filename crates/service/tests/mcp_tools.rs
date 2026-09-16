@@ -4907,10 +4907,18 @@ async fn a_verification_by_an_agent_records_its_model() {
     );
 }
 
-/// A write that reports no model is byte-identical to one made before the key
-/// existed: the two-key flow mapping, and the word nowhere in the file.
+/// A write and an edit that report no model leave the two-key flow mapping and
+/// put the key nowhere in the frontmatter.
+///
+/// The byte pin proper is the core test
+/// (`a_generated_block_without_a_model_emits_the_two_key_form_unchanged`), which
+/// compares a stamp against a fixture written before the key existed and asserts
+/// every other byte is where it was. This one is the end-to-end half of that:
+/// the whole MCP path, from the parameter nobody passed to the line on disk. The
+/// scan is over the frontmatter block rather than the file, so it reads what it
+/// is about and not the prose an author happened to write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_write_without_a_model_is_byte_identical_to_before() {
+async fn a_write_without_a_model_emits_the_two_key_provenance_block() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();
@@ -4944,7 +4952,15 @@ async fn a_write_without_a_model_is_byte_identical_to_before() {
         text.contains(&format!("generated: {{ by: {expected}, at: ")),
         "the two-key form, unchanged: {text}"
     );
-    assert!(!text.contains("model"), "no model was reported: {text}");
+    let frontmatter = text
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---"))
+        .map(|(block, _)| block)
+        .unwrap_or_else(|| panic!("the engram carries a frontmatter block: {text}"));
+    assert!(
+        !frontmatter.contains("model"),
+        "no model was reported: {frontmatter}"
+    );
 }
 
 /// A person's write never carries a model, whoever reports one. The `human:`
@@ -4985,6 +5001,143 @@ async fn a_human_actor_never_carries_a_model() {
     assert!(
         !text.contains("model"),
         "a person writes with no model: {text}"
+    );
+}
+
+/// A verification a caller attributes to a person never carries a model either.
+/// The entry's own actor is what the rule reads, not the agent that made the
+/// call: a record saying a model produced a check a person made is the shape the
+/// trust tier is there to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_verifier_never_carries_a_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked by a person", "content": "A fact somebody read." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked-by-a-person",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "human:jordi",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked-by-a-person.md")).unwrap();
+    let entries = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .verified;
+    let [only] = entries.as_slice() else {
+        panic!("one verification: {entries:?}");
+    };
+    assert_eq!(only.by, "human:jordi");
+    assert_eq!(only.model, None, "a person checks with no model: {text}");
+    assert!(
+        text.contains("verified: { by: human:jordi, at: "),
+        "the two-key entry form, unchanged: {text}"
+    );
+}
+
+/// A verification attributed to another agent keeps the model, because the rule
+/// is about the `human:` prefix and nothing else: an actor a caller names is
+/// treated exactly as the one the server composes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_agent_verifier_still_carries_the_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked by a bot", "content": "A fact a bot read." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked-by-a-bot",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "team-bot/1.0",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked-by-a-bot.md")).unwrap();
+    assert!(
+        text.contains("verified: { by: team-bot/1.0, model: claude-opus-5, at: "),
+        "a named agent verifier keeps its model: {text}"
+    );
+}
+
+/// An instance pinned to a person still records an agent verifier's model. The
+/// prefix rule reads the actor a record CLAIMS, and what a `verified` entry
+/// claims is its own `by`: the acting identity decides the `generated` block it
+/// stamps and nothing else, so an operator who pins `identity.actor` to a person
+/// does not thereby strip the model off a check attributed to a bot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_instance_still_records_an_agent_verifiers_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "identity.actor": "human:jordi" } }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Pinned instance", "content": "A fact a bot read." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "pinned-instance",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "team-bot/1.0",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/pinned-instance.md")).unwrap();
+    assert!(
+        text.contains("verified: { by: team-bot/1.0, model: claude-opus-5, at: "),
+        "the entry's own actor is the only prefix test on this path: {text}"
+    );
+    assert!(
+        text.contains("generated: { by: human:jordi, at: "),
+        "and the block the person's instance stamps carries none: {text}"
     );
 }
 

@@ -345,14 +345,18 @@ fn set_generated(
                 .get(serde_yaml_ng::Value::String("at".into()))
                 .and_then(|v| v.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
-            // The model the writer reported, when it reported one. Absent,
-            // blank or non-scalar all read as absence: the block still names
-            // the actor, which is what the spec requires of it.
+            // The model the writer reported, when it reported one. Read as a
+            // string and nothing else, the way a `verified` entry reads it
+            // (`crystalline_core::engram::reported_model`), so the same value
+            // means the same thing in both blocks: absent, blank or not a
+            // string all read as absence, and the block still names the actor,
+            // which is what the spec requires of it.
             let model = map
                 .get(serde_yaml_ng::Value::String("model".into()))
-                .and_then(scalar_string)
-                .map(|m| m.trim().to_string())
-                .filter(|m| !m.is_empty());
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string);
             *field = Some(Generated { by, model, at });
             return;
         }

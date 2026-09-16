@@ -101,6 +101,24 @@ fn a_verified_entry_carries_its_model() {
     );
 }
 
+/// A `model` that is not a string is no model at all, in either block. The two
+/// parsers read the key by the same rule, so a hand-written number does not
+/// become a model id in `generated` and absence in `verified`.
+#[test]
+fn a_non_string_model_reads_as_no_model_in_either_block() {
+    let source = "---\ntype: engram\ntitle: X\npermalink: x\nstatus: stable\ngenerated: { by: claude-code/2.1.271, model: 5 }\nverified: { by: claude-code/2.1.271, model: 5 }\n---\n\nA body long enough to say something.\n";
+    let fm = parse_engram(source).unwrap().frontmatter;
+    assert_eq!(
+        fm.generated.as_ref().expect("generated parses").model,
+        None,
+        "a number is not a model id"
+    );
+    let [only] = fm.verified.as_slice() else {
+        panic!("one verification parses: {:?}", fm.verified);
+    };
+    assert_eq!(only.model, None, "and it is not one here either");
+}
+
 #[test]
 fn a_generated_block_without_an_actor_is_kept_verbatim() {
     // `by` is required by OKF v0.2, so a block without one is preserved as an
