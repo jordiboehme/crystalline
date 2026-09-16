@@ -1716,13 +1716,23 @@ fn declared_fn(line: &str) -> Option<&str> {
 /// times out: the file lock is held for ever, so every later write, edit, save
 /// or delete of that engram hangs and the person's unsaved work never lands.
 ///
-/// **Five needles, not one.** `apply_text` is the write; `has_live_room`,
+/// **Seven needles, not one.** `apply_text` is the write; `has_live_room`,
 /// `live_text`, `participants` and `touch_agent_presence` are reads, and
 /// every one of the five reaches `state.lock()` on the very same session
 /// state lock the room's saver holds across the file lock - so a future
 /// function that took the file lock and then only READ the room, never
 /// wrote it, would wedge exactly the way C1 did, with a green suite if only
 /// the write were watched.
+///
+/// The other two are the disposals, `dispose_domain` and
+/// `dispose_domain_discarding`, and they are the sharpest of the seven:
+/// `dispose_domain_discarding` takes the registry lock and then calls
+/// `final_save` on each victim, which holds the session state lock across
+/// `Engine::save_engram` - the cycle verbatim. Neither of their callers
+/// (`unregister_domain` and `leave_review_mode`) holds a file lock today, and
+/// `leave_review_mode` is precisely the function that could grow one later: it
+/// already writes folded drafts into the folder. Watching them costs nothing
+/// and is what keeps that a checked fact.
 ///
 /// A source scan rather than a behavioural assertion, and for the reason the
 /// other guards in this repo are source scans: the failure is a lock taken one
@@ -1740,13 +1750,15 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
 
     /// Every way an engine function reaches into a room, all of which take
     /// the same session state lock the room's saver holds across the file
-    /// lock: the one write and the four reads.
-    const ROOM_ENTRY_NEEDLES: [&str; 5] = [
+    /// lock: the one write, the four reads and the two disposals.
+    const ROOM_ENTRY_NEEDLES: [&str; 7] = [
         ".apply_text(",
         ".has_live_room(",
         ".live_text(",
         ".participants(",
         ".touch_agent_presence(",
+        ".dispose_domain(",
+        ".dispose_domain_discarding(",
     ];
 
     /// Every way an engine function takes a per-path write lock: the file's

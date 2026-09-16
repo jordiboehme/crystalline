@@ -2278,9 +2278,11 @@ impl Store for PostgresStore {
             .execute(&mut *c)
             .await
             .map_err(IndexError::from)?;
-        // The row is already named by its id, which the actor-scoped lookup
-        // above resolved, so this statement is inside that actor's dimension
-        // and carries no waiver of its own.
+        // -- actor: by id - the row is already named by its id, which the
+        // actor-scoped lookup above resolved, so this statement is inside that
+        // actor's dimension without screening for it again. The census reads
+        // each statement alone, and alone this one names no actor, so it says
+        // here which of the two waivers it holds.
         sqlx::query("DELETE FROM engram WHERE id=$1")
             .bind(id)
             .execute(&mut *c)

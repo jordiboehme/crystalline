@@ -7416,44 +7416,6 @@ parity!(
 /// a child table alone needs that test extended, not this one.
 #[test]
 fn every_engram_reading_sql_carries_an_actor_predicate() {
-    // The predicate in each of the spellings the two dialects and the bound
-    // forms use, and the waiver token.
-    const PREDICATES: &[&str] = &[
-        "actor = ''",
-        "actor=''",
-        "actor = ?",
-        "actor=?",
-        "actor = $",
-        "actor=$",
-        "actor=excluded",
-        // The overlay counts ask for every actor but the base one, which is as
-        // much a statement about whose rows it means as the base predicate is.
-        "actor <> ''",
-        // An insert says whose row it writes through the conflict target it
-        // names, which is the actor-aware unique index.
-        "ON CONFLICT(domain_id, path, actor)",
-        // A search candidate leg names its rows through the composed screen
-        // each backend's `actor_screen` builds: the base predicate verbatim
-        // when the search names no actor, and the shadowing form - this
-        // actor's own drafts minus tombstones, plus every base row they hold
-        // no row at - when it names one. The screen's own source is a site in
-        // this census too, and it is the one that carries the bound `actor =`
-        // spellings for both dialects.
-        "{actor_screen}",
-        // The graph frontier screens TWO ends of the `engram` table in one
-        // statement - the row an edge leaves and the row it reaches - so it
-        // names two composed screens rather than one, and the node hydrate
-        // that follows names a third. All three are built by the same
-        // `actor_screen` the search legs use, through its alias-taking form.
-        "{src_screen}",
-        "{dst_screen}",
-        "{node_screen}",
-    ];
-    const WAIVER: &str = "-- actor: all";
-    // How far around a statement its predicate or waiver may sit. A statement
-    // built from clause fragments has them a few lines above the SQL text.
-    const WINDOW: usize = 14;
-
     let files: &[(&str, &str)] = &[
         ("turso/mod.rs", include_str!("../src/turso/mod.rs")),
         ("postgres/mod.rs", include_str!("../src/postgres/mod.rs")),
@@ -7464,76 +7426,299 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         ),
         ("store.rs", include_str!("../src/store.rs")),
     ];
-
-    let mut sites = 0usize;
-    let mut waived = 0usize;
-    for (file, src) in files {
-        let lines: Vec<&str> = src.lines().collect();
-        for (n, line) in lines.iter().enumerate() {
-            if line.trim_start().starts_with("//") || !names_the_engram_table(line) {
-                continue;
-            }
-            sites += 1;
-            let lo = n.saturating_sub(WINDOW);
-            let hi = (n + WINDOW + 1).min(lines.len());
-            let window = lines[lo..hi].join("\n");
-            // The predicate is looked for first: a waiver in the window belongs
-            // to a neighbouring statement whenever this one names its actor,
-            // and counting it as waived here would hide the real waiver list.
-            if PREDICATES.iter().any(|p| window.contains(p)) {
-                continue;
-            }
-            if window.contains(WAIVER) {
-                waived += 1;
-                continue;
-            }
-            panic!(
-                "{file}:{} reads the engram table without saying whose rows it means, \
-                 and carries no `{WAIVER}` waiver either: {}",
-                n + 1,
-                line.trim()
-            );
-        }
-    }
+    let census = census_engram_statements(files);
+    assert!(
+        census.failures.is_empty(),
+        "these statements read the engram table without saying whose rows they mean, \
+         and carry no waiver either:\n{}",
+        census.failures.join("\n")
+    );
     assert_eq!(
-        sites, 152,
+        census.sites, 152,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
          59 per backend in mod.rs, 15 per backend in search.rs, 4 in the shared \
          reference-resolution expression. One per backend in search.rs is the \
          anti-join inside `actor_screen_on`, which asks whether the reader holds \
          a row of their own at a base row's path - one site however many \
          statements compose the screen. Two shapes here sit INSIDE a screened \
-         statement and carry no screen of their own on purpose, which is why \
-         they pass on their neighbour's predicate rather than on a waiver: the \
-         `tgt` hop of the graph frontier and of the outbound verdict reads the \
-         row a reference was bound to for its address alone, with the screen on \
-         the `dst` beside it, and the dangling probe in \
-         `reresolve_actor_references` asks whether ANY row still stands at a \
-         `to_id`, since whose the vanished row was does not change that the \
-         reference now points at nothing"
+         statement and carry no screen of their own on purpose, and each passes \
+         on the screen its own statement carries: the `tgt` hop of the graph \
+         frontier and of the outbound verdict reads the row a reference was \
+         bound to for its address alone, with the screen on the `dst` beside it, \
+         and the dangling probe in `reresolve_actor_references` asks whether ANY \
+         row still stands at a `to_id`, since whose the vanished row was does \
+         not change that the reference now points at nothing"
     );
     assert_eq!(
-        waived, 14,
+        census.waived, 16,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Seven per backend: the five statements of `clear_domain`, the id-scoped delete inside \
-         `delete_engram`, and `chunks_needing_embedding`'s domain scope"
+         Eight per backend: the five statements of `clear_domain`, the id-scoped delete inside \
+         `delete_engram` and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, \
+         plus `clear_overlay_entry`'s delete, which is `-- actor: by id` because the id it \
+         names was resolved by an actor-scoped lookup two statements above"
     );
 }
 
-/// Whether a line of source names the `engram` table itself, as opposed to
-/// `engram_tag` or an `engram_id` column.
-fn names_the_engram_table(line: &str) -> bool {
-    for keyword in ["FROM engram", "JOIN engram", "INTO engram", "UPDATE engram"] {
-        let mut rest = line;
-        while let Some(at) = rest.find(keyword) {
-            let tail = &rest[at + keyword.len()..];
-            if !tail.starts_with('_') {
-                return true;
+/// The census above, proved on a source it is handed rather than on the one it
+/// guards: a statement whose own predicate is deleted is caught even when a
+/// neighbouring statement still carries one.
+///
+/// This is the property the line-window version did not have. Measured over
+/// the real sources at the time it was written, breaking each of the 140
+/// predicate-carrying lines one at a time, the window caught 48 and missed 92:
+/// six adjacent `domain_stats` counts, four `inbound_refs` arms and six
+/// `vocabulary` branches each passed on a neighbour's predicate from inside the
+/// same fourteen lines. Scoping the search to the statement's own parentheses
+/// catches all 140. The fixture below is that shape in miniature, so the
+/// property is checked rather than remembered.
+#[test]
+fn the_census_reads_each_statement_alone() {
+    const INTACT: &str = "\
+fn stats() {
+    let sql = \"SELECT \\
+         (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = ''), \\
+         (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = '' AND e.tombstone=0)\";
+}
+";
+    let intact = census_engram_statements(&[("fixture.rs", INTACT)]);
+    assert_eq!(intact.sites, 2, "two statements, two sites");
+    assert!(
+        intact.failures.is_empty(),
+        "both carry their own predicate: {:?}",
+        intact.failures
+    );
+
+    let broken = INTACT.replacen("e.domain_id=d.id AND e.actor = ''", "e.domain_id=d.id", 1);
+    let broken = census_engram_statements(&[("fixture.rs", &broken)]);
+    assert_eq!(
+        broken.failures.len(),
+        1,
+        "the statement whose predicate went is named, and its neighbour's does \
+         not stand in for it: {:?}",
+        broken.failures
+    );
+
+    // And a composed statement still passes on the fragment its own function
+    // builds, which is the one place the window is still consulted.
+    const COMPOSED: &str = "\
+fn listing() {
+    where_clauses.insert(0, \"e.actor = ''\".to_string());
+    let where_sql = format!(\"WHERE {}\", where_clauses.join(\" AND \"));
+    let sql = format!(\"SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}\");
+}
+";
+    let composed = census_engram_statements(&[("fixture.rs", COMPOSED)]);
+    assert!(
+        composed.failures.is_empty(),
+        "a statement interpolating a fragment reads the lines around it: {:?}",
+        composed.failures
+    );
+}
+
+/// What [`census_engram_statements`] found.
+struct Census {
+    /// Every statement naming the `engram` table.
+    sites: usize,
+    /// How many of them answered with a waiver rather than a predicate.
+    waived: usize,
+    /// The ones that answered with neither, as `file:line: text`.
+    failures: Vec<String>,
+}
+
+/// The predicate in each of the spellings the two dialects and the bound forms
+/// use.
+const ACTOR_PREDICATES: &[&str] = &[
+    "actor = ''",
+    "actor=''",
+    "actor = ?",
+    "actor=?",
+    "actor = $",
+    "actor=$",
+    "actor=excluded",
+    // The overlay counts ask for every actor but the base one, which is as
+    // much a statement about whose rows it means as the base predicate is.
+    "actor <> ''",
+    // An insert says whose row it writes through the conflict target it names,
+    // which is the actor-aware unique index.
+    "ON CONFLICT(domain_id, path, actor)",
+    // A search candidate leg names its rows through the composed screen each
+    // backend's `actor_screen` builds: the base predicate verbatim when the
+    // search names no actor, and the shadowing form - this actor's own drafts
+    // minus tombstones, plus every base row they hold no row at - when it names
+    // one. The screen's own source is a site in this census too, and it is the
+    // one that carries the bound `actor =` spellings for both dialects.
+    "{actor_screen}",
+    // The graph frontier screens TWO ends of the `engram` table in one
+    // statement - the row an edge leaves and the row it reaches - so it names
+    // two composed screens rather than one, and the node hydrate that follows
+    // names a third. All three are built by the same `actor_screen` the search
+    // legs use, through its alias-taking form.
+    "{src_screen}",
+    "{dst_screen}",
+    "{node_screen}",
+];
+
+/// The two waiver tokens, each saying in one line why a statement means rows
+/// it does not screen: every actor's, or the one row an actor-scoped lookup
+/// already named by its id.
+const ACTOR_WAIVERS: &[&str] = &["-- actor: all", "-- actor: by id"];
+
+/// How far around a composed statement its fragment's predicate may sit, and
+/// how far around any statement its waiver may. Both are declared in the
+/// function that builds the statement rather than inside it, which is why these
+/// two questions still read a window where the predicate question does not.
+const ACTOR_WINDOW: usize = 14;
+
+/// Walk every statement that names the `engram` table and ask, of each one
+/// ALONE, whether it says whose rows it means.
+///
+/// **The unit is the statement, not a line window.** A site's scope runs from
+/// the innermost parenthesis still open before it to the one that closes it -
+/// so a subquery is its own scope and six counts in one `SELECT` are six
+/// scopes - bounded by the `;`, `{` or `}` that ends the Rust statement when no
+/// parenthesis is open. Parentheses inside a string literal count, because that
+/// is where the SQL is; `;`, `{` and `}` count only outside one, because a
+/// format placeholder is not a block.
+///
+/// Two questions still read a window of [`ACTOR_WINDOW`] lines, and both are
+/// about text that is deliberately declared beside a statement rather than
+/// inside it: a waiver, which is a comment a person wrote and whose count this
+/// census pins; and the predicate of a statement that interpolates a fragment
+/// (`{where_sql}`), where the fragment is built a few lines above. Deleting
+/// that fragment's predicate is still caught, because nothing in the window
+/// carries one afterwards.
+fn census_engram_statements(files: &[(&str, &str)]) -> Census {
+    let mut census = Census {
+        sites: 0,
+        waived: 0,
+        failures: Vec::new(),
+    };
+    for (file, src) in files {
+        let inside = string_mask(src);
+        let lines: Vec<&str> = src.lines().collect();
+        for (at, _) in src.match_indices("FROM engram").chain(
+            src.match_indices("JOIN engram")
+                .chain(src.match_indices("INTO engram"))
+                .chain(src.match_indices("UPDATE engram")),
+        ) {
+            // `engram_tag` and `engram_id` are not this table.
+            if src[at + "FROM engram".len()..].starts_with('_') {
+                continue;
             }
-            rest = &rest[at + keyword.len()..];
+            let line_no = src[..at].matches('\n').count();
+            if lines[line_no].trim_start().starts_with("//") {
+                continue;
+            }
+            census.sites += 1;
+            let scope = statement_scope(src, &inside, at);
+            if ACTOR_PREDICATES.iter().any(|p| scope.contains(p)) {
+                continue;
+            }
+            let lo = line_no.saturating_sub(ACTOR_WINDOW);
+            let hi = (line_no + ACTOR_WINDOW + 1).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            // A composed statement carries a placeholder where its predicate
+            // would be, and the fragment behind it is built in the same
+            // function.
+            if scope.contains('{') && ACTOR_PREDICATES.iter().any(|p| window.contains(p)) {
+                continue;
+            }
+            if ACTOR_WAIVERS.iter().any(|w| window.contains(w)) {
+                census.waived += 1;
+                continue;
+            }
+            census
+                .failures
+                .push(format!("{file}:{}: {}", line_no + 1, lines[line_no].trim()));
         }
     }
-    false
+    census
+}
+
+/// Which bytes of a Rust source sit inside a string literal, so the scan can
+/// tell a format placeholder from a block and an SQL parenthesis from a call's.
+fn string_mask(src: &str) -> Vec<bool> {
+    let bytes = src.as_bytes();
+    let mut inside = vec![false; bytes.len()];
+    let (mut i, mut in_string, mut in_comment) = (0usize, false, false);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_comment {
+            if c == b'\n' {
+                in_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string {
+            inside[i] = true;
+            if c == b'\\' {
+                if i + 1 < bytes.len() {
+                    inside[i + 1] = true;
+                }
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            in_comment = true;
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            inside[i] = true;
+        }
+        i += 1;
+    }
+    inside
+}
+
+/// The statement a site stands in: see [`census_engram_statements`] for the
+/// rule and why it is the rule.
+fn statement_scope<'a>(src: &'a str, inside: &[bool], at: usize) -> &'a str {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for i in (0..at).rev() {
+        let c = bytes[i];
+        if !inside[i] && matches!(c, b';' | b'{' | b'}') {
+            start = i + 1;
+            break;
+        }
+        if c == b')' {
+            depth += 1;
+        } else if c == b'(' {
+            if depth == 0 {
+                start = i + 1;
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    let mut depth = 0usize;
+    let mut end = src.len();
+    for (i, c) in bytes.iter().enumerate().skip(at) {
+        if !inside[i] && matches!(c, b';' | b'{' | b'}') && depth == 0 {
+            end = i;
+            break;
+        }
+        if *c == b'(' {
+            depth += 1;
+        } else if *c == b')' {
+            if depth == 0 {
+                end = i;
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    &src[start..end]
 }
 
 /// A draft's child rows never reach a base-facing answer, even where the
