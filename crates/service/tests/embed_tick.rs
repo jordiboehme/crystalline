@@ -38,6 +38,7 @@ fn write_params(title: &str, content: &str) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 

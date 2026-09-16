@@ -103,6 +103,7 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 
@@ -125,6 +126,7 @@ fn edit_params(
         include_subsections: false,
         expected_checksum,
         ack_scope: None,
+        share_link: None,
     }
 }
 
@@ -201,6 +203,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "alpha".to_string(),
                 domain: Some("eng".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -242,6 +245,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "shared-insight".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )

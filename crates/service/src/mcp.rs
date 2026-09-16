@@ -1192,6 +1192,75 @@ pub enum Transport {
 /// client's own `initialize` name, which is the per-connection variation
 /// SEP-2567 forbids. What is here instead was decided before the connection
 /// existed: see `harness_onboarded`.
+/// The draft joins one MCP session opened, and the thing that ends them.
+///
+/// **A join belongs to a session, never to an account** (see [`crate::join`]),
+/// and this is what makes that true on this surface: the keys an agent's
+/// session was handed live here, in an [`Arc`] every clone of its
+/// [`McpServer`] shares, and the last clone going away is the session ending.
+/// A person's browser join is a different set of keys in a different place, so
+/// a person joining a draft in a window has not joined it for their agent, and
+/// an agent presenting a link has not moved their browser.
+///
+/// The keys are also the reason a write is routed by a key rather than by
+/// [`crate::join::Joins::holds`]: `holds` asks about an ACCOUNT, and an agent
+/// authenticates as the same account its person does.
+struct SessionJoins {
+    registry: Arc<crate::join::Joins>,
+    /// `(key, account)` for every join this session opened, in the order it
+    /// opened them.
+    keys: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl SessionJoins {
+    fn new(registry: Arc<crate::join::Joins>) -> SessionJoins {
+        SessionJoins {
+            registry,
+            keys: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record a key this session was just handed. Joining a draft this session
+    /// is already inside answers the key it already holds
+    /// ([`crate::join::Joins::open`] dedups), so this de-duplicates too rather
+    /// than growing a list of one key repeated.
+    fn remember(&self, key: String, account: String) {
+        let mut keys = self.lock();
+        if !keys.iter().any(|(held, _)| held == &key) {
+            keys.push((key, account));
+        }
+    }
+
+    /// The joins this session is holding in one domain, as the registry
+    /// answers them for `account`.
+    ///
+    /// Re-read every time rather than cached: a revoke, a rename, a discard or
+    /// a fold ends a join in the registry, and a session that answered from a
+    /// copy would go on writing into a draft it had been put out of.
+    fn held(&self, account: &str, domain: &str) -> Vec<crate::join::Join> {
+        let joins = &self.registry;
+        self.lock()
+            .iter()
+            .filter_map(|(key, held_for)| (held_for == account).then(|| joins.get(key, account))?)
+            .filter(|join| join.domain == domain)
+            .collect()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, String)>> {
+        self.keys.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The session is over, so the drafts it was working inside are drafts it is
+/// no longer inside.
+impl Drop for SessionJoins {
+    fn drop(&mut self) {
+        for (key, account) in self.lock().iter() {
+            self.registry.close(key, account);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct McpServer {
     engine: Arc<Engine>,
@@ -1210,6 +1279,9 @@ pub struct McpServer {
     /// the safe direction (an over-served client pays duplicated context, an
     /// under-served one loses onboarding it cannot rediscover).
     harness_onboarded: bool,
+    /// The drafts this session joined by presenting a share-link, and the
+    /// handle whose last clone ends them. See [`SessionJoins`].
+    joins: Arc<SessionJoins>,
 }
 
 impl McpServer {
@@ -1224,11 +1296,71 @@ impl McpServer {
     }
 
     fn with_transport(engine: Arc<Engine>, transport: Transport) -> McpServer {
+        let joins = Arc::new(SessionJoins::new(engine.joins().clone()));
         McpServer {
             engine,
             transport,
             harness_onboarded: false,
+            joins,
         }
+    }
+
+    /// Present a share-link: bind it to this account, open the draft it names
+    /// for THIS session, and answer the join the verb routes through.
+    ///
+    /// Both of the browser's two steps at once (see
+    /// [`Engine::open_share_link`]), because an agent that was handed a link
+    /// and passed it to a verb has decided both: it means to see the draft and
+    /// it means to work in it.
+    async fn enter_draft(
+        &self,
+        scope: &Scope,
+        token: &str,
+    ) -> Result<crate::join::Join, ErrorData> {
+        let (key, join) = self
+            .engine
+            .open_share_link(token, scope)
+            .await
+            .map_err(to_error)?;
+        self.joins.remember(key, join.account.clone());
+        Ok(join)
+    }
+
+    /// The join this session holds that `identifier` names, or `None`.
+    ///
+    /// **By the page, never by the domain**, and that is the whole of it. A
+    /// session that joined one draft of a domain goes on editing its own
+    /// engrams in that domain exactly as before; only a call that named the
+    /// shared page is routed into its author's copy. Matching by the domain
+    /// instead would bind every write the session made anywhere in that domain
+    /// to the one page it was invited into.
+    ///
+    /// The name is checked against what the GRANT opens
+    /// ([`Engine::granted_draft_named`]), which is the draft's own address,
+    /// its path and the path with the suffix off - the three spellings an
+    /// engram is addressed by - and against the path the join was opened for,
+    /// so one of the owner's other drafts answering the same name routes
+    /// nothing.
+    async fn joined_for(
+        &self,
+        scope: &Scope,
+        domain: &str,
+        identifier: &str,
+    ) -> Option<crate::join::Join> {
+        let account = crate::scope::overlay_actor(scope)?;
+        let held = self.joins.held(&account, domain);
+        for join in held {
+            let named = self
+                .engine
+                .granted_draft_named(domain, identifier, Some(&join.owner), scope)
+                .await
+                .ok()
+                .flatten();
+            if named.is_some_and(|(_, path)| path == join.path) {
+                return Some(join);
+            }
+        }
+        None
     }
 
     /// Record that the harness this process serves is already onboarded (see
@@ -1454,7 +1586,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1473,6 +1605,13 @@ impl McpServer {
             return refuse(refusal).map(CallToolResponse::from);
         }
         let actor = acting_actor(&ctx);
+        // A capture inside somebody's draft names that draft on the call: this
+        // verb derives its destination from the title rather than resolving a
+        // page, so there is no identifier to work out which draft was meant.
+        let join = match p.share_link.as_deref() {
+            Some(token) => Some(self.enter_draft(&scope, token).await?),
+            None => None,
+        };
 
         // **A refusal is read before the engine runs, never after it.** A
         // collision is discovered by attempting the write, so the shape that
@@ -1496,7 +1635,7 @@ impl McpServer {
 
         let written = self
             .engine
-            .write_engram_as(&p, actor.as_deref(), &scope)
+            .write_engram_joined(&p, actor.as_deref(), &scope, join.as_ref())
             .await;
 
         // A permalink collision is the one failure here with a real choice
@@ -1542,7 +1681,7 @@ impl McpServer {
                 retry.overwrite = true;
                 let receipt = self
                     .engine
-                    .write_engram_as(&retry, actor.as_deref(), &scope)
+                    .write_engram_joined(&retry, actor.as_deref(), &scope, join.as_ref())
                     .await
                     .map_err(to_error)?;
                 let receipt = self
@@ -1556,7 +1695,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this session, so a later edit_engram of it lands in their copy.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -1565,6 +1704,15 @@ impl McpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let scope = self.scope_of(&ctx);
+        // A link presented here binds it to this account and opens the draft
+        // for this session, so the read below answers the draft it names and a
+        // later edit of that page lands in its author's copy. The read itself
+        // needs no join - a grant is what a read crosses on - but an agent
+        // that was handed a link and is reading with it has decided both, the
+        // same way a person pressing the button in a browser has.
+        if let Some(token) = p.share_link.as_deref() {
+            self.enter_draft(&scope, token).await?;
+        }
         let value = self
             .engine
             .read_engram(&p, &scope)
@@ -1579,7 +1727,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this session and the edit lands in its author's copy, with the receipt saying whose. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it and when. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1620,9 +1768,17 @@ impl McpServer {
                 Some(true) => {}
             }
         }
+        // Which draft this edit is inside, if any: the link presented on this
+        // call, or - for a session already inside one - the join whose draft
+        // the identifier names. An edit of anything else in that domain is the
+        // session's own, exactly as it was before it joined anything.
+        let join = match p.share_link.as_deref() {
+            Some(token) => Some(self.enter_draft(&scope, token).await?),
+            None => self.joined_for(&scope, &p.domain, &p.identifier).await,
+        };
         let receipt = self
             .engine
-            .edit_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
+            .edit_engram_joined(&p, acting_actor(&ctx).as_deref(), &scope, join.as_ref())
             .await
             .map_err(to_error)?;
         // `for_edit` is `None` for `set_frontmatter` and for any operation that
@@ -4294,6 +4450,81 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// A join an MCP session opened ends when that session ends, and belongs
+    /// to nobody else while it stands.
+    ///
+    /// The pin under ruling 2: an agent's join is keyed by its session, not by
+    /// its account, so a person's browser join never becomes their agent's and
+    /// an agent's never becomes theirs. The registry itself keys by account
+    /// (that is what a browser upgrade can ask), so the thing that separates
+    /// the two is WHO HOLDS THE KEY - and this is the holder.
+    #[test]
+    fn a_sessions_joins_end_with_the_session() {
+        let registry = Arc::new(crate::join::Joins::default());
+        let join = crate::join::Join {
+            account: "bob".to_string(),
+            domain: "team".to_string(),
+            path: "fresh.md".to_string(),
+            owner: "alice".to_string(),
+        };
+        let key = registry.open(join.clone()).unwrap();
+
+        let session = SessionJoins::new(registry.clone());
+        session.remember(key.clone(), "bob".to_string());
+        session.remember(key.clone(), "bob".to_string());
+        assert_eq!(
+            session.held("bob", "team"),
+            vec![join.clone()],
+            "one key, however often it is remembered"
+        );
+        assert!(
+            session.held("bob", "other").is_empty(),
+            "and it is a join into one domain"
+        );
+        assert!(
+            session.held("carol", "team").is_empty(),
+            "held for the account it was opened for and no other"
+        );
+
+        drop(session);
+        assert_eq!(registry.get(&key, "bob"), None, "the session ended it");
+        assert!(!registry.holds("bob", "team", "alice", "fresh.md"));
+    }
+
+    /// A join another session is holding is not this session's, whatever
+    /// account it belongs to.
+    ///
+    /// Said from the browser's side: bob's browser is inside alice's draft, so
+    /// the registry says his account holds a join - and bob's agent, which
+    /// authenticates as bob, is holding no key and is therefore inside
+    /// nothing.
+    #[test]
+    fn another_sessions_join_is_not_this_sessions() {
+        let registry = Arc::new(crate::join::Joins::default());
+        let browser_key = registry
+            .open(crate::join::Join {
+                account: "bob".to_string(),
+                domain: "team".to_string(),
+                path: "fresh.md".to_string(),
+                owner: "alice".to_string(),
+            })
+            .unwrap();
+        let agent = SessionJoins::new(registry.clone());
+        assert!(
+            agent.held("bob", "team").is_empty(),
+            "the agent's session opened nothing, so it is inside nothing"
+        );
+        assert!(
+            registry.holds("bob", "team", "alice", "fresh.md"),
+            "while the account is inside it, which is what the browser upgrade asks"
+        );
+        drop(agent);
+        assert!(
+            registry.get(&browser_key, "bob").is_some(),
+            "and an agent session ending leaves a join it never opened alone"
+        );
+    }
 
     /// **The join is the server's word, at any position and any multiplicity.**
     ///

@@ -115,6 +115,7 @@ fn read(identifier: &str, domain: &str) -> ReadParams {
     ReadParams {
         identifier: identifier.to_string(),
         domain: Some(domain.to_string()),
+        share_link: None,
     }
 }
 

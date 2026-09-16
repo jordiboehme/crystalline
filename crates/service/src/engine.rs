@@ -3823,12 +3823,37 @@ impl Engine {
         client: Option<&str>,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
+        self.write_engram_joined(p, client, scope, None).await
+    }
+
+    /// [`Engine::write_engram_as`], with the join a session may be holding.
+    ///
+    /// A capture inside a join replaces the granted page with the document the
+    /// caller composed, which is the one thing this verb can do inside
+    /// somebody's draft: its destination is derived from the title rather than
+    /// resolved from a page, so a capture that lands anywhere else is a
+    /// capture of the caller's own and has nothing to do with the draft.
+    ///
+    /// **The path screen therefore runs only when a join actually took**, and
+    /// the asymmetry with [`Engine::save_engram_joined`] is deliberate. An
+    /// UNJOINED capture at a granted path is the second way forward
+    /// [`granted_needs_join`] names out loud - draft your own copy and leave
+    /// theirs as it stands - and that is what it has always done here.
+    /// Screening it would take that fork away.
+    pub async fn write_engram_joined(
+        &self,
+        p: &WriteParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
         let source = self.content_source(&p.domain)?;
-        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
+        let join = join.filter(|_| view.joined().is_some());
         let actor = self.actor_for(client, overlay);
         let engram_type = p
             .engram_type
@@ -3838,6 +3863,14 @@ impl Engine {
         let tags = p.tags.clone();
 
         let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title)?;
+
+        // A join is into ONE draft: a capture inside one that resolved
+        // anywhere else has nowhere to land, and is told so rather than
+        // writing into the owner's overlay at a path they never shared.
+        if let Some(join) = join {
+            self.screen_granted_path(&p.domain, &rel, scope, Some(join))
+                .await?;
+        }
 
         // The whole existence-check-then-write, for a file domain, under that
         // file's lock: the check and the write it authorizes must be one step,
@@ -3932,6 +3965,11 @@ impl Engine {
         if let (Some(_), Some(domain_id)) = (overlay, overlay_domain_id) {
             let warning = view.write(domain_id, &rel, &markdown).await?;
             receipt["draft"] = json!(true);
+            // Whose draft it landed in, when that is not the caller's own, in
+            // the words the joined save and the joined edit both use.
+            if let Some(owner) = view.joined() {
+                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+            }
             note_unmirrored(&mut receipt, warning);
             return Ok(receipt);
         }
@@ -4470,6 +4508,126 @@ impl Engine {
             .granted_draft_named(domain, identifier, None, scope)
             .await?
             .map(|(owner, path)| granted_needs_join(&owner, &path)))
+    }
+
+    /// Present a share-link and open a join on the draft it names.
+    ///
+    /// **The agent's door into somebody else's draft, and it is the same door
+    /// a browser goes through.** The two REST steps a person takes in one
+    /// call: accepting the link, which binds it to their account for good, and
+    /// joining it, which is the second and separate decision to type into
+    /// somebody's work. One call, because an agent that was handed a link and
+    /// passed it to a verb has decided both. The join it opens belongs to the
+    /// session that presented it and ends when that session ends; the key is
+    /// what the caller holds, and nothing else in this process hands it out.
+    ///
+    /// The order is the REST route's order and it is load bearing: the domain
+    /// screen comes BEFORE the redemption, because redeeming binds the link
+    /// irreversibly and an account that may not read the domain would
+    /// otherwise burn it for the person it was meant for.
+    ///
+    /// Every way a link fails to open anything is one refusal, deliberately:
+    /// an invented link, a revoked one, an expired one, one already bound to
+    /// somebody else and one into a domain this caller may not read are five
+    /// different facts and none of them is this caller's to learn.
+    pub async fn open_share_link(
+        &self,
+        token: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<(String, crate::join::Join)> {
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Err(EngineError::Refused(
+                "a draft share-link binds to an account, and this session has none: sign in \
+                 before presenting one"
+                    .to_string(),
+            ));
+        };
+        let Some(access) = self.domain_access.get() else {
+            // Every install that serves no accounts: a one-shot command, the
+            // embedded stdio stack, a daemon with the web surface off. There
+            // are no share-links there to present, and saying so is better
+            // than the dead-link sentence, which would suggest this one had
+            // simply expired.
+            return Err(EngineError::Refused(
+                "this instance serves no accounts, so it mints and opens no draft share-links: \
+                 drafts here belong to whoever runs it"
+                    .to_string(),
+            ));
+        };
+        let dead = || {
+            EngineError::NotFound(
+                "this draft link opens nothing: it may have been revoked, it may have expired, \
+                 it may already belong to somebody else, or the draft it was for may have been \
+                 folded or discarded. Ask whoever shared it for a fresh one."
+                    .to_string(),
+            )
+        };
+        let named = access
+            .overlay_grant_domain(token)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?
+            .ok_or_else(dead)?;
+        // The same screen every other read of a domain makes, on the grantee:
+        // a link is its author's word about one draft and never about a
+        // domain, so a private domain this account is not a member of stays a
+        // domain it has never heard of.
+        let hidden = self.hidden_for(scope).await?;
+        if self.domain_entry_scoped(&named, &hidden).is_err() {
+            return Err(dead());
+        }
+        let (domain, owner, path) = access
+            .redeem_overlay_grant(token, &account)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?
+            .ok_or_else(dead)?;
+        // A grant lasts exactly as long as the thing it grants, and a join
+        // into a draft that is gone is a join to nothing.
+        if self
+            .overlay_draft_at(&domain, &owner, &path)
+            .await?
+            .is_none()
+        {
+            return Err(EngineError::NotFound(format!(
+                "this link was for {owner}'s draft of '{path}', and that draft is no longer \
+                 there: it was folded into the domain, discarded, or moved somewhere else. Ask \
+                 for a fresh link, or look for the page in the domain itself."
+            )));
+        }
+        // Seeing a draft and editing it are two states, and this is the one
+        // that needs the right: an account that may only read the domain opens
+        // the link and reads the draft, and is told why it may not type in it.
+        let right = access
+            .write_right(scope, &domain)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        if right < crate::scope::DomainRight::Write {
+            return Err(EngineError::Refused(format!(
+                "you may read {owner}'s draft of '{path}' and not edit it: your access on \
+                 '{domain}' is {}, and editing somebody's draft needs the same editor access \
+                 that writing anything else here needs. Suggest changes to whoever shared it, \
+                 or ask for editor access on the domain.",
+                crate::rest::member_level_word(right)
+            )));
+        }
+        let join = crate::join::Join {
+            account,
+            domain,
+            path,
+            owner,
+        };
+        let key = self.joins().open(join.clone()).map_err(|refusal| {
+            EngineError::Refused(match refusal {
+                crate::join::JoinRefusal::AccountFull => "you are already working inside as many \
+                     drafts as this instance keeps open for one account: leave one of them and \
+                     this one will open"
+                    .to_string(),
+                crate::join::JoinRefusal::InstanceFull => "this instance is already holding as \
+                     many drafts open as it will hold at once, across everybody: leave one of \
+                     yours, or try again shortly"
+                    .to_string(),
+            })
+        })?;
+        Ok((key, join))
     }
 
     /// The draft this caller holds a live link to that `identifier` names, as
@@ -6026,6 +6184,10 @@ impl Engine {
                     status: Some("stable".to_string()),
                     metadata: None,
                     overwrite: false,
+                    // A split writes the splitter's own new engram, which is
+                    // nobody's shared draft: a link presented on the split
+                    // would be a link to the page being split, not to this.
+                    share_link: None,
                 },
                 client,
                 // The splitter's own scope: the new engram is written by
@@ -6740,13 +6902,60 @@ impl Engine {
         client: Option<&str>,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
+        self.edit_engram_joined(p, client, scope, None).await
+    }
+
+    /// [`Engine::edit_engram_as`], with the join a session may be holding.
+    ///
+    /// **The compose verb, and so the one a join is actually for.** A person
+    /// invited into somebody's draft is invited to work on that page, and an
+    /// agent invited into it edits the page - it does not re-address it, move
+    /// it or take it away, which is why those verbs take no join. The two
+    /// gates `Engine::save_engram_joined` carries ride here for the same
+    /// reason they ride there rather than in the routes, so a second surface
+    /// that learns to join inherits both: an edit is into ONE draft, and an
+    /// edit at a path this caller was GRANTED but has not joined is refused in
+    /// words that name both ways forward.
+    ///
+    /// `None` is the ordinary edit, which is what every surface but a joined
+    /// one passes and what this verb did before joins existed.
+    pub async fn edit_engram_joined(
+        &self,
+        p: &EditParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
+        // The join as this view actually took it: one naming another domain,
+        // or a domain that has stopped reviewing changes, is not a join into
+        // this edit at all and must not gate it.
+        let join = join.filter(|_| view.joined().is_some());
         let actor = self.actor_for(client, overlay);
-        let (desc, source) = view.resolve(&p.identifier).await?;
+        let (desc, source) = match view.resolve(&p.identifier).await {
+            Ok(resolved) => resolved,
+            // A name this caller's own view cannot resolve, when they hold a
+            // link to a draft that answers to it: the miss IS the rule, since
+            // the granted draft is deliberately absent from every ordinary
+            // read they make. So the refusal teaches instead, in the same
+            // words a save at that name gets.
+            Err(EngineError::NotFound(missing)) => {
+                return match self
+                    .teach_granted_miss(&p.domain, &p.identifier, scope)
+                    .await?
+                {
+                    Some(teaching) => Err(EngineError::Refused(teaching)),
+                    None => Err(EngineError::NotFound(missing)),
+                };
+            }
+            Err(e) => return Err(e),
+        };
+        self.screen_granted_path(&desc.domain, &desc.path, scope, join)
+            .await?;
         // An `evolve_ack` assignment is the one set_frontmatter key whose value
         // the server completes rather than takes: the scope comes from running
         // detection over this engram's domain, which needs the store and so
@@ -6777,6 +6986,14 @@ impl Engine {
         });
         if overlay.is_some() {
             response["draft"] = json!(true);
+        }
+        // Whose draft it landed in, when that is not the caller's own - the
+        // one thing a joined edit has to say that an ordinary one does not.
+        // Somebody composing inside a colleague's draft is owed a plain
+        // sentence about where the words went, in the same words the joined
+        // save says it in.
+        if let Some(owner) = view.joined() {
+            response["joined"] = json!(format!("landed in {owner}'s draft"));
         }
         // Where it went, said only when that is not where an edit ordinarily
         // goes: somebody has this page open, the text is in their document,
@@ -20961,6 +21178,7 @@ mod lock_tests {
                     status: None,
                     metadata: None,
                     overwrite: false,
+                    share_link: None,
                 })
                 .await
         });

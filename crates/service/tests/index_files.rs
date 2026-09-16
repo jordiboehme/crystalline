@@ -55,6 +55,7 @@ fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 
@@ -165,6 +166,7 @@ async fn an_edit_that_changes_the_title_updates_the_listing() {
             include_subsections: false,
             expected_checksum: None,
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -368,6 +370,7 @@ async fn a_virtual_domain_generates_no_files() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap();

@@ -44,6 +44,7 @@ async fn write(engine: &Engine, title: &str, status: &str, body: &str) {
             status: Some(status.to_string()),
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap();

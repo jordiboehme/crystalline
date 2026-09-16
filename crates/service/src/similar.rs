@@ -235,6 +235,7 @@ mod tests {
             expected_replacements: None,
             include_subsections: false,
             ack_scope: None,
+            share_link: None,
         };
         assert!(SimilarProbe::for_edit(&p).is_none());
         p.operation = "append".into();

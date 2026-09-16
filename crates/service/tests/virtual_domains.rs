@@ -100,6 +100,7 @@ fn write_params(title: &str, content: &str) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 
@@ -123,6 +124,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "first-note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -148,6 +150,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
             include_subsections: false,
             expected_checksum: None,
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -156,6 +159,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "first-note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -212,6 +216,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "first-note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -235,6 +240,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -256,6 +262,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             include_subsections: false,
             expected_checksum: None,
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -275,6 +282,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             include_subsections: false,
             expected_checksum: Some(stale_checksum),
             ack_scope: None,
+            share_link: None,
         })
         .await;
     assert!(
@@ -288,6 +296,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -313,6 +322,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             include_subsections: false,
             expected_checksum: Some(fresh),
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -342,6 +352,7 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
             include_subsections: false,
             expected_checksum: None,
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -351,6 +362,7 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "sentinel-note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -382,6 +394,7 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
             include_subsections: false,
             expected_checksum: Some(checksum),
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -403,6 +416,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             &ReadParams {
                 identifier: "timestamp-note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -425,6 +439,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             include_subsections: false,
             expected_checksum: None,
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap_err();
@@ -441,6 +456,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             &ReadParams {
                 identifier: "timestamp-note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -463,6 +479,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             include_subsections: false,
             expected_checksum: Some(before_checksum),
             ack_scope: None,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -513,6 +530,7 @@ async fn full_reindex_preserves_virtual(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "kept-note".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -531,6 +549,7 @@ async fn full_reindex_preserves_virtual(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "page".to_string(),
                 domain: Some("docs".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -644,6 +663,7 @@ fn tagged(title: &str, content: &str, tags: Vec<&str>) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 
@@ -676,6 +696,7 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "alpha".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -697,6 +718,7 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "alpha".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -789,6 +811,7 @@ async fn retag_merges_separator_variant(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "under".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -870,6 +893,7 @@ async fn merge_records_alias_in_virtual_manifest(store: Arc<Mutex<dyn Store>>) {
             &ReadParams {
                 identifier: "manifest".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -928,6 +952,7 @@ async fn merge_surfaces_conflict_in_virtual_manifest(store: Arc<Mutex<dyn Store>
             &ReadParams {
                 identifier: "manifest".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -972,6 +997,7 @@ async fn merge_surfaces_conflict_in_virtual_manifest(store: Arc<Mutex<dyn Store>
             &ReadParams {
                 identifier: "manifest".to_string(),
                 domain: Some("notes".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )

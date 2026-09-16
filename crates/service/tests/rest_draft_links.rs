@@ -193,6 +193,7 @@ impl Fixture {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         };
         let receipt = self
             .engine
@@ -2469,5 +2470,153 @@ async fn revoking_one_link_leaves_the_other_grantee_one_press_away() {
             .unwrap()
             .contains("Carol is still welcome"),
         "and it landed in her draft: {hers}"
+    );
+}
+
+// --- the agent's way in: a share-link presented in a verb --------------------
+
+/// The scope the MCP door resolves for an account, which is what an agent's
+/// verbs are threaded with.
+fn as_account(name: &str) -> Scope {
+    Scope::User {
+        account: name.to_string(),
+        admin: false,
+    }
+}
+
+/// An `append` edit of `fresh`, the shape an agent adding a line sends.
+fn append_edit(line: &str) -> crystalline_service::params::EditParams {
+    crystalline_service::params::EditParams {
+        identifier: "fresh".to_string(),
+        domain: "team".to_string(),
+        operation: "append".to_string(),
+        content: Some(line.to_string()),
+        ..crystalline_service::params::EditParams::default()
+    }
+}
+
+/// An agent presents the link it was handed and composes into the author's
+/// draft: the two browser steps in one, and the write lands where the author
+/// will review it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_presenting_a_share_link_edits_inside_the_owners_draft() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let alice = login(f.addr, "alice").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (_key, join) = f
+        .engine
+        .open_share_link(&token, &as_account("bob"))
+        .await
+        .expect("the link opens alice's draft for bob");
+    assert_eq!(join.owner, "alice");
+    assert_eq!(join.path, path);
+    assert_eq!(join.account, "bob");
+
+    let receipt = f
+        .engine
+        .edit_engram_joined(
+            &append_edit("bob's agent added this"),
+            Some("bob"),
+            &as_account("bob"),
+            Some(&join),
+        )
+        .await
+        .expect("a joined edit lands");
+    assert_eq!(
+        receipt["joined"],
+        serde_json::json!("landed in alice's draft"),
+        "and says whose work it changed: {receipt}"
+    );
+    assert_eq!(receipt["draft"], serde_json::json!(true), "{receipt}");
+
+    let hers = f
+        .engine
+        .overlay_draft_at("team", "alice", &path)
+        .await
+        .unwrap()
+        .expect("her draft is still there");
+    assert!(
+        hers.content.contains("bob's agent added this"),
+        "her draft is where it landed: {hers:?}"
+    );
+    assert!(
+        f.engine
+            .overlay_draft_at("team", "bob", &path)
+            .await
+            .unwrap()
+            .is_none(),
+        "and he is holding nothing of his own, which is the whole point"
+    );
+}
+
+/// The same agent, at the same page, with no join: refused, and told the two
+/// ways forward rather than quietly forking the page into its own overlay.
+///
+/// **And the pin under ruling 2 rides here**: bob's BROWSER is inside alice's
+/// draft the whole time - it joined through the route a person presses - so
+/// the registry says his account holds a join into exactly this draft. His
+/// agent, which authenticates as the same account, is holding no key and is
+/// therefore inside nothing. A person joining a draft in a window has not
+/// joined it for their agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_browser_join_is_not_the_agents_and_an_unjoined_edit_is_taught() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Bob's browser accepts the link AND joins the draft: from here on the
+    // registry says the account bob is inside alice's draft.
+    let joined: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(joined["join_key"].as_str().is_some(), "{joined}");
+    assert!(
+        f.engine.joins().holds("bob", "team", "alice", &path),
+        "the account is inside the draft, which is what a browser upgrade asks"
+    );
+
+    // His agent, holding no key of its own, is not.
+    let refused = f
+        .engine
+        .edit_engram_joined(
+            &append_edit("written without joining"),
+            Some("bob"),
+            &as_account("bob"),
+            None,
+        )
+        .await
+        .expect_err("an unjoined edit at a granted path is refused");
+    let said = refused.to_string();
+    assert!(
+        said.contains("Join the draft") && said.contains("your own overlay"),
+        "the refusal names both ways forward: {said}"
+    );
+    assert!(
+        f.engine
+            .overlay_draft_at("team", "alice", &path)
+            .await
+            .unwrap()
+            .expect("her draft is untouched")
+            .content
+            .contains("only alice has"),
+        "and nothing of the refused edit reached her draft"
     );
 }

@@ -457,6 +457,7 @@ async fn draft_alpha(engine: &Engine, account: &str, body: &str) {
             &crystalline_service::params::ReadParams {
                 identifier: "alpha".to_string(),
                 domain: Some("team".to_string()),
+                share_link: None,
             },
             &scope,
         )

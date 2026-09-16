@@ -61,6 +61,7 @@ fn write(title: &str, content: &str) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 
@@ -201,6 +202,7 @@ fn ack(permalink: &str) -> EditParams {
         expected_replacements: None,
         include_subsections: false,
         ack_scope: None,
+        share_link: None,
     }
 }
 
@@ -641,6 +643,7 @@ async fn a_draft_is_never_its_base_rows_twin() {
                 include_subsections: false,
                 expected_checksum: None,
                 ack_scope: None,
+                share_link: None,
             },
             None,
             &alice,
@@ -664,6 +667,7 @@ async fn a_draft_is_never_its_base_rows_twin() {
                 include_subsections: false,
                 expected_checksum: None,
                 ack_scope: None,
+                share_link: None,
             },
             None,
             &alice,

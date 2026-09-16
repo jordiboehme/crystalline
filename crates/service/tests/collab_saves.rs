@@ -812,6 +812,7 @@ async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
             &crystalline_service::params::ReadParams {
                 identifier: "alpha".to_string(),
                 domain: Some("team".to_string()),
+                share_link: None,
             },
             &crystalline_service::Scope::Unrestricted,
         )

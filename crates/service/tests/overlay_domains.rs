@@ -607,6 +607,7 @@ async fn an_index_wipe_keeps_drafts_through_the_journal() {
             &ReadParams {
                 identifier: "plan".to_string(),
                 domain: Some("team".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -1521,6 +1522,7 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 
@@ -1528,6 +1530,7 @@ fn read(identifier: &str) -> ReadParams {
     ReadParams {
         identifier: identifier.to_string(),
         domain: Some("team".to_string()),
+        share_link: None,
     }
 }
 
@@ -1611,6 +1614,7 @@ async fn overlay_writes_never_touch_the_tree_and_reads_shadow_per_actor() {
                 include_subsections: false,
                 expected_checksum: None,
                 ack_scope: None,
+                share_link: None,
             },
             Some("claude-code/2.0-for-alice"),
             &alice,
@@ -1796,6 +1800,7 @@ async fn no_identity_no_overlay_writes_refuse_with_teaching_text() {
                 include_subsections: false,
                 expected_checksum: None,
                 ack_scope: None,
+                share_link: None,
             },
             None,
             &Scope::Anonymous,
@@ -2007,6 +2012,7 @@ async fn a_write_receipt_says_draft_and_still_carries_similar() {
                 include_subsections: false,
                 expected_checksum: None,
                 ack_scope: None,
+                share_link: None,
             },
             who,
             &alice,
@@ -2436,6 +2442,7 @@ async fn a_draft_in_an_unregistered_domain_is_not_an_answer() {
                 &ReadParams {
                     identifier: "plan".to_string(),
                     domain: Some("ghost".to_string()),
+                    share_link: None,
                 },
                 scope,
             )
@@ -2743,6 +2750,7 @@ async fn a_mirror_that_fails_never_unsays_a_draft_that_landed() {
                 include_subsections: false,
                 expected_checksum: None,
                 ack_scope: None,
+                share_link: None,
             },
             who,
             &alice,
@@ -3095,6 +3103,7 @@ async fn a_tombstone_is_honoured_for_an_identifier_that_names_no_domain() {
     let bare = |identifier: &str| ReadParams {
         identifier: identifier.to_string(),
         domain: None,
+        share_link: None,
     };
 
     assert!(
@@ -3558,6 +3567,7 @@ async fn a_drafts_own_relations_are_what_its_author_reads() {
                 include_subsections: false,
                 expected_checksum: None,
                 ack_scope: None,
+                share_link: None,
             },
             None,
             &alice,
@@ -5681,6 +5691,12 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
         // Redeeming a link and joining the draft it opens: the actor is the
         // grant row's `owner`, written when its author minted the link.
         ("draft_links.rs", "open_link"),
+        // The same two steps for a session with no browser to take them in:
+        // an agent presenting the link in a verb. The owner is the grant
+        // row's, exactly as it is above, and the freshness check is the same
+        // one - a link outlives the draft it was for, and a join into a draft
+        // that is gone is a join to nothing.
+        ("engine.rs", "open_share_link"),
         // The read a grant widens, at the one path the grant names.
         ("engine.rs", "granted_read"),
         // Which granted draft a name opens, for the two surfaces that have a

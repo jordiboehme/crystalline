@@ -38,6 +38,7 @@ fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
     }
 }
 
@@ -1527,6 +1528,7 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
                 &crystalline_service::params::ReadParams {
                     identifier: "note".to_string(),
                     domain: Some("into".to_string()),
+                    share_link: None,
                 },
                 &Scope::Unrestricted
             )
@@ -1881,6 +1883,7 @@ async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every
                 status: None,
                 metadata: None,
                 overwrite: false,
+                share_link: None,
             },
             Some("claude-code/2.0-for-alice"),
             &Scope::User {

@@ -3001,6 +3001,7 @@ async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap();

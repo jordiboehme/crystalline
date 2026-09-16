@@ -386,6 +386,7 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
             &ReadParams {
                 identifier: "alpha".to_string(),
                 domain: Some("brand-knowledge".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )

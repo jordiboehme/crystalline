@@ -58,6 +58,7 @@ async fn checksum_of(engine: &Engine, domain: &str, identifier: &str) -> (String
             &ReadParams {
                 identifier: identifier.to_string(),
                 domain: Some(domain.to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -148,6 +149,7 @@ async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap_err();
@@ -201,6 +203,7 @@ async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -277,6 +280,7 @@ async fn a_stale_edit_is_a_conflict_on_file_and_virtual_domains() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -482,6 +486,7 @@ async fn the_supersede_pair_links_by_permalink_so_a_colon_in_a_title_cannot_brea
                 &ReadParams {
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
+                    share_link: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -526,6 +531,7 @@ async fn a_hand_written_colon_title_resolves_through_read_engram() {
             &ReadParams {
                 identifier: "reader".to_string(),
                 domain: Some("eng".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -558,6 +564,7 @@ async fn a_hand_written_colon_title_resolves_through_read_engram() {
             &ReadParams {
                 identifier: "log-weekly".to_string(),
                 domain: Some("eng".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -613,6 +620,7 @@ async fn split_links_by_permalink_so_a_colon_in_a_title_cannot_break_the_pair() 
                 &ReadParams {
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
+                    share_link: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -1081,6 +1089,7 @@ async fn observation_lines(engine: &Engine, identifier: &str, needles: &[&str]) 
             &ReadParams {
                 identifier: identifier.to_string(),
                 domain: Some("eng".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -1165,6 +1174,7 @@ async fn split_moves_the_selected_observations_and_wires_the_pair_both_ways() {
                 &ReadParams {
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
+                    share_link: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -1304,6 +1314,7 @@ async fn split_works_on_a_virtual_domain_too() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -1312,6 +1323,7 @@ async fn split_works_on_a_virtual_domain_too() {
             &ReadParams {
                 identifier: "scratch-bundle".to_string(),
                 domain: Some("scratch".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -1547,6 +1559,7 @@ async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_o
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
         })
         .await
         .unwrap();
@@ -1559,6 +1572,7 @@ async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_o
             &ReadParams {
                 identifier: "scratch-bundle".to_string(),
                 domain: Some("scratch".to_string()),
+                share_link: None,
             },
             &Scope::Unrestricted,
         )
@@ -1654,6 +1668,7 @@ async fn every_write_verb(scope: &Scope) -> Vec<(&'static str, serde_json::Value
                     status: None,
                     metadata: None,
                     overwrite: false,
+                    share_link: None,
                 },
                 Some(ACTOR),
                 scope,

@@ -712,6 +712,7 @@ impl Review {
                     status: None,
                     metadata: None,
                     overwrite: false,
+                    share_link: None,
                 },
                 None,
                 &crystalline_service::Scope::User {
@@ -1117,6 +1118,7 @@ async fn a_link_opens_the_draft_it_was_minted_on_and_no_other() {
             &crystalline_service::params::ReadParams {
                 identifier: "aaa".to_string(),
                 domain: Some("team".to_string()),
+                share_link: None,
             },
             &crystalline_service::Scope::User {
                 account: "alice".to_string(),
@@ -1305,6 +1307,7 @@ async fn a_discarding_leave_closes_the_room_without_publishing_its_text() {
             &crystalline_service::params::ReadParams {
                 identifier: "plan".to_string(),
                 domain: Some("team".to_string()),
+                share_link: None,
             },
             &crystalline_service::Scope::User {
                 account: "alice".to_string(),
@@ -1522,4 +1525,101 @@ async fn a_discarded_draft_evicts_its_guest_and_leaves_its_author_the_conflict()
         panic!("the room is told its page is gone: {raised:?}")
     };
     assert_eq!(conflict_kind, "deleted");
+}
+
+/// An agent's joined edit of a page its author has open in the editor composes
+/// into the author's live document: ruling 2's sentence, end to end.
+///
+/// The two halves of Task 14 meet here. The join decides WHOSE document the
+/// write is about, and the live seam decides that while somebody has that
+/// document open, the document is where the write goes - so alice sees the
+/// line arrive under her cursor rather than as a conflict ten minutes later,
+/// and her own session is what writes it down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_agent_edit_composes_into_the_owners_open_document() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let token = fx.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Alice has her own draft open, which is what makes the document live.
+    let mut hers = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh",
+        Some(&alice.0),
+        same_host(fx.addr),
+    )
+    .await
+    .expect("her own draft is hers to co-edit");
+    decode_hello(&next_binary(&mut hers).await);
+
+    // Bob's agent presents the link it was handed: both browser steps at once,
+    // and the join is this session's.
+    let bobs_scope = crystalline_service::Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    };
+    let (_key, join) = fx
+        .engine
+        .open_share_link(&token, &bobs_scope)
+        .await
+        .expect("the link opens alice's draft for bob");
+    assert_eq!(join.owner, "alice");
+    let receipt = fx
+        .engine
+        .edit_engram_joined(
+            &crystalline_service::params::EditParams {
+                identifier: "fresh".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("bob's agent added this".to_string()),
+                ..crystalline_service::params::EditParams::default()
+            },
+            Some("bob"),
+            &bobs_scope,
+            Some(&join),
+        )
+        .await
+        .expect("a joined edit lands");
+    assert_eq!(
+        receipt["landed"].as_str(),
+        Some("live"),
+        "into her open document rather than into the row behind it: {receipt}"
+    );
+    assert_eq!(
+        receipt["joined"],
+        serde_json::json!("landed in alice's draft"),
+        "and it is still her draft it is about: {receipt}"
+    );
+
+    // Her screen has it.
+    let doc = client_doc();
+    hers.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut hers).await;
+    apply(&doc, &step2);
+    assert!(
+        doc.get_or_insert_text("content")
+            .get_string(&doc.transact())
+            .contains("bob's agent added this"),
+        "the line is in her document"
+    );
+
+    // And her session is what makes it durable, into her own draft row.
+    hers.send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    wait_for_control(&mut hers, "saved").await;
+    let hers_now = fx
+        .engine
+        .overlay_draft_at("team", "alice", &path)
+        .await
+        .unwrap()
+        .expect("her draft is still hers");
+    assert!(
+        hers_now.content.contains("bob's agent added this"),
+        "her draft row carries it: {hers_now:?}"
+    );
 }

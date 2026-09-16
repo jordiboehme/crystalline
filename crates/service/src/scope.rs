@@ -269,6 +269,38 @@ impl DomainAccess {
             .collect())
     }
 
+    /// Which domain a share-link is about, without redeeming it.
+    ///
+    /// The screen that has to come BEFORE the irreversible half: redeeming
+    /// binds a link to its first presenter for good, so an account that turns
+    /// out not to be allowed to read the domain would otherwise burn the link
+    /// permanently, and the person it was meant for could never open it. One
+    /// row read, and it says nothing but the name.
+    pub async fn overlay_grant_domain(&self, token: &str) -> Result<Option<String>> {
+        self.auth.overlay_grant_domain(token).await
+    }
+
+    /// Present a share-link as `account` and answer the draft it opens, as
+    /// `(domain, owner, path)`.
+    ///
+    /// Binds the link to that account the first time and answers the same
+    /// thing every time after; `None` for an unknown, revoked, expired or
+    /// already-taken link, deliberately one answer for all four. The tuple
+    /// rather than the row, for the reason every delegation here is narrow:
+    /// this resolver is the engine's only way to that database, and one
+    /// question it can ask is one question a later change cannot widen.
+    pub async fn redeem_overlay_grant(
+        &self,
+        token: &str,
+        account: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        Ok(self
+            .auth
+            .redeem_overlay_grant(token, account)
+            .await?
+            .map(|grant| (grant.domain, grant.owner, grant.path)))
+    }
+
     /// End every share-link standing on one draft, because that draft has
     /// ended. Answers how many were standing.
     pub async fn end_overlay_grants(&self, domain: &str, owner: &str, path: &str) -> Result<u64> {

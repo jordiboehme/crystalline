@@ -329,6 +329,10 @@ pub async fn detail(
             &ReadParams {
                 identifier: permalink,
                 domain: Some(domain),
+                // The draft-link routes are this surface's way into a granted
+                // draft: they redeem and join through the session cookie, so a
+                // share-link never rides a REST read.
+                share_link: None,
             },
             &identity.scope(),
         )
@@ -494,6 +498,10 @@ pub async fn inbound(
             &ReadParams {
                 identifier: permalink,
                 domain: Some(domain),
+                // The draft-link routes are this surface's way into a granted
+                // draft: they redeem and join through the session cookie, so a
+                // share-link never rides a REST read.
+                share_link: None,
             },
             query.q.as_deref(),
             query.rel.as_deref(),
@@ -735,6 +743,9 @@ pub async fn create(
         // Never from this route: replacing an engram goes through the PUT,
         // which demands the token of the version being replaced.
         overwrite: false,
+        // Nor from this one: a browser inside somebody's draft holds a join
+        // key and sends that, through the routes that take one.
+        share_link: None,
     };
     let mut written = state
         .engine
@@ -1061,6 +1072,10 @@ pub async fn save(
                     &ReadParams {
                         identifier: permalink,
                         domain: Some(domain),
+                        // The draft-link routes are this surface's way into a granted
+                        // draft: they redeem and join through the session cookie, so a
+                        // share-link never rides a REST read.
+                        share_link: None,
                     },
                     &scope,
                 )
@@ -1660,6 +1675,10 @@ pub async fn remove(
                     &ReadParams {
                         identifier: permalink,
                         domain: Some(domain),
+                        // The draft-link routes are this surface's way into a granted
+                        // draft: they redeem and join through the session cookie, so a
+                        // share-link never rides a REST read.
+                        share_link: None,
                     },
                     &identity.scope(),
                 )
@@ -1705,6 +1724,10 @@ async fn detail_response(
             &ReadParams {
                 identifier: permalink.to_string(),
                 domain: Some(domain.to_string()),
+                // The draft-link routes are this surface's way into a granted
+                // draft: they redeem and join through the session cookie, so a
+                // share-link never rides a REST read.
+                share_link: None,
             },
             scope,
         )

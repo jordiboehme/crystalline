@@ -71,6 +71,15 @@ pub struct WriteParams {
     /// Overwrite an existing engram with the same permalink instead of erroring.
     #[serde(default)]
     pub overwrite: bool,
+    /// A draft share-link somebody handed you (`dl_...`), to work inside the
+    /// draft it opens instead of writing your own copy. Pass it when you were
+    /// given a link and mean to compose into its author's draft: it binds the
+    /// link to this account and opens the draft for this session, and the
+    /// write then lands in that author's copy, where they review it. A write
+    /// at any other page while inside a draft is refused, so leave it out
+    /// unless this call is about the shared page.
+    #[serde(default)]
+    pub share_link: Option<String>,
 }
 
 /// Parameters for `read_engram`.
@@ -82,6 +91,14 @@ pub struct ReadParams {
     /// Restrict resolution to this domain.
     #[serde(default)]
     pub domain: Option<String>,
+    /// A draft share-link somebody handed you (`dl_...`), to read the draft it
+    /// opens rather than the page the domain holds. Pass it the first time you
+    /// are given one and on any later read of that draft; it binds the link to
+    /// this account, opens the draft for this session and lets a later
+    /// `edit_engram` of that page land in its author's copy. Leave it out
+    /// everywhere else - an ordinary read never needs one.
+    #[serde(default)]
+    pub share_link: Option<String>,
 }
 
 /// Parameters for `edit_engram`.
@@ -150,6 +167,15 @@ pub struct EditParams {
     /// they meant and nothing else can tell the server which of two it was.
     #[serde(skip)]
     pub ack_scope: Option<String>,
+    /// A draft share-link somebody handed you (`dl_...`), to edit the draft it
+    /// opens instead of your own copy of the page. Pass it when you were given
+    /// a link and mean to compose into its author's draft: it binds the link
+    /// to this account and opens the draft for this session, and the edit then
+    /// lands in that author's copy, where they review it. An edit of any other
+    /// page while inside a draft is refused, so leave it out unless this call
+    /// is about the shared page.
+    #[serde(default)]
+    pub share_link: Option<String>,
 }
 
 /// Parameters for `save_engram`, the full-document save behind the HTTP PUT.
