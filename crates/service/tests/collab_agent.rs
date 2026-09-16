@@ -26,7 +26,10 @@ use crystalline_service::Engine;
 use crystalline_service::collab::session::{
     AgentPeer, CollabSessions, Frame, Joined, MAX_PARTICIPANTS,
 };
-use crystalline_service::params::{EditParams, ReadParams};
+use crystalline_service::mcp::McpServer;
+use crystalline_service::params::{EditParams, ReadParams, WriteParams};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, broadcast};
 use yrs::sync::awareness::AwarenessUpdateEntry;
 use yrs::sync::{Awareness, AwarenessUpdate, Message, MessageReader, SyncMessage};
@@ -850,5 +853,497 @@ async fn an_agent_whose_state_was_taken_away_publishes_itself_again() {
             .iter()
             .any(|(id, json)| *id == agent_id && json.contains("\"agent\":true")),
         "the room was told, rather than the map quietly disagreeing with it: {states:?}"
+    );
+}
+
+// --- the wholesale overwrite, asked about before it lands -------------------
+//
+// An edit COMPOSES into somebody's open document; a `write_engram` carrying
+// overwrite=true REPLACES it, and replacing work a person can see on screen
+// and has not saved is the one thing an agent may not do quietly. So the call
+// asks first, through the era's own round, and a client with no way to put the
+// question to anybody is refused rather than served the replacement.
+//
+// Driven over the wire rather than through the engine, because the round IS
+// the wire's: the question travels back as an `input_required` result and the
+// answer arrives beside the original arguments on the next call. The fixtures
+// below are copied from `mcp_modern_era.rs` for the reason the module header
+// already gives - integration test crates share no helpers.
+
+/// The revision these rounds are served at.
+const ERA: &str = "2026-07-28";
+
+/// A stdio MCP connection to a server over one engine.
+struct Wire {
+    write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    /// rmcp's init loop until the opener has been sent; the running service it
+    /// yields is kept alive for the rest of the conversation.
+    server: Option<
+        tokio::task::JoinHandle<
+            Result<
+                rmcp::service::RunningService<rmcp::RoleServer, McpServer>,
+                rmcp::service::ServerInitializeError,
+            >,
+        >,
+    >,
+    running: Option<rmcp::service::RunningService<rmcp::RoleServer, McpServer>>,
+}
+
+impl Wire {
+    /// A connection to a server over `engine`, not yet opened.
+    fn to(engine: Arc<Engine>) -> Wire {
+        let (client_io, server_io) = tokio::io::duplex(1 << 18);
+        let server =
+            tokio::spawn(
+                async move { rmcp::serve_server(McpServer::new(engine), server_io).await },
+            );
+        let (read, write) = tokio::io::split(client_io);
+        Wire {
+            write,
+            lines: tokio::io::BufReader::new(read).lines(),
+            server: Some(server),
+            running: None,
+        }
+    }
+
+    async fn send(&mut self, message: Value) {
+        let line = format!("{message}\n");
+        self.write.write_all(line.as_bytes()).await.unwrap();
+        self.write.flush().await.unwrap();
+    }
+
+    async fn recv(&mut self) -> Option<Value> {
+        match tokio::time::timeout(Duration::from_millis(2000), self.lines.next_line()).await {
+            Ok(Ok(Some(line))) => Some(serde_json::from_str(&line).unwrap()),
+            _ => None,
+        }
+    }
+
+    /// Send the session opener and read its answer, collecting the running
+    /// service the init loop hands back.
+    async fn open(&mut self, message: Value) -> Value {
+        self.send(message).await;
+        let task = self.server.take().expect("the opener is sent once");
+        self.running = Some(task.await.unwrap().expect("the server opened a session"));
+        self.recv().await.expect("the opener was answered")
+    }
+
+    /// Send a request on an open connection and read its answer.
+    async fn call(&mut self, message: Value) -> Value {
+        self.send(message).await;
+        self.recv().await.expect("the request was answered")
+    }
+}
+
+fn request(id: u32, method: &str, params: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+/// A modern request from a client that cannot put a question to anybody.
+fn modern(id: u32, method: &str, mut params: Value) -> Value {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": ERA,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "collab-agent-test", "version": "9.9.9" },
+    });
+    request(id, method, params)
+}
+
+/// A modern request from a client that can.
+fn eliciting(id: u32, method: &str, mut params: Value) -> Value {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": ERA,
+        "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "form": {} } },
+        "io.modelcontextprotocol/clientInfo": { "name": "collab-agent-test", "version": "9.9.9" },
+    });
+    request(id, method, params)
+}
+
+/// The engine payload a tool result carries, as JSON.
+fn payload_of(answer: &Value) -> Value {
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    serde_json::from_str(text).unwrap_or(Value::Null)
+}
+
+/// The refusal text a tool result carries.
+fn refusal_of(answer: &Value) -> String {
+    answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The body every wholesale overwrite below tries to land over the document.
+const REPLACEMENT: &str = "A wholesale replacement.";
+
+/// One `write_engram` call replacing `alpha` wholesale, with an optional
+/// answer to the round.
+fn overwrite_alpha(responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "write_engram",
+        "arguments": {
+            "domain": "eng",
+            "title": "Alpha",
+            "content": REPLACEMENT,
+            "overwrite": true,
+        },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The client's answer to the `confirm` question, as an `ElicitResult`.
+fn answer(action: &str, confirm: bool) -> Value {
+    json!({ "confirm": { "action": action, "content": { "confirm": confirm } } })
+}
+
+/// A room over `alpha` with one person in it who has typed a line nobody has
+/// saved yet, and an MCP connection to the same engine.
+///
+/// The sessions registry is handed back because the engine holds it weakly:
+/// dropping it here would close every room before the call under test runs.
+async fn a_person_typing_in_alpha() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    Arc<CollabSessions>,
+    Joined,
+    Doc,
+    support::ScratchStateDir,
+) {
+    let (tmp, engine, scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    publish_name(&joined, &doc, "Jordi").await;
+    append_line(&joined, &doc, "typed but never saved").await;
+    (tmp, engine, sessions, joined, doc, scratch)
+}
+
+/// **The brief's first test.** A wholesale overwrite of a document somebody
+/// has open answers the question instead of the write, and the question names
+/// who is in there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wholesale_overwrite_into_a_live_document_asks_first_naming_who_is_present() {
+    let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
+    let mut wire = Wire::to(engine.clone());
+
+    // Opened through the era's own onboarding call, so the round below runs on
+    // a connection that never handshook.
+    let discovered = wire.open(modern(1, "server/discover", json!({}))).await;
+    assert!(
+        discovered["result"]["instructions"].is_string(),
+        "the connection is open at the era: {discovered}"
+    );
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", overwrite_alpha(None)))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(
+        result["resultType"],
+        json!("input_required"),
+        "the call answers with a round rather than a replacement: {asked}"
+    );
+
+    let question = &result["inputRequests"]["confirm"];
+    assert_eq!(
+        question["method"],
+        json!("elicitation/create"),
+        "the round is an elicitation keyed `confirm`: {asked}"
+    );
+    let message = question["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("live editor"),
+        "the question says the document is open: {message}"
+    );
+    assert!(
+        message.contains("Jordi"),
+        "and names who is in there: {message}"
+    );
+    assert!(
+        message.contains("alpha"),
+        "and which engram it is about: {message}"
+    );
+
+    // Round one replaces nothing: not the file, and not the document the
+    // person is looking at.
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(on_disk, ALPHA, "the file is untouched: {on_disk:?}");
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains("typed but never saved") && !live.contains(REPLACEMENT),
+        "and their unsaved line still stands: {live:?}"
+    );
+}
+
+/// **The brief's second test.** The same call carrying a yes lands the
+/// replacement in the document rather than over it: the room keeps the
+/// document it has, the person's session is still what writes it down, and the
+/// file is not touched behind their back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_overwrite_replaces_the_text_and_keeps_history() {
+    let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
+    let mut wire = Wire::to(engine.clone());
+
+    let asked = wire
+        .open(eliciting(1, "tools/call", overwrite_alpha(None)))
+        .await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "round one asks: {asked}"
+    );
+
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            overwrite_alpha(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the confirmed round writes: {done}"
+    );
+    let receipt = payload_of(&done);
+    assert_eq!(
+        receipt["landed"],
+        json!("live"),
+        "and says where it went: {receipt}"
+    );
+    assert!(
+        receipt["present"].is_array(),
+        "with who is in there: {receipt}"
+    );
+
+    // The client doc is the one it was: an incremental resync over the state
+    // vector it already holds brings it the replacement, which a room that had
+    // thrown its document away could not do.
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains(REPLACEMENT),
+        "the replacement is in the document they are looking at: {live:?}"
+    );
+    assert!(
+        !live.contains("typed but never saved"),
+        "and it is a replacement, so their line went with the rest: {live:?}"
+    );
+
+    // Nothing was written behind the room's back; the room's own saver is what
+    // makes the replacement durable, exactly as it is for a typed line.
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(on_disk, ALPHA, "the file waits for the save: {on_disk:?}");
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(
+        on_disk.contains(REPLACEMENT),
+        "and then the file carries it: {on_disk:?}"
+    );
+}
+
+/// **The brief's third test.** A targeted change is never asked about. It
+/// composes with what the person typed instead of replacing it, which is the
+/// whole reason the question exists for one verb and not the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_targeted_edit_never_asks() {
+    let (_tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
+    let mut wire = Wire::to(engine.clone());
+
+    let done = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            json!({
+                "name": "edit_engram",
+                "arguments": {
+                    "domain": "eng",
+                    "identifier": "alpha",
+                    "operation": "append",
+                    "content": "and the agent added that",
+                },
+            }),
+        ))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "a targeted edit asks nobody anything: {done}"
+    );
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "it simply lands: {done}"
+    );
+    assert_eq!(
+        payload_of(&done)["landed"],
+        json!("live"),
+        "in the open document: {done}"
+    );
+
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains("typed but never saved") && live.contains("and the agent added that"),
+        "both lines stand: {live:?}"
+    );
+}
+
+/// **The brief's fourth test.** A client that cannot put the question to
+/// anybody is refused, not served the replacement: an overwrite nobody can be
+/// asked about would be somebody's unsaved work gone with no way to know.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_without_elicitation_is_refused_not_stomped() {
+    let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
+    let mut wire = Wire::to(engine.clone());
+
+    let refused = wire
+        .open(modern(1, "tools/call", overwrite_alpha(None)))
+        .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "the call is refused rather than written: {refused}"
+    );
+    let text = refusal_of(&refused);
+    assert!(
+        text.contains("nothing was written"),
+        "and says what did not happen: {text}"
+    );
+    assert!(
+        text.contains("edit_engram"),
+        "and what to do instead: {text}"
+    );
+    assert!(
+        text.contains("Jordi"),
+        "and who is in the document it would have replaced: {text}"
+    );
+
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(on_disk, ALPHA, "the file is untouched: {on_disk:?}");
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains("typed but never saved") && !live.contains(REPLACEMENT),
+        "and their unsaved line still stands: {live:?}"
+    );
+}
+
+/// **Ruling from review.** The write's live arm stands ahead of the OVERLAY arm
+/// as well as the file one, which is the ordering the edit's own arm had to be
+/// corrected into: a domain in review mode is where most rooms are, and an arm
+/// behind the overlay arm is unreachable there because that arm returns.
+///
+/// Driven through the engine rather than the wire: the asking is the MCP
+/// layer's, the arm order is the engine's, and this is about the arm order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wholesale_overwrite_in_a_reviewing_domain_lands_in_the_draft_room() {
+    let (tmp, engine, _scratch) = engine_fixture(true).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    // The machine owner is who a local agent acts as, so the owner's room is
+    // the agent's own overlay document.
+    let mine = sessions.join("eng", "alpha", Some("owner")).await.unwrap();
+    let doc = sync_client(&mine).await;
+    append_line(&mine, &doc, "the owner typed this").await;
+
+    let receipt = engine
+        .write_engram_present(
+            &WriteParams {
+                domain: "eng".to_string(),
+                title: "Alpha".to_string(),
+                content: REPLACEMENT.to_string(),
+                folder: None,
+                engram_type: None,
+                tags: Vec::new(),
+                status: None,
+                metadata: None,
+                overwrite: true,
+                share_link: None,
+            },
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            None,
+        )
+        .await
+        .expect("the capture lands");
+    assert_eq!(
+        receipt["landed"].as_str(),
+        Some("live"),
+        "it went into the draft's room rather than past it: {receipt}"
+    );
+    assert_eq!(
+        receipt["draft"].as_bool(),
+        Some(true),
+        "and it is still a draft of the owner's: {receipt}"
+    );
+
+    resync(&mine, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains(REPLACEMENT) && !live.contains("the owner typed this"),
+        "the document they are looking at holds the replacement: {live:?}"
+    );
+    // The team's own folder never hears about a draft, room or no room.
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(on_disk, ALPHA, "the reviewed file stands: {on_disk:?}");
+}
+
+/// **Ruling from review.** The refusal a client that cannot be asked gets is
+/// the same one at the legacy era, which is what nearly every client in the
+/// field still speaks: the gate is era AND capability, so a handshake at
+/// 2025-11-25 reaches it however loudly the client declares elicitation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_peer_is_refused_the_wholesale_overwrite_too() {
+    let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
+    let mut wire = Wire::to(engine.clone());
+
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-collab-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(
+        handshake["result"]["protocolVersion"],
+        json!("2025-11-25"),
+        "the session is the legacy one: {handshake}"
+    );
+
+    let refused = wire
+        .call(request(2, "tools/call", overwrite_alpha(None)))
+        .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "a legacy peer is refused rather than served the replacement: {refused}"
+    );
+    let text = refusal_of(&refused);
+    assert!(
+        text.contains("nothing was written") && text.contains("Jordi"),
+        "in the same words, naming who is in there: {text}"
+    );
+
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(on_disk, ALPHA, "the file is untouched: {on_disk:?}");
+    resync(&joined, &doc).await;
+    assert!(
+        client_text(&doc).contains("typed but never saved"),
+        "and their unsaved line still stands"
     );
 }

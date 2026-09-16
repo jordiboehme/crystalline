@@ -3848,6 +3848,29 @@ impl Engine {
         scope: &crate::scope::Scope,
         join: Option<&crate::join::Join>,
     ) -> Result<Value> {
+        self.write_engram_present(p, client, scope, join, None)
+            .await
+    }
+
+    /// [`Engine::write_engram_joined`], with the agent as a named peer in the
+    /// room the capture may land in.
+    ///
+    /// The bottom rung, and the only one that knows about the strip - the same
+    /// shape [`Engine::edit_engram_present`] has, for the same reason: the room
+    /// is keyed on the overlay owner, and who that is - this actor's own draft,
+    /// the author's draft they were invited into, or the document a direct
+    /// domain keeps - is the view's answer and is resolved here.
+    ///
+    /// `None` is every surface that is not an agent working for somebody: the
+    /// CLI, the control socket, the JSON API.
+    pub async fn write_engram_present(
+        &self,
+        p: &WriteParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+        peer: Option<&AgentPeer>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -3960,6 +3983,48 @@ impl Engine {
             "action": if p.overwrite { "written" } else { "created" },
         });
 
+        // **The live arm, and it stands ahead of every arm that writes**, the
+        // way the edit's does (`Engine::apply_source_edit_staged`). While a
+        // co-editing room is open over this permalink the room's text IS the
+        // engram: somebody has it on screen, the file and the row are both a
+        // save behind, and a capture that replaced the file would be replaced
+        // right back by the room's own saver a moment later - with the
+        // person's unsaved work gone and nothing to say where it went. So the
+        // document is morphed to what this capture would have written, its
+        // history and their cursor are kept, and their session is what makes
+        // it durable.
+        //
+        // Only a replacement ever gets here. A room is open over an engram
+        // that exists, so a capture at that permalink without `overwrite` was
+        // already refused by the collision check above, unchanged.
+        //
+        // No `enforce_temporal` pass beside it, unlike the edit arm: the
+        // markdown above came out of `build_markdown`, which normalizes the
+        // temporal fields and the verification block itself, so the document
+        // this hands the room is already what the saver accepts.
+        if let Some(rooms) = self.collab_rooms()
+            && rooms
+                .live_text(&p.domain, &permalink, overlay)
+                .await
+                .is_some()
+        {
+            let applied = rooms
+                .apply_text(&p.domain, &permalink, overlay, markdown, &actor, peer)
+                .await
+                .map_err(EngineError::Conflict)?;
+            if overlay.is_some() {
+                receipt["draft"] = json!(true);
+            }
+            if let Some(owner) = view.joined() {
+                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+            }
+            // Where it went, in the words the live edit says it in: `present`
+            // names who is about to watch the page change under them.
+            receipt["landed"] = json!("live");
+            receipt["present"] = json!(applied.participants);
+            return Ok(receipt);
+        }
+
         // The third place a write can land, and the reason it comes first: on a
         // domain in review mode the folder and the database both stay as the
         // team left them, so neither arm below may run.
@@ -4007,6 +4072,53 @@ impl Engine {
         self.nudge_embed();
 
         Ok(receipt)
+    }
+
+    /// Whether a capture would replace a document somebody has open, and who
+    /// is in there: the two things `write_engram` needs before it asks.
+    ///
+    /// Asked of the engine rather than worked out by the caller because both
+    /// halves of the room key are the engine's - the permalink is derived from
+    /// the title exactly as the write derives it, and the overlay owner is the
+    /// view's answer, so a draft's room and the team's room over one name are
+    /// never confused for each other.
+    ///
+    /// `None` when no room is open over the destination, which is nearly every
+    /// capture, and for a destination this caller cannot resolve at all - a
+    /// domain nobody registered, a reserved title: there is no document to ask
+    /// about, and the write itself raises the real error a moment later rather
+    /// than having it guessed at here.
+    ///
+    /// The agent stands in the room while the question is put, the way a read
+    /// of a live document stands it there: somebody deciding whether to let
+    /// their page be replaced is owed the name of who is asking. Its own slot
+    /// is left out of the names, which answer "who is in there with you".
+    pub async fn live_write_target(
+        &self,
+        p: &WriteParams,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+        peer: Option<&AgentPeer>,
+    ) -> Option<LiveWriteTarget> {
+        let rooms = self.collab_rooms()?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join)
+            .await
+            .ok()?;
+        let overlay = view.actor();
+        let (_, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title).ok()?;
+        rooms.live_text(&p.domain, &permalink, overlay).await?;
+        let mine = match peer {
+            Some(peer) => {
+                rooms
+                    .touch_agent_presence(&p.domain, &permalink, overlay, peer)
+                    .await
+            }
+            None => None,
+        };
+        let present = rooms
+            .participants(&p.domain, &permalink, overlay, mine)
+            .await;
+        Some(LiveWriteTarget { permalink, present })
     }
 
     /// Save an engram's complete markdown text verbatim, guarded by the
@@ -19350,6 +19462,20 @@ pub enum OpenedLink {
     /// The link bound and the draft is readable; the join was refused, and the
     /// sentence says why. A write is refused with it; a read is not.
     ReadOnly(String),
+}
+
+/// The document a wholesale capture would replace, when somebody has it open.
+///
+/// Both fields are what the question needs and neither is the caller's to
+/// derive: the permalink is where the title would land, and `present` is who
+/// is in the room with the agent asking - its own slot left out, the way every
+/// other answer about a room leaves it out.
+pub struct LiveWriteTarget {
+    /// The permalink the capture resolved to, so the question names the engram
+    /// rather than the title typed at it.
+    pub permalink: String,
+    /// Who is in the room over it right now, in the order the room reports.
+    pub present: Vec<String>,
 }
 
 /// What one source edit did: the mirror warning it may owe, and - when a

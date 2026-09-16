@@ -724,6 +724,38 @@ async fn tool_descriptions_teach_that_working_in_an_open_document_is_seen() {
     }
 }
 
+/// And that replacing one wholesale is not something an agent does quietly:
+/// `write_engram` teaches the confirm, and names the verb to reach for when the
+/// change is a targeted one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_that_a_wholesale_overwrite_asks_first() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    let text = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "write_engram")
+        .expect("write_engram tool present")
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        text.contains("asks them first"),
+        "write_engram teaches that an overwrite of an open document is asked about: {text}"
+    );
+    assert!(
+        text.contains("landed live"),
+        "and what the receipt says when it lands in their document: {text}"
+    );
+    assert!(
+        text.contains("edit_engram"),
+        "and names the targeted verb to use instead: {text}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_descriptions_teach_folders() {
     let h = Harness::new(&["eng"]).await;

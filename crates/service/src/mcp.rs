@@ -967,8 +967,8 @@ use crystalline_core::config::{ResponseFormat, SkillsServe};
 use crate::collab::session::AgentPeer;
 use crate::domain_view::DomainView;
 use crate::engine::{
-    ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential,
-    ProvisionAction, ShareActor, sanitize_actor,
+    ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, LiveWriteTarget,
+    PreviewCredential, ProvisionAction, ShareActor, sanitize_actor,
 };
 use crate::params::*;
 use crate::rest::member_level_word;
@@ -1840,7 +1840,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document asks them first, by name, and on a yes it lands in their document (receipt: landed live) rather than over it, so use edit_engram when the change is a targeted one. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1887,9 +1887,78 @@ impl McpServer {
             return refuse(COLLISION_REFUSAL).map(CallToolResponse::from);
         }
 
+        let peer = agent_peer(&ctx, &scope);
+
+        // **A wholesale replacement of a document somebody has open is asked
+        // about before it happens.** An `edit_engram` composes into that
+        // document; this verb with `overwrite` replaces it, and the work it
+        // would replace is on somebody's screen and not saved anywhere yet. So
+        // the person is asked, by name, and the write waits for their answer.
+        //
+        // Wholesale is both ways a call reaches a replacement: `overwrite` as
+        // the caller passed it, and a collision round already answered
+        // "overwrite", which is the same act arrived at in two steps. **When
+        // both questions would apply, this is the one that is asked** - it
+        // subsumes the collision, because a yes here is a yes to replacing
+        // what is at that permalink and it also says who is in there, which
+        // the collision question cannot. Nothing changes for a capture whose
+        // destination no room is open over: that is the collision round,
+        // exactly as it was.
+        //
+        // **A client that cannot be asked is refused rather than served the
+        // replacement**, which is this round's one departure from the others
+        // in this file. A delete or an acknowledgment nobody can be asked
+        // about is the verb the human already typed, so it runs; an overwrite
+        // of somebody ELSE's open document is their unsaved work gone with
+        // nothing left to say where it went, and no other surface would ever
+        // show them what happened.
+        let wholesale = p.overwrite || resolved_overwrite(&responses.0) == Some(true);
+        if wholesale
+            && let Some(target) = self
+                .engine
+                .live_write_target(&p, &scope, join.as_ref(), peer.as_ref())
+                .await
+        {
+            if !confirmation_supported(&ctx) {
+                return refuse(live_overwrite_refusal(&target)).map(CallToolResponse::from);
+            }
+            match confirmed(&responses.0) {
+                None => {
+                    return Ok(confirm_question(live_overwrite_question_text(&p, &target)).into());
+                }
+                Some(false) => return refuse(LIVE_OVERWRITE_REFUSAL).map(CallToolResponse::from),
+                // The answered call runs here rather than falling through to
+                // the collision round below: a yes carried on a call that did
+                // not itself pass `overwrite` is the answer to a collision
+                // question as well as to this one, and routing it through the
+                // error the engine would raise for the missing argument would
+                // make the landing depend on that interception. One call, with
+                // the argument the two answers together amount to.
+                Some(true) => {
+                    let mut confirmed_write = p.clone();
+                    confirmed_write.overwrite = true;
+                    let receipt = self
+                        .engine
+                        .write_engram_present(
+                            &confirmed_write,
+                            actor.as_deref(),
+                            &scope,
+                            join.as_ref(),
+                            peer.as_ref(),
+                        )
+                        .await
+                        .map_err(to_error)?;
+                    let receipt = self
+                        .with_similar(receipt, SimilarProbe::for_write(&confirmed_write), &scope)
+                        .await;
+                    return ok_written(receipt).map(CallToolResponse::from);
+                }
+            }
+        }
+
         let written = self
             .engine
-            .write_engram_joined(&p, actor.as_deref(), &scope, join.as_ref())
+            .write_engram_present(&p, actor.as_deref(), &scope, join.as_ref(), peer.as_ref())
             .await;
 
         // A permalink collision is the one failure here with a real choice
@@ -1935,7 +2004,13 @@ impl McpServer {
                 retry.overwrite = true;
                 let receipt = self
                     .engine
-                    .write_engram_joined(&retry, actor.as_deref(), &scope, join.as_ref())
+                    .write_engram_present(
+                        &retry,
+                        actor.as_deref(),
+                        &scope,
+                        join.as_ref(),
+                        peer.as_ref(),
+                    )
                     .await
                     .map_err(to_error)?;
                 let receipt = self
@@ -4563,6 +4638,51 @@ fn collision_question_text(p: &WriteParams, permalink: &str) -> String {
 /// What an unresolved collision tells the model: what is still there, and the
 /// one argument that would have replaced it.
 const COLLISION_REFUSAL: &str = "The overwrite was not confirmed, so the existing engram was left in place; nothing was written. Call write_engram again with overwrite=true if the user asks for it.";
+
+/// The sentence a wholesale overwrite of an open document asks instead of
+/// replacing it.
+///
+/// It names the three things the person deciding needs: which engram, who is
+/// in there, and that the whole document goes rather than a part of it. The
+/// permalink is the one the capture resolved to rather than the title typed at
+/// it, so a yes is given about the page that would actually be replaced.
+fn live_overwrite_question_text(p: &WriteParams, target: &LiveWriteTarget) -> String {
+    format!(
+        "'{}' in '{}' is open in a live editor (present: {}) with work nobody has saved yet, and this write replaces the whole document. Replace it wholesale?",
+        target.permalink,
+        p.domain.trim(),
+        present_names(&target.present)
+    )
+}
+
+/// What an unconfirmed wholesale overwrite tells the model: what is still
+/// standing, and the two ways forward.
+pub const LIVE_OVERWRITE_REFUSAL: &str = "The overwrite was not confirmed, so the live engram was left as its editor holds it; nothing was written. Use edit_engram for a targeted change, or call write_engram again with overwrite=true if the user asks for it.";
+
+/// [`LIVE_OVERWRITE_REFUSAL`] for a client that could not be asked, with the
+/// names it could not put the question to.
+///
+/// The same words plus the fact that makes them true here: nobody was asked,
+/// because this client has no way to ask anybody, and somebody is in the
+/// document all the same.
+fn live_overwrite_refusal(target: &LiveWriteTarget) -> String {
+    format!(
+        "{LIVE_OVERWRITE_REFUSAL} It is open in a live editor right now (present: {}), and this client cannot put the question to them.",
+        present_names(&target.present)
+    )
+}
+
+/// Who is in a room, for a sentence a person reads.
+///
+/// A room with connections but no published name is a real state - a browser
+/// that has not sent its awareness frame yet - and saying so plainly is better
+/// than an empty parenthesis that reads like a bug.
+fn present_names(present: &[String]) -> String {
+    match present.is_empty() {
+        true => "nobody has published a name".to_string(),
+        false => present.join(", "),
+    }
+}
 
 /// The sentence an `evolve_ack` assignment asks before it acts, rendered from
 /// [`crate::engine::Engine::ack_preview`].
