@@ -548,11 +548,20 @@ pub async fn join(
             || "you may read this draft but not edit it".to_string(),
         )));
     }
+    // The browser session this request came from, which is what the join is
+    // keyed to: another window of the same person, and that person's agent,
+    // are other holders and join for themselves. Unreachable as a `None` -
+    // `require_account` above refuses every caller with no account - and
+    // answered with the account rather than unwrapped.
+    let holder = identity
+        .holder()
+        .unwrap_or_else(|| crate::join::Holder::Browser(format!("account:{}", user.name)));
     let key = state
         .engine
         .joins()
         .open(Join {
             account: user.name.clone(),
+            holder,
             domain: opened.domain.clone(),
             path: opened.path.clone(),
             owner: opened.owner.clone(),

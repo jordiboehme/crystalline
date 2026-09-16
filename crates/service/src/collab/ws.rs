@@ -154,8 +154,8 @@ pub async fn join(
     // keeps the one signature the whole surface calls; the cost is that a tick
     // landing in this instant looks past one connection, and it looks again a
     // quarter of a second later.
-    if let Some(account) = &room.guest {
-        joined.session.watch_guest(joined.conn, account).await;
+    if let Some(holder) = &room.guest {
+        joined.session.watch_guest(joined.conn, holder).await;
     }
     let sessions = state.collab.clone();
     // The failure twin of on_upgrade: the connection is REGISTERED in the
@@ -184,9 +184,13 @@ struct Room {
     /// Whose document: `None` for the one a direct domain keeps, `Some(actor)`
     /// for that actor's draft of the page.
     overlay: Option<String>,
-    /// The caller's account, when the document is not their own. `None` in
-    /// their own document and in a direct domain's, which is nearly always.
-    guest: Option<String>,
+    /// The holder the caller's join belongs to, when the document is not
+    /// their own. `None` in their own document and in a direct domain's, which
+    /// is nearly always. The holder rather than the account, because that is
+    /// what the saver's eviction has to ask the registry about on every tick:
+    /// this browser session's join ending is what puts this socket out, and
+    /// another holder of the same account is nothing to do with it.
+    guest: Option<crate::join::Holder>,
     /// The path of the draft the caller's share-link was minted on, when a
     /// link is what got them in. The room has to land on this exact path or it
     /// is not the document the link opened.
@@ -250,7 +254,16 @@ async fn whose_document(
             "no engram '{permalink}' in domain '{domain}'"
         )));
     };
-    if !state.engine.joins().holds(&mine, domain, &owner, &path) {
+    // **The holder, never the account.** A join an agent opened is that
+    // agent's, and opening a room in this person's browser because their agent
+    // is inside a draft would be the registry's whole distinction thrown away
+    // at the one surface that cannot present a key. Unreachable as a `None`
+    // here - `require_domain_write` refused every identity-less caller before
+    // this - and answered with the account-named holder rather than unwrapped.
+    let holder = identity
+        .holder()
+        .unwrap_or_else(|| crate::join::Holder::Browser(format!("account:{mine}")));
+    if !state.engine.joins().holds(&holder, domain, &owner, &path) {
         return Err(
             crate::engine::EngineError::Refused(crate::engine::granted_needs_join(&owner, &path))
                 .into(),
@@ -258,7 +271,7 @@ async fn whose_document(
     }
     Ok(Room {
         overlay: Some(owner),
-        guest: Some(mine),
+        guest: Some(holder),
         granted: Some(path),
     })
 }

@@ -349,6 +349,35 @@ impl Identity {
         }
     }
 
+    /// Which browser session this request came from, as the join registry's
+    /// [`crate::join::Holder`].
+    ///
+    /// **The CSRF token is the id**, because it is the one per-session value
+    /// every identity path already resolves and the only one a WebSocket
+    /// upgrade can be asked about: a browser puts no header on an upgrade, and
+    /// a key in a query string is written to every log and proxy on the way.
+    /// It is not used as a credential here - nothing is authorized by matching
+    /// it - only as the name of the session, which is what a join has to be
+    /// keyed to so one window's is not another's and neither is that person's
+    /// agent's.
+    ///
+    /// `None` for a request with no account: a link binds to an account, so
+    /// there is no join for an anonymous caller to hold.
+    ///
+    /// The fallback is for the header-auth modes, where an identity can be
+    /// real while no session row has been minted for it yet (nothing has
+    /// called `/auth/me`). Those requests are named by the account, which is
+    /// the granularity a forward-auth proxy gives them anyway - the proxy IS
+    /// the session there - and it can never collide with a minted token, which
+    /// is random hex.
+    pub fn holder(&self) -> Option<crate::join::Holder> {
+        let user = self.user.as_ref()?;
+        Some(crate::join::Holder::Browser(match &self.csrf {
+            Some(csrf) => csrf.clone(),
+            None => format!("account:{}", user.name),
+        }))
+    }
+
     /// The caller, when the request may be served at viewer level or above.
     /// 401 when the request carries no identity at all.
     pub fn require_viewer(&self) -> Result<Caller, ApiError> {

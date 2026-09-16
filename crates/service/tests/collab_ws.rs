@@ -1527,6 +1527,13 @@ async fn a_discarded_draft_evicts_its_guest_and_leaves_its_author_the_conflict()
     assert_eq!(conflict_kind, "deleted");
 }
 
+/// The holder a stateless agent is: a modern-era peer on streamable HTTP has
+/// no session at all, so its joins are keyed by the identity its token
+/// resolved to.
+fn agent_holder(name: &str) -> crystalline_service::Holder {
+    crystalline_service::Holder::Token(name.to_string())
+}
+
 /// An agent's joined edit of a page its author has open in the editor composes
 /// into the author's live document: ruling 2's sentence, end to end.
 ///
@@ -1564,7 +1571,7 @@ async fn a_joined_agent_edit_composes_into_the_owners_open_document() {
     };
     let (_key, join) = fx
         .engine
-        .open_share_link(&token, &bobs_scope)
+        .open_share_link(&token, &bobs_scope, &agent_holder("bob"))
         .await
         .expect("the link opens alice's draft for bob");
     assert_eq!(join.owner, "alice");
@@ -1712,4 +1719,76 @@ async fn a_rest_read_of_an_open_engram_answers_a_version_a_write_can_still_use()
         "the version the read handed over still saves: {:?}",
         saved.text().await
     );
+}
+
+/// **An agent's join never opens a room in its person's browser, on either
+/// transport.**
+///
+/// The pin under ruling I2. The co-editing upgrade cannot present a key - a
+/// browser puts no header on an upgrade, and a key in a query string is
+/// written to every log and proxy on the way - so it asks the registry whether
+/// the caller is inside the draft. Asking that about the ACCOUNT made an
+/// agent's join open the room for every window that account had open; it asks
+/// about the browser session now, and this drives both halves: the agent joins
+/// and the window is still outside, the window joins and it is inside.
+///
+/// Run once per agent holder kind, because the transports differ in nothing
+/// else here: a stateless modern peer is a token identity, a stdio agent is a
+/// process, and neither is a browser session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agents_join_never_opens_the_browsers_room() {
+    for agent in [
+        crystalline_service::Holder::Token("bob".to_string()),
+        crystalline_service::Holder::Process(7),
+    ] {
+        let fx = serve_review().await;
+        let alice = login(fx.addr, "alice", "pw12345678").await;
+        let bob = login(fx.addr, "bob", "pw12345678").await;
+        let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+        let token = fx.mint(&alice, &path).await["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Bob's agent presents the link and is inside the draft.
+        let bobs_scope = crystalline_service::Scope::User {
+            account: "bob".to_string(),
+            admin: false,
+        };
+        fx.engine
+            .open_share_link(&token, &bobs_scope, &agent)
+            .await
+            .expect("the link opens alice's draft for his agent");
+        assert!(
+            fx.engine.joins().held_by(&agent, "team").len() == 1,
+            "{agent:?} is inside it"
+        );
+
+        // His browser, which has joined nothing, is still outside.
+        let refused = connect(
+            fx.addr,
+            "/api/v1/collab/team/fresh?overlay=alice",
+            Some(&bob.0),
+            same_host(fx.addr),
+        )
+        .await
+        .expect_err("a window that joined nothing opens no room");
+        let detail = refusal_detail(&refused);
+        assert!(
+            detail.contains("Join the draft"),
+            "and is told how to get in, not that its agent already is: {detail}"
+        );
+
+        // And when the window joins for itself, it is in.
+        fx.accept_and_join(&bob, &token).await;
+        let mut his = connect(
+            fx.addr,
+            "/api/v1/collab/team/fresh?overlay=alice",
+            Some(&bob.0),
+            same_host(fx.addr),
+        )
+        .await
+        .expect("a live link plus this window's own join opens the room");
+        decode_hello(&next_binary(&mut his).await);
+    }
 }

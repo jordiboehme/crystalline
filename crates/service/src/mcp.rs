@@ -1192,23 +1192,32 @@ pub enum Transport {
 /// client's own `initialize` name, which is the per-connection variation
 /// SEP-2567 forbids. What is here instead was decided before the connection
 /// existed: see `harness_onboarded`.
-/// The draft joins one MCP session opened, and the thing that ends them.
+/// The draft joins one MCP server object opened, and the thing that ends them.
 ///
-/// **A join belongs to a session, never to an account** (see [`crate::join`]),
-/// and this is what makes that true on this surface: the keys an agent's
-/// session was handed live here, in an [`Arc`] every clone of its
-/// [`McpServer`] shares, and the last clone going away is the session ending.
-/// A person's browser join is a different set of keys in a different place, so
-/// a person joining a draft in a window has not joined it for their agent, and
-/// an agent presenting a link has not moved their browser.
+/// **A join belongs to a HOLDER, never to an account** (see [`crate::join`]),
+/// and this object is the ending of one KIND of holder: a stdio process, one
+/// connection on the daemon's own socket, or one legacy `Mcp-Session-Id`
+/// session. Each of those is one `McpServer` for its whole life, so its last
+/// clone going away is that holder ending and `Drop` ends its joins.
 ///
-/// The keys are also the reason a write is routed by a key rather than by
-/// [`crate::join::Joins::holds`]: `holds` asks about an ACCOUNT, and an agent
-/// authenticates as the same account its person does.
+/// **A modern-era peer on streamable HTTP is not one of them**, and that is
+/// the case this type has to get right rather than the cases it serves. Those
+/// requests route statelessly: rmcp builds a fresh service per POST
+/// (`daemon.rs`'s table of the five `get_service()` sites), so this object
+/// would live for one call and its `Drop` would run at the end of the very
+/// request that opened the join. So only keys whose holder
+/// [`crate::join::Holder::ends_with_its_holder`] are remembered here at all;
+/// a token identity's join is ended by idleness in the registry instead, and
+/// nothing on the request path ends it.
+///
+/// What is NOT kept here is the set of joins the caller is inside. That is
+/// read from the registry per call ([`crate::join::Joins::held_by`]), for the
+/// same reason: a stateless peer's second request is a different object, and
+/// anything remembered in this one it would have forgotten.
 struct SessionJoins {
     registry: Arc<crate::join::Joins>,
-    /// `(key, account)` for every join this session opened, in the order it
-    /// opened them.
+    /// `(key, account)` for every join this object opened whose holder ends
+    /// when this object does.
     keys: std::sync::Mutex<Vec<(String, String)>>,
 }
 
@@ -1220,30 +1229,17 @@ impl SessionJoins {
         }
     }
 
-    /// Record a key this session was just handed. Joining a draft this session
-    /// is already inside answers the key it already holds
-    /// ([`crate::join::Joins::open`] dedups), so this de-duplicates too rather
-    /// than growing a list of one key repeated.
-    fn remember(&self, key: String, account: String) {
+    /// Record a key this object was just handed, when this object is what ends
+    /// it. De-duplicated, because joining a draft this holder is already
+    /// inside answers the key it already holds.
+    fn remember(&self, join: &crate::join::Join, key: String) {
+        if !join.holder.ends_with_its_holder() {
+            return;
+        }
         let mut keys = self.lock();
         if !keys.iter().any(|(held, _)| held == &key) {
-            keys.push((key, account));
+            keys.push((key, join.account.clone()));
         }
-    }
-
-    /// The joins this session is holding in one domain, as the registry
-    /// answers them for `account`.
-    ///
-    /// Re-read every time rather than cached: a revoke, a rename, a discard or
-    /// a fold ends a join in the registry, and a session that answered from a
-    /// copy would go on writing into a draft it had been put out of.
-    fn held(&self, account: &str, domain: &str) -> Vec<crate::join::Join> {
-        let joins = &self.registry;
-        self.lock()
-            .iter()
-            .filter_map(|(key, held_for)| (held_for == account).then(|| joins.get(key, account))?)
-            .filter(|join| join.domain == domain)
-            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, String)>> {
@@ -1251,8 +1247,9 @@ impl SessionJoins {
     }
 }
 
-/// The session is over, so the drafts it was working inside are drafts it is
-/// no longer inside.
+/// This holder has ended, so the drafts it was working inside are drafts it is
+/// no longer inside. Empty for a stateless peer, by construction: nothing was
+/// remembered for it.
 impl Drop for SessionJoins {
     fn drop(&mut self) {
         for (key, account) in self.lock().iter() {
@@ -1261,6 +1258,22 @@ impl Drop for SessionJoins {
     }
 }
 
+/// Numbers one `McpServer` apart from another on the transports where the
+/// server object IS the holder. A daemon serves many stdio-shaped connections
+/// at once, so the process id alone would make them one holder and any one of
+/// them closing would put the others out of their drafts.
+static NEXT_SERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The MCP server for one connection: one tool router over one shared engine.
+/// Cheap to clone; every serving path builds one per connection (the daemon
+/// per accepted `mcp` socket, the HTTP transport per session, the stdio bridge
+/// once for its single session).
+///
+/// **Nothing about the connecting client is read any more.** The
+/// install-receipt match used to live here as an `AtomicBool` set from the
+/// client's own `initialize` name, which is the per-connection variation
+/// SEP-2567 forbids. What is here instead was decided before the connection
+/// existed: see `harness_onboarded`.
 #[derive(Clone)]
 pub struct McpServer {
     engine: Arc<Engine>,
@@ -1279,9 +1292,12 @@ pub struct McpServer {
     /// the safe direction (an over-served client pays duplicated context, an
     /// under-served one loses onboarding it cannot rediscover).
     harness_onboarded: bool,
-    /// The drafts this session joined by presenting a share-link, and the
-    /// handle whose last clone ends them. See [`SessionJoins`].
+    /// The drafts this server object joined by presenting a share-link, and
+    /// the handle whose last clone ends them. See [`SessionJoins`].
     joins: Arc<SessionJoins>,
+    /// This server object's number, which is the holder id on the transports
+    /// where the object is the holder. See [`SessionJoins`].
+    server: u64,
 }
 
 impl McpServer {
@@ -1302,6 +1318,46 @@ impl McpServer {
             transport,
             harness_onboarded: false,
             joins,
+            server: NEXT_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Which holder this call's joins belong to, and so what ends them.
+    ///
+    /// Resolved PER CALL rather than stored, because on the streamable-HTTP
+    /// transport the server object is not the holder: rmcp builds a fresh one
+    /// per stateless POST, and the thing that persists between two of a modern
+    /// peer's requests is the identity its token resolved to. Three answers,
+    /// one per way of being a caller here:
+    ///
+    /// * **stdio, and the daemon's own socket, are a process**, numbered per
+    ///   server object so a daemon serving several at once keeps them apart.
+    ///   Its joins end when the object does, which is when the connection does.
+    /// * **an HTTP request carrying an `Mcp-Session-Id` is that session.** The
+    ///   legacy lifecycle: the transport owns the session's ending, and the
+    ///   server object built for it goes with it.
+    /// * **an HTTP request with no session is a token identity**, which is
+    ///   what the 2026-07-28 era has instead of a session. Nothing on that
+    ///   path is an ending, so the registry ends those by idleness.
+    ///
+    /// `None` when the request carries no account at all, which is the
+    /// anonymous open tier: a share-link binds to an account, so there is no
+    /// join for that caller to hold and the verb refuses in those words.
+    fn holder_of(&self, ctx: &RequestContext<RoleServer>) -> Option<crate::join::Holder> {
+        match self.transport {
+            Transport::Stdio => Some(crate::join::Holder::Process(self.server)),
+            Transport::Http => {
+                if let Some(session) = ctx
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .and_then(|parts| parts.headers.get("mcp-session-id"))
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(crate::join::Holder::McpSession(session.to_string()));
+                }
+                mcp_account(ctx).map(crate::join::Holder::Token)
+            }
         }
     }
 
@@ -1315,14 +1371,18 @@ impl McpServer {
     async fn enter_draft(
         &self,
         scope: &Scope,
+        ctx: &RequestContext<RoleServer>,
         token: &str,
-    ) -> Result<crate::join::Join, ErrorData> {
-        let (key, join) = self
-            .engine
-            .open_share_link(token, scope)
-            .await
-            .map_err(to_error)?;
-        self.joins.remember(key, join.account.clone());
+    ) -> std::result::Result<crate::join::Join, crate::engine::EngineError> {
+        let Some(holder) = self.holder_of(ctx) else {
+            return Err(crate::engine::EngineError::Refused(
+                "a draft share-link binds to an account, and this session has none: authenticate \
+                 before presenting one"
+                    .to_string(),
+            ));
+        };
+        let (key, join) = self.engine.open_share_link(token, scope, &holder).await?;
+        self.joins.remember(&join, key);
         Ok(join)
     }
 
@@ -1344,11 +1404,15 @@ impl McpServer {
     async fn joined_for(
         &self,
         scope: &Scope,
+        ctx: &RequestContext<RoleServer>,
         domain: &str,
         identifier: &str,
     ) -> Option<crate::join::Join> {
-        let account = crate::scope::overlay_actor(scope)?;
-        let held = self.joins.held(&account, domain);
+        let holder = self.holder_of(ctx)?;
+        // The registry, not a list kept on this object: a stateless peer's
+        // second request is a different object, so anything this one
+        // remembered it would have forgotten. See [`SessionJoins`].
+        let held = self.engine.joins().held_by(&holder, domain);
         for join in held {
             let named = self
                 .engine
@@ -1609,7 +1673,11 @@ impl McpServer {
         // verb derives its destination from the title rather than resolving a
         // page, so there is no identifier to work out which draft was meant.
         let join = match p.share_link.as_deref() {
-            Some(token) => Some(self.enter_draft(&scope, token).await?),
+            Some(token) => Some(
+                self.enter_draft(&scope, &ctx, token)
+                    .await
+                    .map_err(to_error)?,
+            ),
             None => None,
         };
 
@@ -1695,7 +1763,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this session, so a later edit_engram of it lands in their copy.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -1705,13 +1773,15 @@ impl McpServer {
     ) -> Result<CallToolResult, ErrorData> {
         let scope = self.scope_of(&ctx);
         // A link presented here binds it to this account and opens the draft
-        // for this session, so the read below answers the draft it names and a
+        // for this holder, so the read below answers the draft it names and a
         // later edit of that page lands in its author's copy. The read itself
         // needs no join - a grant is what a read crosses on - but an agent
         // that was handed a link and is reading with it has decided both, the
         // same way a person pressing the button in a browser has.
         if let Some(token) = p.share_link.as_deref() {
-            self.enter_draft(&scope, token).await?;
+            self.enter_draft(&scope, &ctx, token)
+                .await
+                .map_err(to_error)?;
         }
         let value = self
             .engine
@@ -1727,7 +1797,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this session and the edit lands in its author's copy, with the receipt saying whose. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it and when. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it and when. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1773,8 +1843,15 @@ impl McpServer {
         // the identifier names. An edit of anything else in that domain is the
         // session's own, exactly as it was before it joined anything.
         let join = match p.share_link.as_deref() {
-            Some(token) => Some(self.enter_draft(&scope, token).await?),
-            None => self.joined_for(&scope, &p.domain, &p.identifier).await,
+            Some(token) => Some(
+                self.enter_draft(&scope, &ctx, token)
+                    .await
+                    .map_err(to_error)?,
+            ),
+            None => {
+                self.joined_for(&scope, &ctx, &p.domain, &p.identifier)
+                    .await
+            }
         };
         let receipt = self
             .engine
@@ -4451,60 +4528,111 @@ mod tests {
 
     use super::*;
 
-    /// A join an MCP session opened ends when that session ends, and belongs
-    /// to nobody else while it stands.
+    /// A join a server object opened ends when THAT OBJECT ends - and only
+    /// when the object is what holds it.
     ///
-    /// The pin under ruling 2: an agent's join is keyed by its session, not by
-    /// its account, so a person's browser join never becomes their agent's and
-    /// an agent's never becomes theirs. The registry itself keys by account
-    /// (that is what a browser upgrade can ask), so the thing that separates
-    /// the two is WHO HOLDS THE KEY - and this is the holder.
+    /// The pin under ruling I1's first half: a stdio process and a legacy MCP
+    /// session are each one `McpServer` for their whole life, so the object
+    /// going away is the holder ending. Nothing else is ended by it: the same
+    /// account's browser session is a different holder with a key of its own,
+    /// which is what keeps an agent's ending out of a person's window.
     #[test]
-    fn a_sessions_joins_end_with_the_session() {
+    fn a_server_objects_joins_end_with_it_when_it_is_the_holder() {
+        let registry = Arc::new(crate::join::Joins::default());
+        let agents = crate::join::Join {
+            account: "bob".to_string(),
+            holder: crate::join::Holder::McpSession("session-1".to_string()),
+            domain: "team".to_string(),
+            path: "fresh.md".to_string(),
+            owner: "alice".to_string(),
+        };
+        let browsers = crate::join::Join {
+            holder: crate::join::Holder::Browser("csrf-bob".to_string()),
+            ..agents.clone()
+        };
+        let agent_key = registry.open(agents.clone()).unwrap();
+        let browser_key = registry.open(browsers).unwrap();
+        assert_ne!(agent_key, browser_key, "two holders, two keys");
+
+        let session = SessionJoins::new(registry.clone());
+        session.remember(&agents, agent_key.clone());
+        session.remember(&agents, agent_key.clone());
+        assert_eq!(session.lock().len(), 1, "one key, however often remembered");
+
+        drop(session);
+        assert_eq!(
+            registry.get(&agent_key, "bob"),
+            None,
+            "the session ended, so its join did"
+        );
+        assert!(
+            registry.get(&browser_key, "bob").is_some(),
+            "and the person's browser is still inside the draft it joined"
+        );
+        assert!(registry.holds(
+            &crate::join::Holder::Browser("csrf-bob".to_string()),
+            "team",
+            "alice",
+            "fresh.md"
+        ));
+    }
+
+    /// A stateless peer's join is not ended by the request that opened it.
+    ///
+    /// The pin under ruling I1's second half. On the streamable-HTTP transport
+    /// a modern-era peer gets a fresh server object per POST, so this object's
+    /// `Drop` runs at the end of the very call that presented the link.
+    /// Nothing is remembered for a token identity, so nothing is ended, and
+    /// the registry is where the next request finds the join.
+    #[test]
+    fn a_stateless_peers_join_is_not_ended_by_the_request_that_opened_it() {
         let registry = Arc::new(crate::join::Joins::default());
         let join = crate::join::Join {
             account: "bob".to_string(),
+            holder: crate::join::Holder::Token("bob".to_string()),
             domain: "team".to_string(),
             path: "fresh.md".to_string(),
             owner: "alice".to_string(),
         };
         let key = registry.open(join.clone()).unwrap();
 
-        let session = SessionJoins::new(registry.clone());
-        session.remember(key.clone(), "bob".to_string());
-        session.remember(key.clone(), "bob".to_string());
-        assert_eq!(
-            session.held("bob", "team"),
-            vec![join.clone()],
-            "one key, however often it is remembered"
-        );
+        // The POST that presented the link.
+        let first = SessionJoins::new(registry.clone());
+        first.remember(&join, key.clone());
         assert!(
-            session.held("bob", "other").is_empty(),
-            "and it is a join into one domain"
+            first.lock().is_empty(),
+            "a token identity's join is not this object's to end"
         );
+        drop(first);
         assert!(
-            session.held("carol", "team").is_empty(),
-            "held for the account it was opened for and no other"
+            registry.get(&key, "bob").is_some(),
+            "so the join outlives the request that opened it"
         );
 
-        drop(session);
-        assert_eq!(registry.get(&key, "bob"), None, "the session ended it");
-        assert!(!registry.holds("bob", "team", "alice", "fresh.md"));
+        // The next POST, a different object, finds it in the registry.
+        let second = SessionJoins::new(registry.clone());
+        assert_eq!(
+            registry.held_by(&crate::join::Holder::Token("bob".to_string()), "team"),
+            vec![join],
+            "which is where a stateless peer's second request looks"
+        );
+        drop(second);
     }
 
-    /// A join another session is holding is not this session's, whatever
-    /// account it belongs to.
+    /// A join another holder is holding is not this object's, whatever account
+    /// it belongs to.
     ///
     /// Said from the browser's side: bob's browser is inside alice's draft, so
-    /// the registry says his account holds a join - and bob's agent, which
-    /// authenticates as bob, is holding no key and is therefore inside
-    /// nothing.
+    /// the registry holds a join for his account - and bob's agent, which
+    /// authenticates as bob, opened nothing and is therefore inside nothing.
     #[test]
-    fn another_sessions_join_is_not_this_sessions() {
+    fn another_holders_join_is_not_this_objects() {
         let registry = Arc::new(crate::join::Joins::default());
+        let browser = crate::join::Holder::Browser("csrf-bob".to_string());
         let browser_key = registry
             .open(crate::join::Join {
                 account: "bob".to_string(),
+                holder: browser.clone(),
                 domain: "team".to_string(),
                 path: "fresh.md".to_string(),
                 owner: "alice".to_string(),
@@ -4512,17 +4640,19 @@ mod tests {
             .unwrap();
         let agent = SessionJoins::new(registry.clone());
         assert!(
-            agent.held("bob", "team").is_empty(),
-            "the agent's session opened nothing, so it is inside nothing"
+            registry
+                .held_by(&crate::join::Holder::Token("bob".to_string()), "team")
+                .is_empty(),
+            "the agent's holder opened nothing, so it is inside nothing"
         );
         assert!(
-            registry.holds("bob", "team", "alice", "fresh.md"),
-            "while the account is inside it, which is what the browser upgrade asks"
+            registry.holds(&browser, "team", "alice", "fresh.md"),
+            "while the window that joined it is inside it"
         );
         drop(agent);
         assert!(
             registry.get(&browser_key, "bob").is_some(),
-            "and an agent session ending leaves a join it never opened alone"
+            "and an agent ending leaves a join it never opened alone"
         );
     }
 

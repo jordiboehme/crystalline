@@ -74,10 +74,13 @@ pub struct WriteParams {
     /// A draft share-link somebody handed you (`dl_...`), to work inside the
     /// draft it opens instead of writing your own copy. Pass it when you were
     /// given a link and mean to compose into its author's draft: it binds the
-    /// link to this account and opens the draft for this session, and the
-    /// write then lands in that author's copy, where they review it. A write
-    /// at any other page while inside a draft is refused, so leave it out
-    /// unless this call is about the shared page.
+    /// link to this account and opens the draft for this connection, and the
+    /// write then lands in that author's copy, where they review it. How long
+    /// that lasts depends on how you are connected: a stdio server or an MCP
+    /// session keeps it until the session ends, and a sessionless HTTP
+    /// connection keeps it for 30 minutes after your last call about that
+    /// draft. A write at any other page while inside a draft is refused, so
+    /// leave it out unless this call is about the shared page.
     #[serde(default)]
     pub share_link: Option<String>,
 }
@@ -94,9 +97,14 @@ pub struct ReadParams {
     /// A draft share-link somebody handed you (`dl_...`), to read the draft it
     /// opens rather than the page the domain holds. Pass it the first time you
     /// are given one and on any later read of that draft; it binds the link to
-    /// this account, opens the draft for this session and lets a later
-    /// `edit_engram` of that page land in its author's copy. Leave it out
-    /// everywhere else - an ordinary read never needs one.
+    /// this account and opens the draft for this connection, so a later
+    /// `edit_engram` of that page lands in its author's copy. How long that
+    /// lasts depends on how you are connected: a stdio server or an MCP
+    /// session keeps it until the session ends, and a sessionless HTTP
+    /// connection keeps it for 30 minutes after your last call about that
+    /// draft. Pass the link again whenever an edit is refused as unjoined.
+    /// Leave it out everywhere else - an ordinary read never needs one, and a
+    /// link you may only READ still opens the draft for reading.
     #[serde(default)]
     pub share_link: Option<String>,
 }
@@ -170,10 +178,14 @@ pub struct EditParams {
     /// A draft share-link somebody handed you (`dl_...`), to edit the draft it
     /// opens instead of your own copy of the page. Pass it when you were given
     /// a link and mean to compose into its author's draft: it binds the link
-    /// to this account and opens the draft for this session, and the edit then
-    /// lands in that author's copy, where they review it. An edit of any other
-    /// page while inside a draft is refused, so leave it out unless this call
-    /// is about the shared page.
+    /// to this account and opens the draft for this connection, and the edit
+    /// then lands in that author's copy, where they review it. How long that
+    /// lasts depends on how you are connected: a stdio server or an MCP
+    /// session keeps it until the session ends, and a sessionless HTTP
+    /// connection keeps it for 30 minutes after your last call about that
+    /// draft - pass the link again whenever an edit is refused as unjoined. An
+    /// edit of any other page while inside a draft is refused, so leave it out
+    /// unless this call is about the shared page.
     #[serde(default)]
     pub share_link: Option<String>,
 }

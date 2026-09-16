@@ -4518,8 +4518,10 @@ impl Engine {
     /// joining it, which is the second and separate decision to type into
     /// somebody's work. One call, because an agent that was handed a link and
     /// passed it to a verb has decided both. The join it opens belongs to the
-    /// session that presented it and ends when that session ends; the key is
-    /// what the caller holds, and nothing else in this process hands it out.
+    /// HOLDER that presented it - a browser session, an MCP session, a process,
+    /// or a token identity that has no session at all and is ended by idleness
+    /// instead - and ends when that holder does; the key is what the caller
+    /// holds, and nothing else in this process hands it out.
     ///
     /// The order is the REST route's order and it is load bearing: the domain
     /// screen comes BEFORE the redemption, because redeeming binds the link
@@ -4534,6 +4536,7 @@ impl Engine {
         &self,
         token: &str,
         scope: &crate::scope::Scope,
+        holder: &crate::join::Holder,
     ) -> Result<(String, crate::join::Join)> {
         let Some(account) = crate::scope::overlay_actor(scope) else {
             return Err(EngineError::Refused(
@@ -4611,6 +4614,12 @@ impl Engine {
         }
         let join = crate::join::Join {
             account,
+            // Which of this account's callers is inside the draft, and what
+            // ending ends it. Decided by the surface rather than here: only it
+            // knows whether this request is a browser session, an MCP session,
+            // a process or a stateless peer with a token and no session at
+            // all. See [`crate::join::Holder`].
+            holder: holder.clone(),
             domain,
             path,
             owner,

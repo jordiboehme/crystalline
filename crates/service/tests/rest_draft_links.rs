@@ -2484,6 +2484,18 @@ fn as_account(name: &str) -> Scope {
     }
 }
 
+/// The holder a stateless agent is: a modern-era peer on streamable HTTP has
+/// no session at all, so its joins are keyed by the identity its token
+/// resolved to and ended by idleness.
+fn agent_holder(name: &str) -> crystalline_service::join::Holder {
+    crystalline_service::join::Holder::Token(name.to_string())
+}
+
+/// The holder one signed-in browser session is.
+fn browser_holder(session: &Session) -> crystalline_service::join::Holder {
+    crystalline_service::join::Holder::Browser(session.csrf.clone())
+}
+
 /// An `append` edit of `fresh`, the shape an agent adding a line sends.
 fn append_edit(line: &str) -> crystalline_service::params::EditParams {
     crystalline_service::params::EditParams {
@@ -2511,7 +2523,7 @@ async fn an_agent_presenting_a_share_link_edits_inside_the_owners_draft() {
 
     let (_key, join) = f
         .engine
-        .open_share_link(&token, &as_account("bob"))
+        .open_share_link(&token, &as_account("bob"), &agent_holder("bob"))
         .await
         .expect("the link opens alice's draft for bob");
     assert_eq!(join.owner, "alice");
@@ -2589,8 +2601,16 @@ async fn a_browser_join_is_not_the_agents_and_an_unjoined_edit_is_taught() {
         .unwrap();
     assert!(joined["join_key"].as_str().is_some(), "{joined}");
     assert!(
-        f.engine.joins().holds("bob", "team", "alice", &path),
-        "the account is inside the draft, which is what a browser upgrade asks"
+        f.engine
+            .joins()
+            .holds(&browser_holder(&bob), "team", "alice", &path),
+        "the window that pressed the button is inside the draft"
+    );
+    assert!(
+        !f.engine
+            .joins()
+            .holds(&agent_holder("bob"), "team", "alice", &path),
+        "and his agent, which authenticates as the same account, is not"
     );
 
     // His agent, holding no key of its own, is not.
@@ -2618,5 +2638,68 @@ async fn a_browser_join_is_not_the_agents_and_an_unjoined_edit_is_taught() {
             .content
             .contains("only alice has"),
         "and nothing of the refused edit reached her draft"
+    );
+}
+
+/// An agent's session ending never touches the key its person's browser holds.
+///
+/// **The pin under ruling I1's third half.** Before the holder, `Joins::open`
+/// de-duplicated per ACCOUNT, so an agent joining a draft its person's browser
+/// was already inside was handed that browser's key - and on the stateless
+/// transport its server object is one request, so the `Drop` at the end of
+/// that request closed the key the person was working with and the next tick
+/// closed their socket. A holder is what makes the two keys two keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agents_join_ending_leaves_the_browsers_key_alone() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let joined: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let browser_key = joined["join_key"].as_str().unwrap().to_string();
+
+    // His agent presents the same link. A legacy MCP session is a holder whose
+    // ending is observable, which is what makes this test able to end it.
+    let agent = crystalline_service::Holder::McpSession("session-1".to_string());
+    let (agent_key, _join) = f
+        .engine
+        .open_share_link(&token, &as_account("bob"), &agent)
+        .await
+        .expect("the link opens alice's draft for his agent too");
+    assert_ne!(
+        agent_key, browser_key,
+        "two holders of one account are two joins"
+    );
+
+    // The agent's session ends.
+    assert_eq!(f.engine.joins().end_holder(&agent), 1);
+    assert_eq!(
+        f.engine.joins().get(&agent_key, "bob"),
+        None,
+        "its own join is over"
+    );
+    assert!(
+        f.engine.joins().get(&browser_key, "bob").is_some(),
+        "and the person is still working in the draft they joined"
+    );
+    assert!(
+        f.engine
+            .joins()
+            .holds(&browser_holder(&bob), "team", "alice", &path),
+        "which the co-editing upgrade still agrees with"
     );
 }

@@ -3823,3 +3823,302 @@ async fn a_confirmed_removal_lands_and_a_declined_one_does_nothing() {
         "with its files left on disk"
     );
 }
+
+// --- what holds a stateless peer's draft join --------------------------------
+
+/// A review-mode instance with accounts, an MCP token and a share-link already
+/// minted on one author's draft.
+///
+/// Built here rather than reusing [`Harness`], because the question below is
+/// only askable with a door in front of the transport: a join binds to an
+/// account, so the peer has to authenticate, and the domain has to be one that
+/// keeps drafts at all.
+struct ReviewInstance {
+    addr: std::net::SocketAddr,
+    engine: Arc<Engine>,
+    /// The share-link alice minted on her own draft, for bob to present.
+    token: String,
+    /// Bob's MCP token, which is what his agent authenticates with.
+    bearer: String,
+    path: String,
+    _scratch: support::ScratchStateDir,
+    _tmp: tempfile::TempDir,
+}
+
+async fn serve_review_instance() -> ReviewInstance {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- Everything the team knows\n\n## When to Use\n\n- Route here for team questions\n",
+    )
+    .unwrap();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    let mut cfg = GlobalConfig {
+        auth: Some(crystalline_core::config::AuthConfig {
+            mcp: Some(true),
+            oauth: Some(false),
+            ..crystalline_core::config::AuthConfig::default()
+        }),
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains.insert("team".to_string(), entry);
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["alice", "bob"] {
+        auth.add_user(
+            name,
+            name,
+            None,
+            crystalline_service::rest::Role::Editor,
+            "pw12345678",
+        )
+        .await
+        .unwrap();
+    }
+    let bearer = auth.issue_mcp_token("bob", "agent").await.unwrap().token;
+
+    // Alice's draft of a page nobody else has, and her link on it.
+    let receipt = engine
+        .write_engram_as(
+            &crystalline_service::params::WriteParams {
+                domain: "team".to_string(),
+                title: "Fresh".to_string(),
+                content: "A page only alice has.".to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec!["team".to_string()],
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+            },
+            None,
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .expect("her draft lands in her overlay");
+    let path = receipt["path"].as_str().unwrap().to_string();
+    let token = auth
+        .mint_overlay_grant("team", &path, "alice", None)
+        .await
+        .unwrap()
+        .token;
+
+    let router = http_router(
+        engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth,
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    ReviewInstance {
+        addr,
+        engine,
+        token,
+        bearer,
+        path,
+        _scratch: scratch,
+        _tmp: tmp,
+    }
+}
+
+/// [`post`] with an `Authorization: Bearer` header, which everything below
+/// needs and nothing above does: the gate is off in [`Harness`].
+async fn post_as(
+    addr: std::net::SocketAddr,
+    body: &str,
+    method: &str,
+    name: Option<&str>,
+    bearer: &str,
+) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut head = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Connection: close\r\n\
+         Authorization: Bearer {bearer}\r\n\
+         MCP-Protocol-Version: {ERA}\r\n\
+         Mcp-Method: {method}\r\n"
+    );
+    if let Some(name) = name {
+        head.push_str(&format!("Mcp-Name: {name}\r\n"));
+    }
+    let request = format!("{head}Content-Length: {}\r\n\r\n{body}", body.len());
+    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.flush().await;
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// One stateless `tools/call`, as this era's peer makes it.
+async fn call_as(
+    addr: std::net::SocketAddr,
+    id: u32,
+    tool: &str,
+    arguments: Value,
+    bearer: &str,
+) -> Value {
+    let body = modern(
+        id,
+        "tools/call",
+        json!({ "name": tool, "arguments": arguments }),
+    )
+    .to_string();
+    let raw = post_as(addr, &body, "tools/call", Some(tool), bearer).await;
+    assert!(
+        !has_session_header(&raw),
+        "this era is sessionless, and the fixture depends on it:\n{}",
+        head_of(&raw)
+    );
+    payload(&raw)
+}
+
+/// The text of a `tools/call` result, whether it came back as content or as an
+/// error.
+fn said(payload: &Value) -> String {
+    payload.to_string()
+}
+
+/// **A stateless peer's draft join survives from one POST to the next, and is
+/// ended by idleness.**
+///
+/// The pin under ruling I1. This era has no session: rmcp builds a fresh
+/// server object for every POST, so the join cannot be held on that object -
+/// its `Drop` would run at the end of the request that opened it, and the tool
+/// descriptions promise the opposite ("opens the draft for this session, so a
+/// later edit_engram of that page lands in their copy"). It is held by the
+/// identity the token resolved to and ended by [`IDLE_JOIN_LIMIT`] of nothing
+/// using it, which the last leg drives as a value rather than waiting half an
+/// hour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stateless_peers_draft_join_outlives_its_request_and_expires_idle() {
+    let fx = serve_review_instance().await;
+
+    // POST one: present the link on a read. This is where the join is opened.
+    let read = call_as(
+        fx.addr,
+        1,
+        "read_engram",
+        json!({
+            "identifier": "fresh",
+            "domain": "team",
+            "share_link": fx.token,
+        }),
+        &fx.bearer,
+    )
+    .await;
+    assert!(
+        said(&read).contains("A page only alice has"),
+        "the link opens her draft: {read}"
+    );
+    assert!(
+        fx.engine.joins().holds(
+            &crystalline_service::Holder::Token("bob".to_string()),
+            "team",
+            "alice",
+            &fx.path
+        ),
+        "and the join is held by the identity rather than by the request"
+    );
+
+    // POST two: a different server object entirely, and no link presented. The
+    // edit still lands in alice's draft, which is what the description says.
+    let edited = call_as(
+        fx.addr,
+        2,
+        "edit_engram",
+        json!({
+            "identifier": "fresh",
+            "domain": "team",
+            "operation": "append",
+            "content": "bob's agent added this",
+        }),
+        &fx.bearer,
+    )
+    .await;
+    assert!(
+        said(&edited).contains("landed in alice's draft"),
+        "the second request is still inside the draft the first one joined: {edited}"
+    );
+    let hers = fx
+        .engine
+        .overlay_draft_at("team", "alice", &fx.path)
+        .await
+        .unwrap()
+        .expect("her draft is where it landed");
+    assert!(hers.content.contains("bob's agent added this"), "{hers:?}");
+
+    // And idleness is what ends it. Driven as a value, the way the co-editing
+    // saver's window is.
+    let past = std::time::Instant::now()
+        + crystalline_service::join::IDLE_JOIN_LIMIT
+        + Duration::from_secs(1);
+    assert_eq!(fx.engine.joins().expire_idle(past), 1);
+    let after = call_as(
+        fx.addr,
+        3,
+        "edit_engram",
+        json!({
+            "identifier": "fresh",
+            "domain": "team",
+            "operation": "append",
+            "content": "and this, half an hour later",
+        }),
+        &fx.bearer,
+    )
+    .await;
+    assert!(
+        said(&after).contains("Join the draft"),
+        "an expired join is no join, and the refusal teaches the way back in: {after}"
+    );
+}
