@@ -1210,6 +1210,23 @@ fn overwrite_alpha(responses: Option<Value>) -> Value {
     params
 }
 
+/// The same capture WITHOUT `overwrite`: the shape an agent sends when it does
+/// not know the permalink is taken.
+fn capture_alpha(responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "write_engram",
+        "arguments": {
+            "domain": "eng",
+            "title": "Alpha",
+            "content": REPLACEMENT,
+        },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
 /// The client's answer to the `confirm` question, as an `ElicitResult`.
 fn answer(action: &str, confirm: bool) -> Value {
     json!({ "confirm": { "action": action, "content": { "confirm": confirm } } })
@@ -1293,6 +1310,83 @@ async fn a_wholesale_overwrite_into_a_live_document_asks_first_naming_who_is_pre
     assert!(
         live.contains("typed but never saved") && !live.contains(REPLACEMENT),
         "and their unsaved line still stands: {live:?}"
+    );
+}
+
+/// A capture that did not pass `overwrite` into a live document asks ONE
+/// question, and the answer to it lands.
+///
+/// Both questions apply here: the permalink is taken, and a room is open over
+/// it. The collision round used to be asked first and the live round second,
+/// so the person was asked twice about one act in two different wordings - and
+/// a client that sends only the newest answer, rather than accumulating them,
+/// answered the second question, found `overwrite` unset again and was asked
+/// the first one back. This is the two-round sequence with nothing carried
+/// forward: one question, one answer, one write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_into_a_live_document_asks_one_question_and_the_answer_lands() {
+    let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
+    let mut wire = Wire::to(engine.clone());
+
+    let asked = wire
+        .open(eliciting(1, "tools/call", capture_alpha(None)))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(
+        result["resultType"],
+        json!("input_required"),
+        "round one asks rather than writing: {asked}"
+    );
+    assert!(
+        result["inputRequests"]["confirm"].is_null(),
+        "and it is not the confirm key, which a second round would have to \
+         carry beside the answer below: {asked}"
+    );
+    let question = &result["inputRequests"]["resolution"];
+    let message = question["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already exists"),
+        "the one question says the engram is there: {message}"
+    );
+    assert!(
+        message.contains("live editor") && message.contains("Jordi"),
+        "and that somebody is in it, by name: {message}"
+    );
+
+    // Round two carries the answer to that question and NOTHING else - no
+    // `confirm` beside it, which is exactly the client behaviour the old
+    // ordering could not terminate under.
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            capture_alpha(Some(json!({
+                "resolution": { "action": "accept", "content": { "resolution": "overwrite" } }
+            }))),
+        ))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "round two writes rather than asking again: {done}"
+    );
+    let receipt = payload_of(&done);
+    assert_eq!(
+        receipt["landed"],
+        json!("live"),
+        "and it landed in the document: {receipt}"
+    );
+
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains(REPLACEMENT),
+        "which is where the person sees it: {live:?}"
+    );
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert_eq!(
+        on_disk, ALPHA,
+        "and nothing was written behind the room's back: {on_disk:?}"
     );
 }
 

@@ -821,15 +821,26 @@ async fn tool_descriptions_teach_review_mode() {
     // Task 15 (an ancestor of Task 18, the commit this pin means to bite on)
     // and is already pinned by
     // `tool_descriptions_teach_that_working_in_an_open_document_is_seen`. "so
-    // you always see what the person sees" is the phrase that came in WITH
-    // Task 18's sentence and nowhere else, so it is what actually strengthens
-    // this conjunction against a reword of that sentence.
+    // you see what the person sees" is the phrase that came in WITH Task 18's
+    // sentence and nowhere else, so it is what actually strengthens this
+    // conjunction against a reword of that sentence.
+    //
+    // The needle lost its "always" when the sentence did. The claim was not
+    // true on the path a share-link takes: a granted read answers the draft
+    // row its author last saved, never their open document (ruled onto the
+    // backlog, `plans/backlog.md`), so the description says which reads are
+    // live and the second half of this assertion pins the qualification rather
+    // than the promise it replaced.
     assert!(
         read.contains("live editor")
             && read.contains("live document")
-            && read.contains("so you always see what the person sees"),
+            && read.contains("so you see what the person sees")
+            && read.contains(
+                "a draft you reach with a share_link answers its author's last \
+                              saved text"
+            ),
         "read_engram teaches that a live editor is read through the live document, \
-         and that doing so always shows the person's own text: {read}"
+         and which read is answered from the row instead: {read}"
     );
 
     let share = description_of("share_changes");

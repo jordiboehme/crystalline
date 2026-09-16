@@ -1999,15 +1999,30 @@ impl McpServer {
         // would replace is on somebody's screen and not saved anywhere yet. So
         // the person is asked, by name, and the write waits for their answer.
         //
-        // Wholesale is both ways a call reaches a replacement: `overwrite` as
-        // the caller passed it, and a collision round already answered
-        // "overwrite", which is the same act arrived at in two steps. **When
-        // both questions would apply, this is the one that is asked** - it
-        // subsumes the collision, because a yes here is a yes to replacing
-        // what is at that permalink and it also says who is in there, which
-        // the collision question cannot. Nothing changes for a capture whose
-        // destination no room is open over: that is the collision round,
-        // exactly as it was.
+        // **When both questions would apply, this is the one that is asked**,
+        // and it is asked FIRST - before the write that would raise the
+        // collision. It subsumes the collision, because a yes here is a yes to
+        // replacing what is at that permalink and it also says who is in
+        // there, which the collision question cannot. Asking the collision
+        // first and this one second would put two differently worded questions
+        // about one act to the same person, and on a client that does not
+        // carry the first answer into the second round the two would alternate
+        // for ever.
+        //
+        // **Which key carries the answer depends on how the caller arrived**,
+        // and that is what makes the round terminate. A caller that passed
+        // `overwrite` has already decided to replace what is there and is
+        // being asked the live question alone, so it answers on the confirm
+        // key. A caller that did not pass it is being asked ONE question that
+        // is both, so it answers on the resolution key - the same key the
+        // collision round has always used, which is why round two carries
+        // `resolution: overwrite` and lands rather than asking again. Reading
+        // `confirm` there instead would let a yes carried over from some other
+        // verb's round turn a plain capture into an overwrite, which is worse
+        // than the second question it would save.
+        //
+        // Nothing changes for a capture whose destination no room is open
+        // over: that is the collision round, exactly as it was.
         //
         // **A client that cannot be asked is refused rather than served the
         // replacement**, which is this round's one departure from the others
@@ -2016,28 +2031,34 @@ impl McpServer {
         // of somebody ELSE's open document is their unsaved work gone with
         // nothing left to say where it went, and no other surface would ever
         // show them what happened.
-        let wholesale = p.overwrite || resolved_overwrite(&responses.0) == Some(true);
-        if wholesale
-            && let Some(target) = self
-                .engine
-                .live_write_target(&p, &scope, join.as_ref(), peer.as_ref())
-                .await
+        if let Some(target) = self
+            .engine
+            .live_write_target(&p, &scope, join.as_ref(), peer.as_ref())
+            .await
         {
             if !confirmation_supported(&ctx) {
                 return refuse(live_overwrite_refusal(&target)).map(CallToolResponse::from);
             }
-            match confirmed(&responses.0) {
-                None => {
+            let answered = match p.overwrite {
+                true => confirmed(&responses.0),
+                false => resolved_overwrite(&responses.0),
+            };
+            match answered {
+                None if p.overwrite => {
                     return Ok(confirm_question(live_overwrite_question_text(&p, &target)).into());
+                }
+                None => {
+                    return Ok(
+                        collision_question(live_collision_question_text(&p, &target)).into(),
+                    );
                 }
                 Some(false) => return refuse(LIVE_OVERWRITE_REFUSAL).map(CallToolResponse::from),
                 // The answered call runs here rather than falling through to
-                // the collision round below: a yes carried on a call that did
-                // not itself pass `overwrite` is the answer to a collision
-                // question as well as to this one, and routing it through the
-                // error the engine would raise for the missing argument would
+                // the collision round below: the yes was given about replacing
+                // the page at that permalink, so routing it through the error
+                // the engine would raise for the missing `overwrite` would
                 // make the landing depend on that interception. One call, with
-                // the argument the two answers together amount to.
+                // the argument the answer amounts to.
                 Some(true) => {
                     let mut confirmed_write = p.clone();
                     confirmed_write.overwrite = true;
@@ -2137,7 +2158,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document, so you always see what the person sees. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -2186,7 +2207,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. A draft reached that way is read from its author's last saved text rather than from their open document, so send an edit inside one without expected_checksum: the text composes correctly either way, and a checksum taken from a granted read is refused as stale for as long as its author keeps typing. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -4828,6 +4849,24 @@ const COLLISION_REFUSAL: &str = "The overwrite was not confirmed, so the existin
 fn live_overwrite_question_text(p: &WriteParams, target: &LiveWriteTarget) -> String {
     format!(
         "'{}' in '{}' is open in a live editor (present: {}) with work nobody has saved yet, and this write replaces the whole document. Replace it wholesale?",
+        target.permalink,
+        p.domain.trim(),
+        present_names(&target.present)
+    )
+}
+
+/// The one question a capture asks when the permalink it would land on is both
+/// taken and open in a live editor.
+///
+/// Both questions in one sentence, because it is one act: the engram is there,
+/// somebody is in it with work nobody has saved, and a yes replaces the whole
+/// document. It is asked on the resolution key rather than the confirm key -
+/// see the round that returns it - so the answer that comes back is the one
+/// this verb already knows how to carry into a write.
+fn live_collision_question_text(p: &WriteParams, target: &LiveWriteTarget) -> String {
+    format!(
+        "'{}' would land at permalink '{}' which already exists in '{}' and is open in a live editor right now (present: {}), with work nobody has saved yet; this write replaces the whole document. Overwrite it, or cancel?",
+        p.title.trim(),
         target.permalink,
         p.domain.trim(),
         present_names(&target.present)
