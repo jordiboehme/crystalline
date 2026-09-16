@@ -125,7 +125,18 @@ impl Joins {
                 continue;
             }
             held += 1;
-            if existing.domain == join.domain && existing.path == join.path {
+            // All three, and `owner` is the one that is easy to forget: two
+            // authors routinely hold a draft at the same path, because an
+            // overlay row is keyed by actor as well as by path. Dedupping on
+            // the path alone would hand somebody joining a SECOND author's
+            // draft the key they hold for the first, and every write made
+            // "inside" the second would be routed into the first author's
+            // overlay. [`Joins::end_draft`] names a draft the same three ways,
+            // and the two have to agree about what one draft is.
+            if existing.domain == join.domain
+                && existing.owner == join.owner
+                && existing.path == join.path
+            {
                 return Ok(key.clone());
             }
         }
@@ -256,6 +267,44 @@ mod tests {
             })
             .unwrap();
         assert_ne!(other, first);
+    }
+
+    /// Two authors can hold a draft at one path, so a join is to one author's.
+    ///
+    /// The dedup and [`Joins::end_draft`] have to mean the same thing by "one
+    /// draft": if the dedup forgot the owner, somebody joining a second
+    /// author's draft at a path they already work in would be handed the first
+    /// author's key, and every write they made would be routed into the wrong
+    /// overlay - under the wrong name, for the wrong person to review.
+    #[test]
+    fn joining_a_second_authors_draft_at_the_same_path_is_a_second_join() {
+        let joins = Joins::default();
+        let from_alice = joins.open(join("bob")).unwrap();
+        let from_carol = joins
+            .open(Join {
+                owner: "carol".to_string(),
+                ..join("bob")
+            })
+            .unwrap();
+        assert_ne!(
+            from_alice, from_carol,
+            "one key per draft, and these are two drafts"
+        );
+        assert_eq!(
+            joins.get(&from_alice, "bob").map(|held| held.owner),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            joins.get(&from_carol, "bob").map(|held| held.owner),
+            Some("carol".to_string()),
+            "each key routes to the author whose draft it was opened on"
+        );
+
+        // And ending one leaves the other, which is the same agreement said
+        // from the other side.
+        assert_eq!(joins.end_draft("team", "alice", "plan.md"), 1);
+        assert_eq!(joins.get(&from_alice, "bob"), None);
+        assert!(joins.get(&from_carol, "bob").is_some());
     }
 
     /// One account cannot take the instance's joins away from everybody else.

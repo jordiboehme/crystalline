@@ -519,6 +519,29 @@ impl<'a> DomainView<'a> {
     /// row first and failing on the mirror would resurrect a draft its author
     /// dropped. Failing on the mirror before the row has moved refuses a call
     /// that did nothing, which is the honest answer and the retryable one.
+    ///
+    /// **This is also where a draft's share-links and joins end**, and it is
+    /// the one place they can be ended once rather than at each verb. Every
+    /// way an overlay row is taken away passes through here - the discard, the
+    /// fold, a withdrawal ([`Engine::revert_into_overlay`]), a conflict
+    /// resolution ([`Engine::resolve_in_overlay`]), a settled convergence and
+    /// the rename convergence performs when the base carried the draft along
+    /// ([`Engine::move_draft_with_the_base`]), which never touches the move
+    /// verb at all - so a verb added later inherits the ending instead of
+    /// having to remember it. A grant lasts exactly as long as the thing it
+    /// grants, and a row left live springs back onto whatever its author
+    /// drafts at that path next.
+    ///
+    /// The WRITER above is deliberately not such a seam. A draft being saved
+    /// is the same draft, and ending its links on every keystroke would mean a
+    /// grant that survived only until its author next typed. Two paths replace
+    /// a draft rather than removing it - the delete that stands a tombstone
+    /// over a base row, and the move that does the same at its source - and
+    /// each ends the grants itself, beside its call to this.
+    ///
+    /// Ended after the transaction commits, never inside it: the accounts
+    /// database is a different store behind a different lock, and a row that
+    /// is gone is what makes ending its grants the truth.
     pub(crate) async fn drop(&self, domain_id: DomainId, path: &str) -> Result<()> {
         let actor = self.writing_actor()?;
         let domain = self.domain.as_str();
@@ -547,6 +570,12 @@ impl<'a> DomainView<'a> {
         match done {
             Ok(()) => {
                 store.commit().await?;
+                // Released by name rather than by falling out of scope: the
+                // ending below reaches a different store behind a different
+                // lock, and holding the index's across it would be a lock
+                // order this file does not otherwise have.
+                std::mem::drop(store);
+                self.engine.end_draft_grants(domain, actor, path).await;
                 Ok(())
             }
             Err(e) => {

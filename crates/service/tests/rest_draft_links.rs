@@ -94,6 +94,7 @@ async fn serve() -> Fixture {
         ("alice", Role::Editor),
         ("bob", Role::Editor),
         ("carol", Role::Editor),
+        ("dave", Role::Editor),
         ("vera", Role::Viewer),
     ] {
         auth.add_user(name, name, None, role, "pw12345678")
@@ -1888,3 +1889,4 @@ async fn a_rename_ends_a_live_join_at_the_old_path() {
         "and it says what she left it saying: {hers}"
     );
 }
+

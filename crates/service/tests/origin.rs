@@ -27,6 +27,8 @@ use crystalline_remote::state::{
 use crystalline_service::Scope;
 use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
 use crystalline_service::params::{ReadParams, SearchParams};
+use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::scope::DomainAccess;
 use crystalline_service::{Engine, EnvOverlay};
 use support::{CountingEmbedder, MockProvider, sha256_hex};
 use tokio::sync::Mutex;
@@ -5125,5 +5127,132 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
     assert!(
         err.to_string().contains("withdraw it and share again"),
         "a convergence pass did not write over who owns the proposal: {err}"
+    );
+}
+
+/// The accounts database wired into an engine, with one share-link on one
+/// actor's draft already redeemed by `bob`.
+///
+/// Engine-level rather than over HTTP, because what is under test is the
+/// ENGINE seam: a pull converging or renaming somebody's draft never passes a
+/// route at all, and a test that drove one would be asserting about the wrong
+/// layer.
+async fn granted(eng: &Engine, tmp: &Path, actor: &str, path: &str) -> Arc<AuthStore> {
+    let auth = Arc::new(AuthStore::open(&tmp.join("web-auth.db")).await.unwrap());
+    for name in [actor, "bob"] {
+        auth.add_user(name, name, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    let minted = auth
+        .mint_overlay_grant("team", path, actor, None)
+        .await
+        .unwrap();
+    auth.redeem_overlay_grant(&minted.token, "bob")
+        .await
+        .unwrap()
+        .expect("bob holds the link");
+    auth
+}
+
+/// A pull that converges a granted draft out of the overlay ends its links.
+///
+/// The draft is the folder now, so there is nothing left to share: everybody
+/// who can read the domain reads that text anyway. A link left live would be a
+/// link to a draft that is not there, waiting to spring back onto whatever its
+/// author drafts at that path next - and this path never touches the discard,
+/// the fold or the move verb, which is exactly why the ending belongs at the
+/// seam they all pass through rather than at each of them.
+#[tokio::test]
+async fn a_pulled_convergence_ends_the_links_on_the_draft_it_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
+    let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
+    assert_eq!(
+        auth.overlay_grants_held("bob", "team").await.unwrap().len(),
+        1,
+        "bob holds the link before the pull"
+    );
+
+    // The team reviewed the rewrite and merged it.
+    let merged = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan.md", DRAFT_PLAN.as_bytes().to_vec()),
+    ]));
+    mock.set_branch("main", &merged);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    assert!(
+        auth.overlay_grants_held("bob", "team")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the link ended with the draft the pull cleared"
+    );
+
+    // And a later draft at the same path revives nothing.
+    draft(&eng, "alice", "notes/plan.md", DRAFT_FRESH).await;
+    assert!(
+        auth.overlay_grants_held("bob", "team")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a second draft at that path is alice's alone"
+    );
+}
+
+/// And the rename a pull performs when the base carries the draft along ends
+/// them too.
+///
+/// That rename is `move_draft_with_the_base`, which never goes through the move
+/// verb - so it is the path a hook on the verb alone would miss, and the reason
+/// the ending is at the drop rather than at the verbs.
+#[tokio::test]
+async fn convergences_rename_ends_the_links_on_the_path_it_left() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
+    let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
+
+    // The team filed the same page under a new name.
+    let renamed = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan-v2.md", team_plan()),
+    ]));
+    mock.set_branch("main", &renamed);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        overlay_paths(&eng, "alice").await,
+        vec!["notes/plan-v2.md".to_string()],
+        "the draft travelled with the page it is a draft of"
+    );
+    assert!(
+        auth.overlay_grants_held("bob", "team")
+            .await
+            .unwrap()
+            .is_empty(),
+        "and the link on the path it left ended with it: the author re-shares \
+         the page under its new name"
     );
 }
