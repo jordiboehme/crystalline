@@ -162,6 +162,7 @@ impl CollabSessions {
     /// back to the registry: a frontmatter rename has to move its key, and the
     /// session is the only one who learns about the rename (from the save
     /// receipt).
+    ///
     /// `overlay` is whose document to open: `None` for the one a direct domain
     /// keeps, `Some(actor)` for that actor's draft of the page. It is the
     /// caller's job to have decided that the caller may be in that document -
@@ -505,6 +506,7 @@ impl SaveStateTag {
 /// through its MCP session opens the join record that route reads, so a room
 /// asked for over that draft carries the owner here by exactly the path a
 /// browser's does; nothing in this module has to learn what an MCP session is.
+///
 /// **A domain that has stopped reviewing changes has no overlay documents
 /// left, so a room over one falls back to the base view** - the same reading
 /// [`DomainView::for_write_joined`] takes of a join into a domain that left
@@ -869,12 +871,6 @@ impl CollabSession {
             self.key_permalink.lock().expect("key mutex").clone(),
             self.overlay.clone(),
         )
-    }
-
-    /// Whose document this room is a room over, or `None` for the one a direct
-    /// domain keeps.
-    pub fn overlay(&self) -> Option<&str> {
-        self.overlay.as_deref()
     }
 
     /// The view this room reads and writes through, built fresh per use the

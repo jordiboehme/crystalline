@@ -1043,3 +1043,51 @@ async fn a_grantees_upload_from_a_joined_room_lands_in_the_owners_files() {
         "and not in his"
     );
 }
+
+/// Leaving the draft puts the socket outside it too, on the same tick and by
+/// the same question: the room asks the join registry, and Leave, a
+/// revocation, a rename, a discard and a fold all end a join there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grantee_who_leaves_the_draft_is_closed_out_of_its_room() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    let joined = fx.accept_and_join(&bob, &token).await;
+    let key = joined["join_key"].as_str().unwrap().to_string();
+
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut his).await;
+
+    let left = fx
+        .request(&bob, reqwest::Method::POST, "/api/v1/draft-links/leave")
+        .json(&serde_json::json!({ "key": key }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(left.status(), 204);
+
+    let closed = wait_for_control(&mut his, "closed").await;
+    assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
+
+    // The link still opens the draft, so rejoining and reopening the room is
+    // the same two presses it was the first time.
+    fx.accept_and_join(&bob, &token).await;
+    connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .expect("a join is a join, however many times it is opened");
+}

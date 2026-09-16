@@ -4732,8 +4732,52 @@ async fn a_fold_closes_open_rooms_first() {
     assert!(
         f.held("team", "owner").await.is_empty(),
         "and the room's save is in the file rather than in a draft nobody \
-         planned for: a room saves as the machine owner, so a sweep one step \
-         earlier would have left one behind"
+         planned for: the key comes off before the sweep, so the room's view \
+         falls back to the folder - one step earlier and this save would have \
+         made a draft row the plan never covered"
+    );
+}
+
+/// The same sweep, of a room over one actor's OWN draft: the owner component
+/// of a room's key must not hide it from the fold that ends every draft in the
+/// domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fold_sweeps_the_rooms_over_its_drafts_too() {
+    let f = review_fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    let joined = sessions
+        .join("team", "fresh", Some("alice"))
+        .await
+        .expect("her draft is a document a room can be over");
+    assert_eq!(sessions.session_count().await, 1);
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["rooms_closed"],
+        serde_json::json!(1),
+        "a room over her draft is one of the domain's rooms: {receipt}"
+    );
+    assert_eq!(sessions.session_count().await, 0);
+    assert!(joined.session.is_disposed());
+    assert!(
+        f.held("team", "alice").await.is_empty(),
+        "her rows went with the fold, room or no room"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("fresh.md")).unwrap(),
+        ALICE_NEW,
+        "and what she drafted is what the folder holds"
     );
 }
 
