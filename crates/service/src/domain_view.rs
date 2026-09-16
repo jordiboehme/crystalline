@@ -953,6 +953,23 @@ impl<'a> DomainView<'a> {
                 return Err(e);
             }
         }
+        // The draft has left the path it was shared at, so every link on that
+        // path and every session inside it ends with it - the same call the
+        // discard paths make, for the same reason: a grant lasts exactly as
+        // long as the thing it grants, and a row left live would spring back
+        // onto whatever its author drafted at the old path next.
+        //
+        // **After the destination write, never before.** A move that could not
+        // write the destination puts the source back and did not happen, and a
+        // move that did not happen must not have ended anybody's link on the
+        // way to not happening.
+        //
+        // The grant does not follow the rename, deliberately: it was minted on
+        // a path, the author is the one who knows whether the page is still the
+        // page they shared, and re-sharing it under its new name is one press.
+        self.engine
+            .end_draft_grants(&p.domain, actor, &src.path)
+            .await;
         let mut receipt = json!({
             "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
             "to": { "domain": p.domain, "permalink": dest_permalink, "path": dest_rel },

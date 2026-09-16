@@ -1678,3 +1678,213 @@ async fn a_reader_of_no_such_domain_does_not_burn_the_link() {
         "nobody spent it on the way past: {accepted}"
     );
 }
+
+/// Renaming a draft ends the links on it, exactly as discarding one does.
+///
+/// A rename is the author deciding the page belongs somewhere else. The link
+/// was minted on a path, so after the move it names somewhere its author is no
+/// longer working - and a row left live would spring back onto whatever they
+/// drafted at the old path next, which is the same revival a discard used to
+/// allow. The author re-shares the page under its new path; nothing follows the
+/// rename by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renamed_draft_ends_its_grant_and_a_redraft_at_the_old_path_revives_nothing() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    let path = f
+        .draft("alice", "Fresh", "The first thing alice wrote.")
+        .await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let accepted = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200, "bob holds the link");
+
+    // Alice decides the page belongs somewhere else.
+    let moved = alice
+        .request(f.addr, reqwest::Method::POST, "/api/v1/domains/team/move")
+        .json(&serde_json::json!({"permalink": "fresh", "destination": "notes/fresh"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200, "{:?}", moved.text().await);
+
+    let dead = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dead.status(),
+        404,
+        "the link ended with the draft leaving that path: {:?}",
+        dead.text().await
+    );
+    // The page kept its own address through the move - a document travels
+    // verbatim - so this is the same engram, now standing somewhere the link
+    // was never minted on, and nothing followed it there.
+    let elsewhere = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        elsewhere.status(),
+        404,
+        "where alice put the page is hers alone until she shares it again"
+    );
+
+    // And a later draft at the OLD path revives nothing.
+    //
+    // The moved draft is taken away first, and only because it still answers
+    // to the address the second page will want - one engram answers to one
+    // address, wherever it stands. That discard is at the NEW path and ends
+    // nothing at the old one, so what the old token meets below is whatever
+    // the rename left behind it.
+    let moved_read = f.reads(&alice, "fresh").await;
+    assert_eq!(
+        moved_read["path"],
+        serde_json::json!("notes/fresh.md"),
+        "and it is the moved one she is reading: {moved_read}"
+    );
+    let discarded = alice
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", moved_read["checksum"].as_str().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(discarded.status(), 204, "{:?}", discarded.text().await);
+    f.draft("alice", "Fresh", "A second thing, written later.")
+        .await;
+    let revived = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revived.status(), 404, "{:?}", revived.text().await);
+    let read = bob
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 404, "her second page is hers alone too");
+}
+
+/// And it ends the sessions that were inside it.
+///
+/// A join is to one draft at one path. Once its author has moved that draft
+/// away, a session still holding the join would be writing into an overlay
+/// entry that is not there - so the join ends with the grant, and the writing
+/// goes back to being the writer's own, which is what the refusal always
+/// offered as the second way forward.
+///
+/// Two things are asserted and they are the two halves of "gone": the registry
+/// holds nothing, which is what the bar at the top of the screen reads on its
+/// next look, and a write still presenting the key reaches nothing of alice's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_ends_a_live_join_at_the_old_path() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    let path = f
+        .draft("alice", "Fresh", "The thing alice is drafting.")
+        .await;
+    let token = f.mint(&alice, &path).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let joined: serde_json::Value = bob
+        .request(f.addr, reqwest::Method::POST, "/api/v1/draft-links/join")
+        .json(&serde_json::json!({"token": token}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key = joined["join_key"].as_str().unwrap().to_string();
+    let checksum = joined["checksum"].as_str().unwrap().to_string();
+    assert!(
+        f.engine.joins().get(&key, "bob").is_some(),
+        "the join is open before the rename"
+    );
+
+    // Alice moves the draft bob is working in.
+    let moved = alice
+        .request(f.addr, reqwest::Method::POST, "/api/v1/domains/team/move")
+        .json(&serde_json::json!({"permalink": "fresh", "destination": "notes/fresh"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200, "{:?}", moved.text().await);
+
+    // The registry is what the bar reads on its next look, and it holds
+    // nothing: the join ended with the draft it was a join to.
+    assert!(
+        f.engine.joins().get(&key, "bob").is_none(),
+        "the join ended with the draft"
+    );
+
+    // Bob writes at the old path, still presenting the key he was given. It
+    // reaches nothing of hers: there is no join for it to route through any
+    // more, and no draft of his own at that path either.
+    let written = bob
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .header("if-match", format!("\"{checksum}\""))
+        .header("x-crystalline-join", &key)
+        .json(&serde_json::json!({"content": "bob types into a draft he has left"}))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        written.status(),
+        200,
+        "a key that has been ended routes nothing: {:?}",
+        written.text().await
+    );
+    let hers = f.reads(&alice, "fresh").await;
+    assert_eq!(
+        hers["path"],
+        serde_json::json!("notes/fresh.md"),
+        "her draft is where she moved it: {hers}"
+    );
+    assert!(
+        hers["content"]
+            .as_str()
+            .unwrap()
+            .contains("The thing alice is drafting"),
+        "and it says what she left it saying: {hers}"
+    );
+}
