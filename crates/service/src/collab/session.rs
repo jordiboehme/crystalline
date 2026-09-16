@@ -399,6 +399,24 @@ pub struct CollabSession {
     /// the life of the room - a rename moves the permalink, never the owner -
     /// and read by everything this room reads and writes through.
     overlay: Option<String>,
+    /// The path this room's document stood at when it opened, and the only
+    /// path an overlay room ever writes.
+    ///
+    /// A room addresses its saves by the permalink its own text carries, and
+    /// that line is typed by whoever is in the room. So the path is pinned
+    /// here at the open and every save is screened against it
+    /// ([`Engine::save_engram_in_overlay`]): a document that starts claiming
+    /// to be a different engram is refused rather than followed, because a
+    /// room is one document and a person invited into one page was invited
+    /// into one page. `None` for a room over the document a direct domain
+    /// keeps, which is not inside anybody's overlay and has the whole folder
+    /// in front of it either way.
+    ///
+    /// It is also what keeps the guest eviction's lookup asking about the
+    /// right draft on every tick rather than only at the upgrade: `state.path`
+    /// moves only on an accepted save's receipt, and an accepted save is one
+    /// that landed here.
+    pinned_path: Option<String>,
     /// The registry this room lives in, for the rename move. Weak because the
     /// registry owns the session and never the other way round.
     registry: Weak<CollabSessions>,
@@ -566,6 +584,7 @@ impl CollabSession {
             epoch,
             domain: key.0,
             key_permalink: std::sync::Mutex::new(key.1),
+            pinned_path: key.2.is_some().then(|| loaded.path.clone()),
             overlay: key.2,
             registry,
             engine,
@@ -1118,7 +1137,17 @@ impl CollabSession {
             // stopped reviewing changes has no draft left for this room to be
             // over, and its text belongs in the folder (see `room_view`).
             Ok(view) if view.actor().is_some() => {
-                self.engine.save_engram_in_overlay(&view, &params).await
+                // The path this room opened on, which is the only one it
+                // writes. Unreachable as a `None` here - an overlay room is
+                // the only kind whose view carries an actor - and answered
+                // with the room's current path rather than by unwrapping.
+                let pinned = self
+                    .pinned_path
+                    .clone()
+                    .unwrap_or_else(|| state.path.clone());
+                self.engine
+                    .save_engram_in_overlay(&view, &params, &pinned)
+                    .await
             }
             Ok(_) => {
                 self.engine

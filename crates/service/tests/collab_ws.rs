@@ -1174,3 +1174,109 @@ async fn a_link_opens_the_draft_it_was_minted_on_and_no_other() {
         Err(err) => assert_eq!(refusal_status(&err), Some(404)),
     }
 }
+
+/// Replace the whole document in one transaction, the way a client that
+/// rewrote the frontmatter does.
+fn replace_all(doc: &Doc, content: &str) -> Vec<u8> {
+    let text = doc.get_or_insert_text("content");
+    let mut txn = doc.transact_mut();
+    let len = text.get_string(&txn).encode_utf16().count() as u32;
+    text.remove_range(&mut txn, 0, len);
+    text.insert(&mut txn, 0, content);
+    txn.encode_update_v1()
+}
+
+/// A room saves at the path it was opened on, every time, and a document that
+/// starts claiming to be a different page is refused rather than followed.
+///
+/// A room addresses its saves by the permalink its own text carries, and that
+/// line is typed by whoever is in the room - so without a screen a guest
+/// invited into one page holds a write over every page in its author's
+/// overlay. The address ladder answers a TITLE as well as a permalink, and the
+/// address check in front of a draft write deliberately does not treat a title
+/// as an address, so the two together are the way out of the granted page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rooms_save_at_another_path_is_refused_and_the_room_stays_open() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut his).await;
+    let doc = client_doc();
+    his.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut his).await;
+    apply(&doc, &step2);
+
+    // He makes the document the team's own page word for word, with one line
+    // changed: its address, set to the page's TITLE. Nothing holds that as a
+    // permalink, so the address check lets it stand at the granted path - and
+    // from the next save on, the name this room addresses by resolves to the
+    // team's page. The text is the team's so that the merge the CAS mismatch
+    // starts comes out clean, which is what makes the write land rather than
+    // stall.
+    let retargeted = TEAM_PLAN.replace("permalink: plan", "permalink: Plan");
+    let update = replace_all(&doc, &retargeted);
+    his.send(binary(update_frame(&update))).await.unwrap();
+    his.send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    wait_for_control(&mut his, "saved").await;
+
+    // The next save addresses "Plan", which resolves to the team's page - a
+    // path nobody shared with him.
+    let update = append_line(&doc, "and now somewhere else");
+    his.send(binary(update_frame(&update))).await.unwrap();
+    his.send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    let refused = wait_for_control(&mut his, "save-failed").await;
+    let Control::SaveFailed { detail } = &refused else {
+        panic!("a save at another path is refused: {refused:?}")
+    };
+    assert!(
+        detail.contains("alice") && detail.contains("fresh.md") && detail.contains("plan.md"),
+        "the refusal names the draft this room is and the path the write would have gone to: \
+         {detail}"
+    );
+
+    assert!(
+        fx.engine
+            .overlay_draft_at("team", "alice", "plan.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "and nothing of hers stands at the page he re-addressed to"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.domain_dir.join("plan.md")).unwrap(),
+        TEAM_PLAN,
+        "nor did the folder move"
+    );
+    let still_hers = fx
+        .engine
+        .overlay_draft_at("team", "alice", &path)
+        .await
+        .unwrap()
+        .expect("her draft is where it always was");
+    assert!(
+        !still_hers.content.contains("and now somewhere else"),
+        "the refused text landed nowhere: {still_hers:?}"
+    );
+
+    // The room is still open: the frame was rejected, not the socket, and his
+    // text is still in the document to fix.
+    his.send(binary(step1(&doc))).await.unwrap();
+    let _ = next_sync_step2(&mut his).await;
+}

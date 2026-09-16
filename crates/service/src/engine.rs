@@ -1099,6 +1099,22 @@ pub fn joined_files_are_the_drafts(owner: &str, draft: &str, path: &str) -> Stri
     )
 }
 
+/// What a write inside somebody's draft is told when it would land somewhere
+/// else.
+///
+/// One sentence for the two surfaces that can be inside a draft - a request
+/// carrying a join, and a co-editing room over an overlay document - because
+/// it is one rule: you are inside ONE page, and a write that resolved to
+/// another page is not that page's. A room reaches it when the document's own
+/// frontmatter starts claiming to be a different engram, which is the way an
+/// address moves without anybody saying so.
+pub fn joined_write_is_elsewhere(owner: &str, draft: &str, path: &str) -> String {
+    format!(
+        "this session is working inside {owner}'s draft of '{draft}', so a write to '{path}' has \
+         nowhere to land: leave that draft first, and the write goes back to being your own"
+    )
+}
+
 pub fn granted_needs_join(owner: &str, path: &str) -> String {
     format!(
         "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step. \
@@ -4156,12 +4172,30 @@ impl Engine {
     /// room IS. Everything after that is the same write, through the same
     /// function, with the same compare-and-swap.
     ///
-    /// Two gates a request meets are deliberately absent, because neither is
+    /// **`expected_path` is the path the room is a room over, and a save that
+    /// resolves anywhere else is refused.** A room addresses its saves by the
+    /// permalink its own text carries, and that line is typed by whoever is in
+    /// the room, so without this screen a person invited into one page holds a
+    /// write over every page in its author's overlay: the address ladder
+    /// answers a TITLE as well as a permalink
+    /// ([`DomainView::resolve_draft`], and `find_engram` on the base side),
+    /// while the address check in front of a draft write deliberately does not
+    /// treat a title as an address - so a document that renames its own
+    /// permalink to another engram's title stands at the granted path and
+    /// resolves to the other one from the next save on. This is the room's
+    /// counterpart of [`Engine::screen_granted_path`], which refuses the same
+    /// move for a request carrying a join, and it speaks the same sentence.
+    ///
+    /// The refusal is an ordinary save refusal: the room stays open, the text
+    /// stays in the document, and the author is told why - which is the right
+    /// outcome for "this document now claims to be a different page".
+    ///
+    /// One gate a request meets is deliberately absent, because it is not
     /// about this caller: the teaching refusal for a name only a share-link
     /// resolves (a room resolves through the owner's own view, where the page
-    /// is simply there), and the grant-and-join screen (the door that opened
-    /// the room made that decision once, at the upgrade, rather than four
-    /// times a second).
+    /// is simply there). The grant-and-join decision is the door's, made once
+    /// at the upgrade rather than four times a second - and the screen below
+    /// is what keeps that decision true for the life of the room.
     ///
     /// The receipt is the overlay one: `draft: true`, and the permalink the
     /// draft answers to after the write, which an author who edited the
@@ -4170,12 +4204,20 @@ impl Engine {
         &self,
         view: &DomainView<'_>,
         p: &SaveParams,
+        expected_path: &str,
     ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
         refuse_not_an_engram(&p.content)?;
         let (desc, source) = view.resolve(&p.identifier).await?;
+        if desc.path != expected_path {
+            return Err(EngineError::Refused(joined_write_is_elsewhere(
+                view.writing_actor()?,
+                expected_path,
+                &desc.path,
+            )));
+        }
         // The same two reserved screens the request-driven save makes, on the
         // resolved path, which is the authority on what would be written.
         if crystalline_core::is_reserved_path(&desc.path) {
@@ -4605,11 +4647,10 @@ impl Engine {
                         &join.path,
                     )));
                 }
-                return Err(EngineError::Refused(format!(
-                    "this session is working inside {}'s draft of '{}', so a write to '{}' has \
-                     nowhere to land: leave that draft first, and the write goes back to being \
-                     your own",
-                    join.owner, join.path, path
+                return Err(EngineError::Refused(joined_write_is_elsewhere(
+                    &join.owner,
+                    &join.path,
+                    path,
                 )));
             }
             return Ok(());
