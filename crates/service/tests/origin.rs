@@ -5411,7 +5411,9 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
     .await
     .unwrap();
 
-    let before = crystalline_service::nudge::share_walks();
+    // Counted for this domain's own folder, which is this test's tempdir: a
+    // sibling test in this binary walks its own team domain, and `cargo test`
+    // runs the two as threads in one process.
     assert!(
         crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
             .await
@@ -5419,7 +5421,7 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
         "a domain that owes nothing has nothing to ask about"
     );
     assert_eq!(
-        crystalline_service::nudge::share_walks() - before,
+        crystalline_service::nudge::share_walks_for(&root),
         1,
         "the first receipt pays for the walk"
     );
@@ -5437,7 +5439,7 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
         "the second receipt answers from the memo, which has not seen the new file"
     );
     assert_eq!(
-        crystalline_service::nudge::share_walks() - before,
+        crystalline_service::nudge::share_walks_for(&root),
         1,
         "and it pays for no second walk inside the memo window"
     );

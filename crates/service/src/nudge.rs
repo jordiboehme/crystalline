@@ -146,6 +146,13 @@ const SHARE_MEMO_TTL: Duration = Duration::from_secs(60);
 static SHARE_MEMO: LazyLock<Mutex<HashMap<String, (Instant, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// What one team domain's folder is keyed by, in the memo and in the walk
+/// counter beside it, so the two can never disagree about which folder an entry
+/// is about.
+fn memo_key(root: &Path) -> String {
+    root.display().to_string()
+}
+
 /// Take [`SHARE_MEMO`], ignoring poisoning: a panicking reader leaves a map
 /// that is still a map, and a cost bound is no reason to bring a daemon down.
 fn memo() -> std::sync::MutexGuard<'static, HashMap<String, (Instant, u64)>> {
@@ -154,27 +161,45 @@ fn memo() -> std::sync::MutexGuard<'static, HashMap<String, (Instant, u64)>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// How many times the share arm has gone past the memo to an actual walk, for
-/// the test that pins the memo. A test seam: neither the counter nor its
-/// increment is compiled into a released binary.
+/// How many times the share arm has gone past the memo to an actual walk, per
+/// folder, for the test that pins the memo. A test seam: neither the counter
+/// nor its increment is compiled into a released binary.
+///
+/// **Per folder rather than one total for the process**, under the same key the
+/// memo itself uses. Two tests in one binary walk two different temporary
+/// domains, and `cargo test` runs a binary's tests as threads in one process,
+/// so a single total would make each one's assertion depend on when the other
+/// happened to run. Keyed, each test reads only its own folder's walks, and a
+/// third test added later changes nothing.
 #[cfg(any(test, feature = "testing"))]
-static SHARE_WALKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SHARE_WALKS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// How many walks this process has paid for since it started.
+/// How many walks this process has paid for on `root`'s folder since it
+/// started.
 #[cfg(any(test, feature = "testing"))]
-pub fn share_walks() -> u64 {
-    SHARE_WALKS.load(std::sync::atomic::Ordering::Relaxed)
+pub fn share_walks_for(root: &Path) -> u64 {
+    SHARE_WALKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&memo_key(root))
+        .copied()
+        .unwrap_or(0)
 }
 
-/// Count one paid walk. A no-op in a released binary.
+/// Count one paid walk on `key`. A no-op in a released binary.
 #[cfg(any(test, feature = "testing"))]
-fn count_walk() {
-    SHARE_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn count_walk(key: &str) {
+    *SHARE_WALKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.to_string())
+        .or_default() += 1;
 }
 
-/// Count one paid walk. A no-op in a released binary.
+/// Count one paid walk on `key`. A no-op in a released binary.
 #[cfg(not(any(test, feature = "testing")))]
-fn count_walk() {}
+fn count_walk(_key: &str) {}
 
 /// The one line a write receipt carries, or `None` when nothing is due.
 ///
@@ -316,13 +341,13 @@ async fn unshared_team_work(
 /// moment is retried on the next receipt rather than cached as "owes nothing"
 /// for a minute.
 async fn walked_unshared(engine: &Engine, name: &str, root: &Path) -> u64 {
-    let key = root.display().to_string();
+    let key = memo_key(root);
     if let Some((at, count)) = memo().get(&key)
         && at.elapsed() < SHARE_MEMO_TTL
     {
         return *count;
     }
-    count_walk();
+    count_walk(&key);
     match engine.unshared_change_count(name).await {
         Some(count) => {
             memo().insert(key, (Instant::now(), count));
