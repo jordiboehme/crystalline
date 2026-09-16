@@ -1391,3 +1391,135 @@ async fn a_discarding_leave_closes_the_room_without_publishing_its_text() {
     let closed = wait_for_control(&mut his, "closed").await;
     assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
 }
+
+/// The other two endings a join has, driven through to the socket.
+///
+/// Revoking a link and pressing Leave are asserted above; these are the two
+/// that end a join from the DRAFT's side rather than from the link's - its
+/// author moves it, or takes it back - and both reach the same registry the
+/// tick asks. The owner's own room is not a guest of anything, so it stays;
+/// what it meets instead is the deletion-conflict flow, which is the one that
+/// keeps her text and lets her put it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_by_the_owner_closes_the_guests_socket() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+
+    let mut hers = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh",
+        Some(&alice.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut hers).await;
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut his).await;
+
+    fx.engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "fresh".to_string(),
+                domain: "team".to_string(),
+                destination: "notes/fresh.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .expect("her own draft is hers to move");
+
+    let closed = wait_for_control(&mut his, "closed").await;
+    assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
+
+    // Hers stands: a move is the end of a join, not of a room.
+    let doc = client_doc();
+    hers.send(binary(step1(&doc))).await.unwrap();
+    let _ = next_sync_step2(&mut hers).await;
+}
+
+/// Discarding one draft - the author takes it back, outside any fold - ends
+/// the joins into it, and the author's own room meets the deletion conflict
+/// rather than losing what it was holding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discarded_draft_evicts_its_guest_and_leaves_its_author_the_conflict() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+
+    let mut hers = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh",
+        Some(&alice.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut hers).await;
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut his).await;
+
+    fx.engine
+        .delete_engram_as(
+            &crystalline_service::params::DeleteParams {
+                identifier: "fresh".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .expect("her own draft is hers to take back");
+
+    let closed = wait_for_control(&mut his, "closed").await;
+    assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
+
+    // Her own room is still there, and what it meets is the conflict that
+    // keeps her text: the page she was editing is not there to save into.
+    let doc = client_doc();
+    hers.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut hers).await;
+    apply(&doc, &step2);
+    let update = append_line(&doc, "still typing");
+    hers.send(binary(update_frame(&update))).await.unwrap();
+    hers.send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    let raised = wait_for_control(&mut hers, "conflict").await;
+    let Control::Conflict { conflict_kind, .. } = &raised else {
+        panic!("the room is told its page is gone: {raised:?}")
+    };
+    assert_eq!(conflict_kind, "deleted");
+}

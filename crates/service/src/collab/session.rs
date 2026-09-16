@@ -458,6 +458,14 @@ pub struct CollabSession {
     /// The engine every durable read and write goes through.
     engine: Arc<Engine>,
     tx: broadcast::Sender<Frame>,
+    /// Whether anybody is in this room as somebody's guest, so a tick over a
+    /// room nobody joined into costs no lock at all.
+    ///
+    /// Written only under the state guard, and always to `!guests.is_empty()`
+    /// as that guard sees it, so it cannot say "nobody" while a guest stands
+    /// in the map - which would be a session left inside a draft it had been
+    /// put out of.
+    has_guests: AtomicBool,
     /// The room is over: the registry dropped it, or a saver pass panicked.
     /// Ends the saver loop and makes every save path a no-op, so nothing can
     /// write through a session no one owns any more.
@@ -624,6 +632,7 @@ impl CollabSession {
             registry,
             engine,
             tx,
+            has_guests: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
             state: Mutex::new(SessionState {
                 separator: separator_of(&loaded.content),
@@ -795,11 +804,9 @@ impl CollabSession {
     /// Called by the upgrade route once it has decided the connection may be
     /// here at all; a room over nobody's draft never has one.
     pub async fn watch_guest(&self, conn: ConnId, account: &str) {
-        self.state
-            .lock()
-            .await
-            .guests
-            .insert(conn, account.to_string());
+        let mut state = self.state.lock().await;
+        state.guests.insert(conn, account.to_string());
+        self.has_guests.store(true, Ordering::Relaxed);
     }
 
     /// Close every connection whose join into this draft has ended.
@@ -820,10 +827,10 @@ impl CollabSession {
         let Some(owner) = self.overlay.as_deref() else {
             return; // a document nobody joined into cannot be left
         };
-        let mut state = self.state.lock().await;
-        if state.guests.is_empty() {
-            return;
+        if !self.has_guests.load(Ordering::Relaxed) {
+            return; // asked four times a second, and almost always here
         }
+        let mut state = self.state.lock().await;
         let path = state.path.clone();
         let joins = self.engine.joins();
         let ended: Vec<ConnId> = state
@@ -834,6 +841,8 @@ impl CollabSession {
             .collect();
         for conn in ended {
             state.guests.remove(&conn);
+            self.has_guests
+                .store(!state.guests.is_empty(), Ordering::Relaxed);
             let _ = self.tx.send(Frame {
                 from: None,
                 to: Some(conn),
@@ -848,6 +857,8 @@ impl CollabSession {
     pub async fn remove_conn(&self, conn: ConnId) -> bool {
         let mut state = self.state.lock().await;
         state.guests.remove(&conn);
+        self.has_guests
+            .store(!state.guests.is_empty(), Ordering::Relaxed);
         let ids = state.conns.remove(&conn).unwrap_or_default();
         if !ids.is_empty() {
             // Null this connection's awareness states for everyone else: the
@@ -1497,15 +1508,33 @@ impl CollabSession {
         // save_engram refuses a missing file by design, so the room's text
         // goes back through the restore verb instead.
         let file = Self::file_text_locked(state);
-        // Through the room's own view, for the reason the save goes through
-        // it: a room over one actor's draft puts its text back in that
-        // actor's draft, and a room over the document a direct domain keeps
-        // puts it back in the folder.
-        match self
-            .engine
-            .restore_engram_in_view(&view, &self.domain, &state.path, &file)
-            .await
-        {
+        // Through the room's own view when the room is over a draft - it puts
+        // its text back in that actor's draft - and through the scope its save
+        // uses otherwise. The two arms have to agree, and the save's `None`
+        // arm goes through `Scope::Unrestricted`: routing a base room's
+        // restore through the base view instead would write the folder of a
+        // domain that reviews changes, which is the one thing review mode
+        // exists to stop. Neither arm is reachable from the collab route in a
+        // reviewing domain, which always names an owner; the registry API can
+        // still ask for it, and this is the answer it gets.
+        let restored = match view.actor() {
+            Some(_) => {
+                self.engine
+                    .restore_engram_in_view(&view, &self.domain, &state.path, &file)
+                    .await
+            }
+            None => {
+                self.engine
+                    .restore_engram(
+                        &self.domain,
+                        &state.path,
+                        &file,
+                        &crate::scope::Scope::Unrestricted,
+                    )
+                    .await
+            }
+        };
+        match restored {
             Ok(receipt) => {
                 let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
                 let permalink = receipt["permalink"]

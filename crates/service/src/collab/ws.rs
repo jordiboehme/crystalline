@@ -131,9 +131,13 @@ pub async fn join(
     // registered by this line, so it unwinds through the same `finish` a
     // failed upgrade does.
     //
-    // It is also what makes the saver's eviction lookup sound: that asks the
-    // join registry about the ROOM's path, and this is where the room's path
-    // and the join's path are made the same path.
+    // It is also the first half of what makes the saver's eviction lookup
+    // sound: that asks the join registry about the ROOM's path, and this is
+    // where the room's path and the join's path are first made the same path.
+    // The second half is `CollabSession`'s pinned path, which is what keeps
+    // them the same on every tick after this one - a room's address is
+    // re-derived from its own text at every save, and the pin is what stops
+    // that text from moving the room.
     if let Some(granted) = &room.granted
         && joined.session.path().await != *granted
     {
