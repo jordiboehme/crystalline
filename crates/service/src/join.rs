@@ -353,12 +353,20 @@ impl Joins {
         found
     }
 
-    /// End one join. `false` when the key names none of `account`'s, which is
-    /// what an already-closed join and somebody else's key both answer.
-    pub fn close(&self, key: &str, account: &str) -> bool {
+    /// End one join. `false` when the key names none of `account`'s
+    /// `holder`'s, which is what an already-closed join, somebody else's key
+    /// and another holder of the same account all answer.
+    ///
+    /// **Guarded on the holder too, not the account alone.** One account can
+    /// hold several joins at once through several holders - another window
+    /// of the same person, that person's agent - and each is its own object
+    /// with its own lifetime; a close keyed on the account alone would let
+    /// one holder end another's join, closing a page out from under whoever
+    /// actually opened it.
+    pub fn close(&self, key: &str, account: &str, holder: &Holder) -> bool {
         let mut open = self.lock();
         match open.get(key) {
-            Some(held) if held.join.account == account => {
+            Some(held) if held.join.account == account && &held.join.holder == holder => {
                 open.remove(key);
                 true
             }
@@ -477,9 +485,61 @@ mod tests {
             None,
             "somebody else presenting it is told what an invented key is told"
         );
-        assert!(!joins.close(&key, "carol"), "and cannot end it either");
-        assert!(joins.close(&key, "bob"));
+        assert!(
+            !joins.close(&key, "carol", &browser("bob")),
+            "and cannot end it either"
+        );
+        assert!(joins.close(&key, "bob", &browser("bob")));
         assert_eq!(joins.get(&key, "bob"), None, "a closed join is gone");
+    }
+
+    /// One account, two holders - another window of the same person, and
+    /// that person's agent - each holding their own join over the same page.
+    /// One cannot close the other's key: `close` is guarded on the holder,
+    /// not the account alone, so a browser tab leaving does not close out
+    /// from under the agent working the same draft, and the reverse.
+    #[test]
+    fn one_holder_of_an_account_cannot_close_another_holders_key() {
+        let joins = Joins::default();
+        let agent = Join {
+            holder: Holder::Process(1),
+            ..join("bob")
+        };
+        let browser_key = joins.open(join("bob")).unwrap();
+        let agent_key = joins.open(agent).unwrap();
+        assert_ne!(
+            browser_key, agent_key,
+            "two holders of one account over one page are two joins"
+        );
+
+        assert!(
+            !joins.close(&agent_key, "bob", &browser("bob")),
+            "the browser holder cannot close the agent's key"
+        );
+        assert_eq!(
+            joins.get(&agent_key, "bob"),
+            Some(Join {
+                holder: Holder::Process(1),
+                ..join("bob")
+            }),
+            "which is still open"
+        );
+
+        assert!(
+            !joins.close(&browser_key, "bob", &Holder::Process(1)),
+            "and the agent cannot close the browser's key either"
+        );
+        assert_eq!(
+            joins.get(&browser_key, "bob"),
+            Some(join("bob")),
+            "which is still open too"
+        );
+
+        assert!(
+            joins.close(&agent_key, "bob", &Holder::Process(1)),
+            "each holder can still close its own"
+        );
+        assert!(joins.close(&browser_key, "bob", &browser("bob")));
     }
 
     /// Joining a draft you are already inside is not a second piece of work.
@@ -494,7 +554,7 @@ mod tests {
         let first = joins.open(join("bob")).unwrap();
         let again = joins.open(join("bob")).unwrap();
         assert_eq!(first, again, "one join, one key");
-        assert!(joins.close(&first, "bob"));
+        assert!(joins.close(&first, "bob", &browser("bob")));
         assert_eq!(joins.get(&again, "bob"), None, "and one Leave ends it");
 
         // Another draft is another join, which is the half this must not break.
@@ -748,7 +808,7 @@ mod tests {
         assert!(!joins.holds("bob", &browser("bob"), "team", "carol", "plan.md"));
         assert!(!joins.holds("bob", &browser("bob"), "other", "alice", "plan.md"));
         assert!(!joins.holds("bob", &browser("bob"), "team", "alice", "charter.md"));
-        joins.close(&key, "bob");
+        joins.close(&key, "bob", &browser("bob"));
         assert!(
             !joins.holds("bob", &browser("bob"), "team", "alice", "plan.md"),
             "and leaving ends it"

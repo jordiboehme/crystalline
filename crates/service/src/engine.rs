@@ -2537,7 +2537,7 @@ impl Engine {
             &state_dir, domain, actor, &desc.path,
         ) {
             Ok(()) => None,
-            Err(e) => Some(unmirrored(domain, actor, &desc.path, &e)),
+            Err(e) => Some(unmirrored(domain, actor, &desc.path, &e, true)),
         };
         if let Some(text) = &warning {
             tracing::warn!(domain, actor, path = desc.path.as_str(), "{text}");
@@ -2901,9 +2901,21 @@ impl Engine {
     /// Write one domain's convergence record, and never fail a pull over it.
     ///
     /// The record is a report, and the rows and mirrors it describes have
-    /// already moved by the time it is written: a record this machine could not
-    /// save is a status that is behind, which the next pass corrects, and
-    /// failing here would turn that into a failed pull over work that landed.
+    /// already moved by the time it is written: failing here would turn a
+    /// record this machine could not save into a failed pull over work that
+    /// landed, so it only warns.
+    ///
+    /// **That "the next pass corrects it" is only half true.** A stale record
+    /// is a subset of the truth for an entry that is still there but should
+    /// have been cleared - the next pass that touches that path settles it
+    /// correctly either way. It is not a subset for an entry that is MISSING:
+    /// a path that diverged this pass and never made it into the saved
+    /// record because the save failed settles as `Leave` on every later pass
+    /// that does not touch it again, forever. Not a regression against the
+    /// in-memory record this replaced, which had the same window (a crash
+    /// before it was written loses it the same way) and a wider one (it did
+    /// not survive a restart at all either), so this is a known gap rather
+    /// than new behaviour.
     ///
     /// **Every caller holds the domain's origin lock.** The whole struct is
     /// written at once - the conflicts and the proposal owners beside them - so
@@ -3119,6 +3131,19 @@ impl Engine {
     /// of anybody's knowledge, and a proposal whose owner is not recorded reads
     /// as somebody else's - which is the safe way round, since it never tells
     /// one actor to withdraw a proposal that is not theirs.
+    ///
+    /// **Last writer wins, not first**, which matters only once more than one
+    /// actor can touch one open proposal: while `REVIEW_NO_STACKING` refuses a
+    /// second actor's share against an open proposal, this is never called
+    /// twice for the same number by two different actors, so the map's one
+    /// entry is always the opener's. If a later design serves stacked
+    /// proposals and calls this for a second sharer, the insert here
+    /// overwrites the recorded owner with the last sharer rather than keeping
+    /// the opener - the map is also never pruned of a merged or closed
+    /// proposal, only a withdrawn one. Both are tracked in `plans/backlog.md`
+    /// beside the per-actor proposal chain entry, not fixed here: neither is
+    /// reachable while one proposal at a time is enforced upstream of this
+    /// map.
     fn record_proposal_actor(&self, domain: &str, number: u64, actor: Option<&str>) {
         let Ok(journal_dir) = self.journal_state_dir() else {
             return;
@@ -3824,6 +3849,41 @@ impl Engine {
         Ok((rel, permalink))
     }
 
+    /// Whether `permalink` already answers for somebody at another path than
+    /// `rel`, from this writer's own point of view: the writer's own shadowed
+    /// view in review mode (a name another actor is drafting under is free,
+    /// and a path this writer has tombstoned is free again), the plain index
+    /// otherwise. `None` means free; `Some(path)` names where it is taken.
+    ///
+    /// Shared by [`Engine::write_engram_present`]'s two collision checks - the
+    /// early, unlocked one that answers before `build_markdown` can raise a
+    /// different error, and the later one under the write lock that is the
+    /// actual race guard - so the two can never drift into two readings of
+    /// "taken".
+    async fn permalink_taken(
+        &self,
+        domain: &str,
+        rel: &str,
+        permalink: &str,
+        overlay_draft: Option<(&str, DomainId)>,
+    ) -> Result<Option<String>> {
+        let store = self.store.lock().await;
+        Ok(match overlay_draft {
+            Some((actor, domain_id)) => match store.overlay_entry(domain_id, actor, rel).await? {
+                Some(entry) if entry.tombstone => None,
+                Some(entry) => Some(entry.path),
+                None => store
+                    .find_engram(domain, permalink)
+                    .await?
+                    .map(|existing| existing.path),
+            },
+            None => store
+                .find_engram(domain, permalink)
+                .await?
+                .map(|existing| existing.path),
+        })
+    }
+
     /// Create or overwrite an engram, then index it. A file domain writes the
     /// markdown file first (files-are-truth) then reindexes it from disk; a
     /// virtual domain builds the markdown in memory and indexes it straight into
@@ -3925,10 +3985,41 @@ impl Engine {
                 .await?;
         }
 
-        // The document this capture would land, built before any lock is taken
-        // because nothing about it needs one: it is the caller's own arguments
-        // plus this instant, and a call that cannot produce a well-formed
-        // engram is better refused with no lock in hand.
+        // The domain's index id, resolved once here rather than once per
+        // collision check below: `overlay` and its domain id can never
+        // diverge, so the pair is paired in the type rather than re-paired at
+        // every read.
+        let overlay_draft = match overlay {
+            Some(actor) => Some((actor, self.domain_source(&p.domain).await?.0)),
+            None => None,
+        };
+
+        // **Ahead of `build_markdown`, deliberately.** A malformed capture at
+        // a permalink that is already taken answers "permalink already
+        // exists", the more useful of the two messages and the one this verb
+        // gave before `build_markdown` was hoisted ahead of the collision
+        // check: `build_markdown` can refuse on unbuildable content (a bad
+        // date, a malformed `verified` entry), and that refusal must not hide
+        // a plainer one this writer could already act on. Unlocked and
+        // best-effort - the actual race guard is the second, locked check
+        // below, right before the write it authorizes - so a permalink freed
+        // or taken between the two still gets the correct, authoritative
+        // answer there.
+        if !p.overwrite
+            && let Some(at) = self
+                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+                .await?
+        {
+            return Err(EngineError::Conflict(format!(
+                "permalink '{permalink}' already exists in domain '{}' (at {at}); pass overwrite=true to replace",
+                p.domain
+            )));
+        }
+
+        // The document this capture would land, built before any file lock is
+        // taken because nothing about it needs one: it is the caller's own
+        // arguments plus this instant, and a call that cannot produce a
+        // well-formed engram is better refused with no lock in hand.
         let today = chrono::Utc::now().date_naive();
         let now = now_offset();
         // The model the agent reported, held against the actor this write
@@ -3989,7 +4080,13 @@ impl Engine {
         // capture would pass the check and morph the open page into a brand
         // new engram with a receipt saying "created". A capture that never
         // asked to replace anything takes the ordinary create path beside the
-        // room instead.
+        // room instead. Nothing is silently clobbered once it does: the room's
+        // next save still carries the checksum of the version it read, the CAS
+        // against the file this capture just wrote refuses, and the save falls
+        // into the external-change path instead (`raise_deleted` when the
+        // engram is absent, `merge_external` when it is present - which it now
+        // is) - so the person is shown a merge or a conflict against the
+        // capture's engram, never an overwrite of it.
         if p.overwrite
             && let Some(rooms) = self.collab_rooms()
             && rooms.has_live_room(&p.domain, &permalink, overlay).await
@@ -4008,19 +4105,14 @@ impl Engine {
             // names who is about to watch the page change under them.
             receipt["landed"] = json!("live");
             receipt["present"] = json!(applied.participants);
-            // The tails, and which of them this arm owes. The generated folder
-            // indexes and the embedding nudge describe bytes that are nowhere
-            // yet, so they belong to the room's saver, which runs both when the
-            // text lands (`Engine::save_engram`). The routing cache is asked
-            // for here too, because a virtual domain's MANIFEST is the one
-            // engram whose text is also configuration and this arm must never
-            // be the place a stale routing block hides: it reads the row the
-            // saver will write, so at this instant it confirms the cache
-            // rather than moving it, and the move itself is pinned end to end
-            // by `a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache`.
-            if matches!(source, ContentSource::Virtual) {
-                self.refresh_routing_cache().await;
-            }
+            // The tails, and which of them this arm owes: none of them. The
+            // generated folder indexes, the embedding nudge and - for a
+            // virtual domain whose MANIFEST is the one engram whose text is
+            // also configuration - the routing cache all describe bytes that
+            // are nowhere yet, so all three belong to the room's saver, which
+            // runs them when the text lands (`Engine::save_engram`), pinned
+            // end to end by
+            // `a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache`.
             return Ok(receipt);
         }
 
@@ -4039,57 +4131,28 @@ impl Engine {
             None => None,
         };
 
-        // The domain's index id, resolved once: the two arms below both need
-        // it, and the overlay check above needs it before either runs.
-        // Resolved here only when the collision check below needs it, which is
-        // only in review mode: the overlay probe is keyed on the domain's id
-        // where the base probe is keyed on its name. A direct write resolves it
-        // in its own arm after the file is written, exactly where it always
-        // did, so a create this call is about to refuse leaves behind no
-        // `domain` row it would not have created before.
-        let overlay_domain_id = match overlay {
-            Some(_) => Some(self.domain_source(&p.domain).await?.0),
-            None => None,
-        };
-
-        // Enforce overwrite semantics against what this writer can see there.
-        // On a direct domain that is the index row; on a domain in review mode
-        // it is the writer's own shadowed view, so a name another actor is
-        // drafting under is free (their draft is not an answer to anybody
-        // else) and a path this writer has tombstoned is free again (they see
-        // nothing there).
+        // Enforce overwrite semantics against what this writer can see there,
+        // one more time, now under the write lock: the check above is
+        // unlocked and answers only for the nicer message ahead of
+        // `build_markdown`, so two concurrent creates of one title racing
+        // each other past it must still be caught HERE, atomically with the
+        // write below - `overlay_draft` was resolved once, above, and is
+        // reused rather than re-paired.
+        if !p.overwrite
+            && let Some(at) = self
+                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+                .await?
         {
-            let store = self.store.lock().await;
-            let taken = match (overlay, overlay_domain_id) {
-                (Some(actor), Some(domain_id)) => {
-                    match store.overlay_entry(domain_id, actor, &rel).await? {
-                        Some(entry) if entry.tombstone => None,
-                        Some(entry) => Some(entry.path),
-                        None => store
-                            .find_engram(&p.domain, &permalink)
-                            .await?
-                            .map(|existing| existing.path),
-                    }
-                }
-                _ => store
-                    .find_engram(&p.domain, &permalink)
-                    .await?
-                    .map(|existing| existing.path),
-            };
-            if let Some(at) = taken
-                && !p.overwrite
-            {
-                return Err(EngineError::Conflict(format!(
-                    "permalink '{permalink}' already exists in domain '{}' (at {at}); pass overwrite=true to replace",
-                    p.domain
-                )));
-            }
+            return Err(EngineError::Conflict(format!(
+                "permalink '{permalink}' already exists in domain '{}' (at {at}); pass overwrite=true to replace",
+                p.domain
+            )));
         }
 
         // The third place a write can land, and the reason it comes first: on a
         // domain in review mode the folder and the database both stay as the
         // team left them, so neither arm below may run.
-        if let (Some(_), Some(domain_id)) = (overlay, overlay_domain_id) {
+        if let Some((_, domain_id)) = overlay_draft {
             let warning = view.write(domain_id, &rel, &markdown).await?;
             receipt["draft"] = json!(true);
             // Whose draft it landed in, when that is not the caller's own, in
@@ -4162,6 +4225,16 @@ impl Engine {
     /// refuses with [`EngineError::ReadOnly`] a moment later, and asking
     /// somebody to authorize what the server will refuse anyway is a question
     /// in the wrong words.
+    ///
+    /// **This answers for a REPLACEMENT, and says nothing about whether the
+    /// call in front of it is one.** [`Engine::write_engram_present`]'s live
+    /// arm only takes a found room when `p.overwrite` is also true - that is
+    /// the arm's own precondition, not a room-existence question - and this
+    /// preview tests nothing of the kind: it is right today only because
+    /// every caller gates it on `p.overwrite` itself (`mcp.rs`'s `wholesale`
+    /// check) before ever asking. A caller that asked "is there a document to
+    /// confirm replacing" without repeating that gate would be handed a
+    /// question about a capture that will never take the live arm.
     pub async fn live_write_target(
         &self,
         p: &WriteParams,
@@ -14657,6 +14730,16 @@ impl Engine {
         // and its view already fallen back to the folder - would otherwise
         // publish into the reviewed tree the one text this call said must not
         // go there.
+        //
+        // **This trusts `choices` to be total, and that trust is load
+        // bearing.** `discarded` is read straight off the confirmed map above
+        // with no further check that every drafting actor is in it -
+        // `review::choices`'s own refusal a few lines up is what makes the
+        // set total, by answering `ConfirmationRequired` for any actor its
+        // caller left out. If that refusal ever loosens, an actor holding
+        // drafts but missing from the map would fall through this filter
+        // unnamed, and their room would save into the tree rather than close
+        // discarding - the publish this call exists to prevent.
         self.write_review_key(domain, None)?;
         let discarded: HashSet<String> = choices
             .iter()
@@ -16184,10 +16267,12 @@ impl Engine {
                     object.insert("drafts".to_string(), everyone);
                 }
                 // What the last pull's convergence did here, absent until a
-                // pull has run against this domain in this process. Absent
-                // rather than zeroed, for the reason `behind` is null when
-                // nothing probed it: "nothing converged" and "nothing has
-                // looked yet" are different answers.
+                // pull has converged something or flagged a conflict for this
+                // domain - read off the durable record beside the journal, so
+                // a restart does not turn "nothing has looked yet" into
+                // "nothing converged". Absent rather than zeroed, for the
+                // reason `behind` is null when nothing probed it: the two are
+                // different answers.
                 if let Some(converged) = converged {
                     object.insert("converged".to_string(), converged.clone());
                 }
@@ -17569,7 +17654,12 @@ impl Engine {
 
     /// One domain's origin state directory (base snapshot, conflict records,
     /// `state.json`).
-    fn origin_state_dir(&self, domain: &str) -> Result<PathBuf> {
+    ///
+    /// `pub(crate)` rather than private: [`crate::nudge::memo_key`] keys its
+    /// share-walk memo on this path beside a domain's folder, because two
+    /// domain names can register the same folder under different origins
+    /// directories, and the memoized answer depends on which one.
+    pub(crate) fn origin_state_dir(&self, domain: &str) -> Result<PathBuf> {
         Ok(self.origins_base_dir()?.join(domain))
     }
 
@@ -20856,18 +20946,80 @@ pub(crate) fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
 /// What a draft's receipt says when the row landed and this machine could not
 /// mirror it under the state directory.
 ///
-/// Teaching text rather than a diagnostic: the draft is there and usable, the
-/// one thing that would lose it is named, and so is the way to make the copy
-/// exist again. The underlying error rides along because the cause is almost
-/// always a state directory that is not writable, which the reader can see and
-/// fix.
-pub(crate) fn unmirrored(domain: &str, actor: &str, path: &str, reason: &std::io::Error) -> String {
-    format!(
-        "the draft of '{path}' landed in the index, but this machine could not mirror it under \
-         its state directory ({reason}), so a 'crystalline reindex --wipe' would lose it; make \
-         the overlays folder for domain '{domain}' writable and write again to mirror it, or \
-         share the change while it is still here. Nobody but '{actor}' can see it either way."
-    )
+/// One string for both shapes a draft's mirror can take: an ordinary write,
+/// and a tombstone, which `deleted` tells apart. Teaching text rather than a
+/// diagnostic: for a write, the draft is there and usable, the one thing that
+/// would lose it is named, and so is the way to make the copy exist again.
+/// For a tombstone a wipe does not lose an edit, it drops the tombstone row
+/// itself and finds nothing in the journal to restore, so the base row comes
+/// back - the deletion is reverted and the engram reappears - and "write it
+/// again" is not a remedy there (the path already resolves as absent for its
+/// author, so a second delete only answers "no engram"). The underlying error
+/// rides along because the cause is almost always a state directory that is
+/// not writable, which the reader can see and fix.
+pub(crate) fn unmirrored(
+    domain: &str,
+    actor: &str,
+    path: &str,
+    reason: &std::io::Error,
+    deleted: bool,
+) -> String {
+    if deleted {
+        format!(
+            "the deletion of '{path}' landed in the index, but this machine could not mirror it \
+             under its state directory ({reason}), so a 'crystalline reindex --wipe' would drop \
+             the tombstone and find nothing in the journal to restore, bringing the base row back \
+             - the deletion is reverted and the engram reappears; make the overlays folder for \
+             domain '{domain}' writable, or share the change while it is still here. Nobody but \
+             '{actor}' can see it either way."
+        )
+    } else {
+        format!(
+            "the draft of '{path}' landed in the index, but this machine could not mirror it under \
+             its state directory ({reason}), so a 'crystalline reindex --wipe' would lose it; make \
+             the overlays folder for domain '{domain}' writable and write again to mirror it, or \
+             share the change while it is still here. Nobody but '{actor}' can see it either way."
+        )
+    }
+}
+
+#[cfg(test)]
+mod unmirrored_tests {
+    use super::*;
+
+    fn io_error() -> std::io::Error {
+        std::io::Error::other("permission denied")
+    }
+
+    /// The tombstone shape names the reappearance on a wipe and never offers
+    /// "write again", which is not a remedy for a deletion.
+    #[test]
+    fn the_tombstone_wording_names_reappearance_and_drops_write_again() {
+        let text = unmirrored("jordi", "human:jordi", "notes/old", &io_error(), true);
+        assert!(
+            text.contains("reappears"),
+            "tombstone wording must name the reappearance, got: {text}"
+        );
+        assert!(
+            !text.contains("write again"),
+            "tombstone wording must not offer to write again, got: {text}"
+        );
+        assert!(
+            text.contains("share the change while it is still here"),
+            "tombstone wording must still offer to share, got: {text}"
+        );
+    }
+
+    /// The ordinary draft shape keeps offering "write again", which is the
+    /// remedy a lost edit actually has.
+    #[test]
+    fn the_draft_wording_keeps_write_again() {
+        let text = unmirrored("jordi", "human:jordi", "notes/old", &io_error(), false);
+        assert!(
+            text.contains("write again"),
+            "draft wording must offer to write again, got: {text}"
+        );
+    }
 }
 
 /// A browse prefix as a lowercased folder prefix: empty for the root, and
@@ -21232,6 +21384,16 @@ fn build_markdown(
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
     crystalline_core::temporal::normalize_verified(&mut fm)
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
+    // `normalize_verified` promotes a caller-supplied `metadata.verified`
+    // into the typed field verbatim, model and all: it enforces the entry's
+    // SHAPE, not the same actor rule the verb path applies through
+    // `stamped_model` when this write stamps its OWN `generated.by`/model.
+    // Run every entry through it here too, or a `human:` actor named in
+    // `metadata.verified` keeps a model this same write would have dropped
+    // had it arrived through the verb instead.
+    for entry in &mut fm.verified {
+        entry.model = stamped_model(&entry.by, entry.model.as_deref());
+    }
 
     let engram = Engram {
         frontmatter: fm,

@@ -126,6 +126,7 @@ impl std::fmt::Debug for MintedLinkResponse {
 
 /// Which draft a listing is about.
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LinksQuery {
     /// The domain-relative path of the caller's own draft.
     pub path: String,
@@ -616,7 +617,13 @@ pub async fn leave(
     ApiJson(body): ApiJson<LeaveBody>,
 ) -> Result<StatusCode, ApiError> {
     let user = identity.require_account()?;
-    state.engine.joins().close(&body.key, &user.name);
+    // The same holder `join` above resolves the key to: another window of
+    // the same person, and that person's agent, hold their own keys and
+    // cannot end this one.
+    let holder = identity
+        .holder()
+        .unwrap_or_else(|| crate::join::Holder::Browser(format!("account:{}", user.name)));
+    state.engine.joins().close(&body.key, &user.name, &holder);
     Ok(StatusCode::NO_CONTENT)
 }
 

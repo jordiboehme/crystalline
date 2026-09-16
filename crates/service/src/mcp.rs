@@ -1118,11 +1118,17 @@ const AGENT_LABEL_CLIENT_CHARS: usize = 60;
 /// [`sanitize_actor`] folds whitespace into hyphens because `generated.by` is
 /// a token; a chip in a strip is a name, so the spaces stay and only what
 /// cannot be drawn goes. `None` when nothing legible is left.
+///
+/// A cut at [`AGENT_LABEL_CLIENT_CHARS`] carries a trailing `...`, so a
+/// truncated name reads as truncated rather than as the whole of what the
+/// client reported.
 fn display_client(raw: &str) -> Option<String> {
     let mut out = String::new();
     let mut gap = false;
+    let mut truncated = false;
     for c in raw.trim().chars() {
         if out.chars().count() >= AGENT_LABEL_CLIENT_CHARS {
+            truncated = true;
             break;
         }
         if c.is_whitespace() {
@@ -1137,6 +1143,9 @@ fn display_client(raw: &str) -> Option<String> {
             gap = false;
         }
         out.push(c);
+    }
+    if truncated {
+        out.push_str("...");
     }
     (!out.is_empty()).then_some(out)
 }
@@ -1296,9 +1305,12 @@ pub enum Transport {
 /// anything remembered in this one it would have forgotten.
 struct SessionJoins {
     registry: Arc<crate::join::Joins>,
-    /// `(key, account)` for every join this object opened whose holder ends
-    /// when this object does.
-    keys: std::sync::Mutex<Vec<(String, String)>>,
+    /// `(key, account, holder)` for every join this object opened whose
+    /// holder ends when this object does. The holder rides along with each
+    /// entry, rather than being assumed constant for the object, so `close`
+    /// is always asked to end the exact join this object opened - not just
+    /// one that happens to name the same account.
+    keys: std::sync::Mutex<Vec<(String, String, crate::join::Holder)>>,
 }
 
 impl SessionJoins {
@@ -1317,12 +1329,12 @@ impl SessionJoins {
             return;
         }
         let mut keys = self.lock();
-        if !keys.iter().any(|(held, _)| held == &key) {
-            keys.push((key, join.account.clone()));
+        if !keys.iter().any(|(held, ..)| held == &key) {
+            keys.push((key, join.account.clone(), join.holder.clone()));
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, String)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, String, crate::join::Holder)>> {
         self.keys.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -1332,8 +1344,8 @@ impl SessionJoins {
 /// remembered for it.
 impl Drop for SessionJoins {
     fn drop(&mut self) {
-        for (key, account) in self.lock().iter() {
-            self.registry.close(key, account);
+        for (key, account, holder) in self.lock().iter() {
+            self.registry.close(key, account, holder);
         }
     }
 }
@@ -2090,7 +2102,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document, so you always see what the person sees. Reading a live document is not a private act: you join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document, so you always see what the person sees. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -2139,7 +2151,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -4875,19 +4887,10 @@ fn refusal_or_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
 /// accounts to hold a member level, so that gate is not the one a
 /// review-mode domain's missing identity trips. Every other `Refused`
 /// message keeps [`to_error`]'s protocol shape, unchanged.
-fn overlay_write_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
-    match &e {
-        EngineError::Refused(message) if message == OVERLAY_NEEDS_IDENTITY => {
-            refuse(message.clone()).map(CallToolResponse::from)
-        }
-        _ => Err(to_error(e)),
-    }
-}
-
-/// [`overlay_write_error`], for the two write verbs whose tool function
-/// answers the bare [`CallToolResult`] rather than [`CallToolResponse`] -
-/// `move_engram` and `split_engram`, neither of which takes an elicitation
-/// round.
+///
+/// [`overlay_write_error`] is this, for the tool functions that answer
+/// [`CallToolResponse`] rather than the bare [`CallToolResult`] this reads:
+/// the two differ only in which shape wraps the same refusal.
 fn overlay_write_error_plain(e: EngineError) -> Result<CallToolResult, ErrorData> {
     match &e {
         EngineError::Refused(message) if message == OVERLAY_NEEDS_IDENTITY => {
@@ -4895,6 +4898,14 @@ fn overlay_write_error_plain(e: EngineError) -> Result<CallToolResult, ErrorData
         }
         _ => Err(to_error(e)),
     }
+}
+
+/// [`overlay_write_error_plain`], for the write verbs whose tool function
+/// answers [`CallToolResponse`] rather than the bare [`CallToolResult`] -
+/// every overlay write except `move_engram` and `split_engram`, neither of
+/// which takes an elicitation round.
+fn overlay_write_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
+    overlay_write_error_plain(e).map(CallToolResponse::from)
 }
 
 /// Map an engine error to an rmcp tool error with an actionable message.
@@ -4981,6 +4992,32 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// A client name past [`AGENT_LABEL_CLIENT_CHARS`] is cut, and the cut
+    /// carries a trailing `...` so it reads as a cut rather than as the
+    /// whole of what the client reported. A name at or under the cap is
+    /// untouched.
+    #[test]
+    fn display_client_marks_a_cut_name_as_cut() {
+        let long = "x".repeat(AGENT_LABEL_CLIENT_CHARS + 10);
+        let shown = display_client(&long).expect("a name of legible characters");
+        assert!(
+            shown.ends_with("..."),
+            "a truncated name must say so: {shown}"
+        );
+        assert_eq!(
+            shown.chars().count(),
+            AGENT_LABEL_CLIENT_CHARS + 3,
+            "the cap's characters plus the three that mark the cut: {shown}"
+        );
+
+        let exact = "y".repeat(AGENT_LABEL_CLIENT_CHARS);
+        let shown = display_client(&exact).expect("a name of legible characters");
+        assert_eq!(
+            shown, exact,
+            "a name at the cap exactly is not truncated and carries no mark"
+        );
+    }
 
     /// **Ruling M2.** On the tier where MCP authentication is off, nobody is
     /// authenticated and nothing is filed under a name - so however the client

@@ -360,14 +360,39 @@ pub(crate) fn by_actor(state_dir: &Path, domain: &str) -> DomainFiles {
         }
     };
     for actor in actors.flatten() {
-        if !actor.path().is_dir() {
-            continue;
-        }
         let Some(name) = actor.file_name().to_str().map(str::to_string) else {
             continue;
         };
         if one_segment(&name, "actor").is_err() {
             continue;
+        }
+        // The actor's own folder, asked about with the same explicit match the
+        // `files_dir` check below uses for the folder one level in, rather than
+        // through `Path::is_dir` - which answers `false` both for "not there"
+        // and for "cannot be determined", so a permission error on the actor
+        // folder itself used to read as "not a directory" and the actor was
+        // skipped silently, unflagged, in exactly the corner that match exists
+        // to catch. `symlink_metadata` so a dangling symlink is a thing that is
+        // there rather than a thing that is not.
+        match std::fs::symlink_metadata(actor.path()) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    domain = domain,
+                    actor = name.as_str(),
+                    "the actor folder of '{name}' could not be asked about: {e}"
+                );
+                per_actor.insert(
+                    name,
+                    FileRead {
+                        entries: Vec::new(),
+                        unreadable: true,
+                    },
+                );
+                continue;
+            }
+            Ok(meta) if !meta.is_dir() => continue,
+            Ok(_) => {}
         }
         // An actor with no files folder at all takes no part in this; one whose
         // folder exists is listed whatever is in it, empty and unreadable
@@ -707,6 +732,72 @@ mod tests {
 
         // Left as we found it, so the tempdir can be removed.
         std::fs::set_permissions(&bob, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// **The same corner, one directory further up: an actor folder that
+    /// cannot itself be stated is flagged, never skipped.**
+    ///
+    /// The same `Path::is_dir` swallow the fix above closed for the `files`
+    /// folder used to sit one line earlier too, over the actor folder itself:
+    /// a permission error asking whether `overlays/team/bob` is a directory
+    /// read as "not a directory" through `is_dir`'s `unwrap_or(false)`, and
+    /// bob was dropped from the listing with nothing to say why.
+    ///
+    /// Stat needs search permission on the PARENT to resolve a name, not on
+    /// the entry itself, so read-only-no-execute on the domain folder is what
+    /// breaks every actor's stat while still letting the domain-level
+    /// `read_dir` list their names (it only needs read). One permission bit
+    /// away from the fix-2 test above, which instead restricts one actor's
+    /// own folder to break the folder one level IN - here both actors are
+    /// affected, which is the honest shape of this corner: it sits above the
+    /// per-actor split, so a domain folder search permission problem catches
+    /// everyone under it, not one name.
+    #[cfg(unix)]
+    #[test]
+    fn an_actor_folder_that_cannot_be_stated_is_flagged_rather_than_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = dir();
+        let state = tmp.path();
+        put(state, "team", "alice", "assets/deck.png", PNG).unwrap();
+        put(state, "team", "bob", "assets/his.png", PNG).unwrap();
+
+        let domain = state.join("overlays/team");
+        std::fs::set_permissions(&domain, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if std::fs::symlink_metadata(domain.join("alice")).is_ok() {
+            std::fs::set_permissions(&domain, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipped: this process can stat through a read-only directory, so the \
+                 permission bits cannot discriminate here (a run as root)"
+            );
+            return;
+        }
+
+        let held = by_actor(state, "team");
+        assert!(
+            !held.unreadable,
+            "the domain folder itself was listable, only its entries could not be stated"
+        );
+        assert!(
+            matches!(held.unlistable(), Some(Some(_))),
+            "an actor whose folder could not be stated is named, not silently absent: \
+             {:?}",
+            held.unlistable()
+        );
+        assert!(
+            held.per_actor.contains_key("alice") && held.per_actor.contains_key("bob"),
+            "both are in the listing, or a fold's refusal could not name them and no \
+             sweep would ever reach them: {:?}",
+            held.per_actor.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            held.counts().is_empty(),
+            "neither answered, so neither has a count: {:?}",
+            held.counts()
+        );
+
+        // Left as we found it, so the tempdir can be removed.
+        std::fs::set_permissions(&domain, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// An answer that could not see everything says so, and a sidecar counts

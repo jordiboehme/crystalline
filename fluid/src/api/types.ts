@@ -4322,13 +4322,14 @@ export interface operations {
     };
     list_draft_links: {
         parameters: {
-            query?: never;
+            query: {
+                /** @description The domain-relative path of the caller's own draft. */
+                path: string;
+            };
             header?: never;
             path: {
                 /** @description The domain the draft is in. */
                 domain: string;
-                /** @description The domain-relative path of the caller's own draft. */
-                path: string;
             };
             cookie?: never;
         };

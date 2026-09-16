@@ -1545,7 +1545,7 @@
           },
           {
             "name": "path",
-            "in": "path",
+            "in": "query",
             "description": "The domain-relative path of the caller's own draft.",
             "required": true,
             "schema": {

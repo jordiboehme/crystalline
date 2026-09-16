@@ -1374,8 +1374,33 @@ fn wholesale_capture(title: &str, content: &str, overwrite: bool) -> WriteParams
     }
 }
 
-/// **Ruling C1.** No engine verb may compose into a co-editing room while it
-/// holds a per-path file write lock.
+/// The name a line declares a function under, if it declares one.
+///
+/// Shared by [`no_engine_function_composes_into_a_room_under_a_file_write_lock`]
+/// and [`declared_fn_re_attributes_lines_after_a_nested_fn`], the test that
+/// pins the one acknowledged limitation this exact shape has: it runs on
+/// every line before any comment skip, and it never resets - so a nested `fn`
+/// (this function is itself that shape, nested inside the guard until this
+/// round moved it out) re-points every later line at the nested name for the
+/// rest of the enclosing body. Neither `engine.rs` function this guard
+/// watches has that shape today, which is the whole of why the guard is
+/// still sound; the other test is what keeps that a checked fact rather than
+/// an assumption.
+fn declared_fn(line: &str) -> Option<&str> {
+    let rest = line.trim_start();
+    let rest = rest
+        .strip_prefix("pub(crate) ")
+        .or_else(|| rest.strip_prefix("pub "))
+        .unwrap_or(rest);
+    let rest = rest.strip_prefix("async ").unwrap_or(rest);
+    let rest = rest.strip_prefix("fn ")?;
+    let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    Some(&rest[..end])
+}
+
+/// **Ruling C1.** No engine function may make a room call - one that reaches
+/// into a [`CollabSessions`] room - while it holds a per-path file write
+/// lock.
 ///
 /// The two locks are taken in the opposite order by the room's own saver - it
 /// holds the session state lock across `Engine::save_engram`, which takes the
@@ -1384,35 +1409,41 @@ fn wholesale_capture(title: &str, content: &str, overwrite: bool) -> WriteParams
 /// times out: the file lock is held for ever, so every later write, edit, save
 /// or delete of that engram hangs and the person's unsaved work never lands.
 ///
+/// **Five needles, not one.** `apply_text` is the write; `has_live_room`,
+/// `live_text`, `participants` and `touch_agent_presence` are reads, and
+/// every one of the five reaches `state.lock()` on the very same session
+/// state lock the room's saver holds across the file lock - so a future
+/// function that took the file lock and then only READ the room, never
+/// wrote it, would wedge exactly the way C1 did, with a green suite if only
+/// the write were watched.
+///
 /// A source scan rather than a behavioural assertion, and for the reason the
 /// other guards in this repo are source scans: the failure is a lock taken one
 /// line too early, which no request can be written to provoke on demand - the
 /// window is a scheduling accident, so a test that drives the two at each
 /// other proves nothing when it passes. What CAN be checked exactly is the
-/// discipline: inside one function, the room call comes before the lock or not
-/// at all. `apply_source_edit_staged` is the shape this describes - its live
-/// arm returns above the arms that take locks - and the write's arm now stands
-/// the same way.
+/// discipline: inside one function, every room call comes before the lock or
+/// not at all. `apply_source_edit_staged` is the shape this describes - its
+/// live arm returns above the arms that take locks - and the write's arm now
+/// stands the same way.
 #[test]
 fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine.rs");
     let text = std::fs::read_to_string(&src).unwrap();
 
-    /// The name a line declares a function under, if it declares one.
-    fn declared_fn(line: &str) -> Option<&str> {
-        let rest = line.trim_start();
-        let rest = rest
-            .strip_prefix("pub(crate) ")
-            .or_else(|| rest.strip_prefix("pub "))
-            .unwrap_or(rest);
-        let rest = rest.strip_prefix("async ").unwrap_or(rest);
-        let rest = rest.strip_prefix("fn ")?;
-        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
-        Some(&rest[..end])
-    }
+    /// Every way an engine function reaches into a room, all of which take
+    /// the same session state lock the room's saver holds across the file
+    /// lock: the one write and the four reads.
+    const ROOM_ENTRY_NEEDLES: [&str; 5] = [
+        ".apply_text(",
+        ".has_live_room(",
+        ".live_text(",
+        ".participants(",
+        ".touch_agent_presence(",
+    ];
 
     // Per function, the first line that takes a file write lock and the first
-    // that composes into a room. A comment mentioning either is not a call, so
+    // that makes a room call. A comment mentioning either is not a call, so
     // the scan skips the comment lines the arms are thick with.
     let mut current = "<file scope>".to_string();
     let mut locked: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1428,7 +1459,10 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
         if code.contains(".write_lock(") {
             locked.entry(current.clone()).or_insert(i);
         }
-        if code.contains(".apply_text(") {
+        if ROOM_ENTRY_NEEDLES
+            .iter()
+            .any(|needle| code.contains(needle))
+        {
             composed.entry(current.clone()).or_insert(i);
         }
     }
@@ -1442,6 +1476,46 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
         "these engine functions take a file write lock and then compose into a room while holding \
          it, which deadlocks against the room's saver taking the two in the other order: \
          {offenders:?}"
+    );
+}
+
+/// **The acknowledged cost of the scan above, pinned rather than only
+/// described.** [`declared_fn`] runs on every line before any comment skip
+/// and never resets when a nested `fn` ends, so a needle after a nested `fn`
+/// is attributed to the NESTED name for the rest of the enclosing body, not
+/// to the function it is textually still inside. The guard's own real
+/// target, `apply_source_edit_staged` and the write's live arm, has no
+/// nested `fn` today, so this is a synthetic case rather than a finding
+/// against `engine.rs`; it is what stands between "the guard is sound" being
+/// a checked fact and an assumption a nested `fn` added later could quietly
+/// break.
+#[test]
+fn declared_fn_re_attributes_lines_after_a_nested_fn() {
+    let source = [
+        "fn outer() {",
+        "    fn inner() {",
+        "        let x = 1;",
+        "    }",
+        "    room.apply_text(x);",
+        "}",
+    ];
+    let mut current = "<file scope>".to_string();
+    let mut owner_of_needle = None;
+    for line in source {
+        if let Some(name) = declared_fn(line) {
+            current = name.to_string();
+        }
+        if line.trim_start().contains(".apply_text(") {
+            owner_of_needle = Some(current.clone());
+        }
+    }
+    assert_eq!(
+        owner_of_needle,
+        Some("inner".to_string()),
+        "the needle sits inside `outer`, past `inner`'s closing brace, but the scan's \
+         never-reset attribution names the nested function instead - this is the exact \
+         limitation the doc comment above describes, pinned so a fix to the scan (or a new \
+         nested fn in the real target that finally exercises it) has to touch this test too"
     );
 }
 

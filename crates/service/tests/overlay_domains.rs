@@ -2458,6 +2458,44 @@ async fn a_draft_in_an_unregistered_domain_is_not_an_answer() {
             "and it is the ordinary miss: {miss}"
         );
     }
+
+    // The same question through the two graph verbs, anchored at the draft
+    // itself: the sibling test above pins this for a domain the caller may
+    // not see, and a domain nobody registered has to answer the same way.
+    let anchor = "crystalline://ghost/plan";
+    for scope in [alice.clone(), Scope::Unrestricted] {
+        let context = f
+            .engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(1),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                &scope,
+            )
+            .await
+            .expect_err("build_context answers nothing for a domain nobody registered");
+        assert!(
+            context
+                .to_string()
+                .contains("no engram 'plan' in domain 'ghost'"),
+            "and it is the ordinary miss: {context}"
+        );
+        let graph = f
+            .engine
+            .graph_neighborhood(anchor, 1, 50, &scope)
+            .await
+            .expect_err("graph_neighborhood answers nothing for a domain nobody registered");
+        assert!(
+            graph
+                .to_string()
+                .contains("no engram 'plan' in domain 'ghost'"),
+            "and it is the ordinary miss: {graph}"
+        );
+    }
 }
 
 /// An overlay write on a domain the caller may not see is refused as an
@@ -2895,6 +2933,17 @@ async fn a_split_whose_mirror_fails_never_takes_the_new_engram_back() {
         serde_json::json!(true),
         "and its receipt says the split landed in a draft: {split}"
     );
+    // The receipt half every other verb's mirror-failure test asserts
+    // (`a_mirror_that_fails_never_unsays_a_draft_that_landed`), which this
+    // one only asserted survival and `draft` for: the source's failed mirror
+    // reaches `draft_warning` too, not only the row's survival.
+    let warning = split["draft_warning"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the receipt carries the source's mirror failure: {split}"));
+    assert!(
+        warning.contains("rich.md") && warning.contains("reindex --wipe"),
+        "and the warning names the draft and what it costs: {warning}"
+    );
 
     // Both engrams are alice's, and the moved observations are in exactly one
     // of them - which is the whole point: taking the new one back would have
@@ -3143,6 +3192,56 @@ async fn a_tombstone_is_honoured_for_an_identifier_that_names_no_domain() {
             .await
             .is_ok(),
         "and it is still there for everybody else"
+    );
+}
+
+/// The other half of the same rule: a bare identifier resolving to a base row
+/// this reader is drafting over reads the DRAFT'S text, not the base's, once
+/// the domain is known.
+///
+/// `resolve_shadowed`'s bare-identifier branch returns `Ok((desc, source,
+/// Some(actor)))` for this shape rather than falling through to the base
+/// descriptor - only the tombstone half above had a test.
+#[tokio::test]
+async fn a_draft_shadows_a_base_row_for_an_identifier_that_names_no_domain() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let bare = |identifier: &str| ReadParams {
+        identifier: identifier.to_string(),
+        domain: None,
+        share_link: None,
+    };
+
+    assert!(
+        f.engine.read_engram(&bare("plan"), &alice).await.unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("the plan as the team has it"),
+        "before her draft she reads the base row like anybody else"
+    );
+
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+
+    let hers = f.engine.read_engram(&bare("plan"), &alice).await.unwrap();
+    assert!(
+        hers["content"]
+            .as_str()
+            .unwrap()
+            .contains("the plan as alice would have it"),
+        "her draft's text is read, not the base row's, once the domain is known: {hers}"
+    );
+
+    let theirs = f
+        .engine
+        .read_engram(&bare("plan"), &account("bob"))
+        .await
+        .unwrap();
+    assert!(
+        theirs["content"]
+            .as_str()
+            .unwrap()
+            .contains("the plan as the team has it"),
+        "and everybody else still reads the base row: {theirs}"
     );
 }
 
@@ -5763,6 +5862,18 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
 /// the frame that matters: the index crate holds the two backend
 /// implementations of the clearing statement, and a caller that took a row away
 /// without ending its grants would be added here, above them.
+///
+/// **Each needle is attributed to the nearest preceding `fn`, not to the file
+/// it is in and not to the call's true dynamic caller.** That is why every
+/// allow-list here is `(file, fn)` pairs rather than bare file names: a needle
+/// two lines under `async fn clear_row(...) {` is blamed on `clear_row` even
+/// though the actual call is `self.clear_row(...)` inside `drop`, wherever
+/// `drop`'s own body happens to sit relative to the needle. It is also why a
+/// needle inside a `fn` nested inside another can be misattributed to the
+/// inner one when the scanner is looking for the OUTER one - pinned as a
+/// synthetic case rather than a live finding by
+/// `collab_agent.rs`'s `declared_fn_re_attributes_lines_after_a_nested_fn`,
+/// for the identical `declared_fn` shape that guard shares with this one.
 #[test]
 fn an_overlay_row_goes_away_only_where_its_grants_and_joins_end() {
     only_these_reach(
@@ -5787,6 +5898,25 @@ fn an_overlay_row_goes_away_only_where_its_grants_and_joins_end() {
             ("domain_view.rs", "move_within"),
         ],
         "a draft is replaced by a tombstone from a function that does not end its grants and          joins; the row is no longer a draft of that page, so a link on it opens something its          author never shared and a session inside it is inside somebody's deletion",
+    );
+    // The one caller `clear_overlay_entry(`'s own scan cannot see: it is pinned
+    // to `clear_row` alone, but `clear_row` itself is unpinned, so a third
+    // caller added directly to it would reach the index without ending
+    // anybody's grants or joins and this file would say nothing. `drop` and
+    // `drop_mid_move` (the wrapper itself, `drop`'s two-guard sibling below)
+    // are its only two, and `clear_row`'s own definition line is the third
+    // entry - the needle sits in its own declaration.
+    only_these_reach(
+        "clear_row(",
+        &[
+            // The seam's own definition.
+            ("domain_view.rs", "clear_row"),
+            // Its two callers, the same two `clear_overlay_entry(`'s scan
+            // names one level further in.
+            ("domain_view.rs", "drop"),
+            ("domain_view.rs", "drop_mid_move"),
+        ],
+        "an overlay row is removed from a function that is not one of clear_row's two wrappers; a          third caller here would take a row away without the removal seam's own guarantee that          ending its share-links and joins is never skipped",
     );
 }
 

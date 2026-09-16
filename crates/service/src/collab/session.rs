@@ -12,6 +12,17 @@
 //! Who may open a room over whose document is decided at the door, in
 //! [`super::ws::join`]: your own needs nothing, and somebody else's needs the
 //! share-link their author minted plus the join this session opened on it.
+//!
+//! **One room's awareness ceiling is 32 names, not [`MAX_PARTICIPANTS`]'s 16.**
+//! A connection slot (`state.conns`) and an agent presence slot
+//! (`state.agents`) are two separate budgets, each capped at
+//! [`MAX_PARTICIPANTS`], and both publish into the same room's awareness map,
+//! which `participants` (`CollabSessions::participants`) and the header strip
+//! (`fluid/src/collab/PresenceChips.tsx`) render in full, unbounded by either
+//! cap on its own. The 16-and-16 split follows from the ruling that set the
+//! agent cap to mirror the connection cap rather than to share its budget, so
+//! a room at both ceilings shows 32 names for as long as it takes one to
+//! leave. Recorded here so it is a known number rather than a rediscovery.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1692,6 +1703,12 @@ impl CollabSession {
     /// parse refusal replacing an io failure (or either replacing a resolved
     /// conflict) has to reach the room, or its alert keeps naming a reason
     /// that no longer applies.
+    ///
+    /// `detail` is never composed here: every caller hands it `err.to_string()`
+    /// off whatever the engine's own save call refused with, so a move-blocked
+    /// author's room says the exact sentence [`crate::engine::joined_write_is_elsewhere`]
+    /// gives the request path for the same shape - one string, reached two
+    /// ways, never two dialects of one refusal.
     fn fail_save(&self, state: &mut SessionState, detail: String) {
         let repeat = matches!(state.save_state, SaveStateTag::Failed)
             && state.failure_detail.as_deref() == Some(detail.as_str());

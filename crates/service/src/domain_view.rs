@@ -501,7 +501,7 @@ impl<'a> DomainView<'a> {
             &record.content,
         ) {
             Ok(()) => None,
-            Err(e) => Some(unmirrored(domain, actor, path, &e)),
+            Err(e) => Some(unmirrored(domain, actor, path, &e, false)),
         };
         if let Some(text) = &warning {
             tracing::warn!(domain, actor, path, "{text}");

@@ -685,10 +685,6 @@ async fn tool_descriptions_teach_which_rule_acknowledges_per_pair() {
     );
 }
 
-/// Folder hierarchy inside a domain is invisible to an agent unless the tool
-/// copy teaches it: `write_engram` documents the `folder` argument and the
-/// `build_context` glob it unlocks, and `move_engram` says a destination
-/// inside the same domain is a normal re-filing move.
 /// Working in a document somebody has open is not a private act, and both
 /// verbs that can do it say so.
 ///
@@ -817,9 +813,18 @@ async fn tool_descriptions_teach_review_mode() {
     }
 
     let read = description_of("read_engram");
+    // "live document" alone does not bite: the description carried it before
+    // this sentence existed ("Reading a live document is not a private
+    // act"), so a reword that dropped "live editor" while keeping that older
+    // sentence would still pass a conjunction of only those two. "participant
+    // strip" is the word the OLD text lacked, so the pin now needs the new
+    // sentence, not just the old one it sits beside.
     assert!(
-        read.contains("live editor") && read.contains("live document"),
-        "read_engram teaches that a live editor is read through the live document: {read}"
+        read.contains("live editor")
+            && read.contains("live document")
+            && read.contains("participant strip"),
+        "read_engram teaches that a live editor is read through the live document, \
+         and that doing so is seen: {read}"
     );
 
     let share = description_of("share_changes");
@@ -835,6 +840,10 @@ async fn tool_descriptions_teach_review_mode() {
     );
 }
 
+/// Folder hierarchy inside a domain is invisible to an agent unless the tool
+/// copy teaches it: `write_engram` documents the `folder` argument and the
+/// `build_context` glob it unlocks, and `move_engram` says a destination
+/// inside the same domain is a normal re-filing move.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_descriptions_teach_folders() {
     let h = Harness::new(&["eng"]).await;
@@ -2865,6 +2874,48 @@ async fn write_engram_rejects_a_timestamp_in_a_date_field() {
     assert!(
         !h.root.join("eng/timestamped-bound.md").exists(),
         "the engram file must not be created when the write is rejected"
+    );
+}
+
+/// The collision check runs ahead of `build_markdown`: a create with
+/// unbuildable content at a permalink that is already taken answers
+/// "permalink already exists ... pass overwrite=true to replace", not the
+/// content error `build_markdown` would otherwise raise first. The plainer
+/// message is the more useful of the two, and the one this verb gave before
+/// `build_markdown` was ever hoisted ahead of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_capture_at_a_taken_permalink_answers_the_collision_refusal() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Taken Title",
+            "content": "The engram that already holds this permalink.",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let err = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Taken Title",
+            "content": "A second capture at the same title, with content that could not be built.",
+            "metadata": { "valid_to": "2026-07-15T10:30:00Z" },
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("already exists") && err.contains("pass overwrite=true to replace"),
+        "the collision refusal, not the malformed-content error: {err}"
     );
 }
 
@@ -5138,6 +5189,54 @@ async fn a_human_instance_still_records_an_agent_verifiers_model() {
     assert!(
         text.contains("generated: { by: human:jordi, at: "),
         "and the block the person's instance stamps carries none: {text}"
+    );
+}
+
+/// A `verified` entry that arrives through `write_engram`'s `metadata`
+/// parameter, rather than through `edit_engram`'s dedicated `verified`
+/// verb path, is held to the very same rule: a `human:` actor never carries a
+/// model, whichever route the entry took in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verified_entry_in_write_engrams_metadata_drops_a_humans_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Checked via metadata",
+            "content": "A fact captured with its check already attached.",
+            "metadata": {
+                "verified": {
+                    "by": "human:jordi",
+                    "model": "claude-opus-5",
+                    "at": "2026-09-16T10:00:00Z",
+                },
+            },
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked-via-metadata.md")).unwrap();
+    let entries = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .verified;
+    let [only] = entries.as_slice() else {
+        panic!("one verification: {entries:?}");
+    };
+    assert_eq!(only.by, "human:jordi");
+    assert_eq!(
+        only.model, None,
+        "the metadata path drops a human's model exactly as the verb path does: {text}"
+    );
+    assert!(
+        text.contains("verified: { by: human:jordi, at: "),
+        "the two-key entry form, unchanged: {text}"
     );
 }
 

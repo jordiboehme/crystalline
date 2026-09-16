@@ -134,72 +134,83 @@ pub fn share_nudge_line(count: u64, domains: &[String]) -> String {
 /// of the work that earned it.
 const SHARE_MEMO_TTL: Duration = Duration::from_secs(60);
 
-/// What the share arm last found for one team domain's folder, and when.
+/// What one team domain is keyed by, in the memo and in the walk counter
+/// beside it: its folder, paired with the origin state directory the answer
+/// was actually read against. See [`SHARE_MEMO`]'s doc for why the folder
+/// alone is not enough.
+type DomainKey = (String, String);
+
+/// What the share arm last found for one team domain, and when.
 ///
 /// Keyed by the folder rather than the domain name: the name is per-install
 /// configuration and two engines in one process (which is what the test suite
 /// is) can register the same name for different folders, while a folder is the
-/// thing actually walked.
+/// thing actually walked. The folder alone is not enough, though: what the
+/// walk answers is the folder read against ONE domain's own origin state
+/// directory (`Engine::origin_state_dir`), and two domain names can register
+/// the very same folder under different origins directories - the same test
+/// suite shape again, one process, two engines. The state directory is in the
+/// key beside the folder for exactly that reason: without it, the second of
+/// two such names to ask would be answered with the first's count for up to
+/// [`SHARE_MEMO_TTL`].
 ///
 /// Process-local and deliberately not persisted: it is a cost bound, not a
 /// decision record. Losing it on restart costs one walk.
-static SHARE_MEMO: LazyLock<Mutex<HashMap<String, (Instant, u64)>>> =
+static SHARE_MEMO: LazyLock<Mutex<HashMap<DomainKey, (Instant, u64)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// What one team domain's folder is keyed by, in the memo and in the walk
-/// counter beside it, so the two can never disagree about which folder an entry
-/// is about.
-fn memo_key(root: &Path) -> String {
-    root.display().to_string()
+/// [`DomainKey`] for one team domain's folder and origin state directory.
+fn memo_key(root: &Path, state_dir: &Path) -> DomainKey {
+    (root.display().to_string(), state_dir.display().to_string())
 }
 
 /// Take [`SHARE_MEMO`], ignoring poisoning: a panicking reader leaves a map
 /// that is still a map, and a cost bound is no reason to bring a daemon down.
-fn memo() -> std::sync::MutexGuard<'static, HashMap<String, (Instant, u64)>> {
+fn memo() -> std::sync::MutexGuard<'static, HashMap<DomainKey, (Instant, u64)>> {
     SHARE_MEMO
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// How many times the share arm has gone past the memo to an actual walk, per
-/// folder, for the test that pins the memo. A test seam: neither the counter
+/// domain, for the test that pins the memo. A test seam: neither the counter
 /// nor its increment is compiled into a released binary.
 ///
-/// **Per folder rather than one total for the process**, under the same key the
+/// **Per domain rather than one total for the process**, under the same key the
 /// memo itself uses. Two tests in one binary walk two different temporary
 /// domains, and `cargo test` runs a binary's tests as threads in one process,
 /// so a single total would make each one's assertion depend on when the other
-/// happened to run. Keyed, each test reads only its own folder's walks, and a
+/// happened to run. Keyed, each test reads only its own domain's walks, and a
 /// third test added later changes nothing.
 #[cfg(any(test, feature = "testing"))]
-static SHARE_WALKS: LazyLock<Mutex<HashMap<String, u64>>> =
+static SHARE_WALKS: LazyLock<Mutex<HashMap<DomainKey, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// How many walks this process has paid for on `root`'s folder since it
-/// started.
+/// How many walks this process has paid for on `root`'s folder read against
+/// `state_dir`, since it started.
 #[cfg(any(test, feature = "testing"))]
-pub fn share_walks_for(root: &Path) -> u64 {
+pub fn share_walks_for(root: &Path, state_dir: &Path) -> u64 {
     SHARE_WALKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&memo_key(root))
+        .get(&memo_key(root, state_dir))
         .copied()
         .unwrap_or(0)
 }
 
 /// Count one paid walk on `key`. A no-op in a released binary.
 #[cfg(any(test, feature = "testing"))]
-fn count_walk(key: &str) {
+fn count_walk(key: &DomainKey) {
     *SHARE_WALKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(key.to_string())
+        .entry(key.clone())
         .or_default() += 1;
 }
 
 /// Count one paid walk on `key`. A no-op in a released binary.
 #[cfg(not(any(test, feature = "testing")))]
-fn count_walk(_key: &str) {}
+fn count_walk(_key: &DomainKey) {}
 
 /// The one line a write receipt carries, or `None` when nothing is due.
 ///
@@ -336,12 +347,20 @@ async fn unshared_team_work(
 /// One direct-mode team domain's unshared count, from the memo when it holds a
 /// fresh answer and from the walk otherwise.
 ///
+/// The key is resolved fresh on every call, against THIS domain name's own
+/// origin state directory (`Engine::origin_state_dir`), not just the folder -
+/// see [`SHARE_MEMO`]'s doc for why the folder alone would answer a second
+/// domain name at the same folder with the first's count.
+///
 /// Only an answer is memoized. A walk that could not run - an origin operation
-/// in flight, an unreadable tree - leaves the memo as it was, so a contended
-/// moment is retried on the next receipt rather than cached as "owes nothing"
-/// for a minute.
+/// in flight, an unreadable tree, a state directory that could not be
+/// resolved - leaves the memo as it was, so a contended moment is retried on
+/// the next receipt rather than cached as "owes nothing" for a minute.
 async fn walked_unshared(engine: &Engine, name: &str, root: &Path) -> u64 {
-    let key = memo_key(root);
+    let Ok(state_dir) = engine.origin_state_dir(name) else {
+        return engine.unshared_change_count(name).await.unwrap_or(0);
+    };
+    let key = memo_key(root, &state_dir);
     if let Some((at, count)) = memo().get(&key)
         && at.elapsed() < SHARE_MEMO_TTL
     {
@@ -449,6 +468,105 @@ mod tests {
             "and the origin lock is taken without waiting, in a guard the \
              blocking task can own: {body}"
         );
+    }
+
+    /// Write a base snapshot straight into an origins directory, bypassing a
+    /// real pull: `files` is what the snapshot says is already known, so any
+    /// file under `root` on disk that is not named here is unshared.
+    fn write_base_snapshot(origins_dir: &std::path::Path, domain: &str, files: &[(&str, &[u8])]) {
+        let mut state = crystalline_remote::state::OriginState::new("acme/shared", "main");
+        state.base_commit = "deadbeef".to_string();
+        for (rel, bytes) in files {
+            state.files.insert(
+                rel.to_string(),
+                crystalline_remote::state::BaseStamp {
+                    sha256: crate::engine::sha256_hex(bytes),
+                    size: bytes.len() as u64,
+                },
+            );
+        }
+        state.save(&origins_dir.join(domain)).unwrap();
+    }
+
+    /// One engine, registering one domain at `root` with an origin (no
+    /// provider needed - a snapshot read never reaches the network), its
+    /// origin state under `origins_dir`.
+    async fn engine_over(
+        config_path: &std::path::Path,
+        origins_dir: &std::path::Path,
+        domain: &str,
+        root: &std::path::Path,
+    ) -> Engine {
+        let mut cfg = GlobalConfig::default();
+        let mut entry = crystalline_core::config::DomainEntry::file(root.to_path_buf());
+        entry.origin = Some(crystalline_core::config::OriginConfig {
+            repo: "acme/shared".to_string(),
+            path: None,
+            branch: Some("main".to_string()),
+            poll_secs: None,
+        });
+        cfg.domains.insert(domain.to_string(), entry);
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        Engine::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(store)),
+            cfg,
+            None,
+            Some(config_path.to_path_buf()),
+        )
+        .with_origins_dir(origins_dir.to_path_buf())
+        .with_state_dir(origins_dir.parent().unwrap().join("state"))
+    }
+
+    /// **The memo is keyed by (folder, state dir), not by folder alone.**
+    ///
+    /// Two domain names registering the SAME folder, each under its own
+    /// origins directory (so its own snapshot), is exactly the shape
+    /// [`memo_key`]'s doc names: before the fix the second name's first
+    /// question was answered with the first name's already-memoized count,
+    /// for up to [`SHARE_MEMO_TTL`], because the memo held only the folder.
+    #[tokio::test]
+    async fn two_domains_at_one_folder_each_answer_their_own_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("shared");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("manifest.md"), b"shared content").unwrap();
+        std::fs::write(root.join("added.md"), b"only on disk").unwrap();
+
+        // Domain A's snapshot has never seen `added.md`: one unshared file.
+        let origins_a = tmp.path().join("origins-a");
+        write_base_snapshot(&origins_a, "brand-a", &[("manifest.md", b"shared content")]);
+        let engine_a = engine_over(&tmp.path().join("a.yaml"), &origins_a, "brand-a", &root).await;
+
+        // Domain B's snapshot already has it: nothing unshared.
+        let origins_b = tmp.path().join("origins-b");
+        write_base_snapshot(
+            &origins_b,
+            "brand-b",
+            &[
+                ("manifest.md", b"shared content"),
+                ("added.md", b"only on disk"),
+            ],
+        );
+        let engine_b = engine_over(&tmp.path().join("b.yaml"), &origins_b, "brand-b", &root).await;
+
+        assert_eq!(
+            walked_unshared(&engine_a, "brand-a", &root).await,
+            1,
+            "A's snapshot has not seen the extra file"
+        );
+        assert_eq!(
+            walked_unshared(&engine_b, "brand-b", &root).await,
+            0,
+            "B's snapshot already has it, at the very same folder"
+        );
+
+        // Asked again, in the opposite order and still inside the memo
+        // window: each domain's own answer holds, neither crossed into the
+        // other's memo entry.
+        assert_eq!(walked_unshared(&engine_b, "brand-b", &root).await, 0);
+        assert_eq!(walked_unshared(&engine_a, "brand-a", &root).await, 1);
     }
 
     /// The line agrees with itself in number, names one domain and counts

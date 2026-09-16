@@ -5421,7 +5421,7 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
         "a domain that owes nothing has nothing to ask about"
     );
     assert_eq!(
-        crystalline_service::nudge::share_walks_for(&root),
+        crystalline_service::nudge::share_walks_for(&root, &origins_dir.join("brand")),
         1,
         "the first receipt pays for the walk"
     );
@@ -5439,7 +5439,7 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
         "the second receipt answers from the memo, which has not seen the new file"
     );
     assert_eq!(
-        crystalline_service::nudge::share_walks_for(&root),
+        crystalline_service::nudge::share_walks_for(&root, &origins_dir.join("brand")),
         1,
         "and it pays for no second walk inside the memo window"
     );

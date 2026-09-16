@@ -136,6 +136,28 @@ async fn serve_with_mcp_auth_and(
     serve_with(mcp_auth, proxy_headers, oauth, None).await
 }
 
+/// The tail every fixture in this file shares once its engine and auth store
+/// are built: mount the production router, bind an ephemeral loopback port
+/// and serve it on a spawned task.
+///
+/// Served the way `run_http` serves it, connect info included: the peer
+/// address the first-run setup route reads lives in the extensions this adds,
+/// and a plain router would leave it missing.
+async fn spawn_serving(engine: Arc<Engine>, store: Arc<AuthStore>) -> std::net::SocketAddr {
+    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], store, None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
 /// The whole of what the suite can configure, for the two tests that need the
 /// `auth.oidc.redirect_uri` override.
 async fn serve_with(
@@ -150,27 +172,7 @@ async fn serve_with(
             .await
             .unwrap(),
     );
-    let router = http_router(
-        engine,
-        Arc::new(AtomicUsize::new(0)),
-        &[],
-        store.clone(),
-        None,
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        // Served the way `run_http` serves it, connect info included: the peer
-        // address the first-run setup route reads lives in the extensions this
-        // adds, and a plain router would leave it missing.
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let addr = spawn_serving(engine, store.clone()).await;
     (addr, tmp, store)
 }
 
@@ -222,24 +224,7 @@ async fn serve_reviewed_domain_with_mcp_auth_off()
     );
     engine.sync(None).await.unwrap();
     let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
-    let router = http_router(
-        engine,
-        Arc::new(AtomicUsize::new(0)),
-        &[],
-        auth.clone(),
-        None,
-    )
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let addr = spawn_serving(engine, auth.clone()).await;
     (addr, tmp, auth)
 }
 
@@ -542,7 +527,7 @@ async fn with_auth_off_the_legacy_open_tier_still_serves() {
 /// give every other `Refused` message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unauthenticated_agents_overlay_write_answers_the_teaching_text() {
-    let (addr, _guard, _store) = serve_reviewed_domain_with_mcp_auth_off().await;
+    let (addr, tmp, _store) = serve_reviewed_domain_with_mcp_auth_off().await;
     let session = McpTestSession::open(&addr, None).await;
     let raw = session
         .call_tool(
@@ -562,6 +547,18 @@ async fn an_unauthenticated_agents_overlay_write_answers_the_teaching_text() {
     assert!(
         text.contains(crystalline_service::OVERLAY_NEEDS_IDENTITY),
         "the teaching text names the fix: {text}"
+    );
+    // The refusal is not only readable, it is a refusal: nothing landed in
+    // the working tree the team reviewed, and no draft was opened under the
+    // state directory either, the same pair `attachments.rs` pins for the
+    // sibling verb.
+    assert!(
+        !tmp.path().join("team/anon-trace.md").exists(),
+        "the refused write left the working tree untouched"
+    );
+    assert!(
+        !tmp.path().join("state/overlays").exists(),
+        "and drafted nothing under the state directory either"
     );
 }
 
