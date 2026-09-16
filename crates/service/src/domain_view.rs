@@ -588,49 +588,78 @@ impl<'a> DomainView<'a> {
     /// [`Engine::resolve_in`] for a call that may be acting inside a draft
     /// overlay: what THIS actor sees at that identifier.
     ///
-    /// `None` is the base resolution unchanged, so a direct domain reaches
-    /// exactly the code it always did. With an actor there are three
-    /// differences, and each one is a place a draft would otherwise be
-    /// invisible to its own author:
-    ///
-    /// * a path this actor has tombstoned resolves to nothing, in the same
-    ///   words an engram nobody wrote produces - their deletion is a deletion
-    ///   for them;
-    /// * a draft at a path no base row holds resolves through the draft's own
-    ///   row, which is the only way an engram created in review mode can be
-    ///   edited, moved or deleted at all;
-    /// * a draft over a base row resolves to the BASE descriptor. Its path,
-    ///   domain and permalink are what a write needs, and the draft's own row
-    ///   is read by the arm that writes it, so resolving to the base keeps one
-    ///   engram one address whether or not this actor has started drafting it.
+    /// The rule itself is [`DomainView::shadow`]'s, which is also what the read
+    /// path applies - see there for why the two must be one function.
     pub(crate) async fn resolve(
         &self,
         identifier: &str,
     ) -> Result<(EngramDescriptor, ContentSource)> {
         let domain = self.domain.as_str();
-        let Some(actor) = self.actor.as_deref() else {
-            return self.engine.resolve_in(identifier, domain).await;
-        };
-        match self.engine.resolve_in(identifier, domain).await {
+        let base = self.engine.resolve_in(identifier, domain).await;
+        self.shadow(identifier, base, || {
+            format!("no engram '{identifier}' in domain '{domain}'")
+        })
+        .await
+    }
+
+    /// The actor dimension applied to a base resolution: **the one place the
+    /// rule lives**, so a read and a write at one address cannot disagree
+    /// about what it names.
+    ///
+    /// They did disagree. The read path was taught that a tombstone is about a
+    /// PATH rather than about an address, and the write path was not, so an
+    /// author who had moved her own draft of a page the team holds could open
+    /// it at its address and not save it there - one screen, one URL, two
+    /// answers. The repair is not the same three lines in two places, which is
+    /// how the split happened; it is one function with two callers.
+    ///
+    /// The rule, in the order it is asked:
+    ///
+    /// * **the base row, unless this actor deleted that path.** A draft over a
+    ///   base row resolves to the BASE descriptor: its path, domain and
+    ///   permalink are what a write needs, the draft's own row is read by the
+    ///   arm that writes it, and resolving to the base is what keeps one engram
+    ///   one address whether or not this actor has started drafting it;
+    /// * **behind their own tombstone, their own drafts.** A tombstone says
+    ///   this PATH holds nothing for them, and an address can move off a path:
+    ///   renaming a draft of a page the team holds leaves a tombstone where the
+    ///   base row is and their own row, carrying the same address, somewhere
+    ///   else, because a document travels verbatim. Answering the miss here
+    ///   would lose the address for its own author while everybody else went on
+    ///   reading the page;
+    /// * **the miss otherwise** - a plain deletion is a deletion for the person
+    ///   who made it, in the same words an engram nobody wrote produces, and
+    ///   `tombstoned` is what says it. A base that knew nothing at all keeps its
+    ///   OWN miss, so an identifier nobody wrote reads the same in both modes;
+    /// * **and a draft at a path no base row holds** resolves through the
+    ///   draft's own row, which is the only way an engram created in review
+    ///   mode can be edited, moved or deleted at all.
+    ///
+    /// The base view is handed its resolution back without a single lookup, so
+    /// a reader with no drafts resolves exactly what they always did.
+    ///
+    /// `tombstoned` is called only on the one arm that needs it, because the
+    /// two callers word that miss differently: a bare identifier does not name
+    /// a domain, so the answer it gets must not either.
+    pub(crate) async fn shadow(
+        &self,
+        identifier: &str,
+        base: Result<(EngramDescriptor, ContentSource)>,
+        tombstoned: impl FnOnce() -> String,
+    ) -> Result<(EngramDescriptor, ContentSource)> {
+        if self.actor.is_none() {
+            return base;
+        }
+        match base {
             Ok((desc, source)) => {
-                let store = self.engine.store();
-                let held = {
-                    let store = store.lock().await;
-                    store
-                        .overlay_entry(desc.domain_id, actor, &desc.path)
-                        .await?
-                };
-                if held.is_some_and(|entry| entry.tombstone) {
-                    return Err(EngineError::NotFound(format!(
-                        "no engram '{identifier}' in domain '{domain}'"
-                    )));
+                if self.deletes(desc.domain_id, &desc.path).await? {
+                    return match self.resolve_draft(identifier).await? {
+                        Some(found) => Ok(found),
+                        None => Err(EngineError::NotFound(tombstoned())),
+                    };
                 }
                 Ok((desc, source))
             }
-            // The base knows nothing about this identifier, which is exactly
-            // the case a draft-only engram is in. The miss is kept and raised
-            // unchanged when the overlay knows nothing either, so an
-            // identifier nobody wrote reads the same in both modes.
             Err(EngineError::NotFound(miss)) => match self.resolve_draft(identifier).await? {
                 Some(found) => Ok(found),
                 None => Err(EngineError::NotFound(miss)),

@@ -2003,6 +2003,127 @@ async fn an_overlay_rename_leaves_the_base_permalink_answering_for_everybody_els
     );
 }
 
+/// And what she can OPEN at that address she can SAVE at it.
+///
+/// The read resolver and the write resolver are two doors onto one view, and
+/// an actor who has moved her own draft of a page the team holds meets both:
+/// her tombstone stands where the base row is, and her row - carrying the same
+/// address, because a document travels verbatim - stands somewhere else. A
+/// resolver that stopped at the tombstone answered the miss for her while the
+/// team went on reading the page, which is the defect round 3 fixed on the
+/// read side alone.
+///
+/// Fluid addresses an engram by its permalink on both verbs, so the split was
+/// reachable in one screen: the editor opened her draft and could not save it.
+/// Driven here over the same URL twice, which is what makes it one test rather
+/// than two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_author_saves_at_the_address_her_own_move_left_standing() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let alice = login(f.addr, "alice").await;
+    let bob = login(f.addr, "bob").await;
+
+    // She redrafts the team's page and then decides it belongs elsewhere.
+    let base = f.reads(&alice, "plan").await;
+    let redrafted = base["content"]
+        .as_str()
+        .unwrap()
+        .replace("What the team agreed", "What alice would rather");
+    let saved = alice
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", base["checksum"].as_str().unwrap()),
+        )
+        .json(&serde_json::json!({"content": redrafted}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200, "{:?}", saved.text().await);
+    let moved = alice
+        .request(f.addr, reqwest::Method::POST, "/api/v1/domains/team/move")
+        .json(&serde_json::json!({"permalink": "plan", "destination": "notes/plan"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 200, "{:?}", moved.text().await);
+
+    // The read answers, which is the premise rather than the point.
+    let opened = f.reads(&alice, "plan").await;
+    assert_eq!(
+        opened["path"],
+        serde_json::json!("notes/plan.md"),
+        "the address opens her draft where she moved it: {opened}"
+    );
+
+    // And the save at the same address lands in the same row.
+    let again = opened
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap()
+        .replace("What alice would rather", "What alice settled on");
+    let resaved = alice
+        .request(
+            f.addr,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/plan",
+        )
+        .header(
+            "if-match",
+            format!("\"{}\"", opened["checksum"].as_str().unwrap()),
+        )
+        .json(&serde_json::json!({"content": again}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resaved.status(),
+        200,
+        "what the address opens, the address saves: {:?}",
+        resaved.text().await
+    );
+    let hers = f.reads(&alice, "plan").await;
+    assert_eq!(
+        hers["path"],
+        serde_json::json!("notes/plan.md"),
+        "in the row she moved it to, not a second one at the old path: {hers}"
+    );
+    assert!(
+        hers["content"]
+            .as_str()
+            .unwrap()
+            .contains("What alice settled on"),
+        "carrying what she just wrote: {hers}"
+    );
+
+    // The path she moved it off still holds nothing of hers, and the team's own
+    // page at that path is untouched by any of it.
+    let gone = alice
+        .request(
+            f.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/plan.md",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 404, "{:?}", gone.text().await);
+    let theirs = f.reads(&bob, "plan").await;
+    assert_eq!(theirs["path"], serde_json::json!("plan.md"));
+    assert!(
+        theirs["content"]
+            .as_str()
+            .unwrap()
+            .contains("What the team agreed"),
+        "a reader with no draft reads the team's own words: {theirs}"
+    );
+}
+
 /// One account holding links to two authors' drafts of the same page joins two
 /// different drafts, and each joined write lands in its own author's overlay.
 ///
