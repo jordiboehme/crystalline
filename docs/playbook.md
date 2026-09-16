@@ -866,6 +866,52 @@ something to decide on. Both ask first, because sharing puts somebody's work in
 front of reviewers - a refreshed folder listing is never a reason on its own.
 Hard-won knowledge is worth the review.
 
+## Review mode
+
+Some knowledge needs a gate before it lands, not only a review after. Put a
+team domain in review mode and every write - yours, a crewmate's, the agent's
+own - joins its author's own private draft instead of touching the shared
+log; the folder everybody reads keeps saying exactly what the team last
+reviewed, and only a merged proposal ever moves it:
+
+```text
+Put fleet-ops in review mode - every write should land as a private draft
+until we choose to share it.
+```
+
+*The agent runs `crystalline domain review fleet-ops overlay` - which needs
+the domain to already track a GitHub repository and nothing unshared sitting
+in its folder, refusing and naming exactly what to share or revert first
+otherwise. From here on, `share_changes` still works the way this chapter
+already taught you, except what it proposes is exactly your own drafts.* Day
+to day nothing about recall changes - search, a plain question and the Evolve
+sweep all show you your own drafts stitched in beside what the team already
+shares - and a file somebody drops straight into the folder by hand, outside
+any draft, is not blocked, only named as `out_of_band` the next time you ask
+where the domain stands, because the folder is still yours to write to
+directly if you choose.
+
+Nothing about this needs a second officer aboard. A one-person boat can put a
+domain in review mode too: the agent shares your GitHub identity and your
+draft, so it changes nothing about how the two of you already work together -
+it just makes the pause you already wanted before something lands official
+rather than a habit.
+
+Turning it back off asks first, because every draft in the domain is about to
+be decided one way or the other:
+
+```text
+Take fleet-ops out of review mode. Bob's docking clamp draft is done - land it
+in the log. Mine can go, I never finished it.
+```
+
+*The agent previews the fold plan - each crewmate and what they hold - before
+running `crystalline domain review fleet-ops direct --fold bob --discard
+<you>`, writing Bob's drafts into the folder and dropping yours outright.
+Every actor the plan names needs an instruction, one of `--fold` or
+`--discard`; leaving one out is refused rather than guessed at, since ending
+review ends every draft still open in the domain.*
+
 ## Appendix
 
 ### Quick reference
@@ -890,6 +936,8 @@ Hard-won knowledge is worth the review.
 | Share part of it | "Share only the clamp engram to fleet-ops and keep the rest local." |
 | Answer a review | "Spell out the clamp threshold and update proposal 1." |
 | Withdraw a proposal | "Withdraw the fleet-ops proposal and keep my local edits." |
+| Turn on review mode | "Put fleet-ops in review mode - every write should land as a private draft." |
+| Turn off review mode | "Take fleet-ops out of review mode, fold Bob's draft and drop mine." |
 
 ### Reference blocks
 
@@ -934,6 +982,8 @@ crystalline connect github --personal               # sign in as yourself for sh
 crystalline origin share fleet-ops --file clamp.md  # share one changed file, not all
 crystalline origin share fleet-ops --proposal 4     # amend that layer after review
 crystalline origin withdraw fleet-ops --proposal 4  # close and clear a proposal
+crystalline domain review fleet-ops overlay         # every write joins a private draft
+crystalline domain review fleet-ops direct --fold bob --discard <you>  # end review
 crystalline verify                                  # static check: frontmatter, links, schema
 crystalline doctor                                  # diagnose index and service; add --fix to repair
 crystalline evolve --domain ship-ops                # the Evolve sweep, run by hand
