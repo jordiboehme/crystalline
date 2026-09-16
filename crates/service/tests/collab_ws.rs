@@ -1091,3 +1091,86 @@ async fn a_grantee_who_leaves_the_draft_is_closed_out_of_its_room() {
     .await
     .expect("a join is a join, however many times it is opened");
 }
+
+/// A link opens the draft it was minted on and no other of its author's.
+///
+/// The room is asked for by ADDRESS and the grant is held on a PATH, and the
+/// two are resolved by different ladders: the grant matches the draft's
+/// permalink, its path or the path with the suffix off, while the room
+/// resolves the address through the owner's own view, which also matches a
+/// draft's TITLE. So one of the owner's other drafts can answer the name the
+/// grant was checked against - and it would be handed over in the greeting,
+/// which is the one thing a share-link must never widen into.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_opens_the_draft_it_was_minted_on_and_no_other() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    // A second draft of hers, at a path that sorts first, whose TITLE is the
+    // address the link was minted on. Nobody shared this one.
+    let decoy = fx.draft("alice", "Aaa", "Something else entirely.").await;
+    let retitled = "---\ntype: engram\ntitle: fresh\npermalink: aaa\ntags:\n  - team\nstatus: stable\n---\n\nSomething else entirely.\n";
+    let read = fx
+        .engine
+        .read_engram(
+            &crystalline_service::params::ReadParams {
+                identifier: "aaa".to_string(),
+                domain: Some("team".to_string()),
+            },
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    fx.engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "aaa".to_string(),
+                content: retitled.to_string(),
+                expected_checksum: read["checksum"].as_str().unwrap().to_string(),
+            },
+            &crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .expect("her own draft is hers to retitle");
+    assert_eq!(decoy, "aaa.md");
+
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+
+    let opened = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await;
+    match opened {
+        Ok(mut socket) => {
+            let _ = next_binary(&mut socket).await;
+            let doc = client_doc();
+            socket.send(binary(step1(&doc))).await.unwrap();
+            let step2 = next_sync_step2(&mut socket).await;
+            apply(&doc, &step2);
+            let text = doc
+                .get_or_insert_text("content")
+                .get_string(&doc.transact());
+            assert!(
+                text.contains("A page only alice has"),
+                "the room is over the draft the link was minted on: {text}"
+            );
+        }
+        // The other honest answer: the address the room would have opened is
+        // not the draft the link names, so it opens nothing - in the same
+        // words a name nobody shared with this account gets.
+        Err(err) => assert_eq!(refusal_status(&err), Some(404)),
+    }
+}

@@ -119,6 +119,29 @@ pub async fn join(
             .await
     }
     .map_err(join_error)?;
+    // **The address the room opened is the path the link was for.** The two
+    // are resolved by different ladders - a grant matches a draft's permalink,
+    // its path or the path with the suffix off, while a room resolves its
+    // address through the owner's own view, which also matches a draft's
+    // TITLE - so one of the owner's OTHER drafts can answer the name the grant
+    // was checked against, and the greeting would hand it over. Checked here
+    // rather than before the join because the room is what resolves the
+    // address, and answered with the ordinary miss: which of somebody's drafts
+    // answers to a name is not a caller's to learn. The connection is already
+    // registered by this line, so it unwinds through the same `finish` a
+    // failed upgrade does.
+    //
+    // It is also what makes the saver's eviction lookup sound: that asks the
+    // join registry about the ROOM's path, and this is where the room's path
+    // and the join's path are made the same path.
+    if let Some(granted) = &room.granted
+        && joined.session.path().await != *granted
+    {
+        finish(&state.collab, &joined.session, joined.conn).await;
+        return Err(ApiError::not_found(format!(
+            "no engram '{permalink}' in domain '{domain}'"
+        )));
+    }
     // A connection that is in somebody else's document is watched: the join
     // that put it there can end while it sits there - the author takes the
     // link back, the draft is folded or discarded or renamed, the person
@@ -160,6 +183,10 @@ struct Room {
     /// The caller's account, when the document is not their own. `None` in
     /// their own document and in a direct domain's, which is nearly always.
     guest: Option<String>,
+    /// The path of the draft the caller's share-link was minted on, when a
+    /// link is what got them in. The room has to land on this exact path or it
+    /// is not the document the link opened.
+    granted: Option<String>,
 }
 
 /// Which document this caller may open a room over, here.
@@ -193,6 +220,7 @@ async fn whose_document(
         return Ok(Room {
             overlay: None,
             guest: None,
+            granted: None,
         });
     }
     let scope = identity.scope();
@@ -206,6 +234,7 @@ async fn whose_document(
         return Ok(Room {
             overlay: Some(mine),
             guest: None,
+            granted: None,
         });
     };
     let Some((owner, path)) = state
@@ -226,6 +255,7 @@ async fn whose_document(
     Ok(Room {
         overlay: Some(owner),
         guest: Some(mine),
+        granted: Some(path),
     })
 }
 

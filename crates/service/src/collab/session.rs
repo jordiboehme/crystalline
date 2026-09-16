@@ -820,6 +820,17 @@ impl CollabSession {
         state.conns.is_empty()
     }
 
+    /// The domain-relative path this room's document stands at, as the open
+    /// resolved it and as every save receipt has reported it since.
+    ///
+    /// Read by the surface that opened the room, to check that the document it
+    /// landed on is the document it decided the caller may be in: a room is
+    /// asked for by ADDRESS and a share-link is held on a PATH, and the two
+    /// are resolved by different ladders.
+    pub async fn path(&self) -> String {
+        self.state.lock().await.path.clone()
+    }
+
     /// Whether nobody is connected any more.
     pub async fn is_empty(&self) -> bool {
         self.state.lock().await.conns.is_empty()
