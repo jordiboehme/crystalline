@@ -1347,3 +1347,294 @@ async fn a_legacy_peer_is_refused_the_wholesale_overwrite_too() {
         "and their unsaved line still stands"
     );
 }
+
+// --- the locks, the precondition and the tails -----------------------------
+//
+// Fix round 1. Three rulings, and they are all about what the write's live arm
+// may do rather than about what it lands: it may not hold a file lock while it
+// reaches into a room, it may not decide "this is a replacement" from a check
+// somebody else made, and it may not drop a tail that keeps the instance
+// truthful without saying which tail belongs to whom.
+
+/// One engram written straight into a helper for the capture tests below.
+fn wholesale_capture(title: &str, content: &str, overwrite: bool) -> WriteParams {
+    WriteParams {
+        domain: "eng".to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        folder: None,
+        engram_type: None,
+        tags: Vec::new(),
+        status: None,
+        metadata: None,
+        overwrite,
+        share_link: None,
+    }
+}
+
+/// **Ruling C1.** No engine verb may compose into a co-editing room while it
+/// holds a per-path file write lock.
+///
+/// The two locks are taken in the opposite order by the room's own saver - it
+/// holds the session state lock across `Engine::save_engram`, which takes the
+/// file lock for the same path - so a verb that holds the file lock and then
+/// waits for the state lock closes a cycle neither side can break. Nothing
+/// times out: the file lock is held for ever, so every later write, edit, save
+/// or delete of that engram hangs and the person's unsaved work never lands.
+///
+/// A source scan rather than a behavioural assertion, and for the reason the
+/// other guards in this repo are source scans: the failure is a lock taken one
+/// line too early, which no request can be written to provoke on demand - the
+/// window is a scheduling accident, so a test that drives the two at each
+/// other proves nothing when it passes. What CAN be checked exactly is the
+/// discipline: inside one function, the room call comes before the lock or not
+/// at all. `apply_source_edit_staged` is the shape this describes - its live
+/// arm returns above the arms that take locks - and the write's arm now stands
+/// the same way.
+#[test]
+fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine.rs");
+    let text = std::fs::read_to_string(&src).unwrap();
+
+    /// The name a line declares a function under, if it declares one.
+    fn declared_fn(line: &str) -> Option<&str> {
+        let rest = line.trim_start();
+        let rest = rest
+            .strip_prefix("pub(crate) ")
+            .or_else(|| rest.strip_prefix("pub "))
+            .unwrap_or(rest);
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("fn ")?;
+        let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+        Some(&rest[..end])
+    }
+
+    // Per function, the first line that takes a file write lock and the first
+    // that composes into a room. A comment mentioning either is not a call, so
+    // the scan skips the comment lines the arms are thick with.
+    let mut current = "<file scope>".to_string();
+    let mut locked: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut composed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, line) in text.lines().enumerate() {
+        if let Some(name) = declared_fn(line) {
+            current = name.to_string();
+        }
+        let code = line.trim_start();
+        if code.starts_with("//") || code.starts_with("///") {
+            continue;
+        }
+        if code.contains(".write_lock(") {
+            locked.entry(current.clone()).or_insert(i);
+        }
+        if code.contains(".apply_text(") {
+            composed.entry(current.clone()).or_insert(i);
+        }
+    }
+
+    let offenders: Vec<&String> = composed
+        .keys()
+        .filter(|name| matches!(locked.get(*name), Some(lock) if lock < &composed[*name]))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these engine functions take a file write lock and then compose into a room while holding \
+         it, which deadlocks against the room's saver taking the two in the other order: \
+         {offenders:?}"
+    );
+}
+
+/// **Ruling C1, the behaviour.** A save and a wholesale overwrite driven at one
+/// another both finish.
+///
+/// Bounded rather than exact: the deadlock the guard above pins is a race, so
+/// this cannot be staged to fail on demand - what it can do is refuse to hang.
+/// A wedged pair never returns at all, so a generous timeout around both is a
+/// true statement about the pair rather than a stopwatch on either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_and_a_wholesale_overwrite_driven_at_each_other_both_finish() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "a person typed this").await;
+
+    let saving = {
+        let session = joined.session.clone();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                session
+                    .tick_save(Instant::now() + Duration::from_secs(60))
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let writing = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            for i in 0..50 {
+                engine
+                    .write_engram_present(
+                        &wholesale_capture("Alpha", &format!("Replacement {i}."), true),
+                        None,
+                        &crystalline_service::Scope::Unrestricted,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("the capture lands, live or on disk");
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let both = async {
+        saving.await.unwrap();
+        writing.await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(30), both)
+        .await
+        .expect("a save and a wholesale overwrite must not wedge each other");
+}
+
+/// **Ruling I1.** The live arm is for a REPLACEMENT, and it says so itself
+/// rather than inheriting the collision check's word for it.
+///
+/// The window: an engram is deleted while its room is still open - the room
+/// only learns of that on its next save - so a capture at that permalink finds
+/// the permalink free, passes the collision check without `overwrite` and,
+/// under an arm that trusted that check, morphs the document somebody is
+/// looking at into a brand new engram with a receipt saying "created".
+///
+/// What happens instead is the ordinary create: the file is written beside the
+/// room, exactly as a capture at a free permalink always has, and the person's
+/// document is left alone. That is the truthful outcome for a call that never
+/// asked to replace anything - and the room, which is a room over an engram
+/// that was deleted, settles that on its own next save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_without_overwrite_never_morphs_an_open_document() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed but never saved").await;
+
+    // The row and the file go while the room stands.
+    engine
+        .delete_engram(&crystalline_service::params::DeleteParams {
+            identifier: "alpha".to_string(),
+            domain: "eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .expect("the engram is deleted under the open room");
+
+    let receipt = engine
+        .write_engram_present(
+            &wholesale_capture("Alpha", "A brand new engram.", false),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            None,
+        )
+        .await
+        .expect("a capture at a free permalink is an ordinary create");
+    assert!(
+        receipt["landed"].is_null(),
+        "a create is not a live landing: {receipt}"
+    );
+    assert_eq!(
+        receipt["action"].as_str(),
+        Some("created"),
+        "and says what it was: {receipt}"
+    );
+
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains("typed but never saved") && !live.contains("A brand new engram."),
+        "the open document was not morphed by a capture that never asked to replace it: {live:?}"
+    );
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(
+        on_disk.contains("A brand new engram."),
+        "the create landed as an ordinary file write: {on_disk:?}"
+    );
+}
+
+/// **Ruling I2.** A virtual domain's MANIFEST replaced inside its room reaches
+/// the routing cache when the room saves - the tail the live arm leaves to the
+/// saver, pinned end to end so "the saver owes it" is a fact rather than a
+/// claim in a comment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache() {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("eng".to_string(), DomainEntry::virtual_domain());
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine
+        .write_engram(&wholesale_capture(
+            "MANIFEST",
+            "# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for the old question\n",
+            false,
+        ))
+        .await
+        .expect("the manifest lands");
+    engine.refresh_routing_cache().await;
+    assert!(
+        engine
+            .virtual_routing_bullets()
+            .await
+            .get("eng")
+            .is_some_and(|bullets| bullets.iter().any(|b| b.contains("the old question"))),
+        "the routing starts where the manifest says"
+    );
+
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "manifest", None).await.unwrap();
+    let _doc = sync_client(&joined).await;
+
+    engine
+        .write_engram_present(
+            &wholesale_capture(
+                "MANIFEST",
+                "# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for the new question\n",
+                true,
+            ),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            None,
+        )
+        .await
+        .expect("the replacement lands in the room");
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let bullets = engine.virtual_routing_bullets().await;
+    assert!(
+        bullets
+            .get("eng")
+            .is_some_and(|bullets| bullets.iter().any(|b| b.contains("the new question"))),
+        "the saved manifest is what the domain routes on: {bullets:?}"
+    );
+    drop(scratch);
+}

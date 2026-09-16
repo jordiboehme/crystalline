@@ -3896,6 +3896,101 @@ impl Engine {
                 .await?;
         }
 
+        // The document this capture would land, built before any lock is taken
+        // because nothing about it needs one: it is the caller's own arguments
+        // plus this instant, and a call that cannot produce a well-formed
+        // engram is better refused with no lock in hand.
+        let today = chrono::Utc::now().date_naive();
+        let now = now_offset();
+        let markdown = build_markdown(
+            &engram_type,
+            &p.title,
+            &permalink,
+            &tags,
+            &status,
+            &today.format("%Y-%m-%d").to_string(),
+            &actor,
+            now,
+            p.metadata.as_ref(),
+            &p.content,
+        )?;
+
+        let mut receipt = json!({
+            "domain": p.domain,
+            "permalink": permalink,
+            "path": rel,
+            "title": p.title,
+            "type": engram_type,
+            "status": status,
+            "action": if p.overwrite { "written" } else { "created" },
+        });
+
+        // **The live arm, and it stands ahead of every arm that writes**, the
+        // way the edit's does (`Engine::apply_source_edit_staged`). While a
+        // co-editing room is open over this permalink the room's text IS the
+        // engram: somebody has it on screen, the file and the row are both a
+        // save behind, and a capture that replaced the file would be replaced
+        // right back by the room's own saver a moment later - with the
+        // person's unsaved work gone and nothing to say where it went. So the
+        // document is morphed to what this capture would have written, its
+        // history and their cursor are kept, and their session is what makes
+        // it durable.
+        //
+        // **Ahead of the FILE LOCK as well, and that ordering is the whole of
+        // a deadlock.** The room's saver takes the two the other way round: it
+        // holds the session state lock across `Engine::save_engram`, which
+        // takes this same path's write lock. An arm that composed into the
+        // room while holding the file lock would close a cycle with a save
+        // already in flight, and neither side times out - the file lock would
+        // be held for ever, so every later write, edit, save and delete of
+        // that engram would hang and the unsaved work would never land. The
+        // edit's live arm keeps the same discipline by standing above the arms
+        // that lock; `no_engine_function_composes_into_a_room_under_a_file_write_lock`
+        // pins it for both.
+        //
+        // **`overwrite` is this arm's own precondition, not the collision
+        // check's.** Replacing a whole document somebody is looking at is only
+        // ever what a replacement may do, and the check below would not say so:
+        // an engram deleted while its room is still open leaves the permalink
+        // free - the room learns of the deletion on its next save - so a plain
+        // capture would pass the check and morph the open page into a brand
+        // new engram with a receipt saying "created". A capture that never
+        // asked to replace anything takes the ordinary create path beside the
+        // room instead.
+        if p.overwrite
+            && let Some(rooms) = self.collab_rooms()
+            && rooms.has_live_room(&p.domain, &permalink, overlay).await
+        {
+            let applied = rooms
+                .apply_text(&p.domain, &permalink, overlay, markdown, &actor, peer)
+                .await
+                .map_err(EngineError::Conflict)?;
+            if overlay.is_some() {
+                receipt["draft"] = json!(true);
+            }
+            if let Some(owner) = view.joined() {
+                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+            }
+            // Where it went, in the words the live edit says it in: `present`
+            // names who is about to watch the page change under them.
+            receipt["landed"] = json!("live");
+            receipt["present"] = json!(applied.participants);
+            // The tails, and which of them this arm owes. The generated folder
+            // indexes and the embedding nudge describe bytes that are nowhere
+            // yet, so they belong to the room's saver, which runs both when the
+            // text lands (`Engine::save_engram`). The routing cache is asked
+            // for here too, because a virtual domain's MANIFEST is the one
+            // engram whose text is also configuration and this arm must never
+            // be the place a stale routing block hides: it reads the row the
+            // saver will write, so at this instant it confirms the cache
+            // rather than moving it, and the move itself is pinned end to end
+            // by `a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache`.
+            if matches!(source, ContentSource::Virtual) {
+                self.refresh_routing_cache().await;
+            }
+            return Ok(receipt);
+        }
+
         // The whole existence-check-then-write, for a file domain, under that
         // file's lock: the check and the write it authorizes must be one step,
         // or two creates of one title both find the permalink free, both write,
@@ -3956,73 +4051,6 @@ impl Engine {
                     p.domain
                 )));
             }
-        }
-
-        let today = chrono::Utc::now().date_naive();
-        let now = now_offset();
-        let markdown = build_markdown(
-            &engram_type,
-            &p.title,
-            &permalink,
-            &tags,
-            &status,
-            &today.format("%Y-%m-%d").to_string(),
-            &actor,
-            now,
-            p.metadata.as_ref(),
-            &p.content,
-        )?;
-
-        let mut receipt = json!({
-            "domain": p.domain,
-            "permalink": permalink,
-            "path": rel,
-            "title": p.title,
-            "type": engram_type,
-            "status": status,
-            "action": if p.overwrite { "written" } else { "created" },
-        });
-
-        // **The live arm, and it stands ahead of every arm that writes**, the
-        // way the edit's does (`Engine::apply_source_edit_staged`). While a
-        // co-editing room is open over this permalink the room's text IS the
-        // engram: somebody has it on screen, the file and the row are both a
-        // save behind, and a capture that replaced the file would be replaced
-        // right back by the room's own saver a moment later - with the
-        // person's unsaved work gone and nothing to say where it went. So the
-        // document is morphed to what this capture would have written, its
-        // history and their cursor are kept, and their session is what makes
-        // it durable.
-        //
-        // Only a replacement ever gets here. A room is open over an engram
-        // that exists, so a capture at that permalink without `overwrite` was
-        // already refused by the collision check above, unchanged.
-        //
-        // No `enforce_temporal` pass beside it, unlike the edit arm: the
-        // markdown above came out of `build_markdown`, which normalizes the
-        // temporal fields and the verification block itself, so the document
-        // this hands the room is already what the saver accepts.
-        if let Some(rooms) = self.collab_rooms()
-            && rooms
-                .live_text(&p.domain, &permalink, overlay)
-                .await
-                .is_some()
-        {
-            let applied = rooms
-                .apply_text(&p.domain, &permalink, overlay, markdown, &actor, peer)
-                .await
-                .map_err(EngineError::Conflict)?;
-            if overlay.is_some() {
-                receipt["draft"] = json!(true);
-            }
-            if let Some(owner) = view.joined() {
-                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
-            }
-            // Where it went, in the words the live edit says it in: `present`
-            // names who is about to watch the page change under them.
-            receipt["landed"] = json!("live");
-            receipt["present"] = json!(applied.participants);
-            return Ok(receipt);
         }
 
         // The third place a write can land, and the reason it comes first: on a
@@ -4092,7 +4120,15 @@ impl Engine {
     /// The agent stands in the room while the question is put, the way a read
     /// of a live document stands it there: somebody deciding whether to let
     /// their page be replaced is owed the name of who is asking. Its own slot
-    /// is left out of the names, which answer "who is in there with you".
+    /// is left out of the names, which answer "who is in there with you". The
+    /// chip stands even when the write is then refused or never confirmed, and
+    /// that is the true thing to draw: an agent that reached for somebody's
+    /// open page was in there, whatever came of it.
+    ///
+    /// A read-only instance answers `None` rather than a question: the write
+    /// refuses with [`EngineError::ReadOnly`] a moment later, and asking
+    /// somebody to authorize what the server will refuse anyway is a question
+    /// in the wrong words.
     pub async fn live_write_target(
         &self,
         p: &WriteParams,
@@ -4100,13 +4136,28 @@ impl Engine {
         join: Option<&crate::join::Join>,
         peer: Option<&AgentPeer>,
     ) -> Option<LiveWriteTarget> {
+        if self.read_only {
+            return None;
+        }
         let rooms = self.collab_rooms()?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join)
             .await
             .ok()?;
         let overlay = view.actor();
-        let (_, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title).ok()?;
-        rooms.live_text(&p.domain, &permalink, overlay).await?;
+        let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title).ok()?;
+        // The same screen the write runs, run before anybody is named: a
+        // grantee working inside one draft who aims a capture at another path
+        // in the owner's overlay is refused by the write, and a question that
+        // named who is in the room over that page would have disclosed it
+        // ahead of the gate that refuses.
+        if let Some(join) = join.filter(|_| view.joined().is_some()) {
+            self.screen_granted_path(&p.domain, &rel, scope, Some(join))
+                .await
+                .ok()?;
+        }
+        if !rooms.has_live_room(&p.domain, &permalink, overlay).await {
+            return None;
+        }
         let mine = match peer {
             Some(peer) => {
                 rooms

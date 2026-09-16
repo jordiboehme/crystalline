@@ -589,6 +589,25 @@ impl CollabSessions {
         session.touch_agent_presence(peer).await
     }
 
+    /// Whether a room is open over one document, without rendering a word of
+    /// it.
+    ///
+    /// The existence half of [`CollabSessions::live_text`], for the callers
+    /// that only need to know whether the room is there: `live_text` renders
+    /// the whole Yrs document under the session lock, which is a real cost on
+    /// a large engram and is pure waste when the answer is a yes-or-no. The
+    /// three conditions are [`CollabSessions::live_room`]'s, so a swept,
+    /// poisoned or closed room answers `false` here exactly as it answers
+    /// `None` there.
+    pub async fn has_live_room(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+    ) -> bool {
+        self.live_room(domain, permalink, overlay).await.is_some()
+    }
+
     /// Who is in the room over one document right now, or an empty list when
     /// no room is open over it.
     pub async fn participants(
