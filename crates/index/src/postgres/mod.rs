@@ -3119,6 +3119,81 @@ mod tests {
         }
     }
 
+    /// `reference_match`'s path tie-break (`crates/index/src/store.rs`) is
+    /// interpolated into a `path_order` variable rather than written out as
+    /// literal text in this file, so `every_text_order_by_is_collation_pinned`'s
+    /// static scan of `postgres/mod.rs` and `postgres/search.rs` can never see
+    /// it: the source line only ever carries the placeholder token
+    /// `{path_order}`, which is not a column `TEXT_COLUMNS` knows about.
+    /// Adding `store.rs` to that scan's `sources` would pass vacuously and
+    /// leave the statement covered by nothing at all while looking covered,
+    /// so this closes the gap by scanning the RENDERED output instead, for
+    /// both backend flags and all three candidate sets `reference_match`
+    /// takes.
+    ///
+    /// One rendering is a single long line carrying four `ORDER BY`
+    /// occurrences, one per `COALESCE` arm, so every occurrence is walked
+    /// with `match_indices` rather than stopping at the first `find`, and
+    /// each occurrence's tail is fed through the same `sort_keys` the static
+    /// scan uses.
+    #[test]
+    fn reference_match_tie_break_is_collation_pinned() {
+        for postgres in [false, true] {
+            for (label, candidates) in [
+                ("Base", crate::store::ReferenceCandidates::Base),
+                (
+                    "View",
+                    crate::store::ReferenceCandidates::View {
+                        screen: "e.actor = 'a'",
+                    },
+                ),
+                (
+                    "DraftsOnly",
+                    crate::store::ReferenceCandidates::DraftsOnly {
+                        screen: "e.actor = 'a'",
+                    },
+                ),
+            ] {
+                let rendered = crate::store::reference_match("relation", candidates, postgres);
+                let mut path_keys = 0usize;
+                for (pos, _) in rendered.match_indices("ORDER BY ") {
+                    for key in sort_keys(&rendered[pos + "ORDER BY ".len()..]) {
+                        assert!(
+                            !key.chars().all(|c| c.is_ascii_digit()),
+                            "reference_match(postgres={postgres}, {label}) orders by the \
+                             positional key `{key}`, which cannot carry a collation."
+                        );
+                        if !key.contains("path") {
+                            continue;
+                        }
+                        path_keys += 1;
+                        if postgres {
+                            assert!(
+                                key.contains("COLLATE"),
+                                "reference_match(postgres=true, {label}) orders by `{key}` \
+                                 without a collation. Pin it with COLLATE \"C\" so it \
+                                 matches Turso's byte order."
+                            );
+                        } else {
+                            assert!(
+                                !key.contains("COLLATE"),
+                                "reference_match(postgres=false, {label}) orders by `{key}` \
+                                 with a collation Turso does not understand; Turso already \
+                                 sorts TEXT byte-wise on its own, so the bare column is \
+                                 correct there."
+                            );
+                        }
+                    }
+                }
+                assert_eq!(
+                    path_keys, 4,
+                    "reference_match(postgres={postgres}, {label}) should carry the path \
+                     tie-break on every one of its four COALESCE arms: {rendered}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sort_keys_splits_a_clause_into_its_keys() {
         assert_eq!(

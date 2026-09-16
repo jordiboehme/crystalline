@@ -510,30 +510,32 @@ parity!(
 
 /// `reference_match`'s title-match arm with two candidates: two engrams share
 /// a title, so a `[[Same Title]]` reference has more than one row it could
-/// bind to. `z-target.md` (permalink `zulu-target`) is synced alone first, so
-/// it gets the lower id; `a-target.md` (permalink `alpha-target`) arrives in a
-/// later sync alongside the reference itself, so it gets the higher id and
-/// its path sorts byte-lower than `z-target.md`'s. Without a secondary sort
-/// key on the tie, `LIMIT 1` is free to answer whichever row insertion order
-/// or physical layout hands it first - the higher-id, byte-higher row here -
-/// which is exactly what a bare `LIMIT 1` with no `ORDER BY` does. The fix
-/// pins the tie to the byte-lower path on both backends, so the reference
-/// binds to `a-target.md` regardless of which candidate existed first.
+/// bind to. `alpha-target.md` (permalink `alpha-target`) is synced alone
+/// first, so it gets the lower id; `Zulu-target.md` (permalink
+/// `zulu-target`) arrives in a later sync alongside the reference itself, so
+/// it gets the higher id. The three orderings a wrong fix could follow all
+/// disagree here, which is the point: insertion order (an unordered `LIMIT 1`
+/// answering whichever row it sees first) picks `alpha-target.md`; a locale
+/// collation, case-insensitive at the primary level, also picks
+/// `alpha-target.md`; only byte order picks `Zulu-target.md`, since `'Z'` is
+/// `0x5A` and `'a'` is `0x61`. The fix pins the tie to byte order on both
+/// backends, so the reference binds to `Zulu-target.md` regardless of which
+/// candidate existed first and regardless of the database's locale.
 async fn reference_match_tie_break_prefers_the_byte_lower_path(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
     write(
         root,
-        "z-target.md",
-        &engram("Same Title", "zulu-target", "engram", "", "z body\n"),
+        "alpha-target.md",
+        &engram("Same Title", "alpha-target", "engram", "", "alpha body\n"),
     );
     sync_domain(store, "d", root).await.unwrap();
 
     write(
         root,
-        "a-target.md",
-        &engram("Same Title", "alpha-target", "engram", "", "a body\n"),
+        "Zulu-target.md",
+        &engram("Same Title", "zulu-target", "engram", "", "zulu body\n"),
     );
     write(
         root,
@@ -548,16 +550,16 @@ async fn reference_match_tie_break_prefers_the_byte_lower_path(store: &dyn Store
     );
     sync_domain(store, "d", root).await.unwrap();
 
-    let a_target = store.lookup_id("d", "alpha-target").await.unwrap().unwrap();
-    let z_target = store.lookup_id("d", "zulu-target").await.unwrap().unwrap();
+    let alpha_target = store.lookup_id("d", "alpha-target").await.unwrap().unwrap();
+    let zulu_target = store.lookup_id("d", "zulu-target").await.unwrap().unwrap();
     let domain = store
         .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
         .await
         .unwrap();
 
-    let a_page = store
+    let alpha_page = store
         .inbound_page(&InboundQuery {
-            engram_id: a_target,
+            engram_id: alpha_target,
             domain_id: domain,
             permalink: "alpha-target",
             title: "Same Title",
@@ -569,9 +571,9 @@ async fn reference_match_tie_break_prefers_the_byte_lower_path(store: &dyn Store
         })
         .await
         .unwrap();
-    let z_page = store
+    let zulu_page = store
         .inbound_page(&InboundQuery {
-            engram_id: z_target,
+            engram_id: zulu_target,
             domain_id: domain,
             permalink: "zulu-target",
             title: "Same Title",
@@ -585,12 +587,12 @@ async fn reference_match_tie_break_prefers_the_byte_lower_path(store: &dyn Store
         .unwrap();
 
     assert_eq!(
-        a_page.total, 1,
-        "the reference binds to the byte-lower path, a-target.md: {a_page:?}"
+        zulu_page.total, 1,
+        "the reference binds to the byte order winner, Zulu-target.md: {zulu_page:?}"
     );
     assert_eq!(
-        z_page.total, 0,
-        "not to the byte-higher path, z-target.md, even though it was inserted first: {z_page:?}"
+        alpha_page.total, 0,
+        "not to the locale order winner or the insertion order winner, alpha-target.md: {alpha_page:?}"
     );
 }
 parity!(
