@@ -1020,7 +1020,7 @@ type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
 /// on a modern-only fleet the number stops growing. A figure covering modern
 /// traffic would be a different metric, not a repair of this one.
 ///
-/// # Why it also releases session claims
+/// # Why it also releases session claims and draft joins
 ///
 /// This is the one seam rmcp calls on *every* end of a session:
 /// `close_session` runs from the DELETE handler (`tower.rs:2073`) and from
@@ -1030,10 +1030,20 @@ type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
 /// permanent entry per connection that ever went idle, so the map is threaded
 /// through here rather than released only where the gate can see it - see
 /// [`crate::mcp_gate::SessionOwners`].
+///
+/// The draft joins that session opened ride along for the same reason. A join
+/// is keyed by its holder, and a legacy session IS one
+/// ([`crate::join::Holder::McpSession`]), so "the session ended" has to be able
+/// to end it. The service object's own drop ends it on the path where that drop
+/// happens, which is a client `DELETE`; an idle keep-alive or a worker error
+/// gives no such guarantee, and that holder has no idle limit of its own to
+/// fall back on. Threading the registry through here makes one rule of the
+/// three endings.
 pub(crate) struct CountingSessions<M> {
     inner: M,
     created: Arc<AtomicUsize>,
     sessions: Arc<crate::mcp_gate::SessionOwners>,
+    joins: Arc<crate::join::Joins>,
 }
 
 impl<M> CountingSessions<M> {
@@ -1041,11 +1051,13 @@ impl<M> CountingSessions<M> {
         inner: M,
         created: Arc<AtomicUsize>,
         sessions: Arc<crate::mcp_gate::SessionOwners>,
+        joins: Arc<crate::join::Joins>,
     ) -> CountingSessions<M> {
         CountingSessions {
             inner,
             created,
             sessions,
+            joins,
         }
     }
 }
@@ -1086,6 +1098,14 @@ impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
         // up on must not keep refusing a later caller who legitimately gets its
         // id, and the entry is worthless either way.
         self.sessions.release(id);
+        // And the drafts that session had joined end with it, for the same
+        // reason and on the same three paths. A join held by a session that is
+        // gone is a key nobody can present and nothing can expire -
+        // `Holder::McpSession` has no idle limit, because a session's ending is
+        // supposed to be its ending - so leaving one here would leave an
+        // author's draft holding a guest who cannot come back.
+        self.joins
+            .end_holder(&crate::join::Holder::McpSession(id.to_string()));
         self.inner.close_session(id)
     }
 
@@ -1447,6 +1467,7 @@ fn http_base(
         session_manager,
         http_sessions,
         session_owners.clone(),
+        engine.joins().clone(),
     ));
     // The REST state is built only when the API is served. It is not free (it
     // resolves paths and can fail), and building it to then leave it unmounted
@@ -2332,6 +2353,7 @@ mod tests {
             LocalSessionManager::default(),
             Arc::new(AtomicUsize::new(0)),
             owners.clone(),
+            Arc::new(crate::join::Joins::default()),
         );
         let (id, _transport) = manager.create_session().await.unwrap();
         owners.claim(id.to_string(), "ada".to_string());
@@ -2342,6 +2364,61 @@ mod tests {
             owners.owner(&id),
             None,
             "a session rmcp has given up on leaves no claim behind"
+        );
+    }
+
+    /// A legacy session's draft join ends WITH THE SESSION, on every path rmcp
+    /// ends one.
+    ///
+    /// `tests/mcp_modern_era.rs` drives the client `DELETE` end to end, and on
+    /// that path the service object dies with the connection, so the join would
+    /// also go through `SessionJoins`' own drop. The other two endings - the 300
+    /// second idle keep-alive and a worker error - reach `close_session` from
+    /// inside `spawn_session_worker` with no drop of ours guaranteed alongside,
+    /// and `Holder::McpSession` is not idle-limited, so a join left behind on
+    /// those would have nothing at all to end it. This is the seam all three
+    /// arrive at, which is why the registry is threaded through here beside the
+    /// claim map rather than left to the service object's lifetime.
+    #[tokio::test]
+    async fn closing_a_session_ends_the_draft_joins_it_held() {
+        use rmcp::transport::streamable_http_server::session::SessionManager;
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
+        let owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+        let joins = Arc::new(crate::join::Joins::default());
+        let manager = CountingSessions::new(
+            LocalSessionManager::default(),
+            Arc::new(AtomicUsize::new(0)),
+            owners.clone(),
+            joins.clone(),
+        );
+        let (id, _transport) = manager.create_session().await.unwrap();
+
+        // One person, two callers, one draft: the session that is about to end
+        // and a window of theirs that is not.
+        let session = crate::join::Holder::McpSession(id.to_string());
+        let window = crate::join::Holder::Browser("a-window".to_string());
+        for holder in [session.clone(), window.clone()] {
+            joins
+                .open(crate::join::Join {
+                    account: "ada".to_string(),
+                    holder,
+                    domain: "eng".to_string(),
+                    path: "notes".to_string(),
+                    owner: "ada".to_string(),
+                })
+                .unwrap();
+        }
+
+        manager.close_session(&id).await.unwrap();
+
+        assert!(
+            !joins.holds("ada", &session, "eng", "ada", "notes"),
+            "the session ended, so the join it held did"
+        );
+        assert!(
+            joins.holds("ada", &window, "eng", "ada", "notes"),
+            "and the window beside it is still inside the draft"
         );
     }
 

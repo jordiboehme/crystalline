@@ -1395,7 +1395,11 @@ impl McpServer {
     ///
     /// `None` when the request carries no account at all, which is the
     /// anonymous open tier: a share-link binds to an account, so there is no
-    /// join for that caller to hold and the verb refuses in those words.
+    /// join for that caller to hold and the verb refuses in those words. With
+    /// MCP authentication off that is EVERY request, so the claim test below is
+    /// never reached and no join is ever opened - an instance with no accounts
+    /// has no drafts to join either, and the answer falls out of the first line
+    /// rather than out of the session rule.
     fn holder_of(&self, ctx: &RequestContext<RoleServer>) -> Option<crate::join::Holder> {
         match self.transport {
             Transport::Stdio => Some(crate::join::Holder::Process(self.server)),
