@@ -5256,3 +5256,53 @@ async fn convergences_rename_ends_the_links_on_the_path_it_left() {
          the page under its new name"
     );
 }
+
+/// And the rename that makes the draft the folder ends them too, although it
+/// writes no destination at all.
+///
+/// The other half of the same function, and the one a reader would skip. When
+/// the team files the page under a new name and what it says there is word for
+/// word what this actor was drafting, the draft has become the folder: there is
+/// nothing left to write and nothing left to share, since everybody who can
+/// read the domain reads that text anyway. The ending waits for the destination
+/// on the path that has one, so this path has to end them where it returns -
+/// which is the line a restructure loses.
+#[tokio::test]
+async fn a_convergence_that_makes_the_draft_the_folder_ends_its_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
+    )
+    .await;
+    // Her draft says exactly what the team's page says, which is what makes the
+    // rename below land rather than move.
+    let agreed = String::from_utf8(team_plan()).unwrap();
+    draft(&eng, "alice", "notes/plan.md", &agreed).await;
+    mirror(tmp.path(), "alice", "notes/plan.md", &agreed);
+    let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
+
+    let renamed = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/plan-v2.md", team_plan()),
+    ]));
+    mock.set_branch("main", &renamed);
+    eng.origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    assert!(
+        overlay_paths(&eng, "alice").await.is_empty(),
+        "her draft is the folder now, under its new name: {:?}",
+        overlay_paths(&eng, "alice").await
+    );
+    assert!(
+        auth.overlay_grants_held("bob", "team")
+            .await
+            .unwrap()
+            .is_empty(),
+        "and the link ended with the draft it was a link to"
+    );
+}

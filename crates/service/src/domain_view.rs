@@ -522,10 +522,11 @@ impl<'a> DomainView<'a> {
     ///
     /// **This is also where a draft's share-links and joins end**, and it is
     /// the one place they can be ended once rather than at each verb. Every
-    /// way an overlay row is taken away passes through here - the discard, the
-    /// fold, a withdrawal ([`Engine::revert_into_overlay`]), a conflict
-    /// resolution ([`Engine::resolve_in_overlay`]), a settled convergence and
-    /// the rename convergence performs when the base carried the draft along
+    /// way an overlay row is taken away passes through here or through
+    /// [`DomainView::drop_mid_move`] beside it - the discard, the fold, a
+    /// withdrawal ([`Engine::revert_into_overlay`]), a conflict resolution
+    /// ([`Engine::resolve_in_overlay`]), a settled convergence and the rename
+    /// convergence performs when the base carried the draft along
     /// ([`Engine::move_draft_with_the_base`]), which never touches the move
     /// verb at all - so a verb added later inherits the ending instead of
     /// having to remember it. A grant lasts exactly as long as the thing it
@@ -543,6 +544,40 @@ impl<'a> DomainView<'a> {
     /// database is a different store behind a different lock, and a row that
     /// is gone is what makes ending its grants the truth.
     pub(crate) async fn drop(&self, domain_id: DomainId, path: &str) -> Result<()> {
+        let actor = self.writing_actor()?.to_string();
+        self.clear_row(domain_id, path).await?;
+        self.engine
+            .end_draft_grants(self.domain.as_str(), &actor, path)
+            .await;
+        Ok(())
+    }
+
+    /// The same removal with the ending **left to the caller**, for the one
+    /// shape that needs it: the source half of a move.
+    ///
+    /// A move is two writes, and until the second one lands the move has not
+    /// happened - the source goes back to exactly what this actor held. So
+    /// ending the links at the removal would end them on the way to not
+    /// happening: a destination that could not be written would leave its
+    /// author's page where it was and their share-link revoked, with whoever
+    /// was inside the draft put out of it, over a move nobody made.
+    ///
+    /// Both movers end the links themselves once they know the move happened,
+    /// and there is no third caller. The deferred-removal guard in
+    /// crates/service/tests/overlay_domains.rs is what keeps it that way: a
+    /// caller that took a row away and ended nothing would leave a link
+    /// standing on a draft that is not there.
+    pub(crate) async fn drop_mid_move(&self, domain_id: DomainId, path: &str) -> Result<()> {
+        self.clear_row(domain_id, path).await
+    }
+
+    /// The removal itself: the mirror, the row and this actor's edges onto it.
+    ///
+    /// Private, and the only place [`Store::clear_overlay_entry`] is called
+    /// from, so "an overlay row goes away" is one piece of code with two
+    /// callers rather than a rule each verb remembers. Whether the draft it
+    /// held is OVER is the callers' question, not this one's.
+    async fn clear_row(&self, domain_id: DomainId, path: &str) -> Result<()> {
         let actor = self.writing_actor()?;
         let domain = self.domain.as_str();
         let state_dir = self.engine.journal_state_dir()?;
@@ -570,12 +605,6 @@ impl<'a> DomainView<'a> {
         match done {
             Ok(()) => {
                 store.commit().await?;
-                // Released by name rather than by falling out of scope: the
-                // ending below reaches a different store behind a different
-                // lock, and holding the index's across it would be a lock
-                // order this file does not otherwise have.
-                std::mem::drop(store);
-                self.engine.end_draft_grants(domain, actor, path).await;
                 Ok(())
             }
             Err(e) => {
@@ -973,7 +1002,9 @@ impl<'a> DomainView<'a> {
             // the move takes it with them; a tombstone over nothing would
             // leave a deletion of an engram the team never had.
             None => {
-                self.drop(src.domain_id, &src.path).await?;
+                // Deferred, like every other half-done step of this verb: the
+                // ending is thirty lines below, after the destination lands.
+                self.drop_mid_move(src.domain_id, &src.path).await?;
             }
             Some(base) => {
                 let base_text = self.engine.load_content(src_source, base).await?;
@@ -998,7 +1029,7 @@ impl<'a> DomainView<'a> {
                         .await
                         .map(|_| ())
                 } else {
-                    self.drop(src.domain_id, &src.path).await
+                    self.drop_mid_move(src.domain_id, &src.path).await
                 };
                 if let Err(undo) = undo {
                     tracing::error!(

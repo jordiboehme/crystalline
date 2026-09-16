@@ -5661,10 +5661,14 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
 /// it lives at the two places a row can stop being a draft, and this pins that
 /// there are still only two.
 ///
-/// * **Removed** - the row goes, which only [`DomainView::drop`] does. The
+/// * **Removed** - the row goes, which only `DomainView::clear_row` does. The
 ///   discard, the fold, a withdrawal, a conflict resolution, a settled
-///   convergence and both of a rename's undo paths all reach it, and each
-///   inherits the ending rather than repeating it.
+///   convergence and both of a rename's undo paths all reach it through
+///   `DomainView::drop`, which ends the links beside it, so each inherits the
+///   ending rather than repeating it. Its one other caller is
+///   `DomainView::drop_mid_move`, the second guard below: a move's source is
+///   taken away before the move is finished, so its ending waits for the
+///   destination rather than firing on the way to a move that may not happen.
 /// * **Replaced** - the row stays and stops being a draft of the page,
 ///   standing as this actor's deletion of what the team holds instead. Two
 ///   verbs do that, the delete and the move's source half, and each ends the
@@ -5684,11 +5688,12 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
 fn an_overlay_row_goes_away_only_where_its_grants_and_joins_end() {
     only_these_reach(
         "clear_overlay_entry(",
-        // The one remover. `DomainView::drop` ends the grants and the joins
-        // after its transaction commits; every verb that undoes a draft goes
-        // through it.
-        &[("domain_view.rs", "drop")],
-        "an overlay row is cleared from a function that is not the drop seam; a draft taken away          there keeps its share-links, which spring back onto whatever its author drafts at that          path next, and keeps the sessions that were writing inside it",
+        // The one remover, private to the view and reached by its two
+        // wrappers: `drop`, which ends the links and joins after its
+        // transaction commits, and `drop_mid_move`, whose caller ends them
+        // once the move it is half of has happened.
+        &[("domain_view.rs", "clear_row")],
+        "an overlay row is cleared from a function that is not the removal seam; a draft taken away          there keeps its share-links, which spring back onto whatever its author drafts at that          path next, and keeps the sessions that were writing inside it",
     );
     only_these_reach(
         "write_overlay_tombstone(",
@@ -5703,6 +5708,38 @@ fn an_overlay_row_goes_away_only_where_its_grants_and_joins_end() {
             ("domain_view.rs", "move_within"),
         ],
         "a draft is replaced by a tombstone from a function that does not end its grants and          joins; the row is no longer a draft of that page, so a link on it opens something its          author never shared and a session inside it is inside somebody's deletion",
+    );
+}
+
+/// And the removal that defers its ending is the move's source alone.
+///
+/// A move is two writes, and until the second lands the move has not happened:
+/// the source goes back to exactly what its author held. So the source's
+/// removal must not end their share-links on the way to a move that may fail -
+/// and nothing else may borrow that deferral, because a verb that took a row
+/// away and ended nothing would leave a link standing on a draft that is not
+/// there, ready to spring back onto whatever its author drafts at that path
+/// next.
+///
+/// Both movers end the links themselves once the destination has landed, which
+/// no scan can see; what this pins is that there are only the two of them.
+#[test]
+fn the_move_source_is_the_only_deferred_removal() {
+    only_these_reach(
+        "drop_mid_move(",
+        &[
+            // The wrapper itself.
+            ("domain_view.rs", "drop_mid_move"),
+            // The author's own rename: its source half, and the rollback that
+            // puts the source back when the destination would not take it.
+            ("domain_view.rs", "move_within"),
+            // The rename a pull performs when the base carried the draft
+            // along, which never touches the move verb.
+            ("engine.rs", "move_draft_with_the_base"),
+        ],
+        "a removal defers the ending of a draft's share-links and joins from a function that is \
+         not one half of a move; whatever it takes away, nothing ends the links on it, and the \
+         next draft at that path inherits them",
     );
 }
 

@@ -2868,10 +2868,18 @@ impl Engine {
         let landed = crystalline_remote::state::read_base_file(state_dir, dest)?
             .is_some_and(|base| base == entry.content.as_bytes());
         let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
-        view.drop(domain_id, &entry.path).await?;
+        // The removal defers the ending of this draft's share-links and joins,
+        // because a move that could not write its destination puts the source
+        // back and did not happen - and a move that did not happen must not
+        // have ended anybody's link on the way to not happening. Every way out
+        // of here below either ends them or is that failure.
+        view.drop_mid_move(domain_id, &entry.path).await?;
         if landed {
             // The rename carried this actor's own words with it: the draft is
-            // the folder now, under its new name.
+            // the folder now, under its new name. There is no destination to
+            // wait for and nothing left to share - everybody who can read the
+            // domain reads that text anyway - so the links end here.
+            self.end_draft_grants(domain, actor, &entry.path).await;
             return Ok(true);
         }
         match view.write(domain_id, dest, &entry.content).await {
@@ -2896,6 +2904,10 @@ impl Engine {
                 return Err(e);
             }
         }
+        // The draft stands somewhere else now, so the links minted on the path
+        // it left end with it: a grant was minted on a path, and re-sharing the
+        // page under its new name is the author's to do.
+        self.end_draft_grants(domain, actor, &entry.path).await;
         Ok(false)
     }
 
