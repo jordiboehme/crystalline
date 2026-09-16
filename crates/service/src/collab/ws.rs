@@ -69,6 +69,7 @@ pub struct JoinQuery {
         (status = 401, description = "No identity.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 403, description = "Viewer role, read-only instance, or a missing/foreign Origin.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 404, description = "No such engram.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 422, description = "`overlay` names somebody whose draft a live share-link shows this caller, and this session has not joined it: seeing a draft and editing it are two steps. The detail is the sentence that says how to take the second.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 409, description = "Mixed line endings: this file cannot hold a shared session; edit solo.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 503, description = "Session or participant capacity reached.", body = ProblemDetail, content_type = "application/problem+json"),
     ),

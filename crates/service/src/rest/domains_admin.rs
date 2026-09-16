@@ -840,7 +840,15 @@ fn single_domain(
                            all exist but are not grouped on the forge yet. \
                            All four are always present, quiet rather than \
                            absent off the stacked path, so one reader handles \
-                           either path.",
+                           either path.\n\nOn a domain that reviews changes \
+                           three more keys say where the drafts stand. \
+                           `my_drafts` counts this account's own draft \
+                           changes, `drafts` counts every actor's, and \
+                           `out_of_band` names the changed files in the folder \
+                           the team reviewed that no draft accounts for - work \
+                           written past review mode, which a client surfaces \
+                           because sharing carries it along. All three are \
+                           absent on a domain that takes changes directly.",
             body = Object,
             example = json!({
                 "domain": "eng",

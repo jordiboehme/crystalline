@@ -38,7 +38,15 @@ use crate::params::{BrowseParams, ListDomainsParams};
     responses(
         (
             status = 200,
-            description = "The engine's own domain listing, unchanged.",
+            description = "The engine's own domain listing, unchanged.\n\nA \
+                           domain that reviews changes before they land \
+                           carries `review: \"overlay\"` and, for a caller \
+                           with an account, `my_drafts`: how many draft \
+                           changes of theirs are waiting to be shared. Both \
+                           are absent on a domain that takes changes directly, \
+                           and `my_drafts` is absent rather than zero when \
+                           there is no account to count for - a client reads \
+                           presence, since null and 0 are different facts.",
             body = Object,
             example = json!({
                 "behavior": [

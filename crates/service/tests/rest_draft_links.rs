@@ -1483,6 +1483,14 @@ async fn a_joined_overwrite_of_an_unreferenced_path_refuses() {
         .send()
         .await
         .unwrap();
+    // 422, and pinned rather than left to the detail text: a teaching refusal
+    // a client reads as an unexpected error is a sentence nobody is shown, and
+    // this status is what the OpenAPI document promises for these routes.
+    assert_eq!(
+        refused.status(),
+        422,
+        "a teaching refusal, the status the document names"
+    );
     let problem: serde_json::Value = refused.json().await.unwrap();
     let detail = problem["detail"].as_str().unwrap_or_default();
     assert!(
@@ -1532,6 +1540,11 @@ async fn a_joined_delete_of_an_unreferenced_file_refuses_and_leaves_no_tombstone
         .send()
         .await
         .unwrap();
+    assert_eq!(
+        refused.status(),
+        422,
+        "a teaching refusal, the status the document names"
+    );
     let problem: serde_json::Value = refused.json().await.unwrap();
     assert!(
         problem["detail"]

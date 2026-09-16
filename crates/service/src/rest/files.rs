@@ -116,11 +116,15 @@ pub struct UploadedAttachment {
     /// Lowercase hex SHA-256 of the stored bytes.
     #[schema(example = "9f2a1c05e2b7")]
     pub sha256: String,
-    /// Present and true only when the file landed as this account's own draft,
-    /// on a domain that reviews changes before they land: the bytes are in that
-    /// account's overlay, nobody else can read them yet, and they reach the
-    /// team when the draft is shared. Absent on a domain that takes changes
-    /// directly, where an upload is the domain's file the moment it lands.
+    /// Present and true when the file landed in a draft rather than in the
+    /// folder the team reviewed, on a domain that reviews changes before they
+    /// land: the bytes are in an overlay, not in the shared tree, and they
+    /// reach the team when that draft is shared. Whose draft depends on the
+    /// write: this account's own ordinarily, and the OWNER's where a live join
+    /// routed the upload into somebody else's draft - so `true` says "not the
+    /// team's file yet" rather than "nobody but you can read it". Absent on a
+    /// domain that takes changes directly, where an upload is the domain's
+    /// file the moment it lands.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = true)]
     pub draft: Option<bool>,
@@ -302,7 +306,13 @@ pub async fn read(
                    `%`, be at most 256 bytes and end in an allowlisted \
                    extension; anything else is 400 naming the rule. The \
                    domain is marked as owing a consolidation sweep, because a \
-                   person just added something the agent has not read yet.",
+                   person just added something the agent has not read yet.\n\n\
+                   On a domain that reviews changes the bytes land in the \
+                   caller's own files overlay and the folder the team reviewed \
+                   is not touched, which is what `draft` in the answer says. \
+                   With `X-Crystalline-Join` naming a live join the bytes \
+                   follow it into the OWNER's files overlay instead, to be \
+                   folded or discarded with the draft that references them.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -311,6 +321,16 @@ pub async fn read(
             description = "Where to store it, domain-relative and under \
                            `assets/`.",
             example = "assets/diagrams/flow.png",
+        ),
+        (
+            "X-Crystalline-Join" = Option<String>,
+            Header,
+            description = "The key of a live join this session opened on a \
+                           draft share-link (`POST /draft-links/join`). It \
+                           routes the upload into the draft owner's files \
+                           overlay rather than the caller's own. A key naming \
+                           no live join of this account's is refused 403 and \
+                           nothing is stored.",
         ),
     ),
     request_body(
@@ -342,7 +362,9 @@ pub async fn read(
         (
             status = 403,
             description = "The caller is not an editor, the CSRF token is \
-                           missing or wrong, or the instance is read-only.",
+                           missing or wrong, the instance is read-only, or a \
+                           presented `X-Crystalline-Join` names no live join \
+                           of this account's.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -356,6 +378,18 @@ pub async fn read(
             status = 413,
             description = "The body is over the 10 MiB limit this API accepts, \
                            which is also the attachment size ceiling.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "A teaching refusal from a domain that reviews \
+                           changes: a write into the folder the team reviewed \
+                           rather than into a draft, a path where a share-link \
+                           shows somebody else's draft and this session has \
+                           not joined it, or a caller with no account of their \
+                           own and so no draft to write into. The detail is \
+                           the sentence that says what to do instead.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -415,10 +449,25 @@ pub async fn write(
                    together. An engram that still references the path keeps its \
                    reference - the consolidation sweep is what reports the \
                    dangling link, rather than this route rewriting somebody's \
-                   markdown.",
+                   markdown.\n\nOn a domain that reviews changes nothing is \
+                   removed from the folder the team reviewed: the deletion is \
+                   recorded in the caller's own files overlay, to be applied \
+                   when the draft is folded. With `X-Crystalline-Join` naming \
+                   a live join it is recorded in the draft OWNER's overlay \
+                   instead, exactly as an upload follows the join.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         ("path" = String, Path, description = "The attachment path.", example = "assets/diagrams/flow.png"),
+        (
+            "X-Crystalline-Join" = Option<String>,
+            Header,
+            description = "The key of a live join this session opened on a \
+                           draft share-link (`POST /draft-links/join`). It \
+                           routes the deletion into the draft owner's files \
+                           overlay rather than the caller's own. A key naming \
+                           no live join of this account's is refused 403 and \
+                           nothing is removed.",
+        ),
     ),
     responses(
         (status = 204, description = "Deleted."),
@@ -437,13 +486,27 @@ pub async fn write(
         (
             status = 403,
             description = "The caller is not an editor, the CSRF token is \
-                           missing or wrong, or the instance is read-only.",
+                           missing or wrong, the instance is read-only, or a \
+                           presented `X-Crystalline-Join` names no live join \
+                           of this account's.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 404,
             description = "No such domain, or no attachment at that path.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "A teaching refusal from a domain that reviews \
+                           changes: a deletion aimed at the folder the team \
+                           reviewed rather than at a draft, a path where a \
+                           share-link shows somebody else's draft and this \
+                           session has not joined it, or a caller with no \
+                           account of their own. The detail is the sentence \
+                           that says what to do instead.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

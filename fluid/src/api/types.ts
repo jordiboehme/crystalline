@@ -460,6 +460,8 @@ export interface paths {
          *     The write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.
          *
          *     Editing the `permalink` in the frontmatter moves the engram's address, since the index takes the permalink from the file. Such a save is answered 200 with the engram read at its new address, so a client can follow the move rather than lose track of what it just wrote.
+         *
+         *     On a domain that reviews changes the save lands in the caller's own private draft and the folder the team reads does not move. A save made from inside somebody else's draft - `X-Crystalline-Join` naming a live join this session opened through a share-link - lands in THAT person's draft instead, and is answered with the draft itself rather than with a detail read: the same body `POST /draft-links/accept` returns (`domain`, `path`, `owner`, `permalink`, `editable`, `reason`, `content`, `checksum`, `join_key`, `joined`), because the caller's ordinary view does not carry the owner's draft and a read-back would answer 404 for a write that landed.
          */
         put: operations["save_engram"];
         post?: never;
@@ -516,12 +518,16 @@ export interface paths {
          * @description Editor only. The request body is the raw file - not multipart - and the declared content type is ignored: the extension allowlist decides the mime, at upload and at every later read.
          *
          *     The path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon, `#` or `%`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.
+         *
+         *     On a domain that reviews changes the bytes land in the caller's own files overlay and the folder the team reviewed is not touched, which is what `draft` in the answer says. With `X-Crystalline-Join` naming a live join the bytes follow it into the OWNER's files overlay instead, to be folded or discarded with the draft that references them.
          */
         put: operations["write_attachment"];
         post?: never;
         /**
          * Delete an attachment.
          * @description Editor only. Removes the bytes and the metadata row together. An engram that still references the path keeps its reference - the consolidation sweep is what reports the dangling link, rather than this route rewriting somebody's markdown.
+         *
+         *     On a domain that reviews changes nothing is removed from the folder the team reviewed: the deletion is recorded in the caller's own files overlay, to be applied when the draft is folded. With `X-Crystalline-Join` naming a live join it is recorded in the draft OWNER's overlay instead, exactly as an upload follows the join.
          */
         delete: operations["delete_attachment"];
         options?: never;
@@ -967,7 +973,7 @@ export interface paths {
         post?: never;
         /**
          * Revoke one share-link.
-         * @description It stops opening anything at once, and the account it was redeemed by stops seeing the draft on its next request. A session that was working inside the draft is put back outside it, so a grantee who had already joined stops writing into it rather than carrying on until they leave; anybody else holding a live link to the same draft is put outside it too and joins again in one press. 404 when the id names no link of the caller's, which is what somebody else's link and an invented id both answer: a revoke is never a probe for which links exist. Served on a read-only instance, like every other account-state route.
+         * @description It stops opening anything at once, and the account it was redeemed by stops seeing the draft on its next request. A session that was working inside the draft is put back outside it, so a grantee who had already joined stops writing into it rather than carrying on until they leave; anybody else holding a live link to the same draft is put outside it too and joins again in one press. 404 when the id names no link of the caller's, which is what somebody else's link and an invented id both answer: a revoke is never a probe for which links exist. The author may always end what she minted, whatever her role has become since - a live credential is never harder to take back than it was to hand out - and an instance admin may end any link, which is the third party a departed author's live link needs. Served on a read-only instance, like every other account-state route.
          */
         delete: operations["revoke_draft_link"];
         options?: never;
@@ -2936,11 +2942,15 @@ export interface components {
         /** @description The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry. */
         UploadedAttachment: {
             /**
-             * @description Present and true only when the file landed as this account's own draft,
-             *     on a domain that reviews changes before they land: the bytes are in that
-             *     account's overlay, nobody else can read them yet, and they reach the
-             *     team when the draft is shared. Absent on a domain that takes changes
-             *     directly, where an upload is the domain's file the moment it lands.
+             * @description Present and true when the file landed in a draft rather than in the
+             *     folder the team reviewed, on a domain that reviews changes before they
+             *     land: the bytes are in an overlay, not in the shared tree, and they
+             *     reach the team when that draft is shared. Whose draft depends on the
+             *     write: this account's own ordinarily, and the OWNER's where a live join
+             *     routed the upload into somebody else's draft - so `true` says "not the
+             *     team's file yet" rather than "nobody but you can read it". Absent on a
+             *     domain that takes changes directly, where an upload is the domain's
+             *     file the moment it lands.
              * @example true
              */
             draft?: boolean | null;
@@ -3713,6 +3723,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
+            /** @description `overlay` names somebody whose draft a live share-link shows this caller, and this session has not joined it: seeing a draft and editing it are two steps. The detail is the sentence that says how to take the second. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
             /** @description Session or participant capacity reached. */
             503: {
                 headers: {
@@ -3852,7 +3871,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's own domain listing, unchanged. */
+            /**
+             * @description The engine's own domain listing, unchanged.
+             *
+             *     A domain that reviews changes before they land carries `review: "overlay"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4730,7 +4753,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's own read payload, unchanged. */
+            /**
+             * @description The engine's own read payload, unchanged.
+             *
+             *     On a domain that reviews changes a read answers the caller's own draft of the page where they hold one, and `draft` is true. At a path a draft share-link was minted on, the grantee's read answers the author's draft instead, with `draft` true and `draft_owner` naming them: a draft standing where the team's page stands must never be mistaken for that page, so a client shows whose work it is. Both keys are absent on every ordinary read.
+             */
             200: {
                 headers: {
                     /** @description Always `no-cache`: store it, but revalidate before every use. */
@@ -4808,6 +4835,8 @@ export interface operations {
                  * @example "3f8a1c05e2"
                  */
                 "If-Match": string;
+                /** @description The key of a live join this session opened on a draft share-link (`POST /draft-links/join`). Present only while working inside somebody else's draft: it routes the save into that person's draft and changes the reply to the accepted-draft body. A key naming no live join of this account's is refused 403 and nothing is written. */
+                "X-Crystalline-Join"?: string | null;
             };
             path: {
                 /** @description The registered domain. */
@@ -4826,7 +4855,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own read payload for the saved engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. */
+            /** @description The engine's own read payload for the saved engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. A save routed by `X-Crystalline-Join` answers the accepted-draft body instead, with `joined` carrying the sentence naming whose draft it landed in. */
             200: {
                 headers: {
                     /** @description The quoted checksum of the engram as saved, the token the next save carries. */
@@ -4855,7 +4884,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. */
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4900,7 +4929,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The document is not an engram (unparseable, or no frontmatter block), the `If-Match` is a wildcard or a weak validator, or the target is one of the reserved OKF names (`index.md`, `log.md`). */
+            /** @description The document is not an engram (unparseable, or no frontmatter block), the `If-Match` is a wildcard or a weak validator, or the target is one of the reserved OKF names (`index.md`, `log.md`). Also the teaching refusals a domain that reviews changes gives: a save at a path where a share-link shows somebody else's draft, which says to join that draft or to draft your own copy, and a caller with no account of their own, which has no draft to write into. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -5247,7 +5276,10 @@ export interface operations {
     write_attachment: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The key of a live join this session opened on a draft share-link (`POST /draft-links/join`). It routes the upload into the draft owner's files overlay rather than the caller's own. A key naming no live join of this account's is refused 403 and nothing is stored. */
+                "X-Crystalline-Join"?: string | null;
+            };
             path: {
                 /** @description The registered domain. */
                 domain: string;
@@ -5293,7 +5325,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only. */
+            /** @description The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5320,12 +5352,24 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
+            /** @description A teaching refusal from a domain that reviews changes: a write into the folder the team reviewed rather than into a draft, a path where a share-link shows somebody else's draft and this session has not joined it, or a caller with no account of their own and so no draft to write into. The detail is the sentence that says what to do instead. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
         };
     };
     delete_attachment: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description The key of a live join this session opened on a draft share-link (`POST /draft-links/join`). It routes the deletion into the draft owner's files overlay rather than the caller's own. A key naming no live join of this account's is refused 403 and nothing is removed. */
+                "X-Crystalline-Join"?: string | null;
+            };
             path: {
                 /** @description The registered domain. */
                 domain: string;
@@ -5364,7 +5408,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only. */
+            /** @description The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5375,6 +5419,15 @@ export interface operations {
             };
             /** @description No such domain, or no attachment at that path. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A teaching refusal from a domain that reviews changes: a deletion aimed at the folder the team reviewed rather than at a draft, a path where a share-link shows somebody else's draft and this session has not joined it, or a caller with no account of their own. The detail is the sentence that says what to do instead. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6281,6 +6334,8 @@ export interface operations {
              * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not.
              *
              *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
+             *
+             *     On a domain that reviews changes three more keys say where the drafts stand. `my_drafts` counts this account's own draft changes, `drafts` counts every actor's, and `out_of_band` names the changed files in the folder the team reviewed that no draft accounts for - work written past review mode, which a client surfaces because sharing carries it along. All three are absent on a domain that takes changes directly.
              */
             200: {
                 headers: {
@@ -7182,7 +7237,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description A viewer account, or a missing CSRF token. */
+            /** @description A missing or wrong CSRF token. No role gate: a revoke only ever ends a credential the caller minted, so an author demoted since keeps the right to take back what she handed out. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -7191,7 +7246,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller minted no link with that id. */
+            /** @description The caller minted no link with that id, and is not an admin of this instance. */
             404: {
                 headers: {
                     [name: string]: unknown;

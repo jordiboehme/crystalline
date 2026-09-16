@@ -266,7 +266,16 @@ pub async fn list(
     responses(
         (
             status = 200,
-            description = "The engine's own read payload, unchanged.",
+            description = "The engine's own read payload, unchanged.\n\nOn a \
+                           domain that reviews changes a read answers the \
+                           caller's own draft of the page where they hold one, \
+                           and `draft` is true. At a path a draft share-link \
+                           was minted on, the grantee's read answers the \
+                           author's draft instead, with `draft` true and \
+                           `draft_owner` naming them: a draft standing where \
+                           the team's page stands must never be mistaken for \
+                           that page, so a client shows whose work it is. Both \
+                           keys are absent on every ordinary read.",
             body = Object,
             headers(
                 ("etag" = String, description = "The quoted checksum of the \
@@ -845,7 +854,19 @@ pub async fn create(
                    since the index takes the permalink from the file. Such a \
                    save is answered 200 with the engram read at its new \
                    address, so a client can follow the move rather than lose \
-                   track of what it just wrote.",
+                   track of what it just wrote.\n\nOn a domain that reviews \
+                   changes the save lands in the caller's own private draft \
+                   and the folder the team reads does not move. A save made \
+                   from inside somebody else's draft - `X-Crystalline-Join` \
+                   naming a live join this session opened through a \
+                   share-link - lands in THAT person's draft instead, and is \
+                   answered with the draft itself rather than with a detail \
+                   read: the same body `POST /draft-links/accept` returns \
+                   (`domain`, `path`, `owner`, `permalink`, `editable`, \
+                   `reason`, `content`, `checksum`, `join_key`, `joined`), \
+                   because the caller's ordinary view does not carry the \
+                   owner's draft and a read-back would answer 404 for a write \
+                   that landed.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -862,6 +883,17 @@ pub async fn create(
                            from the detail read.",
             example = "\"3f8a1c05e2\"",
         ),
+        (
+            "X-Crystalline-Join" = Option<String>,
+            Header,
+            description = "The key of a live join this session opened on a \
+                           draft share-link (`POST /draft-links/join`). \
+                           Present only while working inside somebody else's \
+                           draft: it routes the save into that person's draft \
+                           and changes the reply to the accepted-draft body. \
+                           A key naming no live join of this account's is \
+                           refused 403 and nothing is written.",
+        ),
     ),
     request_body = SaveEngramBody,
     responses(
@@ -871,7 +903,10 @@ pub async fn create(
                            plus - when the `capture.similar` advisory found \
                            neighbours - a `similar` list of up to three \
                            engrams {domain, permalink, title, status, type} \
-                           and a `guidance` string.",
+                           and a `guidance` string. A save routed by \
+                           `X-Crystalline-Join` answers the accepted-draft \
+                           body instead, with `joined` carrying the sentence \
+                           naming whose draft it landed in.",
             body = Object,
             headers(("etag" = String, description = "The quoted checksum of the \
                      engram as saved, the token the next save carries.")),
@@ -897,7 +932,12 @@ pub async fn create(
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled \
                            account. A read-only instance answers this ahead of \
-                           the precondition check, so it is never 428.",
+                           the precondition check, so it is never 428. A \
+                           presented `X-Crystalline-Join` that names no live \
+                           join of this account's is answered here too: the \
+                           draft was left, the link ran out or was taken back, \
+                           or the draft was folded, discarded or renamed, and \
+                           nothing of the caller's was written.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -933,7 +973,13 @@ pub async fn create(
             description = "The document is not an engram (unparseable, or no \
                            frontmatter block), the `If-Match` is a wildcard or \
                            a weak validator, or the target is one of the \
-                           reserved OKF names (`index.md`, `log.md`).",
+                           reserved OKF names (`index.md`, `log.md`). Also the \
+                           teaching refusals a domain that reviews changes \
+                           gives: a save at a path where a share-link shows \
+                           somebody else's draft, which says to join that \
+                           draft or to draft your own copy, and a caller with \
+                           no account of their own, which has no draft to \
+                           write into.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

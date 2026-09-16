@@ -432,9 +432,13 @@ pub async fn list(
                    outside it too and joins again in one press. \
                    404 when the id names no link of the caller's, which is \
                    what somebody else's link and an invented id both answer: \
-                   a revoke is never a probe for which links exist. Served on \
-                   a read-only instance, like every other account-state \
-                   route.",
+                   a revoke is never a probe for which links exist. The \
+                   author may always end what she minted, whatever her role \
+                   has become since - a live credential is never harder to \
+                   take back than it was to hand out - and an instance admin \
+                   may end any link, which is the third party a departed \
+                   author's live link needs. Served on a read-only instance, \
+                   like every other account-state route.",
     responses(
         (status = 204, description = "The link is gone."),
         (
@@ -445,13 +449,17 @@ pub async fn list(
         ),
         (
             status = 403,
-            description = "A viewer account, or a missing CSRF token.",
+            description = "A missing or wrong CSRF token. No role gate: a \
+                           revoke only ever ends a credential the caller \
+                           minted, so an author demoted since keeps the right \
+                           to take back what she handed out.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 404,
-            description = "The caller minted no link with that id.",
+            description = "The caller minted no link with that id, and is not \
+                           an admin of this instance.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
