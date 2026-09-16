@@ -73,7 +73,7 @@ describe("DetailsPanel", () => {
         { by: "human:jordi", model: null, at: "2026-02-01T10:00:00+01:00" },
       ],
     });
-    expect(screen.getByText("human:jordi on 2026-02-01")).toBeInTheDocument();
+    expect(screen.getByText("jordi (human) on 2026-02-01")).toBeInTheDocument();
   });
 
   test("who captured the engram is stated in a reader's words", () => {
@@ -103,8 +103,25 @@ describe("DetailsPanel", () => {
       ],
     });
     expect(
-      screen.getByText("claude-code/2.1.271 with claude-opus-5 on 2026-02-01"),
+      screen.getByText(
+        "claude-code (agent, 2.1.271) with claude-opus-5 on 2026-02-01",
+      ),
     ).toBeInTheDocument();
+  });
+
+  test("the captured-by and verified-by writers are formatted the same way", () => {
+    // Both rows name the same actor, so a reader who is not the same person
+    // reading both rows should not see "Jordi" in one and "human:jordi" in
+    // the other - the raw stored form must never surface here.
+    draw({
+      generatedBy: "human:jordi",
+      verified: [
+        { by: "human:jordi", model: null, at: "2026-02-01T10:00:00+01:00" },
+      ],
+    });
+    expect(screen.queryByText(/human:jordi/)).toBeNull();
+    expect(screen.getByText("jordi (human)")).toBeInTheDocument();
+    expect(screen.getByText("jordi (human) on 2026-02-01")).toBeInTheDocument();
   });
 
   test("an engram that records no writer is attributed to nobody", () => {

@@ -59,8 +59,7 @@ export function PresenceChips({
           />
           {one.agent && (
             <Bot
-              role="img"
-              aria-label="agent"
+              aria-hidden="true"
               size={12}
               strokeWidth={1.75}
               className="shrink-0"

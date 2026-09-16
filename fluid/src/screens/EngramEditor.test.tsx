@@ -2018,6 +2018,12 @@ describe("the engram editor in a session", () => {
    * happens to the text: it gets a chip with its own name, a glyph that says
    * it is an agent, and a color like anybody else's.
    *
+   * The glyph is decorative rather than announced: the server already appends
+   * "(agent: ...)" onto the participant's own name, so a screen reader that
+   * also read the glyph's label would hear "agent" twice for the same chip.
+   * The chip's accessible name is the room list's own label plus the name
+   * text, which already carries the word.
+   *
    * Run at both widths, because the strip lives above the buffer rather than
    * in the details column: a presence feature that vanished at full width
    * would vanish for exactly the person who widened the window to work
@@ -2028,7 +2034,7 @@ describe("the engram editor in a session", () => {
     { width: "the reading measure", fullWidth: false },
     { width: "full width", fullWidth: true },
   ])("with an agent in the room at $width", ({ fullWidth }) => {
-    it("names the agent as its own peer, with a robot glyph", async () => {
+    it("names the agent as its own peer, with a decorative robot glyph", async () => {
       localStorage.setItem(LAYOUT_WIDTH_KEY, fullWidth ? "full" : "reading");
       await openRoom({
         participants: [
@@ -2049,8 +2055,10 @@ describe("the engram editor in a session", () => {
       const chips = screen.getByRole("list", { name: /in this session/i });
       expect(chips.textContent).toContain("ada (agent: claude-code/2.0)");
       expect(chips).toHaveAccessibleName(/ada \(agent: claude-code\/2.0\)/);
-      // One glyph, on the one peer that is not a person.
-      expect(within(chips).getAllByLabelText("agent")).toHaveLength(1);
+      // One glyph, on the one peer that is not a person, hidden from
+      // assistive tech since the name already carries the agent word.
+      const glyphs = chips.querySelectorAll('svg[aria-hidden="true"]');
+      expect(glyphs).toHaveLength(1);
     });
   });
 

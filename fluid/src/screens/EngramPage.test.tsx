@@ -260,7 +260,7 @@ describe("the engram page", () => {
     );
     expect(screen.getByText("7")).toBeVisible();
     expect(screen.getByText(/2026-01-02/)).toBeVisible();
-    expect(screen.getByText(/human:jordi/)).toBeVisible();
+    expect(screen.getByText(/jordi \(human\)/)).toBeVisible();
   });
 
   it("shows nothing at all for the temporal fields an engram leaves out", async () => {

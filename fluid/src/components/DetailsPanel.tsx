@@ -267,7 +267,7 @@ function latestVerification(entries: VerifiedEntry[]): string | null {
   if (latest.by === null) {
     return day;
   }
-  const who = withModel(latest.by, latest.model);
+  const who = withModel(formatActor(latest.by), latest.model);
   return day === null ? who : `${who} on ${day}`;
 }
 
