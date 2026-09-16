@@ -586,7 +586,7 @@ impl CollabSessions {
         peer: &AgentPeer,
     ) -> Option<ClientID> {
         let session = self.live_room(domain, permalink, overlay).await?;
-        Some(session.touch_agent_presence(peer).await)
+        session.touch_agent_presence(peer).await
     }
 
     /// Who is in the room over one document right now, or an empty list when
@@ -1129,21 +1129,51 @@ impl CollabSession {
     /// standing, refreshes its expiry and publishes nothing, because the state
     /// it would publish is the state the room already holds and yrs would drop
     /// a re-publish at the same clock anyway.
-    pub async fn touch_agent_presence(&self, peer: &AgentPeer) -> ClientID {
+    pub async fn touch_agent_presence(&self, peer: &AgentPeer) -> Option<ClientID> {
         let mut state = self.state.lock().await;
         self.touch_agent_locked(&mut state, peer)
     }
 
     /// [`CollabSession::touch_agent_presence`] over the locked state, for the
     /// write path, which is holding the guard across the whole of its edit.
+    ///
     /// Answers the slot's client id, which is how the caller leaves itself out
-    /// of the list of who is in the room with it.
-    fn touch_agent_locked(&self, state: &mut SessionState, peer: &AgentPeer) -> ClientID {
+    /// of the list of who is in the room with it, and `None` when there is no
+    /// slot: a room already holding [`MAX_PARTICIPANTS`] agents, or a publish
+    /// the awareness state refused. A caller handed `None` excludes nothing,
+    /// which is the true thing to do with an agent that is not in the strip.
+    fn touch_agent_locked(&self, state: &mut SessionState, peer: &AgentPeer) -> Option<ClientID> {
         let key = (peer.account.clone(), peer.label.clone());
         let now = Instant::now();
-        if let Some(slot) = state.agents.get_mut(&key) {
-            slot.touched = now;
-            return slot.id;
+        if let Some(id) = state.agents.get(&key).map(|slot| slot.id) {
+            // **A slot the room cannot see is not a slot.** The id is a hash
+            // of a label that is on screen, so a connection in the room can
+            // publish under it, and when that connection leaves the room nulls
+            // every id it sent - the agent's among them. The map would still
+            // say the agent is standing, and a standing slot publishes
+            // nothing, so the agent would go on working with no chip until the
+            // TTL swept a slot nobody could see. Treated as new instead, and
+            // republished at a clock above whatever took it away.
+            if state.awareness.state::<serde_json::Value>(id).is_some() {
+                if let Some(slot) = state.agents.get_mut(&key) {
+                    slot.touched = now;
+                }
+                return Some(id);
+            }
+            state.agents.remove(&key);
+        }
+        // **Bounded exactly as the connection map is** ([`add_conn`]), and for
+        // the same reason: half this key is client-supplied per request, so a
+        // caller that names itself differently every call - by accident, since
+        // a modern-era peer may carry `clientInfo` on one call and omit it on
+        // the next, or on purpose - would otherwise grow one room's strip
+        // without limit. The chip is what is refused and nothing else: the
+        // read or the write that asked for it goes on exactly as it would
+        // have, because an agent's work is not a thing a full strip may
+        // refuse. And a person is never evicted to make room for an agent -
+        // the two maps are separate, so this cap cannot reach a connection.
+        if state.agents.len() >= MAX_PARTICIPANTS {
+            return None;
         }
         let id = agent_client_id(&peer.account, &peer.label, state.awareness.client_id());
         // The clock one past whatever this id last carried, exactly as
@@ -1168,8 +1198,9 @@ impl CollabSession {
             });
             state.agents.insert(key, AgentSlot { id, touched: now });
             self.has_agents.store(true, Ordering::Relaxed);
+            return Some(id);
         }
-        id
+        None
     }
 
     /// Take away the agent slots nothing has refreshed inside the TTL.
@@ -2054,7 +2085,7 @@ impl CollabSession {
         state.oldest_unsaved.get_or_insert(now);
         // The agent joins the strip under the same guard its text landed
         // under, so a person sees the chip and the change together.
-        let mine = peer.map(|peer| self.touch_agent_locked(&mut state, peer));
+        let mine = peer.and_then(|peer| self.touch_agent_locked(&mut state, peer));
         Ok(LiveApplied {
             // Everybody in the room EXCEPT this agent. `present` is what the
             // agent is told about who is in there with it, and its own slot -

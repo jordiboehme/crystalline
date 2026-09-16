@@ -1151,31 +1151,35 @@ fn display_client(raw: &str) -> Option<String> {
 /// being done for, and the harness follows it in the parenthesis because a
 /// person watching two agents work needs to tell them apart.
 ///
-/// `None` when neither half is known, which is a caller with no identity at
-/// all: there is no name to put in a strip, and inventing one would say
-/// somebody is in the room who is not.
+/// `None` when no ACCOUNT is known, whatever the client calls itself: see
+/// [`presence_label`].
 fn agent_peer(ctx: &RequestContext<RoleServer>, scope: &crate::scope::Scope) -> Option<AgentPeer> {
     // The account the gate resolved, or - on a local session, where there is
     // no gate - the identity that session acts with, which is the same name
     // its drafts are filed under.
-    let account = mcp_account(ctx).or_else(|| crate::scope::overlay_actor(scope));
-    let client = client_actor(ctx).and_then(|client| display_client(&client));
-    let (account, label) = match (account, client) {
-        (Some(account), Some(client)) => {
-            let label = format!("{account} (agent: {client})");
-            (account, label)
-        }
-        (Some(account), None) => {
-            let label = format!("{account} (agent)");
-            (account, label)
-        }
-        // Nobody authenticated and nothing is filed under a name here, so the
-        // harness is the whole of what is known about who is in the room.
-        (None, Some(client)) => {
-            let label = format!("{client} (agent)");
-            (client, label)
-        }
-        (None, None) => return None,
+    presence_label(
+        mcp_account(ctx).or_else(|| crate::scope::overlay_actor(scope)),
+        client_actor(ctx).and_then(|client| display_client(&client)),
+    )
+}
+
+/// The two halves composed, and the rule about which of them may lead.
+///
+/// **The account is what makes a chip worth drawing, so without one there is
+/// no chip.** A name in somebody's participant strip says "this is who is in
+/// your document", and on an instance with MCP authentication off the client
+/// half is whatever an unauthenticated caller typed into its handshake - so a
+/// label led by it would let anybody put any name beside a person's own. The
+/// harness may only ever follow an account the server resolved.
+///
+/// The account alone is a complete answer: an agent whose client sent no
+/// usable name is "<account> (agent)", which says the true thing and says who
+/// it is for.
+fn presence_label(account: Option<String>, client: Option<String>) -> Option<AgentPeer> {
+    let account = account?;
+    let label = match client {
+        Some(client) => format!("{account} (agent: {client})"),
+        None => format!("{account} (agent)"),
     };
     Some(AgentPeer { account, label })
 }
@@ -1945,7 +1949,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. Reading a live document is not a private act: you join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -1994,7 +1998,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it and when. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it and when. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -4726,6 +4730,33 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// **Ruling M2.** On the tier where MCP authentication is off, nobody is
+    /// authenticated and nothing is filed under a name - so however the client
+    /// names itself, it gets no chip in anybody's strip.
+    ///
+    /// The half a caller chooses may only ever FOLLOW an account the server
+    /// resolved. Letting it lead would put a name of the caller's choosing
+    /// beside a person's own name in their own document, which is the one
+    /// thing a participant strip must not be able to say.
+    #[test]
+    fn an_unauthenticated_caller_gets_no_chip_however_it_names_itself() {
+        // What `agent_peer` resolves on that tier: no gate identity at all,
+        // and no draft identity either.
+        let account = crate::scope::overlay_actor(&Scope::Anonymous);
+        assert_eq!(account, None, "the open tier holds nobody in particular");
+        assert!(
+            presence_label(account, display_client("Grace Hopper")).is_none(),
+            "so there is nobody to put in the strip"
+        );
+        // An account is what earns one, and the harness then follows it.
+        let peer = presence_label(Some("ada".to_string()), display_client("claude-code/2.0"))
+            .expect("an authenticated caller is a peer");
+        assert_eq!(peer.account, "ada");
+        assert_eq!(peer.label, "ada (agent: claude-code/2.0)");
+        let bare = presence_label(Some("ada".to_string()), None).expect("an account is enough");
+        assert_eq!(bare.label, "ada (agent)");
+    }
 
     /// A join a server object opened ends when THAT OBJECT ends - and only
     /// when the object is what holds it.

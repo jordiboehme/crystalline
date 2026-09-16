@@ -689,6 +689,41 @@ async fn tool_descriptions_teach_which_rule_acknowledges_per_pair() {
 /// copy teaches it: `write_engram` documents the `folder` argument and the
 /// `build_context` glob it unlocks, and `move_engram` says a destination
 /// inside the same domain is a normal re-filing move.
+/// Working in a document somebody has open is not a private act, and both
+/// verbs that can do it say so.
+///
+/// An agent that reads or edits a live document appears in that person's
+/// participant strip by name for a minute. That is a fact about the agent's
+/// own visibility rather than about the engram, so it belongs where an agent
+/// learns what a verb does - in the description it is handed - and not only in
+/// the code that does it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_that_working_in_an_open_document_is_seen() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    for name in ["read_engram", "edit_engram"] {
+        let text = tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} tool present"))
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(
+            text.contains("participant strip"),
+            "{name} teaches where the person sees the agent: {text}"
+        );
+        assert!(
+            text.contains("for a minute"),
+            "{name} teaches how long that name stands: {text}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_descriptions_teach_folders() {
     let h = Harness::new(&["eng"]).await;

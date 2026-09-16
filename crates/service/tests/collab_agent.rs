@@ -16,16 +16,20 @@
 
 mod support;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::collab::session::{AgentPeer, CollabSessions, Frame, Joined};
+use crystalline_service::collab::session::{
+    AgentPeer, CollabSessions, Frame, Joined, MAX_PARTICIPANTS,
+};
 use crystalline_service::params::{EditParams, ReadParams};
 use tokio::sync::{Mutex, broadcast};
-use yrs::sync::{Awareness, Message, MessageReader, SyncMessage};
+use yrs::sync::awareness::AwarenessUpdateEntry;
+use yrs::sync::{Awareness, AwarenessUpdate, Message, MessageReader, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
 use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
@@ -194,6 +198,21 @@ fn awareness_states(rx: &mut broadcast::Receiver<Frame>) -> Vec<(ClientID, Strin
 /// Who the room says is in it right now.
 async fn joined_names(joined: &Joined) -> Vec<String> {
     joined.session.participants(None).await
+}
+
+/// An awareness frame published under somebody else's client id, which is what
+/// a room cannot stop a connection from doing: the ids travel on the wire and
+/// an agent's is a hash of a label that is on screen.
+fn claim_frame(id: ClientID) -> Vec<u8> {
+    let mut clients = HashMap::new();
+    clients.insert(
+        id,
+        AwarenessUpdateEntry {
+            clock: 9,
+            json: "{\"user\":{\"name\":\"somebody else\"}}".into(),
+        },
+    );
+    Message::Awareness(AwarenessUpdate { clients }).encode_v1()
 }
 
 /// An `append` edit of `alpha`, the shape an agent adding a line sends.
@@ -652,6 +671,19 @@ async fn agent_presence_clears_after_the_ttl_and_survives_a_peer_leaving() {
         "the peer left and the agent did not: {names:?}"
     );
 
+    // A saver pass INSIDE the window is not what takes it: the TTL is a
+    // threshold rather than "the next tick", and without this the whole test
+    // passes with the TTL set to a millisecond.
+    mine.session
+        .tick_save(Instant::now() + Duration::from_secs(30))
+        .await;
+    assert!(
+        joined_names(&mine)
+            .await
+            .contains(&"ada (agent)".to_string()),
+        "half a minute in, the agent still stands"
+    );
+
     // And the TTL is what does take it, on the saver's own pass.
     drain(&mut mine.rx);
     mine.session
@@ -669,5 +701,154 @@ async fn agent_presence_clears_after_the_ttl_and_survives_a_peer_leaving() {
             .iter()
             .any(|(id, json)| *id == agent_id && json == "null"),
         "and the room was told to drop the chip: {cleared:?}"
+    );
+}
+
+/// **Ruling I1.** The strip is bounded the way the connection map is: past
+/// [`MAX_PARTICIPANTS`] a touch is refused rather than growing the room, and
+/// nobody is evicted to make space for it.
+///
+/// One caller with a fresh label on every call is not a hypothetical - a
+/// modern-era peer that carries `_meta.clientInfo` on some calls and omits it
+/// on others produces two labels for one account without anybody trying - and
+/// the label is client-supplied, so "a room holds as many chips as a caller
+/// cares to mint" is a growth vector as well as a mess. What must never be
+/// paid for a chip is somebody's connection, and the edit itself is not a chip:
+/// it lands whatever the strip decides.
+#[tokio::test]
+async fn agent_presence_is_bounded_the_way_the_connection_map_is() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let mine = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&mine).await;
+    publish_name(&mine, &doc, "Grace Hopper").await;
+
+    let overflow = MAX_PARTICIPANTS + 4;
+    let mut last = serde_json::Value::Null;
+    for n in 0..overflow {
+        let peer = AgentPeer {
+            account: "ada".to_string(),
+            label: format!("ada (agent: harness-{n})"),
+        };
+        last = engine
+            .edit_engram_present(
+                &append_edit(&format!("line {n}"), None),
+                None,
+                &crystalline_service::Scope::Unrestricted,
+                None,
+                Some(&peer),
+            )
+            .await
+            .expect("the edit lands whatever the strip does with it");
+    }
+
+    let names = joined_names(&mine).await;
+    assert_eq!(
+        names.iter().filter(|name| name.contains("(agent")).count(),
+        MAX_PARTICIPANTS,
+        "the strip stops growing at the cap: {names:?}"
+    );
+    assert!(
+        names.contains(&"Grace Hopper".to_string()),
+        "and the person in the room was not evicted to make room: {names:?}"
+    );
+    assert!(
+        !mine.session.is_empty().await,
+        "their connection stands, which is what the cap is protecting"
+    );
+
+    // The write is not the chip. A refused slot refuses nothing else: the text
+    // composed, the receipt says so, and - with no slot of its own to leave
+    // out - the refused agent is told about everybody who is in there.
+    assert_eq!(last["landed"].as_str(), Some("live"), "{last}");
+    assert_eq!(
+        last["present"].as_array().map(Vec::len),
+        Some(MAX_PARTICIPANTS + 1),
+        "a refused touch excludes nobody from the answer: {last}"
+    );
+    resync(&mine, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains(&format!("line {}", overflow - 1)),
+        "and the last edit of all is in the document: {live:?}"
+    );
+}
+
+/// **Ruling M3.** An agent whose published state was taken out from under it
+/// puts itself back on its next action, rather than working invisibly for the
+/// rest of the minute.
+///
+/// The id an agent publishes under is a hash of a label that is on screen, so
+/// a connection in the room can publish under it; when that connection leaves,
+/// the room nulls every id it sent, the agent's among them. The slot in the
+/// map would still be standing, and a standing slot publishes nothing - so
+/// without this the chip is gone until the TTL sweeps a slot nobody can see.
+#[tokio::test]
+async fn an_agent_whose_state_was_taken_away_publishes_itself_again() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let mut mine = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&mine).await;
+    publish_name(&mine, &doc, "Grace Hopper").await;
+
+    let peer = AgentPeer {
+        account: "ada".to_string(),
+        label: "ada (agent)".to_string(),
+    };
+    engine
+        .edit_engram_present(
+            &append_edit("the agent added that", None),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            Some(&peer),
+        )
+        .await
+        .expect("the edit lands");
+    let agent_id = awareness_states(&mut mine.rx)
+        .into_iter()
+        .find(|(_, json)| json.contains("ada (agent)"))
+        .expect("the room heard the agent arrive")
+        .0;
+
+    // Another connection publishes under the agent's id and then leaves.
+    let theirs = sessions.join("eng", "alpha", None).await.unwrap();
+    theirs
+        .session
+        .handle_frame(theirs.conn, &claim_frame(agent_id))
+        .await;
+    theirs.session.remove_conn(theirs.conn).await;
+    assert!(
+        !joined_names(&mine)
+            .await
+            .contains(&"ada (agent)".to_string()),
+        "the chip went with them, which is the harm"
+    );
+
+    drain(&mut mine.rx);
+    engine
+        .edit_engram_present(
+            &append_edit("and the agent added this", None),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            Some(&peer),
+        )
+        .await
+        .expect("it lands");
+    assert!(
+        joined_names(&mine)
+            .await
+            .contains(&"ada (agent)".to_string()),
+        "and the agent's next action puts it back"
+    );
+    let states = awareness_states(&mut mine.rx);
+    assert!(
+        states
+            .iter()
+            .any(|(id, json)| *id == agent_id && json.contains("\"agent\":true")),
+        "the room was told, rather than the map quietly disagreeing with it: {states:?}"
     );
 }
