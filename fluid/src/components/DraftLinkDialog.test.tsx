@@ -60,7 +60,7 @@ describe.each([
   });
 
   it("shows the minted link once, and says it is the only time", async () => {
-    apiMock.mockImplementation((path: string, init?: RequestInit) =>
+    apiMock.mockImplementation((_path: string, init?: RequestInit) =>
       init?.method === "POST"
         ? Promise.resolve({
             id: 7,
@@ -119,7 +119,7 @@ describe.each([
   });
 
   it("prints the server's own words when minting is refused", async () => {
-    apiMock.mockImplementation((path: string, init?: RequestInit) =>
+    apiMock.mockImplementation((_path: string, init?: RequestInit) =>
       init?.method === "POST"
         ? Promise.reject(
             new ApiProblem(

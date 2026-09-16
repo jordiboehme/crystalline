@@ -39,6 +39,8 @@ const ENGRAM = {
   inboundRefs: [],
   similar: [],
   guidance: null,
+  draft: false,
+  draftOwner: null,
 } satisfies EngramDetail;
 
 afterEach(() => {

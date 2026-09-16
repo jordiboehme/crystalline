@@ -16,6 +16,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import { defined } from "../test/assert";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
@@ -199,10 +200,16 @@ describe("ReviewModeCard", () => {
     // One answer per actor, and the one that ends somebody's work is chosen
     // rather than defaulted into.
     await userEvent.click(
-      screen.getAllByRole("radio", { name: "End them" })[1],
+      defined(
+        screen.getAllByRole("radio", { name: "End them" })[1],
+        "bo's End them radio",
+      ),
     );
     await userEvent.click(
-      screen.getAllByRole("button", { name: "Take review mode off" })[0],
+      defined(
+        screen.getAllByRole("button", { name: "Take review mode off" })[0],
+        "the answered plan's Take review mode off button",
+      ),
     );
     await waitFor(() => {
       expect(calls[1]).toEqual({
@@ -355,7 +362,10 @@ describe("ReviewModeCard", () => {
     );
     await screen.findByText(/ada \(2\)/);
     await userEvent.click(
-      screen.getAllByRole("button", { name: "Take review mode off" })[0],
+      defined(
+        screen.getAllByRole("button", { name: "Take review mode off" })[0],
+        "the answered plan's Take review mode off button",
+      ),
     );
     // Scoped to the card: the app frame carries live regions of its own, and a
     // bare role query would find whichever came first.

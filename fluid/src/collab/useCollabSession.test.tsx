@@ -76,6 +76,8 @@ function detailOf(content: string): EngramDetail {
     inboundRefs: [],
     similar: [],
     guidance: null,
+    draft: false,
+    draftOwner: null,
   };
 }
 
