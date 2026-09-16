@@ -128,6 +128,19 @@ impl std::fmt::Debug for Joined {
     }
 }
 
+/// What an agent's write into a live document did.
+///
+/// One field, and it is the one an agent cannot work out for itself: a write
+/// that composed into somebody's open editor is a write somebody is about to
+/// see land under their cursor, and the receipt says who that is so the agent
+/// can say so too.
+pub struct LiveApplied {
+    /// Who is in the room the text landed in, by the name their client
+    /// publishes in awareness. Sorted and de-duplicated, so one person in two
+    /// windows is one name and the receipt does not reorder between calls.
+    pub participants: Vec<String>,
+}
+
 /// Where one room is filed: the domain, the permalink it answers to, and the
 /// overlay owner whose document it is.
 ///
@@ -397,6 +410,116 @@ impl CollabSessions {
             session.adopt_key(to_permalink);
             sessions.insert(to, session);
         }
+    }
+
+    /// The live text of one open document, or `None` when no room is open
+    /// over it.
+    ///
+    /// **The seam an agent's read and write meet the editor through, and the
+    /// whole of the contract is in the `Option`.** `Some` means somebody has
+    /// this document open and the bytes here are theirs - typed, unsaved, and
+    /// the truth about what the engram says right now. `None` means the file
+    /// or the row is the truth, exactly as it always was, which is what nearly
+    /// every read and write on this instance gets.
+    ///
+    /// FILE space, not session space: the caller is an engine verb that parses
+    /// markdown and compares checksums, so it is handed the bytes the file
+    /// would hold rather than the LF transform the room edits in.
+    ///
+    /// `overlay` is whose document to ask about, and it is the caller's own
+    /// actor - see [`RoomKey`]. An agent writing in a direct domain asks about
+    /// `None`, and in a reviewing domain about its own account's draft (or,
+    /// inside a join, about the owner's, which is the actor its view already
+    /// resolved to). It is never a name taken from a request.
+    pub async fn live_text(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+    ) -> Option<String> {
+        let session = self.live_room(domain, permalink, overlay).await?;
+        Some(session.snapshot().await.0)
+    }
+
+    /// Compose `target` into the live document as one transaction tagged with
+    /// the agent that produced it, and arm the saver.
+    ///
+    /// The text is applied as a minimal line-based edit script
+    /// ([`merge::apply_target`]) rather than as a replacement, which is what
+    /// makes it compose: a person typing at the bottom of the page keeps their
+    /// cursor, their selection and their undo stack, and only the lines the
+    /// agent actually changed move. That is also why the whole document is
+    /// handed in rather than a patch - the engine computed the target from the
+    /// live text, and the diff back to it is this function's job.
+    ///
+    /// `agent_label` is the transaction origin. It never leaves this process -
+    /// a yrs origin is local and does not travel on an update - so it is for
+    /// the in-process observer (a later event handler, a log line) rather than
+    /// for the client, which sees the edit as an ordinary remote update.
+    ///
+    /// The saver is armed the way typing arms it, not forced: the agent's text
+    /// IS the room's text now, and it lands on the same debounce a person's
+    /// does. `Err` when the room closed between the read and the write, which
+    /// the caller reports rather than retries - the document it computed
+    /// against is gone.
+    pub async fn apply_text(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+        target: String,
+        agent_label: &str,
+    ) -> Result<LiveApplied, String> {
+        let Some(session) = self.live_room(domain, permalink, overlay).await else {
+            return Err(format!(
+                "the co-editing session over '{permalink}' in domain '{domain}' closed while this \
+                 write was being prepared; read it again and repeat the edit"
+            ));
+        };
+        session.apply_agent_text(&target, agent_label).await
+    }
+
+    /// Who is in the room over one document right now, or an empty list when
+    /// no room is open over it.
+    pub async fn participants(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+    ) -> Vec<String> {
+        match self.live_room(domain, permalink, overlay).await {
+            Some(session) => session.participants().await,
+            None => Vec::new(),
+        }
+    }
+
+    /// The room over one document, when one is open and still writing.
+    ///
+    /// Three conditions, and each drops a room that is not the truth about the
+    /// engram any more: absent from the map (nobody has it open), disposed (a
+    /// swept or poisoned room, whose saver has ended), and closed (the room
+    /// accepted an external deletion, so its text is deliberately not going
+    /// anywhere). A caller handed one of those would compose into a document
+    /// nothing will ever write back.
+    async fn live_room(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+    ) -> Option<Arc<CollabSession>> {
+        let key = (
+            domain.to_string(),
+            permalink.to_string(),
+            overlay.map(str::to_string),
+        );
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&key)
+            .filter(|session| !session.is_disposed())
+            .cloned()?;
+        (!session.is_closed().await).then_some(session)
     }
 
     /// How many documents are open right now.
@@ -1603,12 +1726,25 @@ impl CollabSession {
     /// than a flicker of half-applied lines - broadcast that update to the
     /// room and tell it the external change is in.
     fn converge(&self, state: &mut SessionState, target: &str) {
+        self.converge_with(state, target, None)
+    }
+
+    /// [`CollabSession::converge`], naming who produced the change.
+    ///
+    /// `origin` tags the yrs transaction. It is local to this process - an
+    /// encoded update carries no origin - so it is for an in-process observer
+    /// rather than for the clients, which see the same remote update either
+    /// way. `None` is the external-change merge, whose author is a file.
+    fn converge_with(&self, state: &mut SessionState, target: &str, origin: Option<&str>) {
         let update = {
             let doc = state.awareness.doc();
             // Taken before the transaction: get_or_insert_text opens one of
             // its own and would deadlock inside ours.
             let text = doc.get_or_insert_text(TEXT_NAME);
-            let mut txn = doc.transact_mut();
+            let mut txn = match origin {
+                Some(origin) => doc.transact_mut_with(origin),
+                None => doc.transact_mut(),
+            };
             let current = text.get_string(&txn);
             merge::apply_target(&text, &mut txn, &current, target);
             txn.encode_update_v1()
@@ -1623,6 +1759,83 @@ impl CollabSession {
             to: None,
             bytes: Bytes::from(control::encode(&Control::Merged)),
         });
+    }
+
+    /// Compose an agent's text into this room's document.
+    ///
+    /// The engine computed `target` from this room's own live text a moment
+    /// ago (and compared the caller's `expected_checksum` against it), so the
+    /// diff applied here is the agent's edit and nothing else. Everything the
+    /// room does with a typed change it does with this one: the update is
+    /// broadcast to every socket, the merge notice tells the editor its
+    /// document moved under it, and the save timers are armed so the text
+    /// lands on the ordinary debounce.
+    ///
+    /// The lock is held across the whole of it, as every other write on this
+    /// room is, so an agent's edit and a save cannot interleave.
+    async fn apply_agent_text(&self, target: &str, origin: &str) -> Result<LiveApplied, String> {
+        if self.is_disposed() {
+            return Err("this co-editing session ended while the write was being prepared".into());
+        }
+        let mut state = self.state.lock().await;
+        if state.closed {
+            return Err(
+                "this co-editing session ended while the write was being prepared".to_string(),
+            );
+        }
+        // Session space: the engine works in FILE space (the bytes a file
+        // holds), the document is a LF view of it, and this is the one
+        // conversion between them on the way in. `file_text` is the way back
+        // out, in `snapshot`.
+        let target = session_text(target);
+        self.converge_with(&mut state, &target, Some(origin));
+        // Armed exactly as an update from a socket arms it (see
+        // `CollabSession::handle_frame`), so the agent's text saves on the
+        // same debounce a person's typing does. Forcing a flush instead would
+        // make an agent's edit the one write on this instance that lands
+        // mid-composition.
+        let now = Instant::now();
+        state.dirty = true;
+        state.last_edit = Some(now);
+        state.oldest_unsaved.get_or_insert(now);
+        Ok(LiveApplied {
+            participants: Self::participants_locked(&state),
+        })
+    }
+
+    /// Who is in this room, by the name their client publishes in awareness.
+    pub async fn participants(&self) -> Vec<String> {
+        Self::participants_locked(&*self.state.lock().await)
+    }
+
+    /// [`CollabSession::participants`] over the locked state.
+    ///
+    /// Read off awareness rather than off the connection map, because the
+    /// connection map holds ids and this is for a person to read. A client
+    /// that publishes no name at all (a provider that never set one, a socket
+    /// that has not sent its first awareness frame) contributes nothing rather
+    /// than an invented placeholder: the list says who is known to be there,
+    /// not how many sockets are open.
+    ///
+    /// Sorted and de-duplicated, so one person in two windows is one name and
+    /// two calls a second apart do not reorder the same room.
+    fn participants_locked(state: &SessionState) -> Vec<String> {
+        let mut names: Vec<String> = state
+            .awareness
+            .iter()
+            .filter_map(|(_, client)| client.data)
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .filter_map(|value| {
+                value
+                    .get("user")
+                    .and_then(|user| user.get("name"))
+                    .and_then(|name| name.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Whether the room accepted an external deletion: the session is over,

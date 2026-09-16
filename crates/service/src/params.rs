@@ -74,7 +74,7 @@ pub struct WriteParams {
 }
 
 /// Parameters for `read_engram`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ReadParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.

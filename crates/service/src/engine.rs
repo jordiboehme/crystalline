@@ -1564,6 +1564,16 @@ impl Engine {
         let _ = self.collab.set(Arc::downgrade(sessions));
     }
 
+    /// The open co-editing rooms, or `None` on every engine that serves no web
+    /// surface - a one-shot CLI command, the embedded stdio stack, most tests.
+    ///
+    /// `None` is what makes those installs byte-identical to their old selves:
+    /// no registry, no rooms, so every read and every edit takes the file or
+    /// the row path it always took.
+    fn collab_rooms(&self) -> Option<Arc<crate::collab::session::CollabSessions>> {
+        self.collab.get().and_then(std::sync::Weak::upgrade)
+    }
+
     /// Hold the domain-admin lock for the whole of a registration or a removal.
     ///
     /// One lock on the engine rather than one per surface: REST's create takes
@@ -6117,7 +6127,7 @@ impl Engine {
         // is already on the receipt this verb built its own from.
         note_unmirrored(
             &mut receipt,
-            source_warning.or_else(|| {
+            source_warning.warning.or_else(|| {
                 created
                     .get("draft_warning")
                     .and_then(Value::as_str)
@@ -6386,6 +6396,27 @@ impl Engine {
         Ok(None)
     }
 
+    /// Who is in the room over one document, for the read payload's `present`.
+    ///
+    /// Asked only when [`CollabSessions::live_text`] already answered, so the
+    /// second lookup is over a room that was open a moment ago; a room that
+    /// closed in between answers an empty list rather than an error, which is
+    /// the true thing to say about who is in a room nobody is in.
+    async fn live_participants(
+        &self,
+        desc: &EngramDescriptor,
+        view: &DomainView<'_>,
+    ) -> Vec<String> {
+        match self.collab_rooms() {
+            Some(rooms) => {
+                rooms
+                    .participants(&desc.domain, &desc.permalink, view.actor())
+                    .await
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
         // The one path a read crosses between two overlays on: a draft this
@@ -6411,6 +6442,28 @@ impl Engine {
             })?,
             None => self.load_content(&source, &desc).await?,
         };
+        // **A co-editing room over this document outranks both.** While one is
+        // open the room's text is what the engram says: somebody is typing
+        // into it, the file and the row are both a save behind, and a reader
+        // answered from either would be reading a version the room has already
+        // moved past. The checksum below is the live text's too, so an edit
+        // guarded with it is guarded against the document rather than against
+        // the file - which is what makes read-then-edit work at all while
+        // somebody is in there.
+        let live = match self.collab_rooms() {
+            Some(rooms) => {
+                rooms
+                    .live_text(&desc.domain, &desc.permalink, view.actor())
+                    .await
+            }
+            None => None,
+        };
+        let present = match &live {
+            Some(_) => self.live_participants(&desc, &view).await,
+            None => Vec::new(),
+        };
+        let is_live = live.is_some();
+        let content = live.unwrap_or(content);
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let checksum = sha256_hex(content.as_bytes());
 
@@ -6514,6 +6567,14 @@ impl Engine {
         // reader never sees the word about anybody else's work.
         if view.draft_at(desc.domain_id, &desc.path).await?.is_some() {
             obj.insert("draft".to_string(), json!(true));
+        }
+
+        // Two lines saying the bytes above are somebody's unsaved work and who
+        // is holding them. Emitted only when a room is actually open, so every
+        // other read on this instance answers exactly what it always did.
+        if is_live {
+            obj.insert("live".to_string(), json!(true));
+            obj.insert("present".to_string(), json!(present));
         }
 
         // Inbound summary: how many references point here, with a small capped
@@ -6693,8 +6754,11 @@ impl Engine {
         // write lock is taken, so a sweep never runs while a file is held.
         let ack = self.ack_draft(p, &desc, &actor, scope).await?;
 
-        let warning = self
-            .apply_source_edit(
+        // The staged form rather than the shorthand, for the one thing it
+        // reports that this verb says out loud: whether the edit composed into
+        // a live co-editing document instead of a file or a row.
+        let edited = self
+            .apply_source_edit_staged(
                 &desc,
                 &source,
                 &view,
@@ -6702,7 +6766,8 @@ impl Engine {
                 &actor,
                 |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
             )
-            .await?;
+            .await
+            .map_err(|failure| failure.error)?;
 
         let mut response = json!({
             "domain": desc.domain,
@@ -6713,7 +6778,15 @@ impl Engine {
         if overlay.is_some() {
             response["draft"] = json!(true);
         }
-        note_unmirrored(&mut response, warning);
+        // Where it went, said only when that is not where an edit ordinarily
+        // goes: somebody has this page open, the text is in their document,
+        // and their session is what writes it down. `present` names them, so
+        // an agent can say whose screen it just appeared on.
+        if let Some(live) = &edited.live {
+            response["landed"] = json!("live");
+            response["present"] = json!(live.participants);
+        }
+        note_unmirrored(&mut response, edited.warning);
         match &ack {
             Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
             Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
@@ -6745,8 +6818,15 @@ impl Engine {
     where
         F: FnOnce(&str) -> Result<String>,
     {
+        // The live landing is dropped here rather than plumbed on: the callers
+        // that reach this shorthand (a retirement, a split's tail, a
+        // successor's back-link) build receipts about what they moved rather
+        // than about where the bytes went, and every one of them composes into
+        // an open room correctly without saying so. The verb that says so is
+        // `edit_engram_as`, which calls the staged form for exactly that.
         self.apply_source_edit_staged(desc, source, view, expected_checksum, actor, apply)
             .await
+            .map(|edited| edited.warning)
             .map_err(|failure| failure.error)
     }
 
@@ -6768,10 +6848,65 @@ impl Engine {
         expected_checksum: Option<&str>,
         actor: &str,
         apply: F,
-    ) -> std::result::Result<Option<String>, SourceEditFailure>
+    ) -> std::result::Result<SourceEdited, SourceEditFailure>
     where
         F: FnOnce(&str) -> Result<String>,
     {
+        // **The live arm, and it comes before every other one.** While a
+        // co-editing room is open over this document, the room's text IS the
+        // engram: somebody has it on screen, the file and the row are both
+        // behind it, and the room's own saver is what makes anything durable.
+        // So an edit composes into the document, the caller's
+        // `expected_checksum` is evaluated against the text the document
+        // holds, and the write below is not reached at all.
+        //
+        // Ahead of the overlay arm as well as the file and virtual ones, which
+        // is what the arm order has to be rather than what it was written as:
+        // the overlay arm returns, so an arm behind it is unreachable in every
+        // domain that reviews changes - which is where most rooms are.
+        //
+        // Nothing here is reachable from a room's own save. A room saves
+        // through `Engine::save_engram_in_overlay` and `Engine::save_engram`,
+        // neither of which is this function, so a live landing can never
+        // recurse into the room that produced it.
+        if let Some(rooms) = self.collab_rooms() {
+            let overlay = view.actor();
+            if let Some(live) = rooms
+                .live_text(&desc.domain, &desc.permalink, overlay)
+                .await
+            {
+                // The document's text is what a caller guarding this edit read
+                // a moment ago, so it is what the guard compares against - the
+                // file's checksum would refuse every guarded edit made while
+                // anybody had the page open.
+                if let Some(expected) = expected_checksum {
+                    let found = sha256_hex(live.as_bytes());
+                    if found != expected {
+                        return Err(SourceEditFailure::before(EngineError::Conflict(
+                            stale_edit_message(expected, &found),
+                        )));
+                    }
+                }
+                let edited = apply(&live).map_err(SourceEditFailure::before)?;
+                // The same two passes every other arm makes, in the same
+                // order. An edit that skipped them would put a document in
+                // front of a person that the saver then refuses, minutes
+                // later, for a reason nobody watching could connect to this.
+                let edited = touch_generated(&edited, actor, now_offset());
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let applied = rooms
+                    .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor)
+                    .await
+                    .map_err(|detail| SourceEditFailure::before(EngineError::Conflict(detail)))?;
+                // No mirror warning: nothing was mirrored, because nothing was
+                // written. The room's saver owes that warning when it lands.
+                return Ok(SourceEdited {
+                    warning: None,
+                    live: Some(applied),
+                });
+            }
+        }
+
         // The third arm, and it comes first because it is the one that must
         // reach neither of the others: on a domain in review mode the folder
         // and the database both go on saying what the team reviewed, and the
@@ -6828,7 +6963,10 @@ impl Engine {
             // proposal about the domain's routing, not the domain's routing,
             // and a draft belongs in no folder's generated index - both of
             // those are properties of what the team reviewed.
-            return Ok(warning);
+            return Ok(SourceEdited {
+                warning,
+                live: None,
+            });
         }
 
         match source {
@@ -6936,7 +7074,10 @@ impl Engine {
         // edit never schedules a pass for a chunk that was not rewritten.
         self.nudge_embed();
         // A direct write has no mirror to fail, so it has nothing to warn about.
-        Ok(None)
+        Ok(SourceEdited {
+            warning: None,
+            live: None,
+        })
     }
 
     /// Apply one edit operation to an engram's markdown, returning the edited
@@ -18843,6 +18984,21 @@ fn host_refusal(name: &str, host: &DomainHost) -> String {
         "domain '{name}' is hosted by instance {} (last heartbeat {}); this instance serves it read-from-database only. Pass --take-over to migrate hosting here.",
         host.instance_id, host.heartbeat_at
     )
+}
+
+/// What one source edit did: the mirror warning it may owe, and - when a
+/// co-editing room was open over the engram - the live document it landed in
+/// instead of the file or the row.
+///
+/// Two fields rather than one return value each, because both travel to the
+/// same place: the receipt the caller builds. `live` is `None` for nearly
+/// every edit there is, which is the ordinary write path saying it wrote
+/// ordinarily.
+struct SourceEdited {
+    /// The unmirrored-draft warning, when the write owed one.
+    warning: Option<String>,
+    /// The live document this edit composed into, when one was open.
+    live: Option<crate::collab::session::LiveApplied>,
 }
 
 /// A source edit that failed, and whether the source may already carry the new
