@@ -705,13 +705,19 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
-    // The one test seam in this file: when armed, the next source edit fails on
-    // its far side, once. See `Engine::fail_next_source_edit`. Compiled only
-    // into a test build (`cfg(test)` for this crate's unit tests, the `testing`
-    // feature for its integration tests), so a released binary carries neither
-    // the flag nor the branches that read it.
+    // The first of this file's two test seams: when armed, the next source edit
+    // fails on its far side, once. See `Engine::fail_next_source_edit`.
+    // Compiled only into a test build (`cfg(test)` for this crate's unit tests,
+    // the `testing` feature for its integration tests), so a released binary
+    // carries neither the flag nor the branches that read it.
     #[cfg(any(test, feature = "testing"))]
     fail_next_source_edit: std::sync::atomic::AtomicBool,
+    // The second, and it is a stopwatch rather than a failure: when armed, the
+    // next edit of a draft sleeps this many milliseconds between reading the
+    // draft and writing it back, holding whatever it holds. See
+    // `Engine::hold_next_draft_edit`, and the same compile-out applies.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_draft_edit: std::sync::atomic::AtomicU64,
     // The effective `skills.serve` value, snapshotted while this engine is
     // built and never re-read. See `Engine::skills_serve` for why it is frozen
     // and `Engine::with_env_overlay` for why the snapshot is taken twice.
@@ -1507,6 +1513,8 @@ impl Engine {
             read_only: false,
             #[cfg(any(test, feature = "testing"))]
             fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            hold_next_draft_edit: std::sync::atomic::AtomicU64::new(0),
             skills_serve,
             instance_id: String::new(),
             label: String::new(),
@@ -1566,10 +1574,43 @@ impl Engine {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether the seam above is armed, consuming the arming. Constant `false`
-    /// outside a test build, where the flag does not exist: the two source-edit
-    /// branches then compile to what they would have been without a seam at
-    /// all.
+    /// Hold the next edit of a draft open between its read and its write, once,
+    /// so a test can put a second writer of the same draft in that window.
+    ///
+    /// The lost update this exists to catch cannot be timed from outside: both
+    /// writers are futures on one runtime, and whether the reader yields
+    /// between its read and its write depends on whether an uncontended mutex
+    /// happens to suspend. A sleep inside the window makes the interleaving a
+    /// fact instead of a coincidence, which is what lets
+    /// `a_capture_and_an_edit_of_one_draft_serialize` fail for the right reason
+    /// when the arms take two different locks and pass when they take one.
+    ///
+    /// Armed for ONE edit and consumed by it, like the failure seam above, and
+    /// compiled out of a released binary the same way.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_draft_edit(&self, millis: u64) {
+        self.hold_next_draft_edit
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hold above, consuming the arming. Does nothing at all outside a test
+    /// build, where the counter does not exist.
+    async fn take_draft_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let millis = self
+                .hold_next_draft_edit
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            if millis > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            }
+        }
+    }
+
+    /// Whether the failure seam is armed, consuming the arming. Constant
+    /// `false` outside a test build, where the flag does not exist: the two
+    /// source-edit branches then compile to what they would have been without a
+    /// seam at all.
     fn take_armed_failure(&self) -> bool {
         #[cfg(any(test, feature = "testing"))]
         {
@@ -4120,17 +4161,24 @@ impl Engine {
             return Ok(receipt);
         }
 
-        // The whole existence-check-then-write, for a file domain, under that
-        // file's lock: the check and the write it authorizes must be one step,
-        // or two creates of one title both find the permalink free, both write,
-        // and the second answers "created" over the first's body instead of the
-        // conflict that says the name was taken. Taken before the store lock,
-        // like every other holder. See `Engine::write_lock`.
-        let file_lock = match &source {
-            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &rel))),
-            ContentSource::Virtual => None,
+        // The whole existence-check-then-write under one lock: the check and
+        // the write it authorizes must be one step, or two creates of one title
+        // both find the permalink free, both write, and the second answers
+        // "created" over the first's body instead of the conflict that says the
+        // name was taken. Which lock depends on where this write lands - the
+        // draft's mirror when it lands in an overlay, the file's own path when
+        // it lands in the folder - because a draft's writers contend with each
+        // other and not with the file nobody is writing. See
+        // `Engine::draft_lock` and `Engine::write_lock`. Taken before the store
+        // lock, like every other holder.
+        let write_lock = match overlay_draft {
+            Some((who, _)) => Some(self.draft_lock(&p.domain, who, &rel)?),
+            None => match &source {
+                ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &rel))),
+                ContentSource::Virtual => None,
+            },
         };
-        let _guard = match &file_lock {
+        let _guard = match &write_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
@@ -4579,15 +4627,10 @@ impl Engine {
         // that is the save's own contract rather than an omission: the
         // shared edit path stamps `generated`, and a save of what was read
         // has to land byte-identical. The compare and the write are held
-        // apart from a concurrent save of the same draft by the same lock
-        // the edit path takes, keyed on the draft's own mirror path.
-        let state_dir = self.journal_state_dir()?;
-        let mirror = state_dir
-            .join("overlays")
-            .join(&desc.domain)
-            .join(who)
-            .join(&desc.path);
-        let lock = self.write_lock(&mirror);
+        // apart from every other writer of the same draft by the one lock
+        // they all take, keyed on the draft's own mirror path. See
+        // `Engine::draft_lock`.
+        let lock = self.draft_lock(&desc.domain, who, &desc.path)?;
         let _guard = lock.lock().await;
         let current = view.text_at(source, desc).await?.ok_or_else(|| {
             EngineError::NotFound(format!(
@@ -7578,18 +7621,14 @@ impl Engine {
         // down in one transaction that rolls back whole, so an edit that
         // refuses leaves the draft holding exactly the bytes it held.
         if let Some(who) = view.actor() {
-            let state_dir = self
-                .journal_state_dir()
-                .map_err(SourceEditFailure::before)?;
             // Keyed on the draft's own mirror path, which is the file this
             // write actually produces, so two edits of one draft serialize on
-            // it exactly as two edits of one engram serialize on its file.
-            let mirror = state_dir
-                .join("overlays")
-                .join(&desc.domain)
-                .join(who)
-                .join(&desc.path);
-            let lock = self.write_lock(&mirror);
+            // it exactly as two edits of one engram serialize on its file - and
+            // so does a capture, a save, a delete and a move of the same draft.
+            // See `Engine::draft_lock`.
+            let lock = self
+                .draft_lock(&desc.domain, who, &desc.path)
+                .map_err(SourceEditFailure::before)?;
             let _guard = lock.lock().await;
             let current = view
                 .text_at(source, desc)
@@ -7609,6 +7648,10 @@ impl Engine {
                     )));
                 }
             }
+            // The test seam, and it sits here because here is the window: the
+            // draft has been read and has not been written back yet. See
+            // `Engine::hold_next_draft_edit`.
+            self.take_draft_hold().await;
             let edited = apply(&current).map_err(SourceEditFailure::before)?;
             let edited = touch_generated(&edited, actor, model, now_offset());
             let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
@@ -8097,7 +8140,29 @@ impl Engine {
         // see it where they moved it to. The folder itself does not move,
         // which is the whole of review mode - the rename is reviewed like any
         // other change.
-        if overlay.is_some() {
+        if let Some(who) = overlay {
+            // Two writes - a tombstone where the team's file is, an entry at
+            // the destination - so two draft locks, taken in key order so two
+            // moves that cross each other cannot each hold what the other
+            // wants. `move_within` refuses a cross-domain move outright, so
+            // both paths are this actor's own drafts in this one domain. See
+            // `Engine::draft_lock`.
+            let (first, second) = match src.path <= dest_rel {
+                true => (src.path.as_str(), dest_rel.as_str()),
+                false => (dest_rel.as_str(), src.path.as_str()),
+            };
+            let low = self.draft_lock(&p.domain, who, first)?;
+            let _low = low.lock().await;
+            // A move onto its own path is refused inside `move_within`, and it
+            // is skipped here rather than taken twice: one path is one lock.
+            let high = match first == second {
+                true => None,
+                false => Some(self.draft_lock(&p.domain, who, second)?),
+            };
+            let _high = match &high {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
             return view
                 .move_within(p, &src, &src_source, &dest_rel, cross)
                 .await;
@@ -8728,13 +8793,18 @@ impl Engine {
         }
         let (desc, source) = view.resolve(&p.identifier).await?;
         // Held across the comparison and the removal, so a guarded delete
-        // cannot check a file that a concurrent save then rewrites underneath
-        // it. See `Engine::write_lock`.
-        let file_lock = match &source {
-            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &desc.path))),
-            ContentSource::Virtual => None,
+        // cannot check a text that a concurrent save then rewrites underneath
+        // it - the draft's own lock when this deletion lands in an overlay, the
+        // file's when it lands in the folder. See `Engine::draft_lock` and
+        // `Engine::write_lock`.
+        let write_lock = match overlay {
+            Some(who) => Some(self.draft_lock(&p.domain, who, &desc.path)?),
+            None => match &source {
+                ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &desc.path))),
+                ContentSource::Virtual => None,
+            },
         };
-        let _guard = match &file_lock {
+        let _guard = match &write_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
@@ -17653,6 +17723,44 @@ impl Engine {
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// The one lock a draft is written under, for every verb that writes one.
+    ///
+    /// A draft has no file in the domain's folder - that is the whole of review
+    /// mode - so the base file's lock holds nothing apart from it: in a
+    /// reviewing domain nobody writes the folder at all, and two writers of one
+    /// draft that took it would be two writers holding a mutex neither of them
+    /// contends. The draft's own mirror in the overlay journal IS the file this
+    /// write produces, so its path is the key, and every arm that writes a
+    /// draft takes it: the capture, the edit, the save, the delete and both
+    /// halves of a move.
+    ///
+    /// What the lock is held across is a read-modify-write with no compare
+    /// behind it. A capture replaces the whole row; an edit reads the draft,
+    /// applies its operation and writes the result; a save compares a checksum
+    /// it read a moment ago. Each store write is atomic on its own, which is
+    /// exactly why a lost update here is invisible - the capture's receipt says
+    /// it landed and the edit that resumed with the older text quietly replaces
+    /// it. Serializing them makes the loser read the winner's bytes and either
+    /// refuse (a stale checksum, a taken permalink) or build on them.
+    ///
+    /// Keyed through [`crate::overlay_journal::entry_path`] rather than by
+    /// hand, so the lock and the mirror can never come to name two different
+    /// places, and taken before the store lock like every other holder. See
+    /// [`Engine::write_lock`], whose map this shares: a base file's path and a
+    /// draft mirror's path are different keys in one map, so no cycle is formed
+    /// and a domain that takes changes directly is untouched by this.
+    fn draft_lock(
+        &self,
+        domain: &str,
+        actor: &str,
+        path: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let state_dir = self.journal_state_dir()?;
+        let mirror = crate::overlay_journal::entry_path(&state_dir, domain, actor, path)
+            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        Ok(self.write_lock(&mirror))
     }
 
     /// The base directory per-domain origin state lives under: the test

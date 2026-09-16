@@ -1442,9 +1442,17 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
         ".touch_agent_presence(",
     ];
 
-    // Per function, the first line that takes a file write lock and the first
-    // that makes a room call. A comment mentioning either is not a call, so
-    // the scan skips the comment lines the arms are thick with.
+    /// Every way an engine function takes a per-path write lock: the file's
+    /// own, and a draft's mirror path through `Engine::draft_lock`, which
+    /// wraps the same map. Both are per-path mutexes held across a
+    /// read-modify-write, so both close the same cycle against the room's
+    /// saver; watching only the spelling that says `write_lock` would leave
+    /// every overlay arm unwatched.
+    const LOCK_NEEDLES: [&str; 2] = [".write_lock(", ".draft_lock("];
+
+    // Per function, the first line that takes a per-path write lock and the
+    // first that makes a room call. A comment mentioning either is not a call,
+    // so the scan skips the comment lines the arms are thick with.
     let mut current = "<file scope>".to_string();
     let mut locked: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut composed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1456,7 +1464,7 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
         if code.starts_with("//") || code.starts_with("///") {
             continue;
         }
-        if code.contains(".write_lock(") {
+        if LOCK_NEEDLES.iter().any(|needle| code.contains(needle)) {
             locked.entry(current.clone()).or_insert(i);
         }
         if ROOM_ENTRY_NEEDLES

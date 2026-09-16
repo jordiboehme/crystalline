@@ -191,7 +191,17 @@ pub(crate) fn actor_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Resu
 }
 
 /// The file one actor's draft of `path` is mirrored in.
-fn entry_path(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<PathBuf> {
+///
+/// Shared with [`crate::engine::Engine::draft_lock`], which keys a draft's
+/// write lock on this path: the lock has to name the file the write produces,
+/// and a second hand-built spelling of it would let two writers of one draft
+/// serialize on two different keys.
+pub(crate) fn entry_path(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<PathBuf> {
     if !is_within_domain(path) || !is_md(path) {
         return Err(refused("path", path));
     }

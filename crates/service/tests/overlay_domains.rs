@@ -1577,6 +1577,115 @@ impl Fixture {
 
 /// The headline property of review mode, in one test: a write by an
 /// authenticated account changes nothing on disk, lands as that account's own
+/// One draft, two writers, one lock.
+///
+/// A draft has no file in the domain's folder, so the base file's lock - which
+/// the capture and the delete arms used to take - is contended by nobody at
+/// all, while the edit and the save take the draft's own mirror path. Two
+/// writers of one draft then hold two different mutexes and neither waits: the
+/// capture's row lands, its receipt says so, and the edit that had already read
+/// the older text writes that text back over it. Nothing refuses, nothing
+/// warns, and the captured document is gone.
+///
+/// The interleaving is made a fact rather than a coincidence by
+/// `Engine::hold_next_draft_edit`: the edit sleeps between reading the draft
+/// and writing it back, which is exactly the window the lost update lives in.
+/// Both orders are legal once the arms share a lock, and both end the same way
+/// - the capture replaces the whole document, and an edit guarded by a checksum
+/// taken before it is refused as stale rather than landing on top - so the
+/// assertion is about the text, not about which of the two answered first.
+#[tokio::test]
+async fn a_capture_and_an_edit_of_one_draft_serialize() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let agent = Some("claude-code/2.0-for-alice");
+
+    // Alice holds a draft of the team's plan, and has read it.
+    f.engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("- [decision] alice starts a draft #team".to_string()),
+                key: None,
+                value: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+                share_link: None,
+                model: None,
+            },
+            agent,
+            &alice,
+        )
+        .await
+        .unwrap();
+    let read = f.engine.read_engram(&read("plan"), &alice).await.unwrap();
+    let checksum = read["checksum"].as_str().unwrap().to_string();
+
+    // Her agent captures over the same draft while a second edit of it is in
+    // flight, and the edit is held open in its read-modify-write window.
+    f.engine.hold_next_draft_edit(150);
+    let capture_params = WriteParams {
+        overwrite: true,
+        ..write_params(
+            "team",
+            "Plan",
+            "- [decision] the capture replaced the whole draft #team",
+        )
+    };
+    let edit_params = EditParams {
+        identifier: "plan".to_string(),
+        domain: "team".to_string(),
+        operation: "append".to_string(),
+        content: Some("- [decision] the edit appended to the older text #team".to_string()),
+        key: None,
+        value: None,
+        find_text: None,
+        expected_replacements: None,
+        section: None,
+        include_subsections: false,
+        expected_checksum: Some(checksum),
+        ack_scope: None,
+        share_link: None,
+        model: None,
+    };
+    let capture = f.engine.write_engram_as(&capture_params, agent, &alice);
+    let edit = f.engine.edit_engram_as(&edit_params, agent, &alice);
+    let (edited, captured) = tokio::join!(edit, capture);
+
+    let captured = captured.expect("the capture lands");
+    assert_eq!(captured["draft"], serde_json::json!(true));
+    if let Err(e) = &edited {
+        let message = e.to_string();
+        assert!(
+            message.contains("stale"),
+            "the loser is told its text moved under it, not something else: {message}"
+        );
+    }
+
+    let held = f.held("team", "alice").await;
+    let plan = held
+        .iter()
+        .find(|(path, _, _)| path == "plan.md")
+        .expect("alice still holds her draft of the plan");
+    assert!(
+        plan.1.contains("the capture replaced the whole draft"),
+        "the capture said it landed, so it landed: {}",
+        plan.1
+    );
+    assert!(
+        !plan.1.contains("the edit appended to the older text"),
+        "and an edit that read the draft before the capture cannot write its \
+         older text back over it: {}",
+        plan.1
+    );
+}
+
 /// draft, is mirrored where a wipe can bring it back, and is visible to its
 /// author and to nobody else.
 ///
