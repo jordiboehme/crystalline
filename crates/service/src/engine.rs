@@ -2493,6 +2493,53 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// Whose drafts a READ may lay over the base, for the verbs that answer
+    /// across domains: search, the similar advisory and the graph.
+    ///
+    /// [`DomainView::for_read`] asks this question of one domain and answers
+    /// `None` where that domain takes changes directly, so a read of an engram
+    /// in such a domain sees the folder whatever rows are left in the index.
+    /// These three verbs have no single domain to ask - one query spans them -
+    /// so they ask whether ANY domain they can touch reviews changes, and name
+    /// no actor at all when none does. An instance with no reviewing domain
+    /// anywhere therefore asks exactly the question it asked before the actor
+    /// dimension existed, and a domain that stopped reviewing with rows still
+    /// in the index (a fold that failed halfway, an edited config, an
+    /// environment variable unset) stops shadowing its own folder.
+    ///
+    /// **The residue, because it is real.** A query that spans a reviewing
+    /// domain AND one that has stopped reviewing still carries the actor, so
+    /// the stale rows of the second are still shadowing there. Screening it per
+    /// domain means the index deciding row by row, which is a `SearchQuery`
+    /// carrying a set of reviewing domain ids into both backends' statements -
+    /// a schema-shaped change this wave's migrations are pinned against. What
+    /// closes it instead is the recovery being reachable: the rows are folded
+    /// or discarded (`crystalline domain review <name> direct`), and
+    /// `restore_overlays` no longer mirrors them back on the next sync.
+    fn reading_actor(&self, scope: &crate::scope::Scope, requested: &[String]) -> Option<String> {
+        let actor = crate::scope::overlay_actor(scope)?;
+        let reviewing = if requested.is_empty() {
+            // Every domain in range is every domain this process knows, and the
+            // question is asked of what is already in memory: the effective
+            // config plus the domains discovered since startup. NOT through
+            // `registered_domain_names`, which re-reads and re-parses the
+            // config file - this runs on every search, every write receipt's
+            // advisory and every graph slice, and a file read on that path is
+            // the shape of regression this wave has already paid for once. The
+            // cost of the narrower answer is one sync pass: a domain another
+            // process put into review mode a moment ago names no actor until
+            // this process notices it, which costs its own drafts a place in
+            // this reader's search until then and nothing else.
+            let config = self.config.read().unwrap();
+            let discovered = self.discovered_domains.read().unwrap();
+            config.domains.values().any(DomainEntry::is_overlay)
+                || discovered.values().any(DomainEntry::is_overlay)
+        } else {
+            requested.iter().any(|name| self.reviews_changes(name))
+        };
+        reviewing.then_some(actor)
+    }
+
     /// [`Engine::actor`] for a write that joins a draft overlay: the identity
     /// the calling surface composed, and never the configured
     /// `identity.actor`.
@@ -9208,16 +9255,14 @@ impl Engine {
             min_similarity: p.min_similarity,
             path_prefix: folder.and_then(folder_prefix),
             // Whose rows this search is entitled to: the base dimension plus
-            // this caller's own drafts. Asked of the scope rather than of the
-            // configuration, and asked unconditionally, because a search spans
-            // domains and only some of them review changes - the actor is one
-            // value for the whole query, so deriving it from "is any domain in
-            // range in review mode" would make one domain's mode decide another
-            // domain's answer. A domain nobody drafts in holds no overlay row,
-            // so the screen collapses back to the base row there and the answer
-            // is the answer it always was; a reader with no identity at all
-            // still names no actor and gets the base dimension alone.
-            actor: crate::scope::overlay_actor(scope),
+            // this caller's own drafts, where any domain in range reviews
+            // changes at all. One value for the whole query, because a search
+            // spans domains and the screen is a column predicate rather than a
+            // per-domain decision - see `Engine::reading_actor`, which is where
+            // the question and its residue are written down. A reader with no
+            // identity names no actor either way and gets the base dimension
+            // alone.
+            actor: self.reading_actor(scope, &p.domains),
             limit: p.limit.unwrap_or(10).clamp(1, MAX_PAGE_LIMIT),
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
@@ -9373,10 +9418,11 @@ impl Engine {
             query_embedding: Some(embedding),
             active_model: Some(self.model_id.clone()),
             // The advisory is a search, so it is the same question about whose
-            // rows are in range. A writer in review mode whose neighbours are
-            // all still drafts would otherwise be told there is nothing near
-            // what they just wrote.
-            actor: crate::scope::overlay_actor(scope),
+            // rows are in range, asked the same way (`Engine::reading_actor`).
+            // A writer in review mode whose neighbours are all still drafts
+            // would otherwise be told there is nothing near what they just
+            // wrote; an instance where nothing reviews anything names nobody.
+            actor: self.reading_actor(scope, &[]),
             // Pure cosine order: the fade would only reorder hits this drops.
             retired_weight: Some(1.0),
             limit: SIMILAR_PAGE,
@@ -9619,12 +9665,13 @@ impl Engine {
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
         // The traversal is asked as this caller, not as the anchor domain's
         // overlay: a slice crosses domains, so whose rows it may walk is one
-        // question about the reader - the same one a search asks - rather than
-        // one domain's mode deciding what another domain's edges say.
+        // question about the reader - the same one a search asks, through the
+        // same `Engine::reading_actor` - rather than one domain's mode deciding
+        // what another domain's edges say. The hop can land anywhere, so the
+        // range it asks about is every registered domain.
+        let reading = self.reading_actor(scope, &[]);
         let store = self.store.lock().await;
-        let mut slice = store
-            .neighbors(&ids, depth, crate::scope::overlay_actor(scope).as_deref())
-            .await?;
+        let mut slice = store.neighbors(&ids, depth, reading.as_deref()).await?;
         // Cut before the ranking, not at output selection like the caller's own
         // `domains` filter below. The two look alike and are not: a presentation
         // filter leaves a node in the graph so it still conducts mass as a
@@ -12484,6 +12531,18 @@ impl Engine {
             });
         }
         let state_dir = self.journal_state_dir()?;
+        // **A domain that reviews nothing takes nothing back.** The mirror can
+        // outlive the mode - a fold that failed halfway, a config key edited
+        // out, an environment variable unset - and this pass runs on every sync
+        // of every domain, so without this the leftover rows would be written
+        // back into the index for ever rather than merely left behind once. The
+        // bytes stay on disk: they are somebody's work, and putting the domain
+        // back into review mode is what brings them back. Resolved after the
+        // state directory, so an engine that can reach no journal still learns
+        // that first.
+        if !self.reviews_changes(domain) {
+            return Ok(0);
+        }
         // A domain with nothing mirrored never reaches the store: the sync pass
         // calls this for every domain on every pass, and resolving a domain id
         // is a write.
@@ -13968,6 +14027,18 @@ impl Engine {
     /// is its source of truth, so no version of this request would succeed and
     /// the way out is to unset the variable. Spelled once here so a preview and
     /// the removal itself cannot word it differently.
+    ///
+    /// [`Engine::set_review_mode`] answers with it too, including for the call
+    /// that takes review mode OFF, and that is deliberate rather than
+    /// over-broad: `CRYSTALLINE_DOMAIN_<NAME>_REVIEW` rides on an env-defined
+    /// domain, whose review key is not in the config file this would write, and
+    /// the environment would put the mode straight back on the effective config
+    /// while the fold was still running. So the exit for such a domain is the
+    /// variable first and the verb second: unset it, restart, and then
+    /// `crystalline domain review <name> direct` (or its REST twin) folds or
+    /// discards the drafts that are left - which works, because leaving review
+    /// mode never asks whether the domain is in it, only what rows it holds.
+    /// Pinned by `a_domain_that_reviews_nothing_can_still_fold_the_drafts_it_holds`.
     fn env_domain_conflict(&self, name: &str) -> Option<EngineError> {
         self.overlay.env_domain(name).map(|env| {
             EngineError::Conflict(format!(

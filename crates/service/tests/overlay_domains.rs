@@ -519,7 +519,11 @@ async fn an_index_wipe_leaves_the_files_overlay_alone() {
 /// base.
 #[tokio::test]
 async fn an_index_wipe_keeps_drafts_through_the_journal() {
-    let f = fixture().await;
+    // In review mode, which is the only place the restore runs: a domain that
+    // reviews nothing is passed over, so its leftover mirror is not written
+    // back into the index on every sync
+    // (`a_restore_passes_over_a_domain_that_reviews_nothing`).
+    let f = review_fixture().await;
     f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
     f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
     f.tombstone("team", "bob", "plan.md").await;
@@ -1582,6 +1586,140 @@ impl Fixture {
 
 /// The headline property of review mode, in one test: a write by an
 /// authenticated account changes nothing on disk, lands as that account's own
+/// A domain that stopped reviewing reads one way, on every verb.
+///
+/// The rows do not go when the mode does: a fold that failed halfway, a
+/// hand-edited config, an environment variable somebody unset all leave a
+/// domain that reviews nothing holding somebody's drafts. `read_engram` has
+/// always answered the folder there - its view asks the domain whether it
+/// reviews changes - while search, the advisory and the graph asked only who
+/// was calling. So a person's own search went on answering with a draft of
+/// theirs that nothing would ever fold, while a read of the same engram
+/// answered the file they had just written, and no receipt said why.
+///
+/// Here the domain takes changes directly and a draft row stands over
+/// `plan.md` anyway, which is exactly the leftover state. Every verb answers
+/// the folder.
+#[tokio::test]
+async fn a_domain_that_stopped_reviewing_serves_no_stale_draft() {
+    let f = fixture().await;
+    let alice = account("alice");
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+
+    let page = f.engine.read_engram(&read("plan"), &alice).await.unwrap();
+    assert!(
+        page["content"]
+            .as_str()
+            .unwrap()
+            .contains("as the team has it"),
+        "a read answers the folder here, as it always has: {page}"
+    );
+
+    let search = async |query: &str| {
+        f.engine
+            .search_engrams(
+                &crystalline_service::params::SearchParams {
+                    query: Some(query.to_string()),
+                    domains: vec!["team".to_string()],
+                    ..Default::default()
+                },
+                &alice,
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        search("alice would have it").await["total"],
+        serde_json::json!(0),
+        "and a search does not hand her a draft the domain has stopped keeping"
+    );
+    assert_eq!(
+        search("as the team has it").await["total"],
+        serde_json::json!(1),
+        "while the row the folder describes is where it always was"
+    );
+
+    assert_eq!(
+        slice_nodes(&f.context("crystalline://team/plan", &alice).await.unwrap()),
+        vec!["plan".to_string()],
+        "and the graph draws the base row, unmarked"
+    );
+}
+
+/// A restore passes over a domain that reviews nothing.
+///
+/// The journal is the one copy of a draft a rebuild can bring back, and the
+/// sync pass reads it for every domain on every pass. A domain that has
+/// stopped reviewing must not have drafts mirrored back INTO its index, or the
+/// leftover state above is recreated on every sync rather than merely left
+/// behind once. The bytes stay on disk: putting the domain back into review
+/// mode is what brings them back, which is the only reading of them anybody
+/// can act on.
+#[tokio::test]
+async fn a_restore_passes_over_a_domain_that_reviews_nothing() {
+    let direct = fixture().await;
+    overlay_journal::journal_write(&direct.state, "team", "alice", "plan.md", ALICE_DRAFT).unwrap();
+    assert_eq!(
+        direct.engine.restore_overlays("team").await.unwrap(),
+        0,
+        "nothing is mirrored back into a domain that reviews nothing"
+    );
+    assert!(direct.held("team", "alice").await.is_empty());
+    assert_eq!(
+        overlay_journal::journal_entries(&direct.state, "team")
+            .entries
+            .len(),
+        1,
+        "and the draft is still on disk, for the domain that reviews again"
+    );
+
+    let reviewing = review_fixture().await;
+    overlay_journal::journal_write(&reviewing.state, "team", "alice", "plan.md", ALICE_DRAFT)
+        .unwrap();
+    assert_eq!(
+        reviewing.engine.restore_overlays("team").await.unwrap(),
+        1,
+        "and a reviewing domain restores it, which is the guard passing rather \
+         than refusing everything"
+    );
+}
+
+/// The way out of the leftover state: fold or discard, on a domain whose
+/// config says nothing about reviewing any more.
+///
+/// This is the recovery the state above needs, and it has to work on the
+/// config as it stands rather than on the config the drafts were written
+/// under - an operator who unset `CRYSTALLINE_DOMAIN_TEAM_REVIEW` and
+/// restarted, or who edited the key out by hand, has no way to put the domain
+/// back the way it was before asking for the drafts to be folded.
+#[tokio::test]
+async fn a_domain_that_reviews_nothing_can_still_fold_the_drafts_it_holds() {
+    let f = fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+
+    let receipt = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["applied"], serde_json::json!(true));
+    assert!(
+        std::fs::read_to_string(f.root.join("team").join("plan.md"))
+            .unwrap()
+            .contains("as alice would have it"),
+        "her draft is in the folder now"
+    );
+    assert!(
+        f.held("team", "alice").await.is_empty(),
+        "and it is nobody's draft any more"
+    );
+}
+
 /// One draft, two writers, one lock.
 ///
 /// A draft has no file in the domain's folder, so the base file's lock - which
