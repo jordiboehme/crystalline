@@ -5739,15 +5739,15 @@ async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it(
             .unwrap(),
     );
     auth.add_user(
-        "owner",
-        "owner",
+        "keeper",
+        "keeper",
         None,
         crystalline_service::rest::Role::Editor,
         "pw12345678",
     )
     .await
     .unwrap();
-    auth.set_domain_visibility("lab", true, "owner")
+    auth.set_domain_visibility("lab", true, "keeper")
         .await
         .unwrap();
     h.engine

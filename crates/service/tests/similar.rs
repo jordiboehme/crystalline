@@ -216,12 +216,12 @@ async fn a_hidden_domains_engram_never_reaches_a_stranger() {
             .await
             .unwrap(),
     );
-    for name in ["owner", "out"] {
+    for name in ["keeper", "out"] {
         auth.add_user(name, name, None, Role::Editor, "pw12345678")
             .await
             .unwrap();
     }
-    auth.set_domain_visibility("lab", true, "owner")
+    auth.set_domain_visibility("lab", true, "keeper")
         .await
         .unwrap();
     engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
@@ -233,7 +233,11 @@ async fn a_hidden_domains_engram_never_reaches_a_stranger() {
         .unwrap();
     assert!(permalinks(&stranger).is_empty(), "{stranger:?}");
     let owner = engine
-        .similar_engrams(&probe, Some(("open", "retry-queue-gotcha")), &user("owner"))
+        .similar_engrams(
+            &probe,
+            Some(("open", "retry-queue-gotcha")),
+            &user("keeper"),
+        )
         .await
         .unwrap();
     assert_eq!(permalinks(&owner), vec!["lab/retry-secrets"]);

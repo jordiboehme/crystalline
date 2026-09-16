@@ -147,6 +147,10 @@ fn role_from_db(s: &str) -> Role {
 ///
 /// `to_lowercase` is full Unicode case folding, matching the convention
 /// `crates/index` already uses for domain and tag names.
+///
+/// This is the fold every path uses, including the ones merely NAMING an
+/// account. A path that CREATES one asks [`normalize_new_account_name`]
+/// instead, which additionally refuses the one reserved name.
 pub fn normalize_account_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -164,6 +168,38 @@ pub fn normalize_account_name(name: &str) -> Result<String> {
         ));
     }
     Ok(trimmed.to_lowercase())
+}
+
+/// [`normalize_account_name`] for a name that is about to become an ACCOUNT,
+/// which is where one name is reserved: [`crate::engine::OWNER_IDENTITY_NAME`],
+/// the key the machine owner's own private drafts are written under in every
+/// domain that reviews changes.
+///
+/// An account keyed on it would act inside those drafts - read them, edit them,
+/// share them, fold them - in every reviewing domain at once, and the machine
+/// owner would be acting inside that account's drafts in the same breath. So
+/// the four paths that can bring an account into being ask this instead of the
+/// plain fold: an admin creating a login, the first-run admin, a trusted header
+/// provisioning one, and an identity provider's first sign-in.
+///
+/// Only those four. Every other caller is naming an account that already
+/// exists - a membership row, a domain's holder, a session, a password check -
+/// and the machine owner's own name is a legitimate principal there: it holds
+/// drafts, it appears in a fold plan, and a lookup that refused it would refuse
+/// the machine owner its own work.
+pub fn normalize_new_account_name(name: &str) -> Result<String> {
+    let folded = normalize_account_name(name)?;
+    if folded == crate::engine::OWNER_IDENTITY_NAME {
+        return Err(refuse(
+            RefusalKind::InvalidName,
+            format!(
+                "'{}' is the name this machine's own work is filed under, so it is not a login \
+                 anybody can hold: pick another name for this account",
+                crate::engine::OWNER_IDENTITY_NAME
+            ),
+        ));
+    }
+    Ok(folded)
 }
 
 /// Fold one half of an identity key: trimmed, and never empty.
@@ -1255,7 +1291,7 @@ impl AuthStore {
         role: Role,
         password: &str,
     ) -> Result<()> {
-        let name = normalize_account_name(name)?;
+        let name = normalize_new_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -1314,7 +1350,7 @@ impl AuthStore {
     /// does not consume the one slot there is. The password is hashed outside
     /// the lock, as in [`AuthStore::add_user`]: argon2 is CPU, not database.
     pub async fn add_first_admin(&self, name: &str, display: &str, password: &str) -> Result<bool> {
-        let name = normalize_account_name(name)?;
+        let name = normalize_new_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -1718,7 +1754,7 @@ impl AuthStore {
     /// stopping *unbounded* minting, not enforcing an exact ceiling.
     pub async fn ensure_user(&self, name: &str, role: Role, cap: usize) -> Result<User> {
         let display = name.trim().to_string();
-        let name = normalize_account_name(name)?;
+        let name = normalize_new_account_name(name)?;
         let _guard = self.guard.lock().await;
         let exists = self
             .query_first(
@@ -1986,7 +2022,7 @@ impl AuthStore {
     ) -> Result<User> {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
-        let base = normalize_account_name(desired_name)?;
+        let base = normalize_new_account_name(desired_name)?;
         let display = display
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -5746,6 +5782,56 @@ mod tests {
         assert_eq!(store.list_users().await.unwrap()[0].name, "ada");
     }
 
+    /// The machine owner's own name is not a login.
+    ///
+    /// `owner` is the actor key every private draft the CLI, the control socket
+    /// and a local stdio agent write is filed under. An account holding it
+    /// would read, edit, share and fold the machine owner's unshared work in
+    /// every reviewing domain at once - in both directions, since the owner
+    /// would be acting in that account's drafts too. Every path that names an
+    /// account folds through `normalize_account_name`, so every one of them
+    /// refuses it, whichever way it is spelled.
+    #[tokio::test]
+    async fn the_machine_owners_name_is_reserved_on_every_path() {
+        let (_dir, store) = store().await;
+        for name in ["owner", "Owner", "OWNER", "  owner  "] {
+            let refusal = store
+                .add_user(name, "Owner", None, Role::Admin, "pw12345678")
+                .await
+                .expect_err("add_user must refuse {name:?}");
+            let message = refusal.to_string();
+            assert!(
+                message.contains("pick another name"),
+                "the refusal teaches what to do instead: {message}"
+            );
+            assert!(
+                store
+                    .ensure_user(name, Role::Viewer, usize::MAX)
+                    .await
+                    .is_err(),
+                "a trusted header cannot provision it either: {name:?}"
+            );
+            assert!(
+                store
+                    .add_first_admin(name, "Owner", "pw12345678")
+                    .await
+                    .is_err(),
+                "and the first-run admin is not it either: {name:?}"
+            );
+            // The lookup paths are untouched: the machine owner's name is a
+            // legitimate principal everywhere it already appears (it holds
+            // drafts, it stands in a fold plan), so naming it answers "nobody
+            // by that name" rather than refusing the name itself.
+            assert!(store.verify_password(name, "pw").await.unwrap().is_none());
+        }
+        assert!(store.list_users().await.unwrap().is_empty());
+        // A name that merely contains it is a name like any other.
+        store
+            .add_user("owner-ada", "Ada", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn normalize_account_name_trims_folds_and_rejects_empty() {
         assert_eq!(normalize_account_name("  AdA  ").unwrap(), "ada");
@@ -5753,6 +5839,10 @@ mod tests {
         assert!(normalize_account_name("").is_err());
         assert!(normalize_account_name("   ").is_err());
         assert!(normalize_account_name("ada lovelace").is_err());
+        // The reserved name folds like any other here; only the account
+        // creation paths refuse it.
+        assert_eq!(normalize_account_name("Owner").unwrap(), "owner");
+        assert!(normalize_new_account_name("Owner").is_err());
     }
 
     #[tokio::test]
@@ -6521,7 +6611,7 @@ mod tests {
     /// join things and one that never does.
     async fn members_cast(store: &AuthStore) {
         for (name, role) in [
-            ("owner", Role::Editor),
+            ("keeper", Role::Editor),
             ("mem", Role::Viewer),
             ("out", Role::Editor),
         ] {
@@ -6539,17 +6629,17 @@ mod tests {
         assert!(store.domain_visibility("lab").await.unwrap().is_none());
         assert!(store.private_domains().await.unwrap().is_empty());
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         let acl = store.domain_visibility("lab").await.unwrap().unwrap();
         assert_eq!(acl.domain, "lab");
-        assert_eq!(acl.owner, "owner");
+        assert_eq!(acl.owner, "keeper");
         assert_eq!(
             store.private_domains().await.unwrap(),
             vec![DomainAcl {
                 domain: "lab".into(),
-                owner: "owner".into()
+                owner: "keeper".into()
             }]
         );
         // The name is trimmed but never folded: the engine keys its domain map
@@ -6586,16 +6676,16 @@ mod tests {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
         assert_eq!(store.domain_members("lab").await.unwrap().len(), 1);
         store
-            .set_domain_visibility("lab", false, "owner")
+            .set_domain_visibility("lab", false, "keeper")
             .await
             .unwrap();
         assert!(store.domain_visibility("lab").await.unwrap().is_none());
@@ -6607,7 +6697,7 @@ mod tests {
         assert!(store.memberships_of("mem").await.unwrap().is_empty());
         // Asking for a state that already holds is not an error.
         store
-            .set_domain_visibility("lab", false, "owner")
+            .set_domain_visibility("lab", false, "keeper")
             .await
             .unwrap();
     }
@@ -6622,11 +6712,11 @@ mod tests {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "keeper")
             .await
             .unwrap();
 
@@ -6637,13 +6727,13 @@ mod tests {
         assert_eq!(
             again,
             VisibilityWrite::AlreadyPrivate {
-                owner: "owner".to_string()
+                owner: "keeper".to_string()
             },
             "the answer says it was already private, and names the owner it kept"
         );
         assert_eq!(
             store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "owner",
+            "keeper",
             "a visibility statement is not an ownership transfer"
         );
         assert_eq!(
@@ -6679,15 +6769,15 @@ mod tests {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "out", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "out", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
         store.transfer_domain("lab", "mem").await.unwrap();
@@ -6718,7 +6808,7 @@ mod tests {
             .to_string();
         assert!(err.contains("not private"), "{err}");
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         let err = store
@@ -6729,7 +6819,7 @@ mod tests {
         assert!(err.contains("no such user"), "{err}");
         assert_eq!(
             store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "owner",
+            "keeper",
             "a refused transfer leaves the owner alone"
         );
     }
@@ -6739,15 +6829,15 @@ mod tests {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "MEM", MemberLevel::Viewer, "owner")
+            .upsert_domain_member("lab", "MEM", MemberLevel::Viewer, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "keeper")
             .await
             .unwrap();
         let members = store.domain_members("lab").await.unwrap();
@@ -6758,7 +6848,7 @@ mod tests {
         );
         assert_eq!(members[0].principal, "mem", "the name is folded");
         assert_eq!(members[0].level, MemberLevel::Manager);
-        assert_eq!(members[0].added_by, "owner");
+        assert_eq!(members[0].added_by, "keeper");
         assert!(!members[0].added_at.is_empty());
         assert_eq!(
             store.memberships_of("Mem").await.unwrap(),
@@ -6777,30 +6867,30 @@ mod tests {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         let err = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "keeper")
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("not private"), "{err}");
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         let err = store
-            .upsert_domain_member("lab", "ghost", MemberLevel::Viewer, "owner")
+            .upsert_domain_member("lab", "ghost", MemberLevel::Viewer, "keeper")
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("no such user"), "{err}");
         let err = store
-            .upsert_domain_member("lab", "owner", MemberLevel::Viewer, "owner")
+            .upsert_domain_member("lab", "keeper", MemberLevel::Viewer, "keeper")
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("already holds every level"), "{err}");
         store.set_disabled("mem", true).await.unwrap();
         let err = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "keeper")
             .await
             .unwrap_err()
             .to_string();
@@ -6823,15 +6913,15 @@ mod tests {
             .await
             .unwrap();
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "out", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "out", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
         store.remove_user("mem").await.unwrap();
@@ -6847,14 +6937,14 @@ mod tests {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
-        store.remove_user("owner").await.unwrap();
+        store.remove_user("keeper").await.unwrap();
         let acl = store
             .domain_visibility("lab")
             .await
@@ -6873,14 +6963,14 @@ mod tests {
         // of this is `a_re_added_owner_name_does_not_inherit_the_domain` in
         // `crate::scope`; here the record itself must not name them.
         store
-            .add_user("owner", "owner", None, Role::Editor, "pw12345678")
+            .add_user("keeper", "keeper", None, Role::Editor, "pw12345678")
             .await
             .unwrap();
         assert_eq!(
             store.domain_visibility("lab").await.unwrap().unwrap().owner,
             ""
         );
-        assert!(store.memberships_of("owner").await.unwrap().is_empty());
+        assert!(store.memberships_of("keeper").await.unwrap().is_empty());
     }
 
     /// The forced removal takes the same step. `remove_user_force` runs the
@@ -6895,14 +6985,14 @@ mod tests {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
-        store.remove_user_force("owner").await.unwrap();
+        store.remove_user_force("keeper").await.unwrap();
         let acl = store
             .domain_visibility("lab")
             .await
@@ -6933,7 +7023,7 @@ mod tests {
         members_cast(&store).await;
 
         let shared = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap_err();
         assert_eq!(
@@ -6952,11 +7042,11 @@ mod tests {
         );
 
         store
-            .set_domain_visibility("lab", true, "owner")
+            .set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         let owner = store
-            .upsert_domain_member("lab", "owner", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "keeper", MemberLevel::Editor, "keeper")
             .await
             .unwrap_err();
         assert_eq!(
@@ -6966,7 +7056,7 @@ mod tests {
         assert!(format!("{owner:#}").contains("owns domain"), "{owner:#}");
 
         let ghost = store
-            .upsert_domain_member("lab", "ghost", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "ghost", MemberLevel::Editor, "keeper")
             .await
             .unwrap_err();
         assert_eq!(
@@ -6980,7 +7070,7 @@ mod tests {
         // and be sure it has no second branch.
         store.set_disabled("mem", true).await.unwrap();
         let disabled = store
-            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap_err();
         assert_eq!(
@@ -6997,7 +7087,7 @@ mod tests {
         // which is what lets the one route taking a principal in the BODY
         // answer the 422 its documentation promises rather than a 500.
         let malformed = store
-            .upsert_domain_member("lab", "  ", MemberLevel::Editor, "owner")
+            .upsert_domain_member("lab", "  ", MemberLevel::Editor, "keeper")
             .await
             .unwrap_err();
         assert_eq!(
@@ -7008,7 +7098,7 @@ mod tests {
         // And a failure that is nobody's doing carries no kind at all, so the
         // surfaces keep answering 500 for what is genuinely theirs.
         let unregistered = store
-            .upsert_domain_member("nosuchdomain", "mem", MemberLevel::Editor, "owner")
+            .upsert_domain_member("nosuchdomain", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap_err();
         assert_eq!(
@@ -7026,11 +7116,11 @@ mod tests {
             let store = AuthStore::open(&path).await.unwrap();
             members_cast(&store).await;
             store
-                .set_domain_visibility("lab", true, "owner")
+                .set_domain_visibility("lab", true, "keeper")
                 .await
                 .unwrap();
             store
-                .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+                .upsert_domain_member("lab", "mem", MemberLevel::Manager, "keeper")
                 .await
                 .unwrap();
         }
@@ -7039,7 +7129,7 @@ mod tests {
         let store = AuthStore::open(&path).await.unwrap();
         assert_eq!(
             store.domain_visibility("lab").await.unwrap().unwrap().owner,
-            "owner"
+            "keeper"
         );
         assert_eq!(
             store.memberships_of("mem").await.unwrap(),
@@ -7064,7 +7154,7 @@ mod tests {
             " Manager ".parse::<MemberLevel>().unwrap(),
             MemberLevel::Manager
         );
-        assert!("owner".parse::<MemberLevel>().is_err());
+        assert!("keeper".parse::<MemberLevel>().is_err());
         assert_eq!(
             member_level_from_db("nonsense"),
             MemberLevel::Viewer,

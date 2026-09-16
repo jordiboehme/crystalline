@@ -263,7 +263,7 @@ impl RestCtx {
         engine.sync(None).await.unwrap();
         let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
         for (name, role) in [
-            ("owner", Role::Editor),
+            ("keeper", Role::Editor),
             ("mem", Role::Editor),
             ("out", Role::Editor),
             ("mgr", Role::Editor),
@@ -294,7 +294,7 @@ impl RestCtx {
 
     async fn add_member(&self, domain: &str, account: &str, level: MemberLevel) {
         self.auth
-            .upsert_domain_member(domain, account, level, "owner")
+            .upsert_domain_member(domain, account, level, "keeper")
             .await
             .unwrap();
     }
@@ -360,7 +360,7 @@ async fn login(addr: std::net::SocketAddr, name: &str, password: &str) -> (Strin
 #[tokio::test]
 async fn a_private_domain_is_absent_for_strangers_and_served_to_members() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
 
     let out = ctx.as_user("out").await;
@@ -417,7 +417,7 @@ async fn a_private_domain_is_absent_for_strangers_and_served_to_members() {
     assert!(!filtered.contains("Secret"), "{filtered}");
 
     // The member and the admin both see it.
-    for name in ["mem", "boss", "owner"] {
+    for name in ["mem", "boss", "keeper"] {
         let client = ctx.as_user(name).await;
         let listed = client.get_json("/api/v1/domains").await.to_string();
         assert!(listed.contains("lab"), "{name} must see lab: {listed}");
@@ -436,7 +436,7 @@ async fn a_private_domain_is_absent_for_strangers_and_served_to_members() {
 #[tokio::test]
 async fn membership_level_gates_writes_not_instance_role() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     // An instance EDITOR, so a refusal here can only come from the membership.
     ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
 
@@ -493,7 +493,7 @@ async fn membership_level_gates_writes_not_instance_role() {
 #[tokio::test]
 async fn an_instance_viewer_invited_as_an_editor_still_cannot_write() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.auth
         .add_user("looker", "looker", None, Role::Viewer, "s3cret")
         .await
@@ -540,7 +540,7 @@ async fn an_instance_viewer_invited_as_an_editor_still_cannot_write() {
 #[tokio::test]
 async fn a_move_is_gated_at_both_ends() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
 
     // A stranger may write `open` and may not see `lab`: the destination is
@@ -615,7 +615,7 @@ async fn a_move_is_gated_at_both_ends() {
 #[tokio::test]
 async fn an_inbound_referrer_in_a_hidden_domain_is_not_reported() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
 
     let boss = ctx.as_user("boss").await;
     let seen = boss.get_json("/api/v1/domains/open/inbound/alpha").await;
@@ -655,7 +655,7 @@ async fn an_inbound_referrer_in_a_hidden_domain_is_not_reported() {
 #[tokio::test]
 async fn the_evolve_queue_names_no_hidden_domain() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
 
     let boss = ctx.as_user("boss").await;
     let swept = boss.get_json("/api/v1/evolve").await.to_string();
@@ -688,7 +688,7 @@ async fn the_evolve_queue_names_no_hidden_domain() {
 #[tokio::test]
 async fn privatizing_an_already_private_domain_keeps_its_owner_and_members() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Editor).await;
 
     let boss = ctx.as_user("boss").await;
@@ -708,7 +708,7 @@ async fn privatizing_an_already_private_domain_keeps_its_owner_and_members() {
             .unwrap()
             .expect("lab is still private")
             .owner,
-        "owner",
+        "keeper",
         "the admin who asked did not become the owner"
     );
     assert_eq!(
@@ -718,7 +718,7 @@ async fn privatizing_an_already_private_domain_keeps_its_owner_and_members() {
     );
 
     // The owner still owns it in the sense that matters: they can open it.
-    let owner = ctx.as_user("owner").await;
+    let owner = ctx.as_user("keeper").await;
     let opened = owner
         .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
         .await;
@@ -735,7 +735,7 @@ async fn privatizing_an_already_private_domain_keeps_its_owner_and_members() {
 #[tokio::test]
 async fn the_owner_re_shares_and_only_an_admin_closes_a_domain() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
 
     let mgr = ctx.as_user("mgr").await;
@@ -770,7 +770,7 @@ async fn the_owner_re_shares_and_only_an_admin_closes_a_domain() {
     );
 
     // The owner opens what the owner closed.
-    let owner = ctx.as_user("owner").await;
+    let owner = ctx.as_user("keeper").await;
     let opened = owner
         .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
         .await;
@@ -840,7 +840,7 @@ async fn privatizing_an_unknown_domain_mints_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_sync_summary_lists_only_visible_team_domains() {
     let ctx = RestCtx::two_team_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
 
     let boss = ctx.as_user("boss").await;
     let all = boss.get_json("/api/v1/sync").await;
@@ -887,7 +887,7 @@ async fn the_sync_summary_lists_only_visible_team_domains() {
 #[tokio::test]
 async fn a_cross_domain_move_receipt_names_no_hidden_domain() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
 
     let out = ctx.as_user("out").await;
     let moved = out
@@ -925,7 +925,7 @@ async fn a_cross_domain_move_receipt_names_no_hidden_domain() {
 #[tokio::test]
 async fn an_absolute_identifier_cannot_reach_another_domain() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     // A member who may read the private domain and not write it: the case
     // where the caller can see the name and still must not act on it.
     ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
@@ -1007,7 +1007,7 @@ async fn an_absolute_identifier_cannot_reach_another_domain() {
 #[tokio::test]
 async fn the_anonymous_viewer_sees_no_private_domain() {
     let ctx = RestCtx::anonymous_instance().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
 
     let nobody = ctx.as_anonymous();
     let listed = nobody.get_json("/api/v1/domains").await.to_string();
@@ -1040,7 +1040,7 @@ async fn the_anonymous_viewer_sees_no_private_domain() {
 async fn a_sweep_with_nothing_visible_refuses_rather_than_widening() {
     let ctx = RestCtx::two_domains().await;
     for domain in ["open", "lab", "spare"] {
-        ctx.make_private(domain, "owner").await;
+        ctx.make_private(domain, "keeper").await;
     }
 
     let out = ctx.as_user("out").await;
@@ -1053,7 +1053,7 @@ async fn a_sweep_with_nothing_visible_refuses_rather_than_widening() {
     }
 
     // The owner still sweeps its own.
-    let owner = ctx.as_user("owner").await;
+    let owner = ctx.as_user("keeper").await;
     let swept = owner.get_json("/api/v1/evolve").await.to_string();
     assert!(swept.contains("lab"), "{swept}");
 }
@@ -1063,7 +1063,7 @@ async fn a_sweep_with_nothing_visible_refuses_rather_than_widening() {
 #[tokio::test]
 async fn manager_invites_but_cannot_change_visibility() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
 
     let mgr = ctx.as_user("mgr").await;
@@ -1093,7 +1093,7 @@ async fn manager_invites_but_cannot_change_visibility() {
         "and cannot hand the domain to itself either"
     );
 
-    let owner = ctx.as_user("owner").await;
+    let owner = ctx.as_user("keeper").await;
     let opened = owner
         .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
         .await;
@@ -1105,14 +1105,14 @@ async fn manager_invites_but_cannot_change_visibility() {
 #[tokio::test]
 async fn the_member_list_is_served_to_members_and_hidden_from_strangers() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
 
     // A viewer-level member sees who else is here: this is what the domain
     // card draws, and being invited is what earns it.
     let mem = ctx.as_user("mem").await;
     let listed = mem.get_json("/api/v1/domains/lab/members").await;
-    assert_eq!(listed["owner"], json!("owner"));
+    assert_eq!(listed["owner"], json!("keeper"));
     assert_eq!(listed["visibility"], json!("private"));
     assert_eq!(listed["members"][0]["principal"], json!("mem"));
     assert_eq!(listed["members"][0]["level"], json!("viewer"));
@@ -1144,7 +1144,7 @@ async fn the_member_list_is_served_to_members_and_hidden_from_strangers() {
 #[tokio::test]
 async fn the_anonymous_viewer_reads_a_shared_member_listing_and_no_private_one() {
     let ctx = RestCtx::anonymous_instance().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
 
     let nobody = ctx.as_anonymous();
     let shared = nobody.get_json("/api/v1/domains/open/members").await;
@@ -1183,7 +1183,7 @@ async fn the_anonymous_viewer_reads_a_shared_member_listing_and_no_private_one()
 #[tokio::test]
 async fn a_member_leaves_a_domain_without_asking_a_manager() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
     ctx.add_member("lab", "out", MemberLevel::Viewer).await;
 
@@ -1221,8 +1221,8 @@ async fn a_member_leaves_a_domain_without_asking_a_manager() {
 
     // The owner is not a membership row and is refused with the route that
     // does change who it is.
-    let owner = ctx.as_user("owner").await;
-    let refused = owner.delete("/api/v1/domains/lab/members/owner").await;
+    let owner = ctx.as_user("keeper").await;
+    let refused = owner.delete("/api/v1/domains/lab/members/keeper").await;
     assert_eq!(refused.status(), 409);
     assert!(
         refused.text().await.unwrap().contains("owner"),
@@ -1238,7 +1238,7 @@ async fn a_member_leaves_a_domain_without_asking_a_manager() {
 #[tokio::test]
 async fn an_admin_transfers_a_domain_and_the_old_owner_becomes_a_stranger() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Editor).await;
 
     let boss = ctx.as_user("boss").await;
@@ -1262,7 +1262,7 @@ async fn an_admin_transfers_a_domain_and_the_old_owner_becomes_a_stranger() {
 
     // The old owner is a stranger now, and the domain is answered as one
     // nobody registered.
-    let owner = ctx.as_user("owner").await;
+    let owner = ctx.as_user("keeper").await;
     assert_eq!(owner.get("/api/v1/domains/lab/members").await.status(), 404);
     let listed = owner.get_json("/api/v1/domains").await.to_string();
     assert!(!listed.contains("lab"), "{listed}");
@@ -1271,14 +1271,14 @@ async fn an_admin_transfers_a_domain_and_the_old_owner_becomes_a_stranger() {
     let mem = ctx.as_user("mem").await;
     let invited = mem
         .put_json(
-            "/api/v1/domains/lab/members/owner",
+            "/api/v1/domains/lab/members/keeper",
             json!({"level": "viewer"}),
         )
         .await;
     assert_eq!(invited.status(), 204, "{:?}", invited.text().await);
     let back = owner.get_json("/api/v1/domains/lab/members").await;
     assert_eq!(back["owner"], json!("mem"));
-    assert_eq!(back["members"][0]["principal"], json!("owner"));
+    assert_eq!(back["members"][0]["principal"], json!("keeper"));
 }
 
 /// A domain whose owner's account was removed has no owner at all, and the
@@ -1287,9 +1287,9 @@ async fn an_admin_transfers_a_domain_and_the_old_owner_becomes_a_stranger() {
 #[tokio::test]
 async fn a_domain_whose_owner_was_removed_reports_no_owner() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Editor).await;
-    ctx.auth.remove_user("owner").await.unwrap();
+    ctx.auth.remove_user("keeper").await.unwrap();
 
     let boss = ctx.as_user("boss").await;
     let listed = boss.get_json("/api/v1/domains/lab/members").await;
@@ -1333,7 +1333,7 @@ async fn membership_is_refused_on_a_shared_domain() {
 
     // And a principal nobody has an account for is an unprocessable body, not
     // a row left waiting for somebody to claim the name.
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     let refused = boss
         .put_json(
             "/api/v1/domains/lab/members/ghost",
@@ -1364,7 +1364,7 @@ async fn membership_is_refused_on_a_shared_domain() {
             .unwrap()
             .expect("lab is private")
             .owner,
-        "owner",
+        "keeper",
         "and nothing was handed on"
     );
 }
@@ -1425,7 +1425,7 @@ async fn a_domain_can_be_created_private_and_belongs_to_its_creator() {
 #[tokio::test]
 async fn a_stranger_mutating_a_hidden_domain_gets_the_unregistered_answer() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
 
     let out = ctx.as_user("out").await;
@@ -1490,7 +1490,7 @@ async fn a_stranger_mutating_a_hidden_domain_gets_the_unregistered_answer() {
             .unwrap()
             .unwrap()
             .owner,
-        "owner"
+        "keeper"
     );
 }
 
@@ -1504,14 +1504,14 @@ async fn a_stranger_mutating_a_hidden_domain_gets_the_unregistered_answer() {
 #[tokio::test]
 async fn the_owner_cannot_be_invited_into_the_domain_it_owns() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
 
     for who in ["mgr", "boss"] {
         let caller = ctx.as_user(who).await;
         let refused = caller
             .put_json(
-                "/api/v1/domains/lab/members/owner",
+                "/api/v1/domains/lab/members/keeper",
                 json!({"level": "viewer"}),
             )
             .await;
@@ -1547,7 +1547,7 @@ async fn the_owner_cannot_be_invited_into_the_domain_it_owns() {
 #[tokio::test]
 async fn an_invite_never_says_whether_an_account_exists() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
     // `mem` exists and is switched off; `ghost` was never an account.
     ctx.auth.set_disabled("mem", true).await.unwrap();
@@ -1605,7 +1605,7 @@ async fn an_invite_never_says_whether_an_account_exists() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_private_domains_owner_unregisters_it_over_rest() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
 
     let stranger = ctx.as_user("out").await;
@@ -1625,7 +1625,7 @@ async fn a_private_domains_owner_unregisters_it_over_rest() {
         "the refusal names who can: {detail}"
     );
 
-    let owner = ctx.as_user("owner").await;
+    let owner = ctx.as_user("keeper").await;
     let removed = owner.delete("/api/v1/domains/lab").await;
     let status = removed.status();
     let body = removed.text().await.unwrap();
@@ -1650,9 +1650,9 @@ async fn a_private_domains_owner_unregisters_it_over_rest() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shared_domain_stays_admin_only_over_rest() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
 
-    let editor = ctx.as_user("owner").await;
+    let editor = ctx.as_user("keeper").await;
     let refused = editor.delete("/api/v1/domains/open").await;
     assert_eq!(refused.status(), 403, "no owner concept on a shared domain");
 
@@ -1682,8 +1682,8 @@ async fn a_virtual_domain_needs_purge_over_rest() {
     assert_eq!(created.status(), 201, "the virtual domain is registered");
     // Owned by a plain instance editor, which is the principal this route only
     // started serving in this change.
-    ctx.make_private("mind", "owner").await;
-    let owner = ctx.as_user("owner").await;
+    ctx.make_private("mind", "keeper").await;
+    let owner = ctx.as_user("keeper").await;
     let written = owner
         .post_json(
             "/api/v1/domains/mind/engrams",
@@ -1721,8 +1721,8 @@ async fn a_virtual_domain_needs_purge_over_rest() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_domain_needs_no_purge_over_rest() {
     let ctx = RestCtx::two_domains().await;
-    ctx.make_private("lab", "owner").await;
-    let owner = ctx.as_user("owner").await;
+    ctx.make_private("lab", "keeper").await;
+    let owner = ctx.as_user("keeper").await;
     let removed = owner.delete("/api/v1/domains/lab").await;
     let status = removed.status();
     let body = removed.text().await.unwrap();
@@ -1740,7 +1740,7 @@ async fn a_file_domain_needs_no_purge_over_rest() {
 #[tokio::test]
 async fn the_owner_sees_per_actor_counts_and_a_member_gets_403() {
     let ctx = RestCtx::a_reviewing_team_domain().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Editor).await;
 
     let mem = ctx.as_user("mem").await;
@@ -1754,7 +1754,7 @@ async fn the_owner_sees_per_actor_counts_and_a_member_gets_403() {
         assert_eq!(written.status(), 201, "{:?}", written.text().await);
     }
 
-    let owner = ctx.as_user("owner").await;
+    let owner = ctx.as_user("keeper").await;
     assert_eq!(
         owner.get_json("/api/v1/domains/lab/drafts").await,
         json!({ "actors": [{ "actor": "mem", "entries": 2 }] }),
@@ -1784,7 +1784,7 @@ async fn the_owner_sees_per_actor_counts_and_a_member_gets_403() {
 #[tokio::test]
 async fn the_drafts_route_never_returns_a_path_or_content() {
     let ctx = RestCtx::a_reviewing_team_domain().await;
-    ctx.make_private("lab", "owner").await;
+    ctx.make_private("lab", "keeper").await;
     ctx.add_member("lab", "mem", MemberLevel::Editor).await;
 
     let mem = ctx.as_user("mem").await;
@@ -1800,7 +1800,7 @@ async fn the_drafts_route_never_returns_a_path_or_content() {
     assert_eq!(written.status(), 201, "{:?}", written.text().await);
 
     let body = ctx
-        .as_user("owner")
+        .as_user("keeper")
         .await
         .get_text("/api/v1/domains/lab/drafts", 200)
         .await;

@@ -559,7 +559,7 @@ mod tests {
     /// stranger, all instance editors except where the ladder needs otherwise.
     async fn cast(auth: &AuthStore) {
         for (name, role) in [
-            ("owner", Role::Editor),
+            ("keeper", Role::Editor),
             ("boss", Role::Admin),
             ("mem", Role::Viewer),
             ("out", Role::Editor),
@@ -582,15 +582,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         cast(&auth).await;
-        auth.set_domain_visibility("lab", true, "owner")
+        auth.set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
         let access = DomainAccess::new(auth);
         assert_eq!(
-            access.right(&user("owner", false), "lab").await.unwrap(),
+            access.right(&user("keeper", false), "lab").await.unwrap(),
             DomainRight::Own
         );
         assert_eq!(
@@ -675,13 +675,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         cast(&auth).await;
-        auth.set_domain_visibility("lab", true, "owner")
+        auth.set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+        auth.upsert_domain_member("lab", "mem", MemberLevel::Viewer, "keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("lab", "out", MemberLevel::Manager, "owner")
+        auth.upsert_domain_member("lab", "out", MemberLevel::Manager, "keeper")
             .await
             .unwrap();
         let access = DomainAccess::new(auth);
@@ -704,10 +704,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         cast(&auth).await;
-        auth.set_domain_visibility("lab", true, "owner")
+        auth.set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
         auth.set_disabled("mem", true).await.unwrap();
@@ -742,26 +742,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         cast(&auth).await;
-        auth.set_domain_visibility("lab", true, "owner")
+        auth.set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
-        auth.remove_user("owner").await.unwrap();
+        auth.remove_user("keeper").await.unwrap();
         // A different person, sitting down at a login name that was freed.
-        auth.add_user("owner", "owner", None, Role::Editor, "pw12345678")
+        auth.add_user("keeper", "keeper", None, Role::Editor, "pw12345678")
             .await
             .unwrap();
         let access = DomainAccess::new(auth);
         assert_eq!(
-            access.right(&user("owner", false), "lab").await.unwrap(),
+            access.right(&user("keeper", false), "lab").await.unwrap(),
             DomainRight::None,
             "the name is not the person: a re-added account inherits nothing"
         );
         assert!(
             access
-                .hidden_domains(&user("owner", false))
+                .hidden_domains(&user("keeper", false))
                 .await
                 .unwrap()
                 .unwrap()
@@ -784,7 +784,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         cast(&auth).await;
-        auth.set_domain_visibility("lab", true, "owner")
+        auth.set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
         let access = DomainAccess::new(auth);
@@ -817,14 +817,14 @@ mod tests {
         let auth = store(&dir).await;
         cast(&auth).await;
         for domain in ["lab", "vault", "attic"] {
-            auth.set_domain_visibility(domain, true, "owner")
+            auth.set_domain_visibility(domain, true, "keeper")
                 .await
                 .unwrap();
         }
-        auth.upsert_domain_member("vault", "mem", MemberLevel::Viewer, "owner")
+        auth.upsert_domain_member("vault", "mem", MemberLevel::Viewer, "keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("attic", "out", MemberLevel::Manager, "owner")
+        auth.upsert_domain_member("attic", "out", MemberLevel::Manager, "keeper")
             .await
             .unwrap();
         auth.transfer_domain("attic", "mem").await.unwrap();
@@ -832,7 +832,7 @@ mod tests {
         let scopes = [
             Scope::Unrestricted,
             Scope::Anonymous,
-            user("owner", false),
+            user("keeper", false),
             user("boss", true),
             user("mem", false),
             user("out", false),
@@ -884,13 +884,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         cast(&auth).await;
-        auth.set_domain_visibility("lab", true, "owner")
+        auth.set_domain_visibility("lab", true, "keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
-        auth.set_domain_visibility("lab", false, "owner")
+        auth.set_domain_visibility("lab", false, "keeper")
             .await
             .unwrap();
         let access = DomainAccess::new(auth);
@@ -944,15 +944,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         cast(&auth).await;
-        auth.set_domain_visibility("lab", true, "Owner")
+        auth.set_domain_visibility("lab", true, "Keeper")
             .await
             .unwrap();
-        auth.upsert_domain_member("lab", "MEM", MemberLevel::Editor, "owner")
+        auth.upsert_domain_member("lab", "MEM", MemberLevel::Editor, "keeper")
             .await
             .unwrap();
         let access = DomainAccess::new(auth);
         assert_eq!(
-            access.right(&user("OWNER", false), "lab").await.unwrap(),
+            access.right(&user("KEEPER", false), "lab").await.unwrap(),
             DomainRight::Own
         );
         assert_eq!(

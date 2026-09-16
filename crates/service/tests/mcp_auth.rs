@@ -1257,7 +1257,7 @@ impl VisibilityCtx {
         level: crystalline_service::rest::MemberLevel,
     ) {
         self.store
-            .upsert_domain_member(domain, account, level, "owner")
+            .upsert_domain_member(domain, account, level, "keeper")
             .await
             .unwrap();
     }
@@ -1381,7 +1381,7 @@ async fn mcp_ctx_with(mcp_auth: bool, fault: bool, team: bool) -> VisibilityCtx 
 
     let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
     for (name, role) in [
-        ("owner", Role::Editor),
+        ("keeper", Role::Editor),
         ("mem", Role::Editor),
         ("out", Role::Editor),
         ("boss", Role::Admin),
@@ -1391,7 +1391,7 @@ async fn mcp_ctx_with(mcp_auth: bool, fault: bool, team: bool) -> VisibilityCtx 
             .await
             .unwrap();
     }
-    auth.set_domain_visibility("lab", true, "owner")
+    auth.set_domain_visibility("lab", true, "keeper")
         .await
         .unwrap();
 
@@ -2614,7 +2614,7 @@ async fn a_private_domains_owner_removes_it_and_a_manager_cannot() {
         "and the manager removed nothing"
     );
 
-    let owner = ctx.token_for("owner").await;
+    let owner = ctx.token_for("keeper").await;
     let session = McpTestSession::open(&ctx.addr, Some(&owner)).await;
     let removed = session
         .call_tool("remove_domain", serde_json::json!({ "domain": "lab" }))
@@ -2643,7 +2643,7 @@ async fn a_private_domains_owner_removes_it_and_a_manager_cannot() {
 async fn a_shared_domain_is_removed_by_an_admin_and_by_nobody_else() {
     let ctx = mcp_ctx(true).await;
 
-    let editor = ctx.token_for("owner").await;
+    let editor = ctx.token_for("keeper").await;
     let session = McpTestSession::open(&ctx.addr, Some(&editor)).await;
     let refused = session
         .call_tool("remove_domain", serde_json::json!({ "domain": "open" }))
@@ -2745,7 +2745,7 @@ async fn the_open_tier_cannot_remove_a_domain() {
 async fn instance_state_changes_over_mcp_are_admin_only() {
     let ctx = mcp_ctx(true).await;
 
-    for account in ["looker", "owner"] {
+    for account in ["looker", "keeper"] {
         let token = ctx.token_for(account).await;
         let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
         let added = session
@@ -2865,7 +2865,7 @@ async fn a_team_domain_is_unregistered_and_its_repository_is_untouched() {
         "a domain carrying an origin is its own kind: {preview}"
     );
 
-    let owner = ctx.token_for("owner").await;
+    let owner = ctx.token_for("keeper").await;
     let session = McpTestSession::open(&ctx.addr, Some(&owner)).await;
     let removed = session
         .call_tool("remove_domain", serde_json::json!({ "domain": "lab" }))

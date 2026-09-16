@@ -71,8 +71,11 @@ pub(crate) const TOMBSTONE_SUFFIX: &str = ".tombstone";
 ///
 /// A leading dot so it can never be mistaken for an actor: the walk both
 /// readers share takes only directories as actor folders, so a file here is
-/// skipped whatever it is called, and the dot makes the name unreachable for a
-/// sanitized login besides. Inside the domain folder rather than beside it, so
+/// skipped whatever it is called. The dot is a convention and not a second
+/// guarantee - `normalize_account_name` permits a dot anywhere in a login, so
+/// an account could in principle be named for this file, and what protects the
+/// record is the walk taking directories alone. Inside the domain folder rather
+/// than beside it, so
 /// [`journal_remove_domain`]'s one `remove_dir_all` sweeps the record with the
 /// drafts it describes - a record that outlived them would name conflicts in
 /// drafts nobody holds any more.

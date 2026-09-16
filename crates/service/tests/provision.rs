@@ -420,10 +420,10 @@ async fn an_apply_report_names_no_domain_the_caller_may_not_see() {
             .await
             .unwrap(),
     );
-    auth.add_user("owner", "owner", None, Role::Admin, "pw12345678")
+    auth.add_user("keeper", "keeper", None, Role::Admin, "pw12345678")
         .await
         .unwrap();
-    auth.set_domain_visibility("vault", true, "owner")
+    auth.set_domain_visibility("vault", true, "keeper")
         .await
         .unwrap();
     engine.set_domain_access(Arc::new(DomainAccess::new(auth)));

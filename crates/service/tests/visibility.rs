@@ -74,7 +74,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Engine>) {
 
     let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
     for (name, role) in [
-        ("owner", Role::Editor),
+        ("keeper", Role::Editor),
         ("mem", Role::Editor),
         ("out", Role::Editor),
         ("boss", Role::Admin),
@@ -83,10 +83,10 @@ async fn fixture() -> (tempfile::TempDir, Arc<Engine>) {
             .await
             .unwrap();
     }
-    auth.set_domain_visibility("lab", true, "owner")
+    auth.set_domain_visibility("lab", true, "keeper")
         .await
         .unwrap();
-    auth.upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+    auth.upsert_domain_member("lab", "mem", MemberLevel::Viewer, "keeper")
         .await
         .unwrap();
     engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
@@ -208,7 +208,7 @@ async fn every_listed_domain_says_whether_it_is_private() {
     let (_tmp, engine) = fixture().await;
     for (who, scope) in [
         ("mem", user("mem")),
-        ("owner", user("owner")),
+        ("keeper", user("keeper")),
         ("boss", admin("boss")),
         ("the machine owner", Scope::Unrestricted),
     ] {
@@ -249,7 +249,7 @@ async fn a_member_and_the_owner_see_the_private_domain() {
     let (_tmp, engine) = fixture().await;
     for (account, scope) in [
         ("mem", user("mem")),
-        ("owner", user("owner")),
+        ("keeper", user("keeper")),
         ("boss", admin("boss")),
     ] {
         let listed = engine

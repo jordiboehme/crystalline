@@ -698,8 +698,13 @@ async fn removing_a_domain_sweeps_every_actors_journal_and_names_the_counts() {
 }
 
 /// The reviewed team domain with an accounts store behind it, so a scope can be
-/// somebody in particular: `owner` holds the domain, `mem` is an editor in it,
+/// somebody in particular: `keeper` holds the domain, `mem` is an editor in it,
 /// and the domain is private, which is what makes membership decide anything.
+///
+/// The holder is `keeper` rather than `owner` because `owner` is the actor key
+/// the machine owner's own drafts carry, and no account may hold it - which is
+/// what lets a test below have both at once: drafts filed under `owner` and a
+/// person who holds the domain asking about them.
 async fn screened_origin_fixture() -> Fixture {
     let f = reviewed_origin_fixture().await;
     let auth = Arc::new(
@@ -707,7 +712,7 @@ async fn screened_origin_fixture() -> Fixture {
             .await
             .unwrap(),
     );
-    for name in ["owner", "mem"] {
+    for name in ["keeper", "mem"] {
         auth.add_user(
             name,
             name,
@@ -718,14 +723,14 @@ async fn screened_origin_fixture() -> Fixture {
         .await
         .unwrap();
     }
-    auth.set_domain_visibility("team", true, "owner")
+    auth.set_domain_visibility("team", true, "keeper")
         .await
         .unwrap();
     auth.upsert_domain_member(
         "team",
         "mem",
         crystalline_service::rest::MemberLevel::Editor,
-        "owner",
+        "keeper",
     )
     .await
     .unwrap();
@@ -746,8 +751,8 @@ async fn screened_origin_fixture() -> Fixture {
 async fn a_members_status_carries_only_its_own_count() {
     let f = screened_origin_fixture().await;
     f.draft("team", "mem", "plan.md", ALICE_DRAFT).await;
-    f.draft("team", "owner", "fresh.md", ALICE_NEW).await;
-    f.tombstone("team", "owner", "plan.md").await;
+    f.draft("team", "keeper", "fresh.md", ALICE_NEW).await;
+    f.tombstone("team", "keeper", "plan.md").await;
 
     let mine = f
         .engine
@@ -767,7 +772,7 @@ async fn a_members_status_carries_only_its_own_count() {
 
     let theirs = f
         .engine
-        .origin_status(Some("team"), false, &account("owner"))
+        .origin_status(Some("team"), false, &account("keeper"))
         .await
         .unwrap();
     let entry = &theirs["domains"][0];
@@ -779,10 +784,10 @@ async fn a_members_status_carries_only_its_own_count() {
     assert_eq!(
         entry["drafts"],
         serde_json::json!([
+            { "actor": "keeper", "entries": 2 },
             { "actor": "mem", "entries": 1 },
-            { "actor": "owner", "entries": 2 },
         ]),
-        "the owner sees who is drafting here and how much: {entry}"
+        "whoever holds the domain sees who is drafting here and how much: {entry}"
     );
     let text = entry.to_string();
     for secret in ["plan.md", "fresh.md", "alice would have it"] {
@@ -2396,7 +2401,7 @@ async fn screened_fixture() -> Fixture {
             .await
             .unwrap(),
     );
-    for name in ["owner", "alice", "out"] {
+    for name in ["keeper", "alice", "out"] {
         auth.add_user(
             name,
             name,
@@ -2407,14 +2412,14 @@ async fn screened_fixture() -> Fixture {
         .await
         .unwrap();
     }
-    auth.set_domain_visibility("team", true, "owner")
+    auth.set_domain_visibility("team", true, "keeper")
         .await
         .unwrap();
     auth.upsert_domain_member(
         "team",
         "alice",
         crystalline_service::rest::MemberLevel::Editor,
-        "owner",
+        "keeper",
     )
     .await
     .unwrap();

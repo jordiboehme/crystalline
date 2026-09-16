@@ -24,19 +24,21 @@ async fn engine() -> Arc<Engine> {
     ))
 }
 
-/// An accounts store holding a private `lab` owned by `owner`, with `mem`
-/// invited and `out` a stranger.
+/// An accounts store holding a private `lab` owned by `keeper`, with `mem`
+/// invited and `out` a stranger. The domain's holder is not called `owner`:
+/// that name is reserved for the machine owner's own drafts and is refused as
+/// a login.
 async fn auth(dir: &std::path::Path, file: &str) -> Arc<AuthStore> {
     let auth = Arc::new(AuthStore::open(&dir.join(file)).await.unwrap());
-    for name in ["owner", "mem", "out"] {
+    for name in ["keeper", "mem", "out"] {
         auth.add_user(name, name, None, Role::Editor, "pw12345678")
             .await
             .unwrap();
     }
-    auth.set_domain_visibility("lab", true, "owner")
+    auth.set_domain_visibility("lab", true, "keeper")
         .await
         .unwrap();
-    auth.upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+    auth.upsert_domain_member("lab", "mem", MemberLevel::Viewer, "keeper")
         .await
         .unwrap();
     auth
@@ -103,7 +105,7 @@ async fn an_installed_resolver_hides_a_private_domain_from_a_stranger() {
     );
     assert!(
         engine
-            .hidden_domains(&user("owner"))
+            .hidden_domains(&user("keeper"))
             .await
             .unwrap()
             .unwrap()
