@@ -332,6 +332,28 @@ export default function EngramPage() {
         </h1>
       </header>
 
+      {/*
+        What this text is, when it is not the page the team holds.
+
+        A draft stands at the same address the shared page stands at, and this
+        screen is where most readers land - a grantee with no write right can
+        reach nothing else. So the marker the editor renders is rendered here
+        too, and it says both halves: whose work this is, and that the shared
+        tree does not hold it. Absent on everything else, which is nearly
+        every page.
+      */}
+      {engram.draft && (
+        <p
+          role="status"
+          aria-label="Draft"
+          className="rounded bg-amber-100 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"
+        >
+          {engram.draftOwner
+            ? `${engram.draftOwner}'s draft, shared with you. The shared tree does not hold this text and it has not been reviewed.`
+            : "Your private draft. The shared tree has not moved; share it for review when it is ready."}
+        </p>
+      )}
+
       <LifecycleBanner
         status={engram.frontmatter.status}
         staleAfter={engram.frontmatter.staleAfter}

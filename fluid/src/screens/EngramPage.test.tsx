@@ -900,6 +900,43 @@ describe("the engram page at full width", () => {
     ).toBeVisible();
   });
 
+  // A draft standing where the team's page stands must never be read as that
+  // page: this screen is where most readers land, and the only one a grantee
+  // with no write right can reach at all.
+  it("says whose draft a granted one is", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const marker = await screen.findByRole("status", { name: /draft/i });
+    expect(marker).toHaveTextContent("alice's draft, shared with you");
+    expect(marker).toHaveTextContent(/not been reviewed/i);
+  });
+
+  it("says that your own draft has not moved the shared tree", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () => detailResponse({ draft: true }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const marker = await screen.findByRole("status", { name: /draft/i });
+    expect(marker).toHaveTextContent("Your private draft");
+    expect(marker).toHaveTextContent(/share it for review/i);
+  });
+
+  it("marks nothing on a page the team already holds", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+    await screen.findByRole("heading", { name: "Alpha" });
+
+    expect(screen.queryByRole("status", { name: /draft/i })).toBeNull();
+  });
+
   it("keeps the column at the reading measure", async () => {
     serveWithFile();
 
