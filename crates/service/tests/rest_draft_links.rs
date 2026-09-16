@@ -96,6 +96,7 @@ async fn serve() -> Fixture {
         ("carol", Role::Editor),
         ("dave", Role::Editor),
         ("vera", Role::Viewer),
+        ("root", Role::Admin),
     ] {
         auth.add_user(name, name, None, role, "pw12345678")
             .await
@@ -264,6 +265,94 @@ impl Fixture {
         assert_eq!(resp.status(), 200, "minting a link on one's own draft");
         resp.json().await.unwrap()
     }
+}
+
+/// Taking a live credential back is never harder than it was to mint it.
+///
+/// An author who has been demoted - she left the team, her role was lowered -
+/// keeps one right over the links she minted: ending them. The alternative is
+/// a grant nobody alive can close, since the row is hers and the draft is
+/// hers, and the only other ways out are folding the draft or unregistering
+/// the domain. An admin may close one too, which is the third party a
+/// departed author's live link needs; everybody else meets the same not-found
+/// somebody else's link has always answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_demoted_author_takes_her_own_link_back_and_a_stranger_never_can() {
+    let _serialized = support::maintenance_guard().await;
+    let f = serve().await;
+    let path = f.draft("alice", "Fresh", "A page only alice has.").await;
+    let author = login(f.addr, "alice").await;
+    let hers = f.mint(&author, &path).await["id"].as_i64().unwrap();
+    let second = f.mint(&author, &path).await["id"].as_i64().unwrap();
+
+    // Alice leaves the team and is demoted. She may write nothing anywhere any
+    // more - and the link she handed out is still opening her unfolded work.
+    f.auth.set_role("alice", Role::Viewer).await.unwrap();
+    let alice = login(f.addr, "alice").await;
+    let refused_write = alice
+        .request(
+            f.addr,
+            reqwest::Method::POST,
+            "/api/v1/domains/team/draft-links",
+        )
+        .json(&serde_json::json!({"path": path}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        refused_write.status(),
+        403,
+        "a viewer mints nothing: {:?}",
+        refused_write.text().await
+    );
+
+    let revoked = alice
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/draft-links/{hers}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        revoked.status(),
+        204,
+        "her own link is hers to end whatever her role is now: {:?}",
+        revoked.text().await
+    );
+
+    // Somebody else's link is still not a thing a stranger may touch, or ask
+    // about: the 404 an invented id answers.
+    let bob = login(f.addr, "bob").await;
+    let stranger = bob
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/draft-links/{second}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stranger.status(), 404, "and it is hers, not his");
+
+    // An admin is the third party who can close one when the author is gone.
+    let root = login(f.addr, "root").await;
+    let swept = root
+        .request(
+            f.addr,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/draft-links/{second}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        swept.status(),
+        204,
+        "an admin closes a live link on this instance: {:?}",
+        swept.text().await
+    );
 }
 
 /// The whole arc in one test: an author mints a link on their own draft, hands

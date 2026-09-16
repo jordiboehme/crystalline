@@ -2264,11 +2264,11 @@ fn write_ops() -> Vec<WriteOp> {
         // read-only still refuses is the write a join enables, in the engine,
         // where it always did.
         //
-        // Minting and revoking are editor-level, because only somebody who may
-        // write on a domain can be holding a draft there to share. `eng` takes
-        // changes directly in this fixture, so nobody is holding one and every
-        // allowed leg answers 404 - past authorization, which is what this
-        // matrix asserts, and sharing nothing.
+        // Minting is editor-level, because only somebody who may write on a
+        // domain can be holding a draft there to share. `eng` takes changes
+        // directly in this fixture, so nobody is holding one and every allowed
+        // leg answers 404 - past authorization, which is what this matrix
+        // asserts, and sharing nothing.
         WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/draft-links",
@@ -2276,6 +2276,13 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Editor,
             read_only_exempt: true,
         },
+        // Revoking is viewer-level, and deliberately: it only ever ends a
+        // credential the caller minted, and the right to take one back must
+        // never be harder to hold than the right to have handed it out was -
+        // an author demoted since would otherwise leave a live link on her
+        // unfolded work that nobody alive could close. Whose link it is, is
+        // the whole of the authorization, and an admin may close any.
+        //
         // Id 11: the next free literal after the oauth consent row's `9` and
         // the oauth-grant row's `10`. Nothing in this matrix mints a real
         // grant, so there is no small id to collide with, and no fixture
@@ -2285,7 +2292,7 @@ fn write_ops() -> Vec<WriteOp> {
             method: Method::DELETE,
             path: "/api/v1/draft-links/11",
             body: None,
-            min_role: Role::Editor,
+            min_role: Role::Viewer,
             read_only_exempt: true,
         },
         // Redeeming, joining and leaving are viewer-level: a link binds to
@@ -2363,11 +2370,13 @@ fn draft_link_routes_are_in_the_write_matrix() {
     assert_eq!(
         viewer,
         vec![
+            "/api/v1/draft-links/11",
             "/api/v1/draft-links/accept",
             "/api/v1/draft-links/join",
             "/api/v1/draft-links/leave",
         ],
-        "a link binds whatever the role, and a viewer opens the draft read-only"
+        "a link binds whatever the role, a viewer opens the draft read-only, \
+         and an author ends her own link whatever her role has become"
     );
 }
 

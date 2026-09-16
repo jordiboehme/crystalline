@@ -2838,8 +2838,18 @@ impl AuthStore {
     }
 
     /// Take one link back, and answer the row it was. `None` when `id` names no
-    /// link of `owner`'s, which is what somebody else's link and an invented id
-    /// both answer: a revoke is never a probe for which links exist.
+    /// link this caller may end, which is what somebody else's link and an
+    /// invented id both answer: a revoke is never a probe for which links
+    /// exist.
+    ///
+    /// **Whose link it is, or an admin's instance.** The author may always end
+    /// what she minted, whatever her role has become since - a live credential
+    /// must never be harder to take back than it was to hand out, or a
+    /// departed author leaves a grant nobody alive can close. `as_admin`
+    /// widens the same query to any link on the instance, which is the third
+    /// party that case needs. Both statements below carry the same widening:
+    /// a row the read matched and the update did not would be a revoke that
+    /// answered a draft it never took a link off.
     ///
     /// **The row rather than a yes**, because taking a link back is not only a
     /// fact about the row: a session may be working inside the draft it opened
@@ -2853,20 +2863,35 @@ impl AuthStore {
     /// was never minted, and so the author's own audit of who they shared with
     /// survives the revoke. The record answered carries the stamp, so what the
     /// caller reads is the link as it now stands.
-    pub async fn revoke_overlay_grant(&self, owner: &str, id: i64) -> Result<Option<OverlayGrant>> {
+    pub async fn revoke_overlay_grant(
+        &self,
+        owner: &str,
+        id: i64,
+        as_admin: bool,
+    ) -> Result<Option<OverlayGrant>> {
         let owner = normalize_account_name(owner)?;
         let revoked_at = chrono::Utc::now().to_rfc3339();
         let _guard = self.guard.lock().await;
-        // Read and then stamp, both under the one guard and both naming the
-        // same normalized owner: a row the read matched and the update did not
-        // would be a revoke that answered a draft it never took a link off.
+        // One predicate and one parameter list, built once and used by both
+        // statements: an admin ends any link on the instance, everybody else
+        // exactly their own. Read and then stamp, both under the one guard and
+        // both carrying this same widening - a row the read matched and the
+        // update did not would be a revoke that answered a draft it never took
+        // a link off.
+        let mine = if as_admin { "" } else { " AND owner = ?2" };
+        let mut params = vec![Value::Integer(id)];
+        if !as_admin {
+            params.push(Value::Text(owner.clone()));
+        }
         let mut rows = self
             .conn
             .query(
-                "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
+                &format!(
+                    "SELECT id, domain, path, owner, grantee, created_at, expires_at, revoked_at
                  FROM overlay_grant
-                 WHERE id = ?1 AND owner = ?2 AND revoked_at IS NULL",
-                vec![Value::Integer(id), Value::Text(owner.clone())],
+                 WHERE id = ?1{mine} AND revoked_at IS NULL"
+                ),
+                params,
             )
             .await
             .with_context(|| format!("revoking a draft share-link for '{owner}'"))?;
@@ -2878,15 +2903,18 @@ impl AuthStore {
         let Some(mut grant) = found else {
             return Ok(None);
         };
+        let mine = if as_admin { "" } else { " AND owner = ?3" };
+        let mut params = vec![Value::Text(revoked_at.clone()), Value::Integer(id)];
+        if !as_admin {
+            params.push(Value::Text(owner.clone()));
+        }
         self.conn
             .execute(
-                "UPDATE overlay_grant SET revoked_at = ?1
-                 WHERE id = ?2 AND owner = ?3 AND revoked_at IS NULL",
-                vec![
-                    Value::Text(revoked_at.clone()),
-                    Value::Integer(id),
-                    Value::Text(owner.clone()),
-                ],
+                &format!(
+                    "UPDATE overlay_grant SET revoked_at = ?1
+                 WHERE id = ?2{mine} AND revoked_at IS NULL"
+                ),
+                params,
             )
             .await
             .with_context(|| format!("revoking a draft share-link for '{owner}'"))?;
@@ -9007,14 +9035,34 @@ mod tests {
         assert_eq!(listed.len(), 1, "the author sees what they minted");
         assert!(
             store
-                .revoke_overlay_grant("bob", revoked.id)
+                .revoke_overlay_grant("bob", revoked.id, false)
                 .await
                 .unwrap()
                 .is_none(),
             "and nobody else can take it back"
         );
+        let swept = store
+            .mint_overlay_grant("team", "plan.md", "alice", None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .revoke_overlay_grant("bob", swept.id, true)
+                .await
+                .unwrap()
+                .is_some(),
+            "an admin closes a link on this instance whoever minted it"
+        );
+        assert!(
+            store
+                .redeem_overlay_grant(&swept.token, "bob")
+                .await
+                .unwrap()
+                .is_none(),
+            "and the row was stamped, not only answered"
+        );
         let taken = store
-            .revoke_overlay_grant("alice", revoked.id)
+            .revoke_overlay_grant("alice", revoked.id, false)
             .await
             .unwrap()
             .expect("its author takes it back");
@@ -9033,7 +9081,7 @@ mod tests {
         );
         assert!(
             store
-                .revoke_overlay_grant("alice", revoked.id)
+                .revoke_overlay_grant("alice", revoked.id, false)
                 .await
                 .unwrap()
                 .is_none(),

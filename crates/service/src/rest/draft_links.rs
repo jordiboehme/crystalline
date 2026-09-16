@@ -48,7 +48,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 
 use super::auth::Identity;
-use super::auth_store::{DRAFT_LINK_PREFIX, OverlayGrant};
+use super::auth_store::{DRAFT_LINK_PREFIX, OverlayGrant, Role};
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, require_domain_read,
     require_domain_write,
@@ -462,11 +462,16 @@ pub async fn revoke(
     identity: Identity,
     ApiPath(id): ApiPath<i64>,
 ) -> Result<StatusCode, ApiError> {
-    identity.require_editor()?;
+    // No role gate: a revoke only ever ends a credential the caller minted,
+    // and the right to take one back must never be harder to hold than the
+    // right to have handed it out was. An author demoted since - she left the
+    // team, her role was lowered - would otherwise leave a live link on her
+    // unfolded work that nobody alive could close. Anonymous is still refused,
+    // because it has no links of its own to end.
     let user = identity.require_account()?;
     let removed = state
         .auth
-        .revoke_overlay_grant(&user.name, id)
+        .revoke_overlay_grant(&user.name, id, user.role == Role::Admin)
         .await
         .map_err(|e| ApiError::internal(format!("{e:#}")))?;
     let Some(ended) = removed else {
