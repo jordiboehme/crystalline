@@ -130,13 +130,26 @@ function joinRoom(hello: Partial<CollabHello> = {}) {
 
 /** An awareness frame from somebody else in the room. */
 function presenceFrame(name: string): Uint8Array {
-  const otherDoc = new Y.Doc();
-  const other = new Awareness(otherDoc);
-  other.setLocalStateField("user", {
+  return awarenessFrame({
     name,
     color: "#f59e0b",
     colorLight: "#f59e0b33",
   });
+}
+
+/**
+ * The awareness frame the SERVER publishes for an agent working in this
+ * document: a name, the agent flag, and deliberately no color of its own.
+ */
+function agentFrame(label: string): Uint8Array {
+  return awarenessFrame({ name: label, agent: true });
+}
+
+/** One awareness state, framed the way the wire carries it. */
+function awarenessFrame(user: Record<string, unknown>): Uint8Array {
+  const otherDoc = new Y.Doc();
+  const other = new Awareness(otherDoc);
+  other.setLocalStateField("user", user);
   const encoder = encoding.createEncoder();
   encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
   encoding.writeVarUint8Array(
@@ -246,6 +259,22 @@ describe("useCollabSession", () => {
     expect(grace?.color).toMatch(/^#[0-9a-f]{6}$/);
     expect(grace?.self).toBe(false);
     expect(me?.self).toBe(true);
+  });
+
+  it("tells an agent peer apart from a person, and colors it anyway", () => {
+    const { socket } = joinRoom();
+    act(() => {
+      socket.receive(presenceFrame("Grace"));
+      socket.receive(agentFrame("ada (agent: claude-code/2.0)"));
+    });
+    const participants = session().participants;
+    const agent = participants.find((one) => one.agent);
+    expect(agent?.name).toBe("ada (agent: claude-code/2.0)");
+    // No color on the wire: the room's own palette, keyed by the label, is
+    // what gives an agent a chip like everybody else's.
+    expect(agent?.color).toMatch(/^#[0-9a-f]{6}$/);
+    expect(agent?.self).toBe(false);
+    expect(participants.find((one) => one.name === "Grace")?.agent).toBe(false);
   });
 
   it("carries a conflict and an accepted deletion", () => {

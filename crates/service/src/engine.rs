@@ -53,6 +53,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::collab::session::AgentPeer;
 use crate::domain_view::DomainView;
 use crate::origin;
 use crate::overlay::{self, EnvOverlay, LoadedConfig};
@@ -6237,9 +6238,15 @@ impl Engine {
             .unwrap_or_else(|| crystalline_core::slugify(&title));
         let remaining = append_body(&plan.remaining, &format!("- split_into [[{back_link}]]"));
         let edited = self
-            .apply_source_edit_staged(&desc, &source, &view, Some(&checksum), &actor, move |_| {
-                Ok(remaining)
-            })
+            .apply_source_edit_staged(
+                &desc,
+                &source,
+                &view,
+                Some(&checksum),
+                &actor,
+                None,
+                move |_| Ok(remaining),
+            )
             .await;
         let source_warning = match edited {
             Ok(warning) => warning,
@@ -6589,11 +6596,12 @@ impl Engine {
         &self,
         desc: &EngramDescriptor,
         view: &DomainView<'_>,
+        except: Option<yrs::ClientID>,
     ) -> Vec<String> {
         match self.collab_rooms() {
             Some(rooms) => {
                 rooms
-                    .participants(&desc.domain, &desc.permalink, view.actor())
+                    .participants(&desc.domain, &desc.permalink, view.actor(), except)
                     .await
             }
             None => Vec::new(),
@@ -6601,7 +6609,24 @@ impl Engine {
     }
 
     pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
-        self.read_engram_in(p, scope, true).await
+        self.read_engram_in(p, scope, true, None).await
+    }
+
+    /// [`Engine::read_engram`], with the reading agent as a named peer in the
+    /// room it may be answered from.
+    ///
+    /// A read that comes back live is a read over somebody's shoulder: the
+    /// bytes are their unsaved work, and the person who typed them is owed the
+    /// same name in the strip an edit puts there. So the claim is made here
+    /// too, and it expires the same way. A read answered from the file or the
+    /// row puts nothing anywhere, which is nearly every read.
+    pub async fn read_engram_present(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+        peer: Option<&AgentPeer>,
+    ) -> Result<Value> {
+        self.read_engram_in(p, scope, true, peer).await
     }
 
     /// [`Engine::read_engram`] with the live document deliberately ignored:
@@ -6626,7 +6651,7 @@ impl Engine {
         p: &ReadParams,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        self.read_engram_in(p, scope, false).await
+        self.read_engram_in(p, scope, false, None).await
     }
 
     async fn read_engram_in(
@@ -6634,6 +6659,7 @@ impl Engine {
         p: &ReadParams,
         scope: &crate::scope::Scope,
         live_wins: bool,
+        peer: Option<&AgentPeer>,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
         // The one path a read crosses between two overlays on: a draft this
@@ -6676,7 +6702,22 @@ impl Engine {
             None => None,
         };
         let present = match &live {
-            Some(_) => self.live_participants(&desc, &view).await,
+            Some(_) => {
+                // The agent stands in the room first and is then told who is
+                // in it: `present` is who this read is reading over, and the
+                // reader is not one of them - not on the call that mints its
+                // slot and not on the ones that find it standing. Another
+                // agent working in the same document is.
+                let mine = match (self.collab_rooms(), peer) {
+                    (Some(rooms), Some(peer)) => {
+                        rooms
+                            .touch_agent_presence(&desc.domain, &desc.permalink, view.actor(), peer)
+                            .await
+                    }
+                    _ => None,
+                };
+                self.live_participants(&desc, &view, mine).await
+            }
             None => Vec::new(),
         };
         let is_live = live.is_some();
@@ -6981,6 +7022,30 @@ impl Engine {
         scope: &crate::scope::Scope,
         join: Option<&crate::join::Join>,
     ) -> Result<Value> {
+        self.edit_engram_present(p, client, scope, join, None).await
+    }
+
+    /// [`Engine::edit_engram_joined`], with the agent as a named peer in the
+    /// room the edit may land in.
+    ///
+    /// The bottom rung, and the only one that knows about the strip. `peer` is
+    /// display alone: it changes nothing about what is written or where, and
+    /// the provenance the edit records is `client` exactly as it always was.
+    /// It is carried this far down rather than resolved from the receipt
+    /// because the room is keyed on the overlay owner, and who that is - your
+    /// own draft, the author's draft you were invited into, or the document a
+    /// direct domain keeps - is the view's answer, resolved here.
+    ///
+    /// `None` is every surface that is not an agent working for somebody: the
+    /// CLI, the control socket, a call nobody authenticated.
+    pub async fn edit_engram_present(
+        &self,
+        p: &EditParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+        peer: Option<&AgentPeer>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -7028,6 +7093,7 @@ impl Engine {
                 &view,
                 p.expected_checksum.as_deref(),
                 &actor,
+                peer,
                 |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
             )
             .await
@@ -7096,7 +7162,12 @@ impl Engine {
         // than about where the bytes went, and every one of them composes into
         // an open room correctly without saying so. The verb that says so is
         // `edit_engram_as`, which calls the staged form for exactly that.
-        self.apply_source_edit_staged(desc, source, view, expected_checksum, actor, apply)
+        //
+        // The agent peer goes the same way and for the same reason: these
+        // verbs carry no peer to name, because none of their surfaces resolves
+        // one. The text still composes into the open room; what an author does
+        // not get is a chip for the agent that retired the page under them.
+        self.apply_source_edit_staged(desc, source, view, expected_checksum, actor, None, apply)
             .await
             .map(|edited| edited.warning)
             .map_err(|failure| failure.error)
@@ -7119,6 +7190,7 @@ impl Engine {
         view: &DomainView<'_>,
         expected_checksum: Option<&str>,
         actor: &str,
+        peer: Option<&AgentPeer>,
         apply: F,
     ) -> std::result::Result<SourceEdited, SourceEditFailure>
     where
@@ -7167,7 +7239,7 @@ impl Engine {
                 let edited = touch_generated(&edited, actor, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let applied = rooms
-                    .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor)
+                    .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor, peer)
                     .await
                     .map_err(|detail| SourceEditFailure::before(EngineError::Conflict(detail)))?;
                 // No mirror warning: nothing was mirrored, because nothing was

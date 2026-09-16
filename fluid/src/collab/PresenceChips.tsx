@@ -6,8 +6,15 @@
  * and the chip in the header are recognisably the same person. The chips are
  * a list rather than a paragraph, and the list itself carries the names, so a
  * screen reader hears who is here without walking the row item by item.
+ *
+ * An agent working in the document is one of the chips rather than a notice of
+ * its own: it is in here, it is changing the text under your cursor, and it
+ * has a name and a color like anybody else. What marks it is a glyph beside
+ * the name, so somebody watching a line appear knows whether a colleague or an
+ * agent wrote it.
  */
 
+import { Bot } from "lucide-react";
 import type { ReactElement } from "react";
 
 import type { CollabParticipant } from "./useCollabSession";
@@ -50,6 +57,15 @@ export function PresenceChips({
             className="size-2 rounded-full"
             style={{ backgroundColor: one.color }}
           />
+          {one.agent && (
+            <Bot
+              role="img"
+              aria-label="agent"
+              size={12}
+              strokeWidth={1.75}
+              className="shrink-0"
+            />
+          )}
           {one.name}
           {one.self && (
             <span className="text-slate-500 dark:text-slate-400">you</span>

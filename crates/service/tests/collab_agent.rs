@@ -22,13 +22,13 @@ use std::time::{Duration, Instant};
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::collab::session::{CollabSessions, Joined};
+use crystalline_service::collab::session::{AgentPeer, CollabSessions, Frame, Joined};
 use crystalline_service::params::{EditParams, ReadParams};
-use tokio::sync::Mutex;
-use yrs::sync::{Message, MessageReader, SyncMessage};
+use tokio::sync::{Mutex, broadcast};
+use yrs::sync::{Awareness, Message, MessageReader, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, GetString, Options, ReadTxn, Text, Transact, Update};
+use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 
@@ -153,6 +153,47 @@ async fn resync(joined: &Joined, doc: &Doc) {
 fn client_text(doc: &Doc) -> String {
     let text = doc.get_or_insert_text("content");
     text.get_string(&doc.transact())
+}
+
+/// Publish a display name in awareness, the way a browser's provider does on
+/// its first frame. Without it a room has connections but no names, and
+/// `present` is empty however many people are in there.
+async fn publish_name(joined: &Joined, doc: &Doc, name: &str) {
+    let mut awareness = Awareness::new(doc.clone());
+    awareness.set_local_state_raw(format!("{{\"user\":{{\"name\":\"{name}\"}}}}"));
+    let update = awareness.update().unwrap();
+    joined
+        .session
+        .handle_frame(joined.conn, &Message::Awareness(update).encode_v1())
+        .await;
+}
+
+/// Throw away whatever the room has broadcast so far, so the next read is
+/// about what one action did.
+fn drain(rx: &mut broadcast::Receiver<Frame>) {
+    while rx.try_recv().is_ok() {}
+}
+
+/// Every awareness state the room has broadcast since the last drain, as the
+/// client id it is about and the JSON it carries ("null" for a state that was
+/// taken away).
+fn awareness_states(rx: &mut broadcast::Receiver<Frame>) -> Vec<(ClientID, String)> {
+    let mut states = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        for message in messages_of(&frame.bytes) {
+            if let Message::Awareness(update) = message {
+                for (id, entry) in update.clients {
+                    states.push((id, entry.json.to_string()));
+                }
+            }
+        }
+    }
+    states
+}
+
+/// Who the room says is in it right now.
+async fn joined_names(joined: &Joined) -> Vec<String> {
+    joined.session.participants(None).await
 }
 
 /// An `append` edit of `alpha`, the shape an agent adding a line sends.
@@ -452,5 +493,181 @@ async fn a_retirement_of_an_open_draft_lands_in_the_document_too() {
     assert!(
         draft.content.contains("status: archived") && draft.content.contains("a person typed this"),
         "{draft:?}"
+    );
+}
+
+/// **The brief's first test.** An agent that works in somebody's open document
+/// is a peer in it: the room hears an awareness state carrying the agent's own
+/// label, flagged as an agent so the strip can draw it as one.
+///
+/// The second half is what keeps the receipt honest. `present` is what the
+/// agent is told about who is in there WITH it, so its own slot is never in
+/// that list - not on the first call, which mints it, and not on the second,
+/// which finds it already standing.
+#[tokio::test]
+async fn an_agent_action_broadcasts_an_awareness_state_flagged_agent() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    publish_name(&joined, &doc, "Grace Hopper").await;
+    append_line(&joined, &doc, "a person typed this").await;
+    drain(&mut joined.rx);
+
+    let peer = AgentPeer {
+        account: "ada".to_string(),
+        label: "ada (agent: claude-code/2.0)".to_string(),
+    };
+    let receipt = engine
+        .edit_engram_present(
+            &append_edit("the agent added that", None),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            Some(&peer),
+        )
+        .await
+        .expect("the edit lands");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+    assert_eq!(
+        receipt["present"].as_array().map(Vec::len),
+        Some(1),
+        "the agent is told who is in there with it, not counted among them: {receipt}"
+    );
+    assert_eq!(
+        receipt["present"][0].as_str(),
+        Some("Grace Hopper"),
+        "{receipt}"
+    );
+
+    let states = awareness_states(&mut joined.rx);
+    let peer_state = states
+        .iter()
+        .find(|(_, json)| json.contains("ada (agent: claude-code/2.0)"))
+        .expect("the room hears the agent arrive");
+    assert!(
+        peer_state.1.contains("\"agent\":true"),
+        "flagged as an agent, so the strip draws it as one: {}",
+        peer_state.1
+    );
+
+    // A second call inside the TTL finds the slot standing: the agent is one
+    // peer however often it works, and it is still not in its own `present`.
+    let receipt = engine
+        .edit_engram_present(
+            &append_edit("and then the agent added this", None),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            Some(&peer),
+        )
+        .await
+        .expect("the second edit lands");
+    assert_eq!(
+        receipt["present"].as_array().map(Vec::len),
+        Some(1),
+        "still only the person: {receipt}"
+    );
+    let names = joined.session.participants(None).await;
+    assert_eq!(
+        names.iter().filter(|name| name.contains("(agent")).count(),
+        1,
+        "and the room holds one agent peer, not two: {names:?}"
+    );
+
+    // Somebody opening the page WHILE the agent is working gets the strip in
+    // their greeting rather than from a broadcast they were not subscribed
+    // for: the full awareness a join hands over carries the agent's slot like
+    // anybody else's.
+    let arriving = sessions.join("eng", "alpha", None).await.unwrap();
+    let greeted: Vec<String> = messages_of(&arriving.greeting)
+        .into_iter()
+        .filter_map(|message| match message {
+            Message::Awareness(update) => Some(update),
+            _ => None,
+        })
+        .flat_map(|update| {
+            update
+                .clients
+                .into_values()
+                .map(|entry| entry.json.to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        greeted.iter().any(|json| {
+            json.contains("ada (agent: claude-code/2.0)") && json.contains("\"agent\":true")
+        }),
+        "a tab opened mid-work is told who is in here: {greeted:?}"
+    );
+}
+
+/// **The brief's second test.** The agent's slot is not a connection: a person
+/// leaving the room does not take it with them, and nothing but the TTL does.
+#[tokio::test]
+async fn agent_presence_clears_after_the_ttl_and_survives_a_peer_leaving() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let mut mine = sessions.join("eng", "alpha", None).await.unwrap();
+    let my_doc = sync_client(&mine).await;
+    publish_name(&mine, &my_doc, "Grace Hopper").await;
+    let hers = sessions.join("eng", "alpha", None).await.unwrap();
+    let her_doc = sync_client(&hers).await;
+    publish_name(&hers, &her_doc, "Ada Lovelace").await;
+
+    let peer = AgentPeer {
+        account: "ada".to_string(),
+        label: "ada (agent)".to_string(),
+    };
+    engine
+        .edit_engram_present(
+            &append_edit("the agent added that", None),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            Some(&peer),
+        )
+        .await
+        .expect("the edit lands");
+    let agent_id = awareness_states(&mut mine.rx)
+        .into_iter()
+        .find(|(_, json)| json.contains("ada (agent)"))
+        .expect("the room heard the agent arrive")
+        .0;
+    assert!(
+        joined_names(&mine)
+            .await
+            .contains(&"ada (agent)".to_string()),
+        "the agent stands in the room"
+    );
+
+    // A person leaves. Their own awareness state is nulled and the agent's is
+    // not: the slot is nobody's connection.
+    hers.session.remove_conn(hers.conn).await;
+    let names = joined_names(&mine).await;
+    assert!(
+        names.contains(&"ada (agent)".to_string()) && !names.contains(&"Ada Lovelace".to_string()),
+        "the peer left and the agent did not: {names:?}"
+    );
+
+    // And the TTL is what does take it, on the saver's own pass.
+    drain(&mut mine.rx);
+    mine.session
+        .tick_save(Instant::now() + Duration::from_secs(61))
+        .await;
+    assert!(
+        !joined_names(&mine)
+            .await
+            .contains(&"ada (agent)".to_string()),
+        "a minute of silence and the agent is gone"
+    );
+    let cleared = awareness_states(&mut mine.rx);
+    assert!(
+        cleared
+            .iter()
+            .any(|(id, json)| *id == agent_id && json == "null"),
+        "and the room was told to drop the chip: {cleared:?}"
     );
 }

@@ -60,6 +60,10 @@ interface PresenceUser {
   name?: string;
   color?: string;
   colorLight?: string;
+  /** Set by the server on the slot it publishes for an agent working in this
+   *  document. A browser never sets it: a person's client publishes a name and
+   *  a color, and nothing else in the room claims to be an agent. */
+  agent?: boolean;
 }
 
 export type CollabMode = "connecting" | "collab" | "solo";
@@ -74,6 +78,10 @@ export interface CollabParticipant {
   name: string;
   color: string;
   self: boolean;
+  /** Whether this peer is an agent rather than a person. The strip draws it
+   *  with a glyph: somebody watching their own document move is owed the fact
+   *  that what moved it was an agent. */
+  agent: boolean;
 }
 
 export interface CollabSession {
@@ -197,9 +205,12 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
         room.push({
           name: user.name,
           // A participant with no color of their own still gets a chip; the
-          // room's own palette is what the color usually comes from.
+          // room's own palette is what the color usually comes from. An agent
+          // is always that case: the server publishes its name and leaves the
+          // color to the same palette everybody else is keyed by.
           color: user.color ?? presenceColor(user.name).color,
           self: clientId === doc.clientID,
+          agent: user.agent === true,
         });
       }
       setParticipants(room);

@@ -25,6 +25,7 @@ import type { Draft } from "../editor/drafts";
 import { readDraft } from "../editor/drafts";
 import { docText } from "../editor/setup";
 import { SAVE_EVENT } from "../editor/useEditorSession";
+import { LAYOUT_WIDTH_KEY } from "../layoutWidth";
 import {
   answersFor,
   domainsResponse,
@@ -196,8 +197,8 @@ function joinedSession(overrides: Partial<CollabSession> = {}) {
     epoch: "e1",
     status: "connected",
     participants: [
-      { name: "Ada Lovelace", color: "#0ea5e9", self: true },
-      { name: "Grace Hopper", color: "#f59e0b", self: false },
+      { name: "Ada Lovelace", color: "#0ea5e9", self: true, agent: false },
+      { name: "Grace Hopper", color: "#f59e0b", self: false, agent: false },
     ],
     flush,
     ...overrides,
@@ -2010,6 +2011,47 @@ describe("the engram editor in a session", () => {
     expect(chips.textContent).toContain("Grace Hopper");
     // The local author is marked rather than listed as a stranger.
     expect(chips.textContent).toContain("you");
+  });
+
+  /**
+   * An agent working in the room is a peer of the room, not an event that
+   * happens to the text: it gets a chip with its own name, a glyph that says
+   * it is an agent, and a color like anybody else's.
+   *
+   * Run at both widths, because the strip lives above the buffer rather than
+   * in the details column: a presence feature that vanished at full width
+   * would vanish for exactly the person who widened the window to work
+   * alongside somebody. Each leg proves it took by the column itself, which
+   * is the difference between the two.
+   */
+  describe.each([
+    { width: "the reading measure", fullWidth: false },
+    { width: "full width", fullWidth: true },
+  ])("with an agent in the room at $width", ({ fullWidth }) => {
+    it("names the agent as its own peer, with a robot glyph", async () => {
+      localStorage.setItem(LAYOUT_WIDTH_KEY, fullWidth ? "full" : "reading");
+      await openRoom({
+        participants: [
+          { name: "Ada Lovelace", color: "#0ea5e9", self: true, agent: false },
+          {
+            name: "ada (agent: claude-code/2.0)",
+            color: "#f59e0b",
+            self: false,
+            agent: true,
+          },
+        ],
+      });
+      if (fullWidth) {
+        expect(screen.queryByLabelText("Status")).not.toBeInTheDocument();
+      } else {
+        expect(screen.getByLabelText("Status")).toBeInTheDocument();
+      }
+      const chips = screen.getByRole("list", { name: /in this session/i });
+      expect(chips.textContent).toContain("ada (agent: claude-code/2.0)");
+      expect(chips).toHaveAccessibleName(/ada \(agent: claude-code\/2.0\)/);
+      // One glyph, on the one peer that is not a person.
+      expect(within(chips).getAllByLabelText("agent")).toHaveLength(1);
+    });
   });
 
   it("the Save button asks the session to flush and never PUTs", async () => {

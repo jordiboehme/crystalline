@@ -964,6 +964,7 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
+use crate::collab::session::AgentPeer;
 use crate::domain_view::DomainView;
 use crate::engine::{
     ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential,
@@ -1102,6 +1103,81 @@ fn without_the_join(sanitized_client: &str) -> String {
         .filter(|segment| !segment.is_empty() && !segment.eq_ignore_ascii_case(ACTOR_JOIN_WORD))
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// The longest client half a presence label carries, in characters.
+///
+/// `clientInfo.name` is client-supplied and unbounded, and this label is
+/// broadcast to every browser in the room and read back in every agent's
+/// `present`. A chip is a chip: a name past this is a client saying more about
+/// itself than a participant strip is for.
+const AGENT_LABEL_CLIENT_CHARS: usize = 60;
+
+/// The client half as a person reads it, rather than as provenance spells it.
+///
+/// [`sanitize_actor`] folds whitespace into hyphens because `generated.by` is
+/// a token; a chip in a strip is a name, so the spaces stay and only what
+/// cannot be drawn goes. `None` when nothing legible is left.
+fn display_client(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in raw.trim().chars() {
+        if out.chars().count() >= AGENT_LABEL_CLIENT_CHARS {
+            break;
+        }
+        if c.is_whitespace() {
+            gap = !out.is_empty();
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if gap {
+            out.push(' ');
+            gap = false;
+        }
+        out.push(c);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// How this call shows up in the participant strip of a room it works in.
+///
+/// **Display, and display only.** What a write RECORDS is
+/// [`acting_actor`]'s hyphenated OKF token and is untouched by this; what a
+/// person SEES beside their own name while an agent is in their document is
+/// this, and the two are built from the same two halves so they can never
+/// name different agents. The account leads because that is who the work is
+/// being done for, and the harness follows it in the parenthesis because a
+/// person watching two agents work needs to tell them apart.
+///
+/// `None` when neither half is known, which is a caller with no identity at
+/// all: there is no name to put in a strip, and inventing one would say
+/// somebody is in the room who is not.
+fn agent_peer(ctx: &RequestContext<RoleServer>, scope: &crate::scope::Scope) -> Option<AgentPeer> {
+    // The account the gate resolved, or - on a local session, where there is
+    // no gate - the identity that session acts with, which is the same name
+    // its drafts are filed under.
+    let account = mcp_account(ctx).or_else(|| crate::scope::overlay_actor(scope));
+    let client = client_actor(ctx).and_then(|client| display_client(&client));
+    let (account, label) = match (account, client) {
+        (Some(account), Some(client)) => {
+            let label = format!("{account} (agent: {client})");
+            (account, label)
+        }
+        (Some(account), None) => {
+            let label = format!("{account} (agent)");
+            (account, label)
+        }
+        // Nobody authenticated and nothing is filed under a name here, so the
+        // harness is the whole of what is known about who is in the room.
+        (None, Some(client)) => {
+            let label = format!("{client} (agent)");
+            (client, label)
+        }
+        (None, None) => return None,
+    };
+    Some(AgentPeer { account, label })
 }
 
 /// The actor a write records: the client that asked, and - when the call
@@ -1901,9 +1977,12 @@ impl McpServer {
                 .await
                 .map_err(to_error)?;
         }
+        // Reading somebody's open document is being in the room with them,
+        // for as long as the claim stands: the strip names this agent while
+        // it works, exactly as it names a person who has the page open.
         let value = self
             .engine
-            .read_engram(&p, &scope)
+            .read_engram_present(&p, &scope, agent_peer(&ctx, &scope).as_ref())
             .await
             .map_err(to_error)?;
         let links = self.attachment_links(&value, &scope).await;
@@ -1969,7 +2048,13 @@ impl McpServer {
         };
         let receipt = self
             .engine
-            .edit_engram_joined(&p, acting_actor(&ctx).as_deref(), &scope, join.as_ref())
+            .edit_engram_present(
+                &p,
+                acting_actor(&ctx).as_deref(),
+                &scope,
+                join.as_ref(),
+                agent_peer(&ctx, &scope).as_ref(),
+            )
             .await
             .map_err(to_error)?;
         // `for_edit` is `None` for `set_frontmatter` and for any operation that

@@ -50,6 +50,16 @@ pub const SAVE_MAX_LAG_MS: u64 = 15_000;
 pub const IDLE_CHECK_MS: u64 = 10_000;
 /// How often the per-session saver wakes up to ask whether anything is due.
 const SAVER_TICK_MS: u64 = 250;
+/// How long an agent stands in the participant strip after its last action.
+///
+/// An agent holds no socket, so nothing tells the room when it has finished:
+/// there is no disconnect to hear. The slot is a claim with an expiry on it
+/// instead, refreshed by every read and every write the agent makes in this
+/// document and swept by the saver's own pass once a minute of silence has
+/// gone by. Long enough that a person watching a chip does not see it blink
+/// between two calls of one piece of work, short enough that a strip is never
+/// a list of agents that left.
+pub const AGENT_PRESENCE_TTL_MS: u64 = 60_000;
 
 /// One connection's identity inside a session, minted at join.
 pub type ConnId = u64;
@@ -138,7 +148,81 @@ pub struct LiveApplied {
     /// Who is in the room the text landed in, by the name their client
     /// publishes in awareness. Sorted and de-duplicated, so one person in two
     /// windows is one name and the receipt does not reorder between calls.
+    ///
+    /// The writing agent's own slot is not in it: this answers "who is in
+    /// there with me", and another agent working in the same document is.
     pub participants: Vec<String>,
+}
+
+/// An agent in a room, as the room shows it.
+///
+/// Two halves because presence is per (account, label) rather than per
+/// connection: the account is who the agent is working for, and the label is
+/// the name a person reads in the strip. One account working through two
+/// harnesses is two peers, which is the true thing to draw - they are two
+/// agents - and the same harness calling ten times is one.
+///
+/// The label is composed where the two halves are known, in `crate::mcp`, and
+/// it is for display alone: what a write records as its provenance is the
+/// hyphenated OKF actor and is untouched by anything here.
+#[derive(Clone, Debug)]
+pub struct AgentPeer {
+    /// The account the call authenticated as, or the identity a local session
+    /// acts with. Half the presence key.
+    pub account: String,
+    /// The name the participant strip shows, "<account> (agent)" or
+    /// "<account> (agent: <client>)".
+    pub label: String,
+}
+
+/// One agent's standing claim on a slot in this room.
+struct AgentSlot {
+    /// The awareness client id it publishes under, minted from its key so the
+    /// same agent reclaims the same slot after a sweep.
+    id: ClientID,
+    /// When it last did something here; the TTL is measured from this.
+    touched: Instant,
+}
+
+/// The awareness client id one agent peer publishes under.
+///
+/// Derived from the key rather than minted from a counter, so the slot an
+/// agent reclaims after a TTL sweep is the slot it had before and a room that
+/// has seen it twice holds one chip. 53 bits because that is what a yjs client
+/// id is (`ClientID::new` asserts it), and the space is wide enough that a
+/// collision with a browser's random id is not a thing to design against -
+/// except for the one id in it that is already spoken for, the room document's
+/// own, which is stepped over rather than shared.
+fn agent_client_id(account: &str, label: &str, avoid: ClientID) -> ClientID {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    const BITS: u64 = (1 << 53) - 1;
+    let mut hash = OFFSET;
+    for byte in account
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0u8))
+        .chain(label.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    let id = ClientID::new(hash & BITS);
+    if id == avoid {
+        return ClientID::new((id.get() + 1) & BITS);
+    }
+    id
+}
+
+/// What an agent publishes about itself: the name to draw and the one flag
+/// that makes the strip draw it as an agent rather than as a person.
+///
+/// No color: the room's own palette is keyed by the name on every client
+/// already, so an agent gets a chip color the same way everybody else does and
+/// there is no second palette to keep in step. Built through `serde_json` and
+/// never by formatting, because the label carries a client-supplied half.
+fn agent_state_json(label: &str) -> String {
+    serde_json::json!({ "user": { "name": label, "agent": true } }).to_string()
 }
 
 /// Where one room is filed: the domain, the permalink it answers to, and the
@@ -452,6 +536,12 @@ impl CollabSessions {
     /// handed in rather than a patch - the engine computed the target from the
     /// live text, and the diff back to it is this function's job.
     ///
+    /// `peer` is who the agent shows up as in the room's participant strip
+    /// while the change lands, and for the minute after it
+    /// ([`AGENT_PRESENCE_TTL_MS`]). `None` for a write with nobody to name -
+    /// the CLI, the control socket - which composes exactly as it did and puts
+    /// nothing in the strip.
+    ///
     /// `agent_label` is the transaction origin. It never leaves this process -
     /// a yrs origin is local and does not travel on an update - so it is for
     /// the in-process observer (a later event handler, a log line) rather than
@@ -469,6 +559,7 @@ impl CollabSessions {
         overlay: Option<&str>,
         target: String,
         agent_label: &str,
+        peer: Option<&AgentPeer>,
     ) -> Result<LiveApplied, String> {
         let Some(session) = self.live_room(domain, permalink, overlay).await else {
             return Err(format!(
@@ -476,7 +567,26 @@ impl CollabSessions {
                  write was being prepared; read it again and repeat the edit"
             ));
         };
-        session.apply_agent_text(&target, agent_label).await
+        session.apply_agent_text(&target, agent_label, peer).await
+    }
+
+    /// Stand an agent in the room over one document, when one is open.
+    ///
+    /// The read side of the same claim [`CollabSessions::apply_text`] makes:
+    /// an agent that was answered somebody's unsaved text is reading over
+    /// their shoulder, and the strip says so for as long as the TTL stands.
+    /// Nothing at all when no room is open, which is nearly every read.
+    /// Answers the awareness id the agent stands under, which is what a
+    /// caller asking who else is in the room leaves out of the answer.
+    pub async fn touch_agent_presence(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+        peer: &AgentPeer,
+    ) -> Option<ClientID> {
+        let session = self.live_room(domain, permalink, overlay).await?;
+        Some(session.touch_agent_presence(peer).await)
     }
 
     /// Who is in the room over one document right now, or an empty list when
@@ -486,9 +596,10 @@ impl CollabSessions {
         domain: &str,
         permalink: &str,
         overlay: Option<&str>,
+        except: Option<ClientID>,
     ) -> Vec<String> {
         match self.live_room(domain, permalink, overlay).await {
-            Some(session) => session.participants().await,
+            Some(session) => session.participants(except).await,
             None => Vec::new(),
         }
     }
@@ -589,6 +700,13 @@ pub struct CollabSession {
     /// in the map - which would be a session left inside a draft it had been
     /// put out of.
     has_guests: AtomicBool,
+    /// Whether any agent stands in this room, so a tick over a room no agent
+    /// has ever worked in costs no lock at all - the same pre-filter
+    /// `has_guests` is, for the same reason.
+    ///
+    /// Written only under the state guard, and always to `!agents.is_empty()`
+    /// as that guard sees it.
+    has_agents: AtomicBool,
     /// The room is over: the registry dropped it, or a saver pass panicked.
     /// Ends the saver loop and makes every save path a no-op, so nothing can
     /// write through a session no one owns any more.
@@ -611,6 +729,14 @@ struct SessionState {
     last_saved_text: String,
     /// Awareness client ids seen per connection, nulled on its disconnect.
     conns: HashMap<ConnId, HashSet<ClientID>>,
+    /// The agents standing in this room, keyed by (account, label).
+    ///
+    /// Beside `conns` and never in it, which is the whole shape of the
+    /// feature: an agent holds no socket, so counting its slot as a connection
+    /// would keep a room open that nobody is in and hand a disconnect the job
+    /// of clearing something no disconnect is about. `remove_conn` leaves
+    /// these alone and only the TTL sweep takes one away.
+    agents: HashMap<(String, String), AgentSlot>,
     /// The connections that are in this room as somebody's guest, and the
     /// account and join holder each of them is inside on. Empty in every room
     /// over a document its participants own, which is nearly all of them.
@@ -763,6 +889,7 @@ impl CollabSession {
             engine,
             tx,
             has_guests: AtomicBool::new(false),
+            has_agents: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
             state: Mutex::new(SessionState {
                 separator: separator_of(&loaded.content),
@@ -772,6 +899,7 @@ impl CollabSession {
                 checksum: loaded.checksum,
                 last_saved_text: loaded.content,
                 conns: HashMap::new(),
+                agents: HashMap::new(),
                 guests: HashMap::new(),
                 dirty: false,
                 last_edit: None,
@@ -987,6 +1115,112 @@ impl CollabSession {
         }
     }
 
+    /// Stand an agent in this room's participant strip, or refresh the claim
+    /// it already holds.
+    ///
+    /// **What makes an agent a peer rather than an event.** A person watching
+    /// their document move under an agent's edit is owed the same thing they
+    /// are owed when a colleague types into it: a name in the strip saying who
+    /// is in here. So every action an agent takes in this document - a write
+    /// that composes into it, a read answered from it - puts the agent in the
+    /// room for the next [`AGENT_PRESENCE_TTL_MS`].
+    ///
+    /// Idempotent per (account, label): the second call finds the slot
+    /// standing, refreshes its expiry and publishes nothing, because the state
+    /// it would publish is the state the room already holds and yrs would drop
+    /// a re-publish at the same clock anyway.
+    pub async fn touch_agent_presence(&self, peer: &AgentPeer) -> ClientID {
+        let mut state = self.state.lock().await;
+        self.touch_agent_locked(&mut state, peer)
+    }
+
+    /// [`CollabSession::touch_agent_presence`] over the locked state, for the
+    /// write path, which is holding the guard across the whole of its edit.
+    /// Answers the slot's client id, which is how the caller leaves itself out
+    /// of the list of who is in the room with it.
+    fn touch_agent_locked(&self, state: &mut SessionState, peer: &AgentPeer) -> ClientID {
+        let key = (peer.account.clone(), peer.label.clone());
+        let now = Instant::now();
+        if let Some(slot) = state.agents.get_mut(&key) {
+            slot.touched = now;
+            return slot.id;
+        }
+        let id = agent_client_id(&peer.account, &peer.label, state.awareness.client_id());
+        // The clock one past whatever this id last carried, exactly as
+        // `remove_conn` does it: a slot that was swept and is being reclaimed
+        // has a clock the room remembers, and a state published under it would
+        // otherwise be dropped as old news.
+        let clock = state.awareness.meta(id).map(|meta| meta.0 + 1).unwrap_or(1);
+        let mut clients = HashMap::new();
+        clients.insert(
+            id,
+            AwarenessUpdateEntry {
+                clock,
+                json: agent_state_json(&peer.label).into(),
+            },
+        );
+        let update = AwarenessUpdate { clients };
+        if state.awareness.apply_update_summary(update.clone()).is_ok() {
+            let _ = self.tx.send(Frame {
+                from: None,
+                to: None,
+                bytes: Bytes::from(Message::Awareness(update).encode_v1()),
+            });
+            state.agents.insert(key, AgentSlot { id, touched: now });
+            self.has_agents.store(true, Ordering::Relaxed);
+        }
+        id
+    }
+
+    /// Take away the agent slots nothing has refreshed inside the TTL.
+    ///
+    /// On the saver's own pass rather than on a timer of its own: the room
+    /// already wakes up four times a second to ask whether a save is due, and
+    /// an expiry that needed a second timer would be a second thing to stop
+    /// when a room is disposed.
+    async fn sweep_agent_presence(&self, now: Instant) {
+        // Nothing to sweep is the ordinary case - most rooms never see an
+        // agent - and it costs no lock at all.
+        if !self.has_agents.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        let mut gone = Vec::new();
+        state.agents.retain(|_, slot| {
+            let expired = now.saturating_duration_since(slot.touched).as_millis() as u64
+                >= AGENT_PRESENCE_TTL_MS;
+            if expired {
+                gone.push(slot.id);
+            }
+            !expired
+        });
+        self.has_agents
+            .store(!state.agents.is_empty(), Ordering::Relaxed);
+        if gone.is_empty() {
+            return;
+        }
+        // The same removal a disconnect broadcasts: the JSON string "null" at
+        // a clock one past the last one seen, which is how the chip leaves
+        // every strip in the room.
+        let mut clients = HashMap::new();
+        for id in gone {
+            let clock = state.awareness.meta(id).map(|meta| meta.0 + 1).unwrap_or(1);
+            state.awareness.remove_state(id);
+            clients.insert(
+                id,
+                AwarenessUpdateEntry {
+                    clock,
+                    json: "null".into(),
+                },
+            );
+        }
+        let _ = self.tx.send(Frame {
+            from: None,
+            to: None,
+            bytes: Bytes::from(Message::Awareness(AwarenessUpdate { clients }).encode_v1()),
+        });
+    }
+
     /// Drop a connection: null + broadcast its awareness states. True = last one.
     pub async fn remove_conn(&self, conn: ConnId) -> bool {
         let mut state = self.state.lock().await;
@@ -1101,6 +1335,10 @@ impl CollabSession {
         // Before the save, so a session whose join ended a moment ago is put
         // outside the draft rather than watching one more save land in it.
         self.evict_ended_joins().await;
+        // And before it for the same kind of reason: an agent that has gone
+        // quiet leaves the strip on the tick it expires on, rather than one
+        // save later.
+        self.sweep_agent_presence(now).await;
         let renamed = self.due_save(now).await;
         // The session guard is dropped by now: the rename move takes the
         // registry lock, and the lock order is registry -> session.
@@ -1784,7 +2022,12 @@ impl CollabSession {
     ///
     /// The lock is held across the whole of it, as every other write on this
     /// room is, so an agent's edit and a save cannot interleave.
-    async fn apply_agent_text(&self, target: &str, origin: &str) -> Result<LiveApplied, String> {
+    async fn apply_agent_text(
+        &self,
+        target: &str,
+        origin: &str,
+        peer: Option<&AgentPeer>,
+    ) -> Result<LiveApplied, String> {
         if self.is_disposed() {
             return Err("this co-editing session ended while the write was being prepared".into());
         }
@@ -1809,14 +2052,21 @@ impl CollabSession {
         state.dirty = true;
         state.last_edit = Some(now);
         state.oldest_unsaved.get_or_insert(now);
+        // The agent joins the strip under the same guard its text landed
+        // under, so a person sees the chip and the change together.
+        let mine = peer.map(|peer| self.touch_agent_locked(&mut state, peer));
         Ok(LiveApplied {
-            participants: Self::participants_locked(&state),
+            // Everybody in the room EXCEPT this agent. `present` is what the
+            // agent is told about who is in there with it, and its own slot -
+            // minted a line ago, or standing from a call a moment ago - is not
+            // news to the one that put it there. Another agent's is.
+            participants: Self::participants_locked(&state, mine),
         })
     }
 
     /// Who is in this room, by the name their client publishes in awareness.
-    pub async fn participants(&self) -> Vec<String> {
-        Self::participants_locked(&*self.state.lock().await)
+    pub async fn participants(&self, except: Option<ClientID>) -> Vec<String> {
+        Self::participants_locked(&*self.state.lock().await, except)
     }
 
     /// [`CollabSession::participants`] over the locked state.
@@ -1830,10 +2080,15 @@ impl CollabSession {
     ///
     /// Sorted and de-duplicated, so one person in two windows is one name and
     /// two calls a second apart do not reorder the same room.
-    fn participants_locked(state: &SessionState) -> Vec<String> {
+    ///
+    /// `except` is the one slot the caller is not asking about: an agent
+    /// asking who is in the room with it leaves itself out, however many times
+    /// it has been in here already.
+    fn participants_locked(state: &SessionState, except: Option<ClientID>) -> Vec<String> {
         let mut names: Vec<String> = state
             .awareness
             .iter()
+            .filter(|(id, _)| Some(*id) != except)
             .filter_map(|(_, client)| client.data)
             .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
             .filter_map(|value| {
