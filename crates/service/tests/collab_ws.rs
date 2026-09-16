@@ -1623,3 +1623,93 @@ async fn a_joined_agent_edit_composes_into_the_owners_open_document() {
         "her draft row carries it: {hers_now:?}"
     );
 }
+
+/// A REST read of an engram somebody has open answers the STORED version, so
+/// the validator it carries is still a token a write can be made with.
+///
+/// The one place the live seam must not reach. On this surface a checksum is a
+/// version token: it comes back as an `ETag`, the browser sends it as
+/// `If-Match`, and the durable write it guards compares against the row. A
+/// checksum of somebody's unsaved document would be a token no save could ever
+/// match, so a person who read a page while a colleague had it open would be
+/// told their edit was stale, hand back the same token, and be told so again
+/// until the colleague's session happened to save. The live view of a document
+/// on this surface is the co-editing socket, which is the thing this test has
+/// open the whole time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rest_read_of_an_open_engram_answers_a_version_a_write_can_still_use() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    assert_eq!(path, "fresh.md");
+
+    let mut hers = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh",
+        Some(&alice.0),
+        same_host(fx.addr),
+    )
+    .await
+    .expect("her own draft is hers to co-edit");
+    decode_hello(&next_binary(&mut hers).await);
+    let doc = client_doc();
+    hers.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut hers).await;
+    apply(&doc, &step2);
+    let update = append_line(&doc, "typed and not yet saved");
+    hers.send(binary(update_frame(&update))).await.unwrap();
+
+    let read = fx
+        .request(
+            &alice,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+    let etag = read
+        .headers()
+        .get(reqwest::header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: serde_json::Value = read.json().await.unwrap();
+    assert!(
+        !body["content"]
+            .as_str()
+            .unwrap()
+            .contains("typed and not yet saved"),
+        "the REST read is the stored version: {body}"
+    );
+    assert!(
+        body.get("live").is_none(),
+        "and says nothing about a live document, which is this surface's socket: {body}"
+    );
+
+    // And the validator it handed over is one a write can be made with.
+    let saved = fx
+        .request(
+            &alice,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/engrams/fresh",
+        )
+        .header("if-match", etag)
+        .json(&serde_json::json!({
+            "content": body["content"].as_str().unwrap().replace(
+                "A page only alice has.",
+                "A page only alice has, saved from the API.",
+            ),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        saved.status(),
+        200,
+        "the version the read handed over still saves: {:?}",
+        saved.text().await
+    );
+}

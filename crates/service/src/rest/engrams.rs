@@ -325,13 +325,15 @@ pub async fn detail(
 ) -> Result<Response, ApiError> {
     let value = state
         .engine
-        .read_engram(
+        .read_engram_stored(
             &ReadParams {
                 identifier: permalink,
                 domain: Some(domain),
                 // The draft-link routes are this surface's way into a granted
                 // draft: they redeem and join through the session cookie, so a
-                // share-link never rides a REST read.
+                // share-link never rides a REST read. The stored read for the
+                // same reason its checksum is an ETag: see
+                // `Engine::read_engram_stored`.
                 share_link: None,
             },
             &identity.scope(),
@@ -500,7 +502,9 @@ pub async fn inbound(
                 domain: Some(domain),
                 // The draft-link routes are this surface's way into a granted
                 // draft: they redeem and join through the session cookie, so a
-                // share-link never rides a REST read.
+                // share-link never rides a REST read. The stored read for the
+                // same reason its checksum is an ETag: see
+                // `Engine::read_engram_stored`.
                 share_link: None,
             },
             query.q.as_deref(),
@@ -1068,13 +1072,16 @@ pub async fn save(
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state
                 .engine
-                .read_engram(
+                .read_engram_stored(
                     &ReadParams {
                         identifier: permalink,
                         domain: Some(domain),
-                        // The draft-link routes are this surface's way into a granted
-                        // draft: they redeem and join through the session cookie, so a
-                        // share-link never rides a REST read.
+                        // The draft-link routes are this surface's way into a
+                        // granted draft: they redeem and join through the
+                        // session cookie, so a share-link never rides a REST
+                        // read. The stored read for the same reason its
+                        // checksum is an ETag: see
+                        // `Engine::read_engram_stored`.
                         share_link: None,
                     },
                     &scope,
@@ -1671,13 +1678,16 @@ pub async fn remove(
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state
                 .engine
-                .read_engram(
+                .read_engram_stored(
                     &ReadParams {
                         identifier: permalink,
                         domain: Some(domain),
-                        // The draft-link routes are this surface's way into a granted
-                        // draft: they redeem and join through the session cookie, so a
-                        // share-link never rides a REST read.
+                        // The draft-link routes are this surface's way into a
+                        // granted draft: they redeem and join through the
+                        // session cookie, so a share-link never rides a REST
+                        // read. The stored read for the same reason its
+                        // checksum is an ETag: see
+                        // `Engine::read_engram_stored`.
                         share_link: None,
                     },
                     &identity.scope(),
@@ -1720,13 +1730,15 @@ async fn detail_response(
 ) -> Result<Response, ApiError> {
     let mut value = state
         .engine
-        .read_engram(
+        .read_engram_stored(
             &ReadParams {
                 identifier: permalink.to_string(),
                 domain: Some(domain.to_string()),
                 // The draft-link routes are this surface's way into a granted
                 // draft: they redeem and join through the session cookie, so a
-                // share-link never rides a REST read.
+                // share-link never rides a REST read. The stored read for the
+                // same reason its checksum is an ETag: see
+                // `Engine::read_engram_stored`.
                 share_link: None,
             },
             scope,

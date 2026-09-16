@@ -6580,6 +6580,40 @@ impl Engine {
     }
 
     pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
+        self.read_engram_in(p, scope, true).await
+    }
+
+    /// [`Engine::read_engram`] with the live document deliberately ignored:
+    /// the stored version, and its checksum.
+    ///
+    /// **For the surface where a checksum is a VERSION TOKEN rather than a
+    /// description.** The JSON API hands its checksum over as an `ETag`, the
+    /// browser sends it back as `If-Match`, and the durable write it guards
+    /// compares against the row or the file. A checksum of somebody's unsaved
+    /// document would be a token no save could ever match, so a reader who
+    /// opened a page while a colleague had it open would be told their edit was
+    /// stale, handed the same token again, and told so again - until the
+    /// colleague's session happened to save. That surface has its own live view
+    /// of a document, and it is the co-editing socket.
+    ///
+    /// An agent's read is the other case and takes the live text: it has no
+    /// socket, its `expected_checksum` is compared by the verb that composes
+    /// into the document, and being answered the bytes the engram actually says
+    /// right now is the whole of Task 14.
+    pub(crate) async fn read_engram_stored(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.read_engram_in(p, scope, false).await
+    }
+
+    async fn read_engram_in(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+        live_wins: bool,
+    ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
         // The one path a read crosses between two overlays on: a draft this
         // caller was handed a link to. Asked first, so the grant stands over
@@ -6612,7 +6646,7 @@ impl Engine {
         // guarded with it is guarded against the document rather than against
         // the file - which is what makes read-then-edit work at all while
         // somebody is in there.
-        let live = match self.collab_rooms() {
+        let live = match self.collab_rooms().filter(|_| live_wins) {
             Some(rooms) => {
                 rooms
                     .live_text(&desc.domain, &desc.permalink, view.actor())
