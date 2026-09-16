@@ -390,6 +390,37 @@ fn stale_edit_message(expected: &str, found: &str) -> String {
     )
 }
 
+/// The gate a whole-document write goes through before anything is written: a
+/// document that is not an engram would poison the index on reindex.
+///
+/// This is the one hard gate, and it is deliberately narrow: the text must
+/// parse (clean UTF-8, frontmatter that is a YAML mapping) and must carry
+/// frontmatter that actually says something, because a save that drops it
+/// silently strips the engram's type, title, permalink, tags and status at
+/// once, leaving the index to fall back to the path slug. An empty block is
+/// that same strip wearing delimiters, so it is refused the same way.
+/// Everything a document can get wrong while still being an engram - a missing
+/// tag, a permalink that is not a slug, an inverted validity window - is the
+/// validation endpoint's business to report, not this path's to refuse: an
+/// engram that already carries such a flaw must stay editable, since fixing it
+/// here is what the editor is for.
+///
+/// One function for the save and the restore, which have always refused the
+/// same shapes in the same words; a co-editing room's saver reaches it through
+/// the save it calls.
+fn refuse_not_an_engram(content: &str) -> Result<()> {
+    let parsed = parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+    if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
+        return Err(EngineError::Invalid(
+            "the document carries no frontmatter, so it is not an engram; \
+             keep the --- delimited frontmatter block, and the type, title, \
+             permalink and tags in it, at the top of the file"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Renders one side of a conflict for [`Engine::origin_conflict_detail`]: an
 /// absent side is `null`, a UTF-8 one is a JSON string, and a side that
 /// exists but is not UTF-8 is `null` with `note` set to say which side was
@@ -3972,29 +4003,7 @@ impl Engine {
         // or a domain that has stopped reviewing changes, is not a join into
         // this write at all and must not gate it.
         let join = join.filter(|_| view.joined().is_some());
-        // A document that is not an engram would poison the index on reindex,
-        // so it is refused before anything is written. This is the one hard
-        // gate, and it is deliberately narrow: the text must parse (clean
-        // UTF-8, frontmatter that is a YAML mapping) and must carry frontmatter
-        // that actually says something, because a save that drops it silently
-        // strips the engram's type, title, permalink, tags and status at once,
-        // leaving the index to fall back to the path slug. An empty block is
-        // that same strip wearing delimiters, so it is refused the same way.
-        // Everything a document can get wrong while still being an engram - a
-        // missing tag, a permalink that is not a slug, an inverted validity
-        // window - is the validation endpoint's business to report, not this
-        // path's to refuse: an engram that already carries such a flaw must
-        // stay editable, since fixing it here is what the editor is for.
-        let parsed =
-            parse_engram_lossless(&p.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
-        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
-            return Err(EngineError::Invalid(
-                "the document carries no frontmatter, so it is not an engram; \
-                 keep the --- delimited frontmatter block, and the type, title, \
-                 permalink and tags in it, at the top of the file"
-                    .into(),
-            ));
-        }
+        refuse_not_an_engram(&p.content)?;
         let (desc, source) = match view.resolve(&p.identifier).await {
             Ok(resolved) => resolved,
             // A name this caller's own view cannot resolve, when they are
@@ -4035,64 +4044,9 @@ impl Engine {
         self.screen_granted_path(&desc.domain, &desc.path, scope, join)
             .await?;
 
-        // The third place a save can land. The whole document goes into this
-        // actor's draft verbatim, checked against the version they read - which
-        // in review mode is their own draft where they hold one, so a second
-        // save does not conflict against the first.
-        if let Some(who) = overlay {
-            // Written directly rather than through `apply_source_edit`, and
-            // that is the save's own contract rather than an omission: the
-            // shared edit path stamps `generated`, and a save of what was read
-            // has to land byte-identical. The compare and the write are held
-            // apart from a concurrent save of the same draft by the same lock
-            // the edit path takes, keyed on the draft's own mirror path.
-            let state_dir = self.journal_state_dir()?;
-            let mirror = state_dir
-                .join("overlays")
-                .join(&desc.domain)
-                .join(who)
-                .join(&desc.path);
-            let lock = self.write_lock(&mirror);
-            let _guard = lock.lock().await;
-            let current = view.text_at(&source, &desc).await?.ok_or_else(|| {
-                EngineError::NotFound(format!(
-                    "no engram '{}' in domain '{}'",
-                    p.identifier, desc.domain
-                ))
-            })?;
-            let found = sha256_hex(current.as_bytes());
-            if found != p.expected_checksum {
-                return Err(EngineError::Conflict(stale_edit_message(
-                    &p.expected_checksum,
-                    &found,
-                )));
-            }
-            let warning = view.write(desc.domain_id, &desc.path, &p.content).await?;
-            // Where the draft now answers, derived exactly as the row's own
-            // permalink is: an author who edited the frontmatter's permalink
-            // line has just moved the address, and the receipt has to say so.
-            let permalink = parse_engram(&p.content)
-                .map(|engram| {
-                    EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&p.content))
-                        .permalink
-                })
-                .unwrap_or_else(|_| desc.permalink.clone());
-            let mut receipt = json!({
-                "domain": desc.domain,
-                "permalink": permalink,
-                "path": desc.path,
-                "checksum": sha256_hex(p.content.as_bytes()),
-                "draft": true,
-            });
-            // Whose draft it landed in, when that is not the caller's own. The
-            // one thing a joined save has to say that an ordinary one does
-            // not: somebody typing inside a colleague's draft is owed a
-            // receipt that names whose work they just changed.
-            if let Some(owner) = view.joined() {
-                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
-            }
-            note_unmirrored(&mut receipt, warning);
-            return Ok(receipt);
+        // The third place a save can land: this actor's own draft.
+        if overlay.is_some() {
+            return self.save_into_overlay(&view, p, &desc, &source).await;
         }
 
         match &source {
@@ -4192,6 +4146,84 @@ impl Engine {
         }))
     }
 
+    /// The overlay arm of a save: the whole document into the view's own
+    /// actor's draft of `desc.path`, verbatim, checked against the version the
+    /// caller read - which in review mode is their own draft where they hold
+    /// one, so a second save does not conflict against the first.
+    ///
+    /// One function rather than one per surface, because the CAS under the
+    /// mirror lock, the permalink re-derivation and the receipt are one
+    /// agreement about what landing in a draft means. Its callers are the
+    /// request-driven save above and the co-editing room's saver, which reaches
+    /// it with a view it built itself over the owner of the document the room
+    /// is a room over.
+    ///
+    /// Everything a caller must decide BEFORE this is deliberately not here:
+    /// whose view it is, whether the document parses, whether the path is
+    /// writable, and - for a request - whether a grant or a join routes it.
+    /// This function writes.
+    async fn save_into_overlay(
+        &self,
+        view: &DomainView<'_>,
+        p: &SaveParams,
+        desc: &EngramDescriptor,
+        source: &ContentSource,
+    ) -> Result<Value> {
+        let who = view.writing_actor()?;
+        // Written directly rather than through `apply_source_edit`, and
+        // that is the save's own contract rather than an omission: the
+        // shared edit path stamps `generated`, and a save of what was read
+        // has to land byte-identical. The compare and the write are held
+        // apart from a concurrent save of the same draft by the same lock
+        // the edit path takes, keyed on the draft's own mirror path.
+        let state_dir = self.journal_state_dir()?;
+        let mirror = state_dir
+            .join("overlays")
+            .join(&desc.domain)
+            .join(who)
+            .join(&desc.path);
+        let lock = self.write_lock(&mirror);
+        let _guard = lock.lock().await;
+        let current = view.text_at(source, desc).await?.ok_or_else(|| {
+            EngineError::NotFound(format!(
+                "no engram '{}' in domain '{}'",
+                p.identifier, desc.domain
+            ))
+        })?;
+        let found = sha256_hex(current.as_bytes());
+        if found != p.expected_checksum {
+            return Err(EngineError::Conflict(stale_edit_message(
+                &p.expected_checksum,
+                &found,
+            )));
+        }
+        let warning = view.write(desc.domain_id, &desc.path, &p.content).await?;
+        // Where the draft now answers, derived exactly as the row's own
+        // permalink is: an author who edited the frontmatter's permalink
+        // line has just moved the address, and the receipt has to say so.
+        let permalink = parse_engram(&p.content)
+            .map(|engram| {
+                EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&p.content)).permalink
+            })
+            .unwrap_or_else(|_| desc.permalink.clone());
+        let mut receipt = json!({
+            "domain": desc.domain,
+            "permalink": permalink,
+            "path": desc.path,
+            "checksum": sha256_hex(p.content.as_bytes()),
+            "draft": true,
+        });
+        // Whose draft it landed in, when that is not the caller's own. The
+        // one thing a joined save has to say that an ordinary one does
+        // not: somebody typing inside a colleague's draft is owed a
+        // receipt that names whose work they just changed.
+        if let Some(owner) = view.joined() {
+            receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+        }
+        note_unmirrored(&mut receipt, warning);
+        Ok(receipt)
+    }
+
     /// Write an engram file back into existence with this exact content, then
     /// reindex it: the resolution path for "externally deleted while a collab
     /// session held unsaved work". [`Engine::save_engram`] refuses a missing
@@ -4217,16 +4249,7 @@ impl Engine {
         }
         let view = DomainView::for_write(self, domain, scope).await?;
         let overlay = view.actor();
-        let parsed =
-            parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
-        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
-            return Err(EngineError::Invalid(
-                "the document carries no frontmatter, so it is not an engram; \
-                 keep the --- delimited frontmatter block, and the type, title, \
-                 permalink and tags in it, at the top of the file"
-                    .into(),
-            ));
-        }
+        refuse_not_an_engram(content)?;
         // Normalized and screened before the two reserved checks read it, the
         // same order the create and move paths use. A stored path is already in
         // this shape, so nothing a caller sends today changes.

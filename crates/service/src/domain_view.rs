@@ -202,7 +202,7 @@ impl<'a> DomainView<'a> {
     /// The actor key a write acts under, refusing the base view the way
     /// [`DomainView::for_write`] already refused it - unreachable, because a
     /// write view with no actor never reaches an overlay arm.
-    fn writing_actor(&self) -> Result<&str> {
+    pub(crate) fn writing_actor(&self) -> Result<&str> {
         self.actor
             .as_deref()
             .ok_or_else(|| EngineError::Refused(OVERLAY_NEEDS_IDENTITY.to_string()))
