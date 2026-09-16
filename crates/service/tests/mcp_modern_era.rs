@@ -3840,6 +3840,9 @@ struct ReviewInstance {
     token: String,
     /// Bob's MCP token, which is what his agent authenticates with.
     bearer: String,
+    /// Vera's, whose instance role is viewer: she may read what is shared with
+    /// her and write nothing.
+    viewer_bearer: String,
     path: String,
     _scratch: support::ScratchStateDir,
     _tmp: tempfile::TempDir,
@@ -3896,7 +3899,17 @@ async fn serve_review_instance() -> ReviewInstance {
         .await
         .unwrap();
     }
+    auth.add_user(
+        "vera",
+        "vera",
+        None,
+        crystalline_service::rest::Role::Viewer,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
     let bearer = auth.issue_mcp_token("bob", "agent").await.unwrap().token;
+    let viewer_bearer = auth.issue_mcp_token("vera", "agent").await.unwrap().token;
 
     // Alice's draft of a page nobody else has, and her link on it.
     let receipt = engine
@@ -3951,6 +3964,7 @@ async fn serve_review_instance() -> ReviewInstance {
         engine,
         token,
         bearer,
+        viewer_bearer,
         path,
         _scratch: scratch,
         _tmp: tmp,
@@ -4120,5 +4134,43 @@ async fn a_stateless_peers_draft_join_outlives_its_request_and_expires_idle() {
     assert!(
         said(&after).contains("Join the draft"),
         "an expired join is no join, and the refusal teaches the way back in: {after}"
+    );
+}
+
+/// A grantee who may only READ the draft is answered the draft, not the
+/// refusal about editing it.
+///
+/// Redeeming a link and joining the draft it opens are two steps, and this
+/// verb takes both. The second can be refused on its own - a viewer may read
+/// somebody's wording and write nothing, which is exactly what a viewer is for
+/// - and failing the read over it would answer a question nobody asked. The
+/// link is bound either way, so the read answers her the draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_grantee_presenting_a_link_is_answered_the_draft() {
+    let fx = serve_review_instance().await;
+    let read = call_as(
+        fx.addr,
+        1,
+        "read_engram",
+        json!({
+            "identifier": "fresh",
+            "domain": "team",
+            "share_link": fx.token,
+        }),
+        &fx.viewer_bearer,
+    )
+    .await;
+    assert!(
+        said(&read).contains("A page only alice has"),
+        "the link opens her draft for reading: {read}"
+    );
+    assert!(
+        !fx.engine.joins().holds(
+            &crystalline_service::Holder::Token("vera".to_string()),
+            "team",
+            "alice",
+            &fx.path
+        ),
+        "and she is inside nothing: editing is a second state she has no right to"
     );
 }

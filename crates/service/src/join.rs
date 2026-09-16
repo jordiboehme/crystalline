@@ -43,6 +43,15 @@
 //! is about how much of this process one person may take, and opening a second
 //! window is not a reason to be allowed twice as much.
 //!
+//! **A read that presents a link opens the draft too**, which the separation
+//! above does not obviously allow. It is deliberate and it is the agent's case
+//! rather than the person's: a browser has two buttons and a person presses
+//! them a minute apart, while an agent that was handed a link and passed it to
+//! a verb has decided both at once and has no second surface to decide the
+//! rest on. The grant is still what a read crosses on, and the join is still
+//! what routes a write - a caller who may only READ the draft redeems the link
+//! and reads it, and is refused the join in the words that say why.
+//!
 //! Nothing here is persisted. A join is the shortest-lived thing in the
 //! system - it lasts as long as one holder, and a daemon restart ends every
 //! holder there is - so a table of joins would only ever be a table of joins

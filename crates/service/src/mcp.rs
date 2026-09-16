@@ -1778,10 +1778,20 @@ impl McpServer {
         // needs no join - a grant is what a read crosses on - but an agent
         // that was handed a link and is reading with it has decided both, the
         // same way a person pressing the button in a browser has.
-        if let Some(token) = p.share_link.as_deref() {
-            self.enter_draft(&scope, &ctx, token)
-                .await
-                .map_err(to_error)?;
+        //
+        // **A refusal to JOIN therefore does not fail the READ.** A grantee
+        // who may read the draft and not edit it, and one already working in
+        // as many drafts as this instance keeps open for one account, have
+        // each redeemed the link and asked for exactly what their grant is
+        // for; failing the read would answer a question nobody asked. A link
+        // that opens NOTHING is the other case and is raised: that caller is
+        // reading a page they were told they had been given, and the sentence
+        // saying the link is dead is the only useful answer there is.
+        if let Some(token) = p.share_link.as_deref()
+            && let Err(err) = self.enter_draft(&scope, &ctx, token).await
+            && !matches!(err, crate::engine::EngineError::Refused(_))
+        {
+            return Err(to_error(err));
         }
         let value = self
             .engine
