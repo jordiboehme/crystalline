@@ -5639,9 +5639,13 @@ fn another_actors_draft_is_read_only_by_the_grant_surface() {
         ("draft_links.rs", "open_link"),
         // The read a grant widens, at the one path the grant names.
         ("engine.rs", "granted_read"),
-        // The teaching refusal for a write that named a granted draft the
-        // caller's own view cannot resolve.
-        ("engine.rs", "teach_granted_miss"),
+        // Which granted draft a name opens, for the two surfaces that have a
+        // name rather than a path: the teaching refusal for a write that named
+        // a draft the caller's own view cannot resolve, and the collab upgrade
+        // deciding whose document a room is over. Both take the owner from a
+        // grant row this instance minted, never from the request - the caller
+        // may SAY whose draft they mean, and this is what checks it.
+        ("engine.rs", "granted_draft_named"),
         // The freshness check in front of that refusal: a link whose draft has
         // gone refuses nothing.
         ("engine.rs", "screen_granted_path"),

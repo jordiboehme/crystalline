@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 
 use super::control::{self, Control};
 use super::session::{CollabSession, CollabSessions, ConnId, Frame, JoinError, Joined};
-use crate::rest::{ApiError, ApiPath, Identity, ProblemDetail, RestState};
+use crate::rest::{ApiError, ApiPath, ApiQuery, Identity, ProblemDetail, RestState};
 
 /// One session frame can legitimately carry a whole document (SyncStep2), so
 /// the ceiling tracks the REST body limit plus protocol overhead - far below
@@ -30,6 +30,16 @@ const PING_INTERVAL_SECS: u64 = 30;
 /// `Closed` control that precedes it carries the reason.
 pub const CLOSE_DELETED: u16 = 4404;
 
+/// Whose draft to open, when it is not the caller's own.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct JoinQuery {
+    /// The actor whose draft of this page to open a session over. Absent is
+    /// the caller's own document, which is what the editor asks for unless a
+    /// share-link brought somebody here.
+    pub overlay: Option<String>,
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/collab/{domain}/{permalink}",
@@ -41,10 +51,18 @@ pub const CLOSE_DELETED: u16 = 4404;
                    cookie and a same-host Origin header are all required and \
                    checked before the upgrade; a read-only instance refuses \
                    like every write. CSRF headers do not apply to the upgrade \
-                   GET. Refusals are problem+json.",
+                   GET. Refusals are problem+json.\n\nA room is one document. \
+                   In a domain that reviews changes that means one person's \
+                   draft of the page: your own by default, and somebody \
+                   else's when `overlay` names them - which needs both a live \
+                   share-link of theirs and a live join this session opened \
+                   on it, because seeing a draft and editing it are two \
+                   steps. What is typed in such a room lands in that person's \
+                   draft, to be folded or discarded with it.",
     params(
         ("domain" = String, Path, description = "The domain."),
         ("permalink" = String, Path, description = "The engram's permalink; may contain slashes."),
+        JoinQuery,
     ),
     responses(
         (status = 101, description = "Switching protocols: the session is joined."),
@@ -59,6 +77,7 @@ pub async fn join(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
+    ApiQuery(query): ApiQuery<JoinQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
@@ -80,11 +99,37 @@ pub async fn join(
     // never the socket's life - and `CollabSessions::join` holding the
     // registry lock across its open is the other half of the argument (see
     // `CollabSessions::dispose_domain`).
+    // Whose document this room is a room over, decided before the upgrade for
+    // the reason every other refusal here is: a socket that opened and then
+    // told its holder they may not be in it would be a refusal nobody can
+    // read.
+    let room = whose_document(
+        &state,
+        &identity,
+        &domain,
+        &permalink,
+        query.overlay.as_deref(),
+    )
+    .await?;
     let joined = {
         let _pass = state.join_pass().await;
-        state.collab.join(&domain, &permalink, None).await
+        state
+            .collab
+            .join(&domain, &permalink, room.overlay.as_deref())
+            .await
     }
     .map_err(join_error)?;
+    // A connection that is in somebody else's document is watched: the join
+    // that put it there can end while it sits there - the author takes the
+    // link back, the draft is folded or discarded or renamed, the person
+    // presses Leave in another window - and the saver closes it on its next
+    // tick. Recorded after the join rather than inside it, so the registry
+    // keeps the one signature the whole surface calls; the cost is that a tick
+    // landing in this instant looks past one connection, and it looks again a
+    // quarter of a second later.
+    if let Some(account) = &room.guest {
+        joined.session.watch_guest(joined.conn, account).await;
+    }
     let sessions = state.collab.clone();
     // The failure twin of on_upgrade: the connection is REGISTERED in the
     // session already, so a handshake that dies after this handler returns
@@ -105,6 +150,82 @@ pub async fn join(
         .max_frame_size(WS_MAX_MESSAGE_BYTES)
         .on_failed_upgrade(failed)
         .on_upgrade(move |socket| run(socket, sessions, joined)))
+}
+
+/// Which document the upgrade is for, and whether the caller is a guest in it.
+struct Room {
+    /// Whose document: `None` for the one a direct domain keeps, `Some(actor)`
+    /// for that actor's draft of the page.
+    overlay: Option<String>,
+    /// The caller's account, when the document is not their own. `None` in
+    /// their own document and in a direct domain's, which is nearly always.
+    guest: Option<String>,
+}
+
+/// Which document this caller may open a room over, here.
+///
+/// **Visibility and editing are two states, and this is where the second one
+/// is checked for a socket.** A domain that takes changes directly has one
+/// document and everybody is in it. A domain that reviews changes has one per
+/// author: your own needs nothing at all, and somebody else's needs a live
+/// share-link of theirs naming this account AND a live join this session
+/// opened on it - the `/draft/<token>` screen is where both are done, and the
+/// bar at the top of the editor is what says you are inside. A link with no
+/// join is answered with the same teaching sentence a write at that path gets,
+/// so a person meets one rule wherever they meet it.
+///
+/// A name nobody handed this caller is answered exactly as a page nobody wrote
+/// is: whether somebody else is drafting there is not this caller's to learn.
+async fn whose_document(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+    permalink: &str,
+    wanted: Option<&str>,
+) -> Result<Room, ApiError> {
+    if !state.engine.reviews_changes(domain) {
+        if wanted.is_some() {
+            return Err(ApiError::not_found(format!(
+                "'{domain}' takes changes directly, so there are no drafts in it to open a                  session over; the page itself is at this address with no owner named"
+            )));
+        }
+        return Ok(Room {
+            overlay: None,
+            guest: None,
+        });
+    }
+    let scope = identity.scope();
+    // Unreachable through this route today - `require_domain_write` above
+    // refuses every caller with no account of their own - and stated rather
+    // than assumed, because the alternative is a room whose saves land under
+    // somebody's name by default.
+    let mine = crate::scope::overlay_actor(&scope)
+        .ok_or_else(|| ApiError::forbidden(crate::engine::OVERLAY_NEEDS_IDENTITY))?;
+    let Some(owner) = wanted.filter(|owner| *owner != mine) else {
+        return Ok(Room {
+            overlay: Some(mine),
+            guest: None,
+        });
+    };
+    let Some((owner, path)) = state
+        .engine
+        .granted_draft_named(domain, permalink, Some(owner), &scope)
+        .await?
+    else {
+        return Err(ApiError::not_found(format!(
+            "no engram '{permalink}' in domain '{domain}'"
+        )));
+    };
+    if !state.engine.joins().holds(&mine, domain, &owner, &path) {
+        return Err(
+            crate::engine::EngineError::Refused(crate::engine::granted_needs_join(&owner, &path))
+                .into(),
+        );
+    }
+    Ok(Room {
+        overlay: Some(owner),
+        guest: Some(mine),
+    })
 }
 
 /// The Origin header is REQUIRED and its authority must equal the request's
@@ -225,9 +346,17 @@ async fn run(socket: WebSocket, sessions: Arc<CollabSessions>, joined: Joined) {
                 Some(Ok(_)) => {} // Ping/Pong are answered by axum; Text is not ours
             },
             frame = rx.recv() => match frame {
-                Ok(Frame { from, bytes }) => {
+                Ok(Frame { from, to, bytes }) => {
                     if from == Some(conn) {
                         continue; // never echo a sender's own update back
+                    }
+                    // Addressed to one connection: the eviction of a session
+                    // whose join has ended. Skipped BEFORE the closing check
+                    // below, or one guest being put outside the draft would
+                    // tear down every socket in the room, the owner's
+                    // included.
+                    if to.is_some_and(|only| only != conn) {
+                        continue;
                     }
                     let closing = is_session_closed(&bytes);
                     if sink.send(WsMessage::Binary(bytes)).await.is_err() {

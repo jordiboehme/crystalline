@@ -186,6 +186,8 @@ export interface paths {
         /**
          * Upgrade to a real-time co-editing session on one engram.
          * @description WebSocket upgrade for the y-sync + awareness protocol over the engram's shared text. Editor role, a live session cookie and a same-host Origin header are all required and checked before the upgrade; a read-only instance refuses like every write. CSRF headers do not apply to the upgrade GET. Refusals are problem+json.
+         *
+         *     A room is one document. In a domain that reviews changes that means one person's draft of the page: your own by default, and somebody else's when `overlay` names them - which needs both a live share-link of theirs and a live join this session opened on it, because seeing a draft and editing it are two steps. What is typed in such a room lands in that person's draft, to be folded or discarded with it.
          */
         get: operations["collab_join"];
         put?: never;
@@ -3649,7 +3651,14 @@ export interface operations {
     };
     collab_join: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description The actor whose draft of this page to open a session over. Absent is
+                 *     the caller's own document, which is what the editor asks for unless a
+                 *     share-link brought somebody here.
+                 */
+                overlay?: string;
+            };
             header?: never;
             path: {
                 /** @description The domain. */

@@ -163,6 +163,30 @@ impl Joins {
             .cloned()
     }
 
+    /// Whether `account` is inside exactly this draft right now.
+    ///
+    /// The question a surface asks when it has no key to present: a browser
+    /// cannot put a header on a WebSocket upgrade, and a key in a URL would be
+    /// written to every log and proxy between here and the page. So the collab
+    /// upgrade asks whether this account holds a join into the draft it is
+    /// being asked to open, rather than asking it to prove one.
+    ///
+    /// That is the same question a key answers, because [`Joins::open`] dedups
+    /// on exactly this triple: one account is inside one draft once, whatever
+    /// key it holds. What it does not distinguish is two windows of one
+    /// account - the gap the join registry already documents (see the module
+    /// doc's note on the REST seam having only the account before it mints) -
+    /// so a person who joined a draft in one window opens a room over it in
+    /// another. Ending the join ends both, which is the property that matters.
+    pub fn holds(&self, account: &str, domain: &str, owner: &str, path: &str) -> bool {
+        self.lock().values().any(|join| {
+            join.account == account
+                && join.domain == domain
+                && join.owner == owner
+                && join.path == path
+        })
+    }
+
     /// End one join. `false` when the key names none of `account`'s, which is
     /// what an already-closed join and somebody else's key both answer.
     pub fn close(&self, key: &str, account: &str) -> bool {
@@ -330,6 +354,31 @@ mod tests {
         assert!(
             joins.open(join("carol")).is_ok(),
             "while everybody else is unaffected, which is the point of the share"
+        );
+    }
+
+    /// The question the collab upgrade asks: is this account inside this
+    /// draft? Same triple as the dedup and the same triple as the ending, so
+    /// the three cannot mean different things by "one draft".
+    #[test]
+    fn holding_a_join_is_asked_by_the_draft_rather_than_by_the_key() {
+        let joins = Joins::default();
+        let key = joins.open(join("bob")).unwrap();
+        assert!(joins.holds("bob", "team", "alice", "plan.md"));
+        assert!(
+            !joins.holds("carol", "team", "alice", "plan.md"),
+            "somebody else is not inside it"
+        );
+        assert!(
+            !joins.holds("bob", "team", "carol", "plan.md"),
+            "and a draft at the same path by another author is another draft"
+        );
+        assert!(!joins.holds("bob", "other", "alice", "plan.md"));
+        assert!(!joins.holds("bob", "team", "alice", "charter.md"));
+        joins.close(&key, "bob");
+        assert!(
+            !joins.holds("bob", "team", "alice", "plan.md"),
+            "and leaving ends it"
         );
     }
 

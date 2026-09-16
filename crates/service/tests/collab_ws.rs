@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite;
 use yrs::sync::{Message, MessageReader, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, Options, ReadTxn, Text, Transact, Update};
+use yrs::{Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 
@@ -594,5 +594,452 @@ async fn a_full_room_is_refused_before_the_upgrade_and_frees_its_slot() {
     assert!(
         opened.is_some(),
         "a closed socket must give its participant slot back"
+    );
+}
+
+// --- a room over somebody else's draft ---------------------------------------
+
+/// The instance the overlay tests run against: one file domain `team` that
+/// reviews changes, three editors, and the engine itself so a test can ask
+/// where a save landed.
+struct Review {
+    addr: std::net::SocketAddr,
+    engine: Arc<Engine>,
+    /// The instance root, so a test can look at the files overlay on disk.
+    root: std::path::PathBuf,
+    /// The domain folder, so a test can assert that nothing reached it.
+    domain_dir: std::path::PathBuf,
+    _scratch: support::ScratchStateDir,
+    _tmp: tempfile::TempDir,
+}
+
+const TEAM_PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Plan\n\nWhat the team agreed.\n";
+
+async fn serve_review() -> Review {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- Everything the team knows\n\n## When to Use\n\n- Route here for team questions\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("plan.md"), TEAM_PLAN).unwrap();
+    let mut entry = DomainEntry::file(dir.clone());
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    let mut cfg = GlobalConfig {
+        auth: Some(AuthConfig {
+            trusted_header: None,
+            proxy_headers: None,
+            anonymous: Some(false),
+            mcp: None,
+            oauth: None,
+            max_users: None,
+            oidc: None,
+        }),
+        ..GlobalConfig::default()
+    };
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["alice", "bob", "carol"] {
+        auth.add_user(name, name, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    let router = http_router(
+        engine.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth,
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    Review {
+        addr,
+        engine,
+        root,
+        domain_dir: dir,
+        _scratch: scratch,
+        _tmp: tmp,
+    }
+}
+
+impl Review {
+    /// One account's draft of a page nobody else has, written as the door
+    /// would have resolved them. Answers its domain-relative path.
+    async fn draft(&self, account: &str, title: &str, body: &str) -> String {
+        let receipt = self
+            .engine
+            .write_engram_as(
+                &crystalline_service::params::WriteParams {
+                    domain: "team".to_string(),
+                    title: title.to_string(),
+                    content: body.to_string(),
+                    folder: None,
+                    engram_type: None,
+                    tags: vec!["team".to_string()],
+                    status: None,
+                    metadata: None,
+                    overwrite: false,
+                },
+                None,
+                &crystalline_service::Scope::User {
+                    account: account.to_string(),
+                    admin: false,
+                },
+            )
+            .await
+            .expect("the draft lands in that account's overlay");
+        assert_eq!(receipt["draft"], serde_json::json!(true), "{receipt}");
+        receipt["path"].as_str().unwrap().to_string()
+    }
+
+    fn request(
+        &self,
+        session: &(String, String),
+        method: reqwest::Method,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        client()
+            .request(method, format!("http://{}{path}", self.addr))
+            .header("cookie", format!("fluid_session={}", session.0))
+            .header("x-csrf-token", &session.1)
+    }
+
+    /// Mint a share-link on the caller's own draft at `path`.
+    async fn mint(&self, session: &(String, String), path: &str) -> serde_json::Value {
+        let resp = self
+            .request(
+                session,
+                reqwest::Method::POST,
+                "/api/v1/domains/team/draft-links",
+            )
+            .json(&serde_json::json!({ "path": path }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "minting a link on one's own draft");
+        resp.json().await.unwrap()
+    }
+
+    /// Redeem a link and then open a join on it: the two steps a person takes
+    /// between being handed a draft and being allowed to type in it.
+    async fn accept_and_join(&self, session: &(String, String), token: &str) -> serde_json::Value {
+        let accepted = self
+            .request(session, reqwest::Method::POST, "/api/v1/draft-links/accept")
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), 200, "the link opens the draft");
+        let joined = self
+            .request(session, reqwest::Method::POST, "/api/v1/draft-links/join")
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(joined.status(), 200, "and the join opens the editing");
+        joined.json().await.unwrap()
+    }
+}
+
+/// The problem+json a refused upgrade carries, so a test can read the teaching
+/// sentence rather than only the status it arrived with.
+fn refusal_detail(err: &tungstenite::Error) -> String {
+    let tungstenite::Error::Http(response) = err else {
+        panic!("the upgrade was refused with an HTTP answer");
+    };
+    let body = response.body().clone().unwrap_or_default();
+    String::from_utf8_lossy(&body).to_string()
+}
+
+/// A grantee who joined types into the OWNER's document: the same room the
+/// owner is in, opening on her text, saving into her draft row.
+///
+/// The whole point of the key change, end to end over the socket: before it,
+/// bob would have been in a room over the page the team reviewed and his text
+/// would have landed in the machine owner's draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grantee_join_lands_in_the_owners_document() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+
+    // Alice opens her own draft: no query parameter, and nothing to ask for.
+    let mut hers = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh",
+        Some(&alice.0),
+        same_host(fx.addr),
+    )
+    .await
+    .expect("her own draft is hers to co-edit");
+    let Control::Hello { epoch, .. } = decode_hello(&next_binary(&mut hers).await) else {
+        panic!("the greeting opens with hello");
+    };
+
+    // Bob opens the same draft by naming whose it is.
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .expect("a live link plus a live join is what opens somebody else's draft");
+    let Control::Hello {
+        epoch: his_epoch, ..
+    } = decode_hello(&next_binary(&mut his).await)
+    else {
+        panic!("the greeting opens with hello");
+    };
+    assert_eq!(
+        his_epoch, epoch,
+        "one document, one room: they are editing the same thing"
+    );
+
+    // He syncs, types and flushes; her draft row is where it lands.
+    let doc = client_doc();
+    his.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut his).await;
+    apply(&doc, &step2);
+    assert!(
+        doc.get_or_insert_text("content")
+            .get_string(&doc.transact())
+            .contains("A page only alice has"),
+        "the room opened on her draft"
+    );
+    let update = append_line(&doc, "bob was here");
+    his.send(binary(update_frame(&update))).await.unwrap();
+    his.send(binary(control_frame(&Control::Flush)))
+        .await
+        .unwrap();
+    wait_for_control(&mut his, "saved").await;
+
+    let hers_now = fx
+        .engine
+        .overlay_draft_at("team", "alice", &path)
+        .await
+        .unwrap()
+        .expect("her draft is still hers");
+    assert!(
+        hers_now.content.contains("bob was here"),
+        "his typing landed in her draft: {hers_now:?}"
+    );
+    assert!(
+        fx.engine
+            .overlay_draft_at("team", "bob", &path)
+            .await
+            .unwrap()
+            .is_none(),
+        "and he forked no copy of his own"
+    );
+    assert!(
+        !fx.domain_dir.join(&path).exists(),
+        "and the folder the team reviewed heard nothing of it"
+    );
+}
+
+/// Naming somebody else's document is refused unless a live link says you may
+/// see it and a live join says you are in it.
+///
+/// Two refusals rather than one, because they are two different states:
+/// nobody handed you this draft, and you were handed it to READ. The second
+/// is the teaching sentence the write path already speaks - visibility and
+/// editing are two steps - so a person meets one rule wherever they meet it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_naming_an_ungranted_owner_refuses() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let carol = login(fx.addr, "carol", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    let url = "/api/v1/collab/team/fresh?overlay=alice";
+
+    // Carol was handed nothing: her answer is the one an unshared draft gives
+    // everybody, which says nothing about whether alice drafts there at all.
+    let err = connect(fx.addr, url, Some(&carol.0), same_host(fx.addr))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal_status(&err), Some(404));
+
+    // Bob holds the link and has not joined: he is told the second step.
+    let accepted = fx
+        .request(&bob, reqwest::Method::POST, "/api/v1/draft-links/accept")
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 200);
+    let err = connect(fx.addr, url, Some(&bob.0), same_host(fx.addr))
+        .await
+        .unwrap_err();
+    assert_eq!(refusal_status(&err), Some(422));
+    let detail = refusal_detail(&err);
+    assert!(
+        detail.contains("alice") && detail.contains("your own"),
+        "the refusal names both ways forward: {detail}"
+    );
+
+    // And once he joins, the same request opens the room.
+    fx.accept_and_join(&bob, &token).await;
+    connect(fx.addr, url, Some(&bob.0), same_host(fx.addr))
+        .await
+        .expect("a join is what was missing");
+}
+
+/// Taking the link back puts the grantee outside the room on the next saver
+/// tick - and leaves the owner in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_grantee_is_closed_on_the_next_tick() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    fx.accept_and_join(&bob, &token).await;
+
+    let mut hers = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh",
+        Some(&alice.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut hers).await;
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut his).await;
+
+    let id = minted["id"].as_i64().unwrap();
+    let revoked = fx
+        .request(
+            &alice,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/draft-links/{id}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 204, "the link is hers to take back");
+
+    let closed = wait_for_control(&mut his, "closed").await;
+    assert!(matches!(closed, Control::Closed { .. }), "{closed:?}");
+
+    // Hers stands: the eviction is addressed to one connection, and a room
+    // that tore itself down over a revoked link would have taken her work
+    // with it.
+    let doc = client_doc();
+    hers.send(binary(step1(&doc))).await.unwrap();
+    let step2 = next_sync_step2(&mut hers).await;
+    apply(&doc, &step2);
+    assert!(
+        doc.get_or_insert_text("content")
+            .get_string(&doc.transact())
+            .contains("A page only alice has"),
+        "her socket still answers over her own draft"
+    );
+}
+
+/// A file uploaded from inside a joined room lands in the OWNER's files
+/// overlay, to be folded or discarded with the page it illustrates.
+///
+/// The routing is the write path's rather than the socket's - an upload is a
+/// REST call carrying this session's join key, and
+/// `a_joined_upload_of_a_new_file_lands_in_the_owners_overlay` in
+/// rest_draft_links.rs pins the rule itself. What this adds is the case the
+/// room makes ordinary: somebody typing in a colleague's draft drops a picture
+/// into it while they are in there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grantees_upload_from_a_joined_room_lands_in_the_owners_files() {
+    let fx = serve_review().await;
+    let alice = login(fx.addr, "alice", "pw12345678").await;
+    let bob = login(fx.addr, "bob", "pw12345678").await;
+    let path = fx.draft("alice", "Fresh", "A page only alice has.").await;
+    let minted = fx.mint(&alice, &path).await;
+    let token = minted["token"].as_str().unwrap().to_string();
+    let joined = fx.accept_and_join(&bob, &token).await;
+    let key = joined["join_key"].as_str().unwrap().to_string();
+
+    let mut his = connect(
+        fx.addr,
+        "/api/v1/collab/team/fresh?overlay=alice",
+        Some(&bob.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut his).await;
+
+    let uploaded = fx
+        .request(
+            &bob,
+            reqwest::Method::PUT,
+            "/api/v1/domains/team/files/assets/sketch.png",
+        )
+        .header("x-crystalline-join", &key)
+        .header("content-type", "image/png")
+        .body(b"a picture bob drew".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), 200, "the upload lands");
+
+    assert!(
+        fx.root
+            .join("state/overlays/team/alice/files/assets/sketch.png")
+            .exists(),
+        "in her files overlay, where the page it belongs to is"
+    );
+    assert!(
+        !fx.root
+            .join("state/overlays/team/bob/files/assets/sketch.png")
+            .exists(),
+        "and not in his"
     );
 }

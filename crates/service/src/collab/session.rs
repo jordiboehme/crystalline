@@ -54,13 +54,21 @@ const SAVER_TICK_MS: u64 = 250;
 /// One connection's identity inside a session, minted at join.
 pub type ConnId = u64;
 
-/// One broadcast frame: protocol bytes plus the connection they came from.
+/// One broadcast frame: protocol bytes, the connection they came from and,
+/// for the one frame that is not everybody's business, the connection they are
+/// for.
 #[derive(Clone)]
 pub struct Frame {
     /// The connection an update came from, so the socket loop can skip
     /// echoing it back; None for server-originated frames (merge edits,
     /// control broadcasts), which everyone gets.
     pub from: Option<ConnId>,
+    /// The connection this frame is FOR, when it is for one of them. `None` on
+    /// every ordinary frame, which the whole room hears. `Some(conn)` is the
+    /// eviction of a session whose join into this draft has ended: it closes
+    /// that socket and no other, because the room belongs to its owner and
+    /// they are still in it.
+    pub to: Option<ConnId>,
     /// The encoded y-protocol messages to send.
     pub bytes: Bytes,
 }
@@ -418,6 +426,10 @@ struct SessionState {
     last_saved_text: String,
     /// Awareness client ids seen per connection, nulled on its disconnect.
     conns: HashMap<ConnId, HashSet<ClientID>>,
+    /// The connections that are in this room as somebody's guest, and the
+    /// account each of them is. Empty in every room over a document its
+    /// participants own, which is nearly all of them.
+    guests: HashMap<ConnId, String>,
     dirty: bool,
     /// When the most recent update landed: the debounce timer's input.
     last_edit: Option<Instant>,
@@ -565,6 +577,7 @@ impl CollabSession {
                 checksum: loaded.checksum,
                 last_saved_text: loaded.content,
                 conns: HashMap::new(),
+                guests: HashMap::new(),
                 dirty: false,
                 last_edit: None,
                 oldest_unsaved: None,
@@ -669,6 +682,7 @@ impl CollabSession {
                         state.oldest_unsaved.get_or_insert(now);
                         let _ = self.tx.send(Frame {
                             from: Some(conn),
+                            to: None,
                             bytes: Bytes::from(
                                 Message::Sync(SyncMessage::Update(update)).encode_v1(),
                             ),
@@ -685,6 +699,7 @@ impl CollabSession {
                         tracked.extend(ids);
                         let _ = self.tx.send(Frame {
                             from: Some(conn),
+                            to: None,
                             bytes: Bytes::from(Message::Awareness(update).encode_v1()),
                         });
                     }
@@ -717,9 +732,66 @@ impl CollabSession {
         replies
     }
 
+    /// Record that `conn` is in this room on a join rather than on its own
+    /// document, so the saver can put it outside the draft when that join
+    /// ends.
+    ///
+    /// Called by the upgrade route once it has decided the connection may be
+    /// here at all; a room over nobody's draft never has one.
+    pub async fn watch_guest(&self, conn: ConnId, account: &str) {
+        self.state
+            .lock()
+            .await
+            .guests
+            .insert(conn, account.to_string());
+    }
+
+    /// Close every connection whose join into this draft has ended.
+    ///
+    /// A join ends in one place - the registry - however it ended: the author
+    /// took the link back (which ends the joins on that draft), the draft was
+    /// folded, discarded or renamed, the person pressed Leave, or the daemon
+    /// was restarted under them. So this asks one question per guest per tick,
+    /// of a map in this process's memory, and never reads the grant rows: a
+    /// revocation is already an ending, and asking the database four times a
+    /// second would be asking it something it has already answered.
+    ///
+    /// The frame is addressed to that connection alone. The owner is not a
+    /// guest and is never in this map, so their socket stands through every
+    /// revocation there is - which is the difference between a link being
+    /// taken back and a room being closed.
+    async fn evict_ended_joins(&self) {
+        let Some(owner) = self.overlay.as_deref() else {
+            return; // a document nobody joined into cannot be left
+        };
+        let mut state = self.state.lock().await;
+        if state.guests.is_empty() {
+            return;
+        }
+        let path = state.path.clone();
+        let joins = self.engine.joins();
+        let ended: Vec<ConnId> = state
+            .guests
+            .iter()
+            .filter(|(_, account)| !joins.holds(account, &self.domain, owner, &path))
+            .map(|(conn, _)| *conn)
+            .collect();
+        for conn in ended {
+            state.guests.remove(&conn);
+            let _ = self.tx.send(Frame {
+                from: None,
+                to: Some(conn),
+                bytes: Bytes::from(control::encode(&Control::Closed {
+                    reason: "left".to_string(),
+                })),
+            });
+        }
+    }
+
     /// Drop a connection: null + broadcast its awareness states. True = last one.
     pub async fn remove_conn(&self, conn: ConnId) -> bool {
         let mut state = self.state.lock().await;
+        state.guests.remove(&conn);
         let ids = state.conns.remove(&conn).unwrap_or_default();
         if !ids.is_empty() {
             // Null this connection's awareness states for everyone else: the
@@ -739,6 +811,7 @@ impl CollabSession {
             }
             let _ = self.tx.send(Frame {
                 from: Some(conn),
+                to: None,
                 bytes: Bytes::from(Message::Awareness(AwarenessUpdate { clients }).encode_v1()),
             });
         }
@@ -819,6 +892,9 @@ impl CollabSession {
     /// One saver pass at `now`: decides whether a save is due and runs it.
     /// Takes `now` so tests drive time synthetically instead of sleeping.
     pub async fn tick_save(&self, now: Instant) {
+        // Before the save, so a session whose join ended a moment ago is put
+        // outside the draft rather than watching one more save land in it.
+        self.evict_ended_joins().await;
         let renamed = self.due_save(now).await;
         // The session guard is dropped by now: the rename move takes the
         // registry lock, and the lock order is registry -> session.
@@ -929,6 +1005,7 @@ impl CollabSession {
         self.dispose();
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Closed {
                 reason: "internal".to_string(),
             })),
@@ -1006,6 +1083,7 @@ impl CollabSession {
                 state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
                         checksum: state.checksum.clone(),
                         permalink: state.permalink.clone(),
@@ -1077,6 +1155,7 @@ impl CollabSession {
                 state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
                         checksum,
                         permalink,
@@ -1115,6 +1194,7 @@ impl CollabSession {
         if !repeat {
             let _ = self.tx.send(Frame {
                 from: None,
+                to: None,
                 bytes: Bytes::from(control::encode(&Control::SaveFailed {
                     detail: detail.clone(),
                 })),
@@ -1133,6 +1213,7 @@ impl CollabSession {
         state.pending = Some(PendingConflict::Deleted);
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Conflict {
                 conflict_kind: "deleted".to_string(),
                 theirs: None,
@@ -1285,6 +1366,7 @@ impl CollabSession {
                 state.closed = true;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Closed {
                         reason: "deleted".to_string(),
                     })),
@@ -1333,6 +1415,7 @@ impl CollabSession {
                 state.pending = Some(PendingConflict::Deleted);
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::SaveFailed {
                         detail: err.to_string(),
                     })),
@@ -1371,6 +1454,7 @@ impl CollabSession {
                 state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
                         checksum,
                         permalink,
@@ -1385,6 +1469,7 @@ impl CollabSession {
                 state.pending = Some(PendingConflict::Deleted);
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::SaveFailed {
                         detail: err.to_string(),
                     })),
@@ -1404,6 +1489,7 @@ impl CollabSession {
         });
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Conflict {
                 conflict_kind: "edit".to_string(),
                 theirs: Some(theirs.content),
@@ -1429,10 +1515,12 @@ impl CollabSession {
         };
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(Message::Sync(SyncMessage::Update(update)).encode_v1()),
         });
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Merged)),
         });
     }

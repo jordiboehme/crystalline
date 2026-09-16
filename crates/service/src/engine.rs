@@ -4414,6 +4414,35 @@ impl Engine {
         identifier: &str,
         scope: &crate::scope::Scope,
     ) -> Result<Option<String>> {
+        Ok(self
+            .granted_draft_named(domain, identifier, None, scope)
+            .await?
+            .map(|(owner, path)| granted_needs_join(&owner, &path)))
+    }
+
+    /// The draft this caller holds a live link to that `identifier` names, as
+    /// `(owner, path)`, or `None` when the name is nothing of the sort.
+    ///
+    /// `owner` narrows it to one author's, which is what a caller asking to
+    /// open a room over somebody's document needs: it names whose, and the
+    /// answer has to be about that person rather than about whoever this
+    /// account happens to hold a link from. `None` asks about any of them,
+    /// which is what the teaching refusal above needs.
+    ///
+    /// Asked only where an answer would change what a caller is told, and only
+    /// for a caller holding at least one live link in this domain - which is
+    /// almost nobody, almost never. The name is matched against what the link
+    /// actually opens: the draft's own address, its path, and the path with
+    /// the suffix off, which are the three spellings the editor and the API
+    /// address an engram by. A link whose draft has gone matches nothing, so a
+    /// dead link teaches nothing and opens nothing.
+    pub(crate) async fn granted_draft_named(
+        &self,
+        domain: &str,
+        identifier: &str,
+        owner: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<(String, String)>> {
         let Some(account) = crate::scope::overlay_actor(scope) else {
             return Ok(None);
         };
@@ -4424,11 +4453,11 @@ impl Engine {
             .overlay_grants_held(&account, domain)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
-        for (path, owner) in held {
-            if owner == account {
+        for (path, held_owner) in held {
+            if held_owner == account || owner.is_some_and(|want| want != held_owner) {
                 continue;
             }
-            let Some(draft) = self.overlay_draft_at(domain, &owner, &path).await? else {
+            let Some(draft) = self.overlay_draft_at(domain, &held_owner, &path).await? else {
                 continue;
             };
             let names = [
@@ -4437,7 +4466,7 @@ impl Engine {
                 path.trim_end_matches(".md"),
             ];
             if names.contains(&identifier) {
-                return Ok(Some(granted_needs_join(&owner, &path)));
+                return Ok(Some((held_owner, path)));
             }
         }
         Ok(None)
