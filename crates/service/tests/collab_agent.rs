@@ -390,3 +390,67 @@ async fn an_edit_of_a_page_no_room_is_open_over_still_writes_the_file() {
         "{on_disk:?}"
     );
 }
+
+/// Every verb that goes through the shared edit body meets the live document,
+/// not only `edit_engram`.
+///
+/// A retirement reaches it through `Engine::apply_source_edit`, the shorthand
+/// three other verbs share, so an engram somebody has open is retired in their
+/// document and their session writes it down. The receipt says nothing about
+/// it - a retirement's receipt is about what it retired - so what this pins is
+/// the behaviour rather than the words.
+///
+/// Driven in a REVIEWING domain, which is where a retirement actually takes
+/// that route: in a domain that takes changes directly `retire_engram_as`
+/// keeps its own file and virtual arms and never reaches the shared body, so a
+/// retirement there writes past an open room and the room meets it as the
+/// external change it is. See the report's concerns.
+#[tokio::test]
+async fn a_retirement_of_an_open_draft_lands_in_the_document_too() {
+    let (_tmp, engine, _scratch) = engine_fixture(true).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", Some("owner")).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "a person typed this").await;
+
+    engine
+        .retire_engram(&crystalline_service::params::RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "archived".to_string(),
+            successor: None,
+            valid_to: None,
+        })
+        .await
+        .expect("the retirement lands");
+
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert!(
+        live.contains("status: archived") && live.contains("a person typed this"),
+        "the retirement composed with what they had typed: {live:?}"
+    );
+    assert!(
+        engine
+            .overlay_draft_at("eng", "owner", "alpha.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "and nothing went behind the room into the row"
+    );
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let draft = engine
+        .overlay_draft_at("eng", "owner", "alpha.md")
+        .await
+        .unwrap()
+        .expect("which the room's own saver then writes down");
+    assert!(
+        draft.content.contains("status: archived") && draft.content.contains("a person typed this"),
+        "{draft:?}"
+    );
+}
