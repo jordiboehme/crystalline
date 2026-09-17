@@ -790,6 +790,10 @@ pub struct UnresolvedRef {
     /// The target text exactly as written inside the brackets. Findings quote
     /// it verbatim so a repair never has to guess the string to replace.
     pub target: String,
+    /// The bracket text exactly as it was written, colon and all. What the
+    /// resolver falls back to when the prefix names no registered domain, so
+    /// V102's repair can be scored against the same string the resolver read.
+    pub raw: String,
     /// The one-based line the reference sits on, when known.
     pub line: Option<usize>,
 }
@@ -1946,14 +1950,30 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
             .filter(|d| !input.known_domains.iter().any(|k| k == *d));
 
         let (evidence, class, fix) = match unregistered {
-            Some(domain) => (
-                format!(
-                    "rel_type={}; target domain `{domain}` is not a registered domain",
-                    reference.rel_type
+            // A prefix nobody registered is not a prefix: the resolver reads
+            // the whole bracket text as a title in this engram's own domain, so
+            // that is what the repair scores against too. A candidate means the
+            // intended target is not in doubt and completing the spelling
+            // changes nothing the archive claims.
+            Some(domain) => match title_candidate(input, graph, &fact.domain, &reference.raw) {
+                Some(candidate) => (
+                    format!(
+                        "rel_type={}; target domain `{domain}` is not a registered domain and \
+                         nothing in {} is titled `{}`; nearest is `{candidate}`",
+                        reference.rel_type, fact.domain, reference.raw
+                    ),
+                    Class::Mechanical,
+                    format!("[[{}]] -> [[{candidate}]]", reference.raw),
                 ),
-                Class::Judgment,
-                format!("[[{}]]", reference.target),
-            ),
+                None => (
+                    format!(
+                        "rel_type={}; target domain `{domain}` is not a registered domain",
+                        reference.rel_type
+                    ),
+                    Class::Judgment,
+                    format!("[[{}]]", reference.target),
+                ),
+            },
             None => {
                 let scope = reference
                     .target_domain

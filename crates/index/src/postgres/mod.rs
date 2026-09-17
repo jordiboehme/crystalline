@@ -653,7 +653,8 @@ fn outbound_ref_from_row(r: &PgRow) -> OutboundRef {
 
 /// Decode one row of the unresolved-reference query. The column layout is
 /// identical across both backends; column 6 is the source path, selected only to
-/// order by, so it is not read back.
+/// order by, so it is not read back, and column 7 is the bracket text as
+/// written, which the repair scores against.
 fn unresolved_ref_from_row(r: &PgRow) -> UnresolvedRef {
     UnresolvedRef {
         from: EngramId(cell_i64(r, 0).unwrap_or(0)),
@@ -665,6 +666,9 @@ fn unresolved_ref_from_row(r: &PgRow) -> UnresolvedRef {
         rel_type: cell_text(r, 2).unwrap_or_default(),
         target_domain: cell_text(r, 3),
         target: cell_text(r, 4).unwrap_or_default(),
+        // A row written before `to_raw` existed reads as an empty string, which
+        // the repair treats as "nothing extra to score" rather than as a match.
+        raw: cell_text(r, 7).unwrap_or_default(),
         // The parser writes 0 when it has no line to report, which the sweep
         // reads as "no line" rather than as line zero.
         line: cell_i64(r, 5).filter(|l| *l > 0).map(|l| l as usize),
@@ -1670,7 +1674,9 @@ impl Store for PostgresStore {
         // the prose arm reports `links_to`, the same relation type the graph gives
         // a wikilink edge. Both arms filter on `to_id IS NULL` and the source
         // domain, which is exactly the pair of partial unresolved indexes. The
-        // source path is selected as the last column purely to order by.
+        // source path is selected as column 7 purely to order by, with `to_raw`
+        // appended after it so the Turso twin's positional sort keeps its
+        // meaning.
         //
         // The compound select is wrapped so the sort keys can carry an explicit
         // `COLLATE "C"`: Turso sorts TEXT byte-wise, while a Postgres database
@@ -1691,14 +1697,15 @@ impl Store for PostgresStore {
         let rows = query_all(
             conn.as_mut(),
             &format!(
-                "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path \
+                "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path, u.to_raw \
              FROM ( \
                SELECT r.engram_id, 0::int8 AS kind, r.rel_type, r.to_domain, r.to_target, \
-                      r.line, e.path \
+                      r.line, e.path, r.to_raw \
                FROM relation r JOIN engram e ON e.id=r.engram_id \
                WHERE {src_screen} AND {rel_pending} AND r.domain_id=$1 \
                UNION ALL \
-               SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path \
+               SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path, \
+                      l.to_raw \
                FROM link l JOIN engram e ON e.id=l.engram_id \
                WHERE {src_screen} AND {link_pending} AND l.domain_id=$1 \
              ) u \

@@ -335,6 +335,7 @@ fn v004_distinguishes_a_missing_relation_from_an_unresolved_one() {
         kind: EdgeKind::Relation,
         target_domain: None,
         target: "Newer Checklist".to_string(),
+        raw: "Newer Checklist".to_string(),
         line: Some(7),
     }];
 
@@ -763,6 +764,7 @@ fn v102_is_mechanical_only_with_a_near_exact_candidate() {
             kind: EdgeKind::Link,
             target_domain: None,
             target: "Deployment Pipline Runbook".to_string(),
+            raw: "Deployment Pipline Runbook".to_string(),
             line: Some(12),
         },
         UnresolvedRef {
@@ -771,6 +773,7 @@ fn v102_is_mechanical_only_with_a_near_exact_candidate() {
             kind: EdgeKind::Link,
             target_domain: None,
             target: "Nothing Like That At All".to_string(),
+            raw: "Nothing Like That At All".to_string(),
             line: Some(14),
         },
     ];
@@ -811,6 +814,7 @@ fn v102_names_an_unregistered_target_domain() {
         kind: EdgeKind::Link,
         target_domain: Some("archive".to_string()),
         target: "Old Notes".to_string(),
+        raw: "archive:Old Notes".to_string(),
         line: None,
     }];
 
@@ -821,6 +825,40 @@ fn v102_names_an_unregistered_target_domain() {
         finding
             .evidence
             .contains("target domain `archive` is not a registered domain")
+    );
+}
+
+/// V102's repair reads a link the way the resolver does. An unresolved
+/// `[[Murmur: the dispatch pipeline]]` is scored against the whole bracket
+/// text, not against `the dispatch pipeline`: a prefix nobody registered is not
+/// a prefix, so the resolver has already read the whole of it as a title at
+/// home and the repair owes the same reading.
+#[test]
+fn v102_suggests_what_the_resolver_would_have_found() {
+    let mut target = fact(1, "murmur-the-dispatch-pipeline");
+    target.title = "Murmur: the dispatch pipelines".to_string();
+    let writer = fact(2, "writer");
+
+    let mut sweep = input(vec![target, writer]);
+    let mut reference = unresolved(2, "the dispatch pipeline");
+    reference.target_domain = Some("Murmur".to_string());
+    reference.raw = "Murmur: the dispatch pipeline".to_string();
+    sweep.unresolved = vec![reference];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V102");
+    assert_eq!(finding.class, Class::Mechanical);
+    assert!(
+        finding.fix.contains("Murmur: the dispatch pipelines"),
+        "the whole bracket text is what was scored: {}",
+        finding.fix
+    );
+    assert!(
+        finding
+            .evidence
+            .contains("target domain `Murmur` is not a registered domain"),
+        "and the evidence still says why the prefix was dropped: {}",
+        finding.evidence
     );
 }
 
@@ -2377,6 +2415,9 @@ fn unresolved(from: i64, target: &str) -> UnresolvedRef {
         kind: EdgeKind::Link,
         target_domain: None,
         target: target.to_string(),
+        // The bracket text and the target are the same string when no prefix
+        // was written, which is what an unprefixed link actually stores.
+        raw: target.to_string(),
         line: Some(3),
     }
 }

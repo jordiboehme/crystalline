@@ -620,7 +620,8 @@ fn outbound_ref_from_row(r: &Row) -> OutboundRef {
 }
 
 /// Decode one row of the unresolved-reference query. Column 6 is the source
-/// path, selected only to order by, so it is not read back.
+/// path, selected only to order by, so it is not read back; column 7 is the
+/// bracket text as written, which the repair scores against.
 fn unresolved_ref_from_row(r: &Row) -> UnresolvedRef {
     UnresolvedRef {
         from: EngramId(cell_i64(r, 0).unwrap_or(0)),
@@ -632,6 +633,9 @@ fn unresolved_ref_from_row(r: &Row) -> UnresolvedRef {
         rel_type: cell_text(r, 2).unwrap_or_default(),
         target_domain: cell_text(r, 3),
         target: cell_text(r, 4).unwrap_or_default(),
+        // A row written before `to_raw` existed reads as an empty string, which
+        // the repair treats as "nothing extra to score" rather than as a match.
+        raw: cell_text(r, 7).unwrap_or_default(),
         // The parser writes 0 when it has no line to report, which the sweep
         // reads as "no line" rather than as line zero.
         line: cell_i64(r, 5).filter(|l| *l > 0).map(|l| l as usize),
@@ -1676,9 +1680,10 @@ impl Store for TursoStore {
         // Relation rows then link rows, both filtered on `to_id IS NULL` and the
         // source domain so the pair of partial unresolved indexes carries the
         // scan. A prose link reports `links_to`, the same relation type the graph
-        // gives a wikilink edge. The source path is selected as the last column
-        // purely to order by: the sort is (path, line, kind, target), positional
-        // because a compound select cannot name a column of a later arm. TEXT
+        // gives a wikilink edge. The source path is selected as column 7 purely
+        // to order by, with `to_raw` appended after it so the positional sort
+        // keeps meaning what it means: the sort is (path, line, kind, target),
+        // positional because a compound select cannot name a column of a later arm. TEXT
         // sorts byte-wise here, which is the order the Postgres implementation
         // pins itself to with an explicit `COLLATE "C"`.
         //
@@ -1695,11 +1700,11 @@ impl Store for TursoStore {
         let rows = query_all(
             &self.conn,
             &format!(
-                "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path \
+                "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path, r.to_raw \
              FROM relation r JOIN engram e ON e.id=r.engram_id \
              WHERE {src_screen} AND {rel_pending} AND r.domain_id=?1 \
              UNION ALL \
-             SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path \
+             SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path, l.to_raw \
              FROM link l JOIN engram e ON e.id=l.engram_id \
              WHERE {src_screen} AND {link_pending} AND l.domain_id=?1 \
              ORDER BY 7, 6, 2, 5"
