@@ -10,8 +10,9 @@ You are being onboarded to the knowledge accumulated in this workspace. It is se
 - astronomy: When asked about moons or planets; When comparing orbital periods
 
 Behavior:
-- Narrow question, one domain fits: search_engrams with domains=[that domain].
-- Broad or unclear question: search_engrams with no domains sweeps them all.
+- Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess.
+- Search before you start: a task begins with search_engrams on its subject, so what an earlier session learned shapes the work instead of being rediscovered after the fact.
+- Narrow question: search_engrams with domains=[that domain]; broad or unclear: no domains sweeps them all.
 - This deployment's knowledge is read-only and curated externally; search and read to learn, never try to capture or change anything.
 - build_context on a crystalline:// anchor gathers knowledge around a task.
-- Read a MANIFEST with read_engram only when the domain's routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session.
+- Read a MANIFEST with read_engram only when the routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session.

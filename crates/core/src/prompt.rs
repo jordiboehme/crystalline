@@ -425,6 +425,14 @@ fn render_behavior_block(output: &PromptOutput, out: &mut String) {
 /// than every write verb on the surface: `split_engram` is taught by the skills
 /// rather than here, so the routing block stays inside its truncation budget.
 ///
+/// The first two rules say *when* to search and everything under them says
+/// *how*, which is why they open the block in both variants: a block that only
+/// routed a search left the agent to decide on its own whether a question was
+/// worth one, and the answer in practice was too rarely. They are the two
+/// lines that must survive a truncating client, so they come first and are
+/// never trimmed; the rules below them absorbed the budget instead, which is
+/// why the narrow and broad routing rule is one line rather than two.
+///
 /// This is the single source of the rule set: [`render_routing_body`] renders
 /// it as the Behavior block of both onboarding renderers, and the MCP
 /// `list_domains` response returns it verbatim for remote clients that never
@@ -432,8 +440,12 @@ fn render_behavior_block(output: &PromptOutput, out: &mut String) {
 /// same rules and the set can never drift between them.
 pub fn behavior_bullets(read_only: bool) -> Vec<String> {
     let mut bullets = vec![
-        "Narrow question, one domain fits: search_engrams with domains=[that domain].".to_string(),
-        "Broad or unclear question: search_engrams with no domains sweeps them all.".to_string(),
+        "Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess."
+            .to_string(),
+        "Search before you start: a task begins with search_engrams on its subject, so what an earlier session learned shapes the work instead of being rediscovered after the fact."
+            .to_string(),
+        "Narrow question: search_engrams with domains=[that domain]; broad or unclear: no domains sweeps them all."
+            .to_string(),
     ];
     if read_only {
         // Read-only variant: no write-tools line and no capture language; the
@@ -448,14 +460,14 @@ pub fn behavior_bullets(read_only: bool) -> Vec<String> {
                 .to_string(),
         );
         bullets.push(
-            "Pass write_engram a folder matching the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons."
+            "Pass write_engram a folder from the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons."
                 .to_string(),
         );
         bullets.push(
             "Check vocabulary for tags and categories in use before inventing one.".to_string(),
         );
         bullets.push(
-            "Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge and raise it when one proves key to a task."
+            "Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge, raise it when one proves key."
                 .to_string(),
         );
     }
@@ -463,7 +475,7 @@ pub fn behavior_bullets(read_only: bool) -> Vec<String> {
         "build_context on a crystalline:// anchor gathers knowledge around a task.".to_string(),
     );
     bullets.push(
-        "Read a MANIFEST with read_engram only when the domain's routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session."
+        "Read a MANIFEST with read_engram only when the routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session."
             .to_string(),
     );
     bullets
@@ -1021,6 +1033,52 @@ mod tests {
         );
     }
 
+    /// The two search-first rules open the Behavior block, in both variants,
+    /// in every rendering of it: the session-hook block [`render_text`]
+    /// writes, the MCP `instructions` [`render_instructions`] writes and the
+    /// [`behavior_bullets`] list the `list_domains` tool returns verbatim.
+    /// They say *when* to search, which the rest of the block never did, so
+    /// they come before the routing rules that say how.
+    #[test]
+    fn the_search_first_rules_open_the_behavior_block_in_every_rendering() {
+        const ANSWER: &str = "Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess.";
+        const START: &str = "Search before you start: a task begins with search_engrams on its subject, so what an earlier session learned shapes the work instead of being rediscovered after the fact.";
+
+        let (_tmp, global) = fixture();
+        for read_only in [false, true] {
+            // The list `list_domains` hands a remote client.
+            let bullets = behavior_bullets(read_only);
+            assert_eq!(bullets[0], ANSWER, "read_only={read_only}: first rule");
+            assert_eq!(bullets[1], START, "read_only={read_only}: second rule");
+
+            // Both onboarding renderers open their Behavior block with the
+            // same two lines, in the same order.
+            let opening = format!("Behavior:\n- {ANSWER}\n- {START}\n");
+            let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+            output.read_only = read_only;
+            for (channel, text) in [
+                ("render_text", render_text(&output)),
+                ("render_instructions", render_instructions(&output)),
+            ] {
+                let block = text.find("Behavior:\n").expect("a behavior block");
+                assert!(
+                    text[block..].starts_with(&opening),
+                    "read_only={read_only} {channel}: the two search-first rules open the block:\n{text}"
+                );
+            }
+        }
+
+        // Read-only keeps its curated-externally sentence, after the two.
+        let read_only = behavior_bullets(true);
+        assert!(
+            read_only
+                .iter()
+                .skip(2)
+                .any(|b| b.contains("read-only and curated externally")),
+            "the curated sentence follows the two rules: {read_only:?}"
+        );
+    }
+
     /// Scaffold `count` file domains, each with `bullets_per_domain` routing
     /// bullets, the way the CLI latency test scaffolds a large registry.
     fn many_domains(count: usize, bullets_per_domain: usize) -> (tempfile::TempDir, GlobalConfig) {
@@ -1088,11 +1146,14 @@ mod tests {
         );
 
         // Tier 2: enough domains to blow the budget at three bullets each, but
-        // not at one - one routing line per domain survives, trimmed.
-        let (_t2, mid) = many_domains(12, 5);
+        // not at one - one routing line per domain survives, trimmed. The
+        // count tracks the size of the fixed head: every byte the Behavior
+        // block gains is a byte the domain lines lose, so a head that grows
+        // pulls this number down and a head that shrinks lets it rise.
+        let (_t2, mid) = many_domains(5, 5);
         let tier2 = render_instructions(&generate_prompt_unscoped(&mid, &BTreeMap::new()));
         assert!(
-            tier2.contains("- domain11: When a task touches domain11 aspect 0\n"),
+            tier2.contains("- domain04: When a task touches domain04 aspect 0\n"),
             "one bullet per domain:\n{tier2}"
         );
         assert!(
