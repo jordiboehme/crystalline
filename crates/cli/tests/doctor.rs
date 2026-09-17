@@ -663,6 +663,17 @@ fn apply_home(cmd: &mut Command, home: &Path) {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CACHE_HOME", home.join("cache"))
+        // `crystalline_remote::token`'s test seam: none of the three
+        // variables above reach it, since the OS keychain service name is a
+        // hardcoded constant rather than derived from any base directory, so
+        // without this a `doctor` run whose config turns `github.enabled` on
+        // (`write_team_domain_config`, below) asks the real login keychain
+        // for a `github` credential the moment `check_github` runs. This is
+        // the boolean kill switch, not `CRYSTALLINE_TEST_TOKEN_STORE_DIR`:
+        // it falls back to the file store at whatever `origins_state_dir()`
+        // already resolves to under the isolated `XDG_STATE_HOME` above,
+        // rather than redirecting to a directory of its own.
+        .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
         // A developer machine's own Copilot home must never leak into the
         // harnesses section's path resolution.
         .env_remove("COPILOT_HOME");

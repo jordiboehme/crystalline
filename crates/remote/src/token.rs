@@ -45,6 +45,42 @@ const KEYRING_TIMEOUT: Duration = Duration::from_secs(15);
 /// changing this one.
 const TOKEN_FILE_NAME: &str = "github-token.json";
 
+/// Set (to any non-empty value) to refuse the real OS keychain backend
+/// everywhere in this module and use the file store instead, at whatever
+/// location the caller already passed in - never a location of its own.
+///
+/// This is deliberately a different variable from
+/// `CRYSTALLINE_TEST_TOKEN_STORE_DIR` (`crystalline::cmd::test_token_store_dir`),
+/// which redirects `connect github` to an entirely different state
+/// directory: reusing that one here once broke
+/// `disconnecting_a_personal_identity_forgets_its_credential`, whose fixture
+/// file lives at the isolated `origins_state_dir()` the test's `HOME`
+/// already redirects to - a boolean kill switch must never also move the
+/// file, or a test that isolates its base directories loses track of where
+/// its own fixture landed. `CRYSTALLINE_TEST_TOKEN_STORE_DIR` still works
+/// the way it always has and is untouched by this variable.
+///
+/// Read once, here, inside [`TokenStore::resolve_and_load_bounded`] and
+/// [`TokenStore::save_resolving_bounded`] - the two functions every public
+/// resolve/save entry point in this module funnels through before it can
+/// ever reach [`keyring_read`] or [`keyring_write`] - rather than by each
+/// caller separately. A CLI command that gains a new credential touch
+/// therefore inherits the protection for free instead of needing its own
+/// copy of this check, which is what let `crystalline doctor` and
+/// `crystalline users disable`/`remove` reach the real login keychain from a
+/// test for as long as only `crystalline connect github` carried its own
+/// seam.
+///
+/// Not a knob any install is meant to set; nothing documents it as one (see
+/// `crystalline_service::overlay::RESERVED_VARS`, which reserves this and
+/// `CRYSTALLINE_TEST_TOKEN_STORE_DIR` from the unknown-variable warning for
+/// the same reason).
+const NO_REAL_KEYCHAIN_ENV: &str = "CRYSTALLINE_TEST_NO_KEYCHAIN";
+
+fn refuse_real_keychain() -> bool {
+    std::env::var_os(NO_REAL_KEYCHAIN_ENV).is_some_and(|v| !v.is_empty())
+}
+
 /// The longest personal identity name a credential is addressed by. Account
 /// names come from the auth layer already trimmed and lowercased, so this is a
 /// sanity ceiling rather than a policy: a keyring account name and a file name
@@ -228,6 +264,17 @@ impl TokenStore {
         fallback_dir: &Path,
         read: impl FnOnce(&str) -> KeyringRead,
     ) -> Result<(TokenStore, Option<StoredToken>), RemoteError> {
+        // The test seam: use the file store at the caller's own
+        // `fallback_dir` and never call `read`, so the real OS keychain
+        // backend is never even constructed. Checked before
+        // `account_for_identity_checked` too, so a test never pays for (or
+        // is refused by) an identity check on the way to a backend it was
+        // never going to reach.
+        if refuse_real_keychain() {
+            let store = TokenStore::file_fallback_for(identity, fallback_dir)?;
+            let token = store.load()?;
+            return Ok((store, token));
+        }
         let account = account_for_identity_checked(identity, host)?;
         match read(&account) {
             KeyringRead::Found(json) => {
@@ -295,6 +342,15 @@ impl TokenStore {
         token: &StoredToken,
         write: impl FnOnce(&str, String) -> Result<(), RemoteError>,
     ) -> Result<TokenStore, RemoteError> {
+        // The test seam: write straight to the file store at the caller's
+        // own `fallback_dir` and never call `write`, so the real OS
+        // keychain backend is never even constructed. See
+        // [`refuse_real_keychain`].
+        if refuse_real_keychain() {
+            let store = TokenStore::file_fallback_for(identity, fallback_dir)?;
+            store.save(token)?;
+            return Ok(store);
+        }
         let account = account_for_identity_checked(identity, host)?;
         if let Ok(json) = to_json(token)
             && write(&account, json).is_ok()
@@ -611,12 +667,33 @@ where
     }
 }
 
+/// Panics with a clear message when [`refuse_real_keychain`] says the real
+/// backend is off limits: the last-resort guard behind [`keyring_read`],
+/// [`keyring_write`] and [`keyring_delete`], which is otherwise unreachable
+/// once the test seam is set, since [`TokenStore::resolve_and_load_bounded`]
+/// and [`TokenStore::save_resolving_bounded`] never call into them and no
+/// other code in this crate constructs a `TokenStore::Keyring` directly. If
+/// this ever fires, some new path reached the real OS keychain from a test
+/// without going through either of those two functions - the fix is to route
+/// it through them, not to silence this.
+fn refuse_real_keychain_under_test(operation: &str) {
+    if refuse_real_keychain() {
+        panic!(
+            "a test reached the real OS keychain to {operation} a credential while \
+             {NO_REAL_KEYCHAIN_ENV} was set; route this call through \
+             TokenStore::resolve_and_load_for or save_resolving_for instead of \
+             constructing a Keyring store directly"
+        );
+    }
+}
+
 /// One bounded keychain read for `account`, the shape both
 /// [`TokenStore::resolve_and_load_for`] and [`TokenStore::load`] read
 /// through. A timeout is reported as [`KeyringRead::Failed`], which is the
 /// same unusable-backend answer a machine with no keychain daemon gives, so
 /// the file fallback takes over on both.
 fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
+    refuse_real_keychain_under_test("read");
     let owned = account.to_string();
     let read = keyring_call_bounded(timeout, "read", move || {
         match keyring::Entry::new(KEYRING_SERVICE, &owned) {
@@ -637,6 +714,7 @@ fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
 /// [`TokenStore::save_resolving_for`] and [`TokenStore::save`] write
 /// through. `Err` carries the reason, a timeout included.
 fn keyring_write(account: &str, json: String, timeout: Duration) -> Result<(), RemoteError> {
+    refuse_real_keychain_under_test("save");
     let owned = account.to_string();
     keyring_call_with_timeout(timeout, "save", move || {
         match keyring::Entry::new(KEYRING_SERVICE, &owned) {
@@ -650,6 +728,7 @@ fn keyring_write(account: &str, json: String, timeout: Duration) -> Result<(), R
 /// One bounded keychain delete for `account`. Deleting an entry that is not
 /// there is not an error, exactly as it was before the bound.
 fn keyring_delete(account: &str, timeout: Duration) -> Result<(), RemoteError> {
+    refuse_real_keychain_under_test("delete");
     let owned = account.to_string();
     keyring_call_with_timeout(timeout, "delete", move || {
         match keyring::Entry::new(KEYRING_SERVICE, &owned) {

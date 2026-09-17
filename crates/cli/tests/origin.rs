@@ -17,6 +17,9 @@
 
 use assert_cmd::Command;
 
+mod common;
+use common::isolate;
+
 fn bin() -> Command {
     Command::cargo_bin("crystalline").unwrap()
 }
@@ -122,19 +125,35 @@ fn origin_update_and_status_refuse_when_github_is_not_enabled() {
         .stderr(predicates::str::contains("github.enabled"));
 }
 
+/// `isolate` redirects `HOME`/`XDG_*` AND, load-bearingly here,
+/// `CRYSTALLINE_TEST_NO_KEYCHAIN`: `origin status`'s connection block reads
+/// this machine's GitHub credential even with zero team domains registered,
+/// and neither `--config` nor `--db` touches that read - it goes through
+/// `Engine::github_credential`, which resolves the OS keychain (a hardcoded
+/// service name, not derived from any base directory) unless this boolean
+/// seam refuses that backend first and falls back to the file store under
+/// the isolated state dir instead. Without `isolate` here this test asked
+/// the real login keychain for a `github` credential on every run -
+/// harmlessly on a machine with none stored, but a real prompt (or a
+/// contended, slow answer under a loaded parallel run) on one that has ever
+/// run `crystalline connect github` for real.
 #[test]
 fn origin_update_and_status_succeed_with_no_team_domains_once_enabled() {
+    let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let config = work.path().join("config.yaml");
     let db = work.path().join("state/index.db");
 
-    bin()
-        .args(["config", "set", "github.enabled", "true", "--config"])
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["config", "set", "github.enabled", "true", "--config"])
         .arg(&config)
         .assert()
         .success();
 
-    let out = bin()
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
         .args(["--json", "origin", "update", "--config"])
         .arg(&config)
         .args(["--db"])
@@ -146,7 +165,9 @@ fn origin_update_and_status_succeed_with_no_team_domains_once_enabled() {
     assert_eq!(data["domains"].as_array().unwrap().len(), 0);
     assert_eq!(data["errors"].as_array().unwrap().len(), 0);
 
-    let out = bin()
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
         .args(["--json", "origin", "status", "--config"])
         .arg(&config)
         .args(["--db"])
@@ -160,7 +181,9 @@ fn origin_update_and_status_succeed_with_no_team_domains_once_enabled() {
 
     // The human render mentions no domains and the disconnected state,
     // without panicking on the empty arrays.
-    let human = bin()
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let human = cmd
         .args(["origin", "status", "--config"])
         .arg(&config)
         .args(["--db"])
@@ -249,22 +272,31 @@ fn origin_share_withdraw_and_resolve_refuse_when_github_is_not_enabled() {
         .stderr(predicates::str::contains("github.enabled"));
 }
 
+/// Isolated the same way as
+/// `origin_update_and_status_succeed_with_no_team_domains_once_enabled`,
+/// even though every verb below fails at the domain-lookup check before
+/// `Engine::github_credential` ever runs: a future reordering of that check
+/// against the connection read must not silently regain a real keychain
+/// touch here.
 #[test]
 fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
+    let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let config = work.path().join("config.yaml");
     let db = work.path().join("state/index.db");
 
-    bin()
-        .args(["config", "set", "github.enabled", "true", "--config"])
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["config", "set", "github.enabled", "true", "--config"])
         .arg(&config)
         .assert()
         .success();
 
     // No such domain is registered, so each verb reaches the engine's real
     // domain-lookup error rather than failing at CLI flag parsing.
-    bin()
-        .args(["origin", "share", "brand", "--config"])
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "share", "brand", "--config"])
         .arg(&config)
         .args(["--db"])
         .arg(&db)
@@ -272,8 +304,9 @@ fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
         .failure()
         .stderr(predicates::str::contains("not registered"));
 
-    bin()
-        .args(["origin", "withdraw", "brand", "--proposal", "1", "--config"])
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "withdraw", "brand", "--proposal", "1", "--config"])
         .arg(&config)
         .args(["--db"])
         .arg(&db)
@@ -283,8 +316,9 @@ fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
 
     // --proposal is optional now: omitting it means "the single open one",
     // which still reaches the engine rather than tripping flag parsing.
-    bin()
-        .args(["origin", "withdraw", "brand", "--revert", "--config"])
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "withdraw", "brand", "--revert", "--config"])
         .arg(&config)
         .args(["--db"])
         .arg(&db)
@@ -292,8 +326,9 @@ fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
         .failure()
         .stderr(predicates::str::contains("not registered"));
 
-    bin()
-        .args(["origin", "resolve", "brand", "notes/a.md", "--keep", "mine"])
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "resolve", "brand", "notes/a.md", "--keep", "mine"])
         .args(["--config"])
         .arg(&config)
         .args(["--db"])
@@ -442,6 +477,13 @@ mod chain {
                 .env("XDG_STATE_HOME", self.dir.join("state"))
                 .env("XDG_CACHE_HOME", self.dir.join("cache"))
                 .env("CRYSTALLINE_SERVICE_HTTP", "false")
+                // Belt and suspenders: every command this mock daemon serves
+                // answers over the ctl socket before the CLI ever opens an
+                // engine, so nothing here should reach a credential store at
+                // all - but a future command that fell through to the
+                // standalone path must not silently regain a real keychain
+                // touch.
+                .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
                 .args(args);
             cmd.output().unwrap()
         }

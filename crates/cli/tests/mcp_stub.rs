@@ -69,7 +69,13 @@ impl Env {
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("XDG_CACHE_HOME", self.dir.join("cache"))
-            .env("CRYSTALLINE_SERVICE_HTTP", "false");
+            .env("CRYSTALLINE_SERVICE_HTTP", "false")
+            // Trips `crystalline_remote::token`'s boolean kill switch too:
+            // the OS keychain service name is a hardcoded constant, not
+            // derived from any base directory above, so anything that
+            // reached a credential store here would otherwise ask the real
+            // login keychain.
+            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1");
     }
 
     fn info_path(&self) -> PathBuf {

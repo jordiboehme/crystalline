@@ -54,7 +54,19 @@ impl Env {
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("XDG_CACHE_HOME", self.dir.join("cache"))
-            .env("CRYSTALLINE_SERVICE_HTTP", "false");
+            .env("CRYSTALLINE_SERVICE_HTTP", "false")
+            // A real daemon spawned here runs its background origin poller
+            // unconditionally; none of these tests turn `github.enabled` on
+            // for an origin-connected domain today, but the OS keychain
+            // service name is a hardcoded constant none of the four
+            // variables above reach, so a daemon that ever did would ask the
+            // real login keychain from its own timer, not just from a
+            // one-shot CLI call. This is the boolean kill switch
+            // (`crystalline_remote::token::refuse_real_keychain`), not
+            // `CRYSTALLINE_TEST_TOKEN_STORE_DIR`: it falls back to the file
+            // store under this daemon's own isolated state dir rather than
+            // a directory of its own.
+            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1");
     }
 
     fn state_dir(&self) -> PathBuf {

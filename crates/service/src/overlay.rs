@@ -106,6 +106,14 @@ const RESERVED_VARS: &[&str] = &[
     // it here or every run that uses it logs a spurious warning - the same
     // reason the postgres line above it is here.
     "CRYSTALLINE_TEST_TOKEN_STORE_DIR",
+    // `crystalline_remote::token`'s boolean kill switch
+    // (`refuse_real_keychain`): set, it refuses the real OS keychain
+    // backend everywhere in that module and falls back to the file store at
+    // whatever directory the caller already resolved, rather than
+    // redirecting to a directory of its own the way the variable above
+    // does. Read straight from the environment in `crates/remote`, never
+    // through the settings registry, so reserved here for the same reason.
+    "CRYSTALLINE_TEST_NO_KEYCHAIN",
     // The install-channel marker (see [`crate::stub::CHANNEL_ENV`]): the mcpb
     // manifest sets it so the degraded status server can tell the Desktop
     // extension apart from a plain install. It is read straight from the
