@@ -48,3 +48,26 @@ fn version_output_names_the_copyright_the_license_and_the_source() {
     );
     assert_eq!(lines[2], env!("CARGO_PKG_REPOSITORY"));
 }
+
+/// The CLI's `--version` block and the daemon's banner name the same copyright
+/// holder and year. Two `concat!` literals in two crates is what the version
+/// task's review flagged: `concat!` takes literal tokens only and cannot read a
+/// const, so an assertion is the whole of what can hold them together. This is
+/// the test that fails the day one of them is changed alone.
+#[test]
+fn the_version_block_and_the_banner_name_one_holder() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_crystalline"))
+        .arg("--version")
+        .output()
+        .expect("the binary runs");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let second = stdout
+        .lines()
+        .nth(1)
+        .expect("the version block has three lines");
+    assert!(
+        second.starts_with(crystalline_service::daemon::COPYRIGHT_HOLDER),
+        "the CLI prints `{second}`, the daemon's banner says `{}`",
+        crystalline_service::daemon::COPYRIGHT_HOLDER
+    );
+}

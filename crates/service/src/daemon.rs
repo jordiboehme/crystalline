@@ -71,11 +71,19 @@ const BANNER: &str = r"
 /// environment rather than retyped, matching `crates/cli/src/main.rs`'s
 /// `VERSION_BLOCK`.
 const COPYRIGHT_LINE: &str = concat!(
-    "Copyright (C) 2026 Jordi Böhme - ",
+    "Copyright (C) 2026 Jordi Böhme",
+    " - ",
     env!("CARGO_PKG_LICENSE"),
     " - ",
     env!("CARGO_PKG_REPOSITORY"),
 );
+
+/// The copyright holder and year, named once for the whole workspace. Public
+/// because `crates/cli/src/main.rs` builds its own `VERSION_BLOCK` with
+/// `concat!`, which takes literal tokens only and so cannot read this: what it
+/// can do is assert against it, which `the_version_block_and_the_banner_name_one_holder`
+/// does, so the two spellings cannot drift apart unnoticed.
+pub const COPYRIGHT_HOLDER: &str = "Copyright (C) 2026 Jordi Böhme";
 
 /// A tracked live session.
 #[derive(Clone, serde::Serialize)]

@@ -1753,6 +1753,83 @@ fn an_occupied_http_address_is_not_fatal_and_says_so() {
     let _ = child.wait();
 }
 
+/// A foreground `serve` prints the copyright line even when stderr is
+/// redirected, because AGPL section 13 means a user of a running instance has
+/// to be able to see where the source is. The line sits after the
+/// `is_terminal()` guard that owns the ASCII banner and inside `if
+/// !daemon_flag`, and only running it proves that placement.
+///
+/// This Env's `apply` sets `CRYSTALLINE_SERVICE_HTTP=false` and no `--http`
+/// flag is passed, so the fixture serves no HTTP endpoint at all - which is
+/// what the second assertion below trades on.
+#[test]
+fn a_foreground_serve_prints_the_copyright_line_to_a_redirected_stderr() {
+    let env = Env::new("copyright");
+    env.setup_domain("eng");
+
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut serving_line = None;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("serving on") => {
+                serving_line = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    serving_line.expect("the daemon announces where it is serving");
+
+    // The copyright line follows right after; collect a little more to see it.
+    let mut copyright_line = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("Copyright") => {
+                copyright_line = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let stderr = copyright_line.expect("a redirected foreground run still prints the copyright line");
+    assert!(
+        stderr.contains(crystalline_service::daemon::COPYRIGHT_HOLDER),
+        "a redirected foreground run still names the holder: {stderr}"
+    );
+    assert!(
+        !stderr.contains("crystalline HTTP endpoint on"),
+        "and this fixture serves no HTTP endpoint, so the assertion above is about the banner line and nothing else: {stderr}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// A flag that contradicts configuration says so at startup, naming both
 /// values and the key, and the daemon serves anyway. This Env sets
 /// CRYSTALLINE_SERVICE_HTTP=false, so `--http <port>` is a real difference.
