@@ -1357,6 +1357,41 @@ pub struct DomainStats {
     /// are complete rows either way, because a rebuild never clears anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebuild_started: Option<String>,
+    /// Which rebuild verb stamped [`DomainStats::rebuild_started`] - `full` or
+    /// `wipe` - or `None` when no rebuild is in flight (and for a marker a
+    /// binary older than the column stamped).
+    ///
+    /// The two verbs are opposites and a reader must not describe one as the
+    /// other: a forced rebuild destroys nothing, so the domain's rows are the
+    /// complete ones from before it; a wipe destroyed every row and every
+    /// embedding before it started, so what is there is only what its rebuild
+    /// managed before it stopped. `None` is read as neither: say that a rebuild
+    /// did not finish and name the command that finishes it, and claim nothing
+    /// about what is in the rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild_kind: Option<String>,
+}
+
+/// Which rebuild verb is stamping a domain's marker: `reindex --full`, which
+/// destroys nothing, or `reindex --wipe`, which destroyed every row and every
+/// embedding before it began. Carried into [`Store::begin_rebuild`] so an
+/// interrupted run can be described in the words of the verb that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildKind {
+    /// `reindex --full`: every file re-read, nothing destroyed.
+    Full,
+    /// `reindex --wipe`: the index emptied first, embeddings and all.
+    Wipe,
+}
+
+impl RebuildKind {
+    /// The word stored in the marker column and printed to a person.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RebuildKind::Full => "full",
+            RebuildKind::Wipe => "wipe",
+        }
+    }
 }
 
 /// The instance currently holding a file domain's host lock in a shared
@@ -2069,15 +2104,21 @@ pub trait Store: Send + Sync {
     async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()>;
 
     /// Stamp a domain as having a forced rebuild in flight, `when` being an RFC
-    /// 3339 instant. Written in the first lock window of the domain's rebuild,
-    /// before anything is read from disk.
+    /// 3339 instant and `kind` the verb that is running. Written in the first
+    /// lock window of the domain's rebuild, before anything is read from disk.
+    ///
+    /// The kind is stamped with the instant because the two verbs leave
+    /// opposite states behind and a reader cannot tell them apart afterwards:
+    /// an interrupted `--full` left complete rows from before it, an
+    /// interrupted `--wipe` left whatever its rebuild had managed and no
+    /// embeddings at all.
     ///
     /// The stamp is durable on purpose. The in-memory activity record the
     /// daemon keeps dies with the process, and the incident this exists for was
     /// on the daemonless path, which has no activity record at all: whatever
     /// runs, the fact that a rebuild started has to outlive the process that
     /// started it, so an interrupted run is never read as a normal one.
-    async fn begin_rebuild(&self, domain: DomainId, when: &str) -> Result<()>;
+    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()>;
 
     /// Clear a domain's rebuild stamp. Called from inside the transaction that
     /// commits the rebuild's apply, so the marker is set exactly while that

@@ -105,8 +105,9 @@ use crate::store::{
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
-    Page, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery, Store, StoreInfo,
-    StoredEngram, Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
+    Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
+    Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, folder_slash, page_window,
+    reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -2276,10 +2277,11 @@ impl Store for PostgresStore {
     /// transaction connection when one is open - the same reason `record_sync`
     /// does, and the reason clearing the marker inside the apply's transaction
     /// is atomic with it here as it is on Turso.
-    async fn begin_rebuild(&self, domain: DomainId, when: &str) -> Result<()> {
+    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()> {
         let mut conn = self.acquire().await?;
-        sqlx::query("UPDATE domain SET rebuild_started=$1 WHERE id=$2")
+        sqlx::query("UPDATE domain SET rebuild_started=$1, rebuild_kind=$2 WHERE id=$3")
             .bind(when)
+            .bind(kind.as_str())
             .bind(domain.0)
             .execute(conn.as_mut())
             .await
@@ -2289,7 +2291,7 @@ impl Store for PostgresStore {
 
     async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
         let mut conn = self.acquire().await?;
-        sqlx::query("UPDATE domain SET rebuild_started=NULL WHERE id=$1")
+        sqlx::query("UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=$1")
             .bind(domain.0)
             .execute(conn.as_mut())
             .await
@@ -2463,7 +2465,7 @@ impl Store for PostgresStore {
              (SELECT count(*) FROM link l JOIN engram e ON e.id=l.engram_id \
               WHERE l.domain_id=d.id AND l.to_id IS NULL AND e.actor = ''), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
-             d.last_registered, d.rebuild_started \
+             d.last_registered, d.rebuild_started, d.rebuild_kind \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
         )
         .fetch_all(conn.as_mut())
@@ -2487,6 +2489,7 @@ impl Store for PostgresStore {
                 host_heartbeat_at: cell_text(r, 13),
                 last_registered: cell_text(r, 14),
                 rebuild_started: cell_text(r, 15),
+                rebuild_kind: cell_text(r, 16),
             })
             .collect())
     }

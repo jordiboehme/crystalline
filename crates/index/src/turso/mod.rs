@@ -44,8 +44,9 @@ use crate::store::{
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
-    Page, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery, Store, StoreInfo,
-    StoredEngram, Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
+    Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
+    Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, folder_slash, page_window,
+    reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -2249,11 +2250,15 @@ impl Store for TursoStore {
         Ok(())
     }
 
-    async fn begin_rebuild(&self, domain: DomainId, when: &str) -> Result<()> {
+    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE domain SET rebuild_started=?1 WHERE id=?2",
-                vec![Value::Text(when.to_string()), Value::Integer(domain.0)],
+                "UPDATE domain SET rebuild_started=?1, rebuild_kind=?2 WHERE id=?3",
+                vec![
+                    Value::Text(when.to_string()),
+                    Value::Text(kind.as_str().to_string()),
+                    Value::Integer(domain.0),
+                ],
             )
             .await?;
         Ok(())
@@ -2262,7 +2267,7 @@ impl Store for TursoStore {
     async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE domain SET rebuild_started=NULL WHERE id=?1",
+                "UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=?1",
                 vec![Value::Integer(domain.0)],
             )
             .await?;
@@ -2424,7 +2429,7 @@ impl Store for TursoStore {
              (SELECT count(*) FROM link l JOIN engram e ON e.id=l.engram_id \
               WHERE l.domain_id=d.id AND l.to_id IS NULL AND e.actor = ''), \
              dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
-             d.last_registered, d.rebuild_started \
+             d.last_registered, d.rebuild_started, d.rebuild_kind \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
             vec![],
         )
@@ -2447,6 +2452,7 @@ impl Store for TursoStore {
                 host_heartbeat_at: cell_text(r, 13),
                 last_registered: cell_text(r, 14),
                 rebuild_started: cell_text(r, 15),
+                rebuild_kind: cell_text(r, 16),
             })
             .collect())
     }

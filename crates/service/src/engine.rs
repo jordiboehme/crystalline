@@ -39,11 +39,11 @@ use crystalline_index::{
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
     EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
     EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
-    InboundQuery, IndexError, RULES, RecentFilter, ReindexHooks, SearchMode, SearchQuery,
-    ShareFacts, Store, StoredEngram, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
-    chunk_engram, configured_model_id, detect, is_retired_status, order_jobs_for_batching,
-    parse_metadata_filters, provider_from_config, rank, reindex_domains, resolve_forward_refs,
-    retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    InboundQuery, IndexError, RULES, RebuildKind, RecentFilter, ReindexHooks, SearchMode,
+    SearchQuery, ShareFacts, Store, StoredEngram, SweepInput, SweepOptions, SweepReport,
+    SyncReport, apply_scan, chunk_engram, configured_model_id, detect, is_retired_status,
+    order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, reindex_domains,
+    resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -12802,8 +12802,14 @@ impl Engine {
             engine: self,
             collab: !self.instance_id.is_empty(),
         };
-        let reports =
-            reindex_domains(&*self.store, &targets, &self.chunk_params, full, &hooks).await?;
+        let reports = reindex_domains(
+            &*self.store,
+            &targets,
+            &self.chunk_params,
+            full.then_some(RebuildKind::Full),
+            &hooks,
+        )
+        .await?;
         Ok(json!({
             "full": full,
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),

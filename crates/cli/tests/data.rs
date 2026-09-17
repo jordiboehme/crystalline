@@ -1629,3 +1629,107 @@ fn wipe_refuses_for_a_virtual_domain_when_the_database_will_not_open() {
         "nothing was set aside either: the refusal comes before the open"
     );
 }
+
+/// The marker mechanism is shared by both rebuild verbs, and the two verbs are
+/// opposites: a forced rebuild destroys nothing, a wipe destroys everything
+/// before it starts. So the marker records which one was running, and status and
+/// doctor say what that means - after an interrupted wipe the rows and the
+/// embeddings really are gone, and telling a person "nothing was destroyed" is
+/// the exact misreading the marker exists to prevent.
+#[test]
+fn an_interrupted_wipe_says_its_rows_and_embeddings_are_gone() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    let second = work.path().join("kb2");
+    bin()
+        .args(["domain", "init"])
+        .arg(&second)
+        .args(["--name", "two"])
+        .assert()
+        .success();
+    write(
+        &second,
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nGamma body mentions zephyrtoken.\n",
+    );
+    bin()
+        .args(["domain", "add", "two"])
+        .arg(&second)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    // The interruption, in the same window a SIGTERM lands in: the wipe has
+    // already destroyed everything and stamped this domain, and its rebuild
+    // cannot run.
+    std::fs::remove_dir_all(&second).unwrap();
+    let out = bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the interrupted wipe fails");
+
+    let out = bin()
+        .args(["--json", "status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let two = status["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == serde_json::json!("two"))
+        .expect("domain two is in the report");
+    assert_eq!(
+        two["rebuild_kind"],
+        serde_json::json!("wipe"),
+        "the marker says which kind of rebuild it was: {status}"
+    );
+
+    let out = bin()
+        .args(["status", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        human.contains("a wipe of 'two' started")
+            && human.contains("did not finish")
+            && human.contains("Run: crystalline reindex --full"),
+        "status names the verb that was running: {human}"
+    );
+    assert!(
+        !human.contains("the ones from before it"),
+        "and never claims the rows are the ones from before a wipe: {human}"
+    );
+
+    let out = bin()
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        human.contains("a wipe started") && human.contains("Run: crystalline reindex --full"),
+        "doctor names it too: {human}"
+    );
+    assert!(
+        !human.contains("nothing was destroyed"),
+        "and never reassures a person that nothing was destroyed: {human}"
+    );
+}

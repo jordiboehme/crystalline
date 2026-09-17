@@ -87,6 +87,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram actor dimension",
         sql: SCHEMA_V13,
     },
+    Migration {
+        version: 14,
+        label: "domain rebuild kind",
+        sql: SCHEMA_V14,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -368,6 +373,21 @@ ALTER TABLE domain ADD COLUMN last_registered TEXT;
 // it rather than a half-built set, because a rebuild clears nothing.
 const SCHEMA_V12: &str = r#"
 ALTER TABLE domain ADD COLUMN rebuild_started TEXT;
+"#;
+
+// Which verb stamped the rebuild marker beside it, `full` or `wipe`.
+//
+// Nullable with no default and no backfill, like the marker itself. NULL means
+// no rebuild is in flight - and, for a row a binary older than this column
+// stamped, that the kind is simply unknown. A reader treats the two alike: it
+// says a rebuild did not finish and names the command that finishes it, and
+// claims nothing about what the rows hold. It has to, because the two verbs
+// leave opposite states behind: an interrupted `--full` left the complete rows
+// from before it, an interrupted `--wipe` destroyed every row and every
+// embedding before it began and left only what its rebuild managed. Telling a
+// person the wrong one of those is the misreading the marker exists to prevent.
+const SCHEMA_V14: &str = r#"
+ALTER TABLE domain ADD COLUMN rebuild_kind TEXT;
 "#;
 
 // The actor dimension. Every engram row gains the actor it belongs to and a
@@ -652,6 +672,70 @@ mod tests {
             .await,
             2,
             "and the finished rebuild clears back to NULL"
+        );
+    }
+
+    /// The v14 column against a domain row that predates it.
+    ///
+    /// A marker a binary older than the kind column stamped comes out of the
+    /// migration with `rebuild_kind` NULL beside a `rebuild_started` that is
+    /// set, which is the shape a reader has to tolerate: it says a rebuild did
+    /// not finish and claims nothing about what the rows hold, because the two
+    /// verbs leave opposite states behind.
+    #[tokio::test]
+    async fn v14_leaves_a_marker_written_before_it_without_a_kind() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for m in &MIGRATIONS[..13] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+        assert_eq!(
+            MIGRATIONS[13].version, 14,
+            "the fourteenth migration is v14"
+        );
+
+        conn.execute_batch(
+            "INSERT INTO domain(id, name, path, rebuild_started) \
+             VALUES (1,'old','/tmp/old',NULL),(2,'busy','/tmp/busy','2026-09-14T00:00:00Z');",
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[13].sql).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE rebuild_kind IS NULL"
+            )
+            .await,
+            2,
+            "no backfill: the standing marker keeps its instant and has no kind"
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE rebuild_started IS NOT NULL"
+            )
+            .await,
+            1,
+            "and the marker itself survived the migration"
+        );
+
+        conn.execute(
+            "UPDATE domain SET rebuild_started='2026-09-17T00:00:00Z', rebuild_kind='wipe' WHERE name='old'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE rebuild_kind='wipe'"
+            )
+            .await,
+            1,
+            "a new stamp carries the verb that is running"
         );
     }
 

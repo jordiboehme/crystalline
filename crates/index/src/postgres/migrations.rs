@@ -86,6 +86,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram actor dimension",
         sql: SCHEMA_V12,
     },
+    Migration {
+        version: 13,
+        label: "domain rebuild kind",
+        sql: SCHEMA_V13,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -349,6 +354,15 @@ const SCHEMA_V11: &str = r#"
 ALTER TABLE domain ADD COLUMN IF NOT EXISTS rebuild_started TEXT;
 "#;
 
+// The Turso v14 column, same meaning: which verb stamped the rebuild marker
+// beside it, `full` or `wipe`, NULL when no rebuild is in flight and for a
+// marker a binary older than the column stamped. Nullable, no default, no
+// backfill, and converging on a retry the way every migration in this dialect
+// does.
+const SCHEMA_V13: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS rebuild_kind TEXT;
+"#;
+
 // The actor dimension, the Turso v13 migration's twin. `actor = ''` is the base
 // row - the one the domain's files on disk say exists - and any other value is
 // one actor's private draft at that path, a full row in its own right so
@@ -533,6 +547,85 @@ mod tests {
             marked.0, 1,
             "the stamped row carries a value and the row beside it still does not"
         );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The v13 column against a database written before it, carrying a marker
+    /// an older binary stamped: the instant survives and the kind reads NULL,
+    /// which is the shape a reader has to tolerate - it says a rebuild did not
+    /// finish and claims nothing about what the rows hold.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate the
+    /// parity suite uses.
+    #[tokio::test]
+    async fn v13_leaves_a_marker_written_before_it_without_a_kind() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig13_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // A database at v12: everything up to but not including the kind.
+        for m in &MIGRATIONS[..12] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        assert_eq!(
+            MIGRATIONS[12].version, 13,
+            "the thirteenth migration is v13"
+        );
+        sqlx::raw_sql(
+            "INSERT INTO domain(name, path, rebuild_started) \
+             VALUES ('old','/tmp/old',NULL),('busy','/tmp/busy','2026-09-14T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATIONS[12].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let kindless: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_kind IS NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            kindless.0, 2,
+            "no backfill: the standing marker keeps its instant and has no kind"
+        );
+        let marked: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_started IS NOT NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(marked.0, 1, "and the marker itself survived the migration");
+
+        sqlx::raw_sql(
+            "UPDATE domain SET rebuild_started='2026-09-17T00:00:00Z', rebuild_kind='wipe' WHERE name='old'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let wiped: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_kind='wipe'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(wiped.0, 1, "a new stamp carries the verb that is running");
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&mut conn)

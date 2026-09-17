@@ -95,7 +95,9 @@ use crystalline_core::{MAX_ATTACHMENT_BYTES, attachment_mime, validate_asset_pat
 
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
-use crate::store::{AttachmentRow, DomainId, DomainKind, EngramRecord, FileStamp, NewChunk, Store};
+use crate::store::{
+    AttachmentRow, DomainId, DomainKind, EngramRecord, FileStamp, NewChunk, RebuildKind, Store,
+};
 
 /// Maximum concurrent hashing or parsing tasks.
 const CONCURRENCY: usize = 8;
@@ -866,9 +868,15 @@ impl ReindexHooks for NoReindexHooks {}
 /// uses - resolve the domain and snapshot its stamps under the lock, walk and
 /// hash with no lock held, apply transactionally in a second window - so a
 /// large domain's rebuild never blocks concurrent readers behind the mutex.
-/// Under `force` the first window also stamps the domain's rebuild marker,
+/// `rebuild` says which verb is running and whether this is a forced run at
+/// all: `None` is an ordinary incremental pass, `Some` forces every file to be
+/// re-read and also stamps each domain's rebuild marker in the first window,
 /// which the apply's own transaction clears, so a rebuild that never finished
 /// says so afterwards instead of reporting its rows as freshly rebuilt ones.
+/// The marker carries the verb with it, because an interrupted
+/// [`RebuildKind::Full`] left the complete rows from before it while an
+/// interrupted [`RebuildKind::Wipe`] destroyed them and every embedding before
+/// it began, and a reader must not describe one as the other.
 ///
 /// The run ends with [`resolve_forward_refs`] over the domains it applied and
 /// one [`Store::checkpoint_wal`], for both callers: a reindex is a
@@ -877,9 +885,10 @@ pub async fn reindex_domains(
     store: &tokio::sync::Mutex<dyn Store>,
     targets: &[(String, PathBuf)],
     chunk_params: &ChunkParams,
-    force: bool,
+    rebuild: Option<RebuildKind>,
     hooks: &dyn ReindexHooks,
 ) -> Result<Vec<SyncReport>> {
+    let force = rebuild.is_some();
     // Each domain this run applied, paired with the report its apply produced,
     // for the final cross-domain resolution pass. A domain a hook skipped wrote
     // nothing and is not in the list at all.
@@ -897,10 +906,10 @@ pub async fn reindex_domains(
                     .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
                     .await
                     .map_err(|e| in_domain("reindex", name, e))?;
-                if force {
+                if let Some(kind) = rebuild {
                     let now = chrono::Utc::now().to_rfc3339();
                     store
-                        .begin_rebuild(domain, &now)
+                        .begin_rebuild(domain, &now, kind)
                         .await
                         .map_err(|e| in_domain("reindex", name, e))?;
                 }

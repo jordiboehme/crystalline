@@ -155,6 +155,14 @@ pub struct DomainDoctor {
     /// never that the data is gone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rebuild_started: Option<String>,
+    /// Which verb stamped [`DomainDoctor::rebuild_started`] - `full` or `wipe`
+    /// - or `None` when none is in flight or the kind is not recorded.
+    ///
+    /// The two verbs leave opposite states behind, so the finding is worded
+    /// from this: a forced rebuild destroyed nothing, a wipe destroyed every row
+    /// and every embedding before it began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_kind: Option<String>,
 }
 
 /// One `E006` encoding finding, reported by `doctor`, fixed by `verify`.
@@ -758,13 +766,13 @@ pub async fn run(
     // Only the direct route can read them: the daemon's doctor answer carries
     // file stamps and nothing else, so a daemon-served run leaves the field
     // absent rather than reporting a rebuild that is not there.
-    let mut rebuild_markers: HashMap<String, String> = HashMap::new();
+    let mut rebuild_markers: HashMap<String, (String, Option<String>)> = HashMap::new();
     if let Some(store) = store_ref
         && let Ok(stats) = store.domain_stats().await
     {
         for d in stats {
             if let Some(started) = d.rebuild_started {
-                rebuild_markers.insert(d.name, started);
+                rebuild_markers.insert(d.name, (started, d.rebuild_kind));
             }
         }
     }
@@ -1026,7 +1034,29 @@ async fn check_domain(
     entry: &DomainEntry,
     store: Option<&dyn Store>,
     daemon_stamps: Option<HashMap<String, FileStamp>>,
-    rebuild_started: Option<String>,
+    rebuild_marker: Option<(String, Option<String>)>,
+    fix: bool,
+) -> Result<DomainDoctor> {
+    // The marker is stamped onto every shape of report, not only the one the
+    // on-disk checks run to the end of. A domain whose folder has gone is
+    // exactly how a rebuild gets interrupted in the first place, and that
+    // report must still say a rebuild did not finish rather than only that the
+    // path is missing.
+    let mut d = check_domain_checks(name, entry, store, daemon_stamps, fix).await?;
+    if let Some((started, kind)) = rebuild_marker {
+        d.rebuild_started = Some(started);
+        d.rebuild_kind = kind;
+    }
+    Ok(d)
+}
+
+/// [`check_domain`] without the rebuild marker: the path, MANIFEST, orphan,
+/// unindexed and encoding checks themselves.
+async fn check_domain_checks(
+    name: &str,
+    entry: &DomainEntry,
+    store: Option<&dyn Store>,
+    daemon_stamps: Option<HashMap<String, FileStamp>>,
     fix: bool,
 ) -> Result<DomainDoctor> {
     // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
@@ -1184,7 +1214,6 @@ async fn check_domain(
         }
     }
 
-    d.rebuild_started = rebuild_started;
     Ok(d)
 }
 
@@ -1847,10 +1876,25 @@ pub fn render_human(report: &DoctorReport) -> String {
         // it - and a re-run while one is in flight waits on the store lock
         // rather than colliding.
         if let Some(started) = &d.rebuild_started {
-            let _ = writeln!(
-                out,
-                "  [problem] a full rebuild started {started} has not finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
-            );
+            let _ = match d.rebuild_kind.as_deref() {
+                // A wipe emptied the index before it began, so the rows here are
+                // whatever its rebuild managed and every embedding is gone.
+                // Saying anything else is the misreading the marker exists for.
+                Some("wipe") => writeln!(
+                    out,
+                    "  [problem] a wipe started {started} has not finished; this domain's rows and every embedding it had were destroyed before it began. Run: crystalline reindex --full"
+                ),
+                Some("full") => writeln!(
+                    out,
+                    "  [problem] a full rebuild started {started} has not finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
+                ),
+                // A marker a binary older than the kind column stamped: say what
+                // is known and claim nothing about the rows either way.
+                _ => writeln!(
+                    out,
+                    "  [problem] a rebuild started {started} has not finished. Run: crystalline reindex --full"
+                ),
+            };
         }
         if d.is_virtual {
             match d.engrams {
@@ -2132,17 +2176,30 @@ pub fn render_human(report: &DoctorReport) -> String {
         // was the middle of something. Coverage can only ever rise across a
         // rebuild now, and saying so is what stops the number being misread in
         // the other direction too.
-        let unfinished: Vec<&str> = report
+        let unfinished: Vec<&DomainDoctor> = report
             .domains
             .iter()
             .filter(|d| d.rebuild_started.is_some())
-            .map(|d| d.name.as_str())
             .collect();
-        if !unfinished.is_empty() {
+        let names = unfinished
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // One unfinished wipe is enough to make the whole figure a post-wipe
+        // one: the wipe emptied the index, not one domain's corner of it.
+        let wiped = unfinished
+            .iter()
+            .any(|d| d.rebuild_kind.as_deref() == Some("wipe"));
+        if wiped {
             let _ = writeln!(
                 out,
-                "  counted while an unfinished rebuild of {} stands; nothing was destroyed, so this figure is the one from before it",
-                unfinished.join(", ")
+                "  counted while an unfinished wipe of {names} stands; the wipe destroyed every embedding before it began, so this figure is what has been re-embedded since, not the one from before it"
+            );
+        } else if !unfinished.is_empty() {
+            let _ = writeln!(
+                out,
+                "  counted while an unfinished rebuild of {names} stands; nothing was destroyed, so this figure is the one from before it"
             );
         }
     } else {
@@ -2503,6 +2560,7 @@ mod tests {
     fn an_unfinished_rebuild_is_a_problem_that_qualifies_the_coverage_figure() {
         let mut report = report_with_orphans(IndexAccess::Direct, &[]);
         report.domains[0].rebuild_started = Some("2026-09-14T09:00:00Z".to_string());
+        report.domains[0].rebuild_kind = Some("full".to_string());
         report.embeddings = Some(serde_json::json!({
             "embedded_with_configured_model": 768,
             "total_chunks": 23598,
@@ -2525,6 +2583,31 @@ mod tests {
             report.remaining_problems(),
             1,
             "an unfinished rebuild is one problem, so doctor exits non-zero"
+        );
+
+        // A wipe is the opposite verb: it destroyed the rows and every
+        // embedding before it started, so neither sentence may reassure.
+        report.domains[0].rebuild_kind = Some("wipe".to_string());
+        let wiped = render_human(&report);
+        assert!(
+            wiped.contains(
+                "[problem] a wipe started 2026-09-14T09:00:00Z has not finished; this domain's rows and every embedding it had were destroyed before it began. Run: crystalline reindex --full"
+            ),
+            "{wiped}"
+        );
+        assert!(
+            !wiped.contains("nothing was destroyed") && !wiped.contains("the ones from before it"),
+            "the coverage caveat says the figure is what has been re-embedded since: {wiped}"
+        );
+        // A marker a binary older than the kind column stamped says what is
+        // known and claims nothing about the rows either way.
+        report.domains[0].rebuild_kind = None;
+        let unknown = render_human(&report);
+        assert!(
+            unknown.contains(
+                "[problem] a rebuild started 2026-09-14T09:00:00Z has not finished. Run: crystalline reindex --full"
+            ),
+            "{unknown}"
         );
 
         // Cleared, it is neither a finding nor a caveat.

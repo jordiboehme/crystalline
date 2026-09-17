@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use crystalline_index::{
     ChunkParams, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE, EmbeddingProvider,
-    EngramRecord, FileStamp, NoReindexHooks, Store, TursoStore, apply_scan, reindex_domains,
-    run_embedding_pass, scan_domain,
+    EngramRecord, FileStamp, NoReindexHooks, RebuildKind, Store, TursoStore, apply_scan,
+    reindex_domains, run_embedding_pass, scan_domain,
 };
 use tokio::sync::Mutex;
 
@@ -275,7 +275,7 @@ async fn interrupted_rebuild_leaves_the_old_index_serving(store: Arc<Mutex<dyn S
         ("a".to_string(), a_root.clone()),
         ("b".to_string(), b_root.clone()),
     ];
-    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
         .await
         .unwrap();
     embed_everything(&store).await;
@@ -288,9 +288,15 @@ async fn interrupted_rebuild_leaves_the_old_index_serving(store: Arc<Mutex<dyn S
 
     // The interruption: domain b cannot be scanned any more.
     std::fs::remove_dir_all(&b_root).unwrap();
-    let err = reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
-        .await
-        .expect_err("the forced run fails in domain b");
+    let err = reindex_domains(
+        &*store,
+        &targets,
+        &params(),
+        Some(RebuildKind::Full),
+        &NoReindexHooks,
+    )
+    .await
+    .expect_err("the forced run fails in domain b");
     assert!(
         err.to_string().contains("reindex of 'b' failed"),
         "the failure names the domain it happened in: {err}"
@@ -329,7 +335,7 @@ async fn a_completed_rebuild_rereads_what_a_sync_skips(store: Arc<Mutex<dyn Stor
     write(&root, "drifted.md", &engram("Drift", "drift", "aaaa bbbb"));
 
     let targets = vec![("d".to_string(), root.clone())];
-    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
         .await
         .unwrap();
     embed_everything(&store).await;
@@ -347,7 +353,7 @@ async fn a_completed_rebuild_rereads_what_a_sync_skips(store: Arc<Mutex<dyn Stor
 
     // A plain sync cannot see it: same mtime, same size, so the prefilter never
     // hashes the file at all.
-    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
         .await
         .unwrap();
     let stale = body_of(&store, domain, "drifted.md").await;
@@ -357,9 +363,15 @@ async fn a_completed_rebuild_rereads_what_a_sync_skips(store: Arc<Mutex<dyn Stor
     );
 
     // The forced run re-reads every file, so it catches it.
-    reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
-        .await
-        .unwrap();
+    reindex_domains(
+        &*store,
+        &targets,
+        &params(),
+        Some(RebuildKind::Full),
+        &NoReindexHooks,
+    )
+    .await
+    .unwrap();
     let fresh = body_of(&store, domain, "drifted.md").await;
     assert!(
         fresh.contains("cccc dddd") && !fresh.contains("aaaa bbbb"),
@@ -410,7 +422,7 @@ async fn a_forced_resync_keeps_overlay_rows(store: Arc<Mutex<dyn Store>>) {
     write(&root, "a.md", &engram("A", "a", "base a"));
     write(&root, "b.md", &engram("B", "b", "base b"));
     let targets = vec![("d".to_string(), root.clone())];
-    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
         .await
         .unwrap();
     let domain = domain_id(&store, "d", &root).await;
@@ -470,9 +482,15 @@ async fn a_forced_resync_keeps_overlay_rows(store: Arc<Mutex<dyn Store>>) {
         );
     }
 
-    let reports = reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
-        .await
-        .unwrap();
+    let reports = reindex_domains(
+        &*store,
+        &targets,
+        &params(),
+        Some(RebuildKind::Full),
+        &NoReindexHooks,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         reports.iter().map(|r| r.deleted).sum::<usize>(),
         0,
@@ -549,7 +567,7 @@ async fn a_forced_reindex_leaves_nothing_to_embed(store: Arc<Mutex<dyn Store>>) 
         );
     }
     let targets = vec![("d".to_string(), root.clone())];
-    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
         .await
         .unwrap();
     embed_everything(&store).await;
@@ -565,9 +583,15 @@ async fn a_forced_reindex_leaves_nothing_to_embed(store: Arc<Mutex<dyn Store>>) 
         "the corpus starts fully embedded"
     );
 
-    reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
-        .await
-        .unwrap();
+    reindex_domains(
+        &*store,
+        &targets,
+        &params(),
+        Some(RebuildKind::Full),
+        &NoReindexHooks,
+    )
+    .await
+    .unwrap();
 
     let store = store.lock().await;
     let pending = store
@@ -615,7 +639,7 @@ async fn a_forced_reindex_still_prunes_deletes(store: Arc<Mutex<dyn Store>>) {
         &engram("Goes", "goes", "- [note] doomed observation\n"),
     );
     let targets = vec![("d".to_string(), root.clone())];
-    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
         .await
         .unwrap();
     let before = stats_of(&store, "d").await;
@@ -623,9 +647,15 @@ async fn a_forced_reindex_still_prunes_deletes(store: Arc<Mutex<dyn Store>>) {
     assert_eq!(before.observations, 2);
 
     std::fs::remove_file(root.join("goes.md")).unwrap();
-    let reports = reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
-        .await
-        .unwrap();
+    let reports = reindex_domains(
+        &*store,
+        &targets,
+        &params(),
+        Some(RebuildKind::Full),
+        &NoReindexHooks,
+    )
+    .await
+    .unwrap();
     assert_eq!(reports[0].deleted, 1, "the run reports the prune");
 
     let after = stats_of(&store, "d").await;
@@ -673,7 +703,7 @@ async fn a_failed_apply_leaves_the_marker_standing(store: Arc<Mutex<dyn Store>>)
     write(&root, "b.md", &engram("B", "b", "beta payload"));
 
     let targets = vec![("d".to_string(), root.clone())];
-    reindex_domains(&*store, &targets, &params(), false, &NoReindexHooks)
+    reindex_domains(&*store, &targets, &params(), None, &NoReindexHooks)
         .await
         .unwrap();
     embed_everything(&store).await;
@@ -685,7 +715,10 @@ async fn a_failed_apply_leaves_the_marker_standing(store: Arc<Mutex<dyn Store>>)
     let now = "2026-09-14T10:00:00Z";
     let snapshot = {
         let store = store.lock().await;
-        store.begin_rebuild(domain, now).await.unwrap();
+        store
+            .begin_rebuild(domain, now, RebuildKind::Full)
+            .await
+            .unwrap();
         store.file_stamps(domain).await.unwrap()
     };
     let scan = scan_domain("d", &root, snapshot, &params(), true)
@@ -728,9 +761,15 @@ async fn a_failed_apply_leaves_the_marker_standing(store: Arc<Mutex<dyn Store>>)
     );
 
     // The rebuild that does land clears it, in the transaction that commits it.
-    reindex_domains(&*store, &targets, &params(), true, &NoReindexHooks)
-        .await
-        .unwrap();
+    reindex_domains(
+        &*store,
+        &targets,
+        &params(),
+        Some(RebuildKind::Full),
+        &NoReindexHooks,
+    )
+    .await
+    .unwrap();
     assert!(
         stats_of(&store, "d").await.rebuild_started.is_none(),
         "a committed rebuild clears the marker"

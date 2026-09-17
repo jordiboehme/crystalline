@@ -41,10 +41,10 @@ pub use store::{
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector,
-    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RecentFilter,
-    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount,
-    Vocabulary, is_current_status, is_retired_status, merge_vocabularies, parse_metadata_filters,
-    retired_factor, salience_prior,
+    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, TagAlias,
+    TagCount, Vocabulary, is_current_status, is_retired_status, merge_vocabularies,
+    parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/plans.rs` and from
 /// nothing else.

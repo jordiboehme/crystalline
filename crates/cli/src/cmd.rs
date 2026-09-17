@@ -14,7 +14,7 @@ use crystalline_core::config::{
     self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
 };
 use crystalline_index::{
-    ChunkParams, DomainKind, NoReindexHooks, Store, apply_scan, configured_model_id,
+    ChunkParams, DomainKind, NoReindexHooks, RebuildKind, Store, apply_scan, configured_model_id,
     download_local_model, provider_from_config, reindex_domains, resolve_forward_refs,
     run_embedding_pass, scan_domain,
 };
@@ -1587,14 +1587,15 @@ pub async fn reindex(
     // A wipe left nothing to compare against, so its rebuild is forced too:
     // every file is read, and the prefilter has no stamps to skip against
     // anyway.
-    let reports = reindex_domains(
-        &*store,
-        &file_targets,
-        &params,
-        full || wipe,
-        &NoReindexHooks,
-    )
-    .await?;
+    let rebuild = if wipe {
+        Some(RebuildKind::Wipe)
+    } else if full {
+        Some(RebuildKind::Full)
+    } else {
+        None
+    };
+    let reports =
+        reindex_domains(&*store, &file_targets, &params, rebuild, &NoReindexHooks).await?;
 
     // The rebuilt base rows are in; now the rows no file on disk describes. An
     // overlay draft is one actor's private version of a path and it lives
@@ -1878,14 +1879,32 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
             continue;
         };
         let name = d["name"].as_str().unwrap_or("");
+        let kind = d["rebuild_kind"].as_str();
         if rebuild_is_live {
-            println!(
-                "  a rebuild is running now; '{name}' was stamped {started} and its rows are the ones from before that rebuild lands"
-            );
+            match kind {
+                // A wipe empties the index before it rebuilds, so nothing about
+                // "the rows from before it" is true while one runs.
+                Some("wipe") => println!(
+                    "  a rebuild is running now; '{name}' was stamped {started} by a wipe, which destroyed its rows and every embedding it had before it began"
+                ),
+                _ => println!(
+                    "  a rebuild is running now; '{name}' was stamped {started} and its rows are the ones from before that rebuild lands"
+                ),
+            }
         } else {
-            println!(
-                "  a full rebuild of '{name}' started {started} and did not finish; that domain's rows are the ones from before it. Run: crystalline reindex --full"
-            );
+            match kind {
+                Some("wipe") => println!(
+                    "  a wipe of '{name}' started {started} and did not finish; that domain's rows and every embedding it had were destroyed before it began, so what is there is only what the rebuild managed. Run: crystalline reindex --full"
+                ),
+                Some("full") => println!(
+                    "  a full rebuild of '{name}' started {started} and did not finish; that domain's rows are the ones from before it. Run: crystalline reindex --full"
+                ),
+                // A marker a binary older than the kind column stamped: say what
+                // is known and claim nothing about the rows either way.
+                _ => println!(
+                    "  a rebuild of '{name}' started {started} and did not finish. Run: crystalline reindex --full"
+                ),
+            }
         }
     }
 
