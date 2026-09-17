@@ -3972,6 +3972,15 @@ async fn a_base_path_with_no_recorded_copy_asks_for_a_resync() {
 /// for a file in a folder exactly as it does for a draft. So the two domains
 /// answer the same thing, which is the point: review mode adds no screen of its
 /// own.
+///
+/// Unix only: a colon is not a legal filename character on Windows, so the
+/// fixture cannot exist there. `write_staged_file` and the plain
+/// `std::fs::write` below both go through NTFS's alternate-data-stream syntax
+/// instead of failing - `plan: v2.md` lands as a file named `plan` carrying a
+/// hidden `: v2.md` stream - so the share sees a clean, colon-free `notes/plan`
+/// and proceeds instead of refusing, which is an OS quirk this fixture cannot
+/// route around, not a difference in the screening rule itself.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_draft_path_is_screened_the_way_a_file_in_the_folder_is() {
     let tmp = tempfile::tempdir().unwrap();
