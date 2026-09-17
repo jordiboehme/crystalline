@@ -4645,7 +4645,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own read payload for the new engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. */
+            /** @description The engine's own read payload for the new engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. A title that will not read back the way it was written - one holding a `/`, which lands the engram nested, or a `:`, which a link reads as a domain prefix - also carries a `notices` list of sentences naming what happened and what to write instead. */
             201: {
                 headers: {
                     /** @description The quoted checksum of the engram as written, the token a later save carries in `If-Match`. */

@@ -579,6 +579,94 @@ async fn a_hand_written_colon_title_resolves_through_read_engram() {
     );
 }
 
+/// A minimal create: everything but the title left at the default a caller who
+/// names only a title and a body would get.
+fn write_params(
+    domain: &str,
+    title: &str,
+    content: &str,
+) -> crystalline_service::params::WriteParams {
+    crystalline_service::params::WriteParams {
+        domain: domain.to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        folder: None,
+        engram_type: None,
+        tags: vec![],
+        status: None,
+        metadata: None,
+        overwrite: false,
+        share_link: None,
+        model: None,
+    }
+}
+
+/// A title holding a slash produces a nested permalink nobody asked for, and a
+/// title holding a colon produces a link that reads as a cross-domain one. The
+/// write still lands - both are legal titles - and the receipt says what
+/// happened and what to write instead, because the alternative is an agent
+/// discovering it weeks later through a link that will not resolve.
+#[tokio::test]
+async fn a_title_holding_a_slash_or_a_colon_is_named_in_the_receipt() {
+    let (_tmp, engine) = engine_fixture().await;
+
+    let slashed = engine
+        .write_engram(&write_params("eng", "Q3/Q4 planning", "body"))
+        .await
+        .unwrap();
+    assert_eq!(slashed["permalink"], "q3/q4-planning");
+    let notices = slashed["notices"].as_array().expect("a notice rode along");
+    let text = notices[0].as_str().unwrap();
+    assert!(
+        text.contains("q3/q4-planning"),
+        "it names the permalink it produced: {text}"
+    );
+    assert!(
+        text.contains("folder"),
+        "and the parameter that places an engram on purpose: {text}"
+    );
+
+    let coloned = engine
+        .write_engram(&write_params(
+            "eng",
+            "Murmur: the dispatch pipeline",
+            "body",
+        ))
+        .await
+        .unwrap();
+    let text = coloned["notices"][0].as_str().unwrap();
+    assert!(
+        text.contains("Murmur"),
+        "it names the prefix a link would read: {text}"
+    );
+    assert!(
+        text.contains("crystalline://eng/murmur-the-dispatch-pipeline"),
+        "and the form that always resolves: {text}"
+    );
+
+    // A title whose colon is followed by nothing, and one whose prefix holds a
+    // space, are not what a link reads as a domain prefix, so neither earns the
+    // colon notice - the same three conditions `LinkTarget::parse` applies.
+    let bare = engine
+        .write_engram(&write_params("eng", "Deadline:", "body"))
+        .await
+        .unwrap();
+    assert!(bare.get("notices").is_none(), "{bare}");
+    let spaced = engine
+        .write_engram(&write_params("eng", "Log entry: Monday", "body"))
+        .await
+        .unwrap();
+    assert!(spaced.get("notices").is_none(), "{spaced}");
+
+    // A plain title carries no notice at all: the key is absent rather than an
+    // empty array, so nothing pays for a field it never uses.
+    let plain = engine
+        .write_engram(&write_params("eng", "Plain title", "body"))
+        .await
+        .unwrap();
+    assert!(plain.get("notices").is_none(), "{plain}");
+}
+
 /// The same rule on the other pair-writing verb, and the sharper case: the
 /// engram carrying the colon is the SOURCE, so both bullets are affected.
 #[tokio::test]

@@ -634,8 +634,9 @@ pub struct MoveBody {
 /// second round trip. One thing rides beside it: when the neighbours probe
 /// found engrams close in meaning to what just landed, the `similar` list and
 /// its `guidance` string are copied off the receipt onto the answer, so a
-/// create is also the search the author did not run. Both keys are absent when
-/// there is nothing to say.
+/// create is also the search the author did not run. A title that slugifies
+/// into something its author would not expect back carries `notices` beside
+/// them. Every one of those keys is absent when there is nothing to say.
 ///
 /// A permalink already taken is the engine's `Conflict`, answered 409: this
 /// route never overwrites, so a client that means to replace something saves it
@@ -662,7 +663,12 @@ pub struct MoveBody {
                            plus - when the `capture.similar` advisory found \
                            neighbours - a `similar` list of up to three \
                            engrams {domain, permalink, title, status, type} \
-                           and a `guidance` string.",
+                           and a `guidance` string. A title that will not read \
+                           back the way it was written - one holding a `/`, \
+                           which lands the engram nested, or a `:`, which a \
+                           link reads as a domain prefix - also carries a \
+                           `notices` list of sentences naming what happened \
+                           and what to write instead.",
             body = Object,
             headers(("etag" = String, description = "The quoted checksum of the \
                      engram as written, the token a later save carries in \
@@ -1800,22 +1806,29 @@ async fn detail_response(
     Ok(resp)
 }
 
-/// Copy the neighbours advisory off a write receipt onto the detail read the
-/// route answers with, when the receipt carries one. The detail is what the
-/// editor renders; the advisory rides beside it under the same two keys the
-/// MCP receipt uses, so one reader learns one shape.
+/// Copy what a write receipt carries beyond the detail read onto the detail the
+/// route answers with. The detail is what the editor renders; these ride beside
+/// it under the same keys the MCP receipt uses, so one reader learns one shape.
+///
+/// Two independent things travel here. The neighbours advisory is a pair -
+/// `similar` and `guidance` - and travels as a pair or not at all. The title
+/// notices are their own: a write can produce a surprising permalink with no
+/// neighbour in sight.
 ///
 /// Safe to do before [`etag`] runs: the tag is taken from the payload's own
 /// `checksum`, which is the version of the engram on disk, rather than hashed
-/// over the body being served, so two extra keys cannot move it.
+/// over the body being served, so extra keys cannot move it.
 fn carry_advisory(detail: &mut Value, receipt: &Value) {
-    let (Value::Object(detail), Some(similar), Some(guidance)) =
-        (detail, receipt.get("similar"), receipt.get("guidance"))
-    else {
+    let Value::Object(detail) = detail else {
         return;
     };
-    detail.insert("similar".to_string(), similar.clone());
-    detail.insert("guidance".to_string(), guidance.clone());
+    if let (Some(similar), Some(guidance)) = (receipt.get("similar"), receipt.get("guidance")) {
+        detail.insert("similar".to_string(), similar.clone());
+        detail.insert("guidance".to_string(), guidance.clone());
+    }
+    if let Some(notices) = receipt.get("notices") {
+        detail.insert("notices".to_string(), notices.clone());
+    }
 }
 
 /// The strong validator for the engram this read returned: the checksum the

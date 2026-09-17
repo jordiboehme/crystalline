@@ -201,6 +201,69 @@ async fn call_text(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<S
     }
 }
 
+/// A title that will not read back the way it was written reaches the agent
+/// that wrote it, under the DEFAULT response format rather than only in JSON.
+/// The write receipt is a confirmation, so it stays compact JSON while the
+/// list-shaped tools render TOON, and the notices ride inside it - an agent
+/// that only learned about the nested permalink weeks later, through a link
+/// that would not resolve, is the whole case for the key existing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_title_that_will_not_read_back_reaches_the_agent_that_wrote_it() {
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let slashed = call_text(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Q3/Q4 planning", "content": "What the quarter holds." }),
+    )
+    .await
+    .unwrap();
+    let receipt: Value = serde_json::from_str(&slashed).unwrap_or_else(|e| {
+        panic!("the confirmation is JSON under the TOON default: {e}: {slashed}")
+    });
+    assert_eq!(receipt["permalink"], "q3/q4-planning");
+    let notice = receipt["notices"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the notice reached the agent: {slashed}"));
+    assert!(
+        notice.contains("q3/q4-planning") && notice.contains("folder"),
+        "whole, not truncated by the renderer: {notice}"
+    );
+
+    let coloned = call_text(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Murmur: the dispatch pipeline",
+            "content": "How dispatch works."
+        }),
+    )
+    .await
+    .unwrap();
+    let receipt: Value = serde_json::from_str(&coloned).unwrap();
+    let notice = receipt["notices"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("and so does the colon's: {coloned}"));
+    assert!(
+        notice.contains("crystalline://eng/murmur-the-dispatch-pipeline"),
+        "naming the form that always resolves: {notice}"
+    );
+
+    // A plain title's receipt gains no key at all.
+    let plain = call_text(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Plain title", "content": "Nothing surprising." }),
+    )
+    .await
+    .unwrap();
+    let receipt: Value = serde_json::from_str(&plain).unwrap();
+    assert!(receipt.get("notices").is_none(), "{plain}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_shaped_responses_default_to_toon_and_configure_restores_json() {
     let h = Harness::new_toon(&["eng"]).await;

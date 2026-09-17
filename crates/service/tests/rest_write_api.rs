@@ -289,6 +289,57 @@ async fn an_editor_creates_an_engram_and_gets_the_detail_back() {
     assert_eq!(dup.status(), 409);
 }
 
+/// A title holding a `/` lands nested, and the detail the create answers with
+/// carries the notice that says so. The editor is where a person writing by
+/// hand finds out, so the receipt's extra key has to survive the hop from the
+/// engine onto the detail read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_created_title_that_will_not_read_back_carries_its_notice() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({
+        "title": "Q3/Q4 planning",
+        "content": "# Q3\n\nWhat the quarter holds.\n"
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["permalink"], "q3/q4-planning");
+    let notices = body["notices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the notice rode across onto the detail: {body}"));
+    assert!(
+        notices[0].as_str().unwrap().contains("folder"),
+        "and it names the parameter that places an engram on purpose: {body}"
+    );
+
+    // A plain title leaves the detail exactly as a read would answer it.
+    let plain = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &editor,
+    )
+    .json(&serde_json::json!({"title": "Gamma", "content": "# Gamma\n\nPlain.\n"}))
+    .send()
+    .await
+    .unwrap();
+    let plain: serde_json::Value = plain.json().await.unwrap();
+    assert!(plain.get("notices").is_none(), "{plain}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_walks_the_if_match_contract() {
     // Serialized against every other test here that writes the shared

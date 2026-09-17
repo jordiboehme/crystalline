@@ -454,6 +454,18 @@ pub fn render_write(v: &Value, out: &mut impl Write) -> io::Result<()> {
             "  landed in your private draft; the shared tree did not move"
         )?;
     }
+    // A title that will not read back the way it was written. One line each,
+    // after everything above, because the address and where it landed are the
+    // answer and these are about how the title came out.
+    for notice in v
+        .get("notices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        writeln!(out, "note: {notice}")?;
+    }
     Ok(())
 }
 
@@ -901,6 +913,46 @@ mod tests {
         assert_eq!(
             out,
             "wrote crystalline://team/plan\n  landed in alice's draft\n"
+        );
+    }
+
+    // A title that will not read back the way it was written says so, after
+    // the address and after where the write landed: those two are the answer,
+    // and the note is about how the title came out.
+    #[test]
+    fn write_notes_a_title_that_will_not_read_back() {
+        let v = json!({
+            "domain": "eng",
+            "permalink": "q3/q4-planning",
+            "action": "created",
+            "draft": true,
+            "notices": ["the title holds a `/`, so this engram landed at the nested permalink `q3/q4-planning`."],
+        });
+        let out = render_to_string(render_write, &v);
+        assert_eq!(
+            out,
+            concat!(
+                "created crystalline://eng/q3/q4-planning\n",
+                "  landed in your private draft; the shared tree did not move\n",
+                "note: the title holds a `/`, so this engram landed at the nested ",
+                "permalink `q3/q4-planning`.\n"
+            )
+        );
+    }
+
+    // Two of them, one line each and in the order the receipt lists them.
+    #[test]
+    fn write_notes_both_shapes_one_line_each() {
+        let v = json!({
+            "domain": "eng",
+            "permalink": "zeta",
+            "action": "created",
+            "notices": ["first", "second"],
+        });
+        let out = render_to_string(render_write, &v);
+        assert_eq!(
+            out,
+            "created crystalline://eng/zeta\nnote: first\nnote: second\n"
         );
     }
 

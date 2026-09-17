@@ -3930,6 +3930,48 @@ impl Engine {
 
     // --- write ---------------------------------------------------------------
 
+    /// What a write says about a title that will not be read back the way it
+    /// was written.
+    ///
+    /// Two shapes, both legal and both surprising. A `/` in a title slugifies
+    /// into a path separator, so the engram lands nested under a folder the
+    /// caller never named. A `:` parses as a cross-domain prefix, so
+    /// `[[Murmur: the dispatch pipeline]]` resolves as a title only while no
+    /// domain called `Murmur` is registered - and the day one is, every such
+    /// link silently means something else. Neither is refused: the title is the
+    /// author's. What the receipt owes them is the permalink that came out and
+    /// the spelling that always works.
+    ///
+    /// Empty when the title holds neither, so the receipt gains no key at all
+    /// in the common case.
+    fn title_notices(title: &str, domain: &str, permalink: &str) -> Vec<String> {
+        let mut notices = Vec::new();
+        if title.contains('/') {
+            notices.push(format!(
+                "the title holds a `/`, so this engram landed at the nested permalink \
+                 `{permalink}`. To place an engram in a folder on purpose, pass the `folder` \
+                 parameter and keep the slash out of the title."
+            ));
+        }
+        // The three conditions `LinkTarget::parse` applies before it reads a
+        // prefix as a domain, spelled the same way here: a title this function
+        // stays quiet about is one no link would ever split.
+        if let Some((prefix, rest)) = title.split_once(':')
+            && !prefix.trim().is_empty()
+            && !rest.trim().is_empty()
+            && !prefix.trim().contains(char::is_whitespace)
+        {
+            notices.push(format!(
+                "the title holds a `:`, so a link written as `[[{title}]]` reads `{}` as a domain \
+                 prefix. It resolves to this engram while no domain of that name is registered, \
+                 and stops the day one is. The form that always works is \
+                 `[[crystalline://{domain}/{permalink}]]`.",
+                prefix.trim()
+            ));
+        }
+        notices
+    }
+
     /// Where an engram titled `title` under `folder` would be written: the
     /// domain-relative path and the permalink it will answer to.
     ///
@@ -4172,6 +4214,13 @@ impl Engine {
             "status": status,
             "action": if p.overwrite { "written" } else { "created" },
         });
+        // Attached here rather than at the end: `write_engram_as` leaves by
+        // three exits - the live-room arm, the draft arm and the base arm -
+        // and a title reads back the same way whichever one a write took.
+        let notices = Self::title_notices(&p.title, &p.domain, &permalink);
+        if !notices.is_empty() {
+            receipt["notices"] = json!(notices);
+        }
 
         // **The live arm, and it stands ahead of every arm that writes**, the
         // way the edit's does (`Engine::apply_source_edit_staged`). While a
