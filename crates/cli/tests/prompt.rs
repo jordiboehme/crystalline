@@ -602,3 +602,90 @@ fn the_workspace_help_names_prompt_rules_and_says_what_repo_config_does() {
         "the no-match answer is stated: {help}"
     );
 }
+
+/// A domain the workspace's `prompt.rules` exclude stays excluded even when
+/// it is named with `--domain`: the flag composes with the workspace scoping
+/// rather than replacing it, exactly as `--domain`'s own help promises
+/// ("stays excluded"). `beta` is registered (so naming it is not a typo, and
+/// the command does not refuse it), but this workspace's `prompt.rules`
+/// exclude it, so it never reaches the routing block regardless of what is
+/// named.
+#[test]
+fn prompt_system_domain_flag_cannot_undo_a_workspace_exclusion() {
+    let tmp = scaffold_domains(&["alpha", "beta"]);
+    std::fs::write(
+        tmp.path().join("config.yaml"),
+        "domains:\n  alpha:\n    path: alpha\n  beta:\n    path: beta\nprompt:\n  rules:\n    \"**\":\n      exclude:\n      - beta\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args([
+            "prompt",
+            "system",
+            "--config",
+            "config.yaml",
+            "--workspace",
+            ".",
+            "--domain",
+            "beta",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        !out.contains("beta"),
+        "a domain the workspace excludes stays out even when named: {out}"
+    );
+
+    // Naming an excluded domain alongside an included one still renders the
+    // included one: the flag narrows what survived the workspace scoping, it
+    // does not replace it.
+    let out = Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args([
+            "prompt",
+            "system",
+            "--config",
+            "config.yaml",
+            "--workspace",
+            ".",
+            "--domain",
+            "alpha",
+            "--domain",
+            "beta",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("alpha"), "{out}");
+    assert!(
+        !out.contains("beta"),
+        "a domain the workspace excludes stays out even when named alongside one that is not: {out}"
+    );
+
+    // The `--domain` flag's own help states the guarantee this test proves,
+    // in the same words: the workspace's `prompt.rules` exclusion wins.
+    let help = Command::cargo_bin("crystalline")
+        .unwrap()
+        .args(["prompt", "system", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(help).unwrap();
+    assert!(
+        help.contains("stays excluded"),
+        "the --domain help states the guarantee this test proves: {help}"
+    );
+}

@@ -861,6 +861,33 @@ mod tests {
         assert!(output.domains.iter().all(|d| !d.preferred));
     }
 
+    /// `restrict_to_domains` cannot resurrect a domain `prompt.rules` already
+    /// dropped for this workspace: naming the excluded domain alongside an
+    /// included one still renders only the included one. The scoped
+    /// `generate_prompt` (not the unscoped generator) is what makes this
+    /// true - it never hands the excluded domain to the filter in the first
+    /// place, and a filter that only ever removes can't add it back.
+    #[test]
+    fn restrict_to_domains_cannot_undo_a_workspace_exclusion() {
+        let (tmp, global) = fixture_with_prompt_rules();
+        let mut output = generate_prompt(&global, tmp.path(), &BTreeMap::new());
+        // The workspace scoping already dropped `beta` for this workspace,
+        // same as `unscoped_ignores_prompt_rules_and_marks_nothing_preferred`
+        // proves the unscoped path does not.
+        assert!(
+            output.domains.iter().all(|d| d.name != "beta"),
+            "prompt.rules should have already excluded beta: {output:?}"
+        );
+
+        restrict_to_domains(&mut output, &["alpha".to_string(), "beta".to_string()]);
+        let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha"],
+            "naming an excluded domain must not add it back: {names:?}"
+        );
+    }
+
     /// The onboarding block is in the same order the domain listing is.
     ///
     /// Registration order is what the config map preserves and it means
