@@ -1525,3 +1525,107 @@ fn the_checksum_help_does_not_claim_virtual_domains_only() {
         assert!(!help.contains("virtual-domain edit"), "{verb}: {help}");
     }
 }
+
+/// The virtual-domain guard has to hold in the one state `--wipe` exists for:
+/// a database file that will not open. The database-side guard cannot fire
+/// there - nothing can ask a corrupt file what it holds - so the config's own
+/// answer is the only signal left, and it refuses before anything is opened,
+/// set aside or recreated.
+///
+/// The corruption is two bytes in the header's page-size field, after a
+/// checkpoint folded the WAL into the file: every payload page is intact and
+/// greppable before and after, so what would destroy the recoverable bytes is
+/// the discard and not the corruption.
+#[test]
+fn wipe_refuses_for_a_virtual_domain_when_the_database_will_not_open() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    bin()
+        .args(["domain", "add", "notes", "--virtual", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    bin()
+        .args(["write", "notes", "Only Copy"])
+        .args(["--content", "virtualpayloadtoken that lives nowhere else"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    // Folds the WAL into the database file, so the payload really is in the
+    // bytes this test follows.
+    bin()
+        .args(["reindex", "--full", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    let needle = b"virtualpayloadtoken";
+    let before = std::fs::read(&db).unwrap();
+    assert!(
+        before.windows(needle.len()).any(|w| w == needle),
+        "the virtual engram's body is in the database file to begin with"
+    );
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        f.seek(SeekFrom::Start(16)).unwrap();
+        f.write_all(b"\x0d\x0d").unwrap();
+        f.flush().unwrap();
+    }
+    let out = bin()
+        .args(["read", "only-copy", "--domain", "notes", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the database really will not open any more"
+    );
+
+    let out = bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "the wipe refuses even though nothing can read the database: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("refusing to wipe")
+            && err.contains("notes")
+            && err.contains("crystalline domain export"),
+        "the refusal names the domain and the way out: {err}"
+    );
+
+    let after = std::fs::read(&db).unwrap();
+    assert!(
+        after.windows(needle.len()).any(|w| w == needle),
+        "the only copy of the virtual engram is still in the file, untouched"
+    );
+    assert!(
+        !work
+            .path()
+            .join("state")
+            .read_dir()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("unreadable-")),
+        "nothing was set aside either: the refusal comes before the open"
+    );
+}

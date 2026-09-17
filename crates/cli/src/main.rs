@@ -217,15 +217,17 @@ enum Command {
         full: bool,
         /// Destroy the index and rebuild it from disk: every row and every
         /// embedding is deleted first, and a database file that will not open
-        /// at all is discarded and recreated. The corruption-recovery path for
-        /// an embedded (turso) index, and the only one that loses work -
-        /// re-embedding a large corpus takes hours. Needs exclusive access to
-        /// the index, so stop the daemon first; refuses while another process
-        /// holds the database, refuses on a postgres index (a shared database
-        /// cannot be made exclusive: drop and recreate it with your database
-        /// tools, then `crystalline sync`), and refuses while the index holds
-        /// a virtual domain, since its engrams live only there and no rebuild
-        /// can bring them back.
+        /// at all is set aside under a timestamped name and recreated - nothing
+        /// on this path is deleted from disk, so a later recovery attempt still
+        /// has the bytes. The corruption-recovery path for an embedded (turso)
+        /// index, and the only one that loses work - re-embedding a large
+        /// corpus takes hours. Needs exclusive access to the index, so stop the
+        /// daemon first; refuses while another process holds the database,
+        /// refuses on a postgres index (a shared database cannot be made
+        /// exclusive: drop and recreate it with your database tools, then
+        /// `crystalline sync`), and refuses while either this configuration or
+        /// the index names a virtual domain, since its engrams live only in the
+        /// database and no rebuild can bring them back - export them first.
         #[arg(long, conflicts_with = "full")]
         wipe: bool,
         /// After reindexing, embed any chunks that need it for the active model.
@@ -2065,6 +2067,36 @@ async fn reindex_dispatch(
         anyhow::bail!(
             "refusing to wipe: this index is a PostgreSQL database, which several instances can be connected to at once, and nothing here can establish that nobody else is serving from it - a wipe would delete their rows and release their host claims while they run. The corruption case --wipe exists for is a local database file that will not open, which this backend does not have. Rebuild without destroying anything instead: crystalline reindex --full. If the database itself must really be cleared, stop every daemon that serves it and drop the schema with your own database tools."
         );
+    }
+
+    // The database-side guard inside `cmd::reindex` is the precise one - it asks
+    // the index itself which domains are virtual - but it can only run once the
+    // index is open, and the state `--wipe` exists for is the one where it never
+    // opens. A database that will not open is set aside and a fresh empty one
+    // takes its place, and an empty index holds no virtual domain at all, so the
+    // precise guard would wave the wipe through in exactly the case that costs
+    // the most. What is left to ask then is this configuration, so it is asked
+    // here, before anything is opened, set aside or recreated.
+    //
+    // It refuses whatever the database's state, healthy or not: the config is a
+    // narrower question than the index (a `--db` override can point a config at
+    // another index entirely), so this refuses a little more often than it must.
+    // An extra refusal costs a flag; a missed one costs the only copy of
+    // somebody's knowledge.
+    if wipe {
+        let virtual_domains: Vec<&str> = cfg
+            .domains
+            .iter()
+            .filter(|(_, entry)| entry.is_virtual())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !virtual_domains.is_empty() {
+            anyhow::bail!(
+                "refusing to wipe: this configuration names {} virtual domain(s) whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed. Copy them out first with: crystalline domain export <name> <dir>, then wipe. To rebuild without destroying anything: crystalline reindex --full. If the database itself will not open any more, take a copy of the index file before anything else - a rebuild reads the files on disk, and a virtual domain has none.",
+                virtual_domains.len(),
+                virtual_domains.join(", ")
+            );
+        }
     }
 
     // `--wipe` is the corruption-recovery path and the only one that needs the

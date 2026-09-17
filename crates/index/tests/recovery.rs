@@ -1,5 +1,7 @@
-//! Corruption recovery: a garbaged database file is discarded and rebuilt from
-//! the files on disk, and search results match the pre-corruption snapshot.
+//! Corruption recovery: a garbaged database file is set aside, rebuilt from the
+//! files on disk, and search results match the pre-corruption snapshot. Nothing
+//! on this path deletes: the unreadable bytes are renamed to a timestamped
+//! sibling, because they may be the only copy of what a virtual domain holds.
 
 use std::io::Write;
 use std::path::Path;
@@ -92,4 +94,91 @@ async fn corrupt_database_recovers_via_reindex_wipe() {
         after_perms, snapshot,
         "results match the pre-corruption snapshot"
     );
+}
+
+/// The discard is a rename, never a delete. A database that will not open is
+/// the last copy of anything a virtual domain holds, and it is also the one
+/// state in which nothing can ask the database what it holds - so the bytes are
+/// moved aside under a timestamped sibling name and a fresh database is opened
+/// beside them, leaving a recovery attempt (or an external sqlite tool) a file
+/// to work with rather than free space.
+#[tokio::test]
+async fn an_unreadable_database_is_set_aside_rather_than_deleted() {
+    let corpus = tempfile::tempdir().unwrap();
+    let root = corpus.path();
+    write(
+        root,
+        "only.md",
+        &engram("Only Copy", "only-copy", "payload_that_must_survive\n"),
+    );
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("index.db");
+    {
+        let store = TursoStore::open(&db_path).await.unwrap();
+        sync_domain(&store, "d", root).await.unwrap();
+        // Fold the WAL into the database file so the payload really is in the
+        // bytes this test follows.
+        store.checkpoint_wal().await.unwrap();
+    }
+    let before = std::fs::read(&db_path).unwrap();
+    assert!(
+        contains(&before, b"payload_that_must_survive"),
+        "the payload is in the database file to begin with"
+    );
+
+    // Two bytes in the header's page-size field: every payload page is intact,
+    // so what would destroy the recoverable bytes is the discard and not the
+    // corruption.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        f.seek(SeekFrom::Start(16)).unwrap();
+        f.write_all(b"\x0d\x0d").unwrap();
+        f.flush().unwrap();
+    }
+    let opens = match TursoStore::open(&db_path).await {
+        Ok(store) => store.store_info().await.is_ok(),
+        Err(_) => false,
+    };
+    assert!(!opens, "the corrupted file really will not open");
+
+    let store = TursoStore::open_resilient(&db_path).await.unwrap();
+    let aside = store
+        .set_aside_database()
+        .expect("the store names the database it set aside");
+    assert!(
+        aside.exists(),
+        "the unreadable database is still on disk at {}",
+        aside.display()
+    );
+    assert!(
+        aside
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("index.db.unreadable-"),
+        "it is set aside under a timestamped sibling name: {}",
+        aside.display()
+    );
+    let kept = std::fs::read(&aside).unwrap();
+    assert!(
+        contains(&kept, b"payload_that_must_survive"),
+        "the payload bytes survive the discard"
+    );
+    // And the fresh database in its place works.
+    assert_eq!(
+        sync_domain(&store, "d", root).await.unwrap().added,
+        1,
+        "the replacement database rebuilds from the file on disk"
+    );
+}
+
+/// A needle search over bytes, so the payload can be followed through a file
+/// that no longer parses as a database.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }

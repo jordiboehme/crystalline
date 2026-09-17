@@ -534,7 +534,7 @@ crystalline (cli)    the one user-facing binary
 
 Exactly one process ever holds the database open: the first `crystalline mcp` or `crystalline serve` takes an advisory lock and becomes the daemon; every later CLI command or MCP connection attaches to it over a local socket, or opens the database directly for a brief operation when no daemon is running.
 
-One principle runs through the whole stack: every domain has exactly one source of truth - markdown files on disk by default, the database itself for a [virtual domain](#virtual-domains) - and the search index is always a derived, disposable layer. `crystalline reindex --full` re-reads every file and rebuilds it at any time, and `crystalline reindex --wipe` throws away a database that will not open and starts over, so index corruption or a schema change is never a data-loss event.
+One principle runs through the whole stack: every domain has exactly one source of truth - markdown files on disk by default, the database itself for a [virtual domain](#virtual-domains) - and the search index is always a derived, disposable layer. `crystalline reindex --full` re-reads every file and rebuilds it at any time, and `crystalline reindex --wipe` sets a database that will not open aside and starts over, so for a file domain index corruption or a schema change is never a data-loss event. A virtual domain has no files behind it, so nothing can rebuild one: `--wipe` refuses while either your configuration or the index names a virtual domain and points at `crystalline domain export` first.
 
 ## FAQ
 

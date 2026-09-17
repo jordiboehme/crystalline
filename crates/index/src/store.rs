@@ -15,6 +15,7 @@
 //! flip and a foreign OKF bundle both stay first-class.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
@@ -2083,6 +2084,18 @@ pub trait Store: Send + Sync {
     /// domain's rebuild is unfinished and is never cleared by a run that did
     /// not finish one.
     async fn end_rebuild(&self, domain: DomainId) -> Result<()>;
+
+    /// The unreadable database this store was opened beside, when it was opened
+    /// resiliently and found one. `None` for every ordinary open, and for every
+    /// backend but the embedded one: corruption recovery is a local file
+    /// concern.
+    ///
+    /// A rebuild that had to move a damaged database out of the way says where
+    /// the bytes went, rather than leaving a person to guess whether anything
+    /// was kept. See [`crate::TursoStore::open_resilient`].
+    fn set_aside_database(&self) -> Option<PathBuf> {
+        None
+    }
 
     // --- the actor dimension -------------------------------------------------
     // An overlay entry is one actor's private draft of a path in a shared

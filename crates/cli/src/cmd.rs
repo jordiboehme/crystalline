@@ -1543,6 +1543,16 @@ pub async fn reindex(
     // the first place, are the documented way to point a narrower config at a
     // wider index. Reading `cfg.domains` here would refuse in the easy case and
     // destroy silently in exactly the cases the flags exist for.
+    // Set by the resilient open when the database it found would not open at
+    // all: those bytes were renamed aside rather than deleted, and the run says
+    // where they went. Read before the wipe, since the wipe is what this is
+    // reporting on.
+    let set_aside = if wipe {
+        store.lock().await.set_aside_database()
+    } else {
+        None
+    };
+
     if wipe {
         let store = store.lock().await;
         let stats = store
@@ -1603,6 +1613,7 @@ pub async fn reindex(
                 "wipe": wipe,
                 "reports": reports,
                 "drafts_restored": drafts_restored,
+                "set_aside": set_aside.as_ref().map(|p| p.display().to_string()),
             })
         );
     } else {
@@ -1621,6 +1632,12 @@ pub async fn reindex(
         }
         if drafts_restored > 0 {
             println!("  {drafts_restored} draft(s) restored from the overlay journal");
+        }
+        if let Some(aside) = &set_aside {
+            println!(
+                "  the database that would not open was set aside at {}, not deleted; remove it once you are satisfied with the rebuild",
+                aside.display()
+            );
         }
     }
 

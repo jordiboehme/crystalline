@@ -31,7 +31,7 @@ pub use search::{
 };
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -73,6 +73,23 @@ pub struct TursoStore {
     // that ran inside the transaction). upsert_engram, upsert_engram_checked and
     // rename_engram never touch the chunk table, so they are not invalidators.
     coverage_cache: Mutex<Option<EmbeddingCoverage>>,
+    // The unreadable database this store was opened beside, when
+    // `open_resilient` found one and moved it out of the way. `None` for every
+    // ordinary open, which is every open but that one.
+    set_aside: Option<PathBuf>,
+}
+
+/// `path` with `suffix` appended to its file name, for the `-wal` / `-shm`
+/// sidecars a turso database keeps beside itself. Appending to the OS string
+/// rather than to the extension is what keeps `index.db-wal` from becoming
+/// `index-wal.db`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    if suffix.is_empty() {
+        return path.to_path_buf();
+    }
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 impl TursoStore {
@@ -87,15 +104,25 @@ impl TursoStore {
         Self::build(":memory:", None).await
     }
 
-    /// Open a store, recovering from a corrupt database file by discarding it
-    /// and starting fresh. Files on disk are the source of truth, so the index
-    /// is always rebuildable; this is the `reindex --wipe` recovery path when the
-    /// database will not open or fails a sanity check.
+    /// Open a store, recovering from a corrupt database file by setting it
+    /// aside and starting fresh. Files on disk are the source of truth, so the
+    /// index is always rebuildable; this is the `reindex --wipe` recovery path
+    /// when the database will not open or fails a sanity check.
+    ///
+    /// Nothing here deletes. A database that will not open is also the state in
+    /// which nothing can ask it what it holds, and what it holds may be the only
+    /// copy of a virtual domain's engrams - so the file and its sidecars are
+    /// renamed to timestamped siblings (`index.db.unreadable-<instant>`, and the
+    /// same name plus `-wal` / `-shm`) and a fresh database is opened in their
+    /// place. A recovery attempt, or an external sqlite tool, then has a file to
+    /// work with rather than free space, and [`TursoStore::set_aside_database`]
+    /// names it so a caller can say where it went. A rename that fails is
+    /// returned as the error it is and never falls back to a delete.
     ///
     /// A file another process holds is the one failure this must not treat as
     /// damage. `reindex --wipe` is daemonless by construction, so it meets a
-    /// running daemon's index as an open that fails - and discarding the files
-    /// then would delete a healthy index out from under a process still
+    /// running daemon's index as an open that fails - and moving the files
+    /// aside then would take a healthy index out from under a process still
     /// serving it, which is the opposite of recovery. Such an error is
     /// returned untouched, and the caller turns it into the usual sentence
     /// naming the holder.
@@ -109,17 +136,46 @@ impl TursoStore {
             Err(e) if is_locked_by_another_process(&e) => return Err(e),
             Err(_) => {}
         }
+        // Subsecond precision, so a second attempt inside the same second
+        // cannot land on a name that is already taken - and if one somehow
+        // does, the open fails rather than renaming over the earlier copy.
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+        let mut aside_base = path.as_os_str().to_os_string();
+        aside_base.push(format!(".unreadable-{stamp}"));
+        let aside_base = PathBuf::from(aside_base);
+        let mut set_aside = None;
         for suffix in ["", "-wal", "-shm"] {
-            let sidecar = if suffix.is_empty() {
-                path.to_path_buf()
-            } else {
-                let mut s = path.as_os_str().to_os_string();
-                s.push(suffix);
-                std::path::PathBuf::from(s)
-            };
-            let _ = std::fs::remove_file(&sidecar);
+            let from = with_suffix(path, suffix);
+            if !from.exists() {
+                continue;
+            }
+            let to = with_suffix(&aside_base, suffix);
+            if to.exists() {
+                return Err(IndexError::Io {
+                    path: to.display().to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "a database was already set aside under this name",
+                    ),
+                });
+            }
+            std::fs::rename(&from, &to).map_err(|source| IndexError::Io {
+                path: from.display().to_string(),
+                source,
+            })?;
+            if suffix.is_empty() {
+                set_aside = Some(to);
+            }
         }
-        TursoStore::open(path).await
+        if let Some(aside) = &set_aside {
+            tracing::warn!(
+                set_aside = %aside.display(),
+                "the index would not open; it was set aside and a fresh one opened in its place"
+            );
+        }
+        let mut store = TursoStore::open(path).await?;
+        store.set_aside = set_aside;
+        Ok(store)
     }
 
     async fn build(open_path: &str, db_path: Option<String>) -> Result<TursoStore> {
@@ -177,6 +233,7 @@ impl TursoStore {
             fts_native,
             tag_cache: Mutex::new(HashMap::new()),
             coverage_cache: Mutex::new(None),
+            set_aside: None,
         })
     }
 
@@ -2210,6 +2267,10 @@ impl Store for TursoStore {
             )
             .await?;
         Ok(())
+    }
+
+    fn set_aside_database(&self) -> Option<PathBuf> {
+        self.set_aside.clone()
     }
 
     // --- the actor dimension -------------------------------------------------
