@@ -3960,10 +3960,16 @@ impl Engine {
         // and earns no notice, and `slugify` drops empty segments, so a title
         // `TODO/` lands at `todo` and nests nothing. The folder named in the
         // remedy comes off the permalink, so it carries any folder the caller
-        // already passed and can be pasted as it stands.
+        // already passed and can be pasted as it stands; the title comes off
+        // the TITLE, so the author reads their own words back rather than the
+        // slug those words became. The two agree: the last segment of the title
+        // slugifies to the last segment of the permalink, which is what makes
+        // the remedy land at the same address.
         if slugify(title).contains('/')
-            && let Some((folder, leaf)) = permalink.rsplit_once('/')
+            && let Some((folder, _)) = permalink.rsplit_once('/')
+            && let Some((_, leaf)) = title.rsplit_once('/')
         {
+            let leaf = leaf.trim();
             notices.push(format!(
                 "the title holds a `/`, so this engram landed at the nested permalink \
                  `{permalink}`. To place an engram in a folder on purpose, pass the folder as \

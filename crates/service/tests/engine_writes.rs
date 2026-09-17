@@ -625,6 +625,11 @@ async fn a_title_holding_a_slash_or_a_colon_is_named_in_the_receipt() {
         text.contains("`folder: \"q3\"`") && text.contains("--folder q3"),
         "and a spelling a person can paste, on both surfaces they write from: {text}"
     );
+    assert!(
+        text.contains("the title `Q4 planning`"),
+        "and the title back in the author's own words, not the slug it would \
+         become: {text}"
+    );
 
     let coloned = engine
         .write_engram(&write_params(

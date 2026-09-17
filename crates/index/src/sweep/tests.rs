@@ -828,6 +828,59 @@ fn v102_names_an_unregistered_target_domain() {
     );
 }
 
+/// A cross-domain reference whose prefix names a domain that IS registered: the
+/// repair has to keep the prefix on both sides. A left side that is the bracket
+/// text minus the prefix names a string that does not occur in the file, and a
+/// right side without it repoints the link at the writer's own domain - the
+/// same silent domain-drop the unregistered arm refuses.
+#[test]
+fn v102_keeps_a_registered_prefix_on_both_sides_of_the_repair() {
+    let mut sweep = input(vec![fact(1, "runbook")]);
+    // A second registered domain, holding the engram the typo meant.
+    sweep.known_domains.push("eng".to_string());
+    sweep.graph.nodes.push(GraphNode {
+        id: EngramId(9),
+        domain: "eng".to_string(),
+        permalink: "incident-response-checklist".to_string(),
+        title: "Incident Response Checklist".to_string(),
+        engram_type: "engram".to_string(),
+        salience: None,
+        status: "stable".to_string(),
+        actor: String::new(),
+    });
+
+    let mut reference = unresolved(1, "Incident Response Checklst");
+    reference.target_domain = Some("eng".to_string());
+    reference.raw = "eng:Incident Response Checklst".to_string();
+    sweep.unresolved = vec![reference];
+
+    let finding = only(&detect(&sweep), "V102");
+    assert_eq!(
+        finding.fix, "[[eng:Incident Response Checklst]] -> [[eng:Incident Response Checklist]]",
+        "the left side is what the file says and the right side still points at eng"
+    );
+    assert_eq!(
+        finding.class,
+        Class::Mechanical,
+        "the candidate is in the very domain the prefix names, so completing the \
+         spelling changes nothing the archive claims"
+    );
+}
+
+/// The same arm with no prefix at all: the bracket text and the raw are one
+/// string, so the repair reads exactly as it did before.
+#[test]
+fn v102_repairs_a_plain_typo_without_inventing_a_prefix() {
+    let mut target = fact(1, "release-checklist");
+    target.title = "Release Checklist".to_string();
+    let mut sweep = input(vec![target, fact(2, "runbook")]);
+    sweep.unresolved = vec![unresolved(2, "Release Checklst")];
+
+    let finding = only(&detect(&sweep), "V102");
+    assert_eq!(finding.fix, "[[Release Checklst]] -> [[Release Checklist]]");
+    assert_eq!(finding.class, Class::Mechanical);
+}
+
 /// A cross-domain reference into a domain the author means to register is not a
 /// spelling mistake, and the fuzzy score cannot tell the two apart: a short
 /// prefix costs almost nothing once the title is long, so

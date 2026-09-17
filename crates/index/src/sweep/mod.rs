@@ -1994,7 +1994,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
             // something local. Naming the candidate is the help; taking the
             // decision is not ours.
             Some(domain) => match title_candidate(input, graph, &fact.domain, &reference.raw) {
-                Some(candidate) => (
+                Some((_, candidate)) => (
                     format!(
                         "rel_type={}; target domain `{domain}` is not a registered domain and \
                          nothing in {} is titled `{}`; nearest is `{candidate}`",
@@ -2013,18 +2013,50 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                 ),
             },
             None => {
+                // Either there is no prefix, or the prefix names a domain that
+                // IS registered. Both ways the reference's own domain is where
+                // the candidate has to come from.
                 let scope = reference
                     .target_domain
                     .as_deref()
                     .unwrap_or(fact.domain.as_str());
+                // The bracket text as the file carries it. A row written
+                // before `to_raw` existed has none, so the split target stands
+                // in - the same degradation the resolver takes on a NULL.
+                let written = if reference.raw.is_empty() {
+                    reference.target.as_str()
+                } else {
+                    reference.raw.as_str()
+                };
                 match title_candidate(input, graph, scope, &reference.target) {
-                    Some(candidate) => (
+                    Some((candidate_domain, candidate)) => (
                         format!(
                             "rel_type={}; nothing titled `{}` in {scope}; nearest is `{candidate}`",
                             reference.rel_type, reference.target
                         ),
-                        Class::Mechanical,
-                        format!("[[{}]] -> [[{candidate}]]", reference.target),
+                        // Mechanical only while the repair stays inside the
+                        // domain the reference named: completing a spelling in
+                        // place records intent the archive already holds, while
+                        // moving a reference from one domain to another drops
+                        // the domain its author chose and needs a yes.
+                        if reference
+                            .target_domain
+                            .as_deref()
+                            .is_none_or(|named| named == candidate_domain)
+                        {
+                            Class::Mechanical
+                        } else {
+                            Class::Judgment
+                        },
+                        // Both sides carry whatever prefix the file carries. A
+                        // left side without it names a string that does not
+                        // occur in the engram, so a literal replace finds
+                        // nothing; a right side without it silently repoints
+                        // the reference at the writing engram's own domain.
+                        format!(
+                            "[[{written}]] -> [[{}]]",
+                            prefixed(reference.target_domain.as_deref(), &candidate)
+                        ),
                     ),
                     None => (
                         format!(
@@ -2052,19 +2084,40 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
     }
 }
 
+/// A repair target written the way the reference that needs it was written:
+/// with the domain prefix when the reference carried one, bare when it did not.
+///
+/// A permalink and a title can both hold characters a prefix cannot, but the
+/// prefix itself is a domain name, so re-attaching it is a join rather than a
+/// parse and cannot go wrong the way splitting can.
+fn prefixed(domain: Option<&str>, target: &str) -> String {
+    match domain {
+        Some(domain) => format!("{domain}:{target}"),
+        None => target.to_string(),
+    }
+}
+
 /// The nearest existing title to an unresolved target inside `scope`, when it
-/// is near enough that the intended target is not in doubt.
+/// is near enough that the intended target is not in doubt, as
+/// `(its domain, its title)`.
+///
+/// The domain rides along rather than being assumed from `scope`, so a caller
+/// deciding whether a repair may be applied without asking can read where the
+/// candidate actually came from. A repair that crosses a domain boundary is a
+/// change to what the archive claims, never a spelling completion, and the
+/// caller must be able to tell the two apart from the value rather than from
+/// this function's screen staying what it is today.
 fn title_candidate(
     input: &SweepInput,
     graph: &Graph<'_>,
     scope: &str,
     target: &str,
-) -> Option<String> {
+) -> Option<(String, String)> {
     let wanted = normalize(target);
     if wanted.is_empty() {
         return None;
     }
-    let mut best: Option<(f64, String)> = None;
+    let mut best: Option<(f64, String, String)> = None;
     let mut consider = |domain: &str, title: &str, permalink: &str| {
         if domain != scope || title.is_empty() {
             return;
@@ -2074,9 +2127,9 @@ fn title_candidate(
         if score >= TITLE_CANDIDATE_THRESHOLD
             && best
                 .as_ref()
-                .is_none_or(|(b, t)| score > *b || (score == *b && title < t.as_str()))
+                .is_none_or(|(b, _, t)| score > *b || (score == *b && title < t.as_str()))
         {
-            best = Some((score, title.to_string()));
+            best = Some((score, domain.to_string(), title.to_string()));
         }
     };
     for fact in &input.engrams {
@@ -2088,7 +2141,7 @@ fn title_candidate(
         }
         consider(&node.domain, &node.title, &node.permalink);
     }
-    best.map(|(_, title)| title)
+    best.map(|(_, domain, title)| (domain, title))
 }
 
 /// `V103`: a reciprocal relation wired from one end only.
