@@ -3097,3 +3097,57 @@ async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
         "the same engram is a neighbour to a caller who may see it: {owner}"
     );
 }
+
+/// Creating a domain whose name already carries a private-domain record owned
+/// by somebody else is a conflict, not a fault: the request was understood, the
+/// caller is allowed to make it, and nothing about the request can be corrected
+/// - the record has to change first, which is what `PUT /domains/{domain}/owner`
+/// does. It used to answer 500 alongside the genuine store failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_a_domain_a_stranger_holds_privately_is_a_conflict() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let root = login(fx.addr, "root", "rootpw").await;
+    // `set_domain_visibility` requires a live account behind the owner it
+    // records, so the stranger needs an account before it can hold one.
+    fx.auth
+        .add_user("stranger", "Stranger", None, Role::Viewer, "strangerpw")
+        .await
+        .unwrap();
+    // The record with no domain behind it: exactly the state the arm detects.
+    fx.auth
+        .set_domain_visibility("orphaned", true, "stranger")
+        .await
+        .unwrap();
+
+    let response = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &root)
+        .json(&serde_json::json!({ "mode": "local", "name": "orphaned", "private": true }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 409);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["title"], "conflict");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("orphaned"), "{detail}");
+    assert!(
+        detail.contains("stranger"),
+        "the owner on file is named for the admin reading it: {detail}"
+    );
+    assert!(
+        detail.contains("PUT /domains/{domain}/owner"),
+        "and the route that changes it is named: {detail}"
+    );
+    assert!(
+        detail.contains("rolled back"),
+        "the registration did not survive the refusal: {detail}"
+    );
+    // Rolled back, so nothing is left registered and shared.
+    assert!(
+        !fx.engine.config().domains.contains_key("orphaned"),
+        "nothing was left registered"
+    );
+}

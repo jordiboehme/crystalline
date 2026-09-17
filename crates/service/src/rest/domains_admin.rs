@@ -273,10 +273,12 @@ fn is_windows_device_name(stem: &str) -> bool {
         ),
         (
             status = 409,
-            description = "The name is taken by another domain, or mode \
-                           `github` was asked for on an instance with no \
-                           GitHub connection - the detail says where to make \
-                           one.",
+            description = "The name is taken by another domain, the name already \
+                           carries a private-domain record owned by another \
+                           account (the detail names the owner and the route \
+                           that hands it over), or mode `github` was asked for \
+                           on an instance with no GitHub connection - the \
+                           detail says where to make one.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -415,16 +417,29 @@ async fn close_new_domain(state: &RestState, report: &Value, owner: &str) -> Res
         // The name already carried a visibility record: a domain that was
         // private under an earlier registration whose records outlived it, or
         // one closed against a name nobody had registered yet. Owned by the
-        // caller it is exactly what was asked for. Owned by somebody else it is
-        // NOT - the domain would be private to a stranger, invisible to the
-        // person who just created it - and this write no longer takes it over,
-        // so the registration is rolled back like any other failure here.
+        // caller it is exactly what was asked for.
         Ok(VisibilityWrite::AlreadyPrivate { owner: held }) if held == owner => return Ok(()),
-        Ok(VisibilityWrite::AlreadyPrivate { owner: held }) => anyhow::anyhow!(
-            "the name already carries a private-domain record owned by another \
-             account, so it was not made yours"
-        )
-        .context(format!("owner on file: '{held}'")),
+        // Owned by somebody else it is NOT - the domain would be private to a
+        // stranger, invisible to the person who just created it - and this
+        // write does not take it over. A conflict rather than a fault: the
+        // request was understood and is allowed, and nothing about it can be
+        // corrected, which is exactly what 409 says and what the sibling
+        // routes answer for a name already taken. Admin-only path
+        // (`identity.require_admin()` above), and an admin sees every domain,
+        // so naming the owner on file discloses nothing.
+        Ok(VisibilityWrite::AlreadyPrivate { owner: held }) => {
+            let rolled_back = state.engine.domain_remove(&name).await.is_ok();
+            return Err(ApiError::conflict(format!(
+                "the name '{name}' already carries a private-domain record owned by '{held}', so it \
+                 was not made yours{}. Hand it over with: PUT /domains/{{domain}}/owner",
+                if rolled_back {
+                    "; the registration was rolled back, so nothing was left shared"
+                } else {
+                    "; it is REGISTERED AND SHARED - unregister it or make it private \
+                     from the `crystalline` CLI on the server"
+                }
+            )));
+        }
         Err(e) => e,
     };
     let rolled_back = state.engine.domain_remove(&name).await.is_ok();

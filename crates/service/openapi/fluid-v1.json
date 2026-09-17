@@ -1079,7 +1079,7 @@
             }
           },
           "409": {
-            "description": "The name is taken by another domain, or mode `github` was asked for on an instance with no GitHub connection - the detail says where to make one.",
+            "description": "The name is taken by another domain, the name already carries a private-domain record owned by another account (the detail names the owner and the route that hands it over), or mode `github` was asked for on an instance with no GitHub connection - the detail says where to make one.",
             "content": {
               "application/problem+json": {
                 "schema": {
