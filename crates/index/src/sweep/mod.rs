@@ -148,7 +148,9 @@ pub const MINHASH_BAND_ROWS: usize = 4;
 
 /// The default approximate token budget for `V105`, matching verify's `Q002`
 /// default so the two rules agree on what oversized means. `0` disables the
-/// rule for an engram.
+/// rule for an engram. A `type: source` engram is held to
+/// `crystalline_core::verify::SOURCE_BUDGET_FACTOR` times this, since
+/// verbatim capture is what a source engram is for.
 pub const DEFAULT_TOKEN_BUDGET: usize = 2500;
 
 /// The fewest non-blank body lines outside fenced code an engram needs before
@@ -410,7 +412,7 @@ pub const RULES: [RuleInfo; 22] = [
         family: Family::Structure,
         base: 60,
         summary: "oversized",
-        instruction: "The engram is over its token budget. Split it by granularity: the distilled summary stays, the full text becomes a type source engram under sources/ and the two link both ways. Verify's Q002 flags the same size.",
+        instruction: "The engram is over its token budget. Which split helps depends on what is oversized, and the row's own fix says which one this engram needs: a distilled summary with the full text moved to a type source engram under sources/, sequential part engrams when the material is already verbatim, or a split by topic when the observations alone are over. A type source engram gets four times the budget, since verbatim capture is what it is for. Verify's Q002 flags the same size.",
     },
     RuleInfo {
         id: "V106",
@@ -1801,19 +1803,39 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             continue;
         }
 
-        // V105: over the token budget.
-        if fact.token_budget > 0 && fact.tokens > fact.token_budget {
+        // V105: over the token budget. `type: source` gets
+        // `SOURCE_BUDGET_FACTOR` times it, from the same core constant verify's
+        // Q002 reads, so the two rules flag the same size and V105's own remedy
+        // does not trip V105.
+        let budget =
+            crystalline_core::verify::effective_token_budget(&fact.engram_type, fact.token_budget);
+        if budget > 0 && fact.tokens > budget {
+            // The observations alone, on their stripped text: category prefix,
+            // trailing tags and context group are already off, so this
+            // undercounts the literal lines. Undercounting is the safe
+            // direction - the case only fires when even the stripped text is
+            // over, so it never calls an engram two engrams over its markup.
+            let observed: usize = fact
+                .observations
+                .iter()
+                .map(|o| o.text.chars().count())
+                .sum::<usize>()
+                / 4;
+            let fix = if observed > budget {
+                "The observations alone exceed the budget, so no split by granularity helps: this is two engrams. Split it by topic with split_engram.".to_string()
+            } else if fact.engram_type.eq_ignore_ascii_case("source") {
+                "Verbatim material does not compress: split it into sequential part engrams in the same sources/ folder, each linked back the way the capture skill describes.".to_string()
+            } else {
+                "split: keep the distilled summary and move the full text to sources/".to_string()
+            };
             report.findings.push(Finding::about("V105", fact).with(
                 Class::Judgment,
+                format!("about {} tokens over the {budget} token budget", fact.tokens),
                 format!(
-                    "about {} tokens over the {} token budget",
-                    fact.tokens, fact.token_budget
+                    "tokens={}; budget={budget}; observations={observed}; same size verify Q002 flags",
+                    fact.tokens
                 ),
-                format!(
-                    "tokens={}; budget={}; same size verify Q002 flags",
-                    fact.tokens, fact.token_budget
-                ),
-                "split: keep the distilled summary and move the full text to sources/".to_string(),
+                fix,
             ));
         }
 

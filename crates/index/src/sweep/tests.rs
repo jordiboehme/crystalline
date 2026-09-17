@@ -982,6 +982,97 @@ fn v105_flags_an_oversized_body() {
     );
 }
 
+/// A `type: source` engram is held to four times the domain's budget.
+/// Verbatim capture is what a source engram is FOR, so the rule that tells
+/// a writer to move the full text into one must not then flag the engram it
+/// just asked for. The factor is shared with verify's Q002 so the two keep
+/// flagging the same size.
+#[test]
+fn a_source_engram_gets_four_times_the_budget() {
+    let mut source = fact(1, "sources/transcript");
+    source.engram_type = "source".to_string();
+    source.token_budget = 2500;
+    source.tokens = 9_000;
+    let report = detect(&input(vec![source.clone()]));
+    assert!(
+        !report.findings.iter().any(|f| f.rule == "V105"),
+        "9000 tokens is inside a source engram's 10000: {:?}",
+        report.findings
+    );
+
+    source.tokens = 10_001;
+    let report = detect(&input(vec![source]));
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule == "V105")
+        .expect("over even the source budget");
+    assert!(
+        finding.evidence.contains("10000"),
+        "the evidence names the budget actually applied: {}",
+        finding.evidence
+    );
+}
+
+/// A budget of zero disables the rule for an engram whatever its type, so
+/// the factor never turns an opt-out into a very large budget.
+#[test]
+fn a_zero_budget_still_disables_v105_for_a_source_engram() {
+    let mut source = fact(1, "sources/transcript");
+    source.engram_type = "source".to_string();
+    source.token_budget = 0;
+    source.tokens = 1_000_000;
+    assert!(
+        !detect(&input(vec![source]))
+            .findings
+            .iter()
+            .any(|f| f.rule == "V105")
+    );
+}
+
+/// The three wordings, one per case. A non-source over budget keeps the
+/// split-by-granularity remedy; a source over its own larger budget cannot
+/// be compressed and splits into sequential parts; an engram whose
+/// observations alone blow the budget cannot be helped by either, because
+/// no granularity split moves a bullet somewhere smaller.
+#[test]
+fn v105_prescribes_a_different_split_per_case() {
+    let mut plain = fact(1, "big");
+    plain.token_budget = 2500;
+    plain.tokens = 4_000;
+    let plain_fix = only(&detect(&input(vec![plain])), "V105").fix;
+    assert!(plain_fix.contains("sources/"), "{plain_fix}");
+    assert!(plain_fix.contains("distilled summary"), "{plain_fix}");
+
+    let mut source = fact(2, "sources/transcript");
+    source.engram_type = "source".to_string();
+    source.token_budget = 2500;
+    source.tokens = 12_000;
+    let source_fix = only(&detect(&input(vec![source])), "V105").fix;
+    assert!(
+        source_fix.contains("Verbatim material does not compress"),
+        "{source_fix}"
+    );
+    assert!(
+        source_fix.contains("sequential part engrams"),
+        "{source_fix}"
+    );
+
+    let mut bullets = fact(3, "observed");
+    bullets.token_budget = 2500;
+    bullets.tokens = 4_000;
+    bullets.observations = vec![FactObservation {
+        line: 3,
+        text: "x".repeat(10_004),
+    }];
+    let bullets_fix = only(&detect(&input(vec![bullets])), "V105").fix;
+    assert!(
+        bullets_fix.contains("The observations alone exceed the budget"),
+        "{bullets_fix}"
+    );
+    assert!(bullets_fix.contains("split_engram"), "{bullets_fix}");
+}
+
 #[test]
 fn v106_flags_a_stub_and_ignores_fenced_code() {
     let mut stub = fact(1, "thin-note");

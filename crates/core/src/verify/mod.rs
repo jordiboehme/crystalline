@@ -35,6 +35,32 @@ use crate::parse::{BodyLine, body_lines};
 pub use report::{Format, render, to_github, to_human, to_json};
 pub use scanner::ScanError;
 
+/// How much more a `type: source` engram may hold than the domain's token
+/// budget allows an ordinary one.
+///
+/// A source engram is the place V105's own remedy tells a writer to put the
+/// full text of something, so holding it to the budget that sent it there would
+/// make the remedy trip the rule. Four times, and read by both rules that flag
+/// oversized engrams - verify's `Q002` here and the index sweep's `V105` - so
+/// the two cannot drift into flagging different sizes.
+pub const SOURCE_BUDGET_FACTOR: usize = 4;
+
+/// The budget an engram of `engram_type` is actually held to, given the budget
+/// resolved for its file and domain.
+///
+/// `0` stays `0`: a budget of zero is an explicit opt-out of the rule, and
+/// multiplying an opt-out would turn it into a very large budget instead.
+pub fn effective_token_budget(engram_type: &str, budget: usize) -> usize {
+    if budget == 0 {
+        return 0;
+    }
+    if engram_type.eq_ignore_ascii_case("source") {
+        budget.saturating_mul(SOURCE_BUDGET_FACTOR)
+    } else {
+        budget
+    }
+}
+
 /// The severity of a verify [`Issue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
