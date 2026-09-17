@@ -11,3 +11,26 @@ export function defined<T>(value: T | undefined, what = "value"): T {
   }
   return value;
 }
+
+/**
+ * A `getByText`/`findByText` matcher for a sentence RTL's own default one
+ * cannot find: a plain string or `RegExp` matcher is tested against one
+ * element's own text, and a sentence broken up by an inline link - the share
+ * outcome's linked proposal number among them - has no single element whose
+ * own text is the whole thing.
+ *
+ * Matches the deepest element whose text satisfies `pattern`: an ancestor
+ * that only matches because a matching descendant's text rolled up into its
+ * own `textContent` is passed over, which is what keeps this from throwing
+ * "multiple elements found" over one sentence sitting in two nested nodes.
+ */
+export function acrossElements(pattern: RegExp) {
+  return (_content: string, element: Element | null): boolean => {
+    if (element === null || !pattern.test(element.textContent ?? "")) {
+      return false;
+    }
+    return !Array.from(element.children).some((child) =>
+      pattern.test(child.textContent ?? ""),
+    );
+  };
+}

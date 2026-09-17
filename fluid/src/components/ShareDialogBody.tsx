@@ -79,7 +79,7 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { asNumber, asObject, asString } from "../api/json";
 import { useAuth } from "../auth/AuthContext";
-import { plural } from "../format";
+import { isWebAddress, plural } from "../format";
 import { ChangeList } from "./ChangeList";
 import type { ShareDialogProps } from "./ShareDialog";
 import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
@@ -114,7 +114,7 @@ export default function ShareDialogBody({
   // the request; an empty string is a title somebody deliberately cleared.
   const [title, setTitle] = useState<string | null>(null);
   const [description, setDescription] = useState("");
-  const [outcome, setOutcome] = useState<string | null>(null);
+  const [outcome, setOutcome] = useState<OutcomeSentence | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   // `null` is "nobody has touched a box", which is what lets the preselection
   // below stay in charge while the plan is still arriving and re-arriving. A
@@ -513,7 +513,20 @@ export default function ShareDialogBody({
             </form>
           ) : (
             <div className="mt-3 flex flex-col gap-3">
-              <p className="text-sm">{outcome}</p>
+              <p className="text-sm">
+                {outcome.before}
+                {outcome.link !== null && (
+                  <a
+                    href={outcome.link.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-medium underline underline-offset-2 hover:no-underline"
+                  >
+                    {outcome.link.label}
+                  </a>
+                )}
+                {outcome.after}
+              </p>
               <div className="flex justify-end">
                 <button
                   type="button"
@@ -625,6 +638,53 @@ function placementLine(payload: unknown): string {
 }
 
 /**
+ * The outcome sentence, split around the one thing in it worth a click.
+ *
+ * A plain string can't carry a link, and the outcome names a proposal that
+ * has one on every outcome that lands: `before` and `after` are the sentence
+ * with a hole in the middle, `link` is what fills it - `{ label, href }` for
+ * an anchor, or `null` when there is nothing to link, in which case `before`
+ * already carries the whole sentence and `after` is empty.
+ */
+interface OutcomeSentence {
+  before: string;
+  link: { label: string; href: string } | null;
+  after: string;
+}
+
+/** A sentence with nothing to link. */
+function plainSentence(text: string): OutcomeSentence {
+  return { before: text, link: null, after: "" };
+}
+
+/**
+ * A sentence naming a proposal by number, with the number itself as the one
+ * segment a click on it should go anywhere: `${prefix}proposal #N${suffix}`,
+ * the `#N` a link when `url` passes the same address screen the proposals
+ * card links a title through, plain text otherwise or when there is no
+ * number to name at all.
+ */
+function numberSentence(
+  prefix: string,
+  number: number | null,
+  suffix: string,
+  url: string | null,
+): OutcomeSentence {
+  if (number === null) {
+    return plainSentence(`${prefix}the proposal${suffix}`);
+  }
+  const label = `#${String(number)}`;
+  if (url !== null && isWebAddress(url)) {
+    return {
+      before: `${prefix}proposal `,
+      link: { label, href: url },
+      after: suffix,
+    };
+  }
+  return plainSentence(`${prefix}proposal ${label}${suffix}`);
+}
+
+/**
  * The one sentence the outcome earns.
  *
  * Read off the engine's own report rather than through a parsed shape, because
@@ -637,29 +697,55 @@ function placementLine(payload: unknown): string {
  * two rules for saying it are the ones {@link readStackPlacement} carries: the
  * position is the gate, and a chain of one open layer is not a chain anybody
  * needs told about.
+ *
+ * The number itself is the link, on every outcome that names one and whose
+ * url passes {@link isWebAddress} - the same screen the proposals card links
+ * a title through. The placement clause after it (`, layer 2 of 3 on stack
+ * #12`) is never a link: the report carries no address for a stack, only its
+ * number, so there is nothing there to point a reader at.
  */
-function describeOutcome(result: unknown): string {
+function describeOutcome(result: unknown): OutcomeSentence {
   const record = asObject(result);
   const outcome = asString(record?.outcome) ?? "";
-  // A `proposed` report carries its placement at the top level and an
-  // `updated` one inside `proposal`, the same split the number follows.
+  // A `proposed` report carries its placement and url at the top level and
+  // an `updated` one inside `proposal`, the same split the number follows.
   const proposal = asObject(record?.proposal);
   const number = asNumber(record?.number) ?? asNumber(proposal?.number);
-  const named =
-    number === null ? "the proposal" : `proposal #${String(number)}`;
-  const placed = `${named}${placementLine(proposal ?? record)}`;
   switch (outcome) {
     case "updated":
-      return `Updated ${placed}.`;
+      return numberSentence(
+        "Updated ",
+        number,
+        `${placementLine(proposal ?? record)}.`,
+        asString(proposal?.url),
+      );
     case "proposed":
-      return `Opened ${placed}.`;
+      return numberSentence(
+        "Opened ",
+        number,
+        `${placementLine(proposal ?? record)}.`,
+        asString(record?.url),
+      );
     case "nothing_to_share":
-      return "Nothing to share: the team already has all of this.";
+      return plainSentence(
+        "Nothing to share: the team already has all of this.",
+      );
     case "conflicts_pending":
-      return "Conflicts need settling before sharing. Nothing was shared.";
+      return plainSentence(
+        "Conflicts need settling before sharing. Nothing was shared.",
+      );
     case "proposal_diverged":
-      return "A reviewer amended the proposal branch, so nothing was shared. Withdraw it or let the review finish.";
+      return number === null
+        ? plainSentence(
+            "A reviewer amended the proposal branch, so nothing was shared. Withdraw it or let the review finish.",
+          )
+        : numberSentence(
+            "A reviewer amended ",
+            number,
+            "'s branch, so nothing was shared. Withdraw it or let the review finish.",
+            asString(proposal?.url),
+          );
     default:
-      return "Shared.";
+      return plainSentence("Shared.");
   }
 }
