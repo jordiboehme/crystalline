@@ -37,17 +37,24 @@ cargo build --release
 
 python3 evals/scale/generate.py --out evals/scale/corpus
 bash evals/scale/run.sh --stage base
-bash evals/scale/run.sh --stage daemon
 bash evals/scale/run.sh --stage embed
+bash evals/scale/run.sh --stage daemon
 ```
 
 `base` registers the five domains and measures sync, status, verify, the
-search battery, evolve, doctor and a non-embedding `reindex --full`. `daemon`
-serves the same index, runs the battery through the daemon and samples the
-daemon's resident size while it works through the embedding backlog. `embed`
-is `reindex --full --embed` and a second battery; it is a stage of its own
-because it takes the longest by far. Run `base` first: the other two expect
-the index it builds.
+search battery, evolve, doctor and a non-embedding `reindex --full`; it leaves
+every chunk waiting to be embedded. `embed` is `reindex --full --embed` and a
+second battery: it measures the bulk embedding pass and the peak resident size
+that pass reaches, which is the ceiling this harness exists to watch, and it is
+a stage of its own because it takes the longest by far. `daemon` then serves
+the already-embedded index, runs the battery through the daemon and samples the
+daemon's resident size while it works.
+
+Run them in that order. It is load bearing, not a habit: `reindex --full` keeps
+the embedding of every chunk whose text is unchanged, and the daemon drains any
+backlog on its own, so an `embed` stage run after `daemon` finds nothing left to
+embed and would report seconds where the pass takes an hour. It refuses in that
+state rather than reporting a number that looks like a result.
 
 Options: `--bin` (default `target/release/crystalline`), `--corpus`, `--out`,
 `--stage all|base|embed|daemon`, and `STATE_DIR` in the environment for the

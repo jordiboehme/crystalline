@@ -10,12 +10,18 @@
 # them is given --config and --db explicitly as well.
 #
 #   bash evals/scale/run.sh --stage base
-#   bash evals/scale/run.sh --stage daemon
 #   bash evals/scale/run.sh --stage embed
+#   bash evals/scale/run.sh --stage daemon
 #
 # The stages are separate because the embedding pass takes over an hour on a
-# laptop. `base` builds the index from scratch, so it must run first; `daemon`
-# and `embed` both expect the index `base` left behind.
+# laptop, and they run in that order: `base` builds the index from scratch and
+# leaves every chunk waiting to be embedded, `embed` measures that bulk pass and
+# its peak, `daemon` then serves the already-embedded index and samples what the
+# battery costs it. The order is load bearing rather than a habit - `reindex
+# --full` keeps the embedding of every chunk whose text is unchanged, and the
+# daemon drains the backlog on its own, so an embed stage run after the daemon
+# stage embeds nothing at all. It refuses rather than reporting that nothing
+# took no time.
 #
 set -euo pipefail
 
@@ -32,7 +38,9 @@ while [ $# -gt 0 ]; do
     --corpus) CORPUS="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --stage) STAGE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    # The header block above, which ends at the line before `set -euo
+    # pipefail`, so --help never truncates mid-sentence when it is edited.
+    -h|--help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -143,11 +151,10 @@ run_step() {
   record_step "$name" "$rc" "$LOGS/$name.time"
 }
 
-# One number out of `ctl status --json`, or an empty string when the daemon
-# does not answer.
-status_field() {
-  "$BIN" ctl status --json 2> /dev/null \
-    | python3 -c 'import json,sys
+# One dotted field out of a JSON document on stdin, or an empty string when it
+# is not there.
+json_field() {
+  python3 -c 'import json,sys
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -155,7 +162,19 @@ except Exception:
 path = sys.argv[1].split(".")
 for k in path:
     d = d.get(k, {}) if isinstance(d, dict) else {}
-print(d if not isinstance(d, dict) else "")' "$1" || true
+print(d if not isinstance(d, dict) else "")' "$1"
+}
+
+# One number out of `ctl status --json`, or an empty string when the daemon
+# does not answer.
+status_field() {
+  "$BIN" ctl status --json 2> /dev/null | json_field "$1" || true
+}
+
+# The same, read straight off the index file with no daemon involved, for the
+# stages that run before one is started.
+index_field() {
+  "$BIN" status --json --config "$CFG" --db "$DB" 2> /dev/null | json_field "$1" || true
 }
 
 # A search is given --config and --db everywhere except the daemon stage.
@@ -214,6 +233,21 @@ stage_base() {
 
 stage_embed() {
   echo "== embed =="
+  # This stage measures a bulk embed, so it has to start from an index that has
+  # nothing embedded yet - which is what the base stage leaves behind. A
+  # `reindex --full` keeps the embedding of every chunk whose text is unchanged,
+  # so over an already-embedded index this stage embeds nothing and reports a
+  # handful of seconds that read like a result. Say so instead: the number this
+  # stage exists for is the peak resident size of a bulk embed at ten thousand
+  # engrams, and a run that measures nothing has to look like a failure.
+  local embedded total
+  embedded="$(index_field embeddings.embedded_chunks)"
+  total="$(index_field embeddings.total_chunks)"
+  if [ -n "$embedded" ] && [ -n "$total" ] && [ "$total" != "0" ] && [ "$embedded" = "$total" ]; then
+    echo "every chunk is already embedded ($embedded of $total), so this stage would measure nothing." >&2
+    echo "run the stages in order on a fresh --out: base, then embed, then daemon." >&2
+    return 1
+  fi
   run_step "reindex-full-embed" \
     "$BIN" reindex --full --embed --config "$CFG" --db "$DB"
   run_step "status-json-embedded" "$BIN" status --json --config "$CFG" --db "$DB"
@@ -275,7 +309,10 @@ stage_daemon() {
   run_step "ctl-status" "$BIN" ctl status
   search_battery "daemon-search" "text hybrid semantic" "routed"
 
-  # Wait for the embedding backlog the base stage left behind. A backlog that
+  # Drain whatever embedding backlog is left. In the documented order the embed
+  # stage has already done the bulk pass, so this is the daemon's own top-up and
+  # usually returns at once; run without that stage it is the bulk pass itself,
+  # and the sampler above is what measures it. Either way a backlog that
   # outlives the limit is a recordable outcome, not a hang.
   local elapsed=0 embedded total
   while [ "$elapsed" -lt "$DRAIN_LIMIT" ]; do
@@ -309,7 +346,7 @@ case "$STAGE" in
   base) stage_base ;;
   embed) stage_embed ;;
   daemon) stage_daemon ;;
-  all) stage_base; stage_daemon; stage_embed ;;
+  all) stage_base; stage_embed; stage_daemon ;;
 esac
 
 echo
