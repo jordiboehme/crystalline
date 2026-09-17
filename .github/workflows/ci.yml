@@ -268,6 +268,13 @@ jobs:
       - name: Run style lint
         run: bash scripts/style-lint.sh
 
+      # The version moves three files together and the fluid job compares only
+      # two of them. The README's three pins are what a user copies into their
+      # own workflow, so a bump that forgets them ships a snippet pinning the
+      # previous release.
+      - name: The README's action pins match the workspace version
+        run: bash scripts/version-pins.sh
+
   musl-spike:
     name: musl-spike
     runs-on: ubuntu-latest
