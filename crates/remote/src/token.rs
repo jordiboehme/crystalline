@@ -20,6 +20,7 @@
 //! that already has the value in hand constructs the store explicitly.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,11 +29,57 @@ use crate::error::RemoteError;
 /// The keyring service name every Crystalline credential is stored under.
 const KEYRING_SERVICE: &str = "crystalline";
 
+/// How long one OS keychain call may take before the backend is treated as
+/// unusable. Generous enough that a machine merely showing the user an
+/// "allow access" dialog is not cut off mid-decision, short enough that a
+/// wedged keychain daemon cannot make a sign-in look frozen forever.
+///
+/// Every keychain touch in this module goes through
+/// [`keyring_call_with_timeout`] under this bound, so no caller - the daemon
+/// least of all - can block on the platform keychain indefinitely.
+const KEYRING_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The file name the file-backed store writes within its state directory for
 /// the instance credential. Byte-identical to what every existing install
 /// already carries: a personal token gets its own name beside it rather than
 /// changing this one.
 const TOKEN_FILE_NAME: &str = "github-token.json";
+
+/// Set (to any non-empty value) to refuse the real OS keychain backend
+/// everywhere in this module and use the file store instead, at whatever
+/// location the caller already passed in - never a location of its own.
+///
+/// This is deliberately a different variable from
+/// `CRYSTALLINE_TEST_TOKEN_STORE_DIR` (`crystalline::cmd::test_token_store_dir`),
+/// which redirects `connect github` to an entirely different state
+/// directory: reusing that one here once broke
+/// `disconnecting_a_personal_identity_forgets_its_credential`, whose fixture
+/// file lives at the isolated `origins_state_dir()` the test's `HOME`
+/// already redirects to - a boolean kill switch must never also move the
+/// file, or a test that isolates its base directories loses track of where
+/// its own fixture landed. `CRYSTALLINE_TEST_TOKEN_STORE_DIR` still works
+/// the way it always has and is untouched by this variable.
+///
+/// Read once, here, inside [`TokenStore::resolve_and_load_bounded`] and
+/// [`TokenStore::save_resolving_bounded`] - the two functions every public
+/// resolve/save entry point in this module funnels through before it can
+/// ever reach [`keyring_read`] or [`keyring_write`] - rather than by each
+/// caller separately. A CLI command that gains a new credential touch
+/// therefore inherits the protection for free instead of needing its own
+/// copy of this check, which is what let `crystalline doctor` and
+/// `crystalline users disable`/`remove` reach the real login keychain from a
+/// test for as long as only `crystalline connect github` carried its own
+/// seam.
+///
+/// Not a knob any install is meant to set; nothing documents it as one (see
+/// `crystalline_service::overlay::RESERVED_VARS`, which reserves this and
+/// `CRYSTALLINE_TEST_TOKEN_STORE_DIR` from the unknown-variable warning for
+/// the same reason).
+const NO_REAL_KEYCHAIN_ENV: &str = "CRYSTALLINE_TEST_NO_KEYCHAIN";
+
+fn refuse_real_keychain() -> bool {
+    std::env::var_os(NO_REAL_KEYCHAIN_ENV).is_some_and(|v| !v.is_empty())
+}
 
 /// The longest personal identity name a credential is addressed by. Account
 /// names come from the auth layer already trimmed and lowercased, so this is a
@@ -174,9 +221,10 @@ impl TokenStore {
     /// token, so `(Keyring, Some(token))`; `Err(NoEntry)` means the keychain
     /// works but is empty, so `(Keyring, None)` (an absent item never prompts
     /// on macOS, so a machine that has not connected yet is re-read freely);
-    /// anything else - including failing to even build the entry - means the
-    /// backend itself is unusable (headless Linux with no session bus, most CI
-    /// runners), so the file fallback plus whatever that file holds. Callers
+    /// anything else - including failing to even build the entry, and the read
+    /// outrunning [`KEYRING_TIMEOUT`] - means the backend itself is unusable
+    /// (headless Linux with no session bus, most CI runners, a wedged keychain
+    /// daemon), so the file fallback plus whatever that file holds. Callers
     /// that need both a token and the backend choice - every origin operation
     /// and the offline connection probe - get both here without the old
     /// probe-then-load double read that made every such call two keychain
@@ -201,14 +249,39 @@ impl TokenStore {
         host: Option<&str>,
         fallback_dir: &Path,
     ) -> Result<(TokenStore, Option<StoredToken>), RemoteError> {
+        Self::resolve_and_load_bounded(identity, host, fallback_dir, |account| {
+            keyring_read(account, KEYRING_TIMEOUT)
+        })
+    }
+
+    /// [`TokenStore::resolve_and_load_for`] with the keychain read injected,
+    /// so a test can drive the unusable-backend branch - a timeout included -
+    /// without touching the real platform keychain. The only production
+    /// caller passes [`keyring_read`] under [`KEYRING_TIMEOUT`].
+    fn resolve_and_load_bounded(
+        identity: &TokenIdentity,
+        host: Option<&str>,
+        fallback_dir: &Path,
+        read: impl FnOnce(&str) -> KeyringRead,
+    ) -> Result<(TokenStore, Option<StoredToken>), RemoteError> {
+        // The test seam: use the file store at the caller's own
+        // `fallback_dir` and never call `read`, so the real OS keychain
+        // backend is never even constructed. Checked before
+        // `account_for_identity_checked` too, so a test never pays for (or
+        // is refused by) an identity check on the way to a backend it was
+        // never going to reach.
+        if refuse_real_keychain() {
+            let store = TokenStore::file_fallback_for(identity, fallback_dir)?;
+            let token = store.load()?;
+            return Ok((store, token));
+        }
         let account = account_for_identity_checked(identity, host)?;
-        let read = keyring::Entry::new(KEYRING_SERVICE, &account)
-            .ok()
-            .map(|entry| entry.get_password());
-        match read {
-            Some(Ok(json)) => Ok((TokenStore::Keyring { account }, Some(from_json(&json)?))),
-            Some(Err(keyring::Error::NoEntry)) => Ok((TokenStore::Keyring { account }, None)),
-            _ => {
+        match read(&account) {
+            KeyringRead::Found(json) => {
+                Ok((TokenStore::Keyring { account }, Some(from_json(&json)?)))
+            }
+            KeyringRead::Empty => Ok((TokenStore::Keyring { account }, None)),
+            KeyringRead::Failed(_) => {
                 let store = TokenStore::file_fallback_for(identity, fallback_dir)?;
                 let token = store.load()?;
                 Ok((store, token))
@@ -222,9 +295,11 @@ impl TokenStore {
     /// [`TokenStore::resolve_and_load`] does, since a save has the value in
     /// hand and learns the same thing from the write itself.
     ///
-    /// The keychain is tried first with a direct `set_password`; any failure
-    /// (or failing to build the entry, or serialize the token) lands the token
-    /// in the file store instead. The trade-off is deliberate: a keychain that
+    /// The keychain is tried first with a direct `set_password` under
+    /// [`KEYRING_TIMEOUT`]; any failure (or failing to build the entry, or
+    /// serialize the token, or the write outrunning that bound) lands the
+    /// token in the file store instead. The trade-off is deliberate: a
+    /// keychain that
     /// reads fine but fails this one write puts the token in the file, and the
     /// user simply retries connect - judged far rarer and more recoverable
     /// than re-probing on every save, which is the prompt storm this module
@@ -250,10 +325,35 @@ impl TokenStore {
         fallback_dir: &Path,
         token: &StoredToken,
     ) -> Result<TokenStore, RemoteError> {
+        Self::save_resolving_bounded(identity, host, fallback_dir, token, |account, json| {
+            keyring_write(account, json, KEYRING_TIMEOUT)
+        })
+    }
+
+    /// [`TokenStore::save_resolving_for`] with the keychain write injected,
+    /// so a test can drive the unusable-backend branch - a timeout included -
+    /// and prove the token lands in the file store, without touching the real
+    /// platform keychain. The only production caller passes [`keyring_write`]
+    /// under [`KEYRING_TIMEOUT`].
+    fn save_resolving_bounded(
+        identity: &TokenIdentity,
+        host: Option<&str>,
+        fallback_dir: &Path,
+        token: &StoredToken,
+        write: impl FnOnce(&str, String) -> Result<(), RemoteError>,
+    ) -> Result<TokenStore, RemoteError> {
+        // The test seam: write straight to the file store at the caller's
+        // own `fallback_dir` and never call `write`, so the real OS
+        // keychain backend is never even constructed. See
+        // [`refuse_real_keychain`].
+        if refuse_real_keychain() {
+            let store = TokenStore::file_fallback_for(identity, fallback_dir)?;
+            store.save(token)?;
+            return Ok(store);
+        }
         let account = account_for_identity_checked(identity, host)?;
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account)
-            && let Ok(json) = to_json(token)
-            && entry.set_password(&json).is_ok()
+        if let Ok(json) = to_json(token)
+            && write(&account, json).is_ok()
         {
             return Ok(TokenStore::Keyring { account });
         }
@@ -308,9 +408,7 @@ impl TokenStore {
         match self {
             TokenStore::Keyring { account } => {
                 let json = to_json(token)?;
-                keyring_entry(account)?
-                    .set_password(&json)
-                    .map_err(|e| credential_error("save", e))
+                keyring_write(account, json, KEYRING_TIMEOUT)
             }
             TokenStore::File { path } => save_file(path, token),
             TokenStore::Env { .. } => Err(env_read_only_error()),
@@ -326,10 +424,10 @@ impl TokenStore {
     /// token exists at all ever surface).
     pub fn load(&self) -> Result<Option<StoredToken>, RemoteError> {
         match self {
-            TokenStore::Keyring { account } => match keyring_entry(account)?.get_password() {
-                Ok(json) => from_json(&json).map(Some),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(credential_error("load", e)),
+            TokenStore::Keyring { account } => match keyring_read(account, KEYRING_TIMEOUT) {
+                KeyringRead::Found(json) => from_json(&json).map(Some),
+                KeyringRead::Empty => Ok(None),
+                KeyringRead::Failed(e) => Err(credential_error("load", e)),
             },
             TokenStore::File { path } => load_file(path),
             TokenStore::Env { token, host } => Ok(Some(StoredToken {
@@ -345,10 +443,7 @@ impl TokenStore {
     /// error.
     pub fn delete(&self) -> Result<(), RemoteError> {
         match self {
-            TokenStore::Keyring { account } => match keyring_entry(account)?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(credential_error("delete", e)),
-            },
+            TokenStore::Keyring { account } => keyring_delete(account, KEYRING_TIMEOUT),
             TokenStore::File { path } => delete_file(path),
             TokenStore::Env { .. } => Err(env_read_only_error()),
         }
@@ -472,10 +567,179 @@ fn quotable(name: &str) -> String {
     out
 }
 
-/// Opens a keyring entry, mapping the (rare) failure to build one at all to
-/// [`RemoteError::Credential`].
-fn keyring_entry(account: &str) -> Result<keyring::Entry, RemoteError> {
-    keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| credential_error("open", e))
+/// What one bounded keychain read came back with, as owned data: the
+/// closure that runs on the worker thread maps `keyring`'s own error type
+/// here rather than sending it across, so nothing in the bound depends on
+/// that type staying `Send`.
+enum KeyringRead {
+    /// The entry exists and holds this serialized token.
+    Found(String),
+    /// The backend works and holds nothing for this account. Never a
+    /// prompt on macOS, so a machine that has not connected yet is re-read
+    /// freely.
+    Empty,
+    /// The backend itself is unusable (no session bus, no keychain daemon),
+    /// carrying the reason for the log line.
+    Failed(String),
+}
+
+/// Runs one OS keychain call under a deadline: the single site every keychain
+/// touch in this module goes through. Production passes [`KEYRING_TIMEOUT`];
+/// the bound is a parameter so a test can prove the timeout behaviour in
+/// milliseconds instead of seconds.
+///
+/// The closure runs on a dedicated thread and the caller waits for it with a
+/// deadline. A thread rather than `tokio::task::spawn_blocking` because every
+/// caller here is synchronous - `TokenStore::load`, `save` and `delete` and
+/// both resolving constructors are called from sync code (the CLI's connect
+/// commands, the engine's sync credential resolver) as well as from inside
+/// the daemon's runtime, and a sync function cannot await a
+/// `tokio::time::timeout`. One shape that behaves the same in and out of a
+/// runtime beats two, one of which would never be exercised.
+///
+/// **The bound is the whole of the defence on a read.** The daemon's async
+/// connect paths move the whole SAVE off the runtime with `spawn_blocking`, so
+/// a wedged keychain write costs a blocking-pool thread and nothing else. A
+/// read is called synchronously from inside the runtime (the sync credential
+/// resolver every share and pull goes through), so a wedged keychain read
+/// occupies a runtime worker for up to [`KEYRING_TIMEOUT`] before this bound
+/// frees it. That is the reason the bound exists and the reason it is measured
+/// in seconds rather than minutes; moving the reads behind `spawn_blocking`
+/// means making the resolver async, which is a bigger change than the fault it
+/// would soften.
+///
+/// A call that outruns the deadline leaves its thread behind, still parked in
+/// the platform keychain. That is deliberate: the point of the bound is that
+/// the CALLER stops waiting, and a wedged keychain call cannot be cancelled
+/// from outside. One leaked thread per wedged call, on a path that is
+/// attempted at most a handful of times per process, is the price.
+fn keyring_call_with_timeout<T, F>(
+    timeout: Duration,
+    operation: &str,
+    f: F,
+) -> Result<T, RemoteError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    keyring_call_bounded(timeout, operation, f)
+        .map_err(|reason| credential_error(operation, reason))
+}
+
+/// [`keyring_call_with_timeout`] with the reason left bare, for the one caller
+/// that frames it itself.
+///
+/// [`keyring_read`] carries its failures inside [`KeyringRead::Failed`], which
+/// its own callers then turn into an error naming what THEY were doing
+/// ("could not load the GitHub token: ..."). Handing it an already-framed
+/// sentence produced "could not load the GitHub token: could not read the
+/// GitHub token: the OS keychain did not answer within 15s" - one fault
+/// described twice. So the framing happens once, at whichever layer is
+/// speaking.
+fn keyring_call_bounded<T, F>(timeout: Duration, operation: &str, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("crystalline-keyring".to_string())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(|e| e.to_string())?;
+    match rx.recv_timeout(timeout) {
+        Ok(value) => Ok(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                operation,
+                timeout_secs = timeout.as_secs_f64(),
+                "the OS keychain did not answer in time; treating the backend as unusable"
+            );
+            Err(format!(
+                "the OS keychain did not answer within {:.0}s",
+                timeout.as_secs_f64()
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the OS keychain call ended without an answer".to_string())
+        }
+    }
+}
+
+/// Panics with a clear message when [`refuse_real_keychain`] says the real
+/// backend is off limits: the last-resort guard behind [`keyring_read`],
+/// [`keyring_write`] and [`keyring_delete`], which is otherwise unreachable
+/// once the test seam is set, since [`TokenStore::resolve_and_load_bounded`]
+/// and [`TokenStore::save_resolving_bounded`] never call into them and no
+/// other code in this crate constructs a `TokenStore::Keyring` directly. If
+/// this ever fires, some new path reached the real OS keychain from a test
+/// without going through either of those two functions - the fix is to route
+/// it through them, not to silence this.
+fn refuse_real_keychain_under_test(operation: &str) {
+    if refuse_real_keychain() {
+        panic!(
+            "a test reached the real OS keychain to {operation} a credential while \
+             {NO_REAL_KEYCHAIN_ENV} was set; route this call through \
+             TokenStore::resolve_and_load_for or save_resolving_for instead of \
+             constructing a Keyring store directly"
+        );
+    }
+}
+
+/// One bounded keychain read for `account`, the shape both
+/// [`TokenStore::resolve_and_load_for`] and [`TokenStore::load`] read
+/// through. A timeout is reported as [`KeyringRead::Failed`], which is the
+/// same unusable-backend answer a machine with no keychain daemon gives, so
+/// the file fallback takes over on both.
+fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
+    refuse_real_keychain_under_test("read");
+    let owned = account.to_string();
+    let read = keyring_call_bounded(timeout, "read", move || {
+        match keyring::Entry::new(KEYRING_SERVICE, &owned) {
+            Ok(entry) => match entry.get_password() {
+                Ok(json) => KeyringRead::Found(json),
+                Err(keyring::Error::NoEntry) => KeyringRead::Empty,
+                Err(e) => KeyringRead::Failed(e.to_string()),
+            },
+            Err(e) => KeyringRead::Failed(e.to_string()),
+        }
+    });
+    // Bare, because whoever asked for the read is the one who says so: see
+    // [`keyring_call_bounded`].
+    read.unwrap_or_else(KeyringRead::Failed)
+}
+
+/// One bounded keychain write for `account`, the shape both
+/// [`TokenStore::save_resolving_for`] and [`TokenStore::save`] write
+/// through. `Err` carries the reason, a timeout included.
+fn keyring_write(account: &str, json: String, timeout: Duration) -> Result<(), RemoteError> {
+    refuse_real_keychain_under_test("save");
+    let owned = account.to_string();
+    keyring_call_with_timeout(timeout, "save", move || {
+        match keyring::Entry::new(KEYRING_SERVICE, &owned) {
+            Ok(entry) => entry.set_password(&json).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    })?
+    .map_err(|e| credential_error("save", e))
+}
+
+/// One bounded keychain delete for `account`. Deleting an entry that is not
+/// there is not an error, exactly as it was before the bound.
+fn keyring_delete(account: &str, timeout: Duration) -> Result<(), RemoteError> {
+    refuse_real_keychain_under_test("delete");
+    let owned = account.to_string();
+    keyring_call_with_timeout(timeout, "delete", move || {
+        match keyring::Entry::new(KEYRING_SERVICE, &owned) {
+            Ok(entry) => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        }
+    })?
+    .map_err(|e| credential_error("delete", e))
 }
 
 /// Builds a [`RemoteError::Credential`] naming the attempted `operation`.
@@ -573,6 +837,126 @@ mod tests {
     // `file_fallback_store_round_trips_under_the_fallback_dir`, which exercises
     // the exact store both functions build on a machine with no usable keyring
     // backend.
+    //
+    // The bound itself IS exercised, through the injected-closure seams
+    // (`resolve_and_load_bounded`, `save_resolving_bounded`) and through
+    // `keyring_call_with_timeout` directly: a closure that sleeps stands in
+    // for a wedged keychain and nothing in these four tests opens a
+    // `keyring::Entry`.
+
+    /// A keychain call that answers inside the bound passes its value
+    /// straight through: the bound is a ceiling, not a delay.
+    #[test]
+    fn a_fast_keyring_call_passes_its_value_through() {
+        let answered =
+            keyring_call_with_timeout(Duration::from_secs(5), "read", || "in time".to_string())
+                .expect("a call that answers inside the bound is not a failure");
+        assert_eq!(answered, "in time");
+    }
+
+    /// A keychain call that outruns the bound is reported as a credential
+    /// failure naming the timeout, rather than blocking the caller forever.
+    #[test]
+    fn a_keyring_call_past_the_bound_fails_with_the_timeout() {
+        let err = keyring_call_with_timeout(Duration::from_millis(50), "read", || {
+            std::thread::sleep(Duration::from_secs(30));
+        })
+        .expect_err("a call past the bound must not be waited out");
+        assert!(
+            err.to_string().contains("did not answer within"),
+            "the failure names the timeout: {err}"
+        );
+    }
+
+    /// The reason a wedged READ reports is framed once, by whoever asked for
+    /// it. It used to be framed twice - "could not load the GitHub token:
+    /// could not read the GitHub token: ..." - because the bounded call framed
+    /// it for the read and `TokenStore::load` framed it again for the load.
+    #[test]
+    fn a_wedged_read_is_reported_once_and_not_twice() {
+        let read = keyring_call_bounded(Duration::from_millis(50), "read", || {
+            std::thread::sleep(Duration::from_secs(30));
+        })
+        .map(|()| KeyringRead::Empty)
+        .unwrap_or_else(KeyringRead::Failed);
+        let KeyringRead::Failed(reason) = read else {
+            panic!("a call past the bound is a failure");
+        };
+        assert!(
+            reason.contains("did not answer within"),
+            "the reason names the timeout: {reason}"
+        );
+        assert!(
+            !reason.contains("could not"),
+            "and is bare, so the layer that speaks frames it once: {reason}"
+        );
+        let framed = credential_error("load", reason).to_string();
+        assert!(
+            framed.contains("could not load the GitHub token"),
+            "the load says what IT was doing: {framed}"
+        );
+        assert!(
+            !framed.contains("could not read the GitHub token"),
+            "and does not carry the read's framing as well: {framed}"
+        );
+    }
+
+    /// A keychain WRITE that outruns the bound falls through to the file
+    /// store, the same branch a machine with no keychain daemon takes - the
+    /// token is saved, not lost, and the returned store says where.
+    #[test]
+    fn a_keyring_save_past_the_bound_lands_in_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = sample_token();
+        let store = TokenStore::save_resolving_bounded(
+            &TokenIdentity::Instance,
+            None,
+            dir.path(),
+            &token,
+            |_account, _json| {
+                keyring_call_with_timeout(Duration::from_millis(50), "save", || {
+                    std::thread::sleep(Duration::from_secs(30));
+                })
+            },
+        )
+        .expect("the file store takes over");
+
+        assert_eq!(store.kind(), "file");
+        assert_eq!(
+            store.load().unwrap().unwrap().access_token,
+            token.access_token,
+            "the token the wedged keychain never took is on disk"
+        );
+    }
+
+    /// A keychain READ that outruns the bound falls through to the file
+    /// store too, so a wedged keychain degrades a status read rather than
+    /// hanging it.
+    #[test]
+    fn a_keyring_read_past_the_bound_falls_back_to_the_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = sample_token();
+        let file = TokenStore::file_fallback_for(&TokenIdentity::Instance, dir.path()).unwrap();
+        file.save(&token).unwrap();
+
+        let (store, loaded) = TokenStore::resolve_and_load_bounded(
+            &TokenIdentity::Instance,
+            None,
+            dir.path(),
+            |_| {
+                let timed_out =
+                    keyring_call_with_timeout(Duration::from_millis(50), "read", || {
+                        std::thread::sleep(Duration::from_secs(30));
+                    })
+                    .expect_err("the stand-in keychain never answers");
+                KeyringRead::Failed(timed_out.to_string())
+            },
+        )
+        .expect("the file store takes over");
+
+        assert_eq!(store.kind(), "file");
+        assert_eq!(loaded.unwrap().access_token, token.access_token);
+    }
 
     #[test]
     fn personal_and_instance_tokens_live_in_separate_files() {

@@ -115,7 +115,7 @@ fn touch_generated_records_the_actor_and_an_rfc3339_instant() {
     let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
     let now: DateTime<FixedOffset> =
         DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
-    let out = touch_generated(&source, "claude-code/1.0.5", now);
+    let out = touch_generated(&source, "claude-code/1.0.5", None, now);
     assert!(
         out.contains("generated: { by: claude-code/1.0.5, at: 2026-07-02T10:00:00+00:00 }"),
         "{out}"
@@ -126,6 +126,41 @@ fn touch_generated_records_the_actor_and_an_rfc3339_instant() {
     assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-02T10:00:00+00:00");
 }
 
+/// A write that reports no model emits exactly the two-key form it always
+/// emitted, byte for byte, so every engram written before the model existed and
+/// every write that cannot name one is unchanged.
+#[test]
+fn a_generated_block_without_a_model_emits_the_two_key_form_unchanged() {
+    let source = read(&fixtures_dir().join("canonical/generated-provenance.md"));
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(&source, "claude-code/1.0.5", None, now);
+    let expected = source.replace(
+        "generated: { by: claude-code/1.0.5, at: 2026-07-27T09:15:00+00:00 }",
+        "generated: { by: claude-code/1.0.5, at: 2026-07-02T10:00:00+00:00 }",
+    );
+    assert_eq!(out, expected, "only the instant may move");
+    assert!(!out.contains("model"), "no model was reported: {out}");
+}
+
+/// A write that reports its model records it beside the actor, and the block
+/// parses back into the model with the id intact.
+#[test]
+fn touch_generated_keeps_a_reported_model() {
+    let source = read(&fixtures_dir().join("canonical/minimal-okf.md"));
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(&source, "claude-code/2.1.271", Some("claude-opus-5"), now);
+    assert!(
+        out.contains(
+            "generated: { by: claude-code/2.1.271, model: claude-opus-5, at: 2026-07-02T10:00:00+00:00 }"
+        ),
+        "{out}"
+    );
+    let g = parse_engram(&out).unwrap().frontmatter.generated.unwrap();
+    assert_eq!(g.model.as_deref(), Some("claude-opus-5"));
+}
+
 #[test]
 fn touch_generated_migrates_a_legacy_timestamp_line_in_place() {
     // A file written before the `generated` migration carries `timestamp`.
@@ -134,7 +169,7 @@ fn touch_generated_migrates_a_legacy_timestamp_line_in_place() {
     let source = read(&fixtures_dir().join("canonical/full-frontmatter.md"));
     let now: DateTime<FixedOffset> =
         DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
-    let out = touch_generated(&source, "human:jordi", now);
+    let out = touch_generated(&source, "human:jordi", None, now);
     let expected = source.replace(
         "timestamp: 2026-05-01T09:15:00+00:00",
         "generated: { by: human:jordi, at: 2026-07-02T10:00:00+00:00 }",
@@ -159,7 +194,7 @@ body
 ";
     let now: DateTime<FixedOffset> =
         DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
-    let out = touch_generated(source, "new/2", now);
+    let out = touch_generated(source, "new/2", None, now);
     assert!(
         out.contains("timestamp: 2020-01-01T00:00:00+00:00"),
         "{out}"
@@ -196,7 +231,7 @@ Body.
 ";
     let now: DateTime<FixedOffset> =
         DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
-    let out = touch_generated(source, "claude-code/1.0.5", now);
+    let out = touch_generated(source, "claude-code/1.0.5", None, now);
     let e = parse_engram(&out).expect("the refreshed engram still parses");
     let g = e.frontmatter.generated.unwrap();
     assert_eq!(g.by, "claude-code/1.0.5");
@@ -225,7 +260,7 @@ Body.
 ";
     let now: DateTime<FixedOffset> =
         DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
-    let out = touch_generated(source, "new/2", now);
+    let out = touch_generated(source, "new/2", None, now);
     let e = parse_engram(&out).expect("the refreshed engram still parses");
     assert_eq!(e.frontmatter.generated.unwrap().by, "new/2");
     assert!(!out.contains("human:jordi"), "{out}");
@@ -335,6 +370,7 @@ fn set_frontmatter_number_writes_a_bare_yaml_number() {
 fn verification(by: &str, at: &str) -> Verified {
     Verified {
         by: by.to_string(),
+        model: None,
         at: DateTime::parse_from_rfc3339(at).ok(),
     }
 }
@@ -576,6 +612,7 @@ fn a_verified_actor_with_a_newline_stays_one_line() {
         source,
         &[Verified {
             by: "human:jordi\nstatus: evil".to_string(),
+            model: None,
             at: None,
         }],
     );

@@ -11,7 +11,11 @@
 
 import { describe, expect, it } from "vitest";
 
-import { unclampWideDiagram, WIDE_DIAGRAM_PX } from "./wideDiagram";
+import {
+  unclampDiagram,
+  unclampWideDiagram,
+  WIDE_DIAGRAM_PX,
+} from "./wideDiagram";
 
 function rootTag(markup: string): string {
   return /<svg[^>]*>/.exec(markup)?.[0] ?? "";
@@ -103,5 +107,112 @@ describe("unclampWideDiagram", () => {
     const { svg } = unclampWideDiagram(source);
     expect(rootTag(svg)).toContain("background-color: transparent");
     expect(rootTag(svg)).not.toContain("max-width");
+  });
+});
+
+/**
+ * The same unclamp with the measurement taken out of it, and a different
+ * answer to give: as wide as the column allows.
+ *
+ * `width="100%"` is what lets the viewBox scale a small diagram UP into a wide
+ * column, and the inline `min-width` is what stops a narrow column from
+ * squeezing a big one - there the scroll container carries it at its natural
+ * size, exactly as the measured path does. Mermaid's own `max-width` clamp is
+ * the one thing that can be in neither picture.
+ */
+describe("unclampDiagram", () => {
+  function style(markup: string): string {
+    return /\sstyle\s*=\s*"([^"]*)"/.exec(rootTag(markup))?.[1] ?? "";
+  }
+
+  it("fills the column and floors a narrow diagram at its own width", () => {
+    const source =
+      '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;"><g/></svg>';
+    const svg = unclampDiagram(source);
+    expect(rootTag(svg)).toContain('width="100%"');
+    expect(style(svg)).toContain("min-width: 600px");
+    expect(style(svg)).not.toContain("max-width");
+    // The measured form leaves exactly this markup alone, which is the whole
+    // difference between the two.
+    expect(unclampWideDiagram(source)).toEqual({ svg: source, wide: false });
+  });
+
+  it("says the same thing about a diagram past the threshold", () => {
+    // One shape for every diagram: the floor is the drawing's own width, so a
+    // 1600px one keeps 1600px in a column that cannot hold it and grows with a
+    // column that can.
+    const source =
+      '<svg viewBox="0 0 1600 400" width="100%" style="max-width: 1600px;"><g/></svg>';
+    const svg = unclampDiagram(source);
+    expect(rootTag(svg)).toContain('width="100%"');
+    expect(style(svg)).toContain("min-width: 1600px");
+    expect(style(svg)).not.toContain("max-width");
+  });
+
+  it("fills the column with no floor when the natural width cannot be read", () => {
+    // Nothing here says how wide the drawing is, so there is no number to hold
+    // it up with; filling the column is all that is left to mean.
+    const source = '<svg width="100%" style="max-width: 600px;"><g/></svg>';
+    const svg = unclampDiagram(source);
+    expect(rootTag(svg)).toContain('width="100%"');
+    expect(style(svg)).not.toContain("min-width");
+    expect(style(svg)).not.toContain("max-width");
+  });
+
+  it("takes the floor from a width attribute when there is no viewBox", () => {
+    const source = '<svg width="1600px" style="max-width: 1600px;"></svg>';
+    const svg = unclampDiagram(source);
+    expect(rootTag(svg)).toContain('width="100%"');
+    expect(style(svg)).toContain("min-width: 1600px");
+  });
+
+  it("replaces the width rather than adding a second one", () => {
+    const source =
+      '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;"></svg>';
+    expect(widthAttributes(unclampDiagram(source))).toHaveLength(1);
+  });
+
+  it("keeps the rest of an inline style and only trades the clamp for a floor", () => {
+    const source =
+      '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px; background-color: transparent;"></svg>';
+    expect(style(unclampDiagram(source))).toBe(
+      "background-color: transparent; min-width: 600px;",
+    );
+  });
+
+  it("writes a style attribute where the root had none", () => {
+    const svg = unclampDiagram('<svg viewBox="0 0 600 400"></svg>');
+    expect(style(svg)).toBe("min-width: 600px;");
+    expect(rootTag(svg)).toContain('width="100%"');
+  });
+
+  it("is idempotent, over its own output and over the measured path's", () => {
+    // The toggle runs over markup the measured path may already have rewritten,
+    // and a second press of the same button must not stack a second floor.
+    const once = unclampDiagram(
+      '<svg viewBox="0 0 1600 400" width="100%" style="max-width: 1600px;"></svg>',
+    );
+    expect(unclampDiagram(once)).toBe(once);
+    const measured = unclampWideDiagram(
+      '<svg viewBox="0 0 1600 400" width="100%" style="max-width: 1600px;"></svg>',
+    ).svg;
+    const forced = unclampDiagram(measured);
+    expect(unclampDiagram(forced)).toBe(forced);
+    expect(style(forced)).toBe("min-width: 1600px;");
+  });
+
+  it("leaves markup with no root svg exactly as it found it", () => {
+    expect(unclampDiagram("")).toBe("");
+    expect(unclampDiagram("<p>not a diagram</p>")).toBe("<p>not a diagram</p>");
+  });
+
+  it("touches the root tag only", () => {
+    const source =
+      '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;">' +
+      "<style>.node { max-width: 40px; }</style>" +
+      '<svg width="100%" viewBox="0 0 20 20"></svg></svg>';
+    const svg = unclampDiagram(source);
+    expect(svg).toContain(".node { max-width: 40px; }");
+    expect(svg).toContain('<svg width="100%" viewBox="0 0 20 20">');
   });
 });

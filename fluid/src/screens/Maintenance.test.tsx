@@ -27,7 +27,6 @@ import { defined } from "../test/assert";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
-  domainsResponse,
   meResponse,
   renderApp,
   userFixture,
@@ -199,6 +198,77 @@ function includingSuppressedPayload() {
   });
 }
 
+/**
+ * One engram raising two semantic-twin findings, which is the only shape where
+ * the engram and the rule do not name the finding: each row carries the pair it
+ * fired on, and that pair is what an acknowledgment has to be given for.
+ */
+function twinPayload() {
+  const base = evolvePayload();
+  return evolvePayload({
+    total: 5,
+    count: 5,
+    families: [
+      { family: "temporal", findings: 1 },
+      { family: "structure", findings: 1 },
+      { family: "redundancy", findings: 3 },
+    ],
+    queue: [
+      ...base.queue,
+      {
+        n: 4,
+        priority: 75,
+        rule: "V301",
+        class: "judgment",
+        domain: "eng",
+        permalink: "hub",
+        title: "Hub",
+        line: null,
+        finding: "semantic twin of eng/first",
+        evidence: "lead-vector cosine 0.94 at or above 0.88; twin: eng/first",
+        fix: "read both then merge and supersede or link and acknowledge",
+        scope: "eng/first, eng/hub",
+      },
+      {
+        n: 5,
+        priority: 75,
+        rule: "V301",
+        class: "judgment",
+        domain: "eng",
+        permalink: "hub",
+        title: "Hub",
+        line: null,
+        finding: "semantic twin of eng/second",
+        evidence: "lead-vector cosine 0.91 at or above 0.88; twin: eng/second",
+        fix: "read both then merge and supersede or link and acknowledge",
+        scope: "eng/hub, eng/second",
+      },
+    ],
+    actions: [
+      ...base.actions,
+      { rule: "V301", instruction: "Read both, then merge or link them." },
+    ],
+  });
+}
+
+/** The same hub with one of its two pairs already silenced. */
+function acknowledgedTwinPayload() {
+  const twins = twinPayload();
+  return evolvePayload({
+    ...twins,
+    queue: twins.queue.map((finding) =>
+      finding.rule === "V301" && finding.n === 4
+        ? {
+            ...finding,
+            acknowledged: true,
+            ack_note: "distinct, linked",
+            ack_scope: "eng/first, eng/hub",
+          }
+        : finding,
+    ),
+  });
+}
+
 /** A sweep whose acknowledgment was given for evidence that has since moved. */
 function stalePayload() {
   const base = evolvePayload();
@@ -242,12 +312,30 @@ function cleanPayload() {
   });
 }
 
+/**
+ * The registered domains, which is where the filter's choices come from.
+ *
+ * `archive` is the point of it: it has nothing in the sweep below, and it is
+ * still offered, because a domain whose work never ranks into the page is
+ * exactly the domain somebody needs to be able to ask about.
+ */
+function listing() {
+  return {
+    behavior: ["Search before answering from memory."],
+    domains: [
+      { name: "archive", kind: "file", engrams: 9, when_to_use: [] },
+      { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+      { name: "ops", kind: "file", engrams: 2, when_to_use: [] },
+    ],
+  };
+}
+
 /** The app, signed in, with whatever this test wants `/evolve` to answer. */
 function serve(routes: Record<string, Answer> = {}) {
   apiMock.mockImplementation(
     answersFor({
       "/auth/me": () => meResponse({ user: userFixture() }),
-      "/domains": domainsResponse,
+      "/domains": listing,
       "/evolve": () => evolvePayload(),
       ...routes,
     }),
@@ -314,6 +402,21 @@ function rowOf(text: HTMLElement): HTMLElement {
 /** The domain filter. */
 function domainFilter(): HTMLSelectElement {
   return screen.getByLabelText<HTMLSelectElement>("Domain");
+}
+
+/** One of the family chips. */
+function familyChip(name: string): HTMLElement {
+  return screen.getByRole("button", { name, pressed: false });
+}
+
+/** The sweep the app asked for last. */
+function lastSweep(): string {
+  const asked = sweeps();
+  const last = asked.at(-1);
+  if (last === undefined) {
+    throw new Error("expected the screen to have swept at least once");
+  }
+  return last;
 }
 
 beforeEach(() => {
@@ -451,25 +554,108 @@ describe("the maintenance screen", () => {
     ).toBeVisible();
   });
 
-  it("narrows the queue to one domain without asking the server again", async () => {
+  it("re-sweeps the server when a domain is chosen", async () => {
     await open();
     await section(/^Temporal/);
     const before = sweeps().length;
 
     await userEvent.selectOptions(domainFilter(), "ops");
 
-    // Only the ops finding is left, and the families holding nothing for it
-    // are gone rather than drawn empty.
-    const redundancy = await section(/^Redundancy/);
-    expect(rows(redundancy)).toHaveLength(1);
-    expect(rows(redundancy)[0]).toHaveTextContent("Restarting the daemon");
-    expect(screen.queryByText("The old way")).toBeNull();
-    expect(screen.queryByRole("region", { name: /^Temporal/ })).toBeNull();
-    // The select is fed from the whole sweep, so every domain it found is
-    // still on offer after one of them narrows it.
-    expect(within(domainFilter()).getAllByRole("option")).toHaveLength(3);
-    // Narrowing is a lens over what already arrived, not a second sweep.
-    expect(sweeps()).toHaveLength(before);
+    // The whole of the fix: the engine ranks and caps the result, so filtering
+    // the page that came back could only ever show the part of ops that
+    // already survived somebody else's ranking. It is asked again, scoped.
+    await waitFor(() => {
+      expect(sweeps().length).toBeGreaterThan(before);
+    });
+    expect(lastSweep()).toContain("domains=ops");
+  });
+
+  it("marks the queue busy while the re-scoped sweep is still running", async () => {
+    let asked = 0;
+    let land: (() => void) | null = null;
+    await open({
+      "/evolve": () => {
+        asked += 1;
+        if (asked === 1) {
+          return evolvePayload();
+        }
+        // The second sweep is held open, which is the window this is about:
+        // the heaviest read the API has, with a filter already reading as
+        // chosen above rows that answer a different question.
+        return new Promise((resolve) => {
+          land = () => {
+            resolve(evolvePayload());
+          };
+        });
+      },
+    });
+    await section(/^Temporal/);
+
+    await userEvent.selectOptions(domainFilter(), "ops");
+
+    // The previous answer stays drawn - the controls have to stay under the
+    // reader's hand - and says out loud that it is not the answer yet.
+    await waitFor(() => {
+      expect(screen.getByText(/engrams swept/)).toHaveAttribute(
+        "aria-busy",
+        "true",
+      );
+    });
+    expect(
+      defined(screen.getByText("The old way").closest("[aria-busy]")),
+    ).toHaveAttribute("aria-busy", "true");
+
+    await act(async () => {
+      land?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/engrams swept/)).toHaveAttribute(
+        "aria-busy",
+        "false",
+      );
+    });
+  });
+
+  it("offers every registered domain, not only the ones on the page", async () => {
+    await open();
+    await section(/^Temporal/);
+
+    // `archive` has no finding in this sweep at all. It is on offer anyway:
+    // the choices come from the domain listing, and a domain whose work never
+    // ranks into the page is exactly the one worth asking about.
+    const options = within(domainFilter())
+      .getAllByRole("option")
+      .map((option) => option.textContent);
+    expect(options).toEqual(["Every domain", "archive", "eng", "ops"]);
+  });
+
+  it("re-sweeps the server when a family is chosen", async () => {
+    await open();
+    await section(/^Temporal/);
+    const before = sweeps().length;
+
+    await userEvent.click(familyChip("Temporal"));
+
+    // Same reason as the domain filter, and the reported one: a capped page
+    // ranked across every family can hold one temporal finding while the
+    // engine's own count says eight.
+    await waitFor(() => {
+      expect(sweeps().length).toBeGreaterThan(before);
+    });
+    expect(lastSweep()).toContain("families=temporal");
+    expect(
+      screen.getByRole("button", { name: "Temporal", pressed: true }),
+    ).toBeVisible();
+  });
+
+  it("asks about no family in particular until one is pressed", async () => {
+    await open();
+    await section(/^Temporal/);
+
+    // Nothing pressed is every family, which is what the engine reads an empty
+    // filter as: the parameter is left off rather than sent empty.
+    expect(lastSweep()).not.toContain("families=");
   });
 
   it("counts what is drawn, and names the whole queue as the whole queue", async () => {
@@ -500,17 +686,21 @@ describe("the maintenance screen", () => {
     ).toMatch(/1 finding/);
   });
 
-  it("names the base a filtered count is counted against", async () => {
+  it("counts the scoped sweep, with no second smaller number beside it", async () => {
     await open();
     await section(/^Temporal/);
 
     await userEvent.selectOptions(domainFilter(), "ops");
+    await waitFor(() => {
+      expect(lastSweep()).toContain("domains=ops");
+    });
 
-    // "1 finding in ops" alone would lose the only not-all-of-it signal on
-    // the screen, so the page it was filtered out of is named beside it.
+    // The filters are inputs to the sweep, so what came back IS the result for
+    // the scope somebody chose. There is no page-versus-filter gap left to
+    // narrate, and narrating one would invent a base nobody asked about.
     expect(
       await screen.findByText(
-        "42 engrams swept, 3 findings, 1 of them in ops. Everything waiting: Temporal 1, Structure 1, Redundancy 1.",
+        "42 engrams swept, 3 findings. Temporal 1, Structure 1, Redundancy 1.",
       ),
     ).toBeVisible();
   });
@@ -916,6 +1106,75 @@ describe("acknowledging a finding", () => {
     expect(sentBody(acks[0])).toEqual({
       permalink: "notes/old-way",
       rule: "V005",
+    });
+  });
+
+  it("gives the acknowledgment for the pair the clicked row fired on", async () => {
+    const acks: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": twinPayload,
+      "/domains/eng/evolve/ack": (_path, init) => {
+        acks.push(init);
+        return undefined;
+      },
+    });
+    // The second of the hub's two twin rows. Naming the rule alone would leave
+    // the server to pick, and it picks the first - so the pair a reader read
+    // and the pair their note lands on would be different ones.
+    const row = defined(
+      rows(await section(/^Redundancy/))[2],
+      "the second twin",
+    );
+    expect(row).toHaveTextContent("twin: eng/second");
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+    await userEvent.type(
+      within(row).getByLabelText(/why is this intentional/i),
+      "distinct, linked",
+    );
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(acks).toHaveLength(1);
+    });
+    expect(sentBody(acks[0])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+      note: "distinct, linked",
+      scope: "eng/hub, eng/second",
+    });
+  });
+
+  it("takes back the one pair, not every pair the rule holds", async () => {
+    const removals: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": acknowledgedTwinPayload,
+      "/domains/eng/evolve/ack": (_path, init) => {
+        removals.push(init);
+        return undefined;
+      },
+    });
+    const row = defined(
+      rows(await section(/^Redundancy/))[1],
+      "the silenced twin",
+    );
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Unacknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(removals).toHaveLength(1);
+    });
+    expect(removals[0]?.method).toBe("DELETE");
+    expect(sentBody(removals[0])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+      scope: "eng/first, eng/hub",
     });
   });
 

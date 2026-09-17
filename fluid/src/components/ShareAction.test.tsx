@@ -15,6 +15,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
 import type { Role } from "../api/model";
+import { acrossElements } from "../test/assert";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
@@ -429,7 +430,7 @@ describe("the top bar's share action", () => {
       within(dialog).getByRole("button", { name: "Share" }),
     );
 
-    await within(dialog).findByText(/opened proposal #7/i);
+    await within(dialog).findByText(acrossElements(/opened proposal #7/i));
     // The share's own success handler invalidates the status key along with
     // the two listings, and reading that key pulls the origin. Waiting for
     // the summary - invalidated in the same tick, and read by the action

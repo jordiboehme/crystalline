@@ -60,7 +60,8 @@ fn check_content(file: &ScannedFile, lines: &[BodyLine], sink: &mut Sink) {
 /// Q002: an approximate token budget, `body.chars() / 4` (frontmatter
 /// excluded, fenced code included - a wall of code is context bloat too).
 fn check_token_budget(file: &ScannedFile, engram: &Engram, domain: &Domain, sink: &mut Sink) {
-    let budget = resolve_budget(file, domain);
+    let engram_type = engram.frontmatter.engram_type.as_str();
+    let budget = super::effective_token_budget(engram_type, resolve_budget(file, domain));
     if budget == 0 {
         return;
     }
@@ -246,4 +247,64 @@ fn near_miss(line: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::verify::scanner::scanned_file_from_source;
+    use crate::verify::util::body_line_start;
+    use crate::verify::{Issue, Summary};
+
+    /// Runs the whole Q family over a synthetic `type: <engram_type>` engram
+    /// with `body` as its content, assembling the pieces the same way
+    /// `run_rules` does: parse, tokenize the body once and hand both to
+    /// `check` alongside a default domain.
+    fn issues_for_type(engram_type: &str, body: &str) -> Vec<Issue> {
+        let source = format!(
+            "---\ntype: {engram_type}\ntitle: Fixture\npermalink: fixture\nstatus: stable\n---\n\n{body}\n"
+        );
+        let file = scanned_file_from_source(Path::new("fixture.md"), &source);
+        let domain = Domain {
+            name: "engineering".to_string(),
+            root: PathBuf::from("engineering"),
+            manifest_index: None,
+            files: Vec::new(),
+            config: crate::config::DomainConfig::default(),
+        };
+        let engram = file.parsed.as_ref().expect("fixture parses");
+        let lines = crate::parse::body_lines(&engram.body, body_line_start(&file.source));
+        let mut issues = Vec::new();
+        let mut summary = Summary::default();
+        let mut sink = Sink::new(&mut issues, &mut summary, None, false);
+        check(&file, &domain, &lines, &mut sink);
+        issues
+    }
+
+    /// Q002 applies the same factor the sweep's V105 does, from the same
+    /// constant: two rules that flag "the same size" and disagree about what
+    /// the size is would send a writer in a circle.
+    #[test]
+    fn q002_gives_a_source_engram_four_times_the_budget() {
+        let body = "x".repeat(4 * 2500 * 4 + 8);
+        let issues = issues_for_type("source", &body);
+        assert!(
+            issues.iter().any(|i| i.rule == "Q002"),
+            "over even the source budget"
+        );
+        let inside = "x".repeat(4 * 2500 * 4 - 8);
+        assert!(
+            !issues_for_type("source", &inside)
+                .iter()
+                .any(|i| i.rule == "Q002")
+        );
+        // And an engram of any other type is held to the plain budget.
+        assert!(
+            issues_for_type("engram", &inside)
+                .iter()
+                .any(|i| i.rule == "Q002")
+        );
+    }
 }

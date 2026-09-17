@@ -307,6 +307,9 @@ export type ChipVariant =
 // eslint-disable-next-line react-refresh/only-export-components
 export const CHIP_VARIANTS: Record<ChipVariant, string> = {
   neutral: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+  // Emerald rather than the accent: this is the semantic color for a good
+  // outcome, not a stand-in for the brand hue, so it stays green regardless
+  // of what the accent scale is tuned to.
   positive:
     "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
   caution: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",

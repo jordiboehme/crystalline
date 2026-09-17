@@ -13,18 +13,32 @@ pub mod client;
 pub mod collab;
 pub mod control;
 pub mod daemon;
+pub(crate) mod domain_view;
 pub mod engine;
 pub mod harness_cli;
 mod index_files;
 pub mod instance;
+pub mod join;
 pub mod maintenance;
 pub mod mcp;
+pub mod mcp_gate;
+pub mod nudge;
 mod origin;
 pub mod overlay;
+pub(crate) mod overlay_files;
+pub mod overlay_journal;
 pub mod params;
 mod poller;
 pub mod rest;
+// Internal: only the two types below are anybody else's business, and they are
+// re-exported at the root. Kept `pub(crate)` so the module doc's links to its
+// own `pub(crate)` functions are consistent with what rustdoc publishes -
+// `pub mod` made every one of them a broken link for a reader of the docs.
+pub(crate) mod review;
+pub mod scope;
 pub mod settings;
+pub(crate) mod share_staging;
+pub mod similar;
 pub mod stub;
 pub mod subscribers;
 pub mod temp_store;
@@ -43,16 +57,28 @@ pub mod ui;
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use client::{
-    configure, ctl_if_running, ctl_required, domain_export, domain_import, origin_add,
-    origin_resolve, origin_share, origin_status, origin_update, origin_withdraw, run_mcp, run_tool,
-    scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
+    collect_orphaned_domains, configure, ctl_if_running, ctl_required, domain_export,
+    domain_import, domain_remove, domain_review, origin_add, origin_resolve, origin_share,
+    origin_status, origin_update, origin_withdraw, run_mcp, run_tool, scaffold_virtual_manifest,
+    tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
-pub use engine::{Engine, EngineError, ShareActor};
+pub use engine::{
+    ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, ShareActor,
+    WrittenAttachment,
+};
 pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };
+pub use instance::{EXIT_LOCK_HELD, HttpBinding, LockHeld, ServeIntent, StartMode};
+pub use join::{Holder, Join, Joins};
 pub use mcp::McpServer;
+pub use mcp_gate::{
+    MCP_AUTH_REQUIRED, MCP_SESSION_IDENTITY_MISMATCH, McpGate, McpIdentity, SessionOwners,
+};
 pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
+pub use review::{FoldChoice, ReviewModeConfirm};
+pub use scope::{DomainAccess, DomainRight, DomainVisibility, Scope, overlay_actor};
+pub use similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarProbe};
 pub use stub::{DegradedServer, StubStatus};

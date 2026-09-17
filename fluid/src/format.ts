@@ -73,6 +73,23 @@ export function plural(count: number, one: string, many: string): string {
 }
 
 /**
+ * Whether a url is an address a screen will hand a reader as a link.
+ *
+ * The url is the forge's own word, and on an enterprise install the forge is a
+ * machine somebody else administers. Nothing about a review needs a scheme
+ * other than http or https, so anything else - `javascript:` first among them
+ * - is drawn as text instead of as a link that runs on press. Defence in
+ * depth rather than a known hole: the engine builds these from the API's own
+ * fields, and this is the line that holds if one day it does not.
+ *
+ * Shared rather than duplicated: the proposals card and the share dialog both
+ * decide whether a proposal's own url is worth linking, off the same report.
+ */
+export function isWebAddress(url: string): boolean {
+  return url.startsWith("https://") || url.startsWith("http://");
+}
+
+/**
  * Today where this browser is, as `YYYY-MM-DD`.
  *
  * The local day rather than the UTC one, for the reason {@link formatDay}

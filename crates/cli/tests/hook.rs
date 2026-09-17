@@ -18,7 +18,7 @@ use assert_cmd::Command;
 /// The exact reminder text `hook.rs` prints, duplicated here because the
 /// `crystalline` binary has no library target for a test to import it from;
 /// this is a black-box check on what the subprocess actually printed.
-const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing - what a future session would reach for: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers. Not durable: what this session did, temporary paths and outputs, a one-off bug's error text, steps that will not recur, and anything any model already knows. Corrections that make an existing engram wrong get the reconciling edit or supersession, not a new capture beside the old. Propose capturing each as an engram in the fitting crystalline domain, naming the insight, the domain and the folder when one fits, and wait for a yes. Raise the salience of a recalled engram that proved key to the task. If nothing qualifies or everything is captured, finish normally.";
 
 /// The ride-along maintenance paragraph, duplicated here for the same reason
 /// [`NUDGE_REASON`] is: this is a black-box check on what the subprocess
@@ -700,5 +700,135 @@ fn an_env_defined_domain_alone_earns_the_nudge() {
     assert_eq!(
         decision["decision"], "block",
         "a writable node whose only domain comes from the environment is nudgeable"
+    );
+}
+
+/// The exact sentence Claude Code renders as `Stop says: <text>`, duplicated
+/// here for the reason [`NUDGE_REASON`] is: this is a black-box check on what
+/// the subprocess printed.
+const STOP_SYSTEM_MESSAGE: &str =
+    "Crystalline is checking this session for anything worth keeping.";
+
+/// A Stop hook wired for Claude Code answers in the shape that version
+/// honours: the top-level pair that delivers the nudge, the plain sentence a
+/// person reads beside the harness's own unconditional error line, and the
+/// block the documentation describes, carried for the version that implements
+/// it.
+#[test]
+fn the_claude_code_nudge_carries_the_message_and_the_documented_block() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop", "--harness", "claude-code"])
+        .write_stdin(stop_payload("session-claude-code", Some(&transcript)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let printed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(printed["decision"], "block");
+    assert_eq!(printed["reason"], NUDGE_REASON);
+    assert_eq!(printed["systemMessage"], STOP_SYSTEM_MESSAGE);
+    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "Stop");
+    assert_eq!(printed["hookSpecificOutput"]["decision"], "block");
+    assert_eq!(printed["hookSpecificOutput"]["stopReason"], NUDGE_REASON);
+}
+
+/// Every harness whose Stop parser nobody here has measured gets byte-for-byte
+/// the line it has always got: no flag at all (an install written before the
+/// flag existed), a harness that is not Claude Code, and an id this binary does
+/// not know (a hook a newer release wired up, run by an older binary). All
+/// three answer identically, and a hand invocation keeps working unchanged.
+#[test]
+fn an_unmeasured_or_unknown_harness_gets_the_line_it_always_got() {
+    let expected = serde_json::to_string(&serde_json::json!({
+        "decision": "block",
+        "reason": NUDGE_REASON,
+    }))
+    .unwrap();
+
+    for (session, flag) in [
+        ("session-no-flag", None),
+        ("session-codex", Some("codex")),
+        ("session-unknown", Some("a-harness-from-a-future-release")),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let config = work.path().join("config.yaml");
+        write_domain_config(&config);
+        let transcript = substantial_transcript(work.path());
+
+        let mut args = vec!["hook", "stop"];
+        if let Some(flag) = flag {
+            args.extend_from_slice(&["--harness", flag]);
+        }
+        let mut cmd = bin();
+        isolate(&mut cmd, &home);
+        let out = cmd
+            .env("CRYSTALLINE_CONFIG", &config)
+            .args(&args)
+            .write_stdin(stop_payload(session, Some(&transcript)))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{flag:?} must still exit 0");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            expected,
+            "{flag:?} must get exactly the fields it always got"
+        );
+    }
+}
+
+/// **The MCP write receipts ask for a share in exactly these words.**
+///
+/// An agent over MCP never meets a Stop hook, so `crystalline_service::nudge`
+/// carries the same sharing ask on its write receipts. `crates/service` sits
+/// below `crates/cli` and cannot import this constant, so the sentence is
+/// copied there - and a copy nobody pins is two dialects of one ask waiting to
+/// happen.
+///
+/// The pin reads this crate's own source rather than a third copy of the
+/// sentence: a literal repeated here would drift together with the one it is
+/// supposed to catch. Unlike the black-box constants above, that is exactly the
+/// right instrument for this claim - the question is not what the subprocess
+/// printed but whether two constants in two crates are the same bytes.
+#[test]
+fn the_mcp_share_nudge_mirrors_the_hook_byte_for_byte() {
+    const DECL: &str = "pub const SHARE_NUDGE_REASON: &str = \"";
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("hook.rs"),
+    )
+    .expect("the hook's own source");
+    assert_eq!(
+        source.matches(DECL).count(),
+        1,
+        "exactly one declaration of SHARE_NUDGE_REASON is scannable; \
+         teach this test the new shape before changing it"
+    );
+    let literal = source
+        .split_once(DECL)
+        .expect("the declaration")
+        .1
+        .split_once("\";")
+        .expect("the literal ends on the same line it starts")
+        .0;
+    assert!(
+        !literal.is_empty() && !literal.contains('\n') && !literal.contains('\\'),
+        "the scanner only reads a plain one-line literal, and read this instead: {literal:?}"
+    );
+    assert_eq!(
+        crystalline_service::nudge::MCP_SHARE_NUDGE_REASON,
+        literal,
+        "the MCP receipt's sharing ask and the Stop hook's are one sentence; \
+         change both or neither"
     );
 }

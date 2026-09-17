@@ -24,6 +24,11 @@ Environment=CRYSTALLINE_SERVICE_HTTP=127.0.0.1:7411
 EnvironmentFile=-/etc/default/crystalline
 ExecStart=/usr/bin/crystalline serve
 Restart=on-failure
+# Exit code 3 means another Crystalline instance already owns the index. That
+# is not a failure a restart can fix: restarting produces one identical log
+# line per attempt and nothing else, and leaves the unit flapping between
+# active and failed where monitoring cannot see it. Stay failed instead.
+RestartPreventExitStatus=3
 RestartSec=2
 
 [Install]

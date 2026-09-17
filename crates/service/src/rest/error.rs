@@ -464,15 +464,31 @@ impl From<EngineError> for ApiError {
             EngineError::UnknownDomain { .. } | EngineError::NotFound(_) => {
                 ApiError::not_found(detail)
             }
-            EngineError::ReadOnly => ApiError::forbidden(detail),
+            // Two variants share the 403: the server knows who is asking and
+            // refuses. `ReadOnly` refuses everybody, `Forbidden` refuses this
+            // caller and its message names who would be allowed.
+            EngineError::ReadOnly | EngineError::Forbidden(_) => ApiError::forbidden(detail),
             // A second divergence for the same reason: HTTP has a status for
             // "the request is fine, the resource is busy", and a client that
             // reads 409 knows to retry once the sign-in in flight is done,
             // where a 422 would read as "your request was wrong".
-            EngineError::ConnectInProgress => ApiError::conflict(detail),
+            // And a third: the request is well formed and the caller is
+            // allowed to make it, but the resource is in a state - a virtual
+            // domain holding engrams - that this request would destroy without
+            // saying so. 409 is what a client re-sends with the flag; 403 would
+            // read as an authorization problem and 422 as a malformed request,
+            // and it is neither.
+            EngineError::ConnectInProgress | EngineError::ConfirmationRequired(_) => {
+                ApiError::conflict(detail)
+            }
+            // And a fourth shares the 422 with the malformed requests: the
+            // request is well formed and the caller may make it, but the
+            // domain it names takes changes in a shape this call did not
+            // satisfy. The message is the way in, so it travels whole.
             EngineError::Ambiguous(_)
             | EngineError::Conflict(_)
             | EngineError::Invalid(_)
+            | EngineError::Refused(_)
             | EngineError::EnvTokenConnect => unprocessable_error(detail),
             EngineError::Remote(remote) => remote_to_api_error(remote, detail),
             EngineError::Io { .. } | EngineError::Internal(_) => internal_error(detail),
@@ -496,8 +512,10 @@ impl From<anyhow::Error> for ApiError {
 /// or environmental variants are never the caller's mistake and stay 500,
 /// genuine input problems become 422 - a teaching refusal (`Refused`) among
 /// them, since its message is the way out of a situation the request itself
-/// created and a 500 would file it as a server fault - and a repository or
-/// proposal that does not exist becomes a 404.
+/// created and a 500 would file it as a server fault, and an organization
+/// policy refusal (single sign-on, OAuth app restrictions) beside it, which
+/// names the page that clears it - and a repository or proposal that does not
+/// exist becomes a 404.
 fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> ApiError {
     use crystalline_remote::RemoteError;
     match e {
@@ -519,6 +537,8 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::StacksUnsupported
         | RemoteError::Refused(_)
+        | RemoteError::SsoAuthorizationRequired { .. }
+        | RemoteError::OauthAppRestricted { .. }
         | RemoteError::ConflictsPending { .. } => unprocessable_error(detail),
     }
 }
@@ -566,6 +586,49 @@ mod tests {
             ApiError::from(EngineError::Internal("store blew up".into())).status,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A `NotADomain` refusal that names a candidate MANIFEST.md reaches this
+    /// surface's `detail` whole: `detail` is computed once, from the same
+    /// `to_string()` the caller would print, before the status match ever
+    /// runs, so the suggestion clause cannot be trimmed to the refusal's
+    /// first line by the 404 mapping below it.
+    #[test]
+    fn not_a_domain_is_not_found_and_the_candidate_reaches_the_client_whole() {
+        let e = crystalline_remote::RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec!["memory".to_string()],
+            more_candidates: 0,
+        };
+        let detail = e.to_string();
+        let api = remote_to_api_error(e, detail.clone());
+        assert_eq!(api.status, StatusCode::NOT_FOUND);
+        assert_eq!(api.detail, detail);
+        assert!(api.detail.contains("pass memory"), "{}", api.detail);
+    }
+
+    /// An organization policy refusal is 422 on this surface, beside a
+    /// teaching refusal and for the same reason: the token works, nothing on
+    /// this instance is broken, and the message names the GitHub page that
+    /// clears it. A 500 would file it as a server fault and tell the caller
+    /// to wait out a failure they are meant to go and fix.
+    #[test]
+    fn organization_policy_refusals_are_unprocessable_not_server_faults() {
+        for e in [
+            crystalline_remote::RemoteError::SsoAuthorizationRequired {
+                org: "acme".to_string(),
+                url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+            },
+            crystalline_remote::RemoteError::OauthAppRestricted {
+                org: "acme".to_string(),
+            },
+        ] {
+            let detail = e.to_string();
+            let api = remote_to_api_error(e, detail.clone());
+            assert_eq!(api.status, StatusCode::UNPROCESSABLE_ENTITY, "{detail}");
+            assert_eq!(api.detail, detail);
+        }
     }
 
     /// The write-endpoint refinement: a read-only instance answers 403, matching

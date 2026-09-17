@@ -15,11 +15,14 @@
  *
  * The keyboard lives here too, because the frame is what every screen is drawn
  * inside: the palette is mounted once, and so is the map of the keys that
- * reach it, which "?" opens from anywhere no field has the focus.
+ * reach it, which "?" opens from anywhere no field has the focus. The other
+ * bare key is "\\", which is the frame's other choice about its own shape:
+ * how wide what you came to read is allowed to be.
  */
 
 import { useQuery } from "@tanstack/react-query";
 import {
+  FoldHorizontal,
   House,
   Moon,
   PanelLeft,
@@ -29,6 +32,7 @@ import {
   Share2,
   Stethoscope,
   Sun,
+  UnfoldHorizontal,
 } from "lucide-react";
 import {
   useCallback,
@@ -65,6 +69,13 @@ import { useAuth } from "../auth/AuthContext";
 import { useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import {
+  LAYOUT_WIDTH_KEY,
+  LayoutWidthContext,
+  storedFullWidth,
+  useFullWidth,
+} from "../layoutWidth";
+import type { LayoutWidth } from "../layoutWidth";
+import {
   domainRoute,
   githubSettingsRoute,
   maintenanceRoute,
@@ -79,6 +90,7 @@ import { CreateDomainDialog } from "./CreateDomainDialog";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
+import { JoinedDraftBar } from "./JoinedDraftBar";
 import { ShareDialog } from "./ShareDialog";
 import { SharePickerDialog } from "./SharePickerDialog";
 import { ShatterGem } from "./ShatterGem";
@@ -399,6 +411,7 @@ export function Layout() {
   const navigate = useNavigate();
   const [navOpen, setNavOpen] = useState(false);
   const [rail, setRail] = useState(storedRail);
+  const [fullWidth, setFullWidth] = useState(storedFullWidth);
   const wide = useWide();
   const [helpOpen, setHelpOpen] = useState(false);
   // Registering a domain is the frame's own act rather than any screen's: it
@@ -441,6 +454,31 @@ export function Layout() {
     });
   };
 
+  // The same choice about the frame, made about the content rather than about
+  // the column beside it, and kept the same way. Memoized where `toggleRail`
+  // is not: this one is read by the key handler's effect and by the palette
+  // registration, both of which key off identity, so a fresh function every
+  // render would re-subscribe the window and re-register the row forever.
+  const toggleFullWidth = useCallback(() => {
+    setFullWidth((was) => {
+      const next = !was;
+      try {
+        localStorage.setItem(LAYOUT_WIDTH_KEY, next ? "full" : "reading");
+      } catch {
+        // A browser that refuses storage still gets the session's choice.
+      }
+      return next;
+    });
+  }, []);
+
+  // One value for everything drawn inside the frame, the top bar's own button
+  // included: the button that switches the width is a reader of it like any
+  // screen is.
+  const width = useMemo<LayoutWidth>(
+    () => ({ fullWidth, toggleFullWidth }),
+    [fullWidth, toggleFullWidth],
+  );
+
   // What is offered on every screen, because the frame is on every screen: a
   // reader who found the palette can find everything else from inside it.
   // Registered as the frame's, so it sits under whatever the screen in front
@@ -457,6 +495,14 @@ export function Layout() {
         run: () => {
           setHelpOpen(true);
         },
+      },
+      // Named for the act rather than for the state it is in: a palette row
+      // that read "Use full width" on one screen and "Use reading width" on
+      // the next is one row a reader has to look twice at.
+      {
+        id: "layout.full-width",
+        title: "Toggle full width",
+        run: toggleFullWidth,
       },
     ];
     if (capabilities.canAdminister) {
@@ -496,113 +542,150 @@ export function Layout() {
     share.domain,
     share.enabled,
     share.visible,
+    toggleFullWidth,
   ]);
   useRegisterCommands(commands, "frame");
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
-      if (event.key !== "?") {
+      if (event.key !== "?" && event.key !== "\\") {
         return;
       }
       // Not while somebody is writing one. A bare key is only a shortcut
       // where no field has the focus, which includes the editor's own
-      // contenteditable surface as much as it does a search box.
+      // contenteditable surface as much as it does a search box, and a
+      // dropdown that jumps to the option a typed letter names. One guard
+      // for both keys, because it is the same rule about the same thing.
       const target = event.target;
       if (
         target instanceof HTMLElement &&
-        target.closest("input, textarea, [contenteditable=true]") !== null
+        target.closest("input, textarea, select, [contenteditable=true]") !==
+          null
       ) {
         return;
       }
-      setHelpOpen(true);
+      if (event.key === "?") {
+        setHelpOpen(true);
+        return;
+      }
+      // Cmd+\\ and Ctrl+\\ belong to the browser or to the system rather than
+      // to this app, so those are refused. Alt is NOT a modifier to refuse
+      // on: on a German, French, Spanish, Italian or Nordic layout the
+      // backslash IS an Alt key - AltGr+ß or AltGr+8 on Windows and Linux,
+      // which a browser reports as Ctrl and Alt together, and Shift+Option+7
+      // on macOS. Refusing Alt would advertise a shortcut in the help
+      // overlay that never fires on half the keyboards in Europe.
+      if (event.metaKey || (event.ctrlKey && !event.altKey)) {
+        return;
+      }
+      toggleFullWidth();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, []);
+  }, [toggleFullWidth]);
 
   return (
-    <div className="min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-      <TopBar
-        navOpen={navOpen}
-        onToggleNav={() => {
-          setNavOpen((open) => !open);
-        }}
-        onShare={openShare}
-      />
-      <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
+    // Around the whole frame rather than around the outlet: the top bar's own
+    // width button is a reader of this value too.
+    <LayoutWidthContext value={width}>
+      <div className="min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+        <TopBar
+          navOpen={navOpen}
+          onToggleNav={() => {
+            setNavOpen((open) => !open);
+          }}
+          onShare={openShare}
+        />
         {/*
-          The stored width only reaches the sidebar where there is a sidebar to
-          apply it to: below `md` this is a drawer, and it is always expanded.
+          Above everything, on every screen, for as long as this window is
+          inside somebody else's draft. Working in another person's unfolded
+          work is a state the WINDOW is in rather than something one page
+          does, so it is drawn here and not by the screen that started it.
         */}
-        <DomainSidebar
-          open={navOpen}
-          rail={rail && wide}
-          onToggleRail={toggleRail}
-          onCreateDomain={() => {
-            setCreatingDomain(true);
+        <JoinedDraftBar />
+        <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
+          {/*
+            The stored rail only reaches the sidebar where there is a sidebar
+            to apply it to: below `md` this is a drawer, and it is always
+            expanded.
+          */}
+          <DomainSidebar
+            open={navOpen}
+            rail={rail && wide}
+            onToggleRail={toggleRail}
+            onCreateDomain={() => {
+              setCreatingDomain(true);
+            }}
+          />
+          {/*
+            One attribute for the whole app's measure: the stylesheet lifts the
+            cap under it, so no screen has to know anything about the choice to
+            be drawn at the width it asks for.
+          */}
+          <main
+            ref={mainRef}
+            tabIndex={-1}
+            data-width={fullWidth ? "full" : undefined}
+            className="min-w-0 flex-1 focus:outline-none"
+          >
+            <Outlet />
+          </main>
+        </div>
+        <RouteFocus target={mainRef} />
+        {/*
+          Once for the whole app, so the shortcut works on every screen and the
+          palette outlives the screen a jump leaves behind.
+        */}
+        <CommandPalette />
+        {/*
+          And the map of the keys that drive it, one press away from anywhere.
+        */}
+        <HelpOverlay
+          open={helpOpen}
+          onClose={() => {
+            setHelpOpen(false);
           }}
         />
-        <main
-          ref={mainRef}
-          tabIndex={-1}
-          className="min-w-0 flex-1 focus:outline-none"
-        >
-          <Outlet />
-        </main>
+        {/*
+          Mounted by the frame rather than by the sidebar, because both ways in
+          - the launcher under the listing and the palette row - are the
+          frame's.
+        */}
+        {creatingDomain && (
+          <CreateDomainDialog
+            onClose={() => {
+              setCreatingDomain(false);
+            }}
+          />
+        )}
+        {/*
+          The same pair, for the same reason: the button and the palette row
+          both belong to the frame, and the picker hands straight over to the
+          dialog beside it rather than opening a second one over itself.
+        */}
+        {pickingShare && (
+          <SharePickerDialog
+            onPick={(domain) => {
+              setPickingShare(false);
+              setShareDomain(domain);
+            }}
+            onClose={() => {
+              setPickingShare(false);
+            }}
+          />
+        )}
+        {shareDomain !== null && (
+          <ShareDialog
+            domain={shareDomain}
+            onClose={() => {
+              setShareDomain(null);
+            }}
+          />
+        )}
       </div>
-      <RouteFocus target={mainRef} />
-      {/*
-        Once for the whole app, so the shortcut works on every screen and the
-        palette outlives the screen a jump leaves behind.
-      */}
-      <CommandPalette />
-      {/*
-        And the map of the keys that drive it, one press away from anywhere.
-      */}
-      <HelpOverlay
-        open={helpOpen}
-        onClose={() => {
-          setHelpOpen(false);
-        }}
-      />
-      {/*
-        Mounted by the frame rather than by the sidebar, because both ways in -
-        the launcher under the listing and the palette row - are the frame's.
-      */}
-      {creatingDomain && (
-        <CreateDomainDialog
-          onClose={() => {
-            setCreatingDomain(false);
-          }}
-        />
-      )}
-      {/*
-        The same pair, for the same reason: the button and the palette row both
-        belong to the frame, and the picker hands straight over to the dialog
-        beside it rather than opening a second one over itself.
-      */}
-      {pickingShare && (
-        <SharePickerDialog
-          onPick={(domain) => {
-            setPickingShare(false);
-            setShareDomain(domain);
-          }}
-          onClose={() => {
-            setPickingShare(false);
-          }}
-        />
-      )}
-      {shareDomain !== null && (
-        <ShareDialog
-          domain={shareDomain}
-          onClose={() => {
-            setShareDomain(null);
-          }}
-        />
-      )}
-    </div>
+    </LayoutWidthContext>
   );
 }
 
@@ -676,6 +759,7 @@ function TopBar({
           </span>
         )}
 
+        <WidthToggle />
         <ThemeMenu />
         <UserMenu />
       </div>
@@ -836,6 +920,31 @@ function SearchBox() {
         </kbd>
       </div>
     </form>
+  );
+}
+
+/**
+ * How wide the content is allowed to be.
+ *
+ * Beside the theme control rather than beside the one that folds the sidebar:
+ * both of these are choices about how the app is drawn for this reader on
+ * every screen, where the fold is a control on the column it folds. It is also
+ * the only place the sidebar's own toggle is not - below the medium breakpoint
+ * that one is hidden, because there is no rail down there to fold into, and
+ * this choice holds at every width.
+ *
+ * The name says which way it will switch rather than which way it is, the way
+ * the sidebar's pair of names does: a control that announces its own state
+ * leaves a reader to work out what pressing it would do.
+ */
+function WidthToggle() {
+  const { fullWidth, toggleFullWidth } = useFullWidth();
+  return (
+    <IconButton
+      label={fullWidth ? "Use reading width" : "Use full width"}
+      icon={fullWidth ? FoldHorizontal : UnfoldHorizontal}
+      onClick={toggleFullWidth}
+    />
   );
 }
 
@@ -1255,7 +1364,18 @@ function DomainLink({ domain }: { domain: DomainSummary }) {
         }`
       }
     >
-      <span className="truncate">{domain.name}</span>
+      {/*
+        The name and its badge travel together on the left, so the count stays
+        pinned to the right edge whether or not a badge is there. Inside the
+        link rather than beside it, unlike the home card and the domain
+        screen: the whole row is the target here, and a chip hanging outside
+        it would be the one part of the row that does not take a click. The
+        link then reads "lab private 12", which is the row said out loud.
+      */}
+      <span className="flex min-w-0 items-baseline gap-1.5">
+        <span className="truncate">{domain.name}</span>
+        {domain.private && <Chip variant="accent">private</Chip>}
+      </span>
       {domain.engrams !== null && (
         <span className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
           {domain.engrams}

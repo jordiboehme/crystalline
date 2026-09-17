@@ -59,6 +59,8 @@ fn record(path: &str, permalink: &str, content: &str, sha: &str) -> EngramRecord
             size: content.len() as u64,
             sha256: sha.to_string(),
         },
+        actor: String::new(),
+        tombstone: false,
     }
 }
 
@@ -81,12 +83,19 @@ fn pg_url() -> Option<String> {
     }
 }
 
+/// A recycled pid must never adopt a schema a panicking run left behind.
 #[cfg(feature = "postgres")]
 fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("cp_{}_{}", std::process::id(), n)
+    format!(
+        "cp_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
 }
 
 /// The failure signature of the one flake this harness has seen: a query
@@ -197,7 +206,9 @@ async fn concurrent_write_defers(store: &dyn Store) {
     let domain = upsert_domain(store, "d", root).await;
     let snapshot = store.file_stamps(domain).await.unwrap();
     assert!(snapshot.is_empty(), "nothing indexed yet");
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
 
     // A concurrent writer indexes the same path with different content between
     // the snapshot and the apply.
@@ -247,7 +258,9 @@ async fn concurrent_rewrite_skips_delete(store: &dyn Store) {
     std::fs::remove_file(root.join("a.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
     assert!(snapshot.contains_key("a.md"), "a.md still recorded");
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
 
     // A concurrent writer rewrites the row (a new stamp) mid-window.
     store
@@ -286,7 +299,9 @@ async fn recreated_file_skips_delete(store: &dyn Store) {
     // can catch this.
     std::fs::remove_file(root.join("a.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
     write(root, "a.md", &engram("A", "a", "recreated body"));
 
     let report = apply_scan(store, domain, scan).await.unwrap();
@@ -316,7 +331,9 @@ async fn move_with_moved_end_defers(store: &dyn Store) {
     // move.
     std::fs::rename(root.join("old.md"), root.join("new.md")).unwrap();
     let snapshot = store.file_stamps(domain).await.unwrap();
-    let scan = scan_domain("d", root, snapshot, &params()).await.unwrap();
+    let scan = scan_domain("d", root, snapshot, &params(), false)
+        .await
+        .unwrap();
 
     // A concurrent writer mutates the move's `from` end mid-window.
     store

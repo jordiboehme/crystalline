@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +54,19 @@ impl Env {
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("XDG_CACHE_HOME", self.dir.join("cache"))
-            .env("CRYSTALLINE_SERVICE_HTTP", "false");
+            .env("CRYSTALLINE_SERVICE_HTTP", "false")
+            // A real daemon spawned here runs its background origin poller
+            // unconditionally; none of these tests turn `github.enabled` on
+            // for an origin-connected domain today, but the OS keychain
+            // service name is a hardcoded constant none of the four
+            // variables above reach, so a daemon that ever did would ask the
+            // real login keychain from its own timer, not just from a
+            // one-shot CLI call. This is the boolean kill switch
+            // (`crystalline_remote::token::refuse_real_keychain`), not
+            // `CRYSTALLINE_TEST_TOKEN_STORE_DIR`: it falls back to the file
+            // store under this daemon's own isolated state dir rather than
+            // a directory of its own.
+            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1");
     }
 
     fn state_dir(&self) -> PathBuf {
@@ -153,6 +165,19 @@ impl Env {
         )
     }
 
+    /// Like [`Self::run`], but also returns stderr - needed to see a command's
+    /// failure message, which never lands on stdout.
+    fn run_full(&self, args: &[&str]) -> (bool, String, String) {
+        let mut cmd = Command::new(bin());
+        self.apply(&mut cmd);
+        let out = cmd.args(args).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
     /// Poll ctl status until the daemon answers, or panic after ~8s.
     fn wait_ready(&self) {
         let start = Instant::now();
@@ -175,6 +200,12 @@ impl Env {
         let text = std::fs::read_to_string(self.info_path()).ok()?;
         let v: Value = serde_json::from_str(&text).ok()?;
         v.get("pid").and_then(Value::as_u64)
+    }
+
+    /// The whole owner record, for the tests that assert on more than the pid.
+    fn lock_record(&self) -> Option<Value> {
+        let text = std::fs::read_to_string(self.info_path()).ok()?;
+        serde_json::from_str(&text).ok()
     }
 }
 
@@ -233,9 +264,54 @@ impl Mcp {
         }
     }
 
-    fn spawn_inner(env: &Env, read_only: bool) -> Mcp {
+    /// Spawn an `mcp` daemon that owns a config and index other than the
+    /// environment's own defaults, `--db` given ahead of the subcommand the
+    /// way the global flag is placed, `--config` after it. Used to prove a
+    /// bypassing command reads the untouched default index rather than
+    /// colliding with a daemon that never held it in the first place.
+    fn spawn_with_db(env: &Env, config: &Path, db: &Path) -> Mcp {
         let mut cmd = Command::new(bin());
         env.apply(&mut cmd);
+        cmd.arg("--db").arg(db);
+        cmd.arg("mcp");
+        cmd.arg("--config").arg(config);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let out = BufReader::new(child.stdout.take().unwrap());
+        Mcp {
+            child,
+            stdin,
+            out,
+            id: 0,
+        }
+    }
+
+    /// Spawn an `mcp` client, and with it the daemon it starts, carrying one
+    /// extra environment variable.
+    ///
+    /// The daemon inherits this process's environment, so a knob the *daemon*
+    /// has to see has to be set here, where it is started, and not on the `ctl`
+    /// client that later asks it to do the work. The only user is the rebuild
+    /// hold, below.
+    fn spawn_with_env(env: &Env, key: &str, value: &str) -> Mcp {
+        Mcp::spawn_configured(env, false, Some((key, value)))
+    }
+
+    fn spawn_inner(env: &Env, read_only: bool) -> Mcp {
+        Mcp::spawn_configured(env, read_only, None)
+    }
+
+    fn spawn_configured(env: &Env, read_only: bool, extra: Option<(&str, &str)>) -> Mcp {
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        if let Some((key, value)) = extra {
+            cmd.env(key, value);
+        }
         cmd.arg("mcp");
         if read_only {
             cmd.arg("--read-only");
@@ -442,7 +518,9 @@ fn read_only_daemon_reports_hides_and_refuses() {
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
+        "remove_domain",
         "evolve_engrams",
     ] {
         assert!(
@@ -552,6 +630,190 @@ fn watcher_indexes_external_write_without_duplicates() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// A full reindex is no longer a window in which the index is empty: the daemon
+/// keeps answering the whole time, from the rows it had before the rebuild
+/// started, and says out loud that a rebuild is in flight.
+///
+/// The window is made deterministic rather than raced for. The daemon is
+/// started with `CRYSTALLINE_TEST_REBUILD_HOLD_MS`, which the shared reindex
+/// driver honours after it stamps a domain's marker and before it walks the
+/// domain's files - exactly the state the two observation flags below are
+/// looking for. The knob goes on the *daemon*, not on the `ctl` client that
+/// asks for the rebuild, because the daemon is the process that runs the
+/// driver. Without it the flags sample a window a 600-engram rebuild can close
+/// inside one polling lap, which is a race, and a test that observes a race is
+/// a test that flakes.
+///
+/// The corpus stays large, because the "never an empty page" assertion wants
+/// laps to sample and that one is about what a reader sees at every instant,
+/// not about the hold.
+#[test]
+fn the_daemon_keeps_answering_during_a_full_reindex() {
+    let env = Env::new("rbld");
+    env.setup_domain("eng");
+
+    // Seed the corpus before the daemon exists, so the watcher has nothing to
+    // race and the sync below is one plain direct pass.
+    const ENGRAMS: usize = 600;
+    for i in 0..ENGRAMS {
+        std::fs::write(
+            env.dir.join(format!("kb-eng/e{i}.md")),
+            format!(
+                "---\ntype: engram\ntitle: E {i}\npermalink: e{i}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nrebuildtoken payload number {i}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let (ok, _) = env.run(&["sync"]);
+    assert!(ok, "seed sync");
+
+    let total_before = search_total(&env);
+    assert_eq!(total_before, ENGRAMS as u64, "the corpus is indexed");
+
+    // The daemon runs the driver, so the hold is set here, where the daemon is
+    // started. Comfortably above two polling laps, so the state the flags are
+    // looking for cannot close between two samples of it.
+    let mut c1 = Mcp::spawn_with_env(&env, "CRYSTALLINE_TEST_REBUILD_HOLD_MS", "800");
+    c1.initialize();
+    env.wait_ready();
+
+    // The rebuild runs in its own process against the live daemon.
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut rebuild = cmd
+        .args(["ctl", "reindex", "--full"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut saw_live_activity = false;
+    let mut saw_marker = false;
+    let started = Instant::now();
+    loop {
+        let finished = rebuild.try_wait().unwrap().is_some();
+        // One read and one status per lap, both through the daemon that is
+        // rebuilding.
+        assert_eq!(
+            search_total(&env),
+            total_before,
+            "the daemon answers from the rows it already had, never an empty page"
+        );
+        let status = status_json(&env);
+        if status["activity"]["now"]
+            .as_array()
+            .is_some_and(|now| now.iter().any(|a| a["kind"] == json!("reindex")))
+        {
+            saw_live_activity = true;
+        }
+        if domains_rebuilding(&status).contains(&"eng".to_string()) {
+            saw_marker = true;
+        }
+        if finished {
+            break;
+        }
+        // Paced rather than spun: two daemon round-trips per lap as fast as
+        // they complete would make the test's own contention part of why the
+        // window is wide enough to observe, which is not a property to rely on.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        rebuild.wait().unwrap().success(),
+        "the full reindex succeeded"
+    );
+    assert!(
+        saw_live_activity,
+        "ctl status reported the reindex while it ran"
+    );
+    assert!(
+        saw_marker,
+        "ctl status reported the domain's rebuild marker while it ran"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(800),
+        "the daemon honoured the hold, so the window above was held open rather than caught: {:?}",
+        started.elapsed()
+    );
+
+    // And afterwards: the marker is gone and the rows are all still there.
+    let status = status_json(&env);
+    assert!(
+        domains_rebuilding(&status).is_empty(),
+        "a finished rebuild leaves no marker: {status}"
+    );
+    assert_eq!(search_total(&env), total_before);
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// `reindex --wipe` is the one verb that still destroys the index, and it needs
+/// the file to itself. A running daemon is holding it, so the wipe must refuse
+/// and name the holder - never discard a healthy index out from under a process
+/// that is still serving from it.
+///
+/// The failure mode this pins is specific: the wipe opens resiliently, and a
+/// resilient open discards a database it cannot open. A file held by another
+/// process is exactly such a database, so without the lock check the wipe would
+/// delete a live index and report success.
+#[test]
+fn reindex_wipe_refuses_while_a_daemon_holds_the_index() {
+    let env = Env::new("wipe");
+    env.setup_domain("eng");
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    let db = env.state_dir().join("index.db");
+    let size_before = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    assert!(size_before > 0, "the daemon's index exists");
+
+    let (ok, _out, err) = env.run_full(&["reindex", "--wipe"]);
+    assert!(!ok, "the wipe refuses while the daemon holds the index");
+    assert!(
+        err.contains("crystalline") && err.to_lowercase().contains("daemon"),
+        "the refusal names the holder and what to do: {err}"
+    );
+
+    // The index file is still there and the daemon still answers from it.
+    assert!(db.exists(), "the held index file was not discarded");
+    let (ok, out) = env.run(&["--json", "search", "seed"]);
+    assert!(ok, "the daemon still serves: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["total"].as_u64().unwrap_or(0) >= 1, "{v}");
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The hit count for the corpus token, through whatever route the environment
+/// resolves - a running daemon, here.
+fn search_total(env: &Env) -> u64 {
+    let (ok, out) = env.run(&["--json", "search", "rebuildtoken"]);
+    assert!(ok, "search failed: {out}");
+    let v: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("search json: {e}: {out}"));
+    v["total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no total: {v}"))
+}
+
+fn status_json(env: &Env) -> Value {
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "ctl status failed: {out}");
+    serde_json::from_str(&out).unwrap_or_else(|e| panic!("status json: {e}: {out}"))
+}
+
+/// The domains whose rows the status report says are mid-rebuild.
+fn domains_rebuilding(status: &Value) -> Vec<String> {
+    status["domains"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["rebuild_started"].is_string())
+        .filter_map(|d| d["name"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// The daemon gap this covers: a domain registered by `domain add` after the
 /// daemon started is not in its startup config snapshot, so its watcher never
 /// knew the root existed either. `domain add` must still route its own sync
@@ -611,6 +873,310 @@ fn domain_add_while_daemon_running_syncs_and_watches_the_new_domain() {
     assert!(
         found,
         "the watcher picked up an external write in a domain added after daemon start"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The reported bug's exact shape: a bare `crystalline sync --domain <name>`
+/// with a daemon running. `sync_dispatch` (`main.rs`) routes this over the
+/// daemon's ctl socket instead of the direct path in `cmd.rs`, and a
+/// per-file failure used to ride inside the daemon's own `data.reports[].failed`
+/// as an ordinary field, so the ctl envelope around it stayed "ok" and the
+/// process exited 0 regardless. The daemon path now runs the identical
+/// failure check `cmd::sync` runs on the direct path, so a user cannot tell
+/// which one handled their command from the exit code or the message.
+#[test]
+fn sync_over_a_running_daemon_fails_when_a_file_could_not_be_indexed() {
+    let env = Env::new("syncfail");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // A file whose frontmatter repeats a key lands after the daemon started,
+    // so this sync is the first thing to see it - the same duplicate-`tags`
+    // shape the original report hit.
+    std::fs::write(
+        env.dir.join("kb-eng/bad.md"),
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    )
+    .unwrap();
+
+    let (ok, stdout, stderr) = env.run_full(&["sync", "--domain", "eng"]);
+    assert!(
+        !ok,
+        "a partial failure over the daemon must fail the process, not exit 0: stdout={stdout} stderr={stderr}"
+    );
+    // The daemon path prints the full report before failing, same as the
+    // direct path - `sync_dispatch` always renders the daemon's JSON answer
+    // through `print_value`, so the shape differs from the direct path's
+    // plain-text summary line, but the evidence is the same either way: the
+    // report, the failing file's path and the reason are all still on
+    // stdout, printed before the process fails.
+    assert!(
+        stdout.contains("\"failed\""),
+        "the report still prints in full before the failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("bad.md"),
+        "the failing file is named: {stdout}"
+    );
+    assert!(
+        stdout.contains("duplicate entry with key"),
+        "the reason travels with it: {stdout}"
+    );
+    assert!(
+        stderr.contains("failed to sync") && stderr.contains("eng"),
+        "the failure names the count and the domain on stderr: {stderr}"
+    );
+
+    // A clean sync over the same still-running daemon succeeds: the check
+    // only fires on an actual failure, so the two paths cannot drift apart
+    // on the happy path either.
+    std::fs::remove_file(env.dir.join("kb-eng/bad.md")).unwrap();
+    let (ok, out) = env.run(&["sync", "--domain", "eng"]);
+    assert!(ok, "a clean sync over the daemon still succeeds: {out}");
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The other failure class the daemon path used to ignore entirely: not one
+/// file with broken frontmatter, but a whole domain `Engine::sync_take_over`
+/// could not scan at all - it logs a warning, records `{"domain", "error"}`
+/// in the response's top-level `failed` array and moves on to the next
+/// domain, rather than aborting the sweep. That per-domain record rode in
+/// the ctl envelope exactly like a per-file one, so a daemon-routed sync
+/// with one unscannable domain among several still exited 0. A missing
+/// directory is the easy way to trigger it: `scan_domain` errors loudly the
+/// moment its walk root itself cannot be read (see its own comment), and a
+/// removed directory hits that same branch as a permission error would.
+#[test]
+fn sync_over_a_running_daemon_fails_when_a_domain_could_not_be_scanned() {
+    let env = Env::new("scanfail");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // Registered while the daemon is up, exactly like the sibling
+    // `domain_add_while_daemon_running_...` test, so this domain is fully
+    // synced and known-good before its directory disappears out from under
+    // it.
+    env.setup_domain("broken");
+    std::fs::remove_dir_all(env.dir.join("kb-broken")).unwrap();
+
+    // No `--domain` filter: `Engine::sync_take_over` only soft-skips a
+    // domain whose scan failed when sweeping everything (`only.is_none()`);
+    // naming one domain that fails would abort with a plain error instead,
+    // which is not the shape this bug needs (multiple domains, one bad).
+    let (ok, stdout, stderr) = env.run_full(&["sync"]);
+    assert!(
+        !ok,
+        "a domain that could not be scanned at all must fail the process, not exit 0: stdout={stdout} stderr={stderr}"
+    );
+    // The full report still prints before the failure, "eng" included, so a
+    // healthy domain's result is never hidden by a sibling's failure.
+    assert!(
+        stdout.contains("\"eng\""),
+        "eng's own report still prints: {stdout}"
+    );
+    assert!(
+        stdout.contains("broken"),
+        "the daemon's failed-domains array still names it: {stdout}"
+    );
+    assert!(
+        stderr.contains("could not be scanned") && stderr.contains("broken"),
+        "the failure names the domain and says it could not be scanned, not that a file failed to parse: {stderr}"
+    );
+    assert!(
+        !stderr.contains("file(s) failed to sync"),
+        "the wrong failure class must not be claimed - no file parse failure happened here: {stderr}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The colleague's fourth defect, exactly as reported: a healthy daemon is
+/// running and `crystalline doctor` used to die on
+/// `could not open the index ... File is locked by another process`, because
+/// doctor was the one index-touching command with no daemon route. It now
+/// asks the daemon for the file stamps its orphan and unindexed checks need,
+/// so the diagnosis a person runs while the service is up actually runs, and
+/// it still splits "not indexed yet" from "cannot be indexed until the
+/// frontmatter is fixed".
+///
+/// The second domain is registered by editing `config.yaml` directly rather
+/// than through `domain add`: `domain add` routes a sync through the running
+/// daemon, and a watched domain's well-formed file would be indexed within
+/// the debounce, so there would be no unindexed file left to report. The
+/// daemon never watches a domain it did not know at startup, which keeps
+/// `good.md` unindexed for the length of the test while `bad.md` stays
+/// unindexable whatever anyone runs.
+#[test]
+fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
+    let env = Env::new("docdaemon");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    let docs = env.dir.join("kb-docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: docs\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# docs\n\n## Scope\n\n- docs\n\n## When to Use\n\n- Route here for docs\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docs.join("good.md"),
+        "---\ntype: engram\ntitle: Good\npermalink: good\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nA perfectly well-formed engram nobody has indexed yet.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docs.join("bad.md"),
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    cfg.domains.insert(
+        "docs".to_string(),
+        crystalline_core::config::DomainEntry::file(&docs),
+    );
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+
+    let (ok, stdout, stderr) = env.run_full(&["--json", "doctor"]);
+    assert!(
+        !stdout.contains("locked by another process")
+            && !stderr.contains("locked by another process"),
+        "doctor never collides with the service it diagnoses: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !ok,
+        "the two unhealthy files are problems, so doctor exits 1: stdout={stdout} stderr={stderr}"
+    );
+    let report: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("doctor still produced its report: {e}: stdout={stdout} stderr={stderr}")
+    });
+    assert_eq!(
+        report["index"]["source"],
+        json!("daemon"),
+        "the index reads went through the running daemon: {report}"
+    );
+    let docs_report = report["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == json!("docs"))
+        .expect("the second domain is in the report")
+        .clone();
+    assert_eq!(
+        docs_report["unindexed"],
+        json!(["MANIFEST.md", "good.md"]),
+        "the well-formed files are reported as not indexed yet, the manifest among them: {docs_report}"
+    );
+    assert_eq!(
+        docs_report["unsyncable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        vec!["bad.md".to_string()],
+        "the duplicate-key file is the other class, not merely unsynced: {docs_report}"
+    );
+    assert!(
+        docs_report["unsyncable"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("duplicate entry with key"),
+        "the reason travels with it: {docs_report}"
+    );
+
+    // The domain the daemon does watch is clean, so the daemon-served stamps
+    // are read as stamps, not as "nothing is indexed".
+    let eng = report["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == json!("eng"))
+        .expect("the watched domain is in the report")
+        .clone();
+    assert_eq!(eng["unindexed"], json!([]), "{eng}");
+    assert_eq!(eng["index_checked"], json!(true), "{eng}");
+
+    // The human report says where its index answers came from, and keeps the
+    // two file classes apart there too.
+    let (_, human, _) = env.run_full(&["doctor"]);
+    assert!(
+        human.contains("index: read through the running daemon"),
+        "the report names the route it took: {human}"
+    );
+    assert!(
+        human.contains("run: crystalline sync --domain docs\n")
+            && human.contains("cannot be indexed until the frontmatter is fixed"),
+        "and gives each class its own guidance: {human}"
+    );
+
+    // `--domain` sends a name over the socket instead of asking for every
+    // domain, which is a different resolution on the daemon side. It must
+    // still be answered there: a refusal would fall through to the direct
+    // open, hit the same lock and report a partial run, which reads as
+    // "doctor works" from the outside while being the bug again.
+    let (_, filtered, stderr) = env.run_full(&["--json", "doctor", "--domain", "docs"]);
+    let report: Value = serde_json::from_str(&filtered)
+        .unwrap_or_else(|e| panic!("a filtered run still reports: {e}: {filtered} {stderr}"));
+    assert_eq!(
+        report["index"]["source"],
+        json!("daemon"),
+        "a named domain is served by the daemon too, not fallen back to a direct open: {report}"
+    );
+    let names: Vec<String> = report["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(names, vec!["docs".to_string()], "{report}");
+    assert_eq!(
+        report["domains"][0]["unindexed"],
+        json!(["MANIFEST.md", "good.md"])
+    );
+
+    // A virtual domain has no files to stamp, so the daemon answers with
+    // nothing for it. That is an answer, not a refusal: the run stays on the
+    // daemon route and says the count was not read rather than printing a
+    // zero it never looked up.
+    let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    cfg.domains.insert(
+        "ideas".to_string(),
+        crystalline_core::config::DomainEntry {
+            kind: crystalline_core::config::DomainKind::Virtual,
+            path: None,
+            origin: None,
+            provision: None,
+            review: None,
+        },
+    );
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+    let (ok, virtual_json, stderr) = env.run_full(&["--json", "doctor", "--domain", "ideas"]);
+    assert!(
+        ok,
+        "a virtual domain with nothing wrong exits 0: {virtual_json} {stderr}"
+    );
+    let report: Value = serde_json::from_str(&virtual_json).unwrap();
+    assert_eq!(report["index"]["source"], json!("daemon"), "{report}");
+    assert_eq!(report["domains"][0]["engrams"], Value::Null, "{report}");
+    let (_, virtual_human, _) = env.run_full(&["doctor", "--domain", "ideas"]);
+    assert!(
+        virtual_human.contains("ok (virtual, engram count not read)"),
+        "no fabricated count: {virtual_human}"
     );
 
     drop(c1);
@@ -770,6 +1336,136 @@ fn explicit_overrides_bypass_a_running_daemon() {
         hits["total"].as_u64().unwrap_or(0),
         0,
         "the daemon's index holds none of the side domain's content: {hits}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A data verb that took the direct path because of `--db`/`--config` says so
+/// on stderr, the same sentence `status` prints for the same reason
+/// (`status_with_an_override_says_bypassed`), so an empty answer from the
+/// wrong index is never mistaken for a genuine miss - field finding 3.
+///
+/// The daemon here owns a separate config and index of its own, never the
+/// plain default: `search --config <other>` (no `--db`) then reads that
+/// untouched default directly, which is empty rather than locked, so the
+/// command succeeds and the note is the only sign anything was bypassed.
+/// `--json` carries no such note; its stdout is the same empty result either
+/// way.
+#[test]
+fn search_with_an_override_notes_the_bypass_on_stderr() {
+    let env = Env::new("search-bypass-note");
+
+    let side_db = env.dir.join("side.db");
+    let side_config = env.dir.join("side.yaml");
+    let side_domain = env.dir.join("kb-side");
+    std::fs::create_dir_all(&side_domain).unwrap();
+    std::fs::write(
+        side_domain.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: side\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# side\n\n## Scope\n\n- side\n\n## When to Use\n\n- Route here for side\n",
+    )
+    .unwrap();
+    std::fs::write(
+        side_domain.join("seed.md"),
+        "---\ntype: engram\ntitle: Seed\npermalink: seed\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nseed body token\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let ok = cmd
+        .arg("--db")
+        .arg(&side_db)
+        .arg("domain")
+        .arg("add")
+        .arg("side")
+        .arg(&side_domain)
+        .arg("--config")
+        .arg(&side_config)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "domain add into the side config/index");
+
+    // The daemon serves that side index, never the plain default one that
+    // `search --config <other>` (no `--db`) is about to read directly.
+    let mut c1 = Mcp::spawn_with_db(&env, &side_config, &side_db);
+    c1.initialize();
+
+    let other_config = env.dir.join("other.yaml");
+    let (ok, stdout, stderr) =
+        env.run_full(&["search", "seed", "--config", other_config.to_str().unwrap()]);
+    assert!(ok, "search --config <other> must succeed: {stderr}");
+    assert_eq!(stdout, "no results\n", "stdout carries no daemon note");
+    assert!(
+        stderr.contains("Daemon: bypassed (--db/--config override); reading the index directly"),
+        "the same sentence status prints for a bypass: {stderr}"
+    );
+
+    let (ok, json_stdout) = env.run(&[
+        "--json",
+        "search",
+        "seed",
+        "--config",
+        other_config.to_str().unwrap(),
+    ]);
+    assert!(ok, "search --json --config <other> must succeed");
+    assert_eq!(
+        json_stdout,
+        "{\"count\":0,\"hits\":[],\"limit\":10,\"mode\":\"text\",\"page\":1,\"total\":0}\n",
+        "--json stdout is byte-identical to today"
+    );
+
+    drop(c1);
+    let _ = Command::new(bin())
+        .args(["--db"])
+        .arg(&side_db)
+        .arg("ctl")
+        .arg("shutdown")
+        .output();
+}
+
+/// A `--db` client pointed straight at a daemon's own index meets the same
+/// named-holder composer the non-override standalone fallback already uses
+/// (`search_names_the_daemon_and_the_remedy_when_the_index_cannot_be_opened`),
+/// never the raw backend lock text leading - field finding 5.
+#[test]
+fn search_with_a_db_override_names_the_holder_on_a_held_lock() {
+    let env = Env::new("search-db-override-locked");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+    let pid = env.lock_pid().expect("the daemon published its pid");
+
+    let db = env.state_dir().join("index.db");
+    let (ok, stdout, stderr) = env.run_full(&["search", "seed", "--db", db.to_str().unwrap()]);
+    assert!(
+        !ok,
+        "a --db pointed at the daemon's own held index must fail: {stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("(pid {pid})")),
+        "the holder is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("--db or --config"),
+        "the override remedy is given: {stderr}"
+    );
+    assert!(
+        !stderr.contains("reading the index directly"),
+        "a failed direct read must never claim it read the index directly: {stderr}"
+    );
+    let holder_at = stderr
+        .find("owns the index at")
+        .unwrap_or_else(|| panic!("the holder is named: {stderr}"));
+    let raw_at = stderr
+        .find("The index reported: ")
+        .unwrap_or_else(|| panic!("the backend's own words are kept: {stderr}"));
+    assert!(
+        holder_at < raw_at,
+        "the holder is named before the raw lock text, which never leads: {stderr}"
     );
 
     drop(c1);
@@ -950,7 +1646,7 @@ fn http_smoke_initialize_list_and_search() {
     // it, so the count here is the default one rather than every tool this
     // server implements (see crystalline-service's mcp_collab suite for the
     // full gating matrix).
-    assert_eq!(tools.len(), 18, "a default install's tools over HTTP");
+    assert_eq!(tools.len(), 20, "a default install's tools over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");
@@ -1069,6 +1765,151 @@ fn an_occupied_http_address_is_not_fatal_and_says_so() {
     let _ = child.wait();
 }
 
+/// A foreground `serve` prints the copyright line even when stderr is
+/// redirected, because AGPL section 13 means a user of a running instance has
+/// to be able to see where the source is. The line sits after the
+/// `is_terminal()` guard that owns the ASCII banner and inside `if
+/// !daemon_flag`, and only running it proves that placement.
+///
+/// This Env's `apply` sets `CRYSTALLINE_SERVICE_HTTP=false` and no `--http`
+/// flag is passed, so the fixture serves no HTTP endpoint at all - which is
+/// what the second assertion below trades on.
+#[test]
+fn a_foreground_serve_prints_the_copyright_line_to_a_redirected_stderr() {
+    let env = Env::new("copyright");
+    env.setup_domain("eng");
+
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut serving_line = None;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("serving on") => {
+                serving_line = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    serving_line.expect("the daemon announces where it is serving");
+
+    // The copyright line follows right after; collect a little more to see it.
+    let mut copyright_line = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("Copyright") => {
+                copyright_line = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let stderr =
+        copyright_line.expect("a redirected foreground run still prints the copyright line");
+    assert!(
+        stderr.contains(crystalline_service::daemon::COPYRIGHT_HOLDER),
+        "a redirected foreground run still names the holder: {stderr}"
+    );
+    assert!(
+        !stderr.contains("crystalline HTTP endpoint on"),
+        "and this fixture serves no HTTP endpoint, so the assertion above is about the banner line and nothing else: {stderr}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A flag that contradicts configuration says so at startup, naming both
+/// values and the key, and the daemon serves anyway. This Env sets
+/// CRYSTALLINE_SERVICE_HTTP=false, so `--http <port>` is a real difference.
+#[test]
+fn an_exposure_flag_that_contradicts_configuration_says_so() {
+    let env = Env::new("notice");
+    env.setup_domain("eng");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args(["serve", "--http", &addr, "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut notice = None;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("service.http") => {
+                notice = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let notice = notice.expect("the daemon names the flag that contradicts its configuration");
+    assert!(
+        notice.contains(&addr),
+        "it names what the flag asked for: {notice}"
+    );
+    assert!(
+        notice.contains("service.http says no HTTP endpoint"),
+        "and what configuration says, as the absence it is rather than a value \
+         the other daemons bind: {notice}"
+    );
+    assert!(
+        notice.contains("crystalline config set service.http"),
+        "and how to make it permanent: {notice}"
+    );
+
+    // A notice, not a refusal: the daemon is serving.
+    wait_port(&addr);
+    env.wait_ready();
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Parse a JSON-RPC response that may be plain JSON or an SSE `data:` frame.
 fn parse_jsonrpc(body: &str) -> Value {
     for line in body.lines() {
@@ -1085,6 +1926,26 @@ fn parse_jsonrpc(body: &str) -> Value {
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Poll until a departing daemon has let the index lock go.
+///
+/// `Ownership`'s drop removes the owner record, unlocks and only then removes
+/// the lock file, so the lock file's absence is the last step and the honest
+/// signal that a fresh `serve` can take the lock. Without it a test that runs
+/// `ctl shutdown` and immediately starts a second daemon races the first one's
+/// teardown, and on a slow runner the second `serve` loses the lock and exits
+/// before it ever binds. Best effort: a holder killed with `-9` leaves the
+/// file behind with the lock already released, so a timeout returns quietly
+/// and lets the caller proceed.
+fn wait_lock_released(env: &Env) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(8) {
+        if !env.lock_path().exists() && !env.info_path().exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_port(addr: &str) {
@@ -1204,6 +2065,332 @@ fn status_without_a_daemon_and_no_index_reports_registered_domains_as_not_indexe
     assert!(out.contains("No index at "), "{out}");
     assert!(out.contains("Run: crystalline sync"), "{out}");
     assert!(out.contains("eng\t(not indexed yet)"), "{out}");
+}
+
+/// `domain list` reaches the index the same way every other verb does, so a
+/// machine with a daemon gets real counts. Before the routing it opened the
+/// database itself, and the daemon that owns the file turned every count into
+/// the "(not indexed)" a person reads as lost work.
+#[test]
+fn domain_list_with_a_daemon_reports_its_counts() {
+    let env = Env::new("list-up");
+    env.setup_domain("eng");
+
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["domain", "list"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("eng\t"), "{out}");
+    assert!(
+        out.contains(" engrams"),
+        "a running daemon should still yield counts: {out}"
+    );
+    assert!(
+        !out.contains("(not indexed)") && !out.contains("(counts not read)"),
+        "{out}"
+    );
+}
+
+/// With the index unreachable, `domain list` still answers: the registrations
+/// come from configuration, and only the counts are missing. They say so in
+/// words, rather than reading as a domain nobody has synced.
+#[test]
+fn domain_list_degrades_when_the_index_cannot_be_reached() {
+    let env = Env::new("list-degraded");
+    env.setup_domain("eng");
+    // A directory is not a database, so the open fails the way a file nobody
+    // may read does, with no daemon in the picture to answer instead.
+    let wall = env.dir.join("not-a-database");
+    std::fs::create_dir_all(&wall).unwrap();
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd
+        .args(["domain", "list", "--db"])
+        .arg(&wall)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the listing still answers");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("eng\t"), "{stdout}");
+    assert!(stdout.contains("(counts not read)"), "{stdout}");
+    assert!(
+        stderr.contains("engram counts were not read"),
+        "the note says which half is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("crystalline doctor --fix"),
+        "and names a remedy rather than a raw lock error: {stderr}"
+    );
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd
+        .args(["--json", "domain", "list", "--db"])
+        .arg(&wall)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let value: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(value["counts"]["read"], json!(false), "{value}");
+    assert!(
+        value["counts"]["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "a null count is ambiguous without the reason beside it: {value}"
+    );
+    assert_eq!(value["domains"][0]["name"], json!("eng"), "{value}");
+}
+
+/// A verb that cannot answer any part of its question without the index
+/// refuses in the same words, naming the daemon and a remedy rather than
+/// handing a person a raw lock error to guess at.
+#[test]
+fn status_refuses_readably_when_the_index_cannot_be_reached() {
+    let env = Env::new("status-unreachable");
+    env.setup_domain("eng");
+    let wall = env.dir.join("not-a-database");
+    std::fs::create_dir_all(&wall).unwrap();
+
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let out = cmd.args(["status", "--db"]).arg(&wall).output().unwrap();
+    assert!(!out.status.success(), "status needs the index");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`crystalline status` needs the index and could not reach it"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("crystalline doctor --fix"), "{stderr}");
+}
+
+/// A daemon that is not one: a live pid, a published record and a socket that
+/// answers every ctl request with the same canned line. Enough for a client to
+/// attach and read a reply, which is all a test of "what does a bad answer look
+/// like to a person" needs - a real daemon cannot be made to fail its own
+/// `status` on demand.
+struct FakeDaemon {
+    stand_in: Child,
+}
+
+impl FakeDaemon {
+    /// `reply` is written back verbatim for every request, newline added.
+    /// `None` closes the connection having written nothing, which is the
+    /// truncated answer a daemon dying mid-exchange leaves behind.
+    fn spawn(env: &Env, reply: Option<&'static str>) -> FakeDaemon {
+        FakeDaemon::publish(env, Some(reply))
+    }
+
+    /// A daemon that is alive and published but whose socket cannot be
+    /// connected to at all: the record names a live pid, and nothing is
+    /// listening. This is the shape that reaches the standalone fallback,
+    /// because that is the one state in which a client gives up on the socket
+    /// and opens the index itself.
+    fn unreachable(env: &Env) -> FakeDaemon {
+        FakeDaemon::publish(env, None)
+    }
+
+    /// `listen` is the reply behaviour, or `None` to bind no socket at all.
+    fn publish(env: &Env, listen: Option<Option<&'static str>>) -> FakeDaemon {
+        std::fs::create_dir_all(env.state_dir()).unwrap();
+        // A disposable child stands in for the daemon's pid, the same trick
+        // `status_notes_an_unreachable_daemon_on_stderr` uses. A far-future
+        // version keeps a client from trying to displace it.
+        let stand_in = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(
+            env.lock_path(),
+            serde_json::to_string(&json!({
+                "pid": stand_in.id(),
+                "socket_path": env.sock_path().display().to_string(),
+                "version": "99.0.0",
+                "started_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let sock = env.sock_path();
+        let _ = std::fs::remove_file(&sock);
+        let Some(reply) = listen else {
+            return FakeDaemon { stand_in };
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                // The `ctl` handshake line, then the request line.
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                line.clear();
+                let _ = reader.read_line(&mut line);
+                if let Some(reply) = reply {
+                    let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
+        FakeDaemon { stand_in }
+    }
+}
+
+impl Drop for FakeDaemon {
+    fn drop(&mut self) {
+        let _ = self.stand_in.kill();
+        let _ = self.stand_in.wait();
+    }
+}
+
+/// The daemon is reachable and its answer is not usable. `domain list` still
+/// answers: the registrations come from configuration, and only the counts
+/// ride on the daemon. Letting the ctl error fail the command would have put
+/// the daemon's bare error where the listing belongs, which is the raw text
+/// this routing exists to stop showing a person.
+#[test]
+fn domain_list_degrades_when_the_daemon_answers_with_an_error() {
+    let env = Env::new("list-ctl-err");
+    env.setup_domain("eng");
+    let _fake = FakeDaemon::spawn(&env, Some(r#"{"ok":false,"error":"domain_stats failed"}"#));
+
+    let (ok, stdout, stderr) = env.run_full(&["domain", "list"]);
+    assert!(ok, "the listing still answers: {stdout}{stderr}");
+    assert!(stdout.contains("eng\t"), "{stdout}");
+    assert!(stdout.contains("(counts not read)"), "{stdout}");
+    assert!(
+        stderr.contains("engram counts were not read"),
+        "the note says which half is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("crystalline doctor --fix"),
+        "and names a remedy: {stderr}"
+    );
+    assert!(
+        stderr.contains("domain_stats failed"),
+        "with the daemon's own words at the end: {stderr}"
+    );
+
+    let (ok, stdout, _) = env.run_full(&["--json", "domain", "list"]);
+    assert!(ok);
+    let value: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["counts"]["read"], json!(false), "{value}");
+    assert_eq!(value["domains"][0]["name"], json!("eng"), "{value}");
+}
+
+/// The same, for a daemon that dies mid-exchange and leaves a truncated line.
+/// A different failure inside `ctl_exchange`, the same thing to say about it.
+#[test]
+fn domain_list_degrades_when_the_daemon_answers_nothing_at_all() {
+    let env = Env::new("list-ctl-cut");
+    env.setup_domain("eng");
+    let _fake = FakeDaemon::spawn(&env, None);
+
+    let (ok, stdout, stderr) = env.run_full(&["domain", "list"]);
+    assert!(ok, "the listing still answers: {stdout}{stderr}");
+    assert!(stdout.contains("eng\t"), "{stdout}");
+    assert!(stdout.contains("(counts not read)"), "{stdout}");
+    assert!(stderr.contains("crystalline doctor --fix"), "{stderr}");
+}
+
+/// A data verb that cannot reach the index says who has it and what to do,
+/// never the backend's lock text on its own.
+///
+/// The state: a daemon is alive, its record is published, it owns the index
+/// and nothing answers on its socket. The data verbs (`search` and its five
+/// siblings) do not open the index through the CLI's own helper - they reach
+/// it in the service crate, whose standalone fallback used to hand the raw
+/// error straight out. A person reading "Locking error: File is locked by
+/// another process" has no way to know a daemon exists, let alone which
+/// command ends it.
+#[test]
+fn search_names_the_daemon_and_the_remedy_when_the_index_cannot_be_opened() {
+    let env = Env::new("search-locked");
+    env.setup_domain("eng");
+    let _fake = FakeDaemon::unreachable(&env);
+    let pid = {
+        let record: Value =
+            serde_json::from_slice(&std::fs::read(env.lock_path()).unwrap()).unwrap();
+        record["pid"].as_u64().unwrap()
+    };
+    // Make the open fail the way a held index does, without needing a real
+    // daemon to hold it: a directory where the database file belongs cannot be
+    // opened by any backend. What is under test is the wording of a failed
+    // open, not which failure produced it.
+    let db = env.state_dir().join("index.db");
+    let _ = std::fs::remove_file(&db);
+    std::fs::create_dir_all(&db).unwrap();
+
+    let (ok, _stdout, stderr) = env.run_full(&["search", "seed"]);
+    assert!(!ok, "search needs the index: {stderr}");
+    assert!(
+        stderr.contains(&format!("(pid {pid})")),
+        "the holder is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("owns the index at"),
+        "and what it holds: {stderr}"
+    );
+    assert!(
+        stderr.contains("crystalline doctor --fix") && stderr.contains("crystalline ctl shutdown"),
+        "with the two commands that do something about it: {stderr}"
+    );
+    let daemon_at = stderr.find("owns the index at").unwrap();
+    let raw_at = stderr
+        .find("The index reported: ")
+        .unwrap_or_else(|| panic!("the backend's own words are kept: {stderr}"));
+    assert!(
+        daemon_at < raw_at,
+        "and they come last, never first: {stderr}"
+    );
+}
+
+/// `status` is the verb a person reaches for when something is broken, and a
+/// configuration this binary cannot parse is one of the things that can be
+/// broken. The daemon is asked before the file is read, so its report still
+/// arrives, and the config problem travels as a note beside it.
+#[test]
+fn status_still_answers_over_a_config_it_cannot_parse() {
+    let env = Env::new("status-bad-config");
+    env.setup_domain("eng");
+
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    // The daemon read a good config on the way up; this breaks the copy on
+    // disk underneath it, which is exactly the state a person is in when they
+    // reach for `status`.
+    std::fs::write(
+        env.config_path(),
+        "domains: [unclosed
+",
+    )
+    .unwrap();
+
+    let (ok, stdout, stderr) = env.run_full(&["status"]);
+    assert!(ok, "status answers: {stdout}{stderr}");
+    assert!(stdout.starts_with("Daemon: running (pid "), "{stdout}");
+    assert!(
+        stderr.contains("configuration did not load"),
+        "the config problem is named, not swallowed: {stderr}"
+    );
+
+    let (ok, stdout, _) = env.run_full(&["status", "--json"]);
+    assert!(ok);
+    let value: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(value["pid"].as_u64().is_some(), "{value}");
+    assert!(
+        value["config_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
+        "--json carries the same note as a field: {value}"
+    );
 }
 
 /// `--db`/`--config` overrides bypass the daemon on purpose; the first line
@@ -1601,5 +2788,300 @@ fn evolve_reports_a_planted_finding_over_the_daemon() {
     );
 
     drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A second `serve` loses the index lock, and says so in a way an operator can
+/// act on: exit code 3 (distinct from every other startup failure, so a unit
+/// file can set RestartPreventExitStatus=3), and a message naming what this
+/// invocation asked to bind, what the holder's record says it bound, and the
+/// key that makes every daemon on the machine bind the same way.
+///
+/// The holder is alive for the whole test (the `Mcp` client keeps it up), so
+/// there is no teardown window to race here: the lock is held on purpose.
+#[test]
+fn a_serve_that_loses_the_lock_exits_three_and_says_what_was_lost() {
+    let env = Env::new("lockexit");
+    env.setup_domain("eng");
+
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+    let owner_pid = env
+        .lock_pid()
+        .expect("the autostarted daemon published a record");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut second = Command::new(bin());
+    env.apply(&mut second);
+    let out = second
+        .args([
+            "serve",
+            "--http",
+            &addr,
+            "--allowed-host",
+            "muthur.lan",
+            "--config",
+        ])
+        .arg(env.config_path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "lock loss has its own exit code, not the generic 1"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Scoped to the refusal's own line. These flags also contradict this env's
+    // configuration, so the startup notice prints the address, the allow-list
+    // and both keys to the same stderr before the lock is ever attempted -
+    // asserting over the whole capture would pass even if the refusal said
+    // none of it.
+    let refusal = stderr
+        .lines()
+        .find(|l| l.contains("already owns it"))
+        .unwrap_or_else(|| panic!("the refusal reaches stderr: {stderr}"));
+    assert!(
+        refusal.contains(&addr),
+        "it names what this serve asked to bind: {refusal}"
+    );
+    assert!(
+        refusal.contains("muthur.lan"),
+        "and the allow-list it asked for: {refusal}"
+    );
+    assert!(
+        refusal.contains(&owner_pid.to_string()),
+        "it names the holder ({owner_pid}): {refusal}"
+    );
+    assert!(
+        refusal.contains("autostart"),
+        "and how the holder started: {refusal}"
+    );
+    assert!(
+        refusal.contains("service.http"),
+        "and the key that reconciles them: {refusal}"
+    );
+
+    drop(client);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The owner record says how its daemon was started. A daemon an agent's
+/// `crystalline mcp` connection spawned and one an operator ran are
+/// indistinguishable from the outside today, which is what let a managed unit
+/// restart-loop 277 times behind a healthy-looking localhost probe.
+#[test]
+fn the_owner_record_says_how_the_daemon_was_started() {
+    let env = Env::new("startedby");
+    env.setup_domain("eng");
+
+    // Autostart: the mcp client finds no daemon and spawns one.
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+    let record = env.lock_record().expect("the daemon published a record");
+    assert_eq!(
+        record["started_by"], "autostart",
+        "a daemon spawned by a connecting client records it: {record}"
+    );
+    // This Env turns the endpoint off, so the binding is recorded as off
+    // rather than left unrecorded.
+    assert_eq!(record["http"], "off", "{record}");
+    drop(client);
+    let _ = env.run(&["ctl", "shutdown"]);
+    // The autostarted daemon still owns the lock until its teardown finishes;
+    // a second serve started inside that window loses the lock and never binds.
+    wait_lock_released(&env);
+
+    // A deliberate serve on the same state directory records the other mode.
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args([
+            "serve",
+            "--http",
+            &addr,
+            "--allowed-host",
+            "muthur.lan",
+            "--config",
+        ])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_port(&addr);
+    let record = env.lock_record().expect("the daemon published a record");
+    assert_eq!(record["started_by"], "serve", "{record}");
+    assert_eq!(
+        record["http"], addr,
+        "the record names the address it bound: {record}"
+    );
+    assert_eq!(
+        record["allowed_hosts"],
+        serde_json::json!(["muthur.lan"]),
+        "the record carries the Host allow-list too: {record}"
+    );
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A localhost probe can tell a deliberately started daemon from one an agent's
+/// connection spawned, and can see what it actually bound. Without this, a
+/// health check passes while the endpoint an operator configured does not exist
+/// - the exact shape that hid the 2026-09-10 outage.
+///
+/// One daemon, one state directory, no reuse: nothing here has to wait for a
+/// departing holder to let the lock go.
+#[test]
+fn health_and_status_say_how_the_daemon_started_and_what_it_bound() {
+    let env = Env::new("expose");
+    env.setup_domain("eng");
+
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .args([
+            "serve",
+            "--http",
+            &addr,
+            "--allowed-host",
+            "muthur.lan",
+            "--config",
+        ])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_port(&addr);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let body: Value = reqwest::blocking::Client::new()
+        .get(format!("http://{addr}/health"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(body["status"], "ok", "{body}");
+    assert_eq!(body["started_by"], "serve", "{body}");
+    assert_eq!(body["http"], addr, "{body}");
+    // The allow-list is the one exposure fact this body must not carry: the
+    // probe route is never Host-guarded, so anything on it is readable by any
+    // unauthenticated caller that can reach the port, and these are internal
+    // hostnames. It rides the local socket instead, asserted below.
+    assert!(
+        body.get("allowed_hosts").is_none(),
+        "an unguarded probe does not publish the Host allow-list: {body}"
+    );
+
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "{out}");
+    let ctl: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(ctl["started_by"], "serve", "{ctl}");
+    assert_eq!(ctl["http"], addr, "{ctl}");
+    assert_eq!(
+        ctl["allowed_hosts"],
+        serde_json::json!(["muthur.lan"]),
+        "{ctl}"
+    );
+
+    let (ok, human) = env.run(&["status"]);
+    assert!(ok, "{human}");
+    assert!(
+        human.contains("started by serve") && human.contains(&addr),
+        "the human status names both: {human}"
+    );
+
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The other half: an autostarted daemon says so, and the endpoint this test
+/// environment turns off reads as off rather than as missing.
+#[test]
+fn an_autostarted_daemon_reports_itself_as_autostarted() {
+    let env = Env::new("autoexp");
+    env.setup_domain("eng");
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["ctl", "status", "--json"]);
+    assert!(ok, "{out}");
+    let ctl: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(ctl["started_by"], "autostart", "{ctl}");
+    assert!(
+        ctl["http"].is_null(),
+        "the endpoint is off in this env: {ctl}"
+    );
+
+    drop(client);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The daemon route for the rows of a domain nobody registers any more: they
+/// are reported, and `--fix` collects them, through the daemon that owns the
+/// index. Nothing is stopped to do it - which is the whole difference between
+/// this and the orphan *file* rows doctor also reports, where a removal is a
+/// write the daemon's read verb cannot make.
+///
+/// The 0.17.0 shape is reproduced by a config edit rather than by `domain
+/// remove`, which clears the rows itself: a test built on the removal would
+/// assert on an index with no orphan in it.
+#[test]
+fn doctor_collects_orphaned_rows_through_the_running_daemon() {
+    let env = Env::new("orphanrows");
+    env.setup_domain("eng");
+    env.setup_domain("retired");
+    let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    cfg.domains.shift_remove("retired");
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+
+    // The daemon starts after the edit, so the removed domain is in no tier of
+    // its registered set: not the startup snapshot, not the file.
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+
+    let (_, out) = env.run(&["--json", "doctor"]);
+    let report: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(
+        report["index"]["source"], "daemon",
+        "the daemon owns the index and answered: {report}"
+    );
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "the orphan is named: {report}");
+    assert!(
+        rows[0]["engrams"].as_i64().unwrap() >= 2,
+        "with the rows at stake: {report}"
+    );
+    assert_eq!(
+        rows[0]["collected"], false,
+        "and a look removes nothing: {report}"
+    );
+
+    let (_, out) = env.run(&["--json", "doctor", "--fix"]);
+    let report: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(
+        report["orphaned_rows"]["domains"][0]["collected"], true,
+        "the daemon that owns the index does the collecting: {report}"
+    );
+
+    let (_, out) = env.run(&["--json", "doctor"]);
+    let report: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(
+        report["orphaned_rows"]["domains"],
+        json!([]),
+        "and the next look has nothing left to report: {report}"
+    );
+
+    drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
 }

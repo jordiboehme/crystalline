@@ -18,15 +18,40 @@ mod cmd;
 mod doctor;
 mod hook;
 mod install;
+mod members;
 mod receipt;
 mod render;
 mod users;
+
+/// What `-V` and `--version` print. clap's `version` attribute feeds both as
+/// long as `long_version` stays unset - which is what keeps them
+/// byte-identical - so this is the only text either flag prints.
+///
+/// Three lines, no blank line: this is Jordi's own compact form (decided
+/// 2026-09-08), not the fuller GNU disclaimer block - no warranty
+/// paragraph, no "this is free software" line. AGPL section 13 is why the
+/// source link is here at all: a network-served copy has to offer its users
+/// the source.
+///
+/// Read from the environment rather than retyped, so a change to
+/// Cargo.toml's `version`, `license` or `repository` carries here too.
+///
+/// Starts with the bare version number, not `crystalline 0.18.0`: clap
+/// renders `--version`/`-V` as `{bin name} {version}`, prepending the name
+/// itself, so spelling it here too would print it twice.
+const VERSION_BLOCK: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nCopyright (C) 2026 Jordi Böhme - ",
+    env!("CARGO_PKG_LICENSE"),
+    "\n",
+    env!("CARGO_PKG_REPOSITORY"),
+);
 
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
 #[command(
     name = "crystalline",
-    version,
+    version = VERSION_BLOCK,
     about,
     long_about = None,
     after_help = "Quickstart:
@@ -180,11 +205,31 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Rebuild the index. `--full` wipes it first, the corruption-recovery path.
+    /// Rebuild the index from the files on disk. `--full` re-reads every file
+    /// and destroys nothing; `--wipe` is the corruption-recovery path.
     Reindex {
-        /// Wipe the index (rebuilding the file if it will not open) then resync.
+        /// Re-read, re-parse and re-index every file instead of only the ones
+        /// whose modification time or size moved. Destroys nothing: each domain
+        /// keeps its rows until its own rebuild commits, files gone from disk
+        /// are pruned as a sync prunes them, and a chunk whose text is
+        /// unchanged keeps the embedding it already has.
         #[arg(long)]
         full: bool,
+        /// Destroy the index and rebuild it from disk: every row and every
+        /// embedding is deleted first, and a database file that will not open
+        /// at all is set aside under a timestamped name and recreated - nothing
+        /// on this path is deleted from disk, so a later recovery attempt still
+        /// has the bytes. The corruption-recovery path for an embedded (turso)
+        /// index, and the only one that loses work - re-embedding a large
+        /// corpus takes hours. Needs exclusive access to the index, so stop the
+        /// daemon first; refuses while another process holds the database,
+        /// refuses on a postgres index (a shared database cannot be made
+        /// exclusive: drop and recreate it with your database tools, then
+        /// `crystalline sync`), and refuses while either this configuration or
+        /// the index names a virtual domain, since its engrams live only in the
+        /// database and no rebuild can bring them back - export them first.
+        #[arg(long, conflicts_with = "full")]
+        wipe: bool,
         /// After reindexing, embed any chunks that need it for the active model.
         #[arg(long)]
         embed: bool,
@@ -278,7 +323,11 @@ enum Command {
         /// Run as a background daemon (quiet output).
         #[arg(long)]
         daemon: bool,
-        /// Serve the content API read-only: the four content-mutating tools are
+        /// Set by the daemon spawn path, never by a person: marks this daemon
+        /// as one a client started because it found none running.
+        #[arg(long, hide = true)]
+        autostarted: bool,
+        /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
         /// daemon's lifetime.
@@ -332,7 +381,7 @@ enum Command {
     /// created in the browser on the first visit; these commands are the
     /// scripted and recovery path to the same accounts, which live in their own
     /// small database in the state directory, beside the index but never inside it, so a
-    /// `reindex --full` cannot take them with it. Safe to run while a daemon
+    /// `reindex --wipe` cannot take them with it. Safe to run while a daemon
     /// is serving: it picks the change up without a restart.
     Users {
         #[command(subcommand)]
@@ -363,7 +412,10 @@ enum Command {
         /// Extra frontmatter as a JSON object.
         #[arg(long)]
         metadata: Option<String>,
-        /// Overwrite an existing engram with the same permalink.
+        /// Overwrite an existing engram with the same permalink. Where
+        /// somebody has that page open in the web editor, the new text lands
+        /// in their open document while they are looking at it; the receipt
+        /// says so and names who is in there.
         #[arg(long)]
         overwrite: bool,
         /// Load the global config from this file instead of the default path.
@@ -420,9 +472,9 @@ enum Command {
         /// Replace deeper subsections too when replacing a section.
         #[arg(long)]
         include_subsections: bool,
-        /// The checksum from a prior read (guards a virtual-domain edit against a
-        /// change since it was read; the edit is refused as a conflict if it
-        /// changed). Omit for last-write-wins.
+        /// The checksum from a prior read; the edit is refused as a conflict if
+        /// the engram changed since, whichever storage kind holds it. Omit for
+        /// last-write-wins.
         #[arg(long)]
         expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
@@ -445,6 +497,39 @@ enum Command {
         /// Do not rewrite inbound links on a cross-domain move.
         #[arg(long)]
         no_update_links: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Split part of an engram into a new engram of its own, wiring the
+    /// derived_from and split_into pair between them. The move to make when
+    /// one fact in an engram stops holding while the rest still does: split
+    /// first, then retire what remains.
+    Split {
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name.
+        identifier: String,
+        /// The engram's domain. The new engram lands in the same domain.
+        domain: String,
+        /// The new engram's title.
+        title: String,
+        /// Observation bullets to move, by the line numbers `crystalline read`
+        /// reports. Repeat the flag or pass a comma-separated list.
+        #[arg(long)]
+        observation: Vec<String>,
+        /// A section to move, by heading path (`## Notes`). Repeat the flag for
+        /// several.
+        #[arg(long)]
+        section: Vec<String>,
+        /// A domain-relative subfolder for the new engram.
+        #[arg(long)]
+        folder: Option<String>,
+        /// The checksum from a prior read; the split is refused as a conflict if
+        /// the source changed since, whichever storage kind holds it. Omit for
+        /// last-write-wins.
+        #[arg(long)]
+        expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -535,7 +620,8 @@ enum Command {
     /// Sweep for the maintenance the knowledge needs and print a ranked queue.
     ///
     /// Read-only: it detects temporal and lifecycle debt, structural gaps and
-    /// redundancy by dates, links and graph shape, never by meaning, and
+    /// redundancy by dates, links, graph shape and embedding similarity
+    /// (semantic twins), never confirming a contradiction, and
     /// changes nothing itself. Work the queue with the write verbs and re-run
     /// the same scope to confirm it shrank.
     Evolve {
@@ -602,7 +688,21 @@ enum HookEvent {
     /// payload, a hook-caused continuation, an unconfigured or read-only
     /// install, a session already nudged or a session too short to be worth
     /// interrupting - is silent.
-    Stop,
+    Stop {
+        /// Which harness this hook is answering, as `crystalline install`
+        /// wrote it into the harness's settings file (claude-code, codex,
+        /// copilot). Harnesses honour different Stop response shapes, so this
+        /// is what lets each one be answered in its own.
+        ///
+        /// A plain string rather than a value enum, for the reason the `mcp`
+        /// command's flag is one: a hook wired by a newer binary and run by an
+        /// older one names a harness this binary may not know, and a
+        /// lifecycle hook that refuses to start is worse than one that
+        /// answers in the shape every harness has always accepted. Omitted or
+        /// unrecognized is exactly today's behaviour.
+        #[arg(long)]
+        harness: Option<String>,
+    },
 }
 
 /// The kind of prompt to generate: `system` renders the live routing block for
@@ -616,9 +716,22 @@ enum PromptKind {
     /// that read and write them.
     System {
         /// The workspace path to route for. Defaults to the current
-        /// directory.
+        /// directory. Scoping comes from the global config's `prompt.rules`:
+        /// each key is a path glob, and the include and exclude lists of
+        /// every rule whose glob matches this path decide which registered
+        /// domains are rendered. A workspace no rule matches gets every
+        /// registered domain. A `.crystalline.yaml` in the workspace does
+        /// not scope: its `preferred_domains` reorder what is rendered,
+        /// preferred first.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Render only these registered domains, in the configured
+        /// preference order. Repeat the flag for several. A name that is
+        /// not registered is an error naming the ones that are. Applies on
+        /// top of the workspace scoping rather than instead of it, so a
+        /// domain the workspace's `prompt.rules` exclude stays excluded.
+        #[arg(long = "domain")]
+        domains: Vec<String>,
         /// Render the read-only variant: drop the write-tools line and state
         /// that this deployment's knowledge is curated externally. Forces the
         /// mode on regardless of service.read_only.
@@ -631,6 +744,14 @@ enum PromptKind {
         /// Output format: text, json or copilot.
         #[arg(long, value_enum)]
         format: Option<PromptFormat>,
+        /// Which harness this routing prompt is being generated for, as
+        /// `crystalline install` wrote it into the harness's settings file
+        /// (claude-code, codex, copilot). Accepted so both managed hook
+        /// commands carry their harness in the same spelling; the routing
+        /// block itself does not vary by harness today. Omitted or
+        /// unrecognized is exactly today's behaviour.
+        #[arg(long)]
+        harness: Option<String>,
     },
     /// Print the standing onboarding snippet for a remote MCP client: paste it
     /// into the client's custom instructions and the agent onboards itself
@@ -678,9 +799,11 @@ enum CtlCommand {
         #[arg(long)]
         take_over: bool,
     },
-    /// Ask the daemon to reindex. `--full` wipes first.
+    /// Ask the daemon to reindex. `--full` re-reads every file and destroys
+    /// nothing; the wipe is a daemonless command (`crystalline reindex --wipe`),
+    /// since it needs exclusive access to the index file.
     Reindex {
-        /// Wipe the index before reindexing.
+        /// Re-read and re-index every file, not only the ones whose stamp moved.
         #[arg(long)]
         full: bool,
         /// Embed new chunks after reindexing.
@@ -754,6 +877,69 @@ enum UsersCommand {
         #[arg(long, value_enum, default_value_t = RoleArg::Viewer)]
         role: RoleArg,
         /// Bypass the last-admin guard. Recovery scenarios only.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Issue an MCP token for an account, or manage the ones it already
+    /// holds. An agent authenticates with one of these when `auth.mcp` is on,
+    /// sending it as `Authorization: Bearer <token>`, and acts as this account
+    /// for as long as it does. The token is printed once and never again: only
+    /// its hash is stored, so a lost one is revoked and replaced.
+    McpToken {
+        /// The account the token belongs to.
+        name: String,
+        /// What the token is for, shown in the listing. Defaults to `cli`.
+        #[arg(long, conflicts_with_all = ["list", "revoke", "rotate"])]
+        label: Option<String>,
+        /// List this account's tokens instead of issuing one. Never shows a
+        /// token: there is nothing left to show after issuance.
+        #[arg(long, conflicts_with_all = ["revoke", "rotate"])]
+        list: bool,
+        /// Revoke one of this account's tokens by id. It stops working at
+        /// once.
+        #[arg(long, value_name = "ID", conflicts_with = "rotate")]
+        revoke: Option<i64>,
+        /// Replace one of this account's tokens by id, keeping its label: the
+        /// old secret stops working and the new one is printed.
+        #[arg(long, value_name = "ID")]
+        rotate: Option<i64>,
+    },
+    /// Tie a single sign-on identity to an existing account, so that person
+    /// signs in through the provider and lands in this account. The durable
+    /// key is the pair of issuer and subject, never an address: an identity
+    /// reaches an account because somebody said so here, or because that
+    /// account's own first sign-on created it.
+    ///
+    /// This is the administrator's half of linking. The other half is the
+    /// person doing it themselves, from their profile in the web UI, which is
+    /// the way that does not need anybody to read a subject off a provider's
+    /// console.
+    Link {
+        /// The account to link the identity to. It must already exist.
+        name: String,
+        /// The provider's issuer url, exactly as its ID tokens spell it.
+        #[arg(long)]
+        issuer: String,
+        /// The provider's stable identifier for the person (the `sub` claim).
+        #[arg(long)]
+        subject: String,
+    },
+    /// Take away the identity an account holds at one provider. A sign-in
+    /// from it then provisions a new account rather than reaching this one.
+    ///
+    /// The repair for a provider that re-issued its subjects (an Entra tenant
+    /// re-registration, say): unlink the stale identity, then `link` the new
+    /// subject to the same account.
+    Unlink {
+        /// The account to take the identity away from.
+        name: String,
+        /// The provider's issuer url.
+        #[arg(long)]
+        issuer: String,
+        /// Unlink even when it is the account's last way in - no password and
+        /// no other identity. The account is then unreachable until it is
+        /// given a password or linked again, which is exactly the gap the
+        /// re-registration repair passes through.
         #[arg(long)]
         force: bool,
     },
@@ -844,6 +1030,15 @@ enum DomainCommand {
         /// indexes what it downloads.
         #[arg(long)]
         no_sync: bool,
+        /// Register the domain private: only its owner, the accounts invited
+        /// into it and instance admins see it at all. Needs --owner, and needs
+        /// web accounts to exist (`crystalline users add`).
+        #[arg(long, requires = "owner")]
+        private: bool,
+        /// The account that owns the domain, with --private. It must already
+        /// exist and be enabled.
+        #[arg(long, value_name = "ACCOUNT")]
+        owner: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -892,15 +1087,173 @@ enum DomainCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Remove a domain from the global config. Leaves its files and index
-    /// rows untouched (the rows are dropped by a later full reindex).
+    /// Unregister a domain. A file or team domain's files are never touched,
+    /// so registering the folder again re-adopts them; a virtual domain's
+    /// engrams live in the database and go with it, which is what --purge
+    /// confirms.
     Remove {
         /// The domain name to remove.
         name: String,
+        /// Confirm that a virtual domain's engrams are to be deleted with it.
+        /// Required for a virtual domain that holds any; a file or team
+        /// domain never needs it, since its files are never touched.
+        #[arg(long)]
+        purge: bool,
+        /// One other actor holding private drafts in this domain, by name;
+        /// repeat the flag for several. Required when anybody but you is
+        /// drafting here: unregistering the domain ends their unshared work and
+        /// nothing brings it back, so it is named rather than assumed. The
+        /// refusal says who, and how many drafts each of them holds.
+        #[arg(long = "end-drafts", value_name = "ACTOR")]
+        end_drafts: Vec<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Who may reach a private domain: list the members, invite one at a
+    /// level, or remove one. The machine operator administers every domain,
+    /// so these commands need no web role and are not refused by one.
+    Members {
+        /// The registered domain.
+        domain: String,
+        #[command(subcommand)]
+        command: MembersCommand,
+    },
+    /// Make a domain private, owned by one account, or share it with every
+    /// account again. Private is the personal domain: only its owner, the
+    /// accounts invited into it and instance admins see it at all. Sharing it
+    /// again forgets who was invited. The machine operator administers every
+    /// domain.
+    Visibility {
+        /// The registered domain.
+        domain: String,
+        /// private: closed to its owner and the invited. default: shared with
+        /// every account again.
+        #[arg(value_enum)]
+        visibility: VisibilityArg,
+        /// The account that owns the domain once it is private. Required with
+        /// `private`, and meaningless with `default`.
+        #[arg(long, value_name = "ACCOUNT")]
+        owner: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Whether this domain reviews changes before they land. In review mode
+    /// (`overlay`) every write joins its author's own draft and the folder the
+    /// team shares changes only through a reviewed proposal; `direct` takes
+    /// changes into the folder straight away, which is how a domain starts out.
+    ///
+    /// Turning it on needs a GitHub origin, a folder and nothing unshared in
+    /// that folder already. Turning it off ends every private draft in the
+    /// domain, so it always prints the plan first and then needs one `--fold`
+    /// or `--discard` per actor the plan names.
+    Review {
+        /// The registered domain.
+        domain: String,
+        /// overlay: review every change before it lands. direct: take changes
+        /// into the folder straight away.
+        #[arg(value_enum)]
+        mode: ReviewModeArg,
+        /// Write this actor's drafts into the folder the team shares. Repeat
+        /// for each actor; only meaningful with `direct`.
+        #[arg(long, value_name = "ACTOR")]
+        fold: Vec<String>,
+        /// End this actor's drafts without touching the folder. Repeat for
+        /// each actor; only meaningful with `direct`.
+        #[arg(long, value_name = "ACTOR")]
+        discard: Vec<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Hand a private domain to a different account. The old owner keeps
+    /// nothing: invite them back if they should stay. The machine operator
+    /// administers every domain.
+    Transfer {
+        /// The registered domain. It must already be private.
+        domain: String,
+        /// The account to hand it to. It must exist and be enabled.
+        new_owner: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MembersCommand {
+    /// List who owns the domain and who is invited into it.
+    List {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Invite an account, or move one to a different level.
+    Add {
+        /// The account's login name.
+        user: String,
+        /// What that account may do here. Defaults to viewer (read only).
+        #[arg(long, value_enum, default_value_t = LevelArg::Viewer)]
+        level: LevelArg,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Remove a membership. The owner is not a member; hand the domain on
+    /// with `crystalline domain transfer` instead.
+    Remove {
+        /// The account's login name.
+        user: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// The two modes `domain review` accepts. `direct` rather than `off` because
+/// that is what it names: the way a domain takes changes when nobody reviews
+/// them, which is how every domain starts out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReviewModeArg {
+    /// Every write joins its author's own draft; the folder changes only
+    /// through a reviewed proposal.
+    Overlay,
+    /// Every write lands in the folder straight away.
+    Direct,
+}
+
+/// The two visibilities `domain visibility` accepts. `default` rather than
+/// `shared` because that is what it restores: a domain nobody made private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum VisibilityArg {
+    /// Only the owner, the invited accounts and instance admins see it.
+    Private,
+    /// Every account sees it, which is how a domain starts out.
+    Default,
+}
+
+/// The membership levels `domain members add` accepts, mirroring
+/// `crystalline_service::rest::MemberLevel` so clap validates the value and
+/// lists it in `--help`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LevelArg {
+    /// Read only: the domain is visible and searchable, nothing more.
+    Viewer,
+    /// Everything a viewer may do, plus writing and editing its engrams.
+    Editor,
+    /// Everything an editor may do, plus managing this domain's membership.
+    Manager,
+}
+
+impl From<LevelArg> for crystalline_service::rest::MemberLevel {
+    fn from(arg: LevelArg) -> crystalline_service::rest::MemberLevel {
+        match arg {
+            LevelArg::Viewer => crystalline_service::rest::MemberLevel::Viewer,
+            LevelArg::Editor => crystalline_service::rest::MemberLevel::Editor,
+            LevelArg::Manager => crystalline_service::rest::MemberLevel::Manager,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1004,6 +1357,10 @@ enum OriginCommand {
         /// Report only this domain instead of every team domain.
         #[arg(long)]
         domain: Option<String>,
+        /// Name the unshared files under each domain, grouped as added,
+        /// modified and deleted, instead of only counting them.
+        #[arg(long)]
+        files: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1027,8 +1384,9 @@ enum OriginCommand {
         #[arg(long)]
         proposal: Option<u64>,
         /// Share only this changed file, relative to the domain root. Repeat
-        /// for several; omit to share every unshared change. The generated
-        /// index.md of each chosen file's folder rides along.
+        /// for several; omit to share every unshared change. Where the domain
+        /// shares its generated listings, the index.md of each chosen file's
+        /// folder rides along.
         #[arg(long = "file")]
         files: Vec<String>,
         /// Load the global config from this file instead of the default path.
@@ -1198,10 +1556,14 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Prompt { kind }) => match kind {
             PromptKind::System {
                 workspace,
+                domains,
                 read_only,
                 config,
                 format,
-            } => run_prompt(workspace, read_only, config, cli.db, cli.json, format),
+                harness,
+            } => run_prompt(
+                workspace, domains, read_only, config, cli.db, cli.json, format, harness,
+            ),
             PromptKind::Connector => run_prompt_connector(cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
@@ -1243,9 +1605,10 @@ fn main() -> anyhow::Result<()> {
         }) => on_runtime(move || sync_dispatch(domain, embed, take_over, config, cli.db, cli.json)),
         Some(Command::Reindex {
             full,
+            wipe,
             embed,
             config,
-        }) => on_runtime(move || reindex_dispatch(full, embed, config, cli.db, cli.json)),
+        }) => on_runtime(move || reindex_dispatch(full, wipe, embed, config, cli.db, cli.json)),
         Some(Command::Status { config }) => {
             on_runtime_current_thread(move || status_dispatch(config, cli.db, cli.json))
         }
@@ -1284,6 +1647,7 @@ fn main() -> anyhow::Result<()> {
             http,
             allowed_host,
             daemon,
+            autostarted,
             read_only,
             take_over,
             config,
@@ -1299,9 +1663,10 @@ fn main() -> anyhow::Result<()> {
             if let Err(e) = crystalline_service::temp_store::point_at_state_dir() {
                 eprintln!("crystalline: could not claim a scratch directory: {e}");
             }
-            on_runtime(move || {
+            match on_runtime(move || {
                 crystalline_service::run_serve(
                     daemon,
+                    autostarted,
                     http,
                     allowed_host,
                     cli.db,
@@ -1309,7 +1674,25 @@ fn main() -> anyhow::Result<()> {
                     read_only,
                     take_over,
                 )
-            })
+            }) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    // A lost index lock gets its own exit code so a unit file
+                    // can stop restarting on it (RestartPreventExitStatus).
+                    // Matched by type, never by message text. `serve` alone:
+                    // the embedded MCP stack and `hold-lock` take the same
+                    // lock and keep today's exit behaviour, inheriting only
+                    // the better wording.
+                    if err
+                        .downcast_ref::<crystalline_service::LockHeld>()
+                        .is_some()
+                    {
+                        eprintln!("Error: {err}");
+                        std::process::exit(crystalline_service::EXIT_LOCK_HELD);
+                    }
+                    Err(err)
+                }
+            }
         }
         Some(Command::Mcp {
             embedded,
@@ -1327,9 +1710,12 @@ fn main() -> anyhow::Result<()> {
             | Command::Evolve { .. }
             | Command::Vocabulary { .. }),
         ) => on_runtime_current_thread(move || run_data(cmd, cli.db, cli.json)),
-        Some(cmd @ (Command::Write { .. } | Command::Edit { .. } | Command::Move { .. })) => {
-            on_runtime(move || run_data(cmd, cli.db, cli.json))
-        }
+        Some(
+            cmd @ (Command::Write { .. }
+            | Command::Edit { .. }
+            | Command::Move { .. }
+            | Command::Split { .. }),
+        ) => on_runtime(move || run_data(cmd, cli.db, cli.json)),
         Some(Command::Delete {
             identifier,
             domain,
@@ -1339,8 +1725,8 @@ fn main() -> anyhow::Result<()> {
             on_runtime(move || delete_dispatch(identifier, domain, force, config, cli.db, cli.json))
         }
         Some(Command::Hook { event }) => match event {
-            HookEvent::Stop => {
-                hook::run_stop();
+            HookEvent::Stop { harness } => {
+                hook::run_stop(harness.as_deref());
                 Ok(())
             }
         },
@@ -1356,6 +1742,25 @@ fn print_value(value: &serde_json::Value, json: bool) {
             "{}",
             serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
         );
+    }
+}
+
+/// Say in words what `embed_scheduled` on a daemon response means.
+///
+/// The daemon embeds one pass at a time. A `--embed` that arrives while a pass
+/// is already walking the backlog is folded into that pass rather than starting
+/// a second one, and the response says so with this flag instead of a count.
+/// Without a line for it a person reads the raw JSON and sees no
+/// `embedded_chunks` at all, which is the same confusion a `0` would cause. The
+/// `--json` consumer has the flag itself and needs no prose.
+fn print_embed_scheduled(data: &serde_json::Value, json: bool) {
+    if !json
+        && data
+            .get("embed_scheduled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        println!("embedding continues in the daemon: a pass was already running and covers this");
     }
 }
 
@@ -1405,6 +1810,33 @@ fn split_commas(s: Option<String>) -> Option<Vec<String>> {
     })
 }
 
+/// The observation line numbers `crystalline split` was given: every
+/// occurrence of `--observation`, each of which may itself carry a
+/// comma-separated or space-separated list. Repeating the flag adds to the
+/// selection rather than replacing it, which is what its help text promises and
+/// what the neighbouring `--section` does.
+///
+/// A token that is not a line number is an error rather than a silently dropped
+/// selection: a split that moved fewer bullets than the caller named is the one
+/// outcome worth failing for.
+fn split_observation_lines(raw: &[String]) -> anyhow::Result<Option<Vec<usize>>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut lines = Vec::new();
+    for token in raw
+        .iter()
+        .flat_map(|one| one.split([',', ' ']))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        lines.push(token.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("--observation takes line numbers, and '{token}' is not one")
+        })?);
+    }
+    Ok(Some(lines))
+}
+
 fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
     if v.is_empty() { None } else { Some(v) }
 }
@@ -1424,23 +1856,53 @@ async fn status_dispatch(
 ) -> anyhow::Result<()> {
     use serde_json::json;
     let bypassed = db.is_some() || config.is_some();
-    if !bypassed {
-        if let Some(data) =
+    // The daemon is asked before `config.yaml` is read, and `status` is the
+    // only verb that does it in this order. It is the command a person reaches
+    // for when something is broken, and a configuration this binary cannot
+    // parse is one of the things that can be broken: refusing to answer then
+    // would withhold the daemon's report exactly when it is wanted most. The
+    // config problem travels as a note beside the answer instead. `sync` and
+    // `reindex` keep the plain order, because they act on the domains the
+    // config names and cannot sensibly do that from a file they cannot read.
+    if !bypassed
+        && let Some(data) =
             crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
-        {
-            if json {
-                println!("{data}");
-            } else {
-                let note = format!(
-                    "running (pid {}, v{}, up {})",
-                    data["pid"].as_u64().unwrap_or(0),
-                    data["version"].as_str().unwrap_or("unknown"),
-                    format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
-                );
-                cmd::render_status(&data, &note);
+    {
+        let config_error = cmd::load(config.as_deref()).err().map(|e| e.to_string());
+        if json {
+            let mut data = data;
+            if let (Some(err), serde_json::Value::Object(map)) = (&config_error, &mut data) {
+                map.insert("config_error".to_string(), json!(err));
             }
-            return Ok(());
+            println!("{data}");
+        } else {
+            if let Some(err) = &config_error {
+                eprintln!(
+                    "note: the daemon answered, but this machine's configuration did not load: {err}"
+                );
+            }
+            let note = format!(
+                "running (pid {}, v{}, up {})",
+                data["pid"].as_u64().unwrap_or(0),
+                data["version"].as_str().unwrap_or("unknown"),
+                format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
+            );
+            cmd::render_status(&data, &note);
         }
+        return Ok(());
+    }
+    // Nothing answered, so the numbers have to come from the index here, and
+    // that needs the config the probe above could do without.
+    let cfg = cmd::load(config.as_deref())?.effective;
+    let route = cmd::reach_index(
+        None,
+        &cfg,
+        config.as_deref(),
+        db.as_deref(),
+        cmd::OpenAs::Read,
+    )
+    .await?;
+    if !bypassed {
         // Nothing answered. Diagnose the lock holder before falling back:
         // `status` is read-only and never signals anything, but a wedged
         // daemon - alive, holding the lock, answering nothing - is exactly
@@ -1453,8 +1915,8 @@ async fn status_dispatch(
                 );
                 eprintln!("note: daemon {state}; reporting from a direct index read instead");
                 return cmd::status(
-                    config.as_deref(),
-                    db.as_deref(),
+                    route,
+                    &cfg,
                     json,
                     &format!("{state}; reading the index directly"),
                 )
@@ -1481,11 +1943,11 @@ async fn status_dispatch(
         }
     }
     let note = if bypassed {
-        "bypassed (--db/--config override); reading the index directly"
+        crystalline_service::instance::BYPASS_NOTE
     } else {
         "not running; reading the index directly"
     };
-    cmd::status(config.as_deref(), db.as_deref(), json, note).await
+    cmd::status(route, &cfg, json, note).await
 }
 
 /// Render seconds of uptime compactly: `42s`, `12m` or `3h07m`.
@@ -1515,20 +1977,59 @@ async fn sync_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-        && let Some(data) = crystalline_service::ctl_if_running(
+    let cfg = cmd::load(config.as_deref())?.effective;
+    let route = cmd::reach_index(
+        Some(
             json!({ "v": 1, "cmd": "sync", "domain": domain, "embed": embed, "take_over": take_over }),
-        )
-        .await?
-    {
+        ),
+        &cfg,
+        config.as_deref(),
+        db.as_deref(),
+        cmd::OpenAs::Write,
+    )
+    .await?;
+    if let cmd::IndexRoute::Daemon(data) = route {
         print_value(&data, json);
+        print_embed_scheduled(&data, json);
+        // Two failure classes ride inside the daemon's JSON as ordinary
+        // fields, so the ctl envelope around either is still `ok`: the
+        // daemon path needs its own check, the same one `cmd::sync` runs on
+        // the direct path, or a user going through a running daemon (the
+        // common case) would see the exact silently-successful sync this
+        // whole fix exists to end. Read both back out of the daemon's own
+        // JSON rather than assuming their shape, so the two paths cannot
+        // drift out of sync with each other. `data.reports[].failed` is a
+        // per-file parse/upsert failure inside a domain that otherwise
+        // scanned fine; `data.failed` is a whole domain `Engine::sync_take_over`
+        // could not scan at all (see its own comment) and skipped rather than
+        // aborting the sweep for.
+        let reports: Vec<crystalline_index::SyncReport> = data
+            .get("reports")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        let scan_failed: Vec<(String, String)> = data
+            .get("failed")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| {
+                let domain = v.get("domain")?.as_str()?.to_string();
+                let error = v.get("error")?.as_str()?.to_string();
+                Some((domain, error))
+            })
+            .collect();
+        if let Some(err) = cmd::sync_failure(&reports, &scan_failed) {
+            return Err(err);
+        }
         return Ok(());
     }
     cmd::sync(
+        cmd::local_store(route, "sync")?,
+        &cfg,
         domain.as_deref(),
         embed,
-        config.as_deref(),
-        db.as_deref(),
         json,
     )
     .await
@@ -1540,22 +2041,145 @@ async fn sync_dispatch(
 /// always takes the direct path (see [`crystalline_service::use_daemon`]).
 async fn reindex_dispatch(
     full: bool,
+    wipe: bool,
     embed: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-        && let Some(data) = crystalline_service::ctl_if_running(
-            json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }),
-        )
-        .await?
-    {
-        print_value(&data, json);
-        return Ok(());
+    let loaded = cmd::load(config.as_deref())?;
+    let cfg = loaded.effective.clone();
+
+    // A wipe needs the index to itself, and only the embedded backend can
+    // establish that: opening the local database file takes an exclusive lock,
+    // so a daemon still serving it makes the wipe refuse rather than delete
+    // underneath it. A Postgres index has no such moment. It is a shared
+    // database several instances connect to at once, nothing in a connection
+    // says "nobody else is using this", and a wipe there deletes every other
+    // instance's rows and releases their host claims mid-serve. The host-lock
+    // table would catch a collaborating instance, but a daemon outside
+    // collaboration mode writes no row at all, so no check can see it.
+    //
+    // The flag also has nothing to offer that backend: what it exists for is a
+    // local database file that will not open, and Postgres has no local file.
+    // So it refuses there, and names the rebuild that does work.
+    if wipe && !cmd::backend_is_turso(&cfg) {
+        anyhow::bail!(
+            "refusing to wipe: this index is a PostgreSQL database, which several instances can be connected to at once, and nothing here can establish that nobody else is serving from it - a wipe would delete their rows and release their host claims while they run. The corruption case --wipe exists for is a local database file that will not open, which this backend does not have. Rebuild without destroying anything instead: crystalline reindex --full. If the database itself must really be cleared, stop every daemon that serves it and drop the schema with your own database tools."
+        );
     }
-    cmd::reindex(full, embed, config.as_deref(), db.as_deref(), json).await
+
+    // The database-side guard inside `cmd::reindex` is the precise one - it asks
+    // the index itself which domains are virtual - but it can only run once the
+    // index is open, and the state `--wipe` exists for is the one where it never
+    // opens. A database that will not open is set aside and a fresh empty one
+    // takes its place, and an empty index holds no virtual domain at all, so the
+    // precise guard would wave the wipe through in exactly the case that costs
+    // the most. What is left to ask then is this configuration, so it is asked
+    // here, before anything is opened, set aside or recreated.
+    //
+    // It refuses whatever the database's state, healthy or not: the config is a
+    // narrower question than the index (a `--db` override can point a config at
+    // another index entirely), so this refuses a little more often than it must.
+    // An extra refusal costs a flag; a missed one costs the only copy of
+    // somebody's knowledge.
+    if wipe {
+        let virtual_domains: Vec<&str> = cfg
+            .domains
+            .iter()
+            .filter(|(_, entry)| entry.is_virtual())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !virtual_domains.is_empty() {
+            // Two routes out, because the refusal cannot tell which state the
+            // person is in without opening the file it refuses to touch. The
+            // first is the ordinary one and works whenever the index still
+            // opens. The second is the one this guard exists for, and it is the
+            // one that was missing: with the file unreadable, the export cannot
+            // read it, `--full` fails and points back here, and `domain remove`
+            // needs the index open too - so the only exit is the config file,
+            // which is also what `domain remove` names when it meets the same
+            // wall. Both are printed as commands to paste, one per line, and
+            // the step that loses the engrams is named as the step that loses
+            // them.
+            let db_path = cmd::db_path(db.as_deref())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "your index file".to_string());
+            let config_path = loaded.path.display().to_string();
+            let exports: String = virtual_domains
+                .iter()
+                .map(|name| format!("\n  crystalline domain export <dir> --domain {name}"))
+                .collect();
+            anyhow::bail!(
+                "refusing to wipe: this configuration names {} virtual domain(s) whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed.\n\n\
+                 If the index still opens, copy them out first, then wipe:{}\n  crystalline reindex --wipe\n\n\
+                 If a rebuild was all you wanted, nothing here needs wiping: crystalline reindex --full\n\n\
+                 If it does not open any more - the case --wipe exists for - then this file is the only copy those engrams have, and every command that could read them needs it to open:\n  {}\n\
+                 Copy it (and any -wal file beside it) somewhere outside the state directory first. Then either repair that copy with a SQLite tool and put it back, or give the engrams up: delete the domain's entry from this file by hand\n  {}\n\
+                 and run crystalline reindex --wipe again. Deleting the entry is the step that loses the domain's content for good; the wipe then sets the unreadable database aside under a timestamped name, never deleting it, and rebuilds your file domains from the files on disk.",
+                virtual_domains.len(),
+                virtual_domains.join(", "),
+                exports,
+                db_path,
+                config_path
+            );
+        }
+    }
+
+    // `--wipe` is the corruption-recovery path and the only one that needs the
+    // resilient open, which renames a Turso database that will not open at all
+    // out of the way and starts a fresh one beside it. It is also the only one a running daemon cannot do for us: it needs
+    // the index file to itself, and the daemon is holding it. So it sends no
+    // ctl request and always takes the direct path, where a daemon still
+    // holding the file surfaces as the usual "who holds it and what to do"
+    // sentence rather than as a wipe that half happened.
+    //
+    // `--full` no longer destroys anything, so it keeps the ordinary write
+    // open and routes to the daemon exactly like an incremental reindex.
+    let request =
+        (!wipe).then(|| json!({ "v": 1, "cmd": "reindex", "full": full, "embed": embed }));
+    let route = cmd::reach_index(
+        request,
+        &cfg,
+        config.as_deref(),
+        db.as_deref(),
+        if wipe {
+            cmd::OpenAs::Rebuild
+        } else {
+            cmd::OpenAs::Write
+        },
+    )
+    .await?;
+    match route {
+        cmd::IndexRoute::Daemon(data) => {
+            print_value(&data, json);
+            print_embed_scheduled(&data, json);
+            Ok(())
+        }
+        // An index that will not open is the one failure where this verb has
+        // something to say that the shared wording cannot: `--full` opens
+        // ordinarily now, so a damaged database file stops it dead, and the
+        // sentence a person gets points at `doctor --fix`, which clears a stale
+        // lock and does not repair a database. `--wipe` is what repairs one,
+        // and nothing else in the program will ever name it to them. Said only
+        // here, where the remedy is a flag on the command they just ran.
+        cmd::IndexRoute::Unreachable(why) if !wipe => Err(anyhow::anyhow!(
+            "{} If the database file itself is damaged, set it aside and rebuild from your files with: crystalline reindex --wipe - that renames the unreadable file rather than deleting it, so its bytes are still there afterwards.",
+            cmd::index_unreachable("reindex", &why)
+        )),
+        other => {
+            cmd::reindex(
+                cmd::local_store(other, "reindex")?,
+                &cfg,
+                full,
+                wipe,
+                embed,
+                json,
+            )
+            .await
+        }
+    }
 }
 
 /// `config show|set|unset`: route over the daemon's ctl `configure` command
@@ -1705,14 +2329,23 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             print_origin_update(&data, json);
             Ok(())
         }
-        OriginCommand::Status { domain, config } => {
+        OriginCommand::Status {
+            domain,
+            files,
+            config,
+        } => {
+            // Detail is asked for whatever `--files` says, because the always
+            // printed ahead line names the change kinds: "2 local change(s)"
+            // reads as two things you added, and both can be deletions. The
+            // flag decides whether the paths themselves are listed under it.
             let data = crystalline_service::origin_status(
                 domain.as_deref(),
+                true,
                 db.as_deref(),
                 config.as_deref(),
             )
             .await?;
-            print_origin_status(&data, json);
+            print_origin_status(&data, files, json);
             Ok(())
         }
         OriginCommand::Share {
@@ -1871,13 +2504,135 @@ fn shared_by(proposal: &serde_json::Value) -> String {
 /// chain's own standing (see below), unresolved conflicts and when it was
 /// last checked, then one line per domain that genuinely failed to report.
 ///
+/// The ahead line names the kinds of change it counts (see [`ahead_line`]),
+/// and `files` adds the paths themselves under it (see
+/// [`unshared_file_lines`]).
+///
 /// Open proposals arrive in chain order, bottom layer first, and are labelled
 /// `layer k:` only while more than one is open: a lone proposal stands in no
 /// chain, so it renders exactly as it always did. The three chain lines below
 /// them each name something a caller can act on - a declined layer still
 /// carrying open work above it, a link the forge never got, a repair the next
 /// share or withdraw finishes - and stay silent otherwise.
-fn print_origin_status(data: &serde_json::Value, json: bool) {
+/// The always-printed ahead line for one domain entry, indented as it prints:
+/// how much unshared work the domain holds and, unless it is all additions,
+/// what kind of work it is.
+///
+/// A bare "ahead: 2 local change(s)" reads as two things you wrote, and both
+/// can be deletions - somebody can share believing they publish two notes
+/// while proposing to remove two files from the team's repository. So the
+/// kinds are named whenever the set is not purely additions, whether or not
+/// `--files` was asked for. A set that is only additions keeps the short form,
+/// because there the plain reading is the true one.
+///
+/// The breakdown comes from the entry's `detail` block, which the CLI always
+/// asks for. Without it (a daemon from before detail existed, or a working
+/// tree that could not be walked) the line degrades to the bare count rather
+/// than guessing at kinds.
+fn ahead_line(d: &serde_json::Value) -> String {
+    let total = d["local_changes"].as_u64().unwrap_or(0);
+    let kinds: Vec<String> = ["added", "modified", "deleted"]
+        .iter()
+        .filter_map(|kind| {
+            let count = d["detail"][*kind].as_array()?.len();
+            (count > 0).then(|| format!("{count} {kind}"))
+        })
+        .collect();
+    let only_additions = kinds.len() == 1 && kinds[0].ends_with(" added");
+    if total == 0 || kinds.is_empty() || only_additions {
+        return format!("  ahead: {total} local change(s)");
+    }
+    format!("  ahead: {total} local change(s) ({})", kinds.join(", "))
+}
+
+/// What a reviewing domain is holding that no share would pick up: this
+/// session's own drafts, and - for whoever holds the domain - who else is
+/// drafting in it.
+///
+/// The line exists because `ahead` cannot say this. In review mode a write
+/// joins its author's own draft and never reaches the folder the team shares,
+/// so a domain with four unshared drafts in it reports `ahead: 0 local
+/// change(s)`, which is true and reads as "there is nothing to share here".
+///
+/// Absent keys draw nothing at all, which is what a domain that takes changes
+/// directly sends: nobody can draft there, so there is nothing to say. A count
+/// of zero is silent for the same reason a zero conflict count is - reciting
+/// what is normally true teaches a reader to skim the line that one day says
+/// something - and a null count is the case that is neither, an index that
+/// could not be asked, which says so rather than reading as zero.
+///
+/// Names and counts only: what somebody has not shared is theirs until they do.
+fn draft_lines(d: &serde_json::Value) -> Vec<String> {
+    let Some(mine) = d.get("my_drafts") else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    match mine.as_u64() {
+        None => lines.push("  draft changes: unknown (the index could not be asked)".to_string()),
+        Some(0) => {}
+        Some(1) => lines.push("  1 draft change of yours awaits sharing".to_string()),
+        Some(n) => lines.push(format!("  {n} draft changes of yours await sharing")),
+    }
+    // Only where the server sent it, which is its answer to whether this caller
+    // may see who else is drafting here. Nothing on this side works that out.
+    if let Some(everyone) = d.get("drafts").and_then(serde_json::Value::as_array) {
+        let held: Vec<String> = everyone
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} {}",
+                    row["actor"].as_str().unwrap_or("?"),
+                    row["entries"].as_u64().unwrap_or(0)
+                )
+            })
+            .collect();
+        if !held.is_empty() {
+            lines.push(format!("  drafts held here: {}", held.join(", ")));
+        }
+    }
+    lines
+}
+
+/// The `--files` block under one domain: the unshared paths grouped by what
+/// happened to each, then the folder listings that ride along as one quiet
+/// line, because a refreshed listing is derived from the files beside it and
+/// says nothing on its own.
+///
+/// Empty when the domain owes its origin nothing, listings included: a
+/// refreshed listing only ever rides along with a share, so with nothing to
+/// share there is nothing for it to ride along with and the block says nothing
+/// at all. A
+/// domain whose working tree could not be walked says so instead of printing
+/// an empty group, which would read as "nothing to share".
+fn unshared_file_lines(d: &serde_json::Value) -> Vec<String> {
+    let Some(detail) = d.get("detail").filter(|v| v.is_object()) else {
+        return vec!["  unshared files: unknown (the working tree could not be read)".to_string()];
+    };
+    let mut lines = Vec::new();
+    for kind in ["added", "modified", "deleted"] {
+        let paths = detail[kind].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if paths.is_empty() {
+            continue;
+        }
+        lines.push(format!("    {kind}:"));
+        for path in paths {
+            lines.push(format!("      {}", path.as_str().unwrap_or("")));
+        }
+    }
+    if lines.is_empty() {
+        return lines;
+    }
+    let indexes = detail["generated_indexes"].as_u64().unwrap_or(0);
+    if indexes > 0 {
+        lines.push(format!(
+            "    plus {indexes} generated folder listing(s) riding along"
+        ));
+    }
+    lines.insert(0, "  unshared files:".to_string());
+    lines
+}
+
+fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
     if json {
         print_value(data, true);
         return;
@@ -1925,10 +2680,15 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
         let repo = d["repo"].as_str().unwrap_or("");
         let branch = d["branch"].as_str().unwrap_or("");
         println!("{name}: {repo}@{branch}");
-        println!(
-            "  ahead: {} local change(s)",
-            d["local_changes"].as_u64().unwrap_or(0)
-        );
+        println!("{}", ahead_line(d));
+        for line in draft_lines(d) {
+            println!("{line}");
+        }
+        if files {
+            for line in unshared_file_lines(d) {
+                println!("{line}");
+            }
+        }
         println!(
             "  behind: {}",
             match d["behind"].as_bool() {
@@ -2178,6 +2938,28 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             }),
             config,
         ),
+        Command::Split {
+            identifier,
+            domain,
+            title,
+            observation,
+            section,
+            folder,
+            expected_checksum,
+            config,
+        } => (
+            "split_engram",
+            json!({
+                "identifier": identifier,
+                "domain": domain,
+                "title": title,
+                "observations": split_observation_lines(&observation)?,
+                "sections": section,
+                "folder": folder,
+                "expected_checksum": expected_checksum,
+            }),
+            config,
+        ),
         Command::Search {
             query,
             domain,
@@ -2345,8 +3127,8 @@ where
 /// read-only verbs (status, search, read, recent, context, domain list): they
 /// never need worker-pool concurrency, so `current_thread` skips spinning up a
 /// pool multi_thread always creates, even for a one-shot command that awaits
-/// one thing at a time. Kept off the four content-mutating data commands
-/// (write, edit, move, delete) and everything else that touches the daemon,
+/// one thing at a time. Kept off the five content-mutating data commands
+/// (write, edit, move, split, delete) and everything else that touches the daemon,
 /// sync, reindex, import or embed, which stay on [`on_runtime`].
 fn on_runtime_current_thread<F, Fut>(make: F) -> anyhow::Result<()>
 where
@@ -2399,11 +3181,40 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             origin,
             branch,
             no_sync,
+            private,
+            owner,
             config,
-        } => on_runtime(move || {
+        } => on_runtime(move || async move {
+            // The owner is resolved BEFORE anything is registered, so a name
+            // nobody has an account for cannot leave a registered domain
+            // standing shared - which is the opposite of what was asked for.
+            // `--private` requires `--owner` at the clap level, so the pair is
+            // either both present or both absent.
+            let closing = match (private, owner) {
+                (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
+                _ => None,
+            };
             domain_add_dispatch(
-                name, path, is_virtual, origin, branch, config, db, no_sync, json,
+                name.clone(),
+                path,
+                is_virtual,
+                origin,
+                branch,
+                config.clone(),
+                db,
+                no_sync,
+                json,
             )
+            .await?;
+            if let Some(owner) = closing {
+                // The name is re-resolved against the config the registration
+                // just wrote rather than trusted as typed, which is what the
+                // REST path does by reading the engine's own report: a name
+                // the registry does not hold must not get an acl row, whatever
+                // the command line said.
+                members::close_new_domain(&name, &owner, config.as_deref(), json).await?;
+            }
+            Ok(())
         }),
         DomainCommand::List { config } => on_runtime_current_thread(move || async move {
             cmd::domain_list(config.as_deref(), db.as_deref(), json).await
@@ -2426,9 +3237,35 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
         } => on_runtime(move || {
             domain_export_dispatch(domain, path, force, dry_run, config, db, json)
         }),
-        DomainCommand::Remove { name, config } => {
-            on_runtime(move || domain_remove_dispatch(name, config, json))
+        DomainCommand::Remove {
+            name,
+            purge,
+            end_drafts,
+            config,
+        } => on_runtime(move || domain_remove_dispatch(name, purge, end_drafts, config, db, json)),
+        DomainCommand::Members { domain, command } => {
+            on_runtime(move || members::run(domain, command, json))
         }
+        DomainCommand::Visibility {
+            domain,
+            visibility,
+            owner,
+            config,
+        } => on_runtime(move || members::visibility(domain, visibility, owner, config, json)),
+        DomainCommand::Review {
+            domain,
+            mode,
+            fold,
+            discard,
+            config,
+        } => on_runtime(move || {
+            domain_review_dispatch(domain, mode, fold, discard, config, db, json)
+        }),
+        DomainCommand::Transfer {
+            domain,
+            new_owner,
+            config,
+        } => on_runtime(move || members::transfer(domain, new_owner, config, json)),
     }
 }
 
@@ -2867,25 +3704,127 @@ async fn domain_add_origin_dispatch(
     Ok(())
 }
 
-/// `domain remove`: drop it from the config, then best-effort tell a running
-/// daemon to stop watching its path. Never fails on the ctl round trip; the
-/// config edit already succeeded by the time it runs. The notify fires only
-/// when the removal happened in the daemon's own config: an explicit --config
-/// edited a different file the daemon does not serve, so its watch set is
-/// unaffected and there is nothing to forget.
-async fn domain_remove_dispatch(
-    name: String,
+/// `domain remove`: the engine's own unregistration, over the daemon when one
+/// is running and against a directly opened engine otherwise.
+///
+/// It used to be a config-file edit of its own plus a best-effort `forget_domain`
+/// ctl notify. That path skipped everything the entry point does around the
+/// registry edit - the join fence, the co-editing sweep, the index clear, and
+/// the retirement of the domain's visibility and membership records - so a
+/// domain later registered under the same name inherited the old one's owner
+/// and members. `crystalline_service::domain_remove` is the same entry point
+/// the JSON API and the `remove_domain` MCP tool call, so the four surfaces
+/// cannot answer differently. The watcher notify is kept for the case that
+/// still needs it, inside `crystalline_service::domain_remove`: the standalone
+/// branch is reachable with a daemon running (`--db` is a global flag), and a
+/// removal taken there edits the config the daemon is serving while that
+/// daemon goes on watching the root.
+/// `domain review <domain> overlay|direct [--fold A]... [--discard A]...`.
+///
+/// Leaving review mode ends somebody's unshared work, so the plan comes first
+/// and it comes every time: the verb asks for it, shows it, and only then
+/// decides whether it has an answer to send.
+///
+/// - **No `--fold` or `--discard` at all, and somebody is drafting**: the plan
+///   is the whole answer. Nothing is changed, and the last line says what to
+///   pass. That is what makes a bare run safe to type: the destructive half of
+///   this verb cannot be reached without naming the people it is about.
+/// - **No flags, and nobody is drafting**: there is nothing to decide, so the
+///   mode changes. A domain that was never in review mode is this case, and
+///   asking somebody to confirm an empty list would be asking them to confirm
+///   nothing.
+/// - **Any flag**: the answer goes as given, and the engine refuses it if it
+///   does not cover every actor the plan named.
+///
+/// Turning review ON carries no answers at all - a domain on its way in holds
+/// no drafts - so that direction skips the plan and makes the change.
+async fn domain_review_dispatch(
+    domain: String,
+    mode: ReviewModeArg,
+    fold: Vec<String>,
+    discard: Vec<String>,
     config: Option<PathBuf>,
+    db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    cmd::domain_remove(&name, config.as_deref(), json)?;
-    use serde_json::json as j;
-    if config.is_none() {
-        let _ = crystalline_service::ctl_if_running(
-            j!({ "v": 1, "cmd": "forget_domain", "domain": name }),
+    let overlay = mode == ReviewModeArg::Overlay;
+    if overlay {
+        if !fold.is_empty() || !discard.is_empty() {
+            anyhow::bail!(
+                "--fold and --discard say what happens to each actor's private drafts, which is a \
+                 question about LEAVING review mode: a domain on its way in has none yet"
+            );
+        }
+        let report = crystalline_service::domain_review(
+            &domain,
+            true,
+            false,
+            &[],
+            db.as_deref(),
+            config.as_deref(),
         )
-        .await;
+        .await?;
+        cmd::print_domain_review(&report, json);
+        return Ok(());
     }
+
+    let plan = crystalline_service::domain_review(
+        &domain,
+        false,
+        true,
+        &[],
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    if !json {
+        cmd::print_review_plan(&plan);
+    }
+
+    let answers: Vec<(String, bool)> = fold
+        .into_iter()
+        .map(|actor| (actor, true))
+        .chain(discard.into_iter().map(|actor| (actor, false)))
+        .collect();
+    let drafting = plan["actors"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty());
+    if answers.is_empty() && drafting {
+        if json {
+            print_value(&plan, true);
+        }
+        return Ok(());
+    }
+    let report = crystalline_service::domain_review(
+        &domain,
+        false,
+        false,
+        &answers,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    cmd::print_domain_review(&report, json);
+    Ok(())
+}
+
+async fn domain_remove_dispatch(
+    name: String,
+    purge: bool,
+    end_drafts: Vec<String>,
+    config: Option<PathBuf>,
+    db: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = crystalline_service::domain_remove(
+        &name,
+        purge,
+        &end_drafts,
+        db.as_deref(),
+        config.as_deref(),
+    )
+    .await?;
+    cmd::print_domain_remove(&name, &report, json);
     Ok(())
 }
 
@@ -2954,13 +3893,22 @@ fn run_prompt_connector(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_prompt(
     workspace: Option<PathBuf>,
+    only_domains: Vec<String>,
     read_only_flag: bool,
     config_path: Option<PathBuf>,
     db: Option<PathBuf>,
     json_flag: bool,
     format: Option<PromptFormat>,
+    // Accepted and deliberately unread: the routing block does not vary by
+    // harness today. The flag is on the command so both managed hook commands
+    // are spelled the same way, and never reading it is what makes an id this
+    // binary does not know inert - an older binary running a hook a newer one
+    // wrote must behave exactly as it always did, never fail. The day the
+    // block does vary, this is where the id gets resolved.
+    _harness: Option<String>,
 ) -> anyhow::Result<()> {
     // An explicit --format wins; the global --json keeps selecting the JSON
     // shape it always has; the default is plain text.
@@ -2986,8 +3934,8 @@ fn run_prompt(
     // Session-start auto-update: a binary upgraded since the last install
     // refreshes the installed hooks and skills before this session's routing
     // prompt goes out. Cheap when versions match (one small-file read) and
-    // best-effort always; outcomes surface only as trailing notice lines on
-    // the text output.
+    // best-effort always; outcomes surface only as notice lines on stderr,
+    // never in the payload an agent reads.
     let mut reconcile_notices = install::auto_reconcile(
         env!("CARGO_PKG_VERSION"),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -3050,7 +3998,25 @@ fn run_prompt(
         std::collections::BTreeMap::new()
     };
 
+    // Validated against the registry rather than against what survived the
+    // workspace scoping: a name that is registered but scoped out renders
+    // nothing and says nothing, which is what "applies both filters" means; a
+    // name that is registered nowhere is a typo, and the answer to a typo is
+    // the list of real names.
+    if let Some(unknown) = only_domains
+        .iter()
+        .find(|n| !global.domains.contains_key(n.as_str()))
+    {
+        let mut known: Vec<&str> = global.domains.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        anyhow::bail!(
+            "no domain named '{unknown}' is registered. Registered: {}. See them with: crystalline domain list",
+            known.join(", ")
+        );
+    }
+
     let mut output = crystalline_core::generate_prompt(&global, &workspace, &virtual_bullets);
+    crystalline_core::prompt::restrict_to_domains(&mut output, &only_domains);
     // The flag forces the read-only variant on top of service.read_only; it can
     // only turn the mode on, matching the daemon precedence.
     if read_only_flag {
@@ -3060,27 +4026,31 @@ fn run_prompt(
         eprintln!("crystalline prompt system: warning: {w}");
     }
 
+    // Notices go to stderr in every format, and they go there for the same
+    // reason each time: what stdout carries is an agent's context, and a
+    // notice telling the reader to ask a human something would either stall an
+    // unattended run or be answered by invention. A person reading a session
+    // hook's output still sees them, because a hook's stderr is where a
+    // harness shows them.
     match format {
         PromptFormat::Json => println!("{}", crystalline_core::render_json(&output)),
-        PromptFormat::Text => {
-            print!("{}", crystalline_core::render_text(&output));
-            for note in &reconcile_notices {
-                println!("{note}");
-            }
-        }
+        PromptFormat::Text => print!("{}", crystalline_core::render_text(&output)),
         PromptFormat::Copilot => {
-            // The notices ride inside the envelope: Copilot parses stdout as
-            // one JSON document, so a bare trailing line would corrupt it.
-            let mut text = crystalline_core::render_text(&output);
-            for note in &reconcile_notices {
-                text.push_str(note);
-                text.push('\n');
-            }
+            // Copilot parses stdout as one JSON document, so a bare line
+            // printed beside the envelope would corrupt it - which is why the
+            // notices went inside the envelope, and why they no longer do:
+            // inside is the agent's context, and that is the one place an
+            // instruction to ask a human who is not there must never reach.
             println!(
                 "{}",
-                serde_json::to_string(&serde_json::json!({ "additionalContext": text }))?
+                serde_json::to_string(&serde_json::json!({
+                    "additionalContext": crystalline_core::render_text(&output),
+                }))?
             );
         }
+    }
+    for note in &reconcile_notices {
+        eprintln!("{note}");
     }
     Ok(())
 }
@@ -3119,5 +4089,182 @@ fn to_core_format(f: OutputFormat) -> verify::Format {
         OutputFormat::Human => verify::Format::Human,
         OutputFormat::Json => verify::Format::Json,
         OutputFormat::Github => verify::Format::Github,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// One domain entry as `origin status` receives it, carrying the detail
+    /// block the CLI always asks for.
+    fn entry(added: &[&str], modified: &[&str], deleted: &[&str], indexes: u64) -> Value {
+        json!({
+            "domain": "advisor",
+            "local_changes": added.len() + modified.len() + deleted.len(),
+            "detail": {
+                "added": added,
+                "modified": modified,
+                "deleted": deleted,
+                "generated_indexes": indexes,
+            },
+        })
+    }
+
+    /// A reviewing domain says what is waiting in this session's own draft,
+    /// and tells whoever holds the domain who else is holding work.
+    ///
+    /// The count is the whole point of the line. In review mode a write never
+    /// reaches the folder the team shares, so `ahead: 0 local change(s)` is
+    /// true and reads as "nothing to share" over a pile of unshared drafts.
+    #[test]
+    fn the_draft_lines_say_what_is_yours_and_who_else_is_holding_work() {
+        assert_eq!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": 3 })),
+            vec!["  3 draft changes of yours await sharing".to_string()],
+        );
+        assert_eq!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": 1 })),
+            vec!["  1 draft change of yours awaits sharing".to_string()],
+            "one draft is one change, and the sentence agrees with it"
+        );
+        assert!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": 0 })).is_empty(),
+            "a reviewing domain you are holding nothing in says nothing"
+        );
+        assert!(
+            draft_lines(&json!({ "domain": "advisor", "local_changes": 2 })).is_empty(),
+            "and a domain that takes changes directly has no draft line at all"
+        );
+
+        // The coordination half, which only whoever holds the domain is sent.
+        assert_eq!(
+            draft_lines(&json!({
+                "domain": "advisor",
+                "my_drafts": 1,
+                "drafts": [
+                    { "actor": "ada", "entries": 2 },
+                    { "actor": "owner", "entries": 1 },
+                ],
+            })),
+            vec![
+                "  1 draft change of yours awaits sharing".to_string(),
+                "  drafts held here: ada 2, owner 1".to_string(),
+            ],
+        );
+
+        // An index that could not be asked is not a count of zero.
+        assert_eq!(
+            draft_lines(&json!({ "domain": "advisor", "my_drafts": Value::Null })),
+            vec!["  draft changes: unknown (the index could not be asked)".to_string()],
+        );
+    }
+
+    /// The line that misled a reader: two deletions counted as "2 local
+    /// change(s)" read as two notes somebody wrote, when sharing them would
+    /// propose removing two files from the team's repository.
+    #[test]
+    fn the_ahead_line_says_when_the_changes_are_deletions() {
+        let all_deleted = entry(
+            &[],
+            &[],
+            &["CustomHeaderModule.md", "Sysimage Store (AS-2465).md"],
+            12,
+        );
+        assert_eq!(
+            ahead_line(&all_deleted),
+            "  ahead: 2 local change(s) (2 deleted)"
+        );
+    }
+
+    /// A mixed set names every kind in it, in the order a share reports them.
+    #[test]
+    fn the_ahead_line_breaks_a_mixed_set_down_by_kind() {
+        let mixed = entry(&["notes/new.md"], &["notes/edit.md"], &["notes/gone.md"], 3);
+        assert_eq!(
+            ahead_line(&mixed),
+            "  ahead: 3 local change(s) (1 added, 1 modified, 1 deleted)"
+        );
+    }
+
+    /// Nothing unshared, and a set that really is only additions: both keep
+    /// the short form, because there the plain reading is the true one.
+    #[test]
+    fn the_ahead_line_stays_short_for_an_empty_set_and_for_additions() {
+        assert_eq!(
+            ahead_line(&entry(&[], &[], &[], 0)),
+            "  ahead: 0 local change(s)"
+        );
+        assert_eq!(
+            ahead_line(&entry(&["a.md", "b.md"], &[], &[], 4)),
+            "  ahead: 2 local change(s)"
+        );
+    }
+
+    /// Additions are the only single-kind set that keeps the short form. A
+    /// set of only modifications or only deletions names its kind, because
+    /// there the plain reading of a bare count is the wrong one.
+    #[test]
+    fn the_ahead_line_names_a_single_kind_that_is_not_additions() {
+        assert_eq!(
+            ahead_line(&entry(&[], &["a.md", "b.md"], &[], 0)),
+            "  ahead: 2 local change(s) (2 modified)"
+        );
+        assert_eq!(
+            ahead_line(&entry(&[], &[], &["a.md"], 0)),
+            "  ahead: 1 local change(s) (1 deleted)"
+        );
+    }
+
+    /// A payload with no detail block - a daemon from before it existed, or a
+    /// working tree that could not be walked - degrades to the bare count
+    /// rather than inventing kinds for it.
+    #[test]
+    fn the_ahead_line_degrades_to_the_bare_count_without_detail() {
+        assert_eq!(
+            ahead_line(&json!({ "domain": "advisor", "local_changes": 2 })),
+            "  ahead: 2 local change(s)"
+        );
+    }
+
+    /// `--files` names each path under its own kind and draws the folder
+    /// listings as one line, never among the engrams.
+    #[test]
+    fn the_files_block_groups_the_paths_and_keeps_the_listings_apart() {
+        let mixed = entry(
+            &["notes/new.md"],
+            &[],
+            &["CustomHeaderModule.md", "Sysimage Store (AS-2465).md"],
+            12,
+        );
+        assert_eq!(
+            unshared_file_lines(&mixed),
+            vec![
+                "  unshared files:",
+                "    added:",
+                "      notes/new.md",
+                "    deleted:",
+                "      CustomHeaderModule.md",
+                "      Sysimage Store (AS-2465).md",
+                "    plus 12 generated folder listing(s) riding along",
+            ]
+        );
+    }
+
+    /// A domain that owes its origin nothing prints nothing; one whose tree
+    /// could not be read says so, because an empty block would read as
+    /// "nothing to share".
+    #[test]
+    fn the_files_block_tells_nothing_unshared_from_nothing_known() {
+        assert!(unshared_file_lines(&entry(&[], &[], &[], 0)).is_empty());
+        assert!(
+            unshared_file_lines(&entry(&[], &[], &[], 12)).is_empty(),
+            "listings ride along with a share, so with nothing to share they are not a block"
+        );
+        assert_eq!(
+            unshared_file_lines(&json!({ "domain": "advisor", "local_changes": 2 })),
+            vec!["  unshared files: unknown (the working tree could not be read)"]
+        );
     }
 }

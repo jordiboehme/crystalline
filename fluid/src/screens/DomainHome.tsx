@@ -42,7 +42,9 @@ import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
+import { MembersCard } from "../components/MembersCard";
 import { ProposalsCard } from "../components/ProposalsCard";
+import { ReviewModeCard } from "../components/ReviewModeCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
@@ -100,7 +102,12 @@ export default function DomainHome() {
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
   });
-
+  // Off the listing every screen already reads, and deliberately not off the
+  // domain's sync status, which carries the same count: that route is gated
+  // with the share verbs, so a plain member of a reviewing domain could not
+  // reach it, and their own count is exactly what this line is for. A domain
+  // that takes changes directly carries no count at all, which is null here.
+  const myDrafts = summary?.review == null ? null : summary.myDrafts;
   // A domain nobody registered is a wrong address, not an empty shelf. The
   // tree is what says so: a 404 from the manifest also means a domain that
   // simply has not been introduced yet.
@@ -168,7 +175,10 @@ export default function DomainHome() {
   useRegisterCommands(commands);
 
   const unregister = useMutation({
-    mutationFn: () => unregisterDomain(domain),
+    // A virtual domain's engrams are deleted with it and the server refuses to
+    // guess that the loss was intended, so the second press is what carries
+    // `purge`: this dialog is the confirmation the flag stands for.
+    mutationFn: () => unregisterDomain(domain, summary?.kind === "virtual"),
     onSuccess: () => {
       // The listing is what every sidebar, card and switcher draws from, and
       // the domain this screen is about is no longer in it.
@@ -208,7 +218,24 @@ export default function DomainHome() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <h1 className="text-display">{domain}</h1>
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="text-display">{domain}</h1>
+          {/*
+            A sibling of the heading rather than inside it: the heading's own
+            accessible name stays exactly the domain's name, and the badge is
+            a separate piece of content beside it rather than text silently
+            appended to what a screen reader announces as the page's title.
+            Off the listing every other chip here draws from, which is the
+            same read the sidebar and the home cards badge from: one fact,
+            one source, and a header that cannot disagree with the two places
+            that named this domain on the way here. It used to ride on
+            `MembersCard`'s membership read, which said the same thing a
+            request later and only once that request had landed. A domain
+            nobody has made private draws nothing, the same way a kind-less
+            domain draws no chip either.
+          */}
+          {summary?.private === true && <Chip variant="accent">private</Chip>}
+        </div>
         {summary && (
           <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
             {summary.engrams !== null && (
@@ -218,6 +245,20 @@ export default function DomainHome() {
             )}
             {/* The same fact wears the same chip the home card gives it. */}
             {summary.kind !== null && <Chip>{summary.kind}</Chip>}
+          </p>
+        )}
+        {/*
+          What the reader is holding here that no share would pick up. A
+          reviewing domain takes every write into its author's own draft, so
+          somebody arriving at this screen can have work waiting that nothing
+          else on it mentions - the listing counts the engrams the team has, and
+          the sync card is further down the page. Drawn only where there is
+          something to say: zero is the ordinary state and the card below says
+          it in full.
+        */}
+        {myDrafts !== null && myDrafts > 0 && (
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            {`You have ${plural(myDrafts, "draft change", "draft changes")} here, waiting to be shared.`}
           </p>
         )}
       </header>
@@ -242,6 +283,34 @@ export default function DomainHome() {
         its header, and that is exactly the moment somebody reaches for it.
       */}
       {capabilities.canShare && <ProposalsCard domain={domain} />}
+
+      {/*
+        No capability gate here: `GET /members` is served to any account that
+        may see the domain at all, and the card itself decides what it may
+        offer from what that read says (its own row, the owner, the admin
+        flag) rather than from an instance-wide capability. On a shared
+        domain it still draws something for every account there - the shared
+        state, and an admin's own way to close it - so it is page furniture
+        on any domain nobody ever made private, not only on a private one;
+        it draws nothing only while the read is in flight or was refused -
+        see its own module doc.
+      */}
+      <MembersCard domain={domain} />
+
+      {/*
+        Which way a write in this domain goes, and the control that changes it.
+        Under the same instance-wide capability the two share cards above are
+        under, because review mode is about proposing changes to a team and an
+        instance that shares with nobody has no use for it. That is all this
+        condition is: it is NOT a per-domain gate, so the card is drawn on a
+        virtual or origin-less domain too, where the button answers 409 in the
+        server's own words. Whether the CALLER may press is the server's answer
+        rather than this side's arithmetic, for the reason the card's own module
+        doc gives.
+      */}
+      {capabilities.canShare && summary !== undefined && (
+        <ReviewModeCard domain={domain} reviewing={summary.review !== null} />
+      )}
 
       <section aria-labelledby="domain-manifest">
         <h2 id="domain-manifest" className="mb-2 text-section">
@@ -539,7 +608,7 @@ function UnregisterDomain({
           </button>
           <span className="text-sm text-slate-500 dark:text-slate-400">
             {kind === "virtual"
-              ? "This domain's engrams live in the database and will be removed from search; download the archive first if you need a copy."
+              ? "This domain's engrams live in the database and will be deleted with it; this cannot be undone, so download the archive first if you need a copy."
               : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
           </span>
         </>

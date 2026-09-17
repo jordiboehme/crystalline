@@ -28,6 +28,34 @@ export interface DomainSummary {
   lastSync: string | null;
   /** The routing bullets from its MANIFEST: what this domain is for. */
   whenToUse: string[];
+  /**
+   * Whether the domain is private: visible only to its owner, the accounts
+   * invited into it and instance admins.
+   *
+   * False for a shared domain and false for a listing that does not say -
+   * an older server, or an installation with no accounts database, where no
+   * domain has ever been made private. A domain this session may not read is
+   * not in the listing at all, so a row is never withheld here, only marked.
+   */
+  private: boolean;
+  /**
+   * `"overlay"` while this domain reviews changes before they land - every
+   * write joins its author's own draft and the folder changes only through a
+   * reviewed proposal - and null while it takes changes directly, which is how
+   * a domain starts out and what an older server says about every domain.
+   */
+  review: string | null;
+  /**
+   * How many drafts this session's own account holds in this domain, null when
+   * the domain takes changes directly (nobody can draft there), and null again
+   * when the server could not count them.
+   *
+   * It rides on the listing rather than only on the domain's sync status
+   * because that status is gated with the share verbs: a plain member of a
+   * reviewing domain could not reach their own count, and a count of your own
+   * unshared work is a fact about you rather than about the team.
+   */
+  myDrafts: number | null;
 }
 
 /** Everything `GET /domains` says. */
@@ -50,6 +78,9 @@ function readDomain(value: unknown): DomainSummary | null {
     engrams: typeof record?.engrams === "number" ? record.engrams : null,
     lastSync: typeof record?.last_sync === "string" ? record.last_sync : null,
     whenToUse: asStrings(record?.when_to_use),
+    private: record?.private === true,
+    review: typeof record?.review === "string" ? record.review : null,
+    myDrafts: typeof record?.my_drafts === "number" ? record.my_drafts : null,
   };
 }
 

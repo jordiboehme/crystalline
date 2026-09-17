@@ -60,6 +60,10 @@ interface PresenceUser {
   name?: string;
   color?: string;
   colorLight?: string;
+  /** Set by the server on the slot it publishes for an agent working in this
+   *  document. A browser never sets it: a person's client publishes a name and
+   *  a color, and nothing else in the room claims to be an agent. */
+  agent?: boolean;
 }
 
 export type CollabMode = "connecting" | "collab" | "solo";
@@ -74,6 +78,10 @@ export interface CollabParticipant {
   name: string;
   color: string;
   self: boolean;
+  /** Whether this peer is an agent rather than a person. The strip draws it
+   *  with a glyph: somebody watching their own document move is owed the fact
+   *  that what moved it was an agent. */
+  agent: boolean;
 }
 
 export interface CollabSession {
@@ -106,6 +114,15 @@ export interface CollabSessionOptions {
   account: string;
   displayName: string;
   enabled: boolean;
+  /**
+   * Whose draft this session is over, when it is not this account's own.
+   *
+   * Set only where a share-link and a live join have put this window inside
+   * somebody else's work: the server refuses an owner nobody handed this
+   * caller, and a room opened without it would be a room over this account's
+   * own page under a header naming the other person.
+   */
+  overlay?: string | undefined;
   /** Test seam, threaded to the provider; production callers omit it. */
   socketFactory?: SocketFactory;
 }
@@ -126,6 +143,7 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
     account,
     displayName,
     enabled,
+    overlay,
     socketFactory,
   } = options;
   // One doc/awareness/provider generation per (address, epoch-reset). The
@@ -197,9 +215,12 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
         room.push({
           name: user.name,
           // A participant with no color of their own still gets a chip; the
-          // room's own palette is what the color usually comes from.
+          // room's own palette is what the color usually comes from. An agent
+          // is always that case: the server publishes its name and leaves the
+          // color to the same palette everybody else is keyed by.
           color: user.color ?? presenceColor(user.name).color,
           self: clientId === doc.clientID,
+          agent: user.agent === true,
         });
       }
       setParticipants(room);
@@ -397,7 +418,7 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
       },
     };
     const provider = new CollabProvider(
-      collabUrl(domain, address),
+      collabUrl(domain, address, overlay),
       doc,
       awareness,
       handlers,
@@ -427,7 +448,10 @@ export function useCollabSession(options: CollabSessionOptions): CollabSession {
       setBound(null);
       setParticipants([]);
     };
-  }, [generation, domain, address, enabled, socketFactory]);
+    // `overlay` among the dependencies because it is part of WHICH document
+    // this generation is bound to: an owner that changed is a different room,
+    // and a live session over the old one would keep saving into it.
+  }, [generation, domain, address, enabled, overlay, socketFactory]);
 
   // The mid-conflict joiner (see the JOINED_* details above): a greeting that
   // says "conflict" with nothing on screen to resolve is a dead banner, so

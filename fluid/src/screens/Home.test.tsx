@@ -84,6 +84,37 @@ describe("the home screen", () => {
     expect(screenMain.getByText("file").className).toContain("slate");
   });
 
+  it("badges a private domain's card and leaves a shared one plain", async () => {
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+          {
+            name: "lab",
+            kind: "file",
+            engrams: 2,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/");
+
+    const screenMain = await main();
+    const lab = (await screenMain.findByRole("link", { name: "lab" })).closest(
+      "article",
+    );
+    expect(lab).toHaveTextContent("private");
+    // A row that does not say it is private wears nothing, which is also what
+    // a listing from a server that never heard of the field looks like.
+    expect(
+      (await screenMain.findByRole("link", { name: "eng" })).closest("article"),
+    ).not.toHaveTextContent("private");
+  });
+
   it("leaves the tagline to the screen that owns it", async () => {
     serve();
 

@@ -85,6 +85,11 @@ fn table() -> LookupTable {
         "gardening/composting-basics",
         "Composting Basics",
     );
+    t.insert(
+        "astronomy",
+        "astronomy/log-weekly",
+        "Log: Weekly Garden Notes",
+    );
     t
 }
 
@@ -141,4 +146,59 @@ fn explicit_domain_miss_is_cross_domain_unresolved() {
             domain: "gardening".into()
         }
     );
+}
+
+#[test]
+fn title_whose_first_word_ends_in_a_colon_resolves_at_home() {
+    // The parse cannot help splitting this into a domain and a target: `Log`
+    // has no whitespace and something follows the colon. Nothing registered a
+    // domain called `Log`, though, so the whole bracket text is a title, and
+    // that is what the resolver falls back to.
+    let target = LinkTarget::parse("Log: Weekly Garden Notes");
+    assert_eq!(target.domain.as_deref(), Some("Log"));
+    match resolve(&target, "astronomy", &table()) {
+        Resolution::Resolved(r) => {
+            assert_eq!(r.domain, "astronomy");
+            assert_eq!(r.permalink, "astronomy/log-weekly");
+        }
+        other => panic!("expected resolved, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_prefix_matching_nothing_stays_cross_domain_unresolved() {
+    // The fallback is a second question, not a softer answer: a prefix that
+    // names no domain and a whole string that names no engram is still a link
+    // pointing at a domain nobody has.
+    let target = LinkTarget::parse("Log: Something Nobody Wrote");
+    assert_eq!(
+        resolve(&target, "astronomy", &table()),
+        Resolution::CrossDomainUnresolved {
+            domain: "Log".into()
+        }
+    );
+}
+
+#[test]
+fn a_real_domain_prefix_is_never_read_as_a_title() {
+    // `gardening` is a domain, so the prefix keeps its meaning even though
+    // "gardening: Composting Basics" would be a perfectly good title. The
+    // registry decides, and the fallback never runs for a name in it.
+    let mut t = table();
+    t.insert(
+        "astronomy",
+        "astronomy/decoy",
+        "gardening: Composting Basics",
+    );
+    match resolve(
+        &LinkTarget::parse("gardening: Composting Basics"),
+        "astronomy",
+        &t,
+    ) {
+        Resolution::Resolved(r) => {
+            assert_eq!(r.domain, "gardening");
+            assert_eq!(r.permalink, "gardening/composting-basics");
+        }
+        other => panic!("expected resolved, got {other:?}"),
+    }
 }

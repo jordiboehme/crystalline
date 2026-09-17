@@ -68,6 +68,109 @@ pub struct LockInfo {
     /// `serde(default)` reads it as `false`, which is exactly right.
     #[serde(default)]
     pub mcp_line_options: bool,
+    /// How the owning daemon was started. `None` on a record written before
+    /// 0.18.0, and also on one published by a holder that never served (the
+    /// `hold-lock` test command), so a message reading this must say "did not
+    /// record it" rather than naming a version. Reported, never used to decide
+    /// anything.
+    #[serde(default)]
+    pub started_by: Option<StartMode>,
+    /// What the owning daemon bound its HTTP endpoint to.
+    #[serde(default)]
+    pub http: HttpBinding,
+    /// The `Host` allow-list the owning daemon serves with, on top of
+    /// loopback. Empty means loopback only, and also means "not recorded" on a
+    /// pre-0.18.0 record; the pair with `started_by` tells those apart.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+/// How a daemon process came to be running.
+///
+/// **Recorded and reported, never branched on.** `attach_policy` keeps its one
+/// version axis; this field exists so an operator and a probe can tell a
+/// managed daemon from one an agent's `crystalline mcp` connection spawned,
+/// which is what hid the 2026-09-10 outage for 277 restarts. Arbitrating
+/// between two daemons on it was considered and rejected: part A removes the
+/// reason they differ instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartMode {
+    /// A `crystalline serve` a person, a unit file or a container entrypoint
+    /// invoked.
+    Serve,
+    /// Spawned by a client that found no daemon; see `spawn_daemon`.
+    Autostart,
+}
+
+impl StartMode {
+    /// The wire spelling, for a message or a JSON body.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartMode::Serve => "serve",
+            StartMode::Autostart => "autostart",
+        }
+    }
+}
+
+/// What a daemon bound its HTTP endpoint to.
+///
+/// Three shapes rather than an `Option<String>`, because "the endpoint is
+/// deliberately closed" and "the holder did not record one" are different
+/// facts and a refusal that conflates them tells an operator something untrue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpBinding {
+    /// The holder recorded nothing here. True of a record written before the
+    /// field existed, and equally of one published by a holder that never
+    /// served (the `hold-lock` test command), so every message rendered from
+    /// this says the holder *did not record it* and never names a version.
+    #[default]
+    Unrecorded,
+    /// The endpoint is off (`service.http: false`, or `serve --http off`).
+    Off,
+    /// Bound at this `host:port`. Serialized as the bare address, so a person
+    /// reading `service.json` sees the address rather than a wrapper.
+    #[serde(untagged)]
+    Bound(String),
+}
+
+impl HttpBinding {
+    /// The address, when there is one.
+    pub fn address(&self) -> Option<&str> {
+        match self {
+            HttpBinding::Bound(addr) => Some(addr),
+            _ => None,
+        }
+    }
+}
+
+/// What this process asked to serve, recorded by `run_serve` before it takes
+/// the lock.
+///
+/// One place, three readers: the lock record ([`Ownership::publish`]), the
+/// refusal a losing `serve` prints, and the `/health` body. Recording it ahead
+/// of the lock is what lets the refusal name what this invocation wanted, which
+/// is the fact the old message left out.
+#[derive(Debug, Clone)]
+pub struct ServeIntent {
+    pub started_by: StartMode,
+    pub http: HttpBinding,
+    pub allowed_hosts: Vec<String>,
+}
+
+static SERVE_INTENT: std::sync::OnceLock<ServeIntent> = std::sync::OnceLock::new();
+
+/// Record what this process asked to serve. The first call wins; a later one
+/// is ignored, so a record and a `/health` body can never disagree.
+pub fn record_serve_intent(intent: ServeIntent) {
+    let _ = SERVE_INTENT.set(intent);
+}
+
+/// What this process asked to serve, when it is a daemon that recorded it.
+/// `None` in every process that is not serving.
+pub fn serve_intent() -> Option<&'static ServeIntent> {
+    SERVE_INTENT.get()
 }
 
 /// The option token that tells the daemon this stdio session's harness is
@@ -201,6 +304,7 @@ impl Ownership {
     /// the lock file, never into it (mandatory locks on Windows), and renamed
     /// into place so a reader never sees a partial record.
     pub fn publish(&self) -> io::Result<()> {
+        let intent = serve_intent();
         let info = LockInfo {
             pid: std::process::id(),
             socket_path: self.socket_display(),
@@ -209,6 +313,13 @@ impl Ownership {
             // This daemon's `handle_conn` splits the handshake line into a
             // mode and its options, so a bridge may send them.
             mcp_line_options: true,
+            // Absent where a process publishes a record without having gone
+            // through `run_serve`. The one such publisher in this tree is the
+            // `hold-lock` test command, which holds the lock and serves
+            // nothing; a real daemon always records its intent first.
+            started_by: intent.map(|i| i.started_by),
+            http: intent.map(|i| i.http.clone()).unwrap_or_default(),
+            allowed_hosts: intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
         };
         let json = serde_json::to_string(&info).unwrap_or_default();
         let tmp = self.info_path.with_extension("json.tmp");
@@ -998,6 +1109,15 @@ fn spawn_daemon(
         cmd.arg("--db").arg(db);
     }
     cmd.arg("serve").arg("--daemon");
+    // Tell the child it is an autostart rather than an invocation somebody
+    // made. A hidden flag, not the `--daemon` flag: an operator may well run
+    // `serve --daemon` by hand, and systemd and the container image both run
+    // `serve` in the foreground, so `--daemon` answers a different question.
+    // Not an environment variable either: the child inherits this process's
+    // whole environment, and a variable left set in a shell would mislabel a
+    // daemon somebody started deliberately.
+    cmd.arg("--autostarted");
+
     if read_only {
         cmd.arg("--read-only");
     }
@@ -1049,9 +1169,198 @@ fn spawn_daemon(
     }
 }
 
+/// The exit code a `crystalline serve` uses when it could not take the index
+/// lock, distinct from every other startup failure.
+///
+/// 3 because 0 and 1 are the ordinary success and failure of every command
+/// here, 2 is clap's usage error and `crystalline verify`'s scan failure, and
+/// anything from 126 up belongs to the shell. An operator writes it into a
+/// unit file as `RestartPreventExitStatus=3`, which is why the code has to
+/// exist in Crystalline rather than being left to the deployment: a restart
+/// loop on a lock that is not going to free itself produces one identical log
+/// line per attempt and no new information.
+pub const EXIT_LOCK_HELD: i32 = 3;
+
+/// A `serve` that could not take the index lock. Carried as a typed error so
+/// the CLI exits on [`EXIT_LOCK_HELD`] by downcasting rather than by matching
+/// message text.
+#[derive(Debug)]
+pub struct LockHeld {
+    pub message: String,
+}
+
+impl std::fmt::Display for LockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LockHeld {}
+
+/// What a losing `serve` prints: what this invocation asked to bind, what the
+/// holder's record says it bound, and the configuration key that makes the two
+/// agree.
+///
+/// Pure over its two inputs so every shape is testable without a daemon. The
+/// old message named only the holder's pid, which is true and useless when the
+/// consequence is that the endpoint an operator configured no longer exists.
+///
+/// Both sides are *recorded intent*, never a probed listener: this process
+/// wrote its own before it touched the lock, and the holder wrote its own the
+/// same way. So the wording stays with what was asked for and what the record
+/// says, and a holder that recorded nothing is reported as having recorded
+/// nothing rather than as an older version or as an endpoint that is off.
+///
+/// The exposure half is earned rather than always printed. A caller that
+/// recorded no intent at all asked to bind nothing, and one whose exposure
+/// already matches the holder's has nothing to reconcile; both get the shorter
+/// message, because advice that does not apply is noise wherever this string
+/// travels - and it travels into an agent's `status` payload.
+pub fn lock_held_message(intent: Option<&ServeIntent>, holder: Option<&LockInfo>) -> String {
+    let asked = match intent.map(|i| &i.http) {
+        Some(HttpBinding::Bound(addr)) => format!("this serve asked to bind {addr}"),
+        Some(HttpBinding::Off) => {
+            "this serve asked for the index with no HTTP endpoint".to_string()
+        }
+        Some(HttpBinding::Unrecorded) | None => "this process asked for the index".to_string(),
+    };
+    let hosts_asked = match intent {
+        Some(i) if !i.allowed_hosts.is_empty() => {
+            format!(", accepting the Host values {}", i.allowed_hosts.join(", "))
+        }
+        _ => String::new(),
+    };
+    let held = match holder {
+        Some(h) => {
+            let started = match h.started_by {
+                Some(mode) => format!(", started by {}", mode.as_str()),
+                None => ", which did not record how it started".to_string(),
+            };
+            let bound = match &h.http {
+                HttpBinding::Bound(addr) => format!(", and its record says it bound {addr}"),
+                HttpBinding::Off => ", and its record says it bound no HTTP endpoint".to_string(),
+                HttpBinding::Unrecorded => ", and it did not record what it bound".to_string(),
+            };
+            format!(
+                "another Crystalline instance already owns it: pid {}, v{}{started}{bound}",
+                h.pid, h.version
+            )
+        }
+        None => "another process already owns it and published no service record, so neither its \
+                 pid nor its address can be read from here"
+            .to_string(),
+    };
+    // Two callers record no intent: the embedded MCP stack and the `hold-lock`
+    // test command. Neither asked to bind anything, so exposure advice would be
+    // a non sequitur - and the embedded stack copies this string into the
+    // `status` payload and, in the no-record case, the `instructions` an agent
+    // reads. What applies to that caller is the holder itself: it is a daemon
+    // this process can talk to.
+    let Some(intent) = intent else {
+        return format!(
+            "{asked}{hosts_asked}, but {held}. Only one daemon can own the index. Stop the holder \
+             with crystalline ctl shutdown, or attach over the socket."
+        );
+    };
+    // Exposure advice is for two sides that disagree. When this invocation and
+    // the holder asked for the same binding and the same allow-list, writing
+    // that down changes nothing, so the message says only that the index is
+    // owned and by whom. An unrecorded binding on either side is ignorance
+    // rather than agreement, and keeps the advice.
+    let agreed = holder.is_some_and(|h| {
+        intent.http != HttpBinding::Unrecorded
+            && h.http != HttpBinding::Unrecorded
+            && intent.http == h.http
+            && intent.allowed_hosts == h.allowed_hosts
+    });
+    let mut remedy =
+        String::from("Only one daemon can own the index, so this invocation is serving nothing.");
+    if agreed {
+        remedy.push_str(" Stop the holder with crystalline ctl shutdown and start again.");
+        return format!("{asked}{hosts_asked}, but {held}. {remedy}");
+    }
+    remedy.push_str(
+        " Exposure belongs to configuration, where every daemon on this machine reads it however \
+         it was started",
+    );
+    match &intent.http {
+        HttpBinding::Bound(addr) => {
+            remedy.push_str(&format!(": crystalline config set service.http {addr}"));
+        }
+        // An invocation that asked for no endpoint is reconciled by writing
+        // that down, not by being told to invent a host and port.
+        HttpBinding::Off => remedy.push_str(": crystalline config set service.http false"),
+        HttpBinding::Unrecorded => {
+            remedy.push_str(": crystalline config set service.http <host:port>");
+        }
+    }
+    if !intent.allowed_hosts.is_empty() {
+        remedy.push_str(&format!(
+            " and crystalline config set service.allowed_hosts {}",
+            intent.allowed_hosts.join(",")
+        ));
+    }
+    remedy.push_str(". Then stop the holder with crystalline ctl shutdown and start again.");
+    format!("{asked}{hosts_asked}, but {held}. {remedy}")
+}
+
+/// The sentence an overridden command owes for taking the direct path:
+/// `--db` or `--config` named an exact config and index the daemon may not
+/// serve, so it read the file itself rather than asking. `status` prints this
+/// on stdout as its report (behind the `Daemon: ` label every one of its
+/// notes carries); every standalone fallback in [`crate::client`] prints it
+/// on stderr instead, since an empty answer from the wrong index must never
+/// read as a genuine miss. One constant so the two crates say it the same
+/// way.
+pub const BYPASS_NOTE: &str = "bypassed (--db/--config override); reading the index directly";
+
+/// Why the index could not be reached, in words a person can act on, with the
+/// holder looked up here.
+///
+/// A raw lock error names no daemon and no remedy, which is how a colleague's
+/// agent spent a session on the wrong diagnosis. One composer for the whole
+/// tool: the CLI's own opener reaches it through `cmd::reach_index`, and every
+/// standalone fallback in [`crate::client`] reaches it too, so a person meets
+/// the same sentence wherever they meet the same state. It lives beside
+/// [`lock_held_message`] because both answer "somebody else has the index" and
+/// both must keep saying it the same way.
+pub fn index_unreachable_words(location: &str, error: &str, bypassed: bool) -> String {
+    let holder = read_lock_info()
+        .filter(|info| process_alive(info.pid))
+        .map(|info| info.pid);
+    words_for_holder(holder, location, error, bypassed)
+}
+
+/// [`index_unreachable_words`] with the holder already looked up, so the three
+/// sentences can be read back in a test without a daemon on the machine.
+///
+/// `bypassed` is true when `--db` or `--config` told the command to read a
+/// file directly rather than ask the daemon, which changes the remedy: the
+/// cheapest fix there is to stop reaching past the holder.
+pub fn words_for_holder(
+    holder: Option<u32>,
+    location: &str,
+    error: &str,
+    bypassed: bool,
+) -> String {
+    match (holder, bypassed) {
+        (Some(pid), true) => format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {location}, and --db or --config told this command to read that file directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}"
+        ),
+        (Some(pid), false) => format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {location} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}"
+        ),
+        (None, _) => format!(
+            "the index at {location} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+        ),
+    }
+}
+
 /// Acquire ownership of the index by taking the advisory lock, with stale
 /// takeover: a `kill -9`d predecessor's lock is already free, so a short retry
-/// loop simply succeeds. Errors with the live owner's pid when a daemon is up.
+/// loop simply succeeds. When a daemon is up, the error is a [`LockHeld`]
+/// carrying [`lock_held_message`]: what this invocation asked to bind, what
+/// the holder's record says it bound, and the key that reconciles them.
 pub fn acquire_ownership() -> anyhow::Result<Ownership> {
     let dir = config::state_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -1077,10 +1386,14 @@ pub fn acquire_ownership() -> anyhow::Result<Ownership> {
         }
     }
     if !acquired {
-        let pid = read_lock_info().map(|i| i.pid).unwrap_or(0);
-        anyhow::bail!(
-            "another Crystalline instance owns the index (pid {pid}); stop it or attach over the socket"
-        );
+        // Composed here, from the intent this process recorded before it
+        // reached the lock, so the two other callers - the embedded MCP stack
+        // and the `hold-lock` test command - get the no-intent wording and
+        // keep today's exit behaviour. Typed, so the CLI can exit on
+        // [`EXIT_LOCK_HELD`] without matching message text.
+        return Err(anyhow::Error::new(LockHeld {
+            message: lock_held_message(serve_intent(), read_lock_info().as_ref()),
+        }));
     }
 
     // The lock is held. Empty any legacy record bytes (pre-split daemons wrote
@@ -1189,6 +1502,72 @@ pub fn process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    // --- the words a locked index is refused in -----------------------------
+
+    /// The raw backend error is the tail of the sentence, never its head, and
+    /// never the whole of it.
+    fn assert_error_is_only_the_tail(words: &str, raw: &str) {
+        let marker = "The index reported: ";
+        let at = words
+            .find(marker)
+            .unwrap_or_else(|| panic!("no error marker in: {words}"));
+        assert!(
+            !words.starts_with(raw),
+            "a lock error must not lead the sentence: {words}"
+        );
+        assert_eq!(
+            words.match_indices(raw).map(|(i, _)| i).collect::<Vec<_>>(),
+            vec![at + marker.len()],
+            "the raw error appears once, after the marker: {words}"
+        );
+    }
+
+    /// A daemon holds the index and answered nothing: name it by pid, and name
+    /// the two commands that do something about it. This is the shape the
+    /// service crate's own standalone fallbacks hit, so it is pinned where
+    /// both crates read it.
+    #[test]
+    fn a_silent_holder_is_named_with_its_pid_and_a_remedy() {
+        let raw = "Locking error: File is locked by another process";
+        let words = words_for_holder(Some(4242), "/tmp/index.db", raw, false);
+        assert!(words.contains("(pid 4242)"), "{words}");
+        assert!(words.contains("/tmp/index.db"), "{words}");
+        assert!(words.contains("crystalline doctor --fix"), "{words}");
+        assert!(words.contains("crystalline ctl shutdown"), "{words}");
+        assert_error_is_only_the_tail(&words, raw);
+    }
+
+    /// The same holder, reached past by `--db`: the remedy is to stop reaching
+    /// past it, so that is what the sentence says first.
+    #[test]
+    fn a_bypassed_holder_is_told_to_drop_the_override() {
+        let raw = "Locking error: File is locked by another process";
+        let words = words_for_holder(Some(77), "/tmp/index.db", raw, true);
+        assert!(words.contains("(pid 77)"), "{words}");
+        assert!(words.contains("--db or --config"), "{words}");
+        assert!(
+            words.contains("without --db and --config"),
+            "the first remedy is the one that costs nothing: {words}"
+        );
+        assert_error_is_only_the_tail(&words, raw);
+    }
+
+    /// No holder to name, so the sentence says that rather than implying one.
+    /// The unreadable-record shape: no record, an unparseable one and a dead
+    /// pid all arrive here as `None`.
+    #[test]
+    fn with_no_daemon_the_absence_is_stated() {
+        let raw = "unable to open database file";
+        let words = words_for_holder(None, "/tmp/index.db", raw, false);
+        assert!(!words.contains("pid"), "{words}");
+        assert!(
+            words.contains("no Crystalline daemon is running"),
+            "{words}"
+        );
+        assert!(words.contains("crystalline doctor --fix"), "{words}");
+        assert_error_is_only_the_tail(&words, raw);
+    }
+
     // --- the mcp handshake line ---------------------------------------------
 
     /// The extended line only goes to a daemon that declared it parses one. An
@@ -1232,6 +1611,9 @@ mod tests {
             version: crystalline_core::VERSION.to_string(),
             started_at: "2026-08-14T00:00:00Z".to_string(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         })
         .unwrap();
         let info: LockInfo = serde_json::from_str(&current).unwrap();
@@ -1634,6 +2016,9 @@ mod tests {
             version: "0.0.1".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1682,6 +2067,9 @@ mod tests {
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -1750,6 +2138,9 @@ mod tests {
             version: "0.8.2".to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -1939,6 +2330,9 @@ mod tests {
             version: crystalline_core::VERSION.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
         };
         std::fs::write(
             config::service_info_path().unwrap(),
@@ -1991,5 +2385,291 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         assert!(!process_alive(pid), "a reaped child is not alive");
+    }
+
+    // --- the exposure fields of the owner record -----------------------------
+
+    /// A record written before 0.18.0 carries none of the exposure fields, and
+    /// `serde(default)` must read that as "unrecorded" rather than failing the
+    /// parse: a client that cannot read the record cannot displace or diagnose
+    /// the daemon that wrote it.
+    #[test]
+    fn a_pre_exposure_record_reads_as_unrecorded() {
+        let legacy = r#"{"pid":4242,"socket_path":"/tmp/s.sock","version":"0.17.0",
+                         "started_at":"2026-09-10T21:33:04Z","mcp_line_options":true}"#;
+        let info: LockInfo = serde_json::from_str(legacy).expect("a 0.17.0 record still parses");
+        assert_eq!(info.pid, 4242);
+        assert_eq!(
+            info.started_by, None,
+            "an older daemon recorded no start mode"
+        );
+        assert_eq!(info.http, HttpBinding::Unrecorded);
+        assert!(info.allowed_hosts.is_empty());
+    }
+
+    /// The three shapes are distinguishable on the wire, and a bound address is a
+    /// bare string so a human reading service.json sees the address itself.
+    #[test]
+    fn http_binding_round_trips_each_shape() {
+        for binding in [
+            HttpBinding::Unrecorded,
+            HttpBinding::Off,
+            HttpBinding::Bound("0.0.0.0:7411".to_string()),
+        ] {
+            let json = serde_json::to_string(&binding).unwrap();
+            let back: HttpBinding = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, binding, "{json} round trips");
+        }
+        assert_eq!(
+            serde_json::to_string(&HttpBinding::Bound("0.0.0.0:7411".to_string())).unwrap(),
+            "\"0.0.0.0:7411\""
+        );
+        assert_eq!(serde_json::to_string(&HttpBinding::Off).unwrap(), "\"off\"");
+    }
+
+    /// The intent is recorded once per process and the first call wins, so a
+    /// record can never disagree with the `/health` body of the same daemon.
+    ///
+    /// This touches a process-global `OnceLock`. Under `cargo nextest` every
+    /// test gets its own process, so it is isolated for free; under the
+    /// canonical `cargo test --workspace` fallback it shares the process with
+    /// every other test in this module. So it must stay the only test in this
+    /// file that calls `record_serve_intent`, and no test here may call
+    /// `publish()` and then assert on the exposure fields it writes.
+    #[test]
+    fn the_first_recorded_serve_intent_wins() {
+        record_serve_intent(ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Bound("127.0.0.1:7411".into()),
+            allowed_hosts: vec!["muthur.lan".into()],
+        });
+        record_serve_intent(ServeIntent {
+            started_by: StartMode::Autostart,
+            http: HttpBinding::Off,
+            allowed_hosts: vec![],
+        });
+        let intent = serve_intent().expect("recorded");
+        assert_eq!(intent.started_by, StartMode::Serve);
+        assert_eq!(intent.http, HttpBinding::Bound("127.0.0.1:7411".into()));
+        assert_eq!(intent.allowed_hosts, vec!["muthur.lan".to_string()]);
+    }
+
+    /// A holder record for the refusal tests, with the exposure facts each one
+    /// wants and everything else held still.
+    fn holder(
+        pid: u32,
+        version: &str,
+        http: HttpBinding,
+        started_by: Option<StartMode>,
+    ) -> LockInfo {
+        LockInfo {
+            pid,
+            socket_path: "/tmp/s.sock".to_string(),
+            version: version.to_string(),
+            started_at: "2026-09-10T21:33:04Z".to_string(),
+            mcp_line_options: true,
+            started_by,
+            http,
+            allowed_hosts: vec![],
+        }
+    }
+
+    /// The outage shape: a managed serve asked for the LAN endpoint and an
+    /// autostarted daemon already holds the index on loopback. The message has
+    /// to carry all four facts, because the fifth - that the LAN endpoint is
+    /// now gone - is the one an operator is actually losing.
+    #[test]
+    fn the_refusal_names_both_addresses_and_the_config_key() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Bound("0.0.0.0:7411".into()),
+            allowed_hosts: vec!["muthur.lan".into(), "nostromo.lan".into()],
+        };
+        let held = holder(
+            856,
+            "0.18.0",
+            HttpBinding::Bound("127.0.0.1:7411".into()),
+            Some(StartMode::Autostart),
+        );
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(
+            msg.contains("0.0.0.0:7411"),
+            "what this invocation asked for: {msg}"
+        );
+        assert!(
+            msg.contains("127.0.0.1:7411"),
+            "what the holder bound: {msg}"
+        );
+        assert!(msg.contains("856"), "the holder's pid: {msg}");
+        assert!(msg.contains("autostart"), "how the holder started: {msg}");
+        assert!(
+            msg.contains("service.http"),
+            "the key that reconciles them: {msg}"
+        );
+        assert!(
+            msg.contains("service.allowed_hosts"),
+            "and the allow-list key: {msg}"
+        );
+        assert!(
+            msg.contains("muthur.lan"),
+            "the allow-list this invocation asked for: {msg}"
+        );
+        // The prose join and the command join differ on purpose: a space in
+        // the command form would split argv, and `parse_allowed_hosts` rejects
+        // an entry carrying whitespace, so a pasted command would fail.
+        assert!(
+            msg.contains("service.allowed_hosts muthur.lan,nostromo.lan"),
+            "the command form joins the hosts with no space, the spelling the setting takes: {msg}"
+        );
+        assert!(
+            msg.contains("Host values muthur.lan, nostromo.lan"),
+            "while the prose reads as prose: {msg}"
+        );
+    }
+
+    /// A holder that published no record at all: a process holding the lock
+    /// without ever writing service.json. Saying "pid 0" would be a lie, so the
+    /// message says the record is missing and still names the key.
+    #[test]
+    fn the_refusal_is_honest_when_the_holder_published_no_record() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Bound("0.0.0.0:7411".into()),
+            allowed_hosts: vec![],
+        };
+        let msg = lock_held_message(Some(&intent), None);
+        assert!(
+            msg.contains("published no service record"),
+            "the message says the holder is unidentifiable rather than inventing a pid: {msg}"
+        );
+        assert!(!msg.contains("pid 0"), "never a fabricated pid: {msg}");
+        assert!(msg.contains("service.http"), "{msg}");
+    }
+
+    /// A holder that recorded no binding: a daemon from before the field, and
+    /// equally the `hold-lock` test command, which takes the lock and serves
+    /// nothing. The message must not claim its endpoint is off, and must not
+    /// blame a version it cannot know.
+    #[test]
+    fn the_refusal_does_not_claim_an_unrecording_holder_serves_nothing() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Bound("0.0.0.0:7411".into()),
+            allowed_hosts: vec![],
+        };
+        let held = holder(4242, "0.17.0", HttpBinding::Unrecorded, None);
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(msg.contains("did not record"), "{msg}");
+        assert!(
+            !msg.contains("no HTTP endpoint"),
+            "an unrecorded binding is not an off one: {msg}"
+        );
+        assert!(
+            !msg.contains("version"),
+            "an unrecorded field is not evidence of an older version: {msg}"
+        );
+    }
+
+    /// Called from a process that recorded no intent (nothing in this tree
+    /// does, but the renderer is public and must not panic or lie).
+    #[test]
+    fn the_refusal_without_a_recorded_intent_still_names_the_holder() {
+        let held = holder(
+            856,
+            "0.18.0",
+            HttpBinding::Bound("127.0.0.1:7411".into()),
+            Some(StartMode::Serve),
+        );
+        let msg = lock_held_message(None, Some(&held));
+        assert!(msg.contains("856"), "{msg}");
+        assert!(msg.contains("127.0.0.1:7411"), "{msg}");
+        // A caller with no intent asked to bind nothing, so exposure advice is
+        // a non sequitur for it: the embedded MCP stack and `hold-lock` reach
+        // this shape, and the embedded stack copies the string into the
+        // `status` payload an agent reads. What it gets back is the advice
+        // that applies to it.
+        assert!(
+            !msg.contains("Exposure belongs to configuration"),
+            "no exposure lecture for a caller that asked to bind nothing: {msg}"
+        );
+        assert!(
+            !msg.contains("config set service.http"),
+            "and no command to reconcile a binding it never asked for: {msg}"
+        );
+        assert!(
+            msg.contains("attach over the socket"),
+            "the advice that does apply: the holder is a daemon this caller can use: {msg}"
+        );
+    }
+
+    /// An invocation whose exposure is exactly the holder's. Telling an
+    /// operator to write down what both sides already asked for is advice that
+    /// changes nothing, so the message says only that the index is owned and
+    /// by whom. The Windows second-serve test is this shape, and so is every
+    /// restart of a unit against its own autostarted daemon.
+    #[test]
+    fn the_refusal_skips_the_exposure_advice_when_both_sides_asked_the_same() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Off,
+            allowed_hosts: vec![],
+        };
+        let held = holder(856, "0.18.0", HttpBinding::Off, Some(StartMode::Autostart));
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(
+            !msg.contains("Exposure belongs to configuration"),
+            "the two sides agree, so there is nothing to reconcile: {msg}"
+        );
+        assert!(
+            !msg.contains("config set service.http"),
+            "and no command that would change nothing: {msg}"
+        );
+        assert!(msg.contains("856"), "it still names the holder: {msg}");
+        assert!(
+            msg.contains("crystalline ctl shutdown"),
+            "and still gives the one thing that helps: {msg}"
+        );
+    }
+
+    /// Two holders that recorded nothing are not two holders that agree. An
+    /// unrecorded binding is ignorance, and suppressing the advice on it would
+    /// hide the key from the very operator who cannot read the holder's.
+    #[test]
+    fn an_unrecorded_binding_on_both_sides_is_not_agreement() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: vec![],
+        };
+        let held = holder(4242, "0.17.0", HttpBinding::Unrecorded, None);
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(
+            msg.contains("Exposure belongs to configuration"),
+            "neither side is known, so the key is still worth naming: {msg}"
+        );
+        assert!(msg.contains("config set service.http <host:port>"), "{msg}");
+    }
+
+    /// The addresses agree but the allow-lists do not, which is still a
+    /// difference an operator has to write down somewhere.
+    #[test]
+    fn the_refusal_keeps_the_advice_when_only_the_allow_lists_differ() {
+        let intent = ServeIntent {
+            started_by: StartMode::Serve,
+            http: HttpBinding::Bound("0.0.0.0:7411".into()),
+            allowed_hosts: vec!["muthur.lan".into()],
+        };
+        let mut held = holder(
+            856,
+            "0.18.0",
+            HttpBinding::Bound("0.0.0.0:7411".into()),
+            Some(StartMode::Autostart),
+        );
+        held.allowed_hosts = vec![];
+        let msg = lock_held_message(Some(&intent), Some(&held));
+        assert!(
+            msg.contains("service.allowed_hosts muthur.lan"),
+            "the half that differs is still named: {msg}"
+        );
     }
 }

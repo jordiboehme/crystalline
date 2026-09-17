@@ -1,9 +1,10 @@
 //! Implementations of the data and domain-management subcommands.
 //!
-//! These are the first subcommands that touch the derived index. For now they
-//! open the database directly in-process; the M5 daemon will route them over the
-//! control socket when one is running, falling back to this direct path. The
-//! spot where that dispatch slots in is [`open_store`].
+//! Every one of these that touches the derived index reaches it through
+//! [`reach_index`] and nowhere else: a running daemon owns the index file, so a
+//! verb that opens the database on its own answers a person with a lock error
+//! on exactly the machines the daemon is there to serve. `crates/cli/tests/index_access.rs`
+//! guards the rule.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,8 +14,9 @@ use crystalline_core::config::{
     self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
 };
 use crystalline_index::{
-    ChunkParams, DomainKind, Store, apply_scan, configured_model_id, download_local_model,
-    provider_from_config, run_embedding_pass, scan_domain,
+    ChunkParams, DomainKind, NoReindexHooks, RebuildKind, Store, apply_scan, configured_model_id,
+    download_local_model, provider_from_config, reindex_domains, resolve_forward_refs,
+    run_embedding_pass, scan_domain,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -81,27 +83,157 @@ pub(crate) fn db_path(override_path: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// Open the configured backend as a `dyn Store` through the shared factory, so
-/// these standalone commands honor `backend: postgres` (or a Turso file at the
-/// resolved path) without a running daemon, exactly like the daemon and doctor
-/// paths do. `resilient` selects the corruption-recovery open for Turso (the
-/// `reindex --full` recovery path) and is ignored by Postgres.
+// --- one way to reach the index -----------------------------------------------
+
+/// How a verb wants the index opened when it opens one directly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAs {
+    /// A read. On the Turso backend an absent index file means nothing has
+    /// been synced on this machine yet, and the verb answers that rather than
+    /// creating an empty database to read no rows from.
+    Read,
+    /// A write. The index is created when it is not there yet.
+    Write,
+    /// `reindex --wipe`'s corruption-recovery open, which rebuilds a Turso
+    /// database that will not open at all. Creates like [`OpenAs::Write`],
+    /// and a no-op distinction on Postgres, which has no local file.
+    Rebuild,
+}
+
+/// Where a CLI verb reached the index, and how.
+pub(crate) enum IndexRoute {
+    /// A running daemon owns the index and answered the verb's control
+    /// request; this is its reply, in the daemon's own JSON.
+    Daemon(serde_json::Value),
+    /// No daemon was asked, or none answered, and the index opened here.
+    Direct(Arc<TokioMutex<dyn Store>>),
+    /// There is no index on this machine yet, so there is nothing to read.
+    /// Only an [`OpenAs::Read`] ever lands here; a write creates the file.
+    Absent(PathBuf),
+    /// There is an index and this command could not reach it: a daemon owns
+    /// the file and answered nothing, or the open failed outright. The string
+    /// says which, naming the daemon and a remedy, and carries the raw error
+    /// at its end rather than on its own.
+    Unreachable(String),
+}
+
+/// The one way a CLI verb reaches the index.
 ///
-/// The M5 daemon dispatch still slots in above this: when a service socket is
-/// live the command routes over it instead of opening the database in-process.
-async fn open_backend(
+/// Ask a running daemon first, since on any machine with one the daemon owns
+/// the index file and a second opener gets a lock error rather than an answer;
+/// open the index directly when there is no daemon to ask; and where neither
+/// is possible say so in words that name the daemon and the remedy, so that a
+/// verb which can answer part of its question from configuration alone
+/// degrades (see [`domain_list`]) and one which cannot refuses readably (see
+/// [`index_unreachable`]).
+///
+/// `request` is the verb's ctl request, or `None` for a verb whose caller has
+/// already asked the daemon under a different verb (`domain add`, which asks
+/// for a sync of the one domain it just registered). An explicit `--db` or
+/// `--config` override names an exact index the running daemon may not serve,
+/// so it bypasses the daemon entirely; that is
+/// [`crystalline_service::use_daemon`]'s rule and this is the only place the
+/// CLI applies it to the index.
+pub(crate) async fn reach_index(
+    request: Option<serde_json::Value>,
     cfg: &GlobalConfig,
+    config_override: Option<&Path>,
     db_override: Option<&Path>,
-    resilient: bool,
-) -> Result<Arc<TokioMutex<dyn Store>>> {
-    crystalline_index::open_store(&cfg.database(), db_override, resilient)
+    open_as: OpenAs,
+) -> Result<IndexRoute> {
+    let bypassed = !crystalline_service::use_daemon(db_override, config_override);
+    if !bypassed
+        && let Some(request) = request
+        && let Some(data) = crystalline_service::ctl_if_running(request).await?
+    {
+        return Ok(IndexRoute::Daemon(data));
+    }
+    let db = db_path(db_override)?;
+    let turso = backend_is_turso(cfg);
+    if open_as == OpenAs::Read && turso && !db.exists() {
+        return Ok(IndexRoute::Absent(db));
+    }
+    // Postgres has no local file, so naming one in a failure would point at a
+    // path nothing lives at.
+    let location = if turso {
+        db.display().to_string()
+    } else {
+        "the configured database".to_string()
+    };
+    match crystalline_index::open_store(&cfg.database(), db_override, open_as == OpenAs::Rebuild)
         .await
-        .map_err(|e| anyhow!("could not open the index: {e}"))
+    {
+        Ok(store) => Ok(IndexRoute::Direct(store)),
+        Err(e) => Ok(IndexRoute::Unreachable(
+            crystalline_service::instance::index_unreachable_words(
+                &location,
+                &e.to_string(),
+                bypassed,
+            ),
+        )),
+    }
+}
+
+/// The words a listing uses when the daemon it asked answered badly: an error
+/// envelope, or a reply that did not arrive whole. Its own sentence rather
+/// than the shared lock wording in
+/// [`crystalline_service::instance::words_for_holder`], because nothing here
+/// is about a lock: the daemon is reachable and the answer is not usable.
+fn daemon_answered_badly(what: &str, error: &str) -> String {
+    format!(
+        "the running Crystalline daemon answered {what} with an error instead of the counts. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The daemon reported: {error}"
+    )
+}
+
+/// The words a listing uses when it never reached a daemon at all: the only
+/// other way [`reach_index`] fails is [`db_path`], which resolves the default
+/// database location and fails on a home directory it cannot read. Its own
+/// sentence rather than [`daemon_answered_badly`]'s, because that one asserts a
+/// daemon answered, and sending somebody to `crystalline ctl shutdown` over a
+/// failed path resolution points at the wrong machine entirely.
+fn listing_not_reached(what: &str, error: &str) -> String {
+    format!(
+        "{what} could not reach the index, so the per-domain counts are missing. Look at this machine's configuration with: crystalline doctor. The failure was: {error}"
+    )
+}
+
+/// The opened store a verb needs, or the error it fails with. Total over
+/// every route, so no caller has to write a panicking arm for a variant its
+/// own call cannot produce: a verb that sent no ctl request never sees
+/// `Daemon`, and one whose dispatch already rendered the daemon's reply never
+/// reaches here with it, but a future caller that does gets a sentence rather
+/// than a crash.
+pub(crate) fn local_store(route: IndexRoute, verb: &str) -> Result<Arc<TokioMutex<dyn Store>>> {
+    match route {
+        IndexRoute::Direct(store) => Ok(store),
+        IndexRoute::Absent(db) => Err(index_absent(verb, &db)),
+        IndexRoute::Unreachable(why) => Err(index_unreachable(verb, &why)),
+        IndexRoute::Daemon(_) => Err(index_unreachable(
+            verb,
+            "a running Crystalline daemon answered a request this command does not know how to read. Look at it with: crystalline doctor --fix",
+        )),
+    }
+}
+
+/// The error a verb fails with when it needs the index and
+/// [`reach_index`] could not reach it. One wording for every verb, so a
+/// person meets the same sentence wherever they hit the same state.
+pub(crate) fn index_unreachable(verb: &str, reason: &str) -> anyhow::Error {
+    anyhow!("`crystalline {verb}` needs the index and could not reach it: {reason}")
+}
+
+/// The error a verb fails with when there is no index on this machine at all
+/// and it has nothing to answer from.
+pub(crate) fn index_absent(verb: &str, db: &Path) -> anyhow::Error {
+    anyhow!(
+        "`crystalline {verb}` needs the index and there is none at {} yet: nothing has been synced on this machine. Run: crystalline sync",
+        db.display()
+    )
 }
 
 /// Whether the effective backend is the local Turso file (so an absent file
 /// means "no index yet"). Postgres has no local file and is always opened.
-fn backend_is_turso(cfg: &GlobalConfig) -> bool {
+pub(crate) fn backend_is_turso(cfg: &GlobalConfig) -> bool {
     cfg.database().backend == DatabaseBackend::Turso
 }
 
@@ -302,10 +434,15 @@ pub(crate) fn print_domain_add_virtual(name: &str, scaffold: &serde_json::Value,
     }
 }
 
-/// Sync a single, just-registered domain directly (no daemon involved) and
-/// return its report. Parse failures in individual files land in the
-/// report's `failed` list rather than aborting; only a harder error (the
-/// store will not open, the transaction fails) is propagated.
+/// Sync a single, just-registered domain directly and return its report.
+/// Parse failures in individual files land in the report's `failed` list
+/// rather than aborting; only a harder error (the index cannot be reached,
+/// the transaction fails) is propagated.
+///
+/// Reaches the index with no ctl request of its own: `domain add`'s dispatch
+/// has already asked the daemon to sync this one domain and only falls through
+/// to here when none answered, so asking a second time would ask the same
+/// question twice.
 pub(crate) async fn sync_domain_direct(
     name: &str,
     root: &Path,
@@ -313,7 +450,8 @@ pub(crate) async fn sync_domain_direct(
     db_override: Option<&Path>,
 ) -> Result<crystalline_index::SyncReport> {
     let cfg = load(config_override)?.effective;
-    let store = open_backend(&cfg, db_override, false).await?;
+    let route = reach_index(None, &cfg, config_override, db_override, OpenAs::Write).await?;
+    let store = local_store(route, "domain add")?;
     let params = chunk_params(&cfg);
     // First lock window: resolve the domain id and snapshot its stamps. The scan
     // then runs with no lock held; the second window applies transactionally.
@@ -325,7 +463,7 @@ pub(crate) async fn sync_domain_direct(
         let snapshot = store.file_stamps(domain).await?;
         (domain, snapshot)
     };
-    let scan = scan_domain(name, root, snapshot, &params).await?;
+    let scan = scan_domain(name, root, snapshot, &params, false).await?;
     let store = store.lock().await;
     apply_scan(&*store, domain, scan)
         .await
@@ -540,11 +678,13 @@ fn stack_line(proposal: &serde_json::Value) -> Option<String> {
 /// somebody wrote, and one quiet line for the folder listings that rode along
 /// with it.
 ///
-/// The listings are `index.md` files, generated from the engrams beside them so
-/// the team repository stays browsable on the forge. They travel with a share
-/// and they say nothing on their own, so counting them among the engrams would
-/// inflate every number a reader uses to recognize their own work. The second
-/// line is skipped entirely when there are none, which is most shares.
+/// The listings are `index.md` files, generated from the engrams beside them.
+/// They travel with a share only in a domain that declares
+/// `generated_indexes: shared`, and they say nothing on their own, so counting
+/// them among the engrams would inflate every number a reader uses to
+/// recognize their own work. The second line is skipped entirely when there
+/// are none, which is most shares and all of them in a domain that keeps its
+/// listings local.
 fn print_change_counts(proposal: &serde_json::Value) {
     let (added, added_indexes) = split_indexes(&proposal["added"]);
     let (updated, updated_indexes) = split_indexes(&proposal["updated"]);
@@ -799,42 +939,226 @@ fn provision_action_label(status: &str) -> &str {
 
 // --- domain remove -----------------------------------------------------------
 
-/// Remove a domain from the global config. Leaves its files and index rows
-/// untouched; the rows are only dropped by a later full reindex.
-pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> Result<()> {
-    let loaded = load(config_override)?;
-    let mut cfg = loaded.file;
-    if cfg.domains.shift_remove(name).is_none() {
-        // A miss in the file config may be an env-defined domain: those are
-        // immune to `domain remove` (the variable is their source of truth).
-        if let Some(env) = loaded.overlay.env_domain(name) {
-            bail!(
-                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-                env.var
-            );
-        }
-        bail!("no domain named '{name}' is registered");
-    }
-    config::save_yaml(&loaded.path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
+/// Render the engine's own unregistration report.
+///
+/// The removal itself is `crystalline_service::domain_remove`, the entry point
+/// every surface calls; this only says what happened. The two sentences it can
+/// print are the two things that differ by kind, and the difference is the
+/// whole reason a virtual domain needs `--purge`: a file or team domain's files
+/// were left exactly where they are and registering the folder again re-adopts
+/// them, while a virtual domain's engrams were in the database and are gone.
+pub fn print_domain_remove(name: &str, report: &serde_json::Value, json: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "removed": name,
-                "note": "index rows for this domain remain until the next full reindex",
-            })
-        );
-    } else {
-        println!("Removed domain '{name}' (files and index rows left untouched)");
-        println!("Run: crystalline reindex --full to drop its rows from the index");
+        println!("{report}");
+        return;
     }
-    Ok(())
+    let files_kept = report["files_kept"].as_bool().unwrap_or(true);
+    println!("Unregistered domain '{name}' and cleared its rows from the index.");
+    if files_kept {
+        println!("Its files were left untouched: register the folder again to re-adopt them.");
+    } else {
+        println!("It was a virtual domain, so its engrams went with it.");
+    }
+    let rooms = report["rooms_closed"].as_u64().unwrap_or(0);
+    if rooms > 0 {
+        println!("{rooms} open co-editing session(s) were saved and closed.");
+    }
+}
+
+/// The plan `domain review <domain> direct` prints before it sends an answer:
+/// every actor holding drafts, what each of them holds, and the two kinds of
+/// trouble a fold can run into.
+pub fn print_review_plan(plan: &serde_json::Value) {
+    for line in review_plan_lines(plan) {
+        println!("{line}");
+    }
+}
+
+/// The plan as lines, so what an operator reads is a value a test can hold.
+///
+/// Split out of [`print_review_plan`] rather than left inline because the plan
+/// carries TWO kinds of trouble a fold runs into and they arrive in different
+/// places - a path more than one person is drafting, and an address two of
+/// their different paths both answer to - and a printer that renders one and
+/// drops the other reads as a clean plan that is then refused at the confirm,
+/// which is the one outcome this whole direction exists to prevent. That is a
+/// thing to assert, not to eyeball.
+fn review_plan_lines(plan: &serde_json::Value) -> Vec<String> {
+    /// The string values of an array field, in order.
+    fn names(value: &serde_json::Value) -> Vec<&str> {
+        value
+            .as_array()
+            .map(|rows| rows.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    let actors = plan["actors"].as_array().cloned().unwrap_or_default();
+    if actors.is_empty() {
+        return vec![
+            "Nobody is drafting in this domain, so leaving review mode ends nothing.".to_string(),
+        ];
+    }
+    let mut out = vec!["Leaving review mode ends every private draft in this domain:".to_string()];
+    for row in &actors {
+        let actor = row["actor"].as_str().unwrap_or("?");
+        let entries = row["entries"].as_u64().unwrap_or(0);
+        let drafts = row["drafts"].as_array().cloned().unwrap_or_default();
+        // How many of them are files, said on the actor's own line, because
+        // what happens to a file when it folds is not what happens to a page:
+        // the bytes become the team's file rather than a page they can read.
+        let files = drafts
+            .iter()
+            .filter(|draft| draft["kind"] == serde_json::json!("file"))
+            .count();
+        out.push(match files {
+            0 => format!("  {actor} ({entries} draft(s))"),
+            1 => format!("  {actor} ({entries} draft changes, 1 of them a file)"),
+            n => format!("  {actor} ({entries} draft changes, {n} of them files)"),
+        });
+        // Said before their rows, because it is about all of them: an actor
+        // whose files could not be listed is in the plan so somebody knows they
+        // are there, and leaving review mode refuses until the tree can be
+        // read.
+        if row["files_unreadable"].as_bool().unwrap_or(false) {
+            out.push(format!(
+                "    the files {actor} has drafted could not be read, so review mode cannot be \
+                 taken off until they can"
+            ));
+        }
+        for draft in drafts {
+            let path = draft["path"].as_str().unwrap_or("?");
+            let what = if draft["tombstone"].as_bool().unwrap_or(false) {
+                "deleted"
+            } else {
+                "drafted"
+            };
+            let kind = if draft["kind"] == serde_json::json!("file") {
+                "the file "
+            } else {
+                ""
+            };
+            out.push(format!("    {what} {kind}{path}"));
+            if let Some(conflict) = draft["conflict"].as_str() {
+                out.push(format!("      cannot be folded: {conflict}"));
+            }
+        }
+    }
+    for contested in plan["contested_paths"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let path = contested["path"].as_str().unwrap_or("?");
+        out.push(format!(
+            "  {path} is drafted by {}, so at most one of them can be folded.",
+            names(&contested["actors"]).join(" and ")
+        ));
+    }
+    for contested in plan["contested_addresses"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let permalink = contested["permalink"].as_str().unwrap_or("?");
+        out.push(format!(
+            "  {} answer to the address '{permalink}', drafted by {}, so at most one of them can \
+             be folded: one engram answers to one address.",
+            names(&contested["paths"]).join(" and "),
+            names(&contested["actors"]).join(" and ")
+        ));
+    }
+    out.push(
+        "Answer with --fold <actor> (write their drafts into the folder) or --discard <actor> \
+         (end them), one for each actor above."
+            .to_string(),
+    );
+    out
+}
+
+/// What `domain review` says once the mode is what was asked for.
+pub fn print_domain_review(report: &serde_json::Value, json: bool) {
+    if json {
+        println!("{report}");
+        return;
+    }
+    let domain = report["domain"].as_str().unwrap_or("?");
+    match report["review"].as_str() {
+        Some(_) => println!(
+            "Domain '{domain}' reviews changes before they land: every write now joins its \
+             author's own draft, and the folder changes through a reviewed proposal."
+        ),
+        None => println!("Domain '{domain}' takes changes directly again."),
+    }
+    for row in report["folded"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "  folded {}: {} file(s) written, {} deleted.",
+            row["actor"].as_str().unwrap_or("?"),
+            row["written"].as_u64().unwrap_or(0),
+            row["deleted"].as_u64().unwrap_or(0)
+        );
+    }
+    for row in report["discarded"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "  discarded {}: {} draft(s) ended.",
+            row["actor"].as_str().unwrap_or("?"),
+            row["entries"].as_u64().unwrap_or(0)
+        );
+    }
+    let rooms = report["rooms_closed"].as_u64().unwrap_or(0);
+    if rooms > 0 {
+        println!("{rooms} open co-editing session(s) were saved and closed.");
+    }
 }
 
 // --- domain list -------------------------------------------------------------
 
-/// List registered domains, with engram counts when the index is present.
+/// The slice of a domain's index stats this listing prints: how many engrams
+/// it holds, and which instance hosts it in a shared database. Both routes to
+/// the index produce it, so the daemon's answer and a direct read render
+/// identically. Read field by field rather than deserialized whole: the
+/// daemon's rows carry an annotation of its own and [`crystalline_index::DomainStats`]
+/// is a write-only shape.
+struct ListedStats {
+    name: String,
+    engrams: i64,
+    host_instance_id: Option<String>,
+    host_heartbeat_at: Option<String>,
+}
+
+impl ListedStats {
+    fn from_stats(d: &crystalline_index::DomainStats) -> ListedStats {
+        ListedStats {
+            name: d.name.clone(),
+            engrams: d.engrams,
+            host_instance_id: d.host_instance_id.clone(),
+            host_heartbeat_at: d.host_heartbeat_at.clone(),
+        }
+    }
+
+    fn from_json(v: &serde_json::Value) -> Option<ListedStats> {
+        let text = |key: &str| {
+            v.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        Some(ListedStats {
+            name: text("name")?,
+            engrams: v.get("engrams").and_then(serde_json::Value::as_i64)?,
+            host_instance_id: text("host_instance_id"),
+            host_heartbeat_at: text("host_heartbeat_at"),
+        })
+    }
+}
+
+/// List registered domains, with engram counts when the index can be read.
+///
+/// The registrations come from configuration, so this command always answers:
+/// it is the counts, and only the counts, that need the index. When the index
+/// cannot be reached the list still prints and each count says it was not
+/// read, rather than the whole command failing or, worse, reporting a domain
+/// as unindexed because a daemon happened to be holding the file. The daemon's
+/// `status` reply carries the same per-domain stats a direct read would, so a
+/// machine with a daemon gets real counts instead of a lock error.
 pub async fn domain_list(
     config_override: Option<&Path>,
     db_override: Option<&Path>,
@@ -844,15 +1168,94 @@ pub async fn domain_list(
     // overlay marks which rows an environment variable defines.
     let loaded = load(config_override)?;
     let cfg = loaded.effective;
-    let should_open = !backend_is_turso(&cfg) || db_path(db_override)?.exists();
-    let stats = if should_open {
-        match open_backend(&cfg, db_override, false).await {
-            Ok(store) => store.lock().await.domain_stats().await.ok(),
-            Err(_) => None,
+    // Why the counts are missing when they are, in the helper's words; `None`
+    // once they were read, whichever route delivered them.
+    let mut not_read: Option<String> = None;
+    // The one verb that must answer whatever the index does, so the route is
+    // matched rather than propagated with `?`. A daemon that replies with an
+    // error envelope, or dies mid-exchange leaving a truncated line, makes
+    // `ctl_if_running` fail, and letting that fail the command would put the
+    // daemon's bare error where this listing's registrations belong - the raw
+    // backend text this whole task exists to stop showing a person.
+    let route = match reach_index(
+        Some(serde_json::json!({ "v": 1, "cmd": "status" })),
+        &cfg,
+        config_override,
+        db_override,
+        OpenAs::Read,
+    )
+    .await
+    {
+        Ok(route) => Some(route),
+        Err(e) => {
+            // Which of the two failures this was. `db_path` is cheap and pure,
+            // so asking it again is how the arm tells a daemon that answered
+            // badly from a path that never resolved - the alternative is
+            // classifying the error by its text, which is exactly what this
+            // file stopped doing.
+            not_read = Some(match db_path(db_override) {
+                Ok(_) => daemon_answered_badly("this listing", &e.to_string()),
+                Err(_) => listing_not_reached("this listing", &e.to_string()),
+            });
+            None
         }
-    } else {
-        None
     };
+    let stats: Option<Vec<ListedStats>> = match route {
+        None => None,
+        Some(route) => match route {
+            // The daemon's own `domain_stats`, annotated with a `hosted_here`
+            // field this command has no use for. A reply that carries no counts,
+            // or a row that does not read back, is a count nobody read: saying so
+            // is the point, and rendering it as an empty set would put every
+            // domain back on the "(not indexed)" line this routing exists to end.
+            IndexRoute::Daemon(data) => {
+                match data.get("domains").and_then(serde_json::Value::as_array) {
+                    Some(rows) => {
+                        let parsed: Vec<ListedStats> =
+                            rows.iter().filter_map(ListedStats::from_json).collect();
+                        if parsed.len() == rows.len() {
+                            Some(parsed)
+                        } else {
+                            not_read = Some(
+                            "the running Crystalline daemon answered, but its per-domain counts did not read back in the shape this listing expects. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
+                        );
+                            None
+                        }
+                    }
+                    None => {
+                        not_read = Some(
+                        "the running Crystalline daemon answered without the per-domain counts this listing reads. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
+                    );
+                        None
+                    }
+                }
+            }
+            IndexRoute::Direct(store) => match store.lock().await.domain_stats().await {
+                Ok(rows) => Some(rows.iter().map(ListedStats::from_stats).collect()),
+                // Open, and still no counts: the index answered the open and not
+                // the question, which is a different state from both "unreachable"
+                // and "never synced" and must not be rendered as either.
+                Err(e) => {
+                    not_read = Some(format!(
+                        "the index opened, but its per-domain counts could not be read. Look at it with: crystalline doctor --fix. The index reported: {e}"
+                    ));
+                    None
+                }
+            },
+            // No index yet is not a failure to read one: a registered domain that
+            // was never synced is exactly the "(not indexed)" case below.
+            IndexRoute::Absent(_) => Some(Vec::new()),
+            IndexRoute::Unreachable(why) => {
+                not_read = Some(why);
+                None
+            }
+        },
+    };
+    if let Some(why) = &not_read
+        && !json
+    {
+        eprintln!("note: engram counts were not read; {why}");
+    }
     let stat_for = |name: &str| {
         stats
             .as_ref()
@@ -894,7 +1297,18 @@ pub async fn domain_list(
                 })
             })
             .collect();
-        println!("{}", serde_json::json!({ "domains": domains }));
+        // `engrams: null` alone cannot tell "not synced yet" from "nobody
+        // read the index", and those want opposite reactions from a reader.
+        // `counts` says which, and carries the helper's words when the
+        // counts are missing.
+        let counts = match &not_read {
+            Some(why) => serde_json::json!({ "read": false, "reason": why }),
+            None => serde_json::json!({ "read": true }),
+        };
+        println!(
+            "{}",
+            serde_json::json!({ "domains": domains, "counts": counts })
+        );
         return Ok(());
     }
 
@@ -927,6 +1341,9 @@ pub async fn domain_list(
             .unwrap_or_default();
         match count_for(name) {
             Some(n) => println!("{name}\t{location}\t{n} engrams{host}"),
+            None if not_read.is_some() => {
+                println!("{name}\t{location}\t(counts not read){host}")
+            }
             None => println!("{name}\t{location}\t(not indexed){host}"),
         }
     }
@@ -935,20 +1352,24 @@ pub async fn domain_list(
 
 // --- sync --------------------------------------------------------------------
 
-/// Sync one or all registered domains, optionally embedding new chunks after.
+/// Sync one or all registered domains, optionally embedding new chunks after,
+/// into an index its dispatch already reached through [`reach_index`]. Taking
+/// the opened store rather than opening one keeps the daemon-or-direct
+/// decision in `main.rs`'s dispatch layer, where `reindex` and `status` make
+/// the same one.
 pub async fn sync(
+    store: Arc<TokioMutex<dyn Store>>,
+    cfg: &GlobalConfig,
     only: Option<&str>,
     embed: bool,
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load(config_override)?.effective;
-    let targets = select_domains(&cfg, only)?;
-    let store = open_backend(&cfg, db_override, false).await?;
-    let params = chunk_params(&cfg);
+    let targets = select_domains(cfg, only)?;
+    let params = chunk_params(cfg);
 
-    let mut reports = Vec::new();
+    // Each domain this run applied, paired with the report its apply produced,
+    // for the final cross-domain resolution pass below.
+    let mut applied: Vec<(crystalline_index::DomainId, crystalline_index::SyncReport)> = Vec::new();
     for (name, entry) in targets {
         // Virtual domains have no files to sync.
         let Some(path) = resolve_domain_path(&entry) else {
@@ -971,15 +1392,27 @@ pub async fn sync(
             let snapshot = store.file_stamps(domain).await?;
             (domain, snapshot)
         };
-        let scan = scan_domain(&name, &path, snapshot, &params).await?;
+        let scan = scan_domain(&name, &path, snapshot, &params, false).await?;
         let report = {
             let store = store.lock().await;
             apply_scan(&*store, domain, scan)
                 .await
                 .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?
         };
-        reports.push(report);
+        applied.push((domain, report));
     }
+
+    // Every domain of this run is in now, so a reference that pointed forward
+    // into a domain later in the loop resolves here rather than waiting for the
+    // next sync. A single-domain run is a no-op inside the pass.
+    {
+        let store = store.lock().await;
+        resolve_forward_refs(&*store, &mut applied)
+            .await
+            .map_err(|e| anyhow!("resolving forward references failed: {e}"))?;
+    }
+    let reports: Vec<crystalline_index::SyncReport> =
+        applied.into_iter().map(|(_, report)| report).collect();
 
     if json {
         println!("{}", serde_json::to_string(&reports)?);
@@ -991,7 +1424,7 @@ pub async fn sync(
 
     if embed {
         let store = store.lock().await;
-        embed_pass(&*store, &cfg).await?;
+        embed_pass(&*store, cfg).await?;
     }
 
     // Any sync, not just a full reindex, is a snapshot-preparation verb: a
@@ -1003,132 +1436,328 @@ pub async fn sync(
         let store = store.lock().await;
         store.checkpoint_wal().await?;
     }
+
+    // A file that failed to read, parse or upsert is a real failure, not a
+    // shrug: `doctor` exits 1 on a problem and `verify` exits 2, so a sync
+    // that printed a `failed:` line and still exited 0 was the outlier, and a
+    // CI step piping through it could not see the partial failure at all.
+    // The full report (JSON included) has already printed above, so a
+    // `--json` consumer still gets the complete document before this fails
+    // the process. The direct path has no equivalent of a whole domain
+    // skipped by a scan error: `scan_domain` above is called with `?`, so
+    // that class already aborts the whole command immediately rather than
+    // being collected here - `scan_failed` is always empty on this path, and
+    // only the daemon-routed path in `sync_dispatch` (`main.rs`) passes one.
+    if let Some(err) = sync_failure(&reports, &[]) {
+        return Err(err);
+    }
     Ok(())
+}
+
+/// The error `sync` fails with when either failure class is present, or
+/// `None` when both are empty. Shared by both ways a sync can run - directly,
+/// above, and daemon-routed through `sync_dispatch` in `main.rs`, which reads
+/// both classes back out of the daemon's own JSON and calls this too - so the
+/// wording and the trigger condition can never drift apart between the two
+/// paths, and a user cannot tell which one handled their command from the
+/// failure alone.
+///
+/// The two classes mean different things to a person, so a combined failure
+/// names both rather than merging them into one count: a file in `reports[].failed`
+/// is theirs to edit (bad frontmatter, most often), while a domain in
+/// `scan_failed` could not be scanned at all, which is usually a path or
+/// permission problem - not something a file edit fixes.
+pub(crate) fn sync_failure(
+    reports: &[crystalline_index::SyncReport],
+    scan_failed: &[(String, String)],
+) -> Option<anyhow::Error> {
+    let failed_count: usize = reports.iter().map(|r| r.failed.len()).sum();
+    if failed_count == 0 && scan_failed.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if failed_count > 0 {
+        let domains: Vec<&str> = reports
+            .iter()
+            .filter(|r| !r.failed.is_empty())
+            .map(|r| r.domain.as_str())
+            .collect();
+        parts.push(format!(
+            "{failed_count} file(s) failed to sync in domain(s): {}",
+            domains.join(", ")
+        ));
+    }
+    if !scan_failed.is_empty() {
+        let domains: Vec<&str> = scan_failed.iter().map(|(name, _)| name.as_str()).collect();
+        parts.push(format!(
+            "{} domain(s) could not be scanned at all, usually a path or permission problem: {}",
+            scan_failed.len(),
+            domains.join(", ")
+        ));
+    }
+    Some(anyhow!(parts.join("; ")))
 }
 
 // --- reindex -----------------------------------------------------------------
 
-/// Reindex all domains. `--full` wipes the index first (the corruption-recovery
-/// path), opening resiliently so a database that will not open is rebuilt.
+/// Reindex all domains: `full` re-reads every file rather than only the ones
+/// whose stamp moved, `wipe` destroys the index first and rebuilds it from
+/// scratch.
+///
+/// The two are different operations and the flags do not combine. A forced
+/// reindex destroys nothing - every domain serves its previous complete rows
+/// until its own rebuild commits, and an unchanged chunk keeps its embedding -
+/// so an interruption costs a re-run rather than an hour of re-embedding. A
+/// wipe is for the case nothing else can fix, a database file that will not
+/// open, and its cost is the whole embedding corpus; its store was opened
+/// resiliently by the dispatch above, which is what discards an unopenable
+/// file.
+///
+/// The loop itself is [`crystalline_index::reindex_domains`], shared with the
+/// daemon's `ctl reindex`, so the two paths cannot drift apart in what they
+/// re-read, in what order they rebuild or in the passes they end with.
 pub async fn reindex(
+    store: Arc<TokioMutex<dyn Store>>,
+    cfg: &GlobalConfig,
     full: bool,
+    wipe: bool,
     embed: bool,
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
     json: bool,
 ) -> Result<()> {
-    let cfg = load(config_override)?.effective;
-    let targets = select_domains(&cfg, None)?;
-    let params = chunk_params(&cfg);
+    let targets = select_domains(cfg, None)?;
+    let params = chunk_params(cfg);
 
-    // `--full` opens resiliently (Turso rebuilds a database that will not open;
-    // a no-op for Postgres). Rather than a global wipe, it clears each file
-    // domain's rows per-domain and resyncs, so virtual-domain rows, whose only
-    // source of truth is the database, survive the reindex.
-    let store = open_backend(&cfg, db_override, full).await?;
-    // Only the file domains have files to (re)index.
+    // Set by the resilient open when the database it found would not open at
+    // all: those bytes were renamed aside rather than deleted, and the run says
+    // where they went. Read before the wipe, since the wipe is what this is
+    // reporting on.
+    let set_aside = if wipe {
+        store.lock().await.set_aside_database()
+    } else {
+        None
+    };
+
+    // A wipe destroys everything in the database and rebuilds from the files on
+    // disk, so it is only ever safe when the files are the whole truth. A
+    // virtual domain's engrams live nowhere else: wiping them is not a rebuild,
+    // it is deleting knowledge, and no rebuild afterwards can bring them back.
+    // Refuse rather than quietly doing something narrower than the verb's name,
+    // and name the way out.
+    //
+    // The question here is asked of the DATABASE, not of this config. `Store::wipe`
+    // is unscoped - thirteen bare deletes ending in `domain` - so what is at
+    // risk is every virtual domain the index holds, and the two are routinely
+    // not the same set: a domain dropped from the config keeps its rows until
+    // something collects them (the whole orphaned-rows surface exists for that
+    // state), and `--db`/`--config`, the flags that force this direct path in
+    // the first place, are the documented way to point a narrower config at a
+    // wider index. Asking only `cfg.domains` here would wave the wipe through in
+    // exactly the cases those flags exist for.
+    //
+    // The config IS asked, one frame up in `reindex_dispatch`, and the two
+    // guards are complements rather than a contradiction: this one is the
+    // precise question and can only be asked once the index opens, so it cannot
+    // fire in the state `--wipe` exists for, where the file does not open at all
+    // and a fresh empty database has taken its place. The config is the only
+    // signal left there. Neither is sufficient; both are cheap.
+    if wipe {
+        let store = store.lock().await;
+        let stats = store
+            .domain_stats()
+            .await
+            .map_err(|e| anyhow!("could not read the index before wiping it: {e}"))?;
+        let virtual_domains: Vec<&str> = stats
+            .iter()
+            .filter(|d| d.kind == DomainKind::Virtual)
+            .map(|d| d.name.as_str())
+            .collect();
+        if !virtual_domains.is_empty() {
+            let exports: String = virtual_domains
+                .iter()
+                .map(|name| format!("\n  crystalline domain export <dir> --domain {name}"))
+                .collect();
+            bail!(
+                "refusing to wipe: the index holds {} virtual domain(s) whose engrams live nowhere else, so a wipe would delete them for good: {}. The index opened, so copying them out works - do that first, then wipe:{}\n  crystalline reindex --wipe\n\nOr rebuild without destroying anything: crystalline reindex --full",
+                virtual_domains.len(),
+                virtual_domains.join(", "),
+                exports
+            );
+        }
+        store
+            .wipe()
+            .await
+            .map_err(|e| anyhow!("wiping the index failed: {e}"))?;
+    }
+
+    // Only the file domains have files to (re)index. A virtual domain's rows
+    // are its source of truth and are never rebuilt from anything.
     let file_targets: Vec<(String, PathBuf)> = targets
         .into_iter()
         .filter_map(|(name, entry)| resolve_domain_path(&entry).map(|p| (name, p)))
         .collect();
-    // Clear every file domain up front, before any resync, so cross-domain
-    // forward references resolve in the same order as before the lock split (a
-    // source domain sees the cleared, not the stale, target while resolving).
-    if full {
-        let store = store.lock().await;
-        for (name, path) in &file_targets {
-            let domain_id = store
-                .upsert_domain(name, Some(&path.to_string_lossy()), DomainKind::File)
-                .await
-                .map_err(|e| anyhow!("failed to resolve domain '{name}': {e}"))?;
-            store
-                .clear_domain(domain_id)
-                .await
-                .map_err(|e| anyhow!("failed to clear domain '{name}': {e}"))?;
-        }
-    }
 
-    let mut reports = Vec::new();
-    for (name, path) in &file_targets {
-        // First lock window: snapshot; scan with no lock held; second: apply.
-        let (domain, snapshot) = {
-            let store = store.lock().await;
-            let domain = store
-                .upsert_domain(name, Some(&path.to_string_lossy()), DomainKind::File)
-                .await?;
-            let snapshot = store.file_stamps(domain).await?;
-            (domain, snapshot)
-        };
-        let scan = scan_domain(name, path, snapshot, &params).await?;
-        let report = {
-            let store = store.lock().await;
-            apply_scan(&*store, domain, scan)
-                .await
-                .map_err(|e| anyhow!("reindex of '{name}' failed: {e}"))?
-        };
-        reports.push(report);
-    }
+    // A wipe left nothing to compare against, so its rebuild is forced too:
+    // every file is read, and the prefilter has no stamps to skip against
+    // anyway.
+    let rebuild = if wipe {
+        Some(RebuildKind::Wipe)
+    } else if full {
+        Some(RebuildKind::Full)
+    } else {
+        None
+    };
+    let reports =
+        reindex_domains(&*store, &file_targets, &params, rebuild, &NoReindexHooks).await?;
+
+    // The rebuilt base rows are in; now the rows no file on disk describes. An
+    // overlay draft is one actor's private version of a path and it lives
+    // nowhere but the index, so a wipe takes it and no walk can bring it back -
+    // the mirror under the state directory is what can, and this is the moment
+    // to read it. Runs on every reindex, not only a wipe: it costs one
+    // directory read per domain when there is nothing to restore, and a
+    // daemonless installation has no other pass that would ever heal a draft.
+    let drafts_restored = restore_overlay_journals(&store, &file_targets, &params).await;
 
     if json {
         println!(
             "{}",
-            serde_json::json!({ "full": full, "reports": reports })
+            serde_json::json!({
+                "full": full,
+                "wipe": wipe,
+                "reports": reports,
+                "drafts_restored": drafts_restored,
+                "set_aside": set_aside.as_ref().map(|p| p.display().to_string()),
+            })
         );
     } else {
         println!(
             "Reindex ({}) complete",
-            if full { "full" } else { "incremental" }
+            if wipe {
+                "wiped and rebuilt"
+            } else if full {
+                "full"
+            } else {
+                "incremental"
+            }
         );
         for r in &reports {
             print_report(r);
         }
+        if drafts_restored > 0 {
+            println!("  {drafts_restored} draft(s) restored from the overlay journal");
+        }
+        if let Some(aside) = &set_aside {
+            println!(
+                "  the database that would not open was set aside at {}, not deleted; remove it once you are satisfied with the rebuild",
+                aside.display()
+            );
+        }
     }
 
+    // The driver already checkpointed what the rebuild wrote, but the embed
+    // pass runs after it, so its vectors need their own merge before a
+    // downstream pipeline ships index.db as a single file with the sidecars
+    // deleted. A no-op on Postgres (no local WAL file); on Turso this replaces
+    // the downstream Docker image build's shell-out to `sqlite3` for the same
+    // purpose.
     if embed {
         let store = store.lock().await;
-        embed_pass(&*store, &cfg).await?;
-    }
-
-    // Any reindex, full or incremental, is a snapshot-preparation verb: a
-    // downstream pipeline may ship index.db as a single file (sidecars
-    // deleted), so whatever this reindex (and the optional embed pass above)
-    // just wrote must not sit stranded in the WAL. Merge and shrink it now
-    // rather than leaving it to grow until the next natural checkpoint. A
-    // no-op on Postgres (no local WAL file); on Turso this replaces the
-    // downstream Docker image build's shell-out to `sqlite3` for the same
-    // purpose.
-    {
-        let store = store.lock().await;
+        embed_pass(&*store, cfg).await?;
         store.checkpoint_wal().await?;
     }
     Ok(())
 }
 
+/// Put every mirrored draft back into the rebuilt index, answering with how
+/// many rows were written across every domain.
+///
+/// Best effort, per domain: a journal that could not be read or a row that
+/// could not be written is logged and the rebuild still reports what it
+/// rebuilt. The scope is the domains this run just rebuilt, which is this
+/// path's version of the engine's "never restore into a domain nobody
+/// registers" - the targets came from the configuration.
+async fn restore_overlay_journals(
+    store: &Arc<TokioMutex<dyn Store>>,
+    targets: &[(String, PathBuf)],
+    chunk_params: &ChunkParams,
+) -> u64 {
+    let state_dir = match crystalline_core::config::state_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!("the overlay journal could not be located: {e}");
+            return 0;
+        }
+    };
+    let mut restored = 0u64;
+    for (name, root) in targets {
+        // A domain with nothing mirrored is not touched at all. That keeps the
+        // usual reindex a read of one directory per domain, and - since the
+        // driver has already checkpointed the WAL by the time this runs - keeps
+        // it from dirtying the WAL again with a write nobody needed.
+        let counts = crystalline_service::overlay_journal::journal_counts(&state_dir, name);
+        if counts.total == 0 && !counts.unreadable {
+            continue;
+        }
+        let store = store.lock().await;
+        let id = match store
+            .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("the overlay journal for '{name}' was not restored: {e}");
+                continue;
+            }
+        };
+        match crystalline_service::overlay_journal::restore_into(
+            &*store,
+            &state_dir,
+            name,
+            id,
+            chunk_params,
+        )
+        .await
+        {
+            Ok(n) => restored += n,
+            Err(e) => tracing::warn!("the overlay journal for '{name}' was not restored: {e}"),
+        }
+        // What the restore wrote must not sit stranded in the WAL either: a
+        // reindex is a snapshot-preparation verb whichever rows it wrote last.
+        if let Err(e) = store.checkpoint_wal().await {
+            tracing::debug!("reindex: the WAL checkpoint after the restore did not run: {e}");
+        }
+    }
+    restored
+}
+
 // --- status ------------------------------------------------------------------
 
 /// Build the in-process status report in the same shape the daemon's ctl
-/// `status` returns (minus its liveness fields), so both paths render through
-/// [`render_status`] and `--json` yields one stable shape either way.
-pub async fn status_value(
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
-) -> Result<serde_json::Value> {
-    let cfg = load(config_override)?.effective;
+/// `status` returns (minus its liveness fields and the exposure facts only a
+/// serving process recorded - `started_by`, `http`, `allowed_hosts`), so both
+/// paths render through [`render_status`] and `--json` yields one stable shape
+/// either way. Reads whatever [`reach_index`] reached, and is the one verb
+/// here that refuses rather than degrading: a status with no numbers in it
+/// would be a report about nothing.
+pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde_json::Value> {
     let registered: Vec<String> = cfg.domains.keys().cloned().collect();
-    // Only the Turso backend has a local file whose absence means "no index
-    // yet"; Postgres is always opened.
-    if backend_is_turso(&cfg) {
-        let db = db_path(db_override)?;
-        if !db.exists() {
+    let store = match route {
+        IndexRoute::Direct(store) => store,
+        // No index on this machine yet: the same "nothing synced" report the
+        // direct path used to build for an absent database file.
+        IndexRoute::Absent(db) => {
             return Ok(serde_json::json!({
                 "indexed": false,
                 "db_path": db.display().to_string(),
                 "registered": registered,
             }));
         }
-    }
-
-    let store = open_backend(&cfg, db_override, false).await?;
+        IndexRoute::Unreachable(why) => return Err(index_unreachable("status", &why)),
+        // The dispatch renders the daemon's own report and never sends one
+        // here, but the daemon's report IS this function's return shape, so
+        // handing it straight back is the honest total answer.
+        IndexRoute::Daemon(data) => return Ok(data),
+    };
     let store = store.lock().await;
     let info = store
         .store_info()
@@ -1174,6 +1803,28 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     use serde_json::Value;
 
     println!("Daemon: {daemon_note}");
+    // Only the daemon's own report carries these; a direct index read has no
+    // daemon to describe, so the line is absent rather than guessed at. The
+    // phrasing says "asked to bind" on purpose: these are the exposure facts
+    // the daemon recorded on the way up, not a listener this command probed.
+    if let Some(started_by) = data.get("started_by").and_then(Value::as_str) {
+        let bound = data["http"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "off".to_string());
+        let hosts: Vec<&str> = data["allowed_hosts"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let host_note = if hosts.is_empty() {
+            "loopback only".to_string()
+        } else {
+            hosts.join(", ")
+        };
+        println!(
+            "Exposure: asked to bind HTTP {bound}, Host allow-list {host_note} (started by {started_by})"
+        );
+    }
     let registered: Vec<&str> = data["registered"]
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
@@ -1216,6 +1867,58 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
             "text"
         }
     );
+
+    // The rebuild markers, printed directly under the coverage figure they
+    // qualify: a number read as normal in the middle of a rebuild is the
+    // incident this exists for, so the caveat travels with it rather than
+    // sitting somewhere else in the report.
+    //
+    // The marker is durable and nothing clears it when a process is killed, so
+    // it says history, not liveness. A live `reindex` in the daemon's activity
+    // snapshot - which a direct read has none of - says a rebuild is running,
+    // but not *which* domain's: the activity record carries no domain, so a
+    // marker standing from a run that died last week and a rebuild running now
+    // on another domain cannot be told apart from here. So the live line says
+    // only what is known - a rebuild is running, and this domain is stamped -
+    // and never claims the two are the same one. Either way the domain's rows
+    // are complete, because a rebuild clears nothing and coverage can only go
+    // up across one.
+    let rebuild_is_live = data["activity"]["now"]
+        .as_array()
+        .is_some_and(|now| now.iter().any(|a| a["kind"].as_str() == Some("reindex")));
+    for d in data["domains"].as_array().into_iter().flatten() {
+        let Some(started) = d["rebuild_started"].as_str() else {
+            continue;
+        };
+        let name = d["name"].as_str().unwrap_or("");
+        let kind = d["rebuild_kind"].as_str();
+        if rebuild_is_live {
+            match kind {
+                // A wipe empties the index before it rebuilds, so nothing about
+                // "the rows from before it" is true while one runs.
+                Some("wipe") => println!(
+                    "  a rebuild is running now; '{name}' was stamped {started} by a wipe, which destroyed its rows and every embedding it had before it began"
+                ),
+                _ => println!(
+                    "  a rebuild is running now; '{name}' was stamped {started} and its rows are the ones from before that rebuild lands"
+                ),
+            }
+        } else {
+            match kind {
+                Some("wipe") => println!(
+                    "  a wipe of '{name}' started {started} and did not finish; that domain's rows and every embedding it had were destroyed before it began, so what is there is only what the rebuild managed. Run: crystalline reindex --full"
+                ),
+                Some("full") => println!(
+                    "  a full rebuild of '{name}' started {started} and did not finish; that domain's rows are the ones from before it. Run: crystalline reindex --full"
+                ),
+                // A marker a binary older than the kind column stamped: say what
+                // is known and claim nothing about the rows either way.
+                _ => println!(
+                    "  a rebuild of '{name}' started {started} and did not finish. Run: crystalline reindex --full"
+                ),
+            }
+        }
+    }
 
     // What the daemon is doing right now; only its report carries this.
     if let Some(activity) = data.get("activity") {
@@ -1299,15 +2002,16 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     }
 }
 
-/// Show per-domain counts and index diagnostics from a directly opened
-/// index. `daemon_note` explains why the daemon was not consulted.
+/// Show per-domain counts and index diagnostics from the index the dispatch
+/// reached. `daemon_note` says which view this is, so a direct read never
+/// masquerades as a running daemon's.
 pub async fn status(
-    config_override: Option<&Path>,
-    db_override: Option<&Path>,
+    route: IndexRoute,
+    cfg: &GlobalConfig,
     json: bool,
     daemon_note: &str,
 ) -> Result<()> {
-    let value = status_value(config_override, db_override).await?;
+    let value = status_value(route, cfg).await?;
     if json {
         println!("{value}");
     } else {
@@ -1825,20 +2529,32 @@ async fn device_flow_sign_in(
     let start = crystalline_remote::github::auth::start_device_flow(auth_base, client_id)
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    print_device_code(&start);
+    print_device_code(&start, auth_base);
 
     let ticker = tokio::spawn(async {
+        let mut ticks: u32 = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             eprint!(".");
             let _ = std::io::Write::flush(&mut std::io::stderr());
+            ticks += 1;
+            // A minute of dots and still nothing: the most common reason is
+            // the person entered the code and closed the tab without
+            // clicking Authorize, so say so once rather than dotting forever.
+            if ticks == 60 {
+                eprintln!();
+                eprintln!(
+                    "Still waiting - did the page after the code show an Authorize button? The sign-in lands when it is clicked."
+                );
+                eprint!("Waiting for confirmation");
+            }
         }
     });
     let poll =
         crystalline_remote::github::auth::run_device_flow(auth_base, client_id, &start).await;
     ticker.abort();
     eprintln!();
-    let access_token = poll.map_err(|e| anyhow!("{e}"))?;
+    let access_token = poll.map_err(|e| device_flow_error(auth_base, e))?;
 
     let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
         .await
@@ -1847,14 +2563,61 @@ async fn device_flow_sign_in(
 }
 
 /// Prints the device flow's user code and verification url unmissably: this
-/// is the moment a non-engineer copies a code into a browser.
-fn print_device_code(start: &crystalline_remote::DeviceFlowStart) {
+/// is the moment a non-engineer copies a code into a browser. The line under
+/// the box is the confirmation guidance's first sentence - what to do next,
+/// not just where to type the code - so the same warning that trips people
+/// up (closing the tab instead of clicking Authorize) is in view up front.
+fn print_device_code(start: &crystalline_remote::DeviceFlowStart, auth_base: &str) {
     eprintln!();
     eprintln!("================================================");
     eprintln!("  Go to: {}", start.verification_url);
     eprintln!("  Enter this code: {}", start.user_code);
     eprintln!("================================================");
+    eprintln!(
+        "{}",
+        first_sentence(&crystalline_remote::github::auth::confirmation_guidance(
+            auth_base
+        ))
+    );
     eprint!("Waiting for confirmation");
+}
+
+/// The first sentence of `text`, period included - `confirmation_guidance`'s
+/// opening sentence is the one line of it that fits under the code box; the
+/// rest (the applications url, the enterprise policy note) is repeated in
+/// full elsewhere rather than crammed in here.
+fn first_sentence(text: &str) -> &str {
+    match text.find(". ") {
+        Some(period) => &text[..=period],
+        None => text,
+    }
+}
+
+/// Maps a `run_device_flow` outcome to the error `crystalline connect
+/// github` prints. `RemoteError::AuthExpired` means the device code expired
+/// before the browser side finished - GitHub's own reason for that says
+/// nothing about Authorize, so this says it: what happened, the Authorize
+/// reminder repeated, and where to check whether an earlier attempt already
+/// landed. Every other error passes through unchanged; a declined sign-in,
+/// offline and the rest already carry their own actionable message.
+fn device_flow_error(auth_base: &str, e: crystalline_remote::RemoteError) -> anyhow::Error {
+    if matches!(e, crystalline_remote::RemoteError::AuthExpired) {
+        // "Next time:" frames the repeated Authorize sentence as advice for
+        // the retry rather than an instruction to act on a code that no
+        // longer exists - the sentence itself is reused verbatim from
+        // `confirmation_guidance` (via `first_sentence`) rather than
+        // reworded here, so there is still exactly one place that wording
+        // lives.
+        anyhow!(
+            "The code expired before it was authorized. Next time: {} Check {} to see whether an earlier attempt already landed.",
+            first_sentence(&crystalline_remote::github::auth::confirmation_guidance(
+                auth_base
+            )),
+            crystalline_remote::github::auth::authorized_apps_url(auth_base)
+        )
+    } else {
+        anyhow!("{e}")
+    }
 }
 
 /// The bare host `TokenStore::save_resolving` and `resolve_and_load` address,
@@ -1898,10 +2661,17 @@ const HEALTHCHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 /// capped at whatever time remains before the deadline, tracked by hand
 /// since there is no thread involved to enforce it from outside. On
 /// success, prints the health body (the `{"status":"ok","version":...}` JSON
-/// that also lands in `docker inspect`) and returns `Ok`; any failure -
-/// connection refused, a timeout, a non-200 status or a malformed response -
-/// comes back as a single-line `Err` naming the address it failed against,
-/// so the process exits nonzero through the normal error path.
+/// that also lands in `docker inspect`, carrying `started_by` and `http`
+/// beside those two: how the daemon was started and the endpoint it was asked
+/// to bind, so the container `HEALTHCHECK` surfaces the start mode in `docker
+/// inspect` too. Both are added keys, so a monitor reading `status` is
+/// unaffected, and the Host allow-list is deliberately not among them - this
+/// route is unguarded, so it carries nothing an unauthenticated caller should
+/// not read. `crystalline status` is where the allow-list is reported) and
+/// returns `Ok`; any failure - connection refused, a timeout, a non-200 status
+/// or a malformed response - comes back as a single-line `Err` naming the
+/// address it failed against, so the process exits nonzero through the normal
+/// error path.
 ///
 /// B14 exemption: unlike the other data verbs, this default output is not given
 /// a human rendering and does not honor `--json`. The line printed here is the
@@ -2049,8 +2819,19 @@ fn print_report(r: &crystalline_index::SyncReport) {
     } else {
         String::new()
     };
+    // Likewise the cross-domain pass: silent on a run that had nothing left to
+    // settle, and explicit when references only resolved once every other
+    // domain of the run was indexed.
+    let late = if r.relations_resolved_late > 0 || r.links_resolved_late > 0 {
+        format!(
+            " ({} relations, {} links resolved across domains at the end)",
+            r.relations_resolved_late, r.links_resolved_late
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged{}, {} relations resolved, {} links resolved ({} ms)",
+        "{}: {} added, {} updated, {} deleted, {} moved, {} unchanged{}, {} relations resolved, {} links resolved ({} ms){}",
         r.domain,
         r.added,
         r.updated,
@@ -2060,10 +2841,163 @@ fn print_report(r: &crystalline_index::SyncReport) {
         deferred,
         r.relations_resolved,
         r.links_resolved,
-        r.duration_ms
+        r.duration_ms,
+        late
     );
     for (path, err) in &r.failed {
         println!("  failed: {path}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod review_plan_tests {
+    use super::review_plan_lines;
+
+    /// An actor whose files could not be listed is in the plan, and the plan
+    /// says so.
+    ///
+    /// Leaving review mode refuses outright while any part of the overlay
+    /// cannot be read, so the person answering the plan has to learn it from
+    /// the plan rather than from a refusal they did not expect.
+    #[test]
+    fn the_plan_names_an_actor_whose_files_could_not_be_read() {
+        let plan = serde_json::json!({
+            "actors": [
+                { "actor": "ada", "entries": 0, "files_unreadable": true, "drafts": [] },
+            ],
+            "contested_paths": [],
+            "contested_addresses": [],
+        });
+        let lines = review_plan_lines(&plan).join("\n");
+        assert!(
+            lines.contains("the files ada has drafted could not be read"),
+            "the plan names them and says what could not be read: {lines}"
+        );
+        assert!(
+            lines.contains("review mode cannot be taken off until they can"),
+            "and what that means for the answer being asked for: {lines}"
+        );
+    }
+
+    /// A file in the plan is named as one, on the actor's own line and on its
+    /// own row.
+    ///
+    /// What folding does to a page and what it does to a file are different
+    /// enough to be worth a word: a page becomes text the team reads, a file
+    /// becomes bytes in the team's folder. A plan that called both "drafts"
+    /// would leave the person answering it to find that out afterwards.
+    #[test]
+    fn the_plan_says_which_of_the_draft_changes_is_a_file() {
+        let plan = serde_json::json!({
+            "actors": [
+                { "actor": "ada", "entries": 3, "drafts": [
+                    { "path": "alpha.md", "permalink": "alpha", "tombstone": false, "conflict": null },
+                    { "path": "assets/deck.png", "kind": "file", "tombstone": false, "conflict": null },
+                    { "path": "assets/old.png", "kind": "file", "tombstone": true, "conflict": null },
+                ]},
+                { "actor": "bo", "entries": 1, "drafts": [
+                    { "path": "beta.md", "permalink": "beta", "tombstone": false, "conflict": null }
+                ]},
+            ],
+            "contested_paths": [],
+            "contested_addresses": [],
+        });
+        let lines = review_plan_lines(&plan).join("\n");
+        assert!(
+            lines.contains("ada (3 draft changes, 2 of them files)"),
+            "her line counts them and says how many are files: {lines}"
+        );
+        assert!(
+            lines.contains("    drafted the file assets/deck.png")
+                && lines.contains("    deleted the file assets/old.png"),
+            "and each file row says which it is: {lines}"
+        );
+        assert!(
+            lines.contains("  bo (1 draft(s))"),
+            "an actor drafting no files reads exactly as they always did: {lines}"
+        );
+        assert!(
+            lines.contains("    drafted alpha.md"),
+            "and so does a page: {lines}"
+        );
+    }
+
+    /// Both kinds of trouble a fold runs into reach the person answering the
+    /// plan, because a plan that shows one and hides the other is a clean plan
+    /// that then refuses - which is the one thing this whole direction is
+    /// built to avoid.
+    #[test]
+    fn the_plan_names_a_contested_path_and_a_contested_address() {
+        let plan = serde_json::json!({
+            "actors": [
+                { "actor": "ada", "entries": 1, "drafts": [
+                    { "path": "alpha.md", "permalink": "shared", "tombstone": false, "conflict": null }
+                ]},
+                { "actor": "bo", "entries": 1, "drafts": [
+                    { "path": "beta.md", "permalink": "shared", "tombstone": false, "conflict": null }
+                ]},
+            ],
+            "contested_paths": [{ "path": "plan.md", "actors": ["ada", "bo"] }],
+            "contested_addresses": [
+                { "permalink": "shared", "paths": ["alpha.md", "beta.md"], "actors": ["ada", "bo"] }
+            ],
+        });
+        let lines = review_plan_lines(&plan).join("\n");
+        assert!(
+            lines.contains("plan.md is drafted by ada and bo"),
+            "the contested path: {lines}"
+        );
+        assert!(
+            lines.contains("'shared'") && lines.contains("alpha.md") && lines.contains("beta.md"),
+            "the contested address names itself and both paths: {lines}"
+        );
+    }
+
+    /// A domain nobody is drafting in says so and asks for nothing.
+    #[test]
+    fn an_empty_plan_asks_for_no_answer() {
+        let lines = review_plan_lines(&serde_json::json!({ "actors": [] })).join("\n");
+        assert!(lines.contains("Nobody is drafting"), "{lines}");
+        assert!(!lines.contains("--fold"), "{lines}");
+    }
+}
+
+#[cfg(test)]
+mod index_reach_words_tests {
+    use super::{daemon_answered_badly, listing_not_reached};
+
+    /// A daemon that answered badly is a different state from a locked file,
+    /// and says so without borrowing the lock sentence.
+    #[test]
+    fn a_bad_answer_names_the_daemon_not_a_lock() {
+        let words = daemon_answered_badly("this listing", "domain_stats failed");
+        assert!(words.contains("running Crystalline daemon"), "{words}");
+        assert!(words.contains("crystalline doctor --fix"), "{words}");
+        assert!(
+            words.ends_with("The daemon reported: domain_stats failed"),
+            "{words}"
+        );
+        assert!(!words.contains("owns the index at"), "{words}");
+    }
+
+    /// A failure that never reached a daemon does not blame one. The daemon
+    /// probe and the database-path resolution both fail through the same
+    /// `reach_index` return, and only one of them is the daemon's doing.
+    #[test]
+    fn a_failure_that_never_reached_a_daemon_does_not_name_one() {
+        let words = listing_not_reached(
+            "this listing",
+            "could not resolve the default database path",
+        );
+        assert!(!words.contains("daemon"), "{words}");
+        assert!(
+            words.contains("crystalline doctor"),
+            "a remedy a person can paste: {words}"
+        );
+        assert!(
+            words.ends_with("The failure was: could not resolve the default database path"),
+            "and the raw text trails rather than leads: {words}"
+        );
     }
 }
 
@@ -2168,6 +3102,73 @@ mod connect_identity_tests {
             "{:?}",
             path(&machine)
         );
+    }
+}
+
+#[cfg(test)]
+mod first_sentence_tests {
+    use super::first_sentence;
+
+    #[test]
+    fn the_period_is_included_and_nothing_after_it() {
+        assert_eq!(first_sentence("One. Two. Three."), "One.");
+    }
+
+    #[test]
+    fn text_with_no_period_space_comes_back_whole() {
+        assert_eq!(
+            first_sentence("No sentence break here"),
+            "No sentence break here"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_flow_error_tests {
+    use super::device_flow_error;
+
+    /// The one mapped case: an expired code gets the Authorize reminder and
+    /// the applications url, not GitHub's bare "device_code expired".
+    #[test]
+    fn auth_expired_repeats_the_authorize_sentence_and_the_applications_url() {
+        let err = device_flow_error(
+            "https://github.com",
+            crystalline_remote::RemoteError::AuthExpired,
+        )
+        .to_string();
+        assert!(err.contains("expired"), "{err}");
+        assert!(err.contains("Authorize"), "{err}");
+        assert!(
+            err.contains("https://github.com/settings/connections/applications"),
+            "{err}"
+        );
+    }
+
+    /// A GHES auth base carries through to the applications url in the
+    /// mapped message, same as everywhere else this is derived.
+    #[test]
+    fn auth_expired_derives_the_applications_url_from_a_ghes_auth_base() {
+        let err = device_flow_error(
+            "https://github.example.com",
+            crystalline_remote::RemoteError::AuthExpired,
+        )
+        .to_string();
+        assert!(
+            err.contains("https://github.example.com/settings/connections/applications"),
+            "{err}"
+        );
+    }
+
+    /// Every other error passes through unchanged - it already carries its
+    /// own actionable message.
+    #[test]
+    fn every_other_error_passes_through_unchanged() {
+        let err = device_flow_error(
+            "https://github.com",
+            crystalline_remote::RemoteError::Offline,
+        )
+        .to_string();
+        assert_eq!(err, crystalline_remote::RemoteError::Offline.to_string());
     }
 }
 

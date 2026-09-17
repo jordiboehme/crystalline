@@ -25,6 +25,7 @@ const FRONTMATTER: EngramFrontmatter = {
   staleAfter: null,
   verified: [],
   generatedBy: null,
+  generatedModel: null,
 };
 
 function draw(overrides: Partial<EngramFrontmatter> = {}) {
@@ -68,17 +69,59 @@ describe("DetailsPanel", () => {
   test("the latest verification is the stamp that speaks for the engram", () => {
     draw({
       verified: [
-        { by: "human:ada", at: "2026-01-01T09:00:00+01:00" },
-        { by: "human:jordi", at: "2026-02-01T10:00:00+01:00" },
+        { by: "human:ada", model: null, at: "2026-01-01T09:00:00+01:00" },
+        { by: "human:jordi", model: null, at: "2026-02-01T10:00:00+01:00" },
       ],
     });
-    expect(screen.getByText("human:jordi on 2026-02-01")).toBeInTheDocument();
+    expect(screen.getByText("jordi (human) on 2026-02-01")).toBeInTheDocument();
   });
 
   test("who captured the engram is stated in a reader's words", () => {
     draw({ generatedBy: "human:jordi" });
     expect(screen.getByText("Captured by")).toBeInTheDocument();
     expect(screen.getByText("jordi (human)")).toBeInTheDocument();
+  });
+
+  test("shows the model beside the writer", () => {
+    draw({
+      generatedBy: "claude-code/2.1.271",
+      generatedModel: "claude-opus-5",
+    });
+    expect(
+      screen.getByText("claude-code (agent, 2.1.271) with claude-opus-5"),
+    ).toBeInTheDocument();
+  });
+
+  test("shows a verification's model", () => {
+    draw({
+      verified: [
+        {
+          by: "claude-code/2.1.271",
+          model: "claude-opus-5",
+          at: "2026-02-01T10:00:00+01:00",
+        },
+      ],
+    });
+    expect(
+      screen.getByText(
+        "claude-code (agent, 2.1.271) with claude-opus-5 on 2026-02-01",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  test("the captured-by and verified-by writers are formatted the same way", () => {
+    // Both rows name the same actor, so a reader who is not the same person
+    // reading both rows should not see "Jordi" in one and "human:jordi" in
+    // the other - the raw stored form must never surface here.
+    draw({
+      generatedBy: "human:jordi",
+      verified: [
+        { by: "human:jordi", model: null, at: "2026-02-01T10:00:00+01:00" },
+      ],
+    });
+    expect(screen.queryByText(/human:jordi/)).toBeNull();
+    expect(screen.getByText("jordi (human)")).toBeInTheDocument();
+    expect(screen.getByText("jordi (human) on 2026-02-01")).toBeInTheDocument();
   });
 
   test("an engram that records no writer is attributed to nobody", () => {
@@ -110,7 +153,7 @@ describe("DetailsPanel", () => {
       screen.getByText("crystalline://playground/lantern-protocol"),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Copy address" }),
+      screen.getByRole("button", { name: "Copy crystalline:// address" }),
     ).toBeInTheDocument();
     // The outcome is announced beside the control rather than written into
     // its label, so the control keeps the name a reader navigates by.

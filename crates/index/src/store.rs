@@ -15,12 +15,13 @@
 //! flip and a foreign OKF bundle both stay first-class.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
 pub use crystalline_core::config::DomainKind;
 use crystalline_core::{Engram, slugify};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::sweep::UnresolvedRef;
@@ -35,7 +36,11 @@ pub struct EngramId(pub i64);
 
 /// The recorded file identity used by the sync prefilter: modification time and
 /// size are the cheap comparison, the SHA-256 is the authoritative one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because the daemon serves a domain's stamps over the ctl
+/// `file_stamps` command, which is how `crystalline doctor` reads the index
+/// while the daemon holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStamp {
     /// Modification time in whole seconds since the Unix epoch.
     pub mtime: i64,
@@ -60,6 +65,203 @@ pub struct ObservationRecord {
     pub context: Option<String>,
 }
 
+/// The SQL expression that resolves one reference row to an engram id, or to
+/// NULL when nothing answers to it.
+///
+/// One rule, shared by both backends and by both reference tables, because a
+/// second copy of it would be a second answer to "does this link resolve".
+/// `table` is `relation` or `link` (or the alias a statement gave one); every
+/// construct here is spelled the same in both dialects, and the one predicate
+/// that is not, the actor screen, is handed in ready-made by the backend that
+/// owns its spelling.
+///
+/// The tie-break is `e.id` on both backends, and it is `e.id` for two reasons
+/// rather than one. It is collation-free - an integer sorts the same way under
+/// every locale, so neither dialect has to spell a collation to agree with the
+/// other. And it is free of an index cost that a path tie-break is not: turso
+/// can satisfy `ORDER BY e.path` from `idx_engram_path_actor`, so naming the
+/// path here talked the planner out of the title index and turned the title
+/// arm of every unresolved reference into a scan of the whole domain (measured
+/// at 2.4 s for 500 dangling references where the seek takes 25 ms, and the
+/// resolve pass runs on every sync of every domain, reviewed or not). Ordering
+/// by the primary key costs no sorter at all, on either arm.
+///
+/// `candidates` says whose rows may answer. [`ReferenceCandidates::Base`]
+/// emits the text this expression has always emitted plus the new tie-break,
+/// so a base row's references and a direct domain's index pass are otherwise
+/// byte for byte what they were; the other two read one actor's view, with
+/// that actor's own row preferred at an address the base also answers.
+///
+/// Three readings, in the order [`crystalline_core::address::resolve`] tries
+/// them: the target as a permalink in the target domain, the target as a title
+/// there, and - only when the row names a domain nobody registered - the whole
+/// bracket text as a permalink and then a title in the row's OWN domain.
+///
+/// That third reading is what makes an engram titled `Log: Weekly Garden Notes`
+/// reachable. The parser splits that into a domain and a target exactly as it
+/// splits `ops:Runbook`, because nothing inside the brackets says which it is,
+/// and only the registry can settle it. It stays a second question rather than
+/// a softer answer: a prefix that does name a domain never reaches it, and a
+/// row written before `to_raw` existed compares against NULL, which is never
+/// true, so it resolves exactly as it did before until its engram is reindexed.
+pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) -> String {
+    let target_domain = format!(
+        "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
+    );
+    let unregistered = format!(
+        "{table}.to_domain IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
+    );
+    // The tie-break itself: a bare `LIMIT 1` with no secondary sort key leaves
+    // a tie between two candidate rows unpinned, and the row it hands back
+    // then depends on physical layout rather than on the address. The row with
+    // the lower id wins, which is deterministic, spelled the same in both
+    // dialects and served from the primary key.
+    //
+    // `find_engram` pins its own tie to the byte-lower path instead, so the two
+    // can name different rows where two engrams in one domain share a title -
+    // the oldest of them answers a reference, the byte-first of them answers a
+    // lookup. Both are deterministic and locale-free, which is what a tie-break
+    // owes; making them the same key would cost the lookup the same index the
+    // path ordering costs this one, so they are two answers on purpose.
+    let id_order = "e.id";
+    // Which rows may answer, and - when more than one may - which of them wins
+    // at the same address. `Base` is the literal base predicate and no
+    // preference beyond the id tie-break.
+    let (actor_screen, prefer) = match candidates {
+        ReferenceCandidates::Base => ("e.actor = ''", format!(" ORDER BY {id_order}")),
+        ReferenceCandidates::View { screen } | ReferenceCandidates::DraftsOnly { screen } => (
+            screen,
+            // The author's own row first, said as an ordering rather than as
+            // a second COALESCE arm so one arm stays one statement; `0` sorts
+            // before `1` in every dialect and needs no collation of its own.
+            // The id tie-break settles a further tie within that class.
+            format!(" ORDER BY CASE WHEN e.actor = '' THEN 1 ELSE 0 END, {id_order}"),
+        ),
+    };
+    format!(
+        "COALESCE(\
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND e.permalink = {table}.to_target \
+          AND e.domain_id = {target_domain}{prefer} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND lower(e.title) = lower({table}.to_target) \
+          AND e.domain_id = {target_domain}{prefer} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND {unregistered} AND e.permalink = {table}.to_raw \
+          AND e.domain_id = {table}.domain_id{prefer} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND {unregistered} \
+          AND lower(e.title) = lower({table}.to_raw) \
+          AND e.domain_id = {table}.domain_id{prefer} LIMIT 1))"
+    )
+}
+
+/// Whose rows may answer a reference, for [`reference_match`].
+///
+/// Three candidate sets and no fourth. The share-link grants of a later task
+/// widen a set by adding one more `OR` to the screen a caller hands in here,
+/// never by adding a rule of their own, so this stays the one place that says
+/// what a reference may land on.
+pub(crate) enum ReferenceCandidates<'a> {
+    /// The base rows alone: what the domain's files say, which is what a base
+    /// row's own references resolve against and what every reader who names no
+    /// actor reads. There is one base and many readers, so a base row's edges
+    /// are never resolved in anybody's view.
+    Base,
+    /// One actor's view - their own live drafts laid over the base - with their
+    /// own row preferred wherever both answer at the same address. `screen` is
+    /// that actor's composed screen, built by the caller's own backend so the
+    /// tombstone column keeps each dialect's spelling; it excludes tombstones,
+    /// which is what makes a path its author deleted answer nothing they write.
+    View { screen: &'a str },
+    /// One actor's live drafts and nothing else: what a base reference that
+    /// binds to nothing may still reach at READ time for that one reader,
+    /// without the base fallback that is already stored in `to_id`.
+    DraftsOnly { screen: &'a str },
+}
+
+/// The resolve pass over one reference table: bind every row whose `to_id` is
+/// still NULL to the engram its bracket text names.
+///
+/// One statement. Target domain is `to_domain` when set, else the row's own
+/// domain. Prefer a permalink match, then a title match, then the whole
+/// bracket text at home - see [`reference_match`].
+///
+/// Shared by both backends because the text is the same in both dialects down
+/// to the bind placeholder, which is the one argument: `?1` for turso, `$1` for
+/// postgres. Built here rather than inline in the four trait methods so the
+/// plan guards - `the_reference_resolve_pass_seeks_the_title_index` in
+/// `turso/mod.rs` and the registry in `tests/plans.rs` - explain the statement
+/// the stores actually issue. The pass runs on every sync of every domain and
+/// is O(dangling references), so each of its four arms has to be an index seek;
+/// a hand-copied literal in a test is what let the title arm lose its index
+/// once already.
+#[doc(hidden)]
+pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
+    format!(
+        "UPDATE {table} SET to_id = {resolved} \
+         WHERE {table}.to_id IS NULL AND {table}.domain_id = {placeholder} \
+         AND {resolved} IS NOT NULL",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
+/// One step of the graph traversal over the `relation` table: every edge with
+/// an endpoint on the frontier, both endpoints screened.
+///
+/// Shared by both backends because the template is byte-identical in the two
+/// dialects: every dialect-specific piece is inside one of the three fragments
+/// the caller builds with its own placeholders and binds through its own
+/// parameter list. A second copy of this is a second thing that can lose the
+/// `dst` screen, which is why there is only one.
+///
+/// A draft's relation and link rows are written exactly as a base row's, so a
+/// frontier that stops at those tables walks them without ever naming the table
+/// that knows whose they are: the traversal would push a row's id into the
+/// visited set and the node hydrate - which does carry the screen - would then
+/// drop it, leaving an edge with no node and engrams pulled into the
+/// neighbourhood through somebody else's private draft. Both endpoints are
+/// screened, because an edge reaching INTO a row this reader may not see is as
+/// far outside their graph as one leaving it.
+///
+/// `tgt` carries no screen and wants none: it is the row the reference was
+/// bound to, read for its address alone, and the screen that decides what this
+/// reader may meet is the one on `dst` beside it.
+#[doc(hidden)]
+pub fn relation_frontier_sql(
+    list: &str,
+    src_screen: &str,
+    dst_screen: &str,
+    rel_pending: &str,
+) -> String {
+    format!(
+        "SELECT r.engram_id, dst.id, r.rel_type FROM relation r \
+         JOIN engram src ON src.id=r.engram_id AND {src_screen} \
+         JOIN engram tgt ON tgt.id=r.to_id \
+         JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+           AND {dst_screen} \
+         WHERE r.to_id IS NOT NULL \
+           AND (r.engram_id IN ({list}) OR r.to_id IN ({list})){rel_pending}"
+    )
+}
+
+/// The prose-link twin of [`relation_frontier_sql`] over the `link` table, and
+/// shared, screened and redirected for the same reasons.
+#[doc(hidden)]
+pub fn link_frontier_sql(
+    list: &str,
+    src_screen: &str,
+    dst_screen: &str,
+    link_pending: &str,
+) -> String {
+    format!(
+        "SELECT l.engram_id, dst.id FROM link l \
+         JOIN engram src ON src.id=l.engram_id AND {src_screen} \
+         JOIN engram tgt ON tgt.id=l.to_id \
+         JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+           AND {dst_screen} \
+         WHERE l.to_id IS NOT NULL \
+           AND (l.engram_id IN ({list}) OR l.to_id IN ({list})){link_pending}"
+    )
+}
+
 /// One relation bullet, ready to index. `to_id` is filled by
 /// [`Store::resolve_pending_relations`] once the target exists.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +274,15 @@ pub struct RelationRecord {
     pub to_target: String,
     /// An explicit cross-domain target domain, or `None` for same-domain.
     pub to_domain: Option<String>,
+    /// The bracket text exactly as it was written, colon and all.
+    ///
+    /// Kept beside the split because the split is domain-agnostic and can be
+    /// wrong: `[[Log: Weekly Garden Notes]]` and `[[ops:Runbook]]` are the same
+    /// shape, and only the registry tells them apart. Resolution reads this
+    /// when the prefix names no registered domain, and it is the only thing
+    /// that can - `to_domain` and `to_target` have by then lost the whitespace
+    /// the colon was trimmed around.
+    pub to_raw: String,
 }
 
 /// One prose wikilink, treated as a direct link edge.
@@ -83,6 +294,15 @@ pub struct LinkRecord {
     pub to_target: String,
     /// An explicit cross-domain target domain, or `None` for same-domain.
     pub to_domain: Option<String>,
+    /// The bracket text exactly as it was written, colon and all.
+    ///
+    /// Kept beside the split because the split is domain-agnostic and can be
+    /// wrong: `[[Log: Weekly Garden Notes]]` and `[[ops:Runbook]]` are the same
+    /// shape, and only the registry tells them apart. Resolution reads this
+    /// when the prefix names no registered domain, and it is the only thing
+    /// that can - `to_domain` and `to_target` have by then lost the whitespace
+    /// the colon was trimmed around.
+    pub to_raw: String,
 }
 
 /// A fully prepared engram row plus its child rows and file stamp. Built from a
@@ -125,6 +345,21 @@ pub struct EngramRecord {
     pub links: Vec<LinkRecord>,
     /// The file stamp for the sync prefilter.
     pub stamp: FileStamp,
+    /// Whose row this is: the empty string for the base row - the one the
+    /// domain's files on disk say exists - and an actor key for that actor's
+    /// private draft of the same path.
+    ///
+    /// [`EngramRecord::from_engram`] never sets it, and that is the rule rather
+    /// than an omission: a record built by parsing a file describes what is on
+    /// disk, which is the base row by definition. An overlay write names its
+    /// actor as an argument, so the only records carrying one here are those a
+    /// caller built for an actor on purpose.
+    pub actor: String,
+    /// Whether this row is an actor's draft deletion of the base row at the
+    /// same path rather than a draft replacement of it. Never true on a base
+    /// row: the base is what the files say, and a file that is gone has no row
+    /// at all.
+    pub tombstone: bool,
 }
 
 fn date_str(d: Option<NaiveDate>) -> Option<String> {
@@ -196,6 +431,7 @@ impl EngramRecord {
                 rel_type: r.rel_type.clone(),
                 to_target: r.target.target.clone(),
                 to_domain: r.target.domain.clone(),
+                to_raw: r.target.raw.clone(),
             })
             .collect();
         let links = engram
@@ -205,6 +441,7 @@ impl EngramRecord {
                 line: l.line,
                 to_target: l.target.target.clone(),
                 to_domain: l.target.domain.clone(),
+                to_raw: l.target.raw.clone(),
             })
             .collect();
 
@@ -226,6 +463,8 @@ impl EngramRecord {
             relations,
             links,
             stamp,
+            actor: String::new(),
+            tombstone: false,
         }
     }
 }
@@ -418,6 +657,22 @@ pub struct SearchQuery {
     /// domain. The value is a literal path, so `%` and `_` in a folder name are
     /// escaped rather than matched as wildcards.
     pub path_prefix: Option<String>,
+    /// Whose rows to search: `None` is the base dimension alone - the rows the
+    /// domains' files on disk say exist - and `Some(actor)` is that actor's own
+    /// drafts folded in over it.
+    ///
+    /// The fold is a shadowing one, so an engram is one answer however many
+    /// rows carry it. A draft at a path no file holds is a hit of its own; a
+    /// draft over a base row replaces it; a draft deletion (a tombstone) takes
+    /// the base row away and is never a hit itself. Nobody else's drafts are
+    /// ever in range: the value is one actor key, and the predicate reads it
+    /// literally.
+    ///
+    /// `None` is what every unauthenticated reader and every caller on a domain
+    /// that reviews nothing gets, and the backends emit the base predicate
+    /// verbatim for it, so a search that names no actor is the search that was
+    /// there before this dimension existed.
+    pub actor: Option<String>,
     /// Page size.
     pub limit: usize,
     /// One-based page number.
@@ -510,6 +765,11 @@ pub struct GraphNode {
     /// The engram's exact frontmatter status; feeds the retired-status fade in
     /// context ranking.
     pub status: String,
+    /// Whose row this is: empty for the base row the domain's files describe,
+    /// and the actor's key for one of their own drafts. A reader only ever
+    /// meets their own, so a non-empty value means "this is your draft" and is
+    /// what the graph verbs mark a node with.
+    pub actor: String,
 }
 
 /// Whether an edge came from a relation bullet or a prose wikilink.
@@ -737,6 +997,24 @@ pub struct StoredEngram {
     pub content: String,
     /// The lowercase hex SHA-256 of `content`, the CAS token.
     pub sha256: String,
+    /// Whose row this is: the empty string for the base row, an actor key for
+    /// that actor's draft of the same path.
+    pub actor: String,
+    /// Whether the row is an actor's draft deletion of the base row rather than
+    /// a draft replacement of it.
+    ///
+    /// A tombstone is a full row like any other and nothing empties the columns
+    /// beside this flag, so `content` may well hold whatever the caller wrote
+    /// there. A reader decides by this flag, never by finding the content
+    /// empty.
+    pub tombstone: bool,
+    /// The row's own engram id, which is what its chunks, observations and
+    /// graph edges key to.
+    ///
+    /// Here because a draft is a full row: a caller serving one has to be able
+    /// to ask the index about that row's edges, and for a draft at a path no
+    /// base row holds there is no other id to ask with.
+    pub id: EngramId,
 }
 
 /// One inbound reference to an engram: a relation or a prose link that resolves
@@ -752,6 +1030,18 @@ pub struct InboundRef {
     pub src_path: String,
     /// The exact target text used in the link.
     pub to_target: String,
+    /// The domain the reference named, when it named one: `Some("open")` for
+    /// `[[open:Thing]]`, `None` for a bare `[[Thing]]`.
+    ///
+    /// Here because `to_target` alone cannot tell the two apart, and a caller
+    /// that rewrites the bracket text has to. The cross-domain move rewrites
+    /// bare links only: for a prefixed one the bracket text on disk is not
+    /// `[[{to_target}]]`, so a needle built from `to_target` either misses it -
+    /// or, when the same file also holds a bare link with that exact text,
+    /// matches the wrong one and reports the rewrite as a success. A colon
+    /// title (`[[Log: Weekly Notes]]`, which resolves by title) reaches that
+    /// loop the same way, since parsing splits it at the colon.
+    pub to_domain: Option<String>,
     /// Whether the reference came from a relation bullet or a prose link.
     pub kind: EdgeKind,
 }
@@ -811,6 +1101,18 @@ pub struct InboundQuery<'a> {
     /// Keep only references carrying this relation type ([`LINKS_TO`] for prose
     /// wikilinks). `None` selects every relation.
     pub rel: Option<&'a str>,
+    /// Domain names whose references are left out entirely: the private
+    /// domains the caller asking may not see. Empty for a caller who may see
+    /// everything, which is the usual case.
+    ///
+    /// Subtracted inside the query rather than from its answer, and from all
+    /// three of the statements it runs - the page, the total and the
+    /// per-relation summary. A caller that filtered the returned page would
+    /// hand out short pages and a `total` that counts what it did not show,
+    /// and a count that disagrees with its rows says a reference exists
+    /// somewhere the reader may not look, which is exactly the fact being
+    /// kept.
+    pub exclude_domains: &'a [String],
     /// One-based page number.
     pub page: usize,
     /// Page size.
@@ -899,6 +1201,19 @@ pub struct EmbeddingRow {
     pub embedding: Vec<f32>,
     /// The vector dimensionality.
     pub dims: usize,
+}
+
+/// One engram's lead vector: the embedding of its first chunk (`seq = 0`)
+/// for one model, as [`Store::lead_vectors`] returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeadVector {
+    /// The engram the lead chunk belongs to.
+    pub engram_id: EngramId,
+    /// The vector dimensionality, as the chunk row declares it. Carried so a
+    /// caller can skip a pair of mismatched widths rather than compare them.
+    pub dims: usize,
+    /// The lead chunk's embedding, exactly as the backend stored it.
+    pub vector: Vec<f32>,
 }
 
 /// A freshly computed chunk to store against an engram. Produced by the chunker
@@ -1018,6 +1333,65 @@ pub struct DomainStats {
     /// The host's last heartbeat, RFC 3339, when hosted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_heartbeat_at: Option<String>,
+    /// When this domain was last seen registered in the configuration, RFC
+    /// 3339, or `None` when it has never been stamped. Written by
+    /// [`Store::stamp_registered`].
+    ///
+    /// `None` means never stamped. It is emphatically not an old timestamp: a
+    /// caller comparing ages treats `None` as no evidence of staleness, never
+    /// as infinitely old. Every domain row written before the column existed
+    /// reads `None`, so a fresh upgrade must find nothing collectable on its
+    /// first sweep.
+    pub last_registered: Option<String>,
+    /// When a forced rebuild of this domain was stamped as started, RFC 3339,
+    /// or `None` when no rebuild is in flight. Written by
+    /// [`Store::begin_rebuild`] and cleared by [`Store::end_rebuild`] inside
+    /// the transaction that commits the rebuild.
+    ///
+    /// A set value reads as history, not as liveness: nothing clears it when
+    /// the process that stamped it is killed, which is exactly what makes it
+    /// useful. A reader that also sees a live `reindex` activity may say a
+    /// rebuild is running, though not that it is this domain's (the activity
+    /// record carries no domain); one that does not must say a rebuild did not
+    /// finish and that this domain's rows are the ones from before it - they
+    /// are complete rows either way, because a rebuild never clears anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild_started: Option<String>,
+    /// Which rebuild verb stamped [`DomainStats::rebuild_started`] - `full` or
+    /// `wipe` - or `None` when no rebuild is in flight (and for a marker a
+    /// binary older than the column stamped).
+    ///
+    /// The two verbs are opposites and a reader must not describe one as the
+    /// other: a forced rebuild destroys nothing, so the domain's rows are the
+    /// complete ones from before it; a wipe destroyed every row and every
+    /// embedding before it started, so what is there is only what its rebuild
+    /// managed before it stopped. `None` is read as neither: say that a rebuild
+    /// did not finish and name the command that finishes it, and claim nothing
+    /// about what is in the rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebuild_kind: Option<String>,
+}
+
+/// Which rebuild verb is stamping a domain's marker: `reindex --full`, which
+/// destroys nothing, or `reindex --wipe`, which destroyed every row and every
+/// embedding before it began. Carried into [`Store::begin_rebuild`] so an
+/// interrupted run can be described in the words of the verb that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildKind {
+    /// `reindex --full`: every file re-read, nothing destroyed.
+    Full,
+    /// `reindex --wipe`: the index emptied first, embeddings and all.
+    Wipe,
+}
+
+impl RebuildKind {
+    /// The word stored in the marker column and printed to a person.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RebuildKind::Full => "full",
+            RebuildKind::Wipe => "wipe",
+        }
+    }
 }
 
 /// The instance currently holding a file domain's host lock in a shared
@@ -1198,6 +1572,60 @@ pub(crate) fn build_vocabulary(
     }
 }
 
+/// Sum several vocabularies into one, ordered exactly as a single sweep over
+/// the same domains would order it.
+///
+/// This exists for the one caller that cannot ask SQL for what it wants: a
+/// vocabulary sweep for a caller who may not read every domain. The store's own
+/// sweep is all-domains or one domain, so such a caller reads the domains it may
+/// see and merges here - and the merge is [`build_vocabulary`] itself, fed the
+/// summed per-name counts, so the result cannot order or shape itself
+/// differently from a sweep the store answered in one query.
+pub fn merge_vocabularies(parts: Vec<Vocabulary>) -> Vocabulary {
+    let mut engram_tags: HashMap<String, i64> = HashMap::new();
+    let mut observation_tags: HashMap<String, i64> = HashMap::new();
+    let mut categories: HashMap<String, i64> = HashMap::new();
+    let mut relation_types: HashMap<String, i64> = HashMap::new();
+    let mut types: HashMap<String, i64> = HashMap::new();
+    let mut statuses: HashMap<String, i64> = HashMap::new();
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    fn sum(into: &mut HashMap<String, i64>, rows: Vec<NamedCount>) {
+        for row in rows {
+            *into.entry(row.name).or_default() += row.count;
+        }
+    }
+    for part in parts {
+        for tag in part.tags {
+            // A zero count is a name SQL would never have grouped, so it is not
+            // carried into the pair lists `build_vocabulary` expects.
+            if tag.engrams != 0 {
+                *engram_tags.entry(tag.name.clone()).or_default() += tag.engrams;
+            }
+            if tag.observations != 0 {
+                *observation_tags.entry(tag.name).or_default() += tag.observations;
+            }
+        }
+        sum(&mut categories, part.categories);
+        sum(&mut relation_types, part.relation_types);
+        sum(&mut types, part.types);
+        sum(&mut statuses, part.statuses);
+        aliases.extend(
+            part.aliases
+                .into_iter()
+                .map(|alias| (alias.alias, alias.canonical)),
+        );
+    }
+    build_vocabulary(
+        engram_tags.into_iter().collect(),
+        observation_tags.into_iter().collect(),
+        categories.into_iter().collect(),
+        relation_types.into_iter().collect(),
+        types.into_iter().collect(),
+        statuses.into_iter().collect(),
+        aliases,
+    )
+}
+
 /// The backend-agnostic storage interface. All methods are async so a network
 /// backend can implement the same trait.
 #[async_trait]
@@ -1214,6 +1642,17 @@ pub trait Store: Send + Sync {
         path: Option<&str>,
         kind: DomainKind,
     ) -> Result<DomainId>;
+
+    /// The id of a domain the index already holds, or `None` for a name it has
+    /// never been told about. A pure read: it registers nothing.
+    ///
+    /// [`Store::upsert_domain`] is the other way to a [`DomainId`] and it
+    /// writes, which is fine for a verb that is about to write anyway and wrong
+    /// for one that is answering a question. A status call counting somebody's
+    /// drafts, or a removal asking who would lose work, has to reach the rows
+    /// without registering a domain on the way - and has to stay answerable on
+    /// a read-only instance, where a write is refused outright.
+    async fn domain_id(&self, name: &str) -> Result<Option<DomainId>>;
 
     /// The recorded file stamps for a domain, keyed by domain-relative path.
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>>;
@@ -1248,10 +1687,14 @@ pub trait Store: Send + Sync {
     async fn all_engram_contents(&self, domain: DomainId) -> Result<Vec<StoredEngram>>;
 
     /// Delete every engram (and its child and chunk rows) in a single domain,
-    /// keeping the domain row itself. This is the scoped clear the full reindex
-    /// uses per file domain so virtual-domain rows, whose only source of truth is
-    /// the database, are never destroyed. Contrast [`Store::wipe`], which clears
+    /// keeping the domain row itself. The scoped clear behind `domain remove`
+    /// and the orphaned-row sweep. Contrast [`Store::wipe`], which clears
     /// everything.
+    ///
+    /// A reindex does not use this, and deliberately: `--full` re-reads and
+    /// re-upserts instead, so rows a reader is using are never absent between
+    /// a clear and the rebuild that would have refilled them, and an unchanged
+    /// chunk keeps its embedding.
     async fn clear_domain(&self, domain: DomainId) -> Result<()>;
 
     /// Delete the engram at a domain-relative path and all its child rows.
@@ -1398,6 +1841,11 @@ pub trait Store: Send + Sync {
     /// inside it, and a summary that shrank as it was used would be a map that
     /// redraws itself while it is being read.
     ///
+    /// [`InboundQuery::exclude_domains`] is the one narrowing all three of
+    /// them honor, summary included: it is not a filter a reader chose but the
+    /// set of domains that reader may not see, and a count that named one
+    /// would be the disclosure the exclusion is for.
+    ///
     /// Ordered by title, then permalink, then domain, then relation, byte-wise
     /// on both backends, so paging is stable and a page boundary never drops or
     /// repeats a row.
@@ -1406,7 +1854,19 @@ pub trait Store: Send + Sync {
     /// Every relation and prose link that points out of the given engram, each
     /// carrying whether it currently resolves to a target in the index. Ordered
     /// by source line. Backs the `read_engram` resolution flags.
-    async fn outbound_refs(&self, engram_id: EngramId) -> Result<Vec<OutboundRef>>;
+    ///
+    /// `actor` is who is asking. `None` reads the stored `to_id` and nothing
+    /// else, which is the domain's own verdict and the answer this gave before
+    /// the dimension existed. `Some(a)` reads it in that actor's view, which
+    /// moves exactly two verdicts and no others: a bound reference into a path
+    /// they have deleted reads unresolved for them, and an unbound one that
+    /// their own draft answers reads resolved. Both are read-time readings of
+    /// the same stored row - the row is never rewritten for a reader.
+    async fn outbound_refs(
+        &self,
+        engram_id: EngramId,
+        actor: Option<&str>,
+    ) -> Result<Vec<OutboundRef>>;
 
     /// Every relation and prose link written in a domain whose target the index
     /// could not bind, as the consolidation sweep's `V102` input.
@@ -1429,7 +1889,54 @@ pub trait Store: Send + Sync {
     /// the `idx_relation_unresolved` and `idx_link_unresolved` partial indexes,
     /// so the cost tracks the number of dangling references rather than the size
     /// of the domain.
-    async fn unresolved_refs(&self, domain: DomainId) -> Result<Vec<UnresolvedRef>>;
+    ///
+    /// `actor` is who is asking, the same dimension [`Store::outbound_refs`]
+    /// names. `None` is the domain's own queue: the rows its files hold, judged
+    /// by the stored `to_id`. `Some(a)` is that actor's queue - the base rows
+    /// their drafts do not shadow plus their own drafts - judged in their view,
+    /// so a base link their draft answers is not reported to them, a base link
+    /// into a path they deleted is, and their own drafts' dangling references
+    /// stand beside the domain's. Ordered the same way in both arms.
+    async fn unresolved_refs(
+        &self,
+        domain: DomainId,
+        actor: Option<&str>,
+    ) -> Result<Vec<UnresolvedRef>>;
+
+    /// Re-resolve one actor's own references in their own view, and answer how
+    /// many bound.
+    ///
+    /// Two statements per reference table, inside whatever transaction the
+    /// caller has open. First what dangles is unbound: a `to_id` naming a row
+    /// nobody holds any more is the trace of a draft that went away, and
+    /// leaving it would be an edge into nothing. Then what is pending is bound,
+    /// against [`ReferenceCandidates::View`] - their own drafts first, then the
+    /// base - so the author's links follow their own rows as those rows are
+    /// written, dropped and folded.
+    ///
+    /// Scoped to that actor's rows on purpose: the base resolvers
+    /// ([`Store::resolve_pending_relations`] and its twin) stay exactly as they
+    /// are and keep answering for the domain, because a base row's edges are a
+    /// fact about the domain rather than about a reader.
+    ///
+    /// **A binding is made once and not revisited, and two cases follow from
+    /// that.** A reference bound before its author tombstoned the target stays
+    /// bound, since a tombstone deletes nothing - and that one the reader's own
+    /// screen settles at every surface that reads an edge, because the deleted
+    /// path is where the binding points. The other it does not: a reference
+    /// bound to a base row, whose author LATER writes a page of their own
+    /// answering to the same name at a different path, goes on naming the base
+    /// row. Neither statement here moves it (it does not dangle, and it is not
+    /// pending) and no screen can, because the two pages sit at two addresses.
+    /// A third statement that unbound every bound reference to see whether a
+    /// newer row of the author's would beat it is what that would take, and it
+    /// would rewrite an author's settled links on every write they make. The
+    /// binding is the reading that held when the reference was written, which
+    /// is the honest answer rather than the better one.
+    ///
+    /// An empty `actor` is a [`crate::IndexError::Constraint`], like
+    /// [`Store::upsert_overlay`]: the empty string is the base row's own key.
+    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64>;
 
     /// Run a search and return one page of hits plus the total match count.
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
@@ -1450,7 +1957,20 @@ pub trait Store: Send + Sync {
 
     /// Return the neighborhood of a set of seed engrams up to `depth` hops
     /// (`1..=3`), following relations and links across domain boundaries.
-    async fn neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice>;
+    ///
+    /// `actor` is the same dimension [`SearchQuery::actor`] names: `None` walks
+    /// the base rows alone - the graph the domains' files describe, and the
+    /// traversal this ran before the dimension existed - and `Some(a)` walks
+    /// that actor's shadowed view. Both ends of every edge are screened, so an
+    /// edge into a row the reader may not see is not walked at all rather than
+    /// walked and then dropped at the hydrate, which would leave an edge with
+    /// no node and pull engrams in through somebody else's private draft.
+    async fn neighbors(
+        &self,
+        ids: &[EngramId],
+        depth: u8,
+        actor: Option<&str>,
+    ) -> Result<GraphSlice>;
 
     /// Return recent engrams matching a filter, newest first.
     async fn recent(&self, filter: &RecentFilter) -> Result<Vec<EngramSummary>>;
@@ -1493,8 +2013,55 @@ pub trait Store: Send + Sync {
     /// default search mode.
     async fn embedding_coverage(&self) -> Result<EmbeddingCoverage>;
 
-    /// Delete all indexed data, keeping the schema. The corruption-recovery and
-    /// full-reindex path.
+    /// Every engram in `domain` whose first chunk carries an embedding by
+    /// `model`, with that vector, ordered by engram id. The maintenance
+    /// sweep's `V301` compares these pairwise, so the projection is exactly
+    /// the lead chunk - title, description and opening body - and nothing
+    /// wider: one row per engram, never one per chunk. A row whose stored
+    /// width disagrees with its `dims` column is skipped rather than
+    /// returned mis-sized.
+    ///
+    /// `actor` says whose view of the domain the vectors are, the same
+    /// dimension [`SearchQuery::actor`] names: `None` is the base rows alone -
+    /// what the domain's files say exists, and byte for byte the statement
+    /// this method ran before the dimension existed - and `Some(a)` is that
+    /// actor's shadowed view, their own drafts standing in for the base rows
+    /// they are drafts of, their deletions taking a path away, and nobody
+    /// else's drafts ever in range. The dimension is explicit in what this
+    /// takes rather than in what it returns: the caller already knows whose
+    /// view it asked for, and a [`LeadVector`] is the widest row the index
+    /// hands out, so stamping an actor on each one would pay per vector for a
+    /// fact that is constant across the call.
+    ///
+    /// Unbounded on purpose, and the cost is the caller's to bound: every
+    /// matching engram in the domain comes back, so this materializes
+    /// `dims * 4` bytes of payload per engram plus per-vector heap overhead,
+    /// twice over at the peak (the database rows and the decoded output are
+    /// both live inside the call). At the default model's 384 dims that is
+    /// roughly 1.5 KB an engram, so a hundred thousand of them is hundreds of
+    /// megabytes.
+    ///
+    /// The one caller, the sweep's per-domain fact assembly, takes the whole
+    /// fetch knowingly: it already parses every engram in the domain and holds
+    /// each body, so the vectors add a fraction to a cost that was linear in
+    /// domain size anyway, and a domain over the sweep's `MAX_TWIN_VECTORS`
+    /// pays for vectors it then declines to compare. There is deliberately no
+    /// count method to skip on - adding one, or pushing the sweep's rule filter
+    /// down so a run that cannot emit `V301` never asks, is the named follow-up
+    /// in the backlog. Until it lands, a new caller with a ceiling should
+    /// assume this returns everything.
+    async fn lead_vectors(
+        &self,
+        domain: DomainId,
+        model: &str,
+        actor: Option<&str>,
+    ) -> Result<Vec<LeadVector>>;
+
+    /// Delete all indexed data, keeping the schema. The corruption-recovery
+    /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary
+    /// rebuild (`--full`) never comes here, because destroying every embedding
+    /// to re-read files that mostly did not change costs hours and buys
+    /// nothing.
     async fn wipe(&self) -> Result<()>;
 
     /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file
@@ -1512,11 +2079,139 @@ pub trait Store: Send + Sync {
     /// Record that a domain finished syncing at the given RFC 3339 instant.
     async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()>;
 
+    /// Record that every named domain was seen registered at the given RFC
+    /// 3339 instant, writing `last_registered` on each matching row.
+    ///
+    /// Domains are named rather than identified because the caller is the
+    /// configuration, which knows names. A name with no row in the index is a
+    /// silent no-op: this stamps rows, it never creates them. An empty set is
+    /// a no-op too, so a configuration that registers nothing is not an error.
+    ///
+    /// The caller must pass the configuration's own registrations, read the
+    /// way a named lookup resolves them (including a re-read of the config
+    /// file on disk), not a cached or narrower approximation of that set. A
+    /// domain that is genuinely registered but missing from the set handed in
+    /// here goes unstamped, ages, and is indistinguishable from one that was
+    /// removed - which, for a caller that collects on the stamp, is data loss.
+    ///
+    /// The stamp is how a later reader tells a domain removed a week ago from
+    /// one whose configuration was edited an hour ago. Absence of a stamp
+    /// (`DomainStats::last_registered` reading `None`) means *never stamped*,
+    /// not *stamped infinitely long ago*: a caller aging the stamp must treat
+    /// `None` as no evidence of staleness and leave the row alone, so the
+    /// first sweep after an upgrade, when every pre-existing row reads `None`,
+    /// collects nothing.
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()>;
+
+    /// Stamp a domain as having a forced rebuild in flight, `when` being an RFC
+    /// 3339 instant and `kind` the verb that is running. Written in the first
+    /// lock window of the domain's rebuild, before anything is read from disk.
+    ///
+    /// The kind is stamped with the instant because the two verbs leave
+    /// opposite states behind and a reader cannot tell them apart afterwards:
+    /// an interrupted `--full` left complete rows from before it, an
+    /// interrupted `--wipe` left whatever its rebuild had managed and no
+    /// embeddings at all.
+    ///
+    /// The stamp is durable on purpose. The in-memory activity record the
+    /// daemon keeps dies with the process, and the incident this exists for was
+    /// on the daemonless path, which has no activity record at all: whatever
+    /// runs, the fact that a rebuild started has to outlive the process that
+    /// started it, so an interrupted run is never read as a normal one.
+    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()>;
+
+    /// Clear a domain's rebuild stamp. Called from inside the transaction that
+    /// commits the rebuild's apply, so the marker is set exactly while that
+    /// domain's rebuild is unfinished and is never cleared by a run that did
+    /// not finish one.
+    async fn end_rebuild(&self, domain: DomainId) -> Result<()>;
+
+    /// The unreadable database this store was opened beside, when it was opened
+    /// resiliently and found one. `None` for every ordinary open, and for every
+    /// backend but the embedded one: corruption recovery is a local file
+    /// concern.
+    ///
+    /// A rebuild that had to move a damaged database out of the way says where
+    /// the bytes went, rather than leaving a person to guess whether anything
+    /// was kept. See [`crate::TursoStore::open_resilient`].
+    fn set_aside_database(&self) -> Option<PathBuf> {
+        None
+    }
+
+    // --- the actor dimension -------------------------------------------------
+    // An overlay entry is one actor's private draft of a path in a shared
+    // domain: a full `engram` row carrying that actor's key, sitting beside the
+    // base row - the one the domain's files on disk say exists - rather than
+    // replacing it. Because it is a full row, its chunks, embeddings and graph
+    // rows key to its id exactly as a base row's do, and nothing downstream has
+    // to learn a second shape.
+    //
+    // Every method above this comment reads the base and only the base. These
+    // five are the whole of the other direction, and all of them name their
+    // actor. The empty actor never reaches a base row through any of them:
+    // `upsert_overlay` refuses it outright, because a write that fell through
+    // to the base is the one failure this dimension exists to prevent, while
+    // the three readers answer as they would for an actor holding nothing -
+    // `None`, empty, `false`.
+
+    /// Write one actor's draft of a path, replacing that actor's previous draft
+    /// there. Returns the row's id, which is stable across rewrites so the
+    /// chunks already keyed to it survive.
+    ///
+    /// `actor` is authoritative and `record.actor` is ignored, so a caller
+    /// cannot write into one actor's overlay while naming another. An empty
+    /// `actor` is a [`crate::IndexError::Constraint`]: the empty string is the
+    /// base row's own key, and a draft that silently overwrote the base would
+    /// be the one failure this whole dimension exists to prevent.
+    ///
+    /// A tombstone - this actor's draft deletion of the base row - is written
+    /// the same way, with `record.tombstone` set.
+    async fn upsert_overlay(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId>;
+
+    /// One actor's draft at a domain-relative path, or `None` when that actor
+    /// holds none there. A tombstone is a draft like any other and is returned,
+    /// carrying its flag; a caller deciding what a reader sees reads the flag
+    /// rather than the absence.
+    async fn overlay_entry(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<StoredEngram>>;
+
+    /// Every draft one actor holds in a domain, ordered by path. Tombstones
+    /// included, for the same reason.
+    async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>>;
+
+    /// Drop one actor's draft at a path. Returns whether a row was there to
+    /// drop, so a caller can tell "cleared" from "there was nothing to clear"
+    /// without asking twice.
+    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool>;
+
+    /// How many drafts each actor holds in a domain, ordered by actor. Base
+    /// rows are not counted and an actor holding none is not listed, so an
+    /// empty answer means nobody is drafting here.
+    async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>>;
+
     /// Diagnostics about the open store.
     async fn store_info(&self) -> Result<StoreInfo>;
 
     /// Per-domain counts, in registration order.
     async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
+
+    /// Every domain name the index holds, sorted.
+    ///
+    /// The cheap half of [`Store::domain_stats`], for the caller that needs to
+    /// know *which* domains have rows rather than how many rows each has. One
+    /// column of a table with a row per domain, against six correlated counting
+    /// scans per domain - which matters because the serving screen asks this on
+    /// every read, and a domain name is all it wants.
+    async fn domain_names(&self) -> Result<Vec<String>>;
 
     /// The vocabulary in use: tag, observation-category, relation-type, engram
     /// `type` and engram `status` usage counts, for one domain or (when
@@ -1524,7 +2219,13 @@ pub trait Store: Send + Sync {
     /// An unknown domain name yields empty vectors rather than an error, so a
     /// caller can probe a domain that holds no engrams yet. The vectors are
     /// sorted by usage in Rust for cross-backend determinism.
-    async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary>;
+    ///
+    /// `actor` is who is asking. `None` - every caller that shows a person the
+    /// vocabulary - answers the team's own list, because a tag one author is
+    /// trying out in a draft is not yet the domain's agreement. `Some(a)` reads
+    /// that actor's view, and the one caller that passes it is the sweep's tag
+    /// drift rule, whose finding is about what that author wrote.
+    async fn vocabulary(&self, domain: Option<&str>, actor: Option<&str>) -> Result<Vocabulary>;
 
     // --- attachments ---------------------------------------------------------
     // Binary assets under a domain's `assets/` folder. The metadata row is the

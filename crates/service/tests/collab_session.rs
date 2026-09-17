@@ -111,7 +111,7 @@ async fn synced_client(
 async fn the_first_join_loads_the_file_and_greets_with_hello_and_step1() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "crlf").await.unwrap();
+    let joined = sessions.join("eng", "crlf", None).await.unwrap();
 
     let messages = messages_of(&joined.greeting);
     // Message 1: the hello control carrying the recorded separator.
@@ -144,7 +144,7 @@ async fn the_first_join_loads_the_file_and_greets_with_hello_and_step1() {
 async fn a_client_syncs_and_reads_the_lf_session_text() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "crlf").await.unwrap();
+    let joined = sessions.join("eng", "crlf", None).await.unwrap();
 
     // The client answers the greeting's SyncStep1 with its own SyncStep1 and
     // receives SyncStep2 carrying everything it is missing.
@@ -167,7 +167,7 @@ async fn a_non_ascii_engram_round_trips_byte_for_byte() {
     // session exactly as it went in, or the first save would rewrite it.
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "wide").await.unwrap();
+    let joined = sessions.join("eng", "wide", None).await.unwrap();
 
     let doc = synced_client(&joined.session, joined.conn).await;
     let text = doc.get_or_insert_text("content");
@@ -183,8 +183,8 @@ async fn a_non_ascii_engram_round_trips_byte_for_byte() {
 async fn an_update_from_one_conn_fans_out_tagged_with_its_origin() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let alice = sessions.join("eng", "alpha").await.unwrap();
-    let mut bob = sessions.join("eng", "alpha").await.unwrap();
+    let alice = sessions.join("eng", "alpha", None).await.unwrap();
+    let mut bob = sessions.join("eng", "alpha", None).await.unwrap();
 
     // Alice edits: a client-side doc synced first, then an insert, sent as an
     // Update frame the way the provider would send it.
@@ -224,8 +224,8 @@ async fn an_update_from_one_conn_fans_out_tagged_with_its_origin() {
 async fn awareness_states_fan_out_and_null_on_disconnect() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let alice = sessions.join("eng", "alpha").await.unwrap();
-    let mut bob = sessions.join("eng", "alpha").await.unwrap();
+    let alice = sessions.join("eng", "alpha", None).await.unwrap();
+    let mut bob = sessions.join("eng", "alpha", None).await.unwrap();
 
     // Alice announces presence: client 7 with a user state, hand-framed the
     // way y-protocols encodes it (same reference shape as collab_wire.rs).
@@ -265,7 +265,7 @@ async fn awareness_states_fan_out_and_null_on_disconnect() {
 async fn a_late_joiner_is_greeted_with_the_presence_already_in_the_room() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let alice = sessions.join("eng", "alpha").await.unwrap();
+    let alice = sessions.join("eng", "alpha", None).await.unwrap();
     let update = yrs::sync::AwarenessUpdate {
         clients: std::collections::HashMap::from([(
             ClientID::new(7),
@@ -280,7 +280,7 @@ async fn a_late_joiner_is_greeted_with_the_presence_already_in_the_room() {
         .handle_frame(alice.conn, &Message::Awareness(update).encode_v1())
         .await;
 
-    let bob = sessions.join("eng", "alpha").await.unwrap();
+    let bob = sessions.join("eng", "alpha", None).await.unwrap();
     let messages = messages_of(&bob.greeting);
     let Some(Message::Awareness(full)) = messages.get(2) else {
         panic!("the greeting closes with the awareness picture: {messages:?}");
@@ -292,7 +292,7 @@ async fn a_late_joiner_is_greeted_with_the_presence_already_in_the_room() {
 async fn an_awareness_query_is_answered_directly_not_broadcast() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let alice = sessions.join("eng", "alpha").await.unwrap();
+    let alice = sessions.join("eng", "alpha", None).await.unwrap();
     let update = yrs::sync::AwarenessUpdate {
         clients: std::collections::HashMap::from([(
             ClientID::new(9),
@@ -321,7 +321,7 @@ async fn an_awareness_query_is_answered_directly_not_broadcast() {
 async fn a_malformed_frame_is_dropped_without_killing_the_session() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
 
     let replies = joined
         .session
@@ -341,7 +341,7 @@ async fn a_malformed_frame_is_dropped_without_killing_the_session() {
 async fn mixed_endings_and_full_rooms_are_refused() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let refused = sessions.join("eng", "mixed").await.unwrap_err();
+    let refused = sessions.join("eng", "mixed", None).await.unwrap_err();
     assert!(matches!(
         refused,
         crystalline_service::collab::session::JoinError::MixedEndings
@@ -349,9 +349,9 @@ async fn mixed_endings_and_full_rooms_are_refused() {
 
     let mut joined = Vec::new();
     for _ in 0..MAX_PARTICIPANTS {
-        joined.push(sessions.join("eng", "alpha").await.unwrap());
+        joined.push(sessions.join("eng", "alpha", None).await.unwrap());
     }
-    let over = sessions.join("eng", "alpha").await.unwrap_err();
+    let over = sessions.join("eng", "alpha", None).await.unwrap_err();
     assert!(matches!(
         over,
         crystalline_service::collab::session::JoinError::SessionFull
@@ -362,7 +362,7 @@ async fn mixed_endings_and_full_rooms_are_refused() {
 async fn an_unknown_engram_is_an_engine_error_not_a_session() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let refused = sessions.join("eng", "ghost").await.unwrap_err();
+    let refused = sessions.join("eng", "ghost", None).await.unwrap_err();
     assert!(matches!(
         refused,
         crystalline_service::collab::session::JoinError::Engine(_)
@@ -378,14 +378,14 @@ async fn an_unknown_engram_is_an_engine_error_not_a_session() {
 async fn the_last_leave_disposes_the_session() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
-    let joined = sessions.join("eng", "alpha").await.unwrap();
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
     assert_eq!(sessions.session_count().await, 1);
     let last = joined.session.remove_conn(joined.conn).await;
     assert!(last);
     sessions.dispose_if_empty(&joined.session).await;
     assert_eq!(sessions.session_count().await, 0);
     // A fresh join is a fresh epoch: the restart-detection signal.
-    let again = sessions.join("eng", "alpha").await.unwrap();
+    let again = sessions.join("eng", "alpha", None).await.unwrap();
     assert_ne!(again.session.epoch(), joined.session.epoch());
 }
 
@@ -393,8 +393,8 @@ async fn the_last_leave_disposes_the_session() {
 async fn a_populated_session_survives_dispose_if_empty() {
     let (_tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let alice = sessions.join("eng", "alpha").await.unwrap();
-    let bob = sessions.join("eng", "alpha").await.unwrap();
+    let alice = sessions.join("eng", "alpha", None).await.unwrap();
+    let bob = sessions.join("eng", "alpha", None).await.unwrap();
     assert!(
         Arc::ptr_eq(&alice.session, &bob.session),
         "the second join shares the document"
@@ -404,4 +404,161 @@ async fn a_populated_session_survives_dispose_if_empty() {
     assert!(!last, "bob is still connected");
     sessions.dispose_if_empty(&alice.session).await;
     assert_eq!(sessions.session_count().await, 1, "bob keeps it alive");
+}
+
+// --- one room per overlay document -------------------------------------------
+
+/// A file domain `team` in review mode holding MANIFEST and alpha, plus the
+/// state directory the overlay mirror is written under. The third fixture in
+/// this file rather than a parameter on the first: a reviewing domain is a
+/// different world from a direct one, and every assertion about it reads
+/// better beside the domain it is about.
+async fn review_fixture() -> (tempfile::TempDir, Arc<Engine>, support::ScratchStateDir) {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- Everything the team knows\n\n## When to Use\n\n- Route here for team questions\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine, scratch)
+}
+
+/// One account's draft of `alpha`, written as the door would have resolved
+/// them: in review mode a save is a draft of that actor's, standing over the
+/// file rather than replacing it.
+async fn draft_alpha(engine: &Engine, account: &str, body: &str) {
+    let scope = crystalline_service::Scope::User {
+        account: account.to_string(),
+        admin: false,
+    };
+    let checksum = engine
+        .read_engram(
+            &crystalline_service::params::ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("team".to_string()),
+                share_link: None,
+            },
+            &scope,
+        )
+        .await
+        .unwrap()["checksum"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let receipt = engine
+        .save_engram(
+            &crystalline_service::params::SaveParams {
+                domain: "team".to_string(),
+                identifier: "alpha".to_string(),
+                content: ALPHA.replace("A rule about alpha.", body),
+                expected_checksum: checksum,
+            },
+            &scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["draft"],
+        serde_json::json!(true),
+        "the save is a draft of {account}'s: {receipt}"
+    );
+}
+
+/// A room is one overlay DOCUMENT, so two authors drafting the same page are
+/// two rooms - each opening on its own author's text and hearing nothing of
+/// the other.
+///
+/// The whole of the key change in one test: before it, the pair (domain,
+/// permalink) named one room for a page, which meant whoever was typing in it
+/// was typing into a document that belonged to somebody else.
+#[tokio::test]
+async fn two_overlay_owners_get_two_independent_documents() {
+    let (_tmp, engine, _scratch) = review_fixture().await;
+    draft_alpha(&engine, "alice", "Alice would rather say this.").await;
+    let sessions = CollabSessions::new(engine.clone());
+
+    let alice = sessions.join("team", "alpha", Some("alice")).await.unwrap();
+    let bob = sessions.join("team", "alpha", Some("bob")).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&alice.session, &bob.session),
+        "two overlay owners are two documents, not one shared room"
+    );
+    assert_ne!(alice.session.epoch(), bob.session.epoch());
+    assert_eq!(sessions.session_count().await, 2);
+
+    let alices = synced_client(&alice.session, alice.conn).await;
+    let bobs = synced_client(&bob.session, bob.conn).await;
+    assert!(
+        alices
+            .get_or_insert_text("content")
+            .get_string(&alices.transact())
+            .contains("Alice would rather say this."),
+        "her room opens on her own draft"
+    );
+    assert!(
+        bobs.get_or_insert_text("content")
+            .get_string(&bobs.transact())
+            .contains("A rule about alpha."),
+        "and his opens on the text the team reviewed, which is what he holds"
+    );
+
+    // And what one room hears, the other does not.
+    let update = {
+        let text = alices.get_or_insert_text("content");
+        let mut txn = alices.transact_mut();
+        let end = text.len(&txn);
+        text.insert(&mut txn, end, "typed in alice's room\n");
+        txn.encode_update_v1()
+    };
+    alice
+        .session
+        .handle_frame(
+            alice.conn,
+            &Message::Sync(SyncMessage::Update(update)).encode_v1(),
+        )
+        .await;
+    let (bobs_text, _) = bob.session.snapshot().await;
+    assert!(
+        !bobs_text.contains("typed in alice's room"),
+        "his document is his: {bobs_text}"
+    );
+}
+
+/// Joining the same overlay document twice is one room, which is the other
+/// half of the key: the owner component separates documents and nothing else
+/// does.
+#[tokio::test]
+async fn one_overlay_document_is_one_room_however_many_join_it() {
+    let (_tmp, engine, _scratch) = review_fixture().await;
+    draft_alpha(&engine, "alice", "Alice would rather say this.").await;
+    let sessions = CollabSessions::new(engine.clone());
+
+    let first = sessions.join("team", "alpha", Some("alice")).await.unwrap();
+    let second = sessions.join("team", "alpha", Some("alice")).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&first.session, &second.session),
+        "the second join shares the document"
+    );
+    assert_eq!(sessions.session_count().await, 1);
 }

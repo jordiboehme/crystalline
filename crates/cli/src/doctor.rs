@@ -32,16 +32,27 @@
 //! service artifacts; the rest, including the whole GitHub, environment,
 //! harnesses and provisioning sections, are report-only, and every finding
 //! that has a fix points at the right next command.
+//!
+//! The index reads are socket-first, the same shape `sync_dispatch` uses: a
+//! running daemon holds the index file, so its stamps are asked for over ctl
+//! and only a machine with no daemon (or an invocation an explicit
+//! `--db`/`--config` sends down the direct path) opens the file here. When
+//! neither route can read it, doctor does not abort: every check that does
+//! not need the index still runs, [`DoctorReport::index`] names what stopped
+//! the ones that do and what to do about it, and that counts as one
+//! unresolved problem so the exit code still says something is wrong.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
+use crystalline_core::config::{self, DatabaseBackend, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
-use crystalline_index::{Store, TagCluster, configured_model_id, tag_clusters_with_aliases};
+use crystalline_index::{
+    FileStamp, Store, TagCluster, configured_model_id, tag_clusters_with_aliases,
+};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
 use crystalline_remote::state::{OriginState, verify_base};
@@ -52,6 +63,40 @@ use serde::Serialize;
 use crate::cmd;
 use crate::install;
 use crate::receipt;
+
+/// How `doctor` read the index this run.
+///
+/// Every index-backed check - orphan rows, unindexed files, a virtual
+/// domain's engram count, the embedding summary, tag hygiene - needs one of
+/// these routes to be open, and a diagnostic tool must not abort because
+/// none of them was. The report therefore says which route it took, and the
+/// human render reads the same field rather than guessing why a section is
+/// thin.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum IndexAccess {
+    /// No index file exists yet: a fresh install that has never synced.
+    /// Neither an error nor a problem.
+    #[default]
+    Absent,
+    /// Opened here, in this process. The route a machine with no running
+    /// daemon takes, and the one an explicit `--db` or `--config` always
+    /// takes (see [`crystalline_service::use_daemon`]).
+    Direct,
+    /// Served by the running daemon over its control socket, because that
+    /// daemon holds the index file. Orphan rows and unindexed files come
+    /// from its stamps and read exactly as they do on the direct path; the
+    /// checks that need the open store itself (embedding coverage, tag
+    /// hygiene, a virtual domain's engram count) sit this run out.
+    Daemon,
+    /// Neither route could read the index. Every check that does not need it
+    /// still ran.
+    Unavailable {
+        /// What stopped the index-backed checks and what to do about it, as
+        /// guidance a person can act on rather than a bare locking error.
+        reason: String,
+    },
+}
 
 /// One domain's diagnostics.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -69,6 +114,12 @@ pub struct DomainDoctor {
     /// on-disk orphan and unindexed checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engrams: Option<i64>,
+    /// Whether this domain's index-backed checks ran at all: the orphan and
+    /// unindexed sets below, and a virtual domain's engram count. False when
+    /// no route to the index was open, in which case `orphans` and
+    /// `unindexed` are empty because nothing was read, not because nothing
+    /// was found - [`DoctorReport::index`] says why.
+    pub index_checked: bool,
     /// Whether the path exists on disk.
     pub path_exists: bool,
     /// Whether `MANIFEST.md` is present at the root.
@@ -77,8 +128,14 @@ pub struct DomainDoctor {
     pub orphans: Vec<String>,
     /// How many of `orphans` were removed by `--fix`.
     pub orphans_removed: usize,
-    /// On-disk `.md` files not yet present in the index.
+    /// On-disk `.md` files not yet present in the index. Holds only files that
+    /// parse; a file whose frontmatter fails to parse is never merely
+    /// unsynced, so it is reported under `unsyncable` instead.
     pub unindexed: Vec<String>,
+    /// On-disk `.md` files that cannot be indexed at all, because their
+    /// frontmatter fails to parse (`verify` rule `E001`). Running `sync`
+    /// again never resolves these; the frontmatter itself needs a fix.
+    pub unsyncable: Vec<UnsyncableFile>,
     /// Encoding problems, sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
     /// The instance currently hosting this file domain in a shared database, or
@@ -89,6 +146,23 @@ pub struct DomainDoctor {
     /// The host's last heartbeat, RFC 3339, when hosted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_heartbeat_at: Option<String>,
+    /// When a forced rebuild of this domain was stamped as started, RFC 3339,
+    /// or `None` when none is in flight. Read from the index, so a run served
+    /// by the daemon leaves it absent rather than claiming there is none.
+    ///
+    /// A rebuild clears nothing, so a domain carrying this still holds its
+    /// previous complete rows: the finding is that the refresh did not land,
+    /// never that the data is gone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_started: Option<String>,
+    /// Which verb stamped [`DomainDoctor::rebuild_started`] - `full` or `wipe`
+    /// - or `None` when none is in flight or the kind is not recorded.
+    ///
+    /// The two verbs leave opposite states behind, so the finding is worded
+    /// from this: a forced rebuild destroyed nothing, a wipe destroyed every row
+    /// and every embedding before it began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_kind: Option<String>,
 }
 
 /// One `E006` encoding finding, reported by `doctor`, fixed by `verify`.
@@ -99,6 +173,16 @@ pub struct EncodingIssue {
     /// The source line, when known.
     pub line: Option<usize>,
     /// The human message from `verify`.
+    pub message: String,
+}
+
+/// One `E001` finding: a file whose frontmatter does not parse at all, so no
+/// `sync` will ever index it until the frontmatter itself is fixed.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnsyncableFile {
+    /// The file path, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// The human message from `verify`'s `E001` rule.
     pub message: String,
 }
 
@@ -180,7 +264,9 @@ pub struct GithubDoctor {
 /// filtered to drop `domain.*` and `github.token` rows: those get the richer
 /// dedicated [`EnvironmentDoctor::domains`] and
 /// [`EnvironmentDoctor::github_token`] fields instead, so the flat list never
-/// duplicates them. `database.url` already arrives masked as `"(set)"`.
+/// duplicates them. A credential-carrying key already arrives masked as
+/// `"(set)"` (see `EnvOverlay::active_overrides`, which reads the registry's
+/// secret flag).
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvOverride {
     /// The environment variable, for example `CRYSTALLINE_DATABASE_BACKEND`.
@@ -188,7 +274,8 @@ pub struct EnvOverride {
     /// The settings registry key it overrides, for example
     /// `database.backend`.
     pub key: String,
-    /// The overridden value, masked to `"(set)"` for `database.url`.
+    /// The overridden value, masked to `"(set)"` for a credential-carrying
+    /// key.
     pub value: String,
 }
 
@@ -210,9 +297,9 @@ pub struct EnvDomainReport {
 /// for visibility: never counted as a problem, and never present at all
 /// (`None`) when the environment overlay carries nothing (mirroring how
 /// [`DoctorReport::github`] is absent when collaboration is off). No value
-/// here is a secret: `database.url` and the GitHub token are masked exactly
-/// as [`EnvOverlay::active_overrides`] masks them, and the token itself is
-/// reduced to a boolean.
+/// here is a secret: every credential-carrying key and the GitHub token are
+/// masked exactly as [`EnvOverlay::active_overrides`] masks them, and the
+/// token itself is reduced to a boolean.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnvironmentDoctor {
     /// The `CRYSTALLINE_CONFIG` value, when set. A path, never a secret.
@@ -363,6 +450,106 @@ pub struct ProvisioningDoctor {
     pub pending: Vec<ProvisioningPendingDoctor>,
 }
 
+/// One domain the index still holds rows for and nobody registers any more:
+/// what a 0.17.0 removal left behind, and what any row that outlives its
+/// registration becomes.
+///
+/// Its rows are already unanswerable - search, counts and facets all skip a
+/// domain this instance has no registration for - so this section is about
+/// reclaiming the disk they sit on, never about what an answer contains.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanedDomainDoctor {
+    /// The domain name the index knows the rows under.
+    pub name: String,
+    /// The domain kind, `file` or `virtual`.
+    pub kind: String,
+    /// How many engram rows are at stake.
+    pub engrams: i64,
+    /// How long this domain has been absent from the configuration, in whole
+    /// days. `None` when the index has never recorded it as registered, which
+    /// is every row inherited from a version that did not stamp them: no age
+    /// rather than an age of nothing.
+    pub age_days: Option<i64>,
+    /// Whether `--fix` would collect these rows, and did when this run
+    /// carried it. False for the rows nothing collects: a virtual domain's,
+    /// and every domain's on a read-only instance.
+    pub collectable: bool,
+    /// Whether this run actually collected them.
+    pub collected: bool,
+    /// Why a row that was kept was kept, in the engine's own word:
+    /// `virtual`, `no_rows`, `grace`, `unstamped`, `read_only` or
+    /// `hosted_elsewhere`. `None` when it was collected or would be. Only
+    /// `virtual`, `read_only` and `hosted_elsewhere` can reach a `doctor`
+    /// run, which asks on the on-demand path and consults no stamp, but the
+    /// word is carried verbatim rather than narrowed: the render reads it
+    /// through [`KeptReason`], whose vocabulary is the whole of the engine's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
+}
+
+/// Rows whose domain nobody registers any more, and, when the whole check
+/// declined, why.
+///
+/// `None` on [`DoctorReport::orphaned_rows`] when the check did not run at
+/// all: a `--domain` run (an unregistered domain can never be the one named),
+/// a machine with no index yet, or no route to the one it has.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OrphanedRowsDoctor {
+    /// One entry per domain the index holds rows for and the configuration
+    /// does not name. A domain whose rows are already gone is not listed:
+    /// there is nothing at stake and nothing to do.
+    pub domains: Vec<OrphanedDomainDoctor>,
+    /// Why nothing was collected, when nothing could be: a read-only
+    /// instance, or a configuration that could not be read (and a domain
+    /// cannot be shown absent from a file nobody can read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+    /// What went wrong when the check could not be made at all: the daemon
+    /// refused the request, or the index failed under it. Reported rather
+    /// than swallowed, because an empty section and a section that could not
+    /// be filled look identical to a reader and mean opposite things.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The engine's word for why a kept row was kept, as a closed set.
+///
+/// The render matches this exhaustively, so a word added here without a line
+/// to print for it does not compile. A word the engine grows and this build
+/// does not know parses as `None` and gets a sentence that stays true whatever
+/// it turns out to mean - the one thing a render must never do is assert
+/// something about a reason it cannot read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptReason {
+    /// A virtual domain's rows are its only copy.
+    Virtual,
+    /// Nothing left to collect.
+    NoRows,
+    /// Absent from the configuration, but not for long enough yet.
+    Grace,
+    /// Absent, and never recorded as registered, so its clock starts now.
+    Unstamped,
+    /// This instance is read-only.
+    ReadOnly,
+    /// Another instance holds this domain's host lock and is still serving it.
+    HostedElsewhere,
+}
+
+impl KeptReason {
+    /// The engine's word, or `None` for one this build does not know.
+    fn from_word(word: &str) -> Option<KeptReason> {
+        match word {
+            "virtual" => Some(KeptReason::Virtual),
+            "no_rows" => Some(KeptReason::NoRows),
+            "grace" => Some(KeptReason::Grace),
+            "unstamped" => Some(KeptReason::Unstamped),
+            "read_only" => Some(KeptReason::ReadOnly),
+            "hosted_elsewhere" => Some(KeptReason::HostedElsewhere),
+            _ => None,
+        }
+    }
+}
+
 /// Advisory tag-hygiene diagnostics: near-duplicate tag clusters across the
 /// whole index. Purely informational, the same stance provisioning takes:
 /// never feeds [`DoctorReport::remaining_problems`], since consolidating tags is
@@ -376,6 +563,8 @@ pub struct TagsDoctor {
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
+    /// How the index was read this run, and, when it could not be, why.
+    pub index: IndexAccess,
     /// Per-domain diagnostics.
     pub domains: Vec<DomainDoctor>,
     /// Service lock and socket diagnostics.
@@ -396,6 +585,9 @@ pub struct DoctorReport {
     /// Provisioning diagnostics. `None` when no registered domain declares a
     /// `Provisioning` section at all.
     pub provisioning: Option<ProvisioningDoctor>,
+    /// Rows whose domain nobody registers any more. `None` when the check
+    /// did not run: a `--domain` run, no index yet, or no route to it.
+    pub orphaned_rows: Option<OrphanedRowsDoctor>,
     /// Advisory tag-hygiene diagnostics. `None` when there is no index yet;
     /// present (possibly with an empty cluster list) once one exists.
     pub tags: Option<TagsDoctor>,
@@ -408,12 +600,28 @@ impl DoctorReport {
     /// when this is nonzero, 0 otherwise.
     pub fn remaining_problems(&self) -> usize {
         let mut n = 0;
+        // An index nobody could read is one problem, counted once for the
+        // machine rather than once per domain: the cause is shared, and the
+        // per-domain `index_checked` flags only record which checks it took
+        // down with it. Counting it at all is what keeps the exit code
+        // honest, since a partial report otherwise looks like a clean one.
+        if matches!(self.index, IndexAccess::Unavailable { .. }) {
+            n += 1;
+        }
         for d in &self.domains {
             if !d.path_exists || !d.manifest_present {
                 n += 1;
             }
+            // A rebuild that never finished is a problem a person finishes by
+            // re-running it: the domain is serving complete rows, but they are
+            // the ones from before the rebuild, and nothing clears the marker
+            // on its own.
+            if d.rebuild_started.is_some() {
+                n += 1;
+            }
             n += d.orphans.len().saturating_sub(d.orphans_removed);
             n += d.unindexed.len();
+            n += d.unsyncable.len();
             n += d.encoding_issues.len();
         }
         if self.service.lock_stale && !self.service.lock_removed {
@@ -457,6 +665,18 @@ impl DoctorReport {
                 .filter(|h| h.settings_parse_error.is_some())
                 .count();
         }
+        // Rows whose domain is gone count only while something can be done
+        // about them: a collectable set nobody has collected yet. A virtual
+        // domain's rows, and every row on a read-only instance, are reported
+        // and never counted - no `--fix` collects them, so counting them
+        // would fail doctor forever over a state that has no remedy here.
+        if let Some(o) = &self.orphaned_rows {
+            n += o
+                .domains
+                .iter()
+                .filter(|d| d.collectable && !d.collected)
+                .count();
+        }
         // Provisioning never contributes here, the same stance environment
         // takes: an undecided domain is a normal state awaiting a person's
         // answer, and drift, edited and orphaned rows all self-heal at the
@@ -487,31 +707,53 @@ pub async fn run(
     // the process causing it - the one state where doctor matters most.
     let service = check_service(fix).await?;
 
-    let store = if db.is_file() {
-        Some(
-            crystalline_index::open_store(&cfg.database(), Some(&db), false)
-                .await
-                .map_err(|e| {
-                    let hint = if service.daemon_unresponsive && !service.daemon_dislodged {
-                        let pid = service
-                            .lock_pid
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        format!(
-                            ". An unresponsive daemon (pid {pid}) holds the index and answers nothing; rerun with --fix to replace it"
-                        )
-                    } else {
-                        String::new()
-                    };
-                    anyhow!(
-                        "could not open the index at {}: {e}{hint}",
-                        db.display()
-                    )
-                })?,
-        )
-    } else {
+    // Ahead of doctor's own store, and deliberately: the collection needs the
+    // index too, and it asks the daemon first or opens the file itself. Doing
+    // it while doctor holds its own handle (and its own lock, taken a few
+    // lines below and held to the end of the pass) would be a second opener
+    // of the same file waiting on the first.
+    let orphaned_rows = check_orphaned_rows(
+        domain_filter,
+        fix,
+        config_override,
+        db_override,
+        &db,
+        cfg.database().backend,
+    )
+    .await;
+
+    // The index read, socket-first, in the same shape `sync_dispatch` uses. A
+    // healthy daemon holds the index file, so asking it for the stamps is the
+    // only way the ordinary case (a diagnosis run while the service is up)
+    // gets a report at all. Probed after `check_service` and never before it:
+    // a `--fix` that just dislodged a wedged holder has already run, so this
+    // answer is the current one and the ordering above is preserved.
+    let bypassed = !crystalline_service::use_daemon(db_override, config_override);
+    let mut daemon_stamps = if bypassed {
         None
+    } else {
+        daemon_file_stamps(domain_filter).await
     };
+
+    let mut index = IndexAccess::Absent;
+    let mut store = None;
+    if daemon_stamps.is_some() {
+        index = IndexAccess::Daemon;
+    } else if db.is_file() {
+        match crystalline_index::open_store(&cfg.database(), Some(&db), false).await {
+            Ok(opened) => {
+                index = IndexAccess::Direct;
+                store = Some(opened);
+            }
+            // Not an abort. Every check that does not need the index still
+            // runs below, and the reason travels in the report as guidance.
+            Err(e) => {
+                index = IndexAccess::Unavailable {
+                    reason: index_unavailable_reason(&db, &e.to_string(), &service, bypassed),
+                };
+            }
+        }
+    }
     // Lock once for the whole diagnostic pass: a one-shot CLI command has no
     // concurrent store users, and the helpers take a plain `&dyn Store`.
     let guard = match &store {
@@ -520,9 +762,41 @@ pub async fn run(
     };
     let store_ref: Option<&dyn Store> = guard.as_ref().map(|g| &**g as &dyn Store);
 
+    // The rebuild markers, read once for the whole run rather than per domain.
+    // Only the direct route can read them: the daemon's doctor answer carries
+    // file stamps and nothing else, so a daemon-served run leaves the field
+    // absent rather than reporting a rebuild that is not there.
+    let mut rebuild_markers: HashMap<String, (String, Option<String>)> = HashMap::new();
+    if let Some(store) = store_ref
+        && let Ok(stats) = store.domain_stats().await
+    {
+        for d in stats {
+            if let Some(started) = d.rebuild_started {
+                rebuild_markers.insert(d.name, (started, d.rebuild_kind));
+            }
+        }
+    }
+
     let mut domains = Vec::with_capacity(targets.len());
     for (name, entry) in &targets {
-        domains.push(check_domain(name, entry, store_ref, fix).await?);
+        // Taken out of the daemon's answer rather than borrowed, so each
+        // domain's stamps are consumed once. A file domain the daemon
+        // answered for but has no rows for reads as an empty set, which is
+        // exactly what the direct path produces for an unsynced domain.
+        let stamps = daemon_stamps
+            .as_mut()
+            .map(|by_domain| by_domain.remove(name).unwrap_or_default());
+        domains.push(
+            check_domain(
+                name,
+                entry,
+                store_ref,
+                stamps,
+                rebuild_markers.get(name).cloned(),
+                fix,
+            )
+            .await?,
+        );
     }
 
     let environment = check_environment(&loaded.overlay);
@@ -542,9 +816,10 @@ pub async fn run(
 
     let provisioning = check_provisioning(cfg, &loaded.overlay, &targets)?;
 
-    let tags = check_tags(store_ref).await?;
+    let tags = check_tags(store_ref, cfg).await?;
 
     Ok(DoctorReport {
+        index,
         domains,
         service,
         environment,
@@ -552,9 +827,182 @@ pub async fn run(
         embeddings,
         harnesses,
         provisioning,
+        orphaned_rows,
         tags,
         fix,
     })
+}
+
+/// Rows whose domain nobody registers any more, asked of the daemon that owns
+/// the index and otherwise read from the index directly - the same
+/// daemon-first shape the file stamps above take, with the difference that
+/// this one *writes* when `fix` is set, and can, because the daemon that owns
+/// the index does the writing.
+///
+/// The grace period an unattended sweep waits out is never applied here: a
+/// person running `doctor` is the signal it waits for, so an index inherited
+/// from a version that stranded its rows clears on the first `--fix` rather
+/// than a week after it.
+///
+/// Never an error. A daemon that did not answer and an index that would not
+/// open both leave the section out, and [`DoctorReport::index`] says why in
+/// the run's own words.
+async fn check_orphaned_rows(
+    domain_filter: Option<&str>,
+    fix: bool,
+    config_override: Option<&Path>,
+    db_override: Option<&Path>,
+    db: &Path,
+    backend: DatabaseBackend,
+) -> Option<OrphanedRowsDoctor> {
+    // A `--domain` run answers about the domain it names, and an unregistered
+    // one can never be that: `select_domains` resolves registered names only.
+    // Collecting here would act on domains the reader did not name.
+    if domain_filter.is_some() {
+        return None;
+    }
+    let daemon_may_answer = crystalline_service::use_daemon(db_override, config_override)
+        && instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
+    if !orphan_check_has_a_route(
+        daemon_may_answer,
+        matches!(backend, DatabaseBackend::Turso),
+        db.is_file(),
+    ) {
+        return None;
+    }
+    let report =
+        match crystalline_service::collect_orphaned_domains(!fix, db_override, config_override)
+            .await
+        {
+            Ok(report) => report,
+            // Said out loud rather than dropped. A daemon that refused the
+            // request and an index that failed under it both land here, and
+            // an absent section would be indistinguishable from a machine
+            // with nothing to report.
+            Err(e) => {
+                return Some(OrphanedRowsDoctor {
+                    error: Some(format!("{e:#}")),
+                    ..OrphanedRowsDoctor::default()
+                });
+            }
+        };
+    let dry_run = report.get("dry_run").and_then(serde_json::Value::as_bool) != Some(false);
+    let mut domains = Vec::new();
+    for row in report
+        .get("considered")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let kept = row.get("kept").and_then(serde_json::Value::as_str);
+        // A domain whose rows are already gone has nothing at stake and
+        // nothing to do, and it stays in the index forever (the domain row
+        // outlives its engrams by design), so reporting it would be a line
+        // that never goes away and never means anything.
+        if kept == Some("no_rows") {
+            continue;
+        }
+        let collectable = row.get("collected").and_then(serde_json::Value::as_bool) == Some(true);
+        domains.push(OrphanedDomainDoctor {
+            name: row
+                .get("domain")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            kind: row
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("file")
+                .to_string(),
+            engrams: row
+                .get("engrams")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            age_days: row.get("age_days").and_then(serde_json::Value::as_i64),
+            collectable,
+            // On a preview `collected` is what a real run would take; only a
+            // run that was allowed to write actually took it.
+            collected: collectable && !dry_run,
+            kept: kept.map(str::to_string),
+        });
+    }
+    Some(OrphanedRowsDoctor {
+        domains,
+        skipped: report
+            .get("skipped")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        error: None,
+    })
+}
+
+/// Whether the orphan check has any route to the index worth trying.
+///
+/// The file question is the narrow one it looks like: a Turso install that has
+/// never synced has no index file, and the direct route would create an empty
+/// one to discover that a machine with no knowledge in it has no orphaned
+/// rows. It says nothing about the other two shapes. A daemon answers over its
+/// socket whatever backend it serves, and a Postgres install keeps its index
+/// in a server rather than in that file, so gating either on the file would
+/// suppress the section on an install that has plenty to report.
+fn orphan_check_has_a_route(daemon_may_answer: bool, file_backed: bool, db_exists: bool) -> bool {
+    daemon_may_answer || !file_backed || db_exists
+}
+
+/// The per-domain file stamps a running daemon serves over its ctl socket,
+/// keyed by domain name and then by domain-relative path, or `None` when no
+/// daemon answered.
+///
+/// Never an error: a daemon that is not running, one that refuses the request
+/// and one whose answer does not parse all mean the same thing to the caller,
+/// which is that the direct open is the route to try next.
+async fn daemon_file_stamps(
+    domain: Option<&str>,
+) -> Option<HashMap<String, HashMap<String, FileStamp>>> {
+    let data = crystalline_service::ctl_if_running(
+        serde_json::json!({ "v": 1, "cmd": "file_stamps", "domain": domain }),
+    )
+    .await
+    .ok()??;
+    serde_json::from_value(data.get("domains")?.clone()).ok()
+}
+
+/// Why the index-backed checks did not run, written as guidance: what holds
+/// the index, and the command that gets a full report. A person who runs
+/// `doctor` while a daemon is up used to see nothing but the raw locking
+/// error, which named neither.
+fn index_unavailable_reason(
+    db: &Path,
+    error: &str,
+    service: &ServiceDoctor,
+    bypassed: bool,
+) -> String {
+    let db = db.display();
+    let pid = service
+        .lock_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let skipped = "so the orphan, unindexed, embedding and tag checks did not run";
+    // The wedge first: it is the one holder `--fix` can do something about.
+    if service.daemon_unresponsive && !service.daemon_dislodged {
+        return format!(
+            "an unresponsive daemon (pid {pid}) holds the index at {db} and answers nothing on its socket, {skipped}. Rerun `crystalline doctor --fix` to replace it. The index reported: {error}"
+        );
+    }
+    let live_daemon = instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
+    if live_daemon && bypassed {
+        return format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {db}, and --db or --config told doctor to read that file directly instead of asking the daemon, {skipped}. Run `crystalline doctor` without --db and --config to have the daemon answer them, or stop it first with `crystalline ctl shutdown`. The index reported: {error}"
+        );
+    }
+    if live_daemon {
+        return format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {db} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
+        );
+    }
+    format!(
+        "the index at {db} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+    )
 }
 
 fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
@@ -574,10 +1022,41 @@ fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String,
     }
 }
 
+/// One domain's diagnostics. `daemon_stamps` carries the file stamps a
+/// running daemon served for this domain, which is the index read whenever
+/// the daemon holds the index file; `store` is the direct open, used when
+/// there is no daemon to ask. At most one of the two is ever `Some`, and both
+/// produce the identical orphan, unindexed and unsyncable sets - the split
+/// between "not indexed yet" and "cannot be indexed until the frontmatter is
+/// fixed" is computed here, off the stamps, whichever route delivered them.
 async fn check_domain(
     name: &str,
     entry: &DomainEntry,
     store: Option<&dyn Store>,
+    daemon_stamps: Option<HashMap<String, FileStamp>>,
+    rebuild_marker: Option<(String, Option<String>)>,
+    fix: bool,
+) -> Result<DomainDoctor> {
+    // The marker is stamped onto every shape of report, not only the one the
+    // on-disk checks run to the end of. A domain whose folder has gone is
+    // exactly how a rebuild gets interrupted in the first place, and that
+    // report must still say a rebuild did not finish rather than only that the
+    // path is missing.
+    let mut d = check_domain_checks(name, entry, store, daemon_stamps, fix).await?;
+    if let Some((started, kind)) = rebuild_marker {
+        d.rebuild_started = Some(started);
+        d.rebuild_kind = kind;
+    }
+    Ok(d)
+}
+
+/// [`check_domain`] without the rebuild marker: the path, MANIFEST, orphan,
+/// unindexed and encoding checks themselves.
+async fn check_domain_checks(
+    name: &str,
+    entry: &DomainEntry,
+    store: Option<&dyn Store>,
+    daemon_stamps: Option<HashMap<String, FileStamp>>,
     fix: bool,
 ) -> Result<DomainDoctor> {
     // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
@@ -593,6 +1072,8 @@ async fn check_domain(
             manifest_present: true,
             ..Default::default()
         };
+        // The count needs the store itself, so a run served by the daemon
+        // leaves it absent rather than reporting a fabricated zero.
         if let Some(store) = store {
             let count = store
                 .list_engrams(name, None, None)
@@ -600,6 +1081,7 @@ async fn check_domain(
                 .map(|e| e.len() as i64)
                 .unwrap_or(0);
             d.engrams = Some(count);
+            d.index_checked = true;
         }
         return Ok(d);
     }
@@ -623,35 +1105,62 @@ async fn check_domain(
         return Ok(d);
     }
 
-    // (c) Encoding problems: delegate to verify's E006 rather than
-    // re-implementing BOM/null-byte detection.
+    // (c) Encoding problems and (b') unsyncable files: one verify_paths call
+    // sources both. Encoding delegates to E006 rather than re-implementing
+    // BOM/null-byte detection; E001 (frontmatter that fails to parse at all)
+    // is kept keyed by its root-relative, forward-slashed path so it can be
+    // matched against the unindexed set below - `verify` reports an absolute
+    // path, the unindexed set does not, so they are normalised to the same
+    // shape before comparing.
+    let mut unsyncable_by_path: BTreeMap<String, String> = BTreeMap::new();
     if let Ok(report) = verify::verify_paths([&path], &VerifyOptions::default()) {
-        d.encoding_issues = report
-            .issues
-            .into_iter()
-            .filter(|i| i.rule == "E006")
-            .map(|i| EncodingIssue {
-                path: i.path.display().to_string(),
-                line: i.line,
-                message: i.message,
-            })
-            .collect();
+        for issue in report.issues {
+            match issue.rule {
+                "E006" => {
+                    d.encoding_issues.push(EncodingIssue {
+                        path: issue.path.display().to_string(),
+                        line: issue.line,
+                        message: issue.message,
+                    });
+                }
+                "E001" => {
+                    unsyncable_by_path
+                        .insert(relative_slash_path(&path, &issue.path), issue.message);
+                }
+                _ => {}
+            }
+        }
     }
 
-    // (a) + (b): DB orphans and unindexed files.
-    if let Some(store) = store {
-        let domain_id = store
-            .upsert_domain(
-                name,
-                Some(&path.to_string_lossy()),
-                crystalline_index::DomainKind::File,
-            )
-            .await
-            .map_err(|e| anyhow!("could not read domain '{name}': {e}"))?;
-        let stamps = store
-            .file_stamps(domain_id)
-            .await
-            .map_err(|e| anyhow!("could not read file stamps for '{name}': {e}"))?;
+    // (a) + (b): DB orphans and unindexed files, from whichever route reached
+    // the index. `domain_id` stays `None` on the daemon-served route, which is
+    // what keeps `--fix` from pretending it can delete rows through it.
+    let mut domain_id = None;
+    let stamps = match daemon_stamps {
+        Some(stamps) => Some(stamps),
+        None => match store {
+            Some(store) => {
+                let id = store
+                    .upsert_domain(
+                        name,
+                        Some(&path.to_string_lossy()),
+                        crystalline_index::DomainKind::File,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("could not read domain '{name}': {e}"))?;
+                domain_id = Some(id);
+                Some(
+                    store
+                        .file_stamps(id)
+                        .await
+                        .map_err(|e| anyhow!("could not read file stamps for '{name}': {e}"))?,
+                )
+            }
+            None => None,
+        },
+    };
+    if let Some(stamps) = stamps {
+        d.index_checked = true;
         let on_disk = markdown_rel_paths(&path);
         let disk_set: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
         let db_set: HashSet<&str> = stamps.keys().map(String::as_str).collect();
@@ -668,7 +1177,25 @@ async fn check_domain(
             .collect();
         unindexed.sort();
 
-        if fix {
+        // A path with an E001 finding is not merely unsynced, it cannot be
+        // indexed at all until its frontmatter is fixed - split it out.
+        let mut unsyncable: Vec<UnsyncableFile> = Vec::new();
+        unindexed.retain(|p| match unsyncable_by_path.remove(p) {
+            Some(message) => {
+                unsyncable.push(UnsyncableFile {
+                    path: p.clone(),
+                    message,
+                });
+                false
+            }
+            None => true,
+        });
+        d.unsyncable = unsyncable;
+
+        // Only the direct route can delete. Over a daemon the orphans are
+        // still reported, with the render saying plainly what removing them
+        // takes, rather than being silently left in place.
+        if let (true, Some(store), Some(domain_id)) = (fix, store, domain_id) {
             for p in &orphans {
                 store.delete_engram(domain_id, p).await?;
                 d.orphans_removed += 1;
@@ -679,7 +1206,9 @@ async fn check_domain(
 
         // Ownership: who hosts this file domain in a shared database. Unhosted
         // (single-instance) domains leave this `None`.
-        if let Ok(Some(host)) = store.domain_host(domain_id).await {
+        if let (Some(store), Some(domain_id)) = (store, domain_id)
+            && let Ok(Some(host)) = store.domain_host(domain_id).await
+        {
             d.host_instance_id = Some(host.instance_id);
             d.host_heartbeat_at = Some(host.heartbeat_at);
         }
@@ -711,17 +1240,74 @@ fn markdown_rel_paths(root: &Path) -> Vec<String> {
         {
             continue;
         }
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .unwrap_or(entry.path())
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        out.push(rel);
+        out.push(relative_slash_path(root, entry.path()));
     }
     out
+}
+
+/// `p`, relative to `root` and forward-slashed, matching the shape the sync
+/// engine's own walk produces (and, in turn, what the unindexed and orphan
+/// sets are keyed by). `verify::Issue::path` is constructed from the same
+/// root but stays a platform `PathBuf`, so any comparison against those sets
+/// goes through this first.
+///
+/// The fast path is a literal component-prefix strip: free, and exact for
+/// every caller that built `p` by walking `root` itself (`markdown_rel_paths`
+/// below, always). It can still fail for a path that names the same file but
+/// was produced by a second, independent walk of "the same" root -
+/// `check_domain` passes its own `path` into `verify::verify_paths` by
+/// reference, but a config-round-tripped or Windows-verbatim-prefixed
+/// (`\\?\C:\...`) form can disagree with a plain one even when both resolve
+/// to the identical file (seen on Windows CI: a duplicate-key E001 finding
+/// fell back into `unindexed` instead of `unsyncable`, because keeping the
+/// unstripped absolute path on a failed strip can never equal a relative
+/// entry, so the mismatch produced a wrong bucket with nothing on screen to
+/// say so). Canonicalizing both sides and retrying converges them regardless
+/// of which one carries the mismatched form - `dunce::canonicalize`
+/// specifically, not `std::fs::canonicalize`, because it strips a Windows
+/// verbatim prefix from its result rather than risking adding one, so two
+/// paths naming the same file end up in the same shape either way. If even
+/// that fails (one side no longer exists, a permission error), the file's
+/// own name is returned - still relative, in the shape callers expect,
+/// rather than the absolute string a silent mismatch used to produce. That
+/// last fallback is the one answer this function cannot vouch for: a bare
+/// name does not equal a nested key, and two files of the same name in
+/// different folders collapse onto one. Both would land a finding in the
+/// wrong bucket exactly as the original bug did, so the fallback logs a
+/// warning and the next double fault leaves a trail instead of nothing.
+fn relative_slash_path(root: &Path, p: &Path) -> String {
+    if let Some(rel) = strip_to_slash(root, p) {
+        return rel;
+    }
+    if let (Ok(canon_root), Ok(canon_p)) = (dunce::canonicalize(root), dunce::canonicalize(p))
+        && let Some(rel) = strip_to_slash(&canon_root, &canon_p)
+    {
+        return rel;
+    }
+    // The double fault: neither the literal strip nor the canonicalized retry
+    // could relate the two. A bare file name is the best answer left, and it
+    // may not match the key the caller compares it against, so the fallback
+    // says so rather than repeating the silence this helper exists to end.
+    tracing::warn!(
+        root = %root.display(),
+        path = %p.display(),
+        "could not relate a path to its domain root, falling back to its file name"
+    );
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The literal, zero-cost half of [`relative_slash_path`]: `Some` only when
+/// `root` is exactly a component prefix of `p`.
+fn strip_to_slash(root: &Path, p: &Path) -> Option<String> {
+    let rel = p.strip_prefix(root).ok()?;
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -1065,18 +1651,55 @@ fn check_provisioning(
     }))
 }
 
-/// Advisory tag-hygiene check: the near-duplicate tag clusters across the whole
-/// index. Read-only, mirroring `check_provisioning`'s stance - it reads the
-/// vocabulary and groups it, never touching a file. `None` when there is no
-/// index to read.
-async fn check_tags(store: Option<&dyn Store>) -> Result<Option<TagsDoctor>> {
+/// Advisory tag-hygiene check: the near-duplicate tag clusters across every
+/// domain this machine has registered. Read-only, mirroring
+/// `check_provisioning`'s stance - it reads the vocabulary and groups it, never
+/// touching a file. `None` when there is no index to read.
+///
+/// A domain the index holds rows for and the configuration does not register is
+/// left out, because the advice is to run `crystalline tags merge` and that verb
+/// will not touch such a domain: a cluster only its rows produce would be a
+/// finding nobody can act on. The registrations come from `cfg`, the whole
+/// effective configuration and deliberately not the `--domain` selection, which
+/// would narrow this whole-index check into a different one.
+///
+/// The sweep is the single all-domain query it has always been unless an
+/// unregistered domain is actually there; only then does it become one query
+/// per registered domain, merged - the shape `Engine::vocabulary` takes for the
+/// same reason, since a `Vocabulary` is aggregated counts with no domain on
+/// them to filter by afterwards.
+async fn check_tags(store: Option<&dyn Store>, cfg: &GlobalConfig) -> Result<Option<TagsDoctor>> {
     let Some(store) = store else {
         return Ok(None);
     };
-    let vocab = store
-        .vocabulary(None)
+    let indexed = store
+        .domain_names()
         .await
-        .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?;
+        .map_err(|e| anyhow!("could not read the domain list: {e}"))?;
+    let registered: Vec<&String> = indexed
+        .iter()
+        .filter(|name| cfg.domains.contains_key(*name))
+        .collect();
+    // The team's own list, whoever is drafting: `doctor` reports what the
+    // domain has agreed on, and a word one author is trying out in a draft is
+    // not that.
+    let vocab = if registered.len() == indexed.len() {
+        store
+            .vocabulary(None, None)
+            .await
+            .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?
+    } else {
+        let mut parts = Vec::with_capacity(registered.len());
+        for name in registered {
+            parts.push(
+                store
+                    .vocabulary(Some(name), None)
+                    .await
+                    .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?,
+            );
+        }
+        crystalline_index::merge_vocabularies(parts)
+    };
     Ok(Some(TagsDoctor {
         // Fold declared aliases out first, so a cluster an alias already explains
         // is never surfaced as tag drift.
@@ -1212,6 +1835,23 @@ pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
+    // The index route first, so a reader meets the reason before the thin
+    // domain sections it explains. A plain direct open, and a machine with no
+    // index yet, say nothing here: only a route worth knowing about does.
+    match &report.index {
+        IndexAccess::Daemon => {
+            let _ = writeln!(
+                out,
+                "index: read through the running daemon, which owns the index file"
+            );
+        }
+        IndexAccess::Unavailable { reason } => {
+            let _ = writeln!(out, "index:");
+            let _ = writeln!(out, "  [problem] {reason}");
+        }
+        IndexAccess::Absent | IndexAccess::Direct => {}
+    }
+
     for d in &report.domains {
         let _ = writeln!(out, "{} ({})", d.name, d.path);
         // Ownership in a shared database: who hosts this file domain. Unhosted
@@ -1224,12 +1864,50 @@ pub fn render_human(report: &DoctorReport) -> String {
                 .unwrap_or_default();
             let _ = writeln!(out, "  hosted by instance {host}{hb}");
         }
+        // A rebuild that was stamped and never cleared. Nothing was destroyed -
+        // the rows below are the complete ones from before it - so the finding
+        // is a refresh to finish, and the command that finishes it is the one
+        // that was interrupted.
+        //
+        // "has not finished" rather than "never finished": doctor sees no
+        // activity snapshot (the markers only reach it on the direct route),
+        // so it has not checked whether a rebuild is running this second and
+        // must not say it is not. The remedy is the same either way - re-run
+        // it - and a re-run while one is in flight waits on the store lock
+        // rather than colliding.
+        if let Some(started) = &d.rebuild_started {
+            let _ = match d.rebuild_kind.as_deref() {
+                // A wipe emptied the index before it began, so the rows here are
+                // whatever its rebuild managed and every embedding is gone.
+                // Saying anything else is the misreading the marker exists for.
+                Some("wipe") => writeln!(
+                    out,
+                    "  [problem] a wipe started {started} has not finished; this domain's rows and every embedding it had were destroyed before it began. Run: crystalline reindex --full"
+                ),
+                Some("full") => writeln!(
+                    out,
+                    "  [problem] a full rebuild started {started} has not finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
+                ),
+                // A marker a binary older than the kind column stamped: say what
+                // is known and claim nothing about the rows either way.
+                _ => writeln!(
+                    out,
+                    "  [problem] a rebuild started {started} has not finished. Run: crystalline reindex --full"
+                ),
+            };
+        }
         if d.is_virtual {
-            let _ = writeln!(
-                out,
-                "  ok (virtual, {} engram(s) in the database)",
-                d.engrams.unwrap_or(0)
-            );
+            match d.engrams {
+                Some(n) => {
+                    let _ = writeln!(out, "  ok (virtual, {n} engram(s) in the database)");
+                }
+                // A virtual domain lives entirely in the index, so with no
+                // route to it there is nothing to count and nothing to
+                // claim.
+                None => {
+                    let _ = writeln!(out, "  ok (virtual, engram count not read)");
+                }
+            }
             continue;
         }
         if !d.path_exists {
@@ -1239,12 +1917,32 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.manifest_present {
             let _ = writeln!(out, "  [problem] no MANIFEST.md at the domain root");
         }
+        // Said once per domain so an empty orphan and unindexed list is never
+        // mistaken for a clean bill of health. The cause, and its remedy, are
+        // in the index section above.
+        if !d.index_checked && matches!(report.index, IndexAccess::Unavailable { .. }) {
+            let _ = writeln!(
+                out,
+                "  index checks skipped (orphan rows, unindexed files); see the index section above"
+            );
+        }
         if !d.orphans.is_empty() {
             if d.orphans_removed > 0 {
                 let _ = writeln!(
                     out,
                     "  removed {} orphan row(s): {}",
                     d.orphans_removed,
+                    d.orphans.join(", ")
+                );
+            } else if report.index == IndexAccess::Daemon {
+                // Removing a row is a write, and this run reached the index
+                // through a read verb on the daemon that holds it. Say what
+                // that takes instead of pointing at a --fix that would do
+                // nothing.
+                let _ = writeln!(
+                    out,
+                    "  [problem] {} orphan row(s) (file missing on disk): {}. The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`",
+                    d.orphans.len(),
                     d.orphans.join(", ")
                 );
             } else {
@@ -1259,11 +1957,23 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.unindexed.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}: {}",
+                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}",
                 d.unindexed.len(),
-                d.name,
-                d.unindexed.join(", ")
+                d.name
             );
+            for p in &d.unindexed {
+                let _ = writeln!(out, "    {p}");
+            }
+        }
+        if !d.unsyncable.is_empty() {
+            let _ = writeln!(
+                out,
+                "  [problem] {} file(s) cannot be indexed until the frontmatter is fixed (verify rule E001):",
+                d.unsyncable.len()
+            );
+            for f in &d.unsyncable {
+                let _ = writeln!(out, "    {}: {}", f.path, f.message);
+            }
         }
         if !d.encoding_issues.is_empty() {
             let _ = writeln!(
@@ -1275,12 +1985,48 @@ pub fn render_human(report: &DoctorReport) -> String {
                 let _ = writeln!(out, "    {}: {}", e.path, e.message);
             }
         }
+        // "ok" is a claim about everything, so a domain whose index checks
+        // never ran does not get to make it.
         if d.manifest_present
             && d.orphans.is_empty()
             && d.unindexed.is_empty()
+            && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
+            && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {
             let _ = writeln!(out, "  ok");
+        }
+    }
+
+    // Domains the index still holds rows for and the configuration does not
+    // name. Kept apart from the per-domain sections above, and worded apart
+    // from them: an "orphan row" there is one indexed file whose file is
+    // gone, and these are whole domains. The one thing every line must say is
+    // what 0.17.0's message did not, which is that the rows answer nothing
+    // any more and that there is a proportionate way to end them - and the
+    // one thing no line may do is promise a collection that will not happen,
+    // which is why the kept reasons are matched rather than defaulted.
+    if let Some(o) = &report.orphaned_rows {
+        if let Some(err) = &o.error {
+            // A header naming domains would claim the check found some.
+            let _ = writeln!(out, "rows whose domain is gone:");
+            let _ = writeln!(out, "  not checked: {err}");
+        } else if o.domains.is_empty() {
+            // Nothing was considered, so nothing may be called deregistered:
+            // an unreadable configuration is exactly the state in which no
+            // domain can be shown absent from anything.
+            if let Some(skipped) = &o.skipped {
+                let _ = writeln!(out, "rows whose domain is gone:");
+                let _ = writeln!(out, "  not checked: {skipped}");
+            }
+        } else {
+            let _ = writeln!(out, "domains no longer registered:");
+            for d in &o.domains {
+                let _ = writeln!(out, "{}", orphaned_domain_line(d));
+            }
+            if let Some(skipped) = &o.skipped {
+                let _ = writeln!(out, "  nothing was collected: {skipped}");
+            }
         }
     }
 
@@ -1425,8 +2171,57 @@ pub fn render_human(report: &DoctorReport) -> String {
             e["configured_model"].as_str().unwrap_or_default(),
             e["stale_chunks"]
         );
+        // The coverage figure never goes out bare while a rebuild is
+        // unfinished: the incident was a coverage number read as normal when it
+        // was the middle of something. Coverage can only ever rise across a
+        // rebuild now, and saying so is what stops the number being misread in
+        // the other direction too.
+        let unfinished: Vec<&DomainDoctor> = report
+            .domains
+            .iter()
+            .filter(|d| d.rebuild_started.is_some())
+            .collect();
+        let names = unfinished
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // One unfinished wipe is enough to make the whole figure a post-wipe
+        // one: the wipe emptied the index, not one domain's corner of it.
+        let wiped = unfinished
+            .iter()
+            .any(|d| d.rebuild_kind.as_deref() == Some("wipe"));
+        if wiped {
+            let _ = writeln!(
+                out,
+                "  counted while an unfinished wipe of {names} stands; the wipe destroyed every embedding before it began, so this figure is what has been re-embedded since, not the one from before it"
+            );
+        } else if !unfinished.is_empty() {
+            let _ = writeln!(
+                out,
+                "  counted while an unfinished rebuild of {names} stands; nothing was destroyed, so this figure is the one from before it"
+            );
+        }
     } else {
-        let _ = writeln!(out, "embeddings: no index yet");
+        // Absent for three different reasons, and a person acts on each of
+        // them differently, so none of them may print as "no index yet".
+        match &report.index {
+            IndexAccess::Daemon => {
+                let _ = writeln!(
+                    out,
+                    "embeddings: not read here, the running daemon owns the index; run: crystalline status"
+                );
+            }
+            IndexAccess::Unavailable { .. } => {
+                let _ = writeln!(
+                    out,
+                    "embeddings: not read, the index checks did not run (see the index section above)"
+                );
+            }
+            IndexAccess::Absent | IndexAccess::Direct => {
+                let _ = writeln!(out, "embeddings: no index yet");
+            }
+        }
     }
 
     if let Some(harnesses) = &report.harnesses {
@@ -1566,6 +2361,68 @@ pub fn render_human(report: &DoctorReport) -> String {
 /// artifacts"` when empty - the doctor-local twin of `cmd::format_counts`,
 /// operating on the typed map `provision::status` returns rather than a JSON
 /// value.
+/// One line for one domain the index holds rows for and nobody registers.
+///
+/// Every branch is written to stay true of the state it describes: only a row
+/// something will actually collect is promised a collection, and a reason this
+/// build cannot read gets a sentence that asserts nothing about it.
+fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
+    let name = &d.name;
+    let engrams = d.engrams;
+    let age = match d.age_days {
+        Some(days) => format!("last seen registered {days} day(s) ago"),
+        // Not an age of zero: an index inherited from a version that never
+        // recorded a registration has no evidence either way.
+        None => "never seen registered by this version".to_string(),
+    };
+    if d.collected {
+        return format!(
+            "  collected {engrams} engram row(s) of '{name}' ({age}); the files on disk are untouched"
+        );
+    }
+    if d.collectable {
+        return format!(
+            "  [problem] {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected; to clear them now run: crystalline doctor --fix"
+        );
+    }
+    match d.kept.as_deref().and_then(KeptReason::from_word) {
+        Some(KeptReason::Virtual) => format!(
+            "  {name}: {engrams} engram row(s) in a virtual domain, {age}. They are not served any more, and a virtual domain's rows are its only copy, so nothing collects them on its own: end it with `crystalline domain remove {name} --purge`, which asks first"
+        ),
+        // The live peer is serving these rows. Nothing here will ever collect
+        // them, on either path, so nothing here may say it will.
+        Some(KeptReason::HostedElsewhere) => format!(
+            "  {name}: {engrams} engram row(s), {age}. Another instance hosts this domain over the shared database and is still serving those rows, so they are not this instance's to collect"
+        ),
+        // A read-only instance collects nothing at all. The skipped line below
+        // says the same thing about the run; this says it about the rows,
+        // without promising a collection that needs a writable instance.
+        Some(KeptReason::ReadOnly) => format!(
+            "  {name}: {engrams} engram row(s), {age}. This instance is read-only and collects nothing: they stay until a writable instance sweeps them, or until `crystalline doctor --fix` is run against one"
+        ),
+        // Neither reaches a `doctor` run (both need a grace period, and both
+        // doctor routes ask on the on-demand path), but both are honest about
+        // a domain that is only waiting.
+        Some(KeptReason::Grace) | Some(KeptReason::Unstamped) => format!(
+            "  {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected"
+        ),
+        // Filtered out before the render; a line that claims nothing is the
+        // right answer if one ever arrives here anyway.
+        Some(KeptReason::NoRows) => {
+            format!("  {name}: no engram rows left, {age}. There is nothing here to collect")
+        }
+        // A reason this build does not know. Say only what is true of every
+        // kept row: this instance is not serving them and is not collecting
+        // them, and name the word so the reader can look it up.
+        None => {
+            let word = d.kept.as_deref().unwrap_or("no reason given");
+            format!(
+                "  {name}: {engrams} engram row(s), {age}. They are not served any more, and this instance is not collecting them ({word})"
+            )
+        }
+    }
+}
+
 fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
     if counts.is_empty() {
         return "no artifacts".to_string();
@@ -1608,7 +2465,59 @@ mod tests {
         let store = TursoStore::open_in_memory().await.unwrap();
         sync_domain(&store, "kb", root).await.unwrap();
         let store_ref: &dyn Store = &store;
-        check_tags(Some(store_ref)).await.unwrap().unwrap()
+        let mut cfg = GlobalConfig::default();
+        cfg.domains
+            .insert("kb".to_string(), DomainEntry::file(root.to_path_buf()));
+        check_tags(Some(store_ref), &cfg).await.unwrap().unwrap()
+    }
+
+    /// The tag check's advice points the reader at `crystalline tags merge`,
+    /// and that verb will not touch a domain this instance has no registration
+    /// for - so a cluster drawn from one is advice that cannot be taken.
+    #[tokio::test]
+    async fn an_unregistered_domains_tags_are_not_advised_on() {
+        fn engram(tag: &str) -> String {
+            format!(
+                "---\ntype: engram\ntitle: {tag}\npermalink: {tag}\ntags:\n  - {tag}\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n"
+            )
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("kept");
+        let orphan = dir.path().join("orphan");
+        for (root, pair) in [
+            (&kept, ["colours", "colour"]),
+            (&orphan, ["flavours", "flavour"]),
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+            for tag in pair {
+                std::fs::write(root.join(format!("{tag}.md")), engram(tag)).unwrap();
+            }
+        }
+        let store = TursoStore::open_in_memory().await.unwrap();
+        sync_domain(&store, "kept", &kept).await.unwrap();
+        sync_domain(&store, "orphan", &orphan).await.unwrap();
+        let mut cfg = GlobalConfig::default();
+        cfg.domains
+            .insert("kept".to_string(), DomainEntry::file(kept.clone()));
+
+        let store_ref: &dyn Store = &store;
+        let doctor = check_tags(Some(store_ref), &cfg).await.unwrap().unwrap();
+        assert!(
+            doctor
+                .clusters
+                .iter()
+                .any(|c| c.tags.contains(&"colours".to_string())),
+            "the registered domain's tag drift is still reported: {:?}",
+            doctor.clusters
+        );
+        assert!(
+            !doctor
+                .clusters
+                .iter()
+                .any(|c| c.tags.iter().any(|t| t.starts_with("flavour"))),
+            "the unregistered domain's is not: {:?}",
+            doctor.clusters
+        );
     }
 
     #[tokio::test]
@@ -1623,6 +2532,156 @@ mod tests {
         );
     }
 
+    /// One file domain with `orphans` recorded and nothing else wrong, read
+    /// through `index`.
+    fn report_with_orphans(index: IndexAccess, orphans: &[&str]) -> DoctorReport {
+        DoctorReport {
+            index,
+            domains: vec![DomainDoctor {
+                name: "eng".to_string(),
+                kind: "file".to_string(),
+                path: "/kb/eng".to_string(),
+                index_checked: true,
+                path_exists: true,
+                manifest_present: true,
+                orphans: orphans.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A rebuild marker that outlived the run that set it: the finding names
+    /// the instant and the command that finishes it, says plainly that the
+    /// rows are still there, counts toward the exit code, and puts the caveat
+    /// on the embedding coverage figure rather than letting it go out bare -
+    /// the number read as normal mid-rebuild is the incident this exists for.
+    #[test]
+    fn an_unfinished_rebuild_is_a_problem_that_qualifies_the_coverage_figure() {
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.domains[0].rebuild_started = Some("2026-09-14T09:00:00Z".to_string());
+        report.domains[0].rebuild_kind = Some("full".to_string());
+        report.embeddings = Some(serde_json::json!({
+            "embedded_with_configured_model": 768,
+            "total_chunks": 23598,
+            "configured_model": "m",
+            "stale_chunks": 0,
+        }));
+
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "[problem] a full rebuild started 2026-09-14T09:00:00Z has not finished; this domain's rows are the ones from before it. Run: crystalline reindex --full"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("counted while an unfinished rebuild of eng stands"),
+            "the coverage figure never goes out bare while a rebuild is unfinished: {out}"
+        );
+        assert_eq!(
+            report.remaining_problems(),
+            1,
+            "an unfinished rebuild is one problem, so doctor exits non-zero"
+        );
+
+        // A wipe is the opposite verb: it destroyed the rows and every
+        // embedding before it started, so neither sentence may reassure.
+        report.domains[0].rebuild_kind = Some("wipe".to_string());
+        let wiped = render_human(&report);
+        assert!(
+            wiped.contains(
+                "[problem] a wipe started 2026-09-14T09:00:00Z has not finished; this domain's rows and every embedding it had were destroyed before it began. Run: crystalline reindex --full"
+            ),
+            "{wiped}"
+        );
+        assert!(
+            !wiped.contains("nothing was destroyed") && !wiped.contains("the ones from before it"),
+            "the coverage caveat says the figure is what has been re-embedded since: {wiped}"
+        );
+        // A marker a binary older than the kind column stamped says what is
+        // known and claims nothing about the rows either way.
+        report.domains[0].rebuild_kind = None;
+        let unknown = render_human(&report);
+        assert!(
+            unknown.contains(
+                "[problem] a rebuild started 2026-09-14T09:00:00Z has not finished. Run: crystalline reindex --full"
+            ),
+            "{unknown}"
+        );
+
+        // Cleared, it is neither a finding nor a caveat.
+        report.domains[0].rebuild_started = None;
+        let clean = render_human(&report);
+        assert!(!clean.contains("has not finished"), "{clean}");
+        assert!(!clean.contains("unfinished rebuild"), "{clean}");
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// Over a daemon the doctor reads the index through a read verb, so
+    /// `--fix` cannot delete an orphan row however it is spelled. The finding
+    /// is still reported, with what removing it actually takes, rather than
+    /// pointing at a flag that would silently do nothing.
+    #[test]
+    fn an_orphan_found_over_a_daemon_says_what_removing_it_takes() {
+        let daemon = render_human(&report_with_orphans(IndexAccess::Daemon, &["gone.md"]));
+        assert!(
+            daemon.contains("[problem] 1 orphan row(s) (file missing on disk): gone.md."),
+            "{daemon}"
+        );
+        assert!(
+            daemon.contains(
+                "The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`"
+            ),
+            "{daemon}"
+        );
+        assert!(
+            !daemon.contains("rerun with --fix to remove"),
+            "the direct path's advice would be false here: {daemon}"
+        );
+
+        let direct = render_human(&report_with_orphans(IndexAccess::Direct, &["gone.md"]));
+        assert!(
+            direct.contains("rerun with --fix to remove: gone.md"),
+            "the direct path keeps the advice that works there: {direct}"
+        );
+    }
+
+    /// An index nobody could read counts once for the machine, so the exit
+    /// code says something is wrong without inflating the count by one per
+    /// domain.
+    #[test]
+    fn an_unreadable_index_counts_as_exactly_one_problem() {
+        let mut report = DoctorReport {
+            index: IndexAccess::Unavailable {
+                reason: "the index at /kb/index.db could not be opened".to_string(),
+            },
+            domains: vec![
+                DomainDoctor {
+                    name: "eng".to_string(),
+                    path_exists: true,
+                    manifest_present: true,
+                    ..Default::default()
+                },
+                DomainDoctor {
+                    name: "docs".to_string(),
+                    path_exists: true,
+                    manifest_present: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+
+        report.index = IndexAccess::Daemon;
+        assert_eq!(
+            report.remaining_problems(),
+            0,
+            "a run served by the daemon read the index, so there is nothing to report"
+        );
+    }
+
     #[tokio::test]
     async fn a_declared_alias_suppresses_its_cluster() {
         let doctor = tags_doctor_over("\n## Tag Aliases\n\n- colours -> colour\n").await;
@@ -1633,6 +2692,352 @@ mod tests {
                 .any(|c| c.tags.contains(&"colours".to_string())),
             "the alias folds colours onto colour, so the cluster is suppressed: {:?}",
             doctor.clusters
+        );
+    }
+
+    // `relative_slash_path` - the E001-to-unindexed matching helper. These run
+    // on every platform, including the Windows CI leg the regression showed up
+    // on: a duplicate-key finding was silently falling back into `unindexed`
+    // instead of `unsyncable` because a failed `strip_prefix` used to keep the
+    // absolute path, which can never equal a relative entry.
+
+    #[test]
+    fn relative_slash_path_matches_a_nested_file_under_the_same_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nested = root.join("a").join("b").join("c.md");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "x").unwrap();
+
+        // The fast path: `nested` was built by literally joining `root`, the
+        // shape every real caller (`markdown_rel_paths`'s own walk) produces,
+        // so this must resolve without ever touching the canonicalize fallback.
+        assert_eq!(relative_slash_path(root, &nested), "a/b/c.md");
+    }
+
+    #[test]
+    fn relative_slash_path_falls_back_to_a_file_name_rather_than_an_absolute_path() {
+        // A multi-component absolute path (forward slashes parse as
+        // separators on every platform, Windows included) that shares no
+        // component prefix with `root` and does not exist, so both the fast
+        // path and the canonicalize fallback miss. This is the "verbatim
+        // prefix disagrees with a plain root" failure's general shape - two
+        // absolute paths that cannot be reconciled at all - proving the
+        // degrade-safely half: a total non-match still returns a short,
+        // non-empty, root-relative-looking value (just the file name) rather
+        // than the full absolute string the old code kept on a failed strip,
+        // which could never equal a relative `unindexed` entry and was the
+        // bug. The Windows-specific `\\?\C:\...` prefix parsing itself is not
+        // reproducible on a non-Windows path (backslashes are plain filename
+        // characters there, not separators) - that trigger is only provable
+        // by Windows CI; this test and the next one prove the fallback
+        // mechanism handles a genuine mismatch correctly once one occurs.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unrelated = Path::new("/definitely/not/under/root/a/b/bad.md");
+
+        let result = relative_slash_path(root, unrelated);
+        assert_eq!(
+            result, "bad.md",
+            "falls back to just the file name, never the full absolute path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_slash_path_matches_when_the_root_and_the_path_reach_the_same_file_through_different_forms()
+     {
+        // A symlink stands in for the Windows failure's actual shape: two
+        // absolute paths, both real and both naming the same file, that do
+        // not share a literal component prefix (the verbatim-prefixed root
+        // config canonicalized against a plain re-walk, there; a symlinked
+        // root against its real target, here). `strip_prefix` fails on both
+        // for the same reason - the component sequences genuinely differ -
+        // and `dunce::canonicalize` is what reconciles them in both cases, so
+        // this proves the fallback mechanism the Windows fix relies on
+        // actually works, even though it cannot reproduce the Windows-only
+        // verbatim-prefix trigger itself (Windows CI is the proof for that).
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        std::fs::create_dir_all(real_root.join("a").join("b")).unwrap();
+        std::fs::write(real_root.join("a").join("b").join("c.md"), "x").unwrap();
+
+        let linked_root = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+
+        // `root` is given through the symlink; `p` is the file's canonical,
+        // non-symlinked path - the same mismatch shape a canonicalized config
+        // path and a plain re-walked one would produce.
+        let p = real_root.join("a").join("b").join("c.md");
+        assert_eq!(relative_slash_path(&linked_root, &p), "a/b/c.md");
+    }
+
+    // --- rows whose domain nobody registers any more --------------------------
+
+    /// A report carrying nothing but one orphaned-domain section, which is
+    /// what the render and the problem count are read on below. The binary
+    /// tests cover the never-stamped case a real 0.17.0 index produces; these
+    /// cover the branches a fixture cannot age into.
+    fn orphan_report(
+        domains: Vec<OrphanedDomainDoctor>,
+        skipped: Option<String>,
+        fix: bool,
+    ) -> DoctorReport {
+        DoctorReport {
+            orphaned_rows: Some(OrphanedRowsDoctor {
+                domains,
+                skipped,
+                error: None,
+            }),
+            fix,
+            ..DoctorReport::default()
+        }
+    }
+
+    fn orphan(name: &str, engrams: i64, age_days: Option<i64>) -> OrphanedDomainDoctor {
+        OrphanedDomainDoctor {
+            name: name.to_string(),
+            kind: "file".to_string(),
+            engrams,
+            age_days,
+            collectable: true,
+            collected: false,
+            kept: None,
+        }
+    }
+
+    /// The message 0.17.0 got wrong: it told the truth about the rows and then
+    /// named the heaviest command in the tool as the only way out. The honest
+    /// text says the rows answer nothing any more and names the one command
+    /// that ends them now.
+    #[test]
+    fn an_aged_orphan_is_named_with_its_age_and_a_proportionate_remedy() {
+        let report = orphan_report(vec![orphan("gone", 30, Some(13))], None, false);
+        let out = render_human(&report);
+        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
+        assert!(out.contains("last seen registered 13 day(s) ago"), "{out}");
+        assert!(out.contains("not served any more"), "{out}");
+        assert!(out.contains("crystalline doctor --fix"), "{out}");
+        assert!(
+            !out.to_lowercase().contains("reindex"),
+            "a full reindex is never the advice: {out}"
+        );
+        assert_eq!(
+            report.remaining_problems(),
+            1,
+            "rows nobody has collected yet are one problem apiece"
+        );
+    }
+
+    /// Collected is not a problem: the run that was asked did the work, and it
+    /// says what it did without claiming anything about the files on disk,
+    /// which it never touched.
+    #[test]
+    fn a_collected_orphan_is_reported_and_not_counted() {
+        let mut row = orphan("gone", 30, Some(13));
+        row.collected = true;
+        let report = orphan_report(vec![row], None, true);
+        let out = render_human(&report);
+        assert!(
+            out.contains("collected 30 engram row(s) of 'gone'"),
+            "{out}"
+        );
+        assert!(out.contains("files on disk are untouched"), "{out}");
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A virtual domain's rows are the knowledge itself rather than a copy of
+    /// it, so no sweep and no `--fix` ends them: the line names the command
+    /// that asks first, and counting it a problem would fail doctor forever
+    /// over a state with no remedy here.
+    #[test]
+    fn a_virtual_orphan_is_reported_and_never_counted() {
+        let row = OrphanedDomainDoctor {
+            name: "vault".to_string(),
+            kind: "virtual".to_string(),
+            engrams: 12,
+            age_days: Some(409),
+            collectable: false,
+            collected: false,
+            kept: Some("virtual".to_string()),
+        };
+        let report = orphan_report(vec![row], None, false);
+        let out = render_human(&report);
+        assert!(
+            out.contains("vault: 12 engram row(s) in a virtual domain"),
+            "{out}"
+        );
+        assert!(
+            out.contains("crystalline domain remove vault --purge"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("crystalline doctor --fix"),
+            "a --fix that would do nothing is not offered: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A read-only instance collects nothing and says so, with the rows it
+    /// would have collected still named: that operator is exactly the one who
+    /// wants to know what is sitting there.
+    #[test]
+    fn a_read_only_instance_lists_the_rows_and_says_nothing_was_collected() {
+        let row = OrphanedDomainDoctor {
+            collectable: false,
+            kept: Some("read_only".to_string()),
+            ..orphan("gone", 30, Some(13))
+        };
+        let report = orphan_report(
+            vec![row],
+            Some(
+                "this instance is read-only; the registered domains were stamped and nothing was \
+                 removed"
+                    .to_string(),
+            ),
+            false,
+        );
+        let out = render_human(&report);
+        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
+        assert!(
+            out.contains("This instance is read-only and collects nothing"),
+            "the row says what will happen to it: {out}"
+        );
+        assert!(
+            out.contains("until a writable instance sweeps them")
+                && out.contains("`crystalline doctor --fix` is run against one"),
+            "and where a collection can be had: {out}"
+        );
+        assert!(
+            !out.contains("will be collected;"),
+            "never a collection this instance will not make: {out}"
+        );
+        assert!(
+            out.contains("nothing was collected: this instance is read-only"),
+            "and the run's own line agrees with the row's: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A domain another instance hosts over a shared database is being served
+    /// by that instance right now, and the engine guards its rows on both
+    /// paths, so the two things the old fallthrough said about it - not served,
+    /// and due for collection - were both false.
+    #[test]
+    fn a_domain_hosted_by_another_instance_is_its_peers_to_serve() {
+        let row = OrphanedDomainDoctor {
+            collectable: false,
+            kept: Some("hosted_elsewhere".to_string()),
+            ..orphan("shared", 30, Some(13))
+        };
+        let report = orphan_report(vec![row], None, false);
+        let out = render_human(&report);
+        assert!(
+            out.contains("Another instance hosts this domain over the shared database"),
+            "the reason is named: {out}"
+        );
+        assert!(
+            out.contains("not this instance's to collect"),
+            "and the consequence: {out}"
+        );
+        assert!(
+            !out.contains("will be collected"),
+            "nothing promises a collection that will never happen: {out}"
+        );
+        assert!(
+            !out.contains("not served any more"),
+            "and nothing claims the peer stopped serving them: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A reason this build does not know must not borrow the sentence of one
+    /// it does. The line says only what is true of every kept row and names
+    /// the word.
+    #[test]
+    fn a_kept_reason_this_build_does_not_know_claims_nothing() {
+        let row = OrphanedDomainDoctor {
+            collectable: false,
+            kept: Some("some_future_reason".to_string()),
+            ..orphan("gone", 30, Some(13))
+        };
+        let out = render_human(&orphan_report(vec![row], None, false));
+        assert!(
+            out.contains("this instance is not collecting them (some_future_reason)"),
+            "{out}"
+        );
+        assert!(!out.contains("will be collected"), "{out}");
+    }
+
+    /// The state Task 3 left for a container configured entirely by
+    /// environment variables: nothing could be considered, so nothing may be
+    /// called deregistered.
+    #[test]
+    fn an_unreadable_configuration_is_not_reported_as_a_deregistration() {
+        let report = orphan_report(
+            Vec::new(),
+            Some(
+                "the configuration could not be read, and a domain cannot be shown absent from a \
+                 file nobody can read; nothing was stamped and nothing collected"
+                    .to_string(),
+            ),
+            false,
+        );
+        let out = render_human(&report);
+        assert!(
+            !out.contains("domains no longer registered"),
+            "a header that asserts a deregistration nobody established: {out}"
+        );
+        assert!(
+            out.contains("not checked: the configuration could not be read"),
+            "the reader is told why instead: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A daemon that refused the request, or an index that failed under it,
+    /// reads as a check that did not happen rather than as a clean bill.
+    #[test]
+    fn an_engine_failure_is_said_out_loud_rather_than_left_blank() {
+        let report = DoctorReport {
+            orphaned_rows: Some(OrphanedRowsDoctor {
+                error: Some("unknown ctl command 'collect_orphaned_domains'".to_string()),
+                ..OrphanedRowsDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("not checked: unknown ctl command"),
+            "the failure is in the report: {out}"
+        );
+        assert!(
+            !out.contains("domains no longer registered"),
+            "and it claims nothing about what is there: {out}"
+        );
+    }
+
+    /// The route gate is a question about a Turso file, and only a Turso file.
+    /// A Postgres install keeps its index in a server and a daemon answers
+    /// over a socket, so gating either on that file suppressed the section on
+    /// an install with plenty to report.
+    #[test]
+    fn the_route_gate_only_asks_about_a_turso_file() {
+        // Turso, no daemon: the file is the whole question.
+        assert!(orphan_check_has_a_route(false, true, true));
+        assert!(
+            !orphan_check_has_a_route(false, true, false),
+            "a machine that never synced is not given an index to prove it has no orphans"
+        );
+        // Postgres, no daemon: there is no file to ask about.
+        assert!(
+            orphan_check_has_a_route(false, false, false),
+            "a Postgres install is checked over its own backend"
+        );
+        // A daemon answers whatever it serves.
+        assert!(
+            orphan_check_has_a_route(true, true, false),
+            "a daemon answers over its socket, file or no file"
         );
     }
 }

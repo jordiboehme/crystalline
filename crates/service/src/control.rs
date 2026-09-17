@@ -3,7 +3,8 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! sessions, tool, configure, origin_add, origin_update, origin_status,
+//! file_stamps, collect_orphaned_domains, sessions, tool, configure, origin_add,
+//! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
 //! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -19,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::daemon::Shared;
-use crate::engine::{ConfigureAction, ShareActor};
+use crate::engine::{ConfigureAction, EmbedOutcome, Engine, ShareActor};
 
 /// The protocol version carried on every ctl envelope.
 pub const CTL_VERSION: u64 = 1;
@@ -64,6 +65,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
     let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("");
     match cmd {
         "status" => {
+            let intent = crate::instance::serve_intent();
             let mut data = json!({
                 "pid": shared.pid,
                 "version": crystalline_core::VERSION,
@@ -72,6 +74,14 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "http": shared.http_addr.clone(),
                 "http_sessions": shared.http_session_count(),
                 "read_only": shared.engine.read_only(),
+                // How this daemon came to be running, and the Host allow-list
+                // it serves with: a probe that cannot see these cannot tell a
+                // managed daemon from one a client spawned. Both come from the
+                // intent this process recorded before it took the lock, so
+                // `started_by` is "unknown" when nothing recorded one rather
+                // than when the daemon is old.
+                "started_by": intent.map(|i| i.started_by.as_str()).unwrap_or("unknown"),
+                "allowed_hosts": intent.map(|i| i.allowed_hosts.clone()).unwrap_or_default(),
             });
             match shared.engine.status_report().await {
                 Ok(report) => {
@@ -115,6 +125,32 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     maybe_embed(shared, embed, &mut data).await;
                     (envelope_ok(data), false)
                 }
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // The recorded file stamps of one named domain, or of every registered
+        // file domain when none is named. Served from this daemon's own open
+        // store, so a caller that needs to read the index while the daemon
+        // holds the file never has to open it a second time: that is the
+        // collision `crystalline doctor` used to die on.
+        "file_stamps" => {
+            let domain = req.get("domain").and_then(Value::as_str);
+            match shared.engine.domain_file_stamps(domain).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // What the index still holds for domains nobody registers any more,
+        // and, unless `dry_run`, the removal of those rows. The grace period
+        // is never applied here: a person is asking, and the daemon's own
+        // timer is the path that waits the week out. Served from this
+        // daemon's own open store for the reason `file_stamps` is: it holds
+        // the index file, and `crystalline doctor` must not have to stop it
+        // to tidy up.
+        "collect_orphaned_domains" => {
+            let dry_run = req.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+            match shared.engine.collect_orphaned_domains(None, dry_run).await {
+                Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
@@ -245,6 +281,89 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         // Connect a new domain to a GitHub repository: downloads its tracked
         // subtree, registers it in the global config and indexes it.
+        // Unregister a domain, the same entry point the JSON API and the MCP
+        // tool call. As the machine owner: whoever reaches this socket is on
+        // the machine that holds the files.
+        "domain_remove" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let purge = req.get("purge").and_then(Value::as_bool).unwrap_or(false);
+            // Whose unshared work this removal was told it may end. Absent is
+            // an empty list, which is a removal that has confirmed nothing and
+            // refuses the moment anybody else is drafting here.
+            let end_drafts: Vec<String> = req
+                .get("end_drafts")
+                .and_then(Value::as_array)
+                .map(|actors| {
+                    actors
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match shared
+                .engine
+                .unregister_domain(
+                    domain,
+                    &crate::scope::Scope::Unrestricted,
+                    purge,
+                    &end_drafts,
+                )
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Whether a domain reviews changes before they land, and the per-actor
+        // answer that ends its drafts on the way out - the same entry point the
+        // JSON API calls. As the machine owner, for the reason the removal
+        // above states.
+        "domain_review" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let overlay = req.get("mode").and_then(Value::as_str) == Some("overlay");
+            let preview = req.get("preview").and_then(Value::as_bool).unwrap_or(false);
+            // The same rule the JSON API states and the CLI bails on, so the
+            // three surfaces answer one malformed request one way: folds say
+            // what happens to each actor's drafts, which is a question about
+            // leaving review mode.
+            if folds_on_the_way_in(req) {
+                return (envelope_err(FOLDS_ON_THE_WAY_IN.to_string()), false);
+            }
+            let confirm = if preview {
+                crate::review::ReviewModeConfirm::Preview
+            } else {
+                crate::review::ReviewModeConfirm::Confirmed {
+                    folds: req
+                        .get("folds")
+                        .and_then(Value::as_object)
+                        .map(|map| {
+                            map.iter()
+                                .map(|(actor, choice)| {
+                                    (
+                                        actor.clone(),
+                                        if choice.as_str() == Some("fold") {
+                                            crate::review::FoldChoice::Fold
+                                        } else {
+                                            crate::review::FoldChoice::Discard
+                                        },
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            };
+            let mode = overlay.then_some(crystalline_core::config::ReviewMode::Overlay);
+            match shared
+                .engine
+                .set_review_mode(domain, mode, confirm, &crate::scope::Scope::Unrestricted)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "origin_add" => {
             let repo = req.get("repo").and_then(Value::as_str).unwrap_or("");
             let domain = req.get("domain").and_then(Value::as_str);
@@ -285,7 +404,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // Pull one origin-connected domain (or every one) up to date.
         "origin_update" => {
             let domain = req.get("domain").and_then(Value::as_str);
-            match shared.engine.origin_update(domain).await {
+            match shared
+                .engine
+                .origin_update(domain, &crate::scope::Scope::Unrestricted)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -294,7 +417,14 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // relative to its origin, plus this machine's GitHub connection.
         "origin_status" => {
             let domain = req.get("domain").and_then(Value::as_str);
-            match shared.engine.origin_status(domain).await {
+            // Absent reads as false: a client from before detail existed asks
+            // for the counts it already knew how to render.
+            let detail = req.get("detail").and_then(Value::as_bool).unwrap_or(false);
+            match shared
+                .engine
+                .origin_status(domain, detail, &crate::scope::Scope::Unrestricted)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -401,7 +531,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 )),
             };
             match action {
-                Ok(action) => match shared.engine.provision(&action).await {
+                Ok(action) => match shared
+                    .engine
+                    .provision(&action, &crate::scope::Scope::Unrestricted)
+                    .await
+                {
                     Ok(data) => (envelope_ok(data), false),
                     Err(e) => (envelope_err(e.to_string()), false),
                 },
@@ -421,7 +555,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         other => (
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
-                 routing_bullets, scaffold_manifest, domain_import, domain_export, retag, \
+                 routing_bullets, scaffold_manifest, domain_import, domain_export, \
+                 domain_remove, retag, collect_orphaned_domains, \
                  configure, origin_add, origin_update, origin_status, origin_share, \
                  origin_withdraw, origin_resolve, provision, forget_domain or shutdown"
             )),
@@ -432,19 +567,35 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
 
 /// Run a background-equivalent embed pass and record the count on the response.
 async fn maybe_embed(shared: &Arc<Shared>, embed: bool, data: &mut Value) {
+    embed_onto_response(&shared.engine, embed, data).await;
+}
+
+/// The body of [`maybe_embed`], against the engine alone so it can be tested
+/// without a daemon around it.
+///
+/// One pass walks the backlog at a time, so a `--embed` that arrives while the
+/// daemon is already embedding is folded into the running pass rather than
+/// starting a second one. That is reported as `embed_scheduled`, never as
+/// `embedded_chunks: 0`: the zero would tell a person on a large first index -
+/// exactly the case `--embed` is passed for - that nothing was embedded, when
+/// the running pass is in fact covering their request.
+async fn embed_onto_response(engine: &Engine, embed: bool, data: &mut Value) {
     if !embed {
         return;
     }
-    match shared.engine.embed_pending().await {
-        Ok(n) => {
-            if let Value::Object(map) = data {
-                map.insert("embedded_chunks".to_string(), json!(n));
-            }
+    let outcome = engine.embed_pending_outcome().await;
+    let Value::Object(map) = data else {
+        return;
+    };
+    match outcome {
+        Ok(EmbedOutcome::Embedded(n)) => {
+            map.insert("embedded_chunks".to_string(), json!(n));
+        }
+        Ok(EmbedOutcome::AlreadyRunning) => {
+            map.insert("embed_scheduled".to_string(), json!(true));
         }
         Err(e) => {
-            if let Value::Object(map) = data {
-                map.insert("embed_error".to_string(), json!(e.to_string()));
-            }
+            map.insert("embed_error".to_string(), json!(e.to_string()));
         }
     }
 }
@@ -516,6 +667,25 @@ fn optional_string_list(req: &Value, key: &str) -> Result<Option<Vec<String>>, S
     }
 }
 
+/// What every surface says to fold answers sent on the way IN to review mode.
+/// One string rather than three copies: the sentence a client reads must be
+/// the same sentence wherever it meets the rule.
+const FOLDS_ON_THE_WAY_IN: &str = "folds say what happens to each actor's private drafts, which is a question about LEAVING \
+     review mode: a domain on its way in has none yet. Send mode 'overlay' on its own";
+
+/// Whether a `domain_review` request carries fold answers on the way IN.
+///
+/// Any `folds` MAP, not only a non-empty one, exactly as the JSON API reads it
+/// (`rest::domains_admin::set_review_mode`): the rule a client learns is
+/// "folds are a question about leaving", and an empty map waved through here
+/// would make it "folds with something in them are" on this socket and the
+/// other rule everywhere else. An explicit null is not a map and is the absent
+/// key.
+fn folds_on_the_way_in(req: &Value) -> bool {
+    req.get("mode").and_then(Value::as_str) == Some("overlay")
+        && req.get("folds").is_some_and(Value::is_object)
+}
+
 fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
@@ -560,6 +730,37 @@ mod tests {
                 "{envelope}"
             );
         }
+    }
+
+    /// The one malformed `domain_review` request, refused the same way on all
+    /// three surfaces.
+    ///
+    /// Any `folds` MAP, not only a non-empty one, exactly as the JSON API
+    /// reads it: the rule a client learns is "folds are a question about
+    /// leaving", and an empty map waved through here would make it "folds with
+    /// something in them are" on this socket and the other rule everywhere
+    /// else. An explicit null is not a map and is the absent key - a client
+    /// holding the field as nullable and sending what it holds is saying it
+    /// has no answers, which is what absence means.
+    #[test]
+    fn folds_on_the_way_in_are_refused_exactly_as_the_api_refuses_them() {
+        assert!(folds_on_the_way_in(
+            &json!({ "mode": "overlay", "folds": {} })
+        ));
+        assert!(folds_on_the_way_in(
+            &json!({ "mode": "overlay", "folds": { "ada": "fold" } })
+        ));
+        assert!(!folds_on_the_way_in(&json!({ "mode": "overlay" })));
+        assert!(!folds_on_the_way_in(
+            &json!({ "mode": "overlay", "folds": Value::Null })
+        ));
+        // On the way OUT the answers are the whole point of the request.
+        assert!(!folds_on_the_way_in(
+            &json!({ "mode": "direct", "folds": { "ada": "discard" } })
+        ));
+        assert!(!folds_on_the_way_in(
+            &json!({ "mode": "direct", "folds": {} })
+        ));
     }
 
     /// Which credential a forget addresses: absent is the machine's own, so a
@@ -651,5 +852,149 @@ mod tests {
                 "{arm} must not read its proposal as a bare as_u64"
             );
         }
+    }
+
+    // --- the embed field on a daemon response -------------------------------
+
+    /// A provider that holds every batch until the test opens it, and says so
+    /// when a batch arrives, so a pass can be put in flight without polling.
+    struct HeldEmbedder {
+        arrived: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl HeldEmbedder {
+        fn new() -> Self {
+            Self {
+                arrived: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+        /// Wait until the provider is holding a batch, which is to say until a
+        /// pass has claimed the gate and is inside it.
+        async fn wait_for_a_batch(&self) {
+            self.arrived.acquire().await.unwrap().forget();
+        }
+        /// Let every held batch through, and every later one.
+        fn open(&self) {
+            self.release.close();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crystalline_index::EmbeddingProvider for HeldEmbedder {
+        async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+            self.arrived.add_permits(1);
+            // Err once the test closes the semaphore, which is the open gate.
+            let _ = self.release.acquire().await;
+            Ok(vec![vec![0.1_f32; 4]; texts.len()])
+        }
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+        fn dims(&self) -> usize {
+            4
+        }
+        fn max_input_tokens(&self) -> usize {
+            512
+        }
+    }
+
+    fn virtual_engine(
+        store: std::sync::Arc<tokio::sync::Mutex<dyn crystalline_index::Store>>,
+    ) -> Engine {
+        let mut cfg = crystalline_core::config::GlobalConfig::default();
+        cfg.domains.insert(
+            "notes".to_string(),
+            crystalline_core::config::DomainEntry::virtual_domain(),
+        );
+        Engine::new(store, cfg, None, None)
+    }
+
+    fn a_note(title: &str) -> crate::params::WriteParams {
+        crate::params::WriteParams {
+            domain: "notes".to_string(),
+            title: title.to_string(),
+            content: format!("the body of {title}, long enough to make a chunk"),
+            folder: None,
+            engram_type: None,
+            tags: Vec::new(),
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        }
+    }
+
+    /// `sync --embed` and `reindex --embed` through a running daemon report a
+    /// count. One pass walks the backlog at a time, so a request that arrives
+    /// while the daemon is already embedding is folded into the running pass -
+    /// and reporting that as `embedded_chunks: 0` would tell a person on a
+    /// large first index, exactly the case `--embed` is for, that nothing
+    /// happened. It says `embed_scheduled` instead, and the count is reported
+    /// only when this call actually walked the backlog.
+    #[tokio::test]
+    async fn a_turned_away_embed_reports_scheduled_rather_than_a_zero_count() {
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let store: std::sync::Arc<tokio::sync::Mutex<dyn crystalline_index::Store>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(store));
+        let engine = std::sync::Arc::new(virtual_engine(store));
+        let embedder = std::sync::Arc::new(HeldEmbedder::new());
+        engine.set_provider(embedder.clone());
+        for i in 0..3 {
+            engine
+                .write_engram(&a_note(&format!("Note {i}")))
+                .await
+                .unwrap();
+        }
+
+        // A pass is walking the backlog, held at its first batch.
+        let pass = tokio::spawn({
+            let e = engine.clone();
+            async move { e.embed_pending().await }
+        });
+        embedder.wait_for_a_batch().await;
+        assert!(engine.embed_in_flight(), "a pass holds the gate");
+
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, true, &mut data).await;
+        assert_eq!(
+            data["embed_scheduled"], true,
+            "the running pass covers this request: {data}"
+        );
+        assert!(
+            data.get("embedded_chunks").is_none(),
+            "and no count is reported for work another pass is doing: {data}"
+        );
+
+        // Let the pass finish, then a request that really does walk the backlog
+        // reports its count and no schedule flag.
+        embedder.open();
+        pass.await.unwrap().unwrap();
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, true, &mut data).await;
+        assert_eq!(
+            data["embedded_chunks"], 0,
+            "the backlog was drained by the pass: {data}"
+        );
+        assert!(
+            data.get("embed_scheduled").is_none(),
+            "nothing was folded into another pass: {data}"
+        );
+
+        // A pass that embeds reports the count it embedded.
+        engine.write_engram(&a_note("Note 3")).await.unwrap();
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, true, &mut data).await;
+        assert_eq!(data["embedded_chunks"], 1, "{data}");
+
+        // And `embed: false` writes no embed field at all.
+        let mut data = json!({ "domains": 1 });
+        embed_onto_response(&engine, false, &mut data).await;
+        assert!(data.get("embedded_chunks").is_none(), "{data}");
+        assert!(data.get("embed_scheduled").is_none(), "{data}");
     }
 }

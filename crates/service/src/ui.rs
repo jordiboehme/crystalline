@@ -80,6 +80,21 @@ const REVALIDATE: &str = "no-cache";
 /// What the entry point may be held for: nothing at all.
 const NO_STORE: &str = "no-store";
 
+/// The `Content-Security-Policy` the app shell is served under: no origin may
+/// frame it.
+///
+/// The shell answers every app route, the OAuth consent screen at
+/// `/authorize` among them - the one page in this product where a single
+/// click hands a client everything an account can do, which is exactly what
+/// an authorization server's own consent page is targeted by clickjacking
+/// for. `X_FRAME_OPTIONS` rides beside it for the same rule in the header a
+/// modern browser already retired in favor of this directive, kept for the
+/// one that has not: unlike the attachment policy in `rest/files.rs`, this is
+/// not `default-src 'none'; sandbox` - the shell still has to fetch its own
+/// scripts, styles and the API it calls, so only framing is refused, nothing
+/// else the page legitimately does.
+const SHELL_CSP: &str = "frame-ancestors 'none'";
+
 /// The page a binary with no bundle answers navigations with.
 const NOT_BUILT: &str = "<!doctype html>\n\
     <html lang=\"en\"><head><meta charset=\"utf-8\">\n\
@@ -98,8 +113,14 @@ pub fn ui_available<E: RustEmbed>() -> bool {
 
 /// `GET /` and the SPA fallback body: the entry point, never stored, or the
 /// 503 not-built page when the embed is empty.
+///
+/// Both shapes carry [`SHELL_CSP`] and `X-Frame-Options: DENY`, added here
+/// rather than in [`embedded`]: every app route this SPA answers - `/authorize`
+/// included - is this same response, so a policy that unframes the shell
+/// unframes every one of them, while an asset chunk under `/assets/` (served
+/// through [`asset_response`] instead) has no reason to carry it.
 pub fn index_response<E: RustEmbed>() -> Response {
-    embedded::<E>(INDEX, NO_STORE, None).unwrap_or_else(|| {
+    let mut response = embedded::<E>(INDEX, NO_STORE, None).unwrap_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             [
@@ -109,7 +130,14 @@ pub fn index_response<E: RustEmbed>() -> Response {
             Body::from(NOT_BUILT),
         )
             .into_response()
-    })
+    });
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(SHELL_CSP),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
 }
 
 /// `GET /assets/{*path}`: immutable, validated by an `ETag`, 304 on a match,

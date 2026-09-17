@@ -197,6 +197,15 @@ function serve(
       "/domains/eng/tree": treeResponse,
       "/domains/eng/engrams": engramsResponse,
       "/vocabulary": vocabularyResponse,
+      // `MembersCard` reads this unconditionally, the way the tree and the
+      // engram listing are read unconditionally: a shared domain, which
+      // `eng` is unless a test says otherwise, so the card draws its plain
+      // "shared" state and nothing else on this screen changes shape.
+      "/domains/eng/members": () => ({
+        owner: null,
+        visibility: "shared",
+        members: [],
+      }),
       ...routes,
     }),
   );
@@ -262,6 +271,113 @@ describe("the domain screen", () => {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
+  });
+
+  it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "eng",
+            kind: "file",
+            engrams: 4,
+            private: true,
+            when_to_use: ["Route here for eng questions."],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    // A sibling of the heading rather than inside it, off the listing every
+    // other chip on this header draws from, so the heading's own accessible
+    // name stays exactly "eng".
+    const heading = await screen.findByRole("heading", { name: "eng" });
+    expect(heading).toBeVisible();
+    await waitFor(() => {
+      expect(heading.parentElement).toHaveTextContent("private");
+    });
+  });
+
+  it("wears the badge even when the membership read never lands", async () => {
+    // The badge is the listing's answer, not the membership card's: a
+    // members read that fails takes the card down with it and leaves the
+    // header saying exactly what it said before.
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "eng",
+            kind: "file",
+            engrams: 4,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+      "/domains/eng/members": () => {
+        throw new ApiProblem(500, "internal", "the accounts store is down");
+      },
+    });
+
+    renderApp("/d/eng");
+
+    const heading = await screen.findByRole("heading", { name: "eng" });
+    await waitFor(() => {
+      expect(heading.parentElement).toHaveTextContent("private");
+    });
+  });
+
+  it("tells a member how much of their own work is waiting in a reviewing domain", async () => {
+    // An editor, so `can_share` is false and neither share card is drawn: this
+    // is the person whose count used to be invisible in the browser, because
+    // the only place that carried it was the sync route, which is gated with
+    // the share verbs. The listing is the read every member already makes.
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "eng",
+            kind: "file",
+            engrams: 4,
+            review: "overlay",
+            my_drafts: 2,
+            when_to_use: ["Route here for eng questions."],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    expect(
+      await screen.findByText(/You have 2 draft changes here/),
+    ).toBeVisible();
+    // No share card on this session, so the header is the whole of what says
+    // it.
+    expect(screen.queryByRole("region", { name: "Team sync" })).toBeNull();
+  });
+
+  it("says nothing about drafts on a domain that takes changes directly", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
+    expect(screen.queryByText(/draft changes here/)).toBeNull();
+  });
+
+  it("wears no private badge when the domain is shared", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
+    expect(screen.queryByText("private")).toBeNull();
   });
 
   it("says a manifest with no prose at all is there without quoting nothing", async () => {
@@ -679,8 +795,75 @@ describe("the domain screen", () => {
     // Nothing stays on disk here, so nothing here says it does: the engrams
     // are the database's, and the way to keep a copy is named.
     expect(within(body).getByText(/live in the database/i)).toBeVisible();
+    expect(within(body).getByText(/cannot be undone/i)).toBeVisible();
     expect(within(body).getByText(/download the archive first/i)).toBeVisible();
     expect(within(body).queryByText(/files stay on disk/i)).toBeNull();
+  });
+
+  it("sends the purge confirmation for a virtual domain", async () => {
+    const deletes: string[] = [];
+    const removed = (path: string) => {
+      deletes.push(path);
+      return { files_kept: false, rooms_closed: 0 };
+    };
+    serve(
+      {
+        "/domains": () => listingOf("virtual"),
+        "/domains/eng": (path, init) =>
+          init?.method === "DELETE" ? removed(path) : domainsResponse(),
+        "/activity": () => ({ timeframe: "7d", items: [] }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await userEvent.click(
+      await within(body).findByRole("button", { name: "Unregister domain" }),
+    );
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Confirm unregister" }),
+    );
+
+    // The second press IS the confirmation the server asks for, so it travels
+    // with the request rather than being re-collected server-side.
+    await waitFor(() => {
+      expect(deletes.length).toBe(1);
+    });
+    expect(deletes[0]).toContain("purge=true");
+  });
+
+  it("sends no purge confirmation for a file domain", async () => {
+    const deletes: string[] = [];
+    const removed = (path: string) => {
+      deletes.push(path);
+      return { files_kept: true, rooms_closed: 0 };
+    };
+    serve(
+      {
+        "/domains": () => listingOf("file"),
+        "/domains/eng": (path, init) =>
+          init?.method === "DELETE" ? removed(path) : domainsResponse(),
+        "/activity": () => ({ timeframe: "7d", items: [] }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await userEvent.click(
+      await within(body).findByRole("button", { name: "Unregister domain" }),
+    );
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Confirm unregister" }),
+    );
+
+    // Nothing is deleted here, so nothing is confirmed: a file domain's
+    // markdown survives the removal and the flag would be meaningless.
+    await waitFor(() => {
+      expect(deletes.length).toBe(1);
+    });
+    expect(deletes[0]).not.toContain("purge");
   });
 });
 

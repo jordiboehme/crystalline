@@ -14,6 +14,24 @@
  * become a link a moment later, and marking it broken in the meantime would be
  * a claim the app cannot back. Parsed and unresolved is the one honest negative,
  * and it is drawn as such.
+ *
+ * A reference is labelled with the title of the engram it lands on, not with
+ * the text inside its brackets. Those are usually the same string and the
+ * difference is the point when they are not: every relation the engine writes
+ * for itself names the permalink, because a permalink is the stable identity
+ * and never carries a colon, and a reader of a retired engram should still see
+ * "Log: Weekly Garden Notes" rather than `log-weekly`. The file carries the
+ * address, a person keeps seeing the name. Nothing is invented: the title comes
+ * from the graph node the link resolved to, so a reference with no address yet
+ * is not labelled at all - it is the prose it was written as.
+ *
+ * One thing the bracket text cannot settle on its own, and the server's
+ * resolver cannot either: `[[Log: Weekly Garden Notes]]` splits exactly like
+ * `[[ops:Runbook]]`, and only the domain registry says which of the two words
+ * before the colon is a domain. So the split below stays domain-agnostic - it
+ * mirrors the server's parser, and the two must not drift - and the fallback
+ * lives in the resolver, which is handed the domain list this app already
+ * holds. That mirrors where the server keeps it too (`core/src/address.rs`).
  */
 
 import type { EngramDetail, LinkTarget } from "./api/engram";
@@ -109,6 +127,32 @@ function keyOf(target: LinkTarget, fallbackDomain: string): string {
 }
 
 /**
+ * The readings of one bracket text, in the order they are tried.
+ *
+ * Almost always one: what the parser made of it. A second is added only when
+ * the parser found a prefix and the caller's domain list says nothing is
+ * registered under that name - then the whole bracket text, colon and all, is
+ * a title in the engram's own domain. The cross-domain reading is still tried
+ * first, so a prefix naming a real domain never loses to a title that merely
+ * looks like one, and a caller that passes no domain list gets the single
+ * reading it always got.
+ */
+function readings(
+  inner: string,
+  known: ReadonlySet<string> | undefined,
+): LinkTarget[] {
+  const parsed = parseWikiTarget(inner);
+  if (
+    parsed.domain === null ||
+    known === undefined ||
+    known.has(parsed.domain)
+  ) {
+    return [parsed];
+  }
+  return [parsed, { domain: null, target: inner.trim() }];
+}
+
+/**
  * Build the resolver for one engram page.
  *
  * `graph` is optional because it arrives second: the same resolver is used
@@ -118,8 +162,13 @@ function keyOf(target: LinkTarget, fallbackDomain: string): string {
 export function buildWikilinkResolver(
   detail: EngramDetail,
   graph: GraphNeighborhood | undefined,
+  domains?: readonly string[],
 ): WikilinkResolver {
   const home = detail.domain;
+  // Undefined rather than empty when the caller has no listing to give: an
+  // empty set would say every prefix names no domain, which is a claim, where
+  // undefined says this caller cannot tell and asks for the old behavior.
+  const known = domains === undefined ? undefined : new Set(domains);
 
   // What the index made of each parsed reference. Both lists are consulted,
   // because a target written as prose on one line and declared as a relation on
@@ -134,10 +183,18 @@ export function buildWikilinkResolver(
   }
 
   // Where the neighbors live, by title and by permalink, since a wikilink may
-  // be written as either.
-  const located = new Map<string, { domain: string; permalink: string }>();
+  // be written as either. The title rides along because it is what a reader is
+  // shown for whichever of the two the link was written with.
+  const located = new Map<
+    string,
+    { domain: string; permalink: string; title: string }
+  >();
   for (const node of graph?.nodes ?? []) {
-    const where = { domain: node.domain, permalink: node.permalink };
+    const where = {
+      domain: node.domain,
+      permalink: node.permalink,
+      title: node.title,
+    };
     for (const name of [node.title, node.permalink]) {
       // Keyed through the same function the lookup uses, so the two can never
       // disagree about what a key is.
@@ -149,9 +206,14 @@ export function buildWikilinkResolver(
   }
 
   return (inner: string) => {
-    const target = parseWikiTarget(inner);
-    const key = keyOf(target, home);
-    const resolved = parsed.get(key);
+    const candidates = readings(inner, known);
+
+    // What the index made of it, taken from the first reading it has anything
+    // to say about. A verdict of false is the verdict: a second reading is a
+    // different way of asking the same server, not a second opinion.
+    const resolved = candidates
+      .map((target) => parsed.get(keyOf(target, home)))
+      .find((verdict) => verdict !== undefined);
     if (resolved === undefined) {
       // Not a reference the server parsed out of this engram at all. Rendered
       // as prose rather than guessed at: bracket text inside, say, a quoted
@@ -161,13 +223,25 @@ export function buildWikilinkResolver(
     if (!resolved) {
       return { kind: "unresolved" };
     }
-    const where = located.get(key);
-    return where === undefined
-      ? null
-      : {
+
+    // Where it lives, over every reading: the graph places an engram under its
+    // own title, so a target the index resolved through the fallback reading is
+    // findable under that reading and under no other.
+    for (const target of candidates) {
+      const where = located.get(keyOf(target, home));
+      if (where !== undefined) {
+        return {
           kind: "resolved",
           href: engramRoute(where.domain, where.permalink),
-          label: target.target,
+          // The engram's own title, falling back to the bracket text for a node
+          // that carries none. A link written by title is labelled with that
+          // title in its canonical spelling; a link written by permalink is
+          // labelled with the title too, which is the whole reason the engine
+          // may write the address without costing a reader the name.
+          label: where.title === "" ? target.target : where.title,
         };
+      }
+    }
+    return null;
   };
 }

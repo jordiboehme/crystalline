@@ -1,6 +1,28 @@
 //! The in-memory session registry and the per-session document room. The file
 //! stays the source of truth: a session is a live LF-space view of it, and
 //! everything durable flows back through the engine (Tasks 6-7).
+//!
+//! **A room is one DOCUMENT, and in a domain that reviews changes a document
+//! belongs to somebody.** The registry key carries that third component: the
+//! domain, the permalink, and the overlay owner whose draft of it this room is
+//! (`None` for the document a direct domain keeps, which is the folder's own
+//! and everybody's). Two authors drafting one page are two rooms, each opening
+//! on its own author's text and saving into that author's draft row - never
+//! into the folder the team reviewed and never into somebody else's overlay.
+//! Who may open a room over whose document is decided at the door, in
+//! [`super::ws::join`]: your own needs nothing, and somebody else's needs the
+//! share-link their author minted plus the join this session opened on it.
+//!
+//! **One room's awareness ceiling is 32 names, not [`MAX_PARTICIPANTS`]'s 16.**
+//! A connection slot (`state.conns`) and an agent presence slot
+//! (`state.agents`) are two separate budgets, each capped at
+//! [`MAX_PARTICIPANTS`], and both publish into the same room's awareness map,
+//! which `participants` (`CollabSessions::participants`) and the header strip
+//! (`fluid/src/collab/PresenceChips.tsx`) render in full, unbounded by either
+//! cap on its own. The 16-and-16 split follows from the ruling that set the
+//! agent cap to mirror the connection cap rather than to share its budget, so
+//! a room at both ceilings shows 32 names for as long as it takes one to
+//! leave. Recorded here so it is a known number rather than a rediscovery.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +40,7 @@ use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 use super::control::{self, Control};
 use super::merge::{self, MergeOutcome};
 use super::text::{Separator, collab_eligible, file_text, separator_of, session_text};
+use crate::domain_view::DomainView;
 use crate::engine::{Engine, EngineError, EngramText};
 
 /// The name of the one shared Y.Text every session document carries. The
@@ -38,17 +61,35 @@ pub const SAVE_MAX_LAG_MS: u64 = 15_000;
 pub const IDLE_CHECK_MS: u64 = 10_000;
 /// How often the per-session saver wakes up to ask whether anything is due.
 const SAVER_TICK_MS: u64 = 250;
+/// How long an agent stands in the participant strip after its last action.
+///
+/// An agent holds no socket, so nothing tells the room when it has finished:
+/// there is no disconnect to hear. The slot is a claim with an expiry on it
+/// instead, refreshed by every read and every write the agent makes in this
+/// document and swept by the saver's own pass once a minute of silence has
+/// gone by. Long enough that a person watching a chip does not see it blink
+/// between two calls of one piece of work, short enough that a strip is never
+/// a list of agents that left.
+pub const AGENT_PRESENCE_TTL_MS: u64 = 60_000;
 
 /// One connection's identity inside a session, minted at join.
 pub type ConnId = u64;
 
-/// One broadcast frame: protocol bytes plus the connection they came from.
+/// One broadcast frame: protocol bytes, the connection they came from and,
+/// for the one frame that is not everybody's business, the connection they are
+/// for.
 #[derive(Clone)]
 pub struct Frame {
     /// The connection an update came from, so the socket loop can skip
     /// echoing it back; None for server-originated frames (merge edits,
     /// control broadcasts), which everyone gets.
     pub from: Option<ConnId>,
+    /// The connection this frame is FOR, when it is for one of them. `None` on
+    /// every ordinary frame, which the whole room hears. `Some(conn)` is the
+    /// eviction of a session whose join into this draft has ended: it closes
+    /// that socket and no other, because the room belongs to its owner and
+    /// they are still in it.
+    pub to: Option<ConnId>,
     /// The encoded y-protocol messages to send.
     pub bytes: Bytes,
 }
@@ -108,10 +149,106 @@ impl std::fmt::Debug for Joined {
     }
 }
 
-/// The registry of open documents, keyed by (domain, permalink).
+/// What an agent's write into a live document did.
+///
+/// One field, and it is the one an agent cannot work out for itself: a write
+/// that composed into somebody's open editor is a write somebody is about to
+/// see land under their cursor, and the receipt says who that is so the agent
+/// can say so too.
+pub struct LiveApplied {
+    /// Who is in the room the text landed in, by the name their client
+    /// publishes in awareness. Sorted and de-duplicated, so one person in two
+    /// windows is one name and the receipt does not reorder between calls.
+    ///
+    /// The writing agent's own slot is not in it: this answers "who is in
+    /// there with me", and another agent working in the same document is.
+    pub participants: Vec<String>,
+}
+
+/// An agent in a room, as the room shows it.
+///
+/// Two halves because presence is per (account, label) rather than per
+/// connection: the account is who the agent is working for, and the label is
+/// the name a person reads in the strip. One account working through two
+/// harnesses is two peers, which is the true thing to draw - they are two
+/// agents - and the same harness calling ten times is one.
+///
+/// The label is composed where the two halves are known, in `crate::mcp`, and
+/// it is for display alone: what a write records as its provenance is the
+/// hyphenated OKF actor and is untouched by anything here.
+#[derive(Clone, Debug)]
+pub struct AgentPeer {
+    /// The account the call authenticated as, or the identity a local session
+    /// acts with. Half the presence key.
+    pub account: String,
+    /// The name the participant strip shows, "<account> (agent)" or
+    /// "<account> (agent: <client>)".
+    pub label: String,
+}
+
+/// One agent's standing claim on a slot in this room.
+struct AgentSlot {
+    /// The awareness client id it publishes under, minted from its key so the
+    /// same agent reclaims the same slot after a sweep.
+    id: ClientID,
+    /// When it last did something here; the TTL is measured from this.
+    touched: Instant,
+}
+
+/// The awareness client id one agent peer publishes under.
+///
+/// Derived from the key rather than minted from a counter, so the slot an
+/// agent reclaims after a TTL sweep is the slot it had before and a room that
+/// has seen it twice holds one chip. 53 bits because that is what a yjs client
+/// id is (`ClientID::new` asserts it), and the space is wide enough that a
+/// collision with a browser's random id is not a thing to design against -
+/// except for the one id in it that is already spoken for, the room document's
+/// own, which is stepped over rather than shared.
+fn agent_client_id(account: &str, label: &str, avoid: ClientID) -> ClientID {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    const BITS: u64 = (1 << 53) - 1;
+    let mut hash = OFFSET;
+    for byte in account
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0u8))
+        .chain(label.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    let id = ClientID::new(hash & BITS);
+    if id == avoid {
+        return ClientID::new((id.get() + 1) & BITS);
+    }
+    id
+}
+
+/// What an agent publishes about itself: the name to draw and the one flag
+/// that makes the strip draw it as an agent rather than as a person.
+///
+/// No color: the room's own palette is keyed by the name on every client
+/// already, so an agent gets a chip color the same way everybody else does and
+/// there is no second palette to keep in step. Built through `serde_json` and
+/// never by formatting, because the label carries a client-supplied half.
+fn agent_state_json(label: &str) -> String {
+    serde_json::json!({ "user": { "name": label, "agent": true } }).to_string()
+}
+
+/// Where one room is filed: the domain, the permalink it answers to, and the
+/// overlay owner whose document it is.
+///
+/// `None` in the third slot is the document a domain that takes changes
+/// directly keeps - the folder's own text, which is what every room was before
+/// drafts existed. `Some(actor)` is that actor's draft of the page, which is
+/// the only kind of document a reviewing domain has.
+pub type RoomKey = (String, String, Option<String>);
+
+/// The registry of open documents, keyed by [`RoomKey`].
 pub struct CollabSessions {
     engine: Arc<Engine>,
-    sessions: Mutex<HashMap<(String, String), Arc<CollabSession>>>,
+    sessions: Mutex<HashMap<RoomKey, Arc<CollabSession>>>,
     next_conn: AtomicU64,
     next_epoch: AtomicU64,
 }
@@ -133,12 +270,22 @@ impl CollabSessions {
     /// back to the registry: a frontmatter rename has to move its key, and the
     /// session is the only one who learns about the rename (from the save
     /// receipt).
+    ///
+    /// `overlay` is whose document to open: `None` for the one a direct domain
+    /// keeps, `Some(actor)` for that actor's draft of the page. It is the
+    /// caller's job to have decided that the caller may be in that document -
+    /// see [`super::ws::join`], which is the one surface that opens rooms.
     pub async fn join(
         self: &Arc<Self>,
         domain: &str,
         permalink: &str,
+        overlay: Option<&str>,
     ) -> Result<Joined, JoinError> {
-        let key = (domain.to_string(), permalink.to_string());
+        let key = (
+            domain.to_string(),
+            permalink.to_string(),
+            overlay.map(str::to_string),
+        );
         // The registry lock is held across open AND the membership check, so a
         // stampede of joins can neither open the same document twice nor
         // overshoot MAX_PARTICIPANTS between the check and the add.
@@ -261,9 +408,43 @@ impl CollabSessions {
     /// side; the visible behavior (the editor closes, the room is unusable) is
     /// right either way.
     pub async fn dispose_domain(&self, domain: &str) -> usize {
+        self.dispose_domain_discarding(domain, &HashSet::new())
+            .await
+    }
+
+    /// [`CollabSessions::dispose_domain`], told which actors' drafts are being
+    /// DISCARDED rather than folded.
+    ///
+    /// A room over one of those drafts is closed **without being saved**. Every
+    /// other room saves first, exactly as it always did: an unregistration
+    /// saves every room (the files stay on disk), and a fold saves every room
+    /// because the folder is about to take those bytes anyway.
+    ///
+    /// Why the exception is not optional. The sweep runs one step after the
+    /// review key comes off, so a room over a draft has already fallen back to
+    /// the folder ([`room_view`]) and its final save is an ordinary file
+    /// write. Discard is the one fold choice whose whole meaning is "this
+    /// never reaches the tree" - the rows are dropped unwritten - so saving
+    /// such a room would publish, into the reviewed folder, the one text the
+    /// operator just said must not go there. It can be a grantee's text, typed
+    /// inside a share-link, which is the sharpest form of the same thing.
+    ///
+    /// The unsaved text ends with the draft it was typed into, which is what
+    /// discarding that draft means.
+    pub async fn dispose_domain_discarding(
+        &self,
+        domain: &str,
+        discarded: &HashSet<String>,
+    ) -> usize {
         let victims: Vec<Arc<CollabSession>> = {
             let mut sessions = self.sessions.lock().await;
-            let keys: Vec<(String, String)> = sessions
+            // The DOMAIN component alone, whatever document each room is a
+            // room over: leaving review mode ends every draft in the domain,
+            // so a room over any of them is a room over nothing a moment
+            // later. `rooms_closed` counts exactly what it always counted -
+            // the rooms this domain had open - and the owner component neither
+            // hides one from the sweep nor adds one to it.
+            let keys: Vec<RoomKey> = sessions
                 .keys()
                 .filter(|key| key.0 == domain)
                 .cloned()
@@ -272,9 +453,16 @@ impl CollabSessions {
         };
         let closed = victims.len();
         for session in victims {
+            let discarding = session
+                .key()
+                .2
+                .is_some_and(|owner| discarded.contains(&owner));
             // The save comes FIRST: poison disposes the session, and a
-            // disposed session's save paths are all no-ops.
-            session.final_save().await;
+            // disposed session's save paths are all no-ops. Which is exactly
+            // how a discarded actor's room is closed without one.
+            if !discarding {
+                session.final_save().await;
+            }
             session.poison().await;
         }
         closed
@@ -288,11 +476,13 @@ impl CollabSessions {
     /// Called with no session guard held: the lock order is registry ->
     /// session, never the reverse. `epoch` identifies the session that renamed
     /// itself, so an entry that was replaced meanwhile is left alone.
-    async fn rekey(&self, from: &(String, String), to_permalink: &str, epoch: &str) {
+    async fn rekey(&self, from: &RoomKey, to_permalink: &str, epoch: &str) {
         if from.1 == to_permalink {
             return;
         }
-        let to = (from.0.clone(), to_permalink.to_string());
+        // The permalink moves and nothing else does: a rename is a new address
+        // for the same document, and whose document it is has not changed.
+        let to = (from.0.clone(), to_permalink.to_string(), from.2.clone());
         let mut sessions = self.sessions.lock().await;
         if sessions.get(from).is_none_or(|held| held.epoch() != epoch) {
             return; // disposed or replaced meanwhile: not ours to move
@@ -315,6 +505,162 @@ impl CollabSessions {
             session.adopt_key(to_permalink);
             sessions.insert(to, session);
         }
+    }
+
+    /// The live text of one open document, or `None` when no room is open
+    /// over it.
+    ///
+    /// **The seam an agent's read and write meet the editor through, and the
+    /// whole of the contract is in the `Option`.** `Some` means somebody has
+    /// this document open and the bytes here are theirs - typed, unsaved, and
+    /// the truth about what the engram says right now. `None` means the file
+    /// or the row is the truth, exactly as it always was, which is what nearly
+    /// every read and write on this instance gets.
+    ///
+    /// FILE space, not session space: the caller is an engine verb that parses
+    /// markdown and compares checksums, so it is handed the bytes the file
+    /// would hold rather than the LF transform the room edits in.
+    ///
+    /// `overlay` is whose document to ask about, and it is the caller's own
+    /// actor - see [`RoomKey`]. An agent writing in a direct domain asks about
+    /// `None`, and in a reviewing domain about its own account's draft (or,
+    /// inside a join, about the owner's, which is the actor its view already
+    /// resolved to). It is never a name taken from a request.
+    pub async fn live_text(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+    ) -> Option<String> {
+        let session = self.live_room(domain, permalink, overlay).await?;
+        Some(session.snapshot().await.0)
+    }
+
+    /// Compose `target` into the live document as one transaction tagged with
+    /// the agent that produced it, and arm the saver.
+    ///
+    /// The text is applied as a minimal line-based edit script
+    /// ([`merge::apply_target`]) rather than as a replacement, which is what
+    /// makes it compose: a person typing at the bottom of the page keeps their
+    /// cursor, their selection and their undo stack, and only the lines the
+    /// agent actually changed move. That is also why the whole document is
+    /// handed in rather than a patch - the engine computed the target from the
+    /// live text, and the diff back to it is this function's job.
+    ///
+    /// `peer` is who the agent shows up as in the room's participant strip
+    /// while the change lands, and for the minute after it
+    /// ([`AGENT_PRESENCE_TTL_MS`]). `None` for a write with nobody to name -
+    /// the CLI, the control socket - which composes exactly as it did and puts
+    /// nothing in the strip.
+    ///
+    /// `agent_label` is the transaction origin. It never leaves this process -
+    /// a yrs origin is local and does not travel on an update - so it is for
+    /// the in-process observer (a later event handler, a log line) rather than
+    /// for the client, which sees the edit as an ordinary remote update.
+    ///
+    /// The saver is armed the way typing arms it, not forced: the agent's text
+    /// IS the room's text now, and it lands on the same debounce a person's
+    /// does. `Err` when the room closed between the read and the write, which
+    /// the caller reports rather than retries - the document it computed
+    /// against is gone.
+    pub async fn apply_text(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+        target: String,
+        agent_label: &str,
+        peer: Option<&AgentPeer>,
+    ) -> Result<LiveApplied, String> {
+        let Some(session) = self.live_room(domain, permalink, overlay).await else {
+            return Err(format!(
+                "the co-editing session over '{permalink}' in domain '{domain}' closed while this \
+                 write was being prepared; read it again and repeat the edit"
+            ));
+        };
+        session.apply_agent_text(&target, agent_label, peer).await
+    }
+
+    /// Stand an agent in the room over one document, when one is open.
+    ///
+    /// The read side of the same claim [`CollabSessions::apply_text`] makes:
+    /// an agent that was answered somebody's unsaved text is reading over
+    /// their shoulder, and the strip says so for as long as the TTL stands.
+    /// Nothing at all when no room is open, which is nearly every read.
+    /// Answers the awareness id the agent stands under, which is what a
+    /// caller asking who else is in the room leaves out of the answer.
+    pub async fn touch_agent_presence(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+        peer: &AgentPeer,
+    ) -> Option<ClientID> {
+        let session = self.live_room(domain, permalink, overlay).await?;
+        session.touch_agent_presence(peer).await
+    }
+
+    /// Whether a room is open over one document, without rendering a word of
+    /// it.
+    ///
+    /// The existence half of [`CollabSessions::live_text`], for the callers
+    /// that only need to know whether the room is there: `live_text` renders
+    /// the whole Yrs document under the session lock, which is a real cost on
+    /// a large engram and is pure waste when the answer is a yes-or-no. The
+    /// three conditions are [`CollabSessions::live_room`]'s, so a swept,
+    /// poisoned or closed room answers `false` here exactly as it answers
+    /// `None` there.
+    pub async fn has_live_room(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+    ) -> bool {
+        self.live_room(domain, permalink, overlay).await.is_some()
+    }
+
+    /// Who is in the room over one document right now, or an empty list when
+    /// no room is open over it.
+    pub async fn participants(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+        except: Option<ClientID>,
+    ) -> Vec<String> {
+        match self.live_room(domain, permalink, overlay).await {
+            Some(session) => session.participants(except).await,
+            None => Vec::new(),
+        }
+    }
+
+    /// The room over one document, when one is open and still writing.
+    ///
+    /// Three conditions, and each drops a room that is not the truth about the
+    /// engram any more: absent from the map (nobody has it open), disposed (a
+    /// swept or poisoned room, whose saver has ended), and closed (the room
+    /// accepted an external deletion, so its text is deliberately not going
+    /// anywhere). A caller handed one of those would compose into a document
+    /// nothing will ever write back.
+    async fn live_room(
+        &self,
+        domain: &str,
+        permalink: &str,
+        overlay: Option<&str>,
+    ) -> Option<Arc<CollabSession>> {
+        let key = (
+            domain.to_string(),
+            permalink.to_string(),
+            overlay.map(str::to_string),
+        );
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(&key)
+            .filter(|session| !session.is_disposed())
+            .cloned()?;
+        (!session.is_closed().await).then_some(session)
     }
 
     /// How many documents are open right now.
@@ -347,12 +693,50 @@ pub struct CollabSession {
     /// always where the registry holds this session. A std mutex, never held
     /// across an await.
     key_permalink: std::sync::Mutex<String>,
+    /// Whose document this room is a room over: `Some(actor)` for that actor's
+    /// draft of the page, `None` for the one a direct domain keeps. Fixed for
+    /// the life of the room - a rename moves the permalink, never the owner -
+    /// and read by everything this room reads and writes through.
+    overlay: Option<String>,
+    /// The path this room's document stood at when it opened, and the only
+    /// path an overlay room ever writes.
+    ///
+    /// A room addresses its saves by the permalink its own text carries, and
+    /// that line is typed by whoever is in the room. So the path is pinned
+    /// here at the open and every save is screened against it
+    /// ([`Engine::save_engram_in_overlay`]): a document that starts claiming
+    /// to be a different engram is refused rather than followed, because a
+    /// room is one document and a person invited into one page was invited
+    /// into one page. `None` for a room over the document a direct domain
+    /// keeps, which is not inside anybody's overlay and has the whole folder
+    /// in front of it either way.
+    ///
+    /// It is also what keeps the guest eviction's lookup asking about the
+    /// right draft on every tick rather than only at the upgrade: `state.path`
+    /// moves only on an accepted save's receipt, and an accepted save is one
+    /// that landed here.
+    pinned_path: Option<String>,
     /// The registry this room lives in, for the rename move. Weak because the
     /// registry owns the session and never the other way round.
     registry: Weak<CollabSessions>,
     /// The engine every durable read and write goes through.
     engine: Arc<Engine>,
     tx: broadcast::Sender<Frame>,
+    /// Whether anybody is in this room as somebody's guest, so a tick over a
+    /// room nobody joined into costs no lock at all.
+    ///
+    /// Written only under the state guard, and always to `!guests.is_empty()`
+    /// as that guard sees it, so it cannot say "nobody" while a guest stands
+    /// in the map - which would be a session left inside a draft it had been
+    /// put out of.
+    has_guests: AtomicBool,
+    /// Whether any agent stands in this room, so a tick over a room no agent
+    /// has ever worked in costs no lock at all - the same pre-filter
+    /// `has_guests` is, for the same reason.
+    ///
+    /// Written only under the state guard, and always to `!agents.is_empty()`
+    /// as that guard sees it.
+    has_agents: AtomicBool,
     /// The room is over: the registry dropped it, or a saver pass panicked.
     /// Ends the saver loop and makes every save path a no-op, so nothing can
     /// write through a session no one owns any more.
@@ -375,6 +759,25 @@ struct SessionState {
     last_saved_text: String,
     /// Awareness client ids seen per connection, nulled on its disconnect.
     conns: HashMap<ConnId, HashSet<ClientID>>,
+    /// The agents standing in this room, keyed by (account, label).
+    ///
+    /// Beside `conns` and never in it, which is the whole shape of the
+    /// feature: an agent holds no socket, so counting its slot as a connection
+    /// would keep a room open that nobody is in and hand a disconnect the job
+    /// of clearing something no disconnect is about. `remove_conn` leaves
+    /// these alone and only the TTL sweep takes one away.
+    agents: HashMap<(String, String), AgentSlot>,
+    /// The connections that are in this room as somebody's guest, and the
+    /// account and join holder each of them is inside on. Empty in every room
+    /// over a document its participants own, which is nearly all of them.
+    ///
+    /// The holder rather than the account decides: a join belongs to one
+    /// browser session, so the question "is this socket still inside the
+    /// draft" is about that session's join and not about whatever else the
+    /// account may have joined from somewhere else. The account is carried
+    /// beside it because the registry asks for both - see
+    /// [`crate::join::Joins::holds`], where it is the same defence.
+    guests: HashMap<ConnId, (String, crate::join::Holder)>,
     dirty: bool,
     /// When the most recent update landed: the debounce timer's input.
     last_edit: Option<Instant>,
@@ -430,15 +833,64 @@ impl SaveStateTag {
     }
 }
 
+/// The view a room over `overlay` reads and writes through.
+///
+/// One function, so the open, the external-change probe, the merge and the
+/// restore cannot disagree about whose document a room is. `None` is the
+/// document a direct domain keeps and answers exactly what it answered before
+/// drafts existed: the folder's own text through the base view.
+///
+/// **This is the co-editing saver's seam onto another actor's rows**, and the
+/// allow-list guard `another_actors_view_is_reached_only_by_the_owner_gated_surfaces`
+/// in crates/service/tests/overlay_domains.rs names it. What makes it safe is
+/// where the owner comes from: never from the socket, never from a path
+/// segment, only from the key the room was opened under - and that key was
+/// decided by [`super::ws::join`], which lets a caller name somebody else's
+/// document only when a live share-link of that author's names them and this
+/// session holds a live join on it.
+///
+/// **The seam Task 14 needs is this same key.** An agent joining a draft
+/// through its MCP session opens the join record that route reads, so a room
+/// asked for over that draft carries the owner here by exactly the path a
+/// browser's does; nothing in this module has to learn what an MCP session is.
+///
+/// **A domain that has stopped reviewing changes has no overlay documents
+/// left, so a room over one falls back to the base view** - the same reading
+/// [`DomainView::for_write_joined`] takes of a join into a domain that left
+/// review mode. It is load bearing during a fold: the key comes off, then the
+/// rooms are swept, and the sweep's final save has to land in the folder the
+/// folds are about to be written over. Landing it in a draft row instead would
+/// put an actor's last typing somewhere the fold drops a moment later. The
+/// other half of that pair is worth saying too: an UNREGISTRATION sweeps while
+/// the domain is still registered and still reviewing, so a room over a draft
+/// saves into that draft and goes with it - which is what unregistering a
+/// reviewing domain promises, rather than spilling unreviewed work into a
+/// folder that stays on disk.
+fn room_view<'a>(
+    engine: &'a Engine,
+    domain: &str,
+    overlay: Option<&str>,
+) -> Result<DomainView<'a>, EngineError> {
+    match overlay.filter(|_| engine.reviews_changes(domain)) {
+        Some(owner) => DomainView::for_actor(engine, domain, &HashSet::new(), owner),
+        None => DomainView::base(engine, domain, &HashSet::new()),
+    }
+}
+
 impl CollabSession {
     async fn open(
         engine: Arc<Engine>,
-        key: (String, String),
+        key: RoomKey,
         epoch: String,
         registry: Weak<CollabSessions>,
     ) -> Result<Arc<CollabSession>, JoinError> {
-        let loaded = engine
-            .engram_text(&key.0, &key.1)
+        // Read through the room's own view: the owner's draft where the room
+        // is a room over one, the text the team reviewed where it is not. The
+        // domain was screened by the surface that asked for the room, and so
+        // was the right to be in this document.
+        let loaded = room_view(&engine, &key.0, key.2.as_deref())
+            .map_err(JoinError::Engine)?
+            .engram_text(&key.1)
             .await
             .map_err(JoinError::Engine)?;
         if !collab_eligible(&loaded.content) {
@@ -461,9 +913,13 @@ impl CollabSession {
             epoch,
             domain: key.0,
             key_permalink: std::sync::Mutex::new(key.1),
+            pinned_path: key.2.is_some().then(|| loaded.path.clone()),
+            overlay: key.2,
             registry,
             engine,
             tx,
+            has_guests: AtomicBool::new(false),
+            has_agents: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
             state: Mutex::new(SessionState {
                 separator: separator_of(&loaded.content),
@@ -473,6 +929,8 @@ impl CollabSession {
                 checksum: loaded.checksum,
                 last_saved_text: loaded.content,
                 conns: HashMap::new(),
+                agents: HashMap::new(),
+                guests: HashMap::new(),
                 dirty: false,
                 last_edit: None,
                 oldest_unsaved: None,
@@ -577,6 +1035,7 @@ impl CollabSession {
                         state.oldest_unsaved.get_or_insert(now);
                         let _ = self.tx.send(Frame {
                             from: Some(conn),
+                            to: None,
                             bytes: Bytes::from(
                                 Message::Sync(SyncMessage::Update(update)).encode_v1(),
                             ),
@@ -593,6 +1052,7 @@ impl CollabSession {
                         tracked.extend(ids);
                         let _ = self.tx.send(Frame {
                             from: Some(conn),
+                            to: None,
                             bytes: Bytes::from(Message::Awareness(update).encode_v1()),
                         });
                     }
@@ -625,9 +1085,223 @@ impl CollabSession {
         replies
     }
 
+    /// Record that `conn` is in this room on a join rather than on its own
+    /// document, so the saver can put it outside the draft when that join
+    /// ends.
+    ///
+    /// Called by the upgrade route once it has decided the connection may be
+    /// here at all; a room over nobody's draft never has one.
+    pub async fn watch_guest(&self, conn: ConnId, account: &str, holder: &crate::join::Holder) {
+        let mut state = self.state.lock().await;
+        state
+            .guests
+            .insert(conn, (account.to_string(), holder.clone()));
+        self.has_guests.store(true, Ordering::Relaxed);
+    }
+
+    /// Close every connection whose join into this draft has ended.
+    ///
+    /// A join ends in one place - the registry - however it ended: the author
+    /// took the link back (which ends the joins on that draft), the draft was
+    /// folded, discarded or renamed, the person pressed Leave, the link's own
+    /// window ran out, or the daemon was restarted under them. So this asks one
+    /// question per guest per tick, of a map in this process's memory, and
+    /// never reads the grant rows: a revocation is already an ending, and
+    /// asking the database four times a second would be asking it something it
+    /// has already answered.
+    ///
+    /// **An expiry is the one ending nobody announces**, and it is covered the
+    /// same way rather than by a second question: the link's window is stamped
+    /// onto the join when it is opened
+    /// ([`crate::join::Join::expires_at`]), so the moment it passes the
+    /// registry answers no here and the socket is closed on the next pass -
+    /// out of the same map, at the same cost.
+    ///
+    /// **And this pass is what keeps an open room's join alive.** The question
+    /// is a use, so a person reading somebody's draft without typing a word
+    /// refreshes their join four times a second for as long as the room is
+    /// open, and the registry's idle window
+    /// ([`crate::join::IDLE_JOIN_LIMIT`]) never reaches them.
+    ///
+    /// The frame is addressed to that connection alone. The owner is not a
+    /// guest and is never in this map, so their socket stands through every
+    /// revocation there is - which is the difference between a link being
+    /// taken back and a room being closed.
+    async fn evict_ended_joins(&self) {
+        let Some(owner) = self.overlay.as_deref() else {
+            return; // a document nobody joined into cannot be left
+        };
+        if !self.has_guests.load(Ordering::Relaxed) {
+            return; // asked four times a second, and almost always here
+        }
+        let mut state = self.state.lock().await;
+        let path = state.path.clone();
+        let joins = self.engine.joins();
+        let ended: Vec<ConnId> = state
+            .guests
+            .iter()
+            .filter(|(_, (account, holder))| {
+                !joins.holds(account, holder, &self.domain, owner, &path)
+            })
+            .map(|(conn, _)| *conn)
+            .collect();
+        for conn in ended {
+            state.guests.remove(&conn);
+            self.has_guests
+                .store(!state.guests.is_empty(), Ordering::Relaxed);
+            let _ = self.tx.send(Frame {
+                from: None,
+                to: Some(conn),
+                bytes: Bytes::from(control::encode(&Control::Closed {
+                    reason: "left".to_string(),
+                })),
+            });
+        }
+    }
+
+    /// Stand an agent in this room's participant strip, or refresh the claim
+    /// it already holds.
+    ///
+    /// **What makes an agent a peer rather than an event.** A person watching
+    /// their document move under an agent's edit is owed the same thing they
+    /// are owed when a colleague types into it: a name in the strip saying who
+    /// is in here. So every action an agent takes in this document - a write
+    /// that composes into it, a read answered from it - puts the agent in the
+    /// room for the next [`AGENT_PRESENCE_TTL_MS`].
+    ///
+    /// Idempotent per (account, label): the second call finds the slot
+    /// standing, refreshes its expiry and publishes nothing, because the state
+    /// it would publish is the state the room already holds and yrs would drop
+    /// a re-publish at the same clock anyway.
+    pub async fn touch_agent_presence(&self, peer: &AgentPeer) -> Option<ClientID> {
+        let mut state = self.state.lock().await;
+        self.touch_agent_locked(&mut state, peer)
+    }
+
+    /// [`CollabSession::touch_agent_presence`] over the locked state, for the
+    /// write path, which is holding the guard across the whole of its edit.
+    ///
+    /// Answers the slot's client id, which is how the caller leaves itself out
+    /// of the list of who is in the room with it, and `None` when there is no
+    /// slot: a room already holding [`MAX_PARTICIPANTS`] agents, or a publish
+    /// the awareness state refused. A caller handed `None` excludes nothing,
+    /// which is the true thing to do with an agent that is not in the strip.
+    fn touch_agent_locked(&self, state: &mut SessionState, peer: &AgentPeer) -> Option<ClientID> {
+        let key = (peer.account.clone(), peer.label.clone());
+        let now = Instant::now();
+        if let Some(id) = state.agents.get(&key).map(|slot| slot.id) {
+            // **A slot the room cannot see is not a slot.** The id is a hash
+            // of a label that is on screen, so a connection in the room can
+            // publish under it, and when that connection leaves the room nulls
+            // every id it sent - the agent's among them. The map would still
+            // say the agent is standing, and a standing slot publishes
+            // nothing, so the agent would go on working with no chip until the
+            // TTL swept a slot nobody could see. Treated as new instead, and
+            // republished at a clock above whatever took it away.
+            if state.awareness.state::<serde_json::Value>(id).is_some() {
+                if let Some(slot) = state.agents.get_mut(&key) {
+                    slot.touched = now;
+                }
+                return Some(id);
+            }
+            state.agents.remove(&key);
+        }
+        // **Bounded exactly as the connection map is** ([`add_conn`]), and for
+        // the same reason: half this key is client-supplied per request, so a
+        // caller that names itself differently every call - by accident, since
+        // a modern-era peer may carry `clientInfo` on one call and omit it on
+        // the next, or on purpose - would otherwise grow one room's strip
+        // without limit. The chip is what is refused and nothing else: the
+        // read or the write that asked for it goes on exactly as it would
+        // have, because an agent's work is not a thing a full strip may
+        // refuse. And a person is never evicted to make room for an agent -
+        // the two maps are separate, so this cap cannot reach a connection.
+        if state.agents.len() >= MAX_PARTICIPANTS {
+            return None;
+        }
+        let id = agent_client_id(&peer.account, &peer.label, state.awareness.client_id());
+        // The clock one past whatever this id last carried, exactly as
+        // `remove_conn` does it: a slot that was swept and is being reclaimed
+        // has a clock the room remembers, and a state published under it would
+        // otherwise be dropped as old news.
+        let clock = state.awareness.meta(id).map(|meta| meta.0 + 1).unwrap_or(1);
+        let mut clients = HashMap::new();
+        clients.insert(
+            id,
+            AwarenessUpdateEntry {
+                clock,
+                json: agent_state_json(&peer.label).into(),
+            },
+        );
+        let update = AwarenessUpdate { clients };
+        if state.awareness.apply_update_summary(update.clone()).is_ok() {
+            let _ = self.tx.send(Frame {
+                from: None,
+                to: None,
+                bytes: Bytes::from(Message::Awareness(update).encode_v1()),
+            });
+            state.agents.insert(key, AgentSlot { id, touched: now });
+            self.has_agents.store(true, Ordering::Relaxed);
+            return Some(id);
+        }
+        None
+    }
+
+    /// Take away the agent slots nothing has refreshed inside the TTL.
+    ///
+    /// On the saver's own pass rather than on a timer of its own: the room
+    /// already wakes up four times a second to ask whether a save is due, and
+    /// an expiry that needed a second timer would be a second thing to stop
+    /// when a room is disposed.
+    async fn sweep_agent_presence(&self, now: Instant) {
+        // Nothing to sweep is the ordinary case - most rooms never see an
+        // agent - and it costs no lock at all.
+        if !self.has_agents.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        let mut gone = Vec::new();
+        state.agents.retain(|_, slot| {
+            let expired = now.saturating_duration_since(slot.touched).as_millis() as u64
+                >= AGENT_PRESENCE_TTL_MS;
+            if expired {
+                gone.push(slot.id);
+            }
+            !expired
+        });
+        self.has_agents
+            .store(!state.agents.is_empty(), Ordering::Relaxed);
+        if gone.is_empty() {
+            return;
+        }
+        // The same removal a disconnect broadcasts: the JSON string "null" at
+        // a clock one past the last one seen, which is how the chip leaves
+        // every strip in the room.
+        let mut clients = HashMap::new();
+        for id in gone {
+            let clock = state.awareness.meta(id).map(|meta| meta.0 + 1).unwrap_or(1);
+            state.awareness.remove_state(id);
+            clients.insert(
+                id,
+                AwarenessUpdateEntry {
+                    clock,
+                    json: "null".into(),
+                },
+            );
+        }
+        let _ = self.tx.send(Frame {
+            from: None,
+            to: None,
+            bytes: Bytes::from(Message::Awareness(AwarenessUpdate { clients }).encode_v1()),
+        });
+    }
+
     /// Drop a connection: null + broadcast its awareness states. True = last one.
     pub async fn remove_conn(&self, conn: ConnId) -> bool {
         let mut state = self.state.lock().await;
+        state.guests.remove(&conn);
+        self.has_guests
+            .store(!state.guests.is_empty(), Ordering::Relaxed);
         let ids = state.conns.remove(&conn).unwrap_or_default();
         if !ids.is_empty() {
             // Null this connection's awareness states for everyone else: the
@@ -647,10 +1321,22 @@ impl CollabSession {
             }
             let _ = self.tx.send(Frame {
                 from: Some(conn),
+                to: None,
                 bytes: Bytes::from(Message::Awareness(AwarenessUpdate { clients }).encode_v1()),
             });
         }
         state.conns.is_empty()
+    }
+
+    /// The domain-relative path this room's document stands at, as the open
+    /// resolved it and as every save receipt has reported it since.
+    ///
+    /// Read by the surface that opened the room, to check that the document it
+    /// landed on is the document it decided the caller may be in: a room is
+    /// asked for by ADDRESS and a share-link is held on a PATH, and the two
+    /// are resolved by different ladders.
+    pub async fn path(&self) -> String {
+        self.state.lock().await.path.clone()
     }
 
     /// Whether nobody is connected any more.
@@ -695,13 +1381,22 @@ impl CollabSession {
         self.disposed.store(true, Ordering::Relaxed);
     }
 
-    /// The registry key this room is filed under right now: `(domain,
-    /// permalink)`, with the permalink a frontmatter rename may have moved.
-    pub fn key(&self) -> (String, String) {
+    /// The registry key this room is filed under right now: the domain, the
+    /// permalink a frontmatter rename may have moved, and whose document it
+    /// is.
+    pub fn key(&self) -> RoomKey {
         (
             self.domain.clone(),
             self.key_permalink.lock().expect("key mutex").clone(),
+            self.overlay.clone(),
         )
+    }
+
+    /// The view this room reads and writes through, built fresh per use the
+    /// way every other engine caller builds one: a view is a lens over the
+    /// engine for the length of one operation, never something to hold.
+    fn view(&self) -> Result<DomainView<'_>, EngineError> {
+        room_view(&self.engine, &self.domain, self.overlay.as_deref())
     }
 
     /// Record the permalink the registry just re-filed this room under.
@@ -712,6 +1407,13 @@ impl CollabSession {
     /// One saver pass at `now`: decides whether a save is due and runs it.
     /// Takes `now` so tests drive time synthetically instead of sleeping.
     pub async fn tick_save(&self, now: Instant) {
+        // Before the save, so a session whose join ended a moment ago is put
+        // outside the draft rather than watching one more save land in it.
+        self.evict_ended_joins().await;
+        // And before it for the same kind of reason: an agent that has gone
+        // quiet leaves the strip on the tick it expires on, rather than one
+        // save later.
+        self.sweep_agent_presence(now).await;
         let renamed = self.due_save(now).await;
         // The session guard is dropped by now: the rename move takes the
         // registry lock, and the lock order is registry -> session.
@@ -822,6 +1524,7 @@ impl CollabSession {
         self.dispose();
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Closed {
                 reason: "internal".to_string(),
             })),
@@ -847,11 +1550,14 @@ impl CollabSession {
                     return None;
                 }
                 SaveOutcome::External(detail) => {
-                    let theirs = match self
-                        .engine
-                        .engram_text(&self.domain, &state.permalink)
-                        .await
-                    {
+                    let view = match self.view() {
+                        Ok(view) => view,
+                        Err(err) => {
+                            self.fail_save(state, err.to_string());
+                            return None;
+                        }
+                    };
+                    let theirs = match view.engram_text(&state.permalink).await {
                         Ok(theirs) => theirs,
                         // The engram the CAS refused is not there to read: the
                         // write and the delete raced, so this is the deletion.
@@ -896,6 +1602,7 @@ impl CollabSession {
                 state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
                         checksum: state.checksum.clone(),
                         permalink: state.permalink.clone(),
@@ -905,15 +1612,43 @@ impl CollabSession {
             return SaveOutcome::Done(None);
         }
         state.last_attempt = Some(now);
-        let receipt = self
-            .engine
-            .save_engram(&crate::params::SaveParams {
-                domain: self.domain.clone(),
-                identifier: state.permalink.clone(),
-                content: file.clone(),
-                expected_checksum: state.checksum.clone(),
-            })
-            .await;
+        let params = crate::params::SaveParams {
+            domain: self.domain.clone(),
+            identifier: state.permalink.clone(),
+            content: file.clone(),
+            expected_checksum: state.checksum.clone(),
+        };
+        // Whose save this is, which is whose document the room is over. A room
+        // over one actor's draft writes that actor's row and nothing else -
+        // not the folder the team reviewed, and not the draft of whoever
+        // happens to be typing. A room over the document a direct domain keeps
+        // saves as the machine owner, exactly as every room did before there
+        // was anything else to be: the surface that opened it is the gate, as
+        // it is for every other write on this instance.
+        let receipt = match self.view() {
+            // The VIEW decides, never the key on its own: a domain that has
+            // stopped reviewing changes has no draft left for this room to be
+            // over, and its text belongs in the folder (see `room_view`).
+            Ok(view) if view.actor().is_some() => {
+                // The path this room opened on, which is the only one it
+                // writes. Unreachable as a `None` here - an overlay room is
+                // the only kind whose view carries an actor - and answered
+                // with the room's current path rather than by unwrapping.
+                let pinned = self
+                    .pinned_path
+                    .clone()
+                    .unwrap_or_else(|| state.path.clone());
+                self.engine
+                    .save_engram_in_overlay(&view, &params, &pinned)
+                    .await
+            }
+            Ok(_) => {
+                self.engine
+                    .save_engram(&params, &crate::scope::Scope::Unrestricted)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
         match receipt {
             Ok(receipt) => {
                 // A human just taught this domain something through the editor,
@@ -949,6 +1684,7 @@ impl CollabSession {
                 state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
                         checksum,
                         permalink,
@@ -981,12 +1717,19 @@ impl CollabSession {
     /// parse refusal replacing an io failure (or either replacing a resolved
     /// conflict) has to reach the room, or its alert keeps naming a reason
     /// that no longer applies.
+    ///
+    /// `detail` is never composed here: every caller hands it `err.to_string()`
+    /// off whatever the engine's own save call refused with, so a move-blocked
+    /// author's room says the exact sentence [`crate::engine::joined_write_is_elsewhere`]
+    /// gives the request path for the same shape - one string, reached two
+    /// ways, never two dialects of one refusal.
     fn fail_save(&self, state: &mut SessionState, detail: String) {
         let repeat = matches!(state.save_state, SaveStateTag::Failed)
             && state.failure_detail.as_deref() == Some(detail.as_str());
         if !repeat {
             let _ = self.tx.send(Frame {
                 from: None,
+                to: None,
                 bytes: Bytes::from(control::encode(&Control::SaveFailed {
                     detail: detail.clone(),
                 })),
@@ -1005,6 +1748,7 @@ impl CollabSession {
         state.pending = Some(PendingConflict::Deleted);
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Conflict {
                 conflict_kind: "deleted".to_string(),
                 theirs: None,
@@ -1067,11 +1811,10 @@ impl CollabSession {
             return None;
         }
         state.last_probe = Some(now);
-        match self
-            .engine
-            .engram_text(&self.domain, &state.permalink)
-            .await
-        {
+        let Ok(view) = self.view() else {
+            return None;
+        };
+        match view.engram_text(&state.permalink).await {
             Ok(theirs) if theirs.checksum != state.checksum => {
                 let detail = format!(
                     "'{}' changed on disk while this session was idle",
@@ -1158,6 +1901,7 @@ impl CollabSession {
                 state.closed = true;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Closed {
                         reason: "deleted".to_string(),
                     })),
@@ -1183,11 +1927,10 @@ impl CollabSession {
     /// re-opens as an edit conflict instead. A session never silently
     /// overwrites external work.
     async fn restore_mine(&self, state: &mut SessionState) -> Option<String> {
-        match self
-            .engine
-            .engram_text_at_path(&self.domain, &state.path)
-            .await
-        {
+        let Ok(view) = self.view() else {
+            return None;
+        };
+        match view.engram_text_at_path(&state.path).await {
             Ok(Some(theirs)) if theirs.content != state.last_saved_text => {
                 let detail = format!(
                     "'{}' is on disk again with somebody else's text, so restoring \
@@ -1207,6 +1950,7 @@ impl CollabSession {
                 state.pending = Some(PendingConflict::Deleted);
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::SaveFailed {
                         detail: err.to_string(),
                     })),
@@ -1217,11 +1961,33 @@ impl CollabSession {
         // save_engram refuses a missing file by design, so the room's text
         // goes back through the restore verb instead.
         let file = Self::file_text_locked(state);
-        match self
-            .engine
-            .restore_engram(&self.domain, &state.path, &file)
-            .await
-        {
+        // Through the room's own view when the room is over a draft - it puts
+        // its text back in that actor's draft - and through the scope its save
+        // uses otherwise. The two arms have to agree, and the save's `None`
+        // arm goes through `Scope::Unrestricted`: routing a base room's
+        // restore through the base view instead would write the folder of a
+        // domain that reviews changes, which is the one thing review mode
+        // exists to stop. Neither arm is reachable from the collab route in a
+        // reviewing domain, which always names an owner; the registry API can
+        // still ask for it, and this is the answer it gets.
+        let restored = match view.actor() {
+            Some(_) => {
+                self.engine
+                    .restore_engram_in_view(&view, &self.domain, &state.path, &file)
+                    .await
+            }
+            None => {
+                self.engine
+                    .restore_engram(
+                        &self.domain,
+                        &state.path,
+                        &file,
+                        &crate::scope::Scope::Unrestricted,
+                    )
+                    .await
+            }
+        };
+        match restored {
             Ok(receipt) => {
                 let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
                 let permalink = receipt["permalink"]
@@ -1241,6 +2007,7 @@ impl CollabSession {
                 state.failure_detail = None;
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::Saved {
                         checksum,
                         permalink,
@@ -1255,6 +2022,7 @@ impl CollabSession {
                 state.pending = Some(PendingConflict::Deleted);
                 let _ = self.tx.send(Frame {
                     from: None,
+                    to: None,
                     bytes: Bytes::from(control::encode(&Control::SaveFailed {
                         detail: err.to_string(),
                     })),
@@ -1274,6 +2042,7 @@ impl CollabSession {
         });
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Conflict {
                 conflict_kind: "edit".to_string(),
                 theirs: Some(theirs.content),
@@ -1287,24 +2056,133 @@ impl CollabSession {
     /// than a flicker of half-applied lines - broadcast that update to the
     /// room and tell it the external change is in.
     fn converge(&self, state: &mut SessionState, target: &str) {
+        self.converge_with(state, target, None)
+    }
+
+    /// [`CollabSession::converge`], naming who produced the change.
+    ///
+    /// `origin` tags the yrs transaction. It is local to this process - an
+    /// encoded update carries no origin - so it is for an in-process observer
+    /// rather than for the clients, which see the same remote update either
+    /// way. `None` is the external-change merge, whose author is a file.
+    fn converge_with(&self, state: &mut SessionState, target: &str, origin: Option<&str>) {
         let update = {
             let doc = state.awareness.doc();
             // Taken before the transaction: get_or_insert_text opens one of
             // its own and would deadlock inside ours.
             let text = doc.get_or_insert_text(TEXT_NAME);
-            let mut txn = doc.transact_mut();
+            let mut txn = match origin {
+                Some(origin) => doc.transact_mut_with(origin),
+                None => doc.transact_mut(),
+            };
             let current = text.get_string(&txn);
             merge::apply_target(&text, &mut txn, &current, target);
             txn.encode_update_v1()
         };
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(Message::Sync(SyncMessage::Update(update)).encode_v1()),
         });
         let _ = self.tx.send(Frame {
             from: None,
+            to: None,
             bytes: Bytes::from(control::encode(&Control::Merged)),
         });
+    }
+
+    /// Compose an agent's text into this room's document.
+    ///
+    /// The engine computed `target` from this room's own live text a moment
+    /// ago (and compared the caller's `expected_checksum` against it), so the
+    /// diff applied here is the agent's edit and nothing else. Everything the
+    /// room does with a typed change it does with this one: the update is
+    /// broadcast to every socket, the merge notice tells the editor its
+    /// document moved under it, and the save timers are armed so the text
+    /// lands on the ordinary debounce.
+    ///
+    /// The lock is held across the whole of it, as every other write on this
+    /// room is, so an agent's edit and a save cannot interleave.
+    async fn apply_agent_text(
+        &self,
+        target: &str,
+        origin: &str,
+        peer: Option<&AgentPeer>,
+    ) -> Result<LiveApplied, String> {
+        if self.is_disposed() {
+            return Err("this co-editing session ended while the write was being prepared".into());
+        }
+        let mut state = self.state.lock().await;
+        if state.closed {
+            return Err(
+                "this co-editing session ended while the write was being prepared".to_string(),
+            );
+        }
+        // Session space: the engine works in FILE space (the bytes a file
+        // holds), the document is a LF view of it, and this is the one
+        // conversion between them on the way in. `file_text` is the way back
+        // out, in `snapshot`.
+        let target = session_text(target);
+        self.converge_with(&mut state, &target, Some(origin));
+        // Armed exactly as an update from a socket arms it (see
+        // `CollabSession::handle_frame`), so the agent's text saves on the
+        // same debounce a person's typing does. Forcing a flush instead would
+        // make an agent's edit the one write on this instance that lands
+        // mid-composition.
+        let now = Instant::now();
+        state.dirty = true;
+        state.last_edit = Some(now);
+        state.oldest_unsaved.get_or_insert(now);
+        // The agent joins the strip under the same guard its text landed
+        // under, so a person sees the chip and the change together.
+        let mine = peer.and_then(|peer| self.touch_agent_locked(&mut state, peer));
+        Ok(LiveApplied {
+            // Everybody in the room EXCEPT this agent. `present` is what the
+            // agent is told about who is in there with it, and its own slot -
+            // minted a line ago, or standing from a call a moment ago - is not
+            // news to the one that put it there. Another agent's is.
+            participants: Self::participants_locked(&state, mine),
+        })
+    }
+
+    /// Who is in this room, by the name their client publishes in awareness.
+    pub async fn participants(&self, except: Option<ClientID>) -> Vec<String> {
+        Self::participants_locked(&*self.state.lock().await, except)
+    }
+
+    /// [`CollabSession::participants`] over the locked state.
+    ///
+    /// Read off awareness rather than off the connection map, because the
+    /// connection map holds ids and this is for a person to read. A client
+    /// that publishes no name at all (a provider that never set one, a socket
+    /// that has not sent its first awareness frame) contributes nothing rather
+    /// than an invented placeholder: the list says who is known to be there,
+    /// not how many sockets are open.
+    ///
+    /// Sorted and de-duplicated, so one person in two windows is one name and
+    /// two calls a second apart do not reorder the same room.
+    ///
+    /// `except` is the one slot the caller is not asking about: an agent
+    /// asking who is in the room with it leaves itself out, however many times
+    /// it has been in here already.
+    fn participants_locked(state: &SessionState, except: Option<ClientID>) -> Vec<String> {
+        let mut names: Vec<String> = state
+            .awareness
+            .iter()
+            .filter(|(id, _)| Some(*id) != except)
+            .filter_map(|(_, client)| client.data)
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .filter_map(|value| {
+                value
+                    .get("user")
+                    .and_then(|user| user.get("name"))
+                    .and_then(|name| name.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Whether the room accepted an external deletion: the session is over,

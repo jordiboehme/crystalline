@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use crystalline_core::config::{self, GlobalConfig, HttpSetting};
 use crystalline_index::{HostClaim, Store};
 use interprocess::local_socket::tokio::Stream as IpcStream;
@@ -33,23 +32,57 @@ pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
 
 /// Startup banner, shown on a foreground start when stderr is a terminal.
 const BANNER: &str = r"
-                                   ·              *
-                                 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-                                ▐░░░▒▒▒▒▓▓▓█▓▓▓▒▒▒▒░░░▌
-                                 ▀█░░░▒▒▒▓▓█▓▓▒▒▒░░░█▀   ·
-                                   ▀█░░▒▒▒▓█▓▒▒▒░░█▀
-                            *        ▀█░▒▒▓█▓▒▒░█▀
-                                       ▀█▒▒█▒▒█▀
-                                         ▀███▀     ·
-                                           ▀
+                                             ◆───◆───◆
+                                            ╱ ╲ ╱ ╲ ╱ ╲
+                                           ◆───◆───◆───◇
+                                          ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                                 ◆───◆───◆╌╌╌◆╌╌╌◆───◇───◇
+                                ╱ ╲ ╱ ╲ ╱ · · · · · ╱ ╲ ╱
+                               ◆───◆───◆───◇╌╌╌·╌╌╌◇───◇
+                              ╱ ╲ ╱ ╲ ╱ ╲ ╱ · · · · · ╱
+                             ◆╌╌╌◆╌╌╌◆───◇───◆╌╌╌◆╌╌╌◆
+                              · · · · · ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                               ·╌╌╌·╌╌╌◇───◆───◆───◆───◇
+                                · · · · · ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                                 ·╌╌╌·╌╌╌◆╌╌╌◆╌╌╌◆───◇───◇
+                                          · · · · · ╱ ╲ ╱
+                                           ·╌╌╌·╌╌╌◇───◇
+                                            · · · · · ╱
+                                             ·╌╌╌·╌╌╌◇
 
- ██████╗██████╗ ██╗   ██╗███████╗████████╗ █████╗ ██╗     ██╗     ██╗███╗   ██╗███████╗
-██╔════╝██╔══██╗╚██╗ ██╔╝██╔════╝╚══██╔══╝██╔══██╗██║     ██║     ██║████╗  ██║██╔════╝
-██║     ██████╔╝ ╚████╔╝ ███████╗   ██║   ███████║██║     ██║     ██║██╔██╗ ██║█████╗
+ ░░░░░░╗░░░░░░╗ ░░╗   ░░╗░░░░░░░╗░░░░░░░░╗ ░░░░░╗ ░░╗     ░░╗     ░░╗░░░╗   ░░╗░░░░░░░╗
+▒▒╔════╝▒▒╔══▒▒╗╚▒▒╗ ▒▒╔╝▒▒╔════╝╚══▒▒╔══╝▒▒╔══▒▒╗▒▒║     ▒▒║     ▒▒║▒▒▒▒╗  ▒▒║▒▒╔════╝
+▓▓║     ▓▓▓▓▓▓╔╝ ╚▓▓▓▓╔╝ ▓▓▓▓▓▓▓╗   ▓▓║   ▓▓▓▓▓▓▓║▓▓║     ▓▓║     ▓▓║▓▓╔▓▓╗ ▓▓║▓▓▓▓▓╗
 ██║     ██╔══██╗  ╚██╔╝  ╚════██║   ██║   ██╔══██║██║     ██║     ██║██║╚██╗██║██╔══╝
 ╚██████╗██║  ██║   ██║   ███████║   ██║   ██║  ██║███████╗███████╗██║██║ ╚████║███████╗
  ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
 ";
+
+/// The copyright line the foreground banner prints right after the
+/// `crystalline {version} serving on ...` line - outside the `is_terminal`
+/// guard, so a foreground run whose stderr is redirected to a file carries
+/// it too. (`--daemon` never reaches this branch at all: there is no
+/// terminal to print a banner to, and its own, separate startup output below
+/// is limited to the `tracing::info!` lines a backgrounded first-run wizard
+/// still needs.) AGPL section 13 is why it names the source: a
+/// network-served copy has to offer its users the source, so the link
+/// belongs where a user of a running instance can see it. Read from the
+/// environment rather than retyped, matching `crates/cli/src/main.rs`'s
+/// `VERSION_BLOCK`.
+const COPYRIGHT_LINE: &str = concat!(
+    "Copyright (C) 2026 Jordi Böhme",
+    " - ",
+    env!("CARGO_PKG_LICENSE"),
+    " - ",
+    env!("CARGO_PKG_REPOSITORY"),
+);
+
+/// The copyright holder and year, named once for the whole workspace. Public
+/// because `crates/cli/src/main.rs` builds its own `VERSION_BLOCK` with
+/// `concat!`, which takes literal tokens only and so cannot read this: what it
+/// can do is assert against it, which `the_version_block_and_the_banner_name_one_holder`
+/// does, so the two spellings cannot drift apart unnoticed.
+pub const COPYRIGHT_HOLDER: &str = "Copyright (C) 2026 Jordi Böhme";
 
 /// A tracked live session.
 #[derive(Clone, serde::Serialize)]
@@ -143,8 +176,11 @@ impl Shared {
 /// [`resolve_http`]. The effective read-only mode is the explicit flag or
 /// `service.read_only`; `take_over` forces host-lock claims for a deliberate host
 /// migration in a shared database.
+// The daemon's startup switches are flat on purpose, one clap flag each.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
     daemon_flag: bool,
+    autostarted: bool,
     http_flag: Option<String>,
     allowed_host_flag: Vec<String>,
     db: Option<PathBuf>,
@@ -166,6 +202,52 @@ pub async fn run_serve(
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
     let allowed_hosts = resolve_allowed_hosts(&allowed_host_flag, &loaded.effective);
+    // A flag that contradicts configuration is said out loud. `tracing::warn!`
+    // rather than the banner's `eprintln!` so the line reaches both a
+    // foreground serve (the subscriber writes to stderr) and a `--daemon` one
+    // (daemon.log), which is where a systemd or container operator reads.
+    if http_flag.is_some() {
+        let from_config = describe_http(resolve_http(None, &loaded.effective).as_ref());
+        let from_flag = describe_http(http_addr.as_ref());
+        let set_value = http_addr.clone().unwrap_or_else(|| "false".to_string());
+        if let Some(line) = exposure_override_notice(
+            "service.http",
+            &http_clause(http_addr.as_ref()),
+            "binds",
+            &from_flag,
+            &from_config,
+            &set_value,
+        ) {
+            tracing::warn!("{line}");
+        }
+    }
+    if !allowed_host_flag.is_empty() {
+        let from_config = describe_hosts(&resolve_allowed_hosts(&[], &loaded.effective));
+        if let Some(line) = exposure_override_notice(
+            "service.allowed_hosts",
+            &format!("accepts the Host values {}", describe_hosts(&allowed_hosts)),
+            "accepts",
+            &describe_hosts(&allowed_hosts),
+            &from_config,
+            &allowed_hosts.join(","),
+        ) {
+            tracing::warn!("{line}");
+        }
+    }
+    // Record what this invocation asked to serve before anything can fail on
+    // the lock: the refusal below needs it, and so do the record and /health.
+    crate::instance::record_serve_intent(crate::instance::ServeIntent {
+        started_by: if autostarted {
+            crate::instance::StartMode::Autostart
+        } else {
+            crate::instance::StartMode::Serve
+        },
+        http: match &http_addr {
+            Some(addr) => crate::instance::HttpBinding::Bound(addr.clone()),
+            None => crate::instance::HttpBinding::Off,
+        },
+        allowed_hosts: allowed_hosts.clone(),
+    });
     // The one-time first-run setup token, drawn once per serve process and only
     // for a bind other machines can reach: on loopback the wizard is authorized
     // by the peer address itself, so there is nothing to hand out and nothing to
@@ -273,9 +355,13 @@ pub async fn run_serve(
             ownership.socket_display(),
             shared.pid
         );
+        eprintln!("{COPYRIGHT_LINE}");
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
             eprintln!("{}", ui_startup_line(&loaded.effective, addr));
+            if let Some(line) = oauth_without_a_consent_page(&loaded.effective) {
+                eprintln!("crystalline warning: {line}");
+            }
             if let Some(token) = &setup_token {
                 for line in setup_token_lines(addr, token) {
                     eprintln!("{line}");
@@ -332,10 +418,15 @@ pub async fn run_serve(
             e.bootstrap_env_origins().await;
             if let Some(provider) = crate::engine::build_provider(&cfg).await {
                 e.set_provider(provider);
-                match e.embed_pending().await {
-                    Ok(n) if n > 0 => tracing::info!("embedded {n} chunks on startup"),
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!("initial embed failed: {err}"),
+                // Schedule on the worker, like every other caller: an inline
+                // pass here runs beside the worker's, and two passes walk one
+                // backlog with separate cursors, each re-embedding what the
+                // other has in flight. The inline fallback is for an engine
+                // with no worker wired, which a daemon never is.
+                if !e.request_embed()
+                    && let Err(err) = e.embed_pending().await
+                {
+                    tracing::warn!("initial embed failed: {err}");
                 }
             }
         });
@@ -394,6 +485,22 @@ pub async fn run_serve(
         });
     }
 
+    // The orphaned-row sweep: drops the engram rows of a domain nobody has
+    // registered for a week, and stamps every registered domain on the way
+    // past so a domain that is still registered can never age into a
+    // candidate. Nothing is served from those rows in the meantime (an
+    // unregistered domain is no hit, no count and no facet value), so this
+    // reclaims disk rather than changing an answer. A read-only instance's
+    // pass collects nothing and says so, which is why the task is spawned
+    // there too.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_orphan_sweep(e, ORPHAN_SWEEP, rx).await;
+        });
+    }
+
     // The HTTP endpoint, which is on unless it was turned off.
     if let Some(addr) = http_addr.clone() {
         let e = engine.clone();
@@ -415,7 +522,7 @@ pub async fn run_serve(
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
-                        "HTTP endpoint for {addr} could not start ({err}); MCP over the socket is unaffected"
+                        "HTTP endpoint for {addr} could not be built ({err:#}); this is the configuration it was built from rather than the address, and MCP over the socket is unaffected"
                     );
                     return;
                 }
@@ -828,15 +935,15 @@ async fn run_http(
 /// (a local peer is never asked for one) while a missing token on a reachable
 /// bind locks the wizard shut.
 ///
-/// 32 hex characters is 128 bits from the same `OsRng` the session tokens are
-/// drawn from - a one-shot secret a human retypes off a terminal, not a stored
-/// credential.
+/// 32 hex characters is 128 bits from the same OS CSPRNG the session tokens
+/// are drawn from - a one-shot secret a human retypes off a terminal, not a
+/// stored credential.
 fn setup_token_for(addr: &str) -> Option<String> {
     if bind_is_loopback(addr) {
         return None;
     }
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
     Some(crystalline_index::hex_lower(&bytes))
 }
 
@@ -872,6 +979,12 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
     McpServer,
     CountingSessions<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>,
 >;
+
+/// That transport with the identity gate in front of it, which is what every
+/// mount site actually mounts. With `auth.mcp` off the gate is a pass-through,
+/// so the type is the same either way and the router has one shape to reason
+/// about; see [`crate::mcp_gate`].
+type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
 
 /// A session manager that counts the sessions it creates, wrapping the real
 /// one and delegating everything else untouched.
@@ -913,14 +1026,48 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
 /// still connecting. That is the honest reading of the name it already has, and
 /// on a modern-only fleet the number stops growing. A figure covering modern
 /// traffic would be a different metric, not a repair of this one.
+///
+/// # Why it also releases session claims and draft joins
+///
+/// This is the one seam rmcp calls on *every* end of a session:
+/// `close_session` runs from the DELETE handler (`tower.rs:2073`) and from
+/// `spawn_session_worker`'s exit path (`tower.rs:1331`), which is where a
+/// session ended by the 300 second idle keep-alive or by a worker error lands.
+/// The identity gate's claim map has to be released on all three or it grows one
+/// permanent entry per connection that ever went idle, so the map is threaded
+/// through here rather than released only where the gate can see it - see
+/// [`crate::mcp_gate::SessionOwners`].
+///
+/// The draft joins that session opened ride along for the same reason. A join
+/// is keyed by its holder, and a legacy session IS one
+/// ([`crate::join::Holder::McpSession`]), so "the session ended" has to be able
+/// to end it. The service object's own drop ends it on the path where that drop
+/// happens, which is a client `DELETE`; an idle keep-alive or a worker error
+/// gives no such guarantee. The registry's own window
+/// ([`crate::join::IDLE_JOIN_LIMIT`]) is the floor under all of it, but half an
+/// hour of an author's draft holding a guest who cannot come back is a floor
+/// rather than an answer. Threading the registry through here makes one rule of
+/// the three endings, and makes each of them immediate.
 pub(crate) struct CountingSessions<M> {
     inner: M,
     created: Arc<AtomicUsize>,
+    sessions: Arc<crate::mcp_gate::SessionOwners>,
+    joins: Arc<crate::join::Joins>,
 }
 
 impl<M> CountingSessions<M> {
-    fn new(inner: M, created: Arc<AtomicUsize>) -> CountingSessions<M> {
-        CountingSessions { inner, created }
+    fn new(
+        inner: M,
+        created: Arc<AtomicUsize>,
+        sessions: Arc<crate::mcp_gate::SessionOwners>,
+        joins: Arc<crate::join::Joins>,
+    ) -> CountingSessions<M> {
+        CountingSessions {
+            inner,
+            created,
+            sessions,
+            joins,
+        }
     }
 }
 
@@ -955,6 +1102,18 @@ impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
         &self,
         id: &SessionId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // Released before the inner manager is asked to close, so the claim is
+        // gone whether or not the close itself errors: a session rmcp has given
+        // up on must not keep refusing a later caller who legitimately gets its
+        // id, and the entry is worthless either way.
+        self.sessions.release(id);
+        // And the drafts that session had joined end with it, for the same
+        // reason and on the same three paths. A join held by a session that is
+        // gone is a key nobody can present, so leaving one here would leave an
+        // author's draft holding a guest who cannot come back until the
+        // registry's idle window swept it half an hour later.
+        self.joins
+            .end_holder(&crate::join::Holder::McpSession(id.to_string()));
         self.inner.close_session(id)
     }
 
@@ -1092,9 +1251,18 @@ pub fn http_router(
     {
         // No embed exists to serve, so the router is its pre-UI self: the
         // declared routes and the transport behind them.
-        let api = engine.config().api_enabled();
-        let (router, service) =
-            http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+        let config = engine.config();
+        let api = config.api_enabled();
+        let mcp_auth = config.auth_mcp().then(|| auth.clone());
+        let (router, service) = http_base(
+            engine,
+            http_sessions,
+            allowed_hosts,
+            auth,
+            api,
+            setup_token,
+            mcp_auth,
+        )?;
         Ok(router.fallback_service(service))
     }
 }
@@ -1111,15 +1279,25 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
-    // One snapshot for both keys: they are read once when the HTTP surface
-    // starts, like `service.read_only` and the `auth.*` keys, and `ui_enabled`
+    // One snapshot for all three keys: they are read once when the HTTP surface
+    // starts, like `service.read_only`, and `ui_enabled`
     // already carries the coupling (`service.api=false` turns the UI off with
     // it, since a shell whose data routes are gone can only render a login
     // error).
     let config = engine.config();
     let (api, ui) = (config.api_enabled(), config.ui_enabled());
-    let (router, service) =
-        http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+    // Read here with the other two, and for the same reason: the `auth.*` keys
+    // are startup-effective, so a running daemon serves the tier it started in.
+    let mcp_auth = config.auth_mcp().then(|| auth.clone());
+    let (router, service) = http_base(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        api,
+        setup_token,
+        mcp_auth,
+    )?;
     if !ui {
         return Ok(router.fallback_service(service));
     }
@@ -1203,6 +1381,11 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 /// service the caller mounts as (or behind) the fallback. `setup_token` is this
 /// process's first-run token, handed to the REST state that answers the setup
 /// route; `None` closes the token path, which is what a loopback bind wants.
+/// `mcp_auth` is the store the identity gate resolves agent tokens through,
+/// `Some` exactly when `auth.mcp` is on and `None` for the legacy open tier.
+///
+/// Also where the engine is handed its private-domain resolver, since this is
+/// the one place an accounts store and the engine meet on every HTTP path.
 fn http_base(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -1210,9 +1393,70 @@ fn http_base(
     auth: Arc<crate::rest::AuthStore>,
     api: bool,
     setup_token: Option<String>,
-) -> anyhow::Result<(axum::Router, McpService)> {
+    mcp_auth: Option<Arc<crate::rest::AuthStore>>,
+) -> anyhow::Result<(axum::Router, GatedMcpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
+
+    let config = engine.config();
+    // `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
+    // off there is nowhere for them to live, so the refusal happens here
+    // rather than waiting for `RestState::new` below, which never runs when
+    // `api` is false.
+    //
+    // Both guards below only ever fire on an explicit `true`: an unset
+    // `auth.oauth` follows `auth.mcp` where the UI is served
+    // (`GlobalConfig::auth_oauth`), so a derived value is `true` only where
+    // `ui_enabled()` already holds, and `ui_enabled()` implies `api_enabled()`
+    // - a config nobody set `auth.oauth` on can never trip either bail, which
+    // is what lets an upgrade turn OAuth on for a shared instance without
+    // also risking its daemon start.
+    let oauth = config.auth_oauth();
+    if oauth && !api {
+        anyhow::bail!("auth.oauth needs service.api: its endpoints live under /api/v1");
+    }
+    // `authorize` answers a redirect to `/authorize`, a Fluid route; with the
+    // embedded UI off, that address falls to the MCP transport instead
+    // (`ui_serving`'s own rule for every UI path once `service.ui` is off),
+    // and no consent can ever be given. Checked after the `service.api` guard
+    // above rather than folded into it: `ui_enabled()` is already false
+    // whenever `api` is, so that case is already caught there with the more
+    // specific word; this one is what catches `service.ui` turned off on its
+    // own, with the API still serving.
+    //
+    // **This guard reads the setting, not whether a bundle exists, and that is
+    // deliberate.** A binary built without `fluid-ui` (or over an empty
+    // `fluid/dist`) still has `ui_enabled()` true, so a derived `auth.oauth`
+    // comes up on with nowhere to consent. Detecting the bundle here would
+    // have to change what OAuth *is* on that build, and `auth.oauth()` is read
+    // independently by four places - the gate's `with_oauth`,
+    // `well_known_routes`, `OauthServer::new` and `AuthCfg::resolve` - whose
+    // agreement is the property that makes "is OAuth served" one answer. A
+    // fifth answer, disagreeing with the config for a build no release
+    // produces, would cost more than the case is worth. So the combination is
+    // named at startup instead (`oauth_without_a_consent_page`) and documented
+    // as unsupported in `docs/deployment.md`; an explicit `auth.oauth: false`
+    // is the fix, and nothing is granted meanwhile - the flow simply cannot
+    // complete.
+    if oauth && !config.ui_enabled() {
+        anyhow::bail!(
+            "auth.oauth needs service.ui: authorize redirects to /authorize, and with the UI off that address falls to the MCP transport, where no consent can ever happen"
+        );
+    }
+    // What this instance calls itself, resolved once with the other startup
+    // settings: the audience the gate checks an OAuth access token against and
+    // the origin the two well-known documents publish, which have to be one
+    // answer or a client is sent somewhere its token does not work.
+    let origin_rule = crate::rest::OriginRule::from_config(&config, allowed_hosts);
+
+    // Every HTTP caller is answered through a resolved scope, so the engine
+    // gets the resolver the moment the store behind it exists. Installed here,
+    // in the one function both router builders funnel through, rather than at
+    // either call site: a router built without it would serve private domains
+    // to anybody who could reach the port. It is a no-op on a second call, so
+    // an integration test that builds two routers over one engine keeps the
+    // first store.
+    engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
 
     // The session manager drives per-request stream priming (e.g. the
     // tools/list response); its own `session_config.sse_retry` default must be
@@ -1223,24 +1467,59 @@ fn http_base(
     // The counter lives here rather than in the factory below, so it counts
     // sessions rather than every construction rmcp asks for; see
     // [`CountingSessions`].
-    let session_manager = Arc::new(CountingSessions::new(session_manager, http_sessions));
+    // Constructed before the session manager, because both the manager wrapper
+    // and the gate hold the same handle: the manager releases a claim on every
+    // path rmcp ends a session, and the gate is what records one.
+    let session_owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+    let session_manager = Arc::new(CountingSessions::new(
+        session_manager,
+        http_sessions,
+        session_owners.clone(),
+        engine.joins().clone(),
+    ));
     // The REST state is built only when the API is served. It is not free (it
     // resolves paths and can fail), and building it to then leave it unmounted
     // would mean `service.api=false` could still fail a start over a surface
     // that daemon is deliberately not offering.
     let rest = if api {
         Some(crate::rest::router(
-            crate::rest::RestState::new(engine.clone(), auth)?.with_setup_token(setup_token),
+            crate::rest::RestState::new(engine.clone(), auth, allowed_hosts)?
+                .with_setup_token(setup_token),
         ))
     } else {
         None
     };
     let service = StreamableHttpService::new(
-        move || Ok(McpServer::new_http(engine.clone())),
+        {
+            // The live-session map goes to every server object this factory
+            // builds, so a request naming a session can be told from one this
+            // process is actually serving - see `McpServer::holder_of`.
+            let owners = session_owners.clone();
+            move || Ok(McpServer::new_http(engine.clone()).with_session_owners(owners.clone()))
+        },
         session_manager,
         http_config(allowed_hosts),
     );
-    let mut router = axum::Router::new().route("/health", axum::routing::get(health));
+    // The gate wraps the transport rather than the router, which is the whole
+    // of its scope: `/health` keeps answering an orchestrator's probe, the JSON
+    // API keeps its own session and trusted-header rules, and - where the UI is
+    // mounted - a browser navigation is answered by the shell middleware before
+    // the gate is ever reached. What is left for the gate is exactly the
+    // requests the transport would have served.
+    let mut service = crate::mcp_gate::McpGate::new(service, mcp_auth, session_owners);
+    if oauth {
+        service = service.with_oauth(origin_rule.clone());
+    }
+    // The two well-known documents are root documents by specification, so they
+    // are declared here beside `/health` rather than under the `/api/v1` nest -
+    // and declared whether or not `auth.oauth` is on, answering `404` while it
+    // is off. Mounting them conditionally would leave the paths to whatever is
+    // behind them, which is the app shell for a browser's `Accept` and this
+    // gate's own `401` for an API client's; neither reads as "there is no OAuth
+    // here". See `rest::oauth`.
+    let mut router = axum::Router::new()
+        .route("/health", axum::routing::get(health))
+        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);
     }
@@ -1334,31 +1613,94 @@ fn ui_startup_line(config: &GlobalConfig, addr: &str) -> String {
     if !config.ui_enabled() {
         return "web UI off (service.ui=false)".to_string();
     }
+    if ui_bundled() {
+        return format!("crystalline web UI at http://{addr}");
+    }
+    // Either built without the `fluid-ui` feature, so there is no bundle at
+    // all, or a dev build whose `fluid/dist` was never built (or was built
+    // after the last compile of this crate: see the note in `build.rs`).
+    "web UI not built into this binary".to_string()
+}
+
+/// Whether this binary actually carries a Fluid bundle, which is a different
+/// question from whether `service.ui` is on.
+///
+/// Both absences look the same from here and neither is a setting: the
+/// `fluid-ui` feature can be off, or it can be on over an empty embed because
+/// `fluid/dist` was never built. Every release binary and the container image
+/// carry the bundle, so this is false only in a hand-rolled build.
+fn ui_bundled() -> bool {
     #[cfg(feature = "fluid-ui")]
     {
-        if crate::ui::ui_available::<crate::ui::FluidAssets>() {
-            return format!("crystalline web UI at http://{addr}");
-        }
-        // A dev build whose `fluid/dist` was never built, or was built after
-        // the last compile of this crate: see the note in `build.rs`.
-        "web UI not built into this binary".to_string()
+        crate::ui::ui_available::<crate::ui::FluidAssets>()
     }
     #[cfg(not(feature = "fluid-ui"))]
     {
-        // Built without the `fluid-ui` feature, so there is no bundle at all
-        // and nothing to point an address at.
-        let _ = addr;
-        "web UI not built into this binary".to_string()
+        false
     }
+}
+
+/// The line a start prints when OAuth is served by a binary that carries no
+/// consent page, which is a combination nothing releases and nobody can use.
+///
+/// `None` for every ordinary start. The second startup guard in [`http_base`]
+/// carries the reasoning for why this is a line rather than a refusal.
+fn oauth_without_a_consent_page(config: &GlobalConfig) -> Option<&'static str> {
+    consent_page_warning(config, ui_bundled())
+}
+
+/// [`oauth_without_a_consent_page`] with the bundle answered rather than
+/// detected.
+///
+/// Split out so both arms are testable on any build. Asking `ui_bundled()`
+/// inside the decision would leave the warning branch unreachable from a test
+/// on every machine that has a bundle, which is every machine this is
+/// developed and released on - and this line is the only signal a build
+/// without one gets.
+fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static str> {
+    (config.auth_oauth() && config.api_enabled() && config.ui_enabled() && !bundled).then_some(
+        "auth.oauth is on but this binary carries no web UI: /oauth/authorize redirects to \
+         the consent page and there is none, so no client can finish connecting - rebuild \
+         with the bundle or set auth.oauth: false",
+    )
 }
 
 /// Liveness probe for load balancers and uptime monitors: a static payload
 /// with no engine or database work, so a probe can never queue behind
 /// indexing and never needs an MCP handshake.
+///
+/// It also says how this daemon was started and what it was asked to bind,
+/// which is the difference between "something answers on this port" and "the
+/// endpoint this host is configured for exists". Both come from the
+/// process-wide serve intent [`crate::instance::record_serve_intent`] recorded
+/// before the lock was taken, so this stays a pointer read: no engine, no
+/// store, no `Shared`. That intent is the requested binding rather than a
+/// proven listener - a probe that reached this handler has already proven the
+/// listener it dialled, and `http` tells it whether that is the endpoint the
+/// daemon was asked for. A process that never ran `run_serve` (a router built
+/// by a test) reports `"unknown"` and `"unrecorded"`: it did not record the
+/// facts, which is not the same as being too old to have them.
+///
+/// Those two and no more. The Host allow-list is the third exposure fact and
+/// it stays off this body deliberately: this route is never Host-guarded (a
+/// probe must keep working from anywhere), so anything here is readable by any
+/// unauthenticated caller that can reach the port, and the allow-list is a
+/// list of internal hostnames. It is reported on the ctl `status` reply, which
+/// is reachable only over the local unix socket, and through
+/// `crystalline status`, which reads that reply.
 async fn health() -> axum::Json<Value> {
+    let intent = crate::instance::serve_intent();
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": crystalline_core::VERSION,
+        "started_by": intent
+            .map(|i| i.started_by.as_str())
+            .unwrap_or("unknown"),
+        "http": match intent.map(|i| &i.http) {
+            Some(crate::instance::HttpBinding::Bound(addr)) => addr.as_str(),
+            Some(crate::instance::HttpBinding::Off) => "off",
+            _ => "unrecorded",
+        },
     }))
 }
 
@@ -1416,8 +1758,14 @@ const EMBED_TICK: Duration = Duration::from_secs(300);
 /// falls back to an inline embed when no worker is wired (an inline pass on this
 /// timer would reintroduce the request-path stall the worker exists to
 /// prevent), so an unwired tick is a silent no-op. The cadence is a parameter so
-/// a test can drive it fast; production passes [`EMBED_TICK`]. The first tick is
-/// consumed so a self-heal never races the startup embed.
+/// a test can drive it fast; production passes [`EMBED_TICK`].
+///
+/// "A backlog remains" is not on its own the condition to fire: it stays true
+/// for the whole life of a pass that is working through one, so a first index
+/// of any size would be signalled every cadence. A pass in flight is therefore
+/// checked first, and only an outstanding backlog nobody is walking fires the
+/// worker. The interval's first tick is immediate and is consumed, so the first
+/// live tick lands one cadence in rather than the moment the daemon starts.
 pub async fn run_embed_tick(
     engine: Arc<Engine>,
     cadence: Duration,
@@ -1428,15 +1776,126 @@ pub async fn run_embed_tick(
     loop {
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
-            _ = ticker.tick() => match engine.embedding_backlog().await {
-                Ok(0) => {}
-                Ok(_) => {
-                    engine.request_embed();
+            _ = ticker.tick() => {
+                if engine.embed_in_flight() {
+                    continue;
                 }
-                Err(err) => tracing::warn!("embed self-heal backlog probe failed: {err}"),
-            },
+                match engine.embedding_backlog().await {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        engine.request_embed();
+                    }
+                    Err(err) => tracing::warn!("embed self-heal backlog probe failed: {err}"),
+                }
+            }
         }
     }
+}
+
+/// How often the daemon looks for rows whose domain nobody registers any
+/// more. Hourly, which is nothing beside the seven days a domain must have
+/// been absent before its rows go: the cadence decides only how soon after
+/// that week is up the collection happens, and one pass is a stamp write and
+/// one statistics read.
+const ORPHAN_SWEEP: Duration = Duration::from_secs(3600);
+
+/// How long a domain must have been absent from the configuration before an
+/// unattended sweep collects its rows. A week survives a configuration edited
+/// by hand at noon and a machine left off, and nothing is served from those
+/// rows for a moment of it, so the only cost of the wait is disk.
+const ORPHAN_GRACE_DAYS: i64 = 7;
+
+/// Collect the rows of every domain this instance has had no registration for
+/// longer than [`ORPHAN_GRACE_DAYS`], once per `cadence`, until shutdown.
+///
+/// The grace period is always supplied, which is the whole difference between
+/// this and a person asking: an unattended sweep waits out the week, and
+/// `doctor --fix` does not, because a person asking is the signal the week was
+/// waiting for. Each tick is one call into
+/// [`Engine::collect_orphaned_domains`] and never a loop of them: that call
+/// stamps every registered domain, considers every unregistered one and
+/// reports what it did, so a second call would only find what the first
+/// already settled.
+///
+/// The first tick is not consumed, unlike the heartbeat's and the embed
+/// tick's. Those two guard against racing startup work; this one races
+/// nothing, and stamping early is the point: a domain that is never stamped
+/// never ages, so an instance that is only ever up for minutes at a time must
+/// still record that it saw its domains registered. A tick this early can
+/// collect nothing a later one would not, because absence from the
+/// configuration is what makes a candidate and that does not change while the
+/// process starts.
+///
+/// The cadence is a parameter so a test can drive it fast; production passes
+/// [`ORPHAN_SWEEP`]. Silent on a pass that collects nothing - the engine logs
+/// one line per collection - and a failed pass is a warning, never fatal: the
+/// next tick tries again.
+///
+/// A pass that collected nothing *by declining* is the one other thing worth
+/// saying out loud, once. The engine declines when the configuration file
+/// cannot be read, and a container configured entirely through
+/// `CRYSTALLINE_DOMAIN_*` has no such file at all: there the sweep is inert
+/// for the life of the process, and nothing says so short of somebody running
+/// `doctor`. A read-only instance declines the removal half the same way, and
+/// is told the same once. Once, because the alternative is the same sentence
+/// every hour about a state that cannot change while the process runs.
+pub async fn run_orphan_sweep(
+    engine: Arc<Engine>,
+    cadence: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut ticker = tokio::time::interval(cadence);
+    // The task's flag rather than a process-wide static: a daemon runs exactly
+    // one sweep task, so this is once per process where it matters, and a test
+    // that drives several sweeps still sees each one say its piece.
+    let said = AtomicBool::new(false);
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = ticker.tick() => {
+                match engine
+                    .collect_orphaned_domains(
+                        Some(chrono::Duration::days(ORPHAN_GRACE_DAYS)),
+                        false,
+                    )
+                    .await
+                {
+                    Ok(report) => {
+                        if let Some(why) = declined_sweep(&report) {
+                            let line =
+                                format!("the orphaned-row sweep collected nothing: {why}");
+                            if first_time(&said) {
+                                tracing::warn!("{line}");
+                            } else {
+                                tracing::debug!("{line}");
+                            }
+                        }
+                    }
+                    Err(err) => tracing::warn!("the orphaned-row sweep failed: {err}"),
+                }
+            }
+        }
+    }
+}
+
+/// Why a sweep pass declined, or `None` for a pass that ran.
+///
+/// The engine says so in the report's `skipped` sentence rather than in an
+/// error, because declining is not a failure: a caller asking what is
+/// collectable still gets an answer. Read through one function so the key this
+/// depends on is named in one place.
+fn declined_sweep(report: &Value) -> Option<&str> {
+    report.get("skipped").and_then(Value::as_str)
+}
+
+/// Whether this is the first time the flag has been asked, flipping it as it
+/// answers.
+///
+/// A [`std::sync::Once`] would say the same thing and could never be asked
+/// twice in one test process, which is the whole of what there is to check
+/// here: the first caller gets the warning and every later one does not.
+fn first_time(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
 }
 
 // --- shutdown + watcher helpers ---------------------------------------------
@@ -1737,6 +2196,77 @@ fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> 
         .unwrap_or_default()
 }
 
+/// The startup notice for an exposure flag that contradicts configuration.
+///
+/// `None` when the flag asks for exactly what configuration already resolves
+/// to, because only a *difference* is worth a line: a container whose command
+/// repeats its own configured address would otherwise print this on every
+/// start.
+///
+/// **A notice, never a refusal.** A one-off `serve` on a different port is a
+/// real thing to want, and the flags keep winning for the invocation that
+/// passes them. What this says is the thing the 2026-09-10 outage turned on:
+/// a flag configures one process, while every other daemon on the machine -
+/// an autostarted one included - binds whatever configuration says.
+///
+/// One template, two keys, so the verb comes from the caller: an address is
+/// *bound* and a `Host` allow-list is *accepted*, and a line that told an
+/// operator their serve "binds muthur.lan" would be describing something the
+/// daemon does not do. `asked` is the whole opening clause, verb included
+/// ("binds 0.0.0.0:7411", "turns the HTTP endpoint off", "accepts the Host
+/// values muthur.lan"), because one value does not take the key's verb at all:
+/// `--http off` asks for no endpoint, and "binds off" describes nothing. `verb`
+/// repeats the key's verb for the other daemons ("binds", "accepts"); the
+/// repo's own wording for an allow-list lives in `lock_held_message`, in
+/// `instance.rs`.
+fn exposure_override_notice(
+    key: &str,
+    asked: &str,
+    verb: &str,
+    from_flag: &str,
+    from_config: &str,
+    set_value: &str,
+) -> Option<String> {
+    (from_flag != from_config).then(|| {
+        format!(
+            "this serve {asked} because a flag asked for it, for this invocation only. {key} says \
+             {from_config}, and that is what every other daemon on this machine {verb}, including \
+             one a connecting agent starts. Make it the machine's answer with: crystalline config \
+             set {key} {set_value}"
+        )
+    })
+}
+
+/// Render an HTTP resolution for the notice above: an address, or the words
+/// for a closed endpoint. Not the bare word "off", which reads as a value the
+/// other daemons bind ("that is what every other daemon on this machine
+/// binds") rather than as the absence it is.
+fn describe_http(resolved: Option<&String>) -> String {
+    resolved
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "no HTTP endpoint".to_string())
+}
+
+/// What this invocation did about the endpoint, as the clause that opens the
+/// notice. An address is bound; a closed endpoint is turned off, because
+/// nothing is bound when there is no endpoint to bind.
+fn http_clause(resolved: Option<&String>) -> String {
+    match resolved {
+        Some(addr) => format!("binds {addr}"),
+        None => "turns the HTTP endpoint off".to_string(),
+    }
+}
+
+/// Render a `Host` allow-list for the notice above. Empty is loopback only,
+/// which is the secure default rather than an absence.
+fn describe_hosts(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        "loopback only".to_string()
+    } else {
+        hosts.join(", ")
+    }
+}
+
 /// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard
 /// and dropping the SSE priming frame. An empty `allowed_hosts` keeps rmcp's
 /// loopback-only default; a single `*` disables the guard (any Host allowed);
@@ -1786,11 +2316,10 @@ fn http_config(
     if allowed_hosts.is_empty() {
         return base;
     }
-    let mut hosts = vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "::1".to_string(),
-    ];
+    let mut hosts = crate::rest::ALWAYS_ALLOWED_HOSTS
+        .iter()
+        .map(|host| host.to_string())
+        .collect::<Vec<_>>();
     hosts.extend(allowed_hosts.iter().cloned());
     base.with_allowed_hosts(hosts)
 }
@@ -1813,11 +2342,101 @@ pub(crate) async fn open_store(
 mod tests {
     use super::*;
 
-    // These pin down the exact `--http` semantics containers rely on: a
+    /// Every path rmcp ends a session on runs through `close_session`, so
+    /// releasing the identity claim there is what keeps the gate's map in step
+    /// with rmcp's own sessions. A client `DELETE` is one of those paths and is
+    /// covered end to end in `tests/mcp_auth.rs`; the other two - the 300 second
+    /// idle keep-alive and a worker error - are reached from inside
+    /// `spawn_session_worker`, with no seam a test can drive without standing up
+    /// a real session and waiting out a timer that is not on a pausable clock
+    /// from out here. So this drives `close_session` itself, which is the single
+    /// point all three arrive at (rmcp 3.2.0 `tower.rs:1331` and `:2073`).
+    #[tokio::test]
+    async fn closing_a_session_releases_the_identity_that_claimed_it() {
+        use rmcp::transport::streamable_http_server::session::SessionManager;
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
+        let owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+        let manager = CountingSessions::new(
+            LocalSessionManager::default(),
+            Arc::new(AtomicUsize::new(0)),
+            owners.clone(),
+            Arc::new(crate::join::Joins::default()),
+        );
+        let (id, _transport) = manager.create_session().await.unwrap();
+        owners.claim(id.to_string(), "ada".to_string());
+        assert_eq!(owners.owner(&id).as_deref(), Some("ada"));
+
+        manager.close_session(&id).await.unwrap();
+        assert_eq!(
+            owners.owner(&id),
+            None,
+            "a session rmcp has given up on leaves no claim behind"
+        );
+    }
+
+    /// A legacy session's draft join ends WITH THE SESSION, on every path rmcp
+    /// ends one.
+    ///
+    /// `tests/mcp_modern_era.rs` drives the client `DELETE` end to end, and on
+    /// that path the service object dies with the connection, so the join would
+    /// also go through `SessionJoins`' own drop. The other two endings - the 300
+    /// second idle keep-alive and a worker error - reach `close_session` from
+    /// inside `spawn_session_worker` with no drop of ours guaranteed alongside,
+    /// so a join left behind on those would stand until the registry's idle
+    /// window swept it half an hour later. This is the seam all three arrive
+    /// at, which is why the registry is threaded through here beside the claim
+    /// map rather than left to the service object's lifetime.
+    #[tokio::test]
+    async fn closing_a_session_ends_the_draft_joins_it_held() {
+        use rmcp::transport::streamable_http_server::session::SessionManager;
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
+        let owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+        let joins = Arc::new(crate::join::Joins::default());
+        let manager = CountingSessions::new(
+            LocalSessionManager::default(),
+            Arc::new(AtomicUsize::new(0)),
+            owners.clone(),
+            joins.clone(),
+        );
+        let (id, _transport) = manager.create_session().await.unwrap();
+
+        // One person, two callers, one draft: the session that is about to end
+        // and a window of theirs that is not.
+        let session = crate::join::Holder::McpSession(id.to_string());
+        let window = crate::join::Holder::Browser("a-window".to_string());
+        for holder in [session.clone(), window.clone()] {
+            joins
+                .open(crate::join::Join {
+                    account: "ada".to_string(),
+                    holder,
+                    domain: "eng".to_string(),
+                    path: "notes".to_string(),
+                    owner: "ada".to_string(),
+                    expires_at: None,
+                })
+                .unwrap();
+        }
+
+        manager.close_session(&id).await.unwrap();
+
+        assert!(
+            !joins.holds("ada", &session, "eng", "ada", "notes"),
+            "the session ended, so the join it held did"
+        );
+        assert!(
+            joins.holds("ada", &window, "eng", "ada", "notes"),
+            "and the window beside it is still inside the draft"
+        );
+    }
+
+    // These pin down the exact resolution semantics containers rely on: a
     // container must bind 0.0.0.0 (not the 127.0.0.1 default) to be reachable
-    // from outside its network namespace, so `serve --http 0.0.0.0:7411` has
-    // to pass the address through unchanged rather than only accepting the
-    // bare toggle spellings.
+    // from outside its network namespace, so an explicit address such as
+    // 0.0.0.0:7411 has to pass through unchanged rather than only accepting
+    // the bare toggle spellings, whichever way it arrives - a flag or
+    // CRYSTALLINE_SERVICE_HTTP.
 
     #[test]
     fn resolve_http_passes_through_an_explicit_non_loopback_address() {
@@ -1981,6 +2600,47 @@ mod tests {
         );
     }
 
+    /// A binary with no consent page in it says so when OAuth is on, rather
+    /// than serving a flow that cannot complete in silence.
+    ///
+    /// The combination is unsupported rather than guarded against: see the
+    /// second startup guard in `http_base` for why detecting the bundle there
+    /// would cost more than this case is worth.
+    #[test]
+    fn a_start_with_oauth_on_and_no_bundle_says_so() {
+        let mut config = config_with_ui(None, None);
+        config.auth = Some(crystalline_core::config::AuthConfig {
+            mcp: Some(true),
+            ..Default::default()
+        });
+        assert!(config.auth_oauth(), "derived on where the UI is served");
+        // Both arms, decided rather than detected, so neither depends on
+        // whether the machine running this test happens to hold a bundle.
+        let warned = consent_page_warning(&config, false).expect("no bundle, so a warning");
+        assert!(
+            warned.contains("auth.oauth"),
+            "the warning names the key to change: {warned}"
+        );
+        assert!(
+            !warned.contains("  "),
+            "a wrapped literal that lost its continuations reads with gaps in it: {warned}"
+        );
+        assert!(
+            consent_page_warning(&config, true).is_none(),
+            "and an ordinary build says nothing"
+        );
+        assert_eq!(
+            oauth_without_a_consent_page(&config).is_some(),
+            !ui_bundled(),
+            "the production predicate answers for this binary's own bundle"
+        );
+
+        // Never for an instance that is not serving OAuth at all.
+        let off = config_with_ui(None, None);
+        assert!(!off.auth_oauth());
+        assert!(consent_page_warning(&off, false).is_none());
+    }
+
     fn config_with_allowed_hosts(hosts: Vec<String>) -> GlobalConfig {
         let mut config = GlobalConfig::default();
         config.service = Some(crystalline_core::config::ServiceConfig {
@@ -2014,6 +2674,162 @@ mod tests {
     fn resolve_allowed_hosts_empty_without_flag_or_config() {
         let config = GlobalConfig::default();
         assert!(resolve_allowed_hosts(&[], &config).is_empty());
+    }
+
+    /// The sweep says a declined pass once and then stops saying it: an
+    /// environment-only container declines every pass for the life of the
+    /// process, and an hourly warning about a state that cannot change is
+    /// noise rather than news.
+    #[test]
+    fn a_declined_sweep_is_announced_once_and_then_kept_quiet() {
+        let said = AtomicBool::new(false);
+        assert!(first_time(&said), "the first pass warns");
+        assert!(!first_time(&said), "the second does not");
+        assert!(!first_time(&said), "and neither does any after it");
+    }
+
+    /// What the sweep reads to know a pass declined, and what it reads on a
+    /// pass that ran: the engine states the reason in words, and there is no
+    /// reason at all when there is nothing to explain.
+    #[test]
+    fn a_declined_sweep_is_read_from_the_reason_the_engine_gave() {
+        let declined = serde_json::json!({
+            "stamped": 0,
+            "collected": [],
+            "skipped": "the configuration could not be read",
+        });
+        assert_eq!(
+            declined_sweep(&declined),
+            Some("the configuration could not be read")
+        );
+        let ran = serde_json::json!({ "stamped": 3, "collected": [] });
+        assert_eq!(
+            declined_sweep(&ran),
+            None,
+            "a pass that ran explains nothing"
+        );
+    }
+
+    /// `--http off` asks for no endpoint, and nothing is bound when there is
+    /// no endpoint to bind. The old line said "this serve binds off", which
+    /// describes nothing a daemon does; the value has to carry its own verb
+    /// wherever it appears in the sentence.
+    #[test]
+    fn exposure_override_notice_turns_the_endpoint_off_rather_than_binding_off() {
+        let line = exposure_override_notice(
+            "service.http",
+            &http_clause(None),
+            "binds",
+            &describe_http(None),
+            "127.0.0.1:7411",
+            "false",
+        )
+        .expect("a difference is worth a line");
+        assert!(
+            line.contains("this serve turns the HTTP endpoint off"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("binds off"),
+            "nothing anywhere in the line binds a value that is an absence: {line}"
+        );
+        assert!(
+            line.contains("crystalline config set service.http false"),
+            "and the command is the one that writes that down: {line}"
+        );
+
+        // The other direction: configuration is the side that is off.
+        let reverse = exposure_override_notice(
+            "service.http",
+            &http_clause(Some(&"0.0.0.0:7411".to_string())),
+            "binds",
+            "0.0.0.0:7411",
+            &describe_http(None),
+            "0.0.0.0:7411",
+        )
+        .expect("a difference is worth a line");
+        assert!(
+            reverse.contains("service.http says no HTTP endpoint"),
+            "an absent endpoint is named as one on that side too: {reverse}"
+        );
+        assert!(!reverse.contains("binds off"), "{reverse}");
+    }
+
+    /// A flag that asks for exactly what configuration already says is not an
+    /// override, and a line about it would be noise on every container start.
+    #[test]
+    fn exposure_override_notice_is_silent_when_the_flag_agrees_with_configuration() {
+        assert_eq!(
+            exposure_override_notice(
+                "service.http",
+                "binds 127.0.0.1:7411",
+                "binds",
+                "127.0.0.1:7411",
+                "127.0.0.1:7411",
+                "127.0.0.1:7411"
+            ),
+            None
+        );
+    }
+
+    /// The line names both values and the key, and gives the command that makes
+    /// the flag's answer the machine's answer. It is a notice: nothing in it
+    /// refuses, because a one-off serve on another port is a real thing to want.
+    #[test]
+    fn exposure_override_notice_names_both_values_and_the_key() {
+        let line = exposure_override_notice(
+            "service.http",
+            "binds 0.0.0.0:7411",
+            "binds",
+            "0.0.0.0:7411",
+            "127.0.0.1:7411",
+            "0.0.0.0:7411",
+        )
+        .expect("a difference is worth a line");
+        assert!(line.contains("0.0.0.0:7411"), "{line}");
+        assert!(line.contains("127.0.0.1:7411"), "{line}");
+        assert!(line.contains("service.http"), "{line}");
+        assert!(
+            line.contains("crystalline config set service.http 0.0.0.0:7411"),
+            "it gives the command that makes it permanent: {line}"
+        );
+        assert!(
+            !line.contains("refus") && !line.contains("Error"),
+            "it is a notice, not a refusal: {line}"
+        );
+        assert!(
+            !line.contains("HTTP endpoint failed on"),
+            "it must not collide with the bind-failure line the e2e smoke script greps for: {line}"
+        );
+    }
+
+    /// The allow-list flag gets the same treatment, with the comma-separated
+    /// spelling the setting takes rather than the flag's repeated form.
+    #[test]
+    fn exposure_override_notice_uses_the_settable_spelling_for_the_allow_list() {
+        let line = exposure_override_notice(
+            "service.allowed_hosts",
+            "accepts the Host values muthur.lan, host.docker.internal",
+            "accepts",
+            "muthur.lan, host.docker.internal",
+            "loopback only",
+            "muthur.lan,host.docker.internal",
+        )
+        .expect("a difference is worth a line");
+        assert!(line.contains("loopback only"), "{line}");
+        // An allow-list is accepted, never bound: one template serves both
+        // keys, so the verb has to come from the key rather than from the
+        // address case that happened to be written first.
+        assert!(
+            line.contains("accepts the Host values muthur.lan, host.docker.internal"),
+            "a Host allow-list is accepted, not bound: {line}"
+        );
+        assert!(
+            line.contains(
+                "crystalline config set service.allowed_hosts muthur.lan,host.docker.internal"
+            ),
+            "{line}"
+        );
     }
 
     #[test]
@@ -2424,6 +3240,25 @@ mod tests {
         assert!(
             !lines[1].contains("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
             "the caveat line carries no secret of its own"
+        );
+    }
+
+    /// The foreground banner's copyright line, printed right after
+    /// `crystalline {version} serving on ...` outside the `is_terminal`
+    /// guard so a redirected foreground run's stderr still carries it (see
+    /// [`COPYRIGHT_LINE`] for why `--daemon` does not). Names the same
+    /// copyright holder, license and source `crates/cli/src/main.rs`'s
+    /// `VERSION_BLOCK` does, both read from the environment so a Cargo.toml
+    /// change carries.
+    #[test]
+    fn the_banner_copyright_line_names_the_license_and_the_source() {
+        assert_eq!(
+            COPYRIGHT_LINE,
+            format!(
+                "Copyright (C) 2026 Jordi Böhme - {} - {}",
+                env!("CARGO_PKG_LICENSE"),
+                env!("CARGO_PKG_REPOSITORY")
+            )
         );
     }
 

@@ -76,6 +76,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
 walkdir = { workspace = true }
+dunce = { workspace = true }
 # Only the best-effort credential sweeps log through this: a failure there must
 # never fail the command that triggered it, and a swallowed error still has to
 # be findable with RUST_LOG.

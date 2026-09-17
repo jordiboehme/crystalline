@@ -71,10 +71,26 @@ pub struct WriteParams {
     /// Overwrite an existing engram with the same permalink instead of erroring.
     #[serde(default)]
     pub overwrite: bool,
+    /// Your model id, for example claude-opus-5; recorded beside who wrote it
+    /// so a reader can weigh the page. Omit it only if you do not know it.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// A draft share-link somebody handed you (`dl_...`), to work inside the
+    /// draft it opens instead of writing your own copy. Pass it when you were
+    /// given a link and mean to compose into its author's draft: it binds the
+    /// link to this account and opens the draft for this connection, and the
+    /// write then lands in that author's copy, where they review it. How long
+    /// that lasts depends on how you are connected: a stdio server or an MCP
+    /// session keeps it until the session ends, and a sessionless HTTP
+    /// connection keeps it for 30 minutes after your last call about that
+    /// draft. A write at any other page while inside a draft is refused, so
+    /// leave it out unless this call is about the shared page.
+    #[serde(default)]
+    pub share_link: Option<String>,
 }
 
 /// Parameters for `read_engram`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ReadParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
@@ -82,6 +98,19 @@ pub struct ReadParams {
     /// Restrict resolution to this domain.
     #[serde(default)]
     pub domain: Option<String>,
+    /// A draft share-link somebody handed you (`dl_...`), to read the draft it
+    /// opens rather than the page the domain holds. Pass it the first time you
+    /// are given one and on any later read of that draft; it binds the link to
+    /// this account and opens the draft for this connection, so a later
+    /// `edit_engram` of that page lands in its author's copy. How long that
+    /// lasts depends on how you are connected: a stdio server or an MCP
+    /// session keeps it until the session ends, and a sessionless HTTP
+    /// connection keeps it for 30 minutes after your last call about that
+    /// draft. Pass the link again whenever an edit is refused as unjoined.
+    /// Leave it out everywhere else - an ordinary read never needs one, and a
+    /// link you may only READ still opens the draft for reading.
+    #[serde(default)]
+    pub share_link: Option<String>,
 }
 
 /// Parameters for `edit_engram`.
@@ -139,6 +168,34 @@ pub struct EditParams {
     /// last-write-wins.
     #[serde(default)]
     pub expected_checksum: Option<String>,
+    /// Your model id, for example claude-opus-5; recorded beside who wrote it
+    /// so a reader can weigh the page. Omit it only if you do not know it.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The pair an `evolve_ack` assignment names, for the one rule that is
+    /// acknowledged per pair rather than per engram.
+    ///
+    /// Never on the wire - `serde(skip)` keeps it out of the deserialized body
+    /// and out of the tool schema alike. An agent setting frontmatter says
+    /// which rule it is ruling intentional and the server works out what that
+    /// rule is firing on; this is how the REST acknowledgment route passes on
+    /// the pair a person's client named, where the row they clicked is the one
+    /// they meant and nothing else can tell the server which of two it was.
+    #[serde(skip)]
+    pub ack_scope: Option<String>,
+    /// A draft share-link somebody handed you (`dl_...`), to edit the draft it
+    /// opens instead of your own copy of the page. Pass it when you were given
+    /// a link and mean to compose into its author's draft: it binds the link
+    /// to this account and opens the draft for this connection, and the edit
+    /// then lands in that author's copy, where they review it. How long that
+    /// lasts depends on how you are connected: a stdio server or an MCP
+    /// session keeps it until the session ends, and a sessionless HTTP
+    /// connection keeps it for 30 minutes after your last call about that
+    /// draft - pass the link again whenever an edit is refused as unjoined. An
+    /// edit of any other page while inside a draft is refused, so leave it out
+    /// unless this call is about the shared page.
+    #[serde(default)]
+    pub share_link: Option<String>,
 }
 
 /// Parameters for `save_engram`, the full-document save behind the HTTP PUT.
@@ -179,6 +236,39 @@ pub struct RetireParams {
     /// date is unknown, never a sentinel.
     #[serde(default)]
     pub valid_to: Option<String>,
+}
+
+/// Parameters for `split_engram`, the atomic move of part of an engram into a
+/// new one.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct SplitParams {
+    /// The source engram's domain. The new engram lands in the same domain.
+    pub domain: String,
+    /// The source engram: a bare permalink, title or `crystalline://` URL,
+    /// domain-relative.
+    pub identifier: String,
+    /// The new engram's title. Slugified into its permalink, as write_engram
+    /// slugifies one.
+    pub title: String,
+    /// A domain-relative subfolder for the new engram. Defaults to the domain
+    /// root, whatever folder the source sits in.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// The observation bullets to move, by the one-based line numbers
+    /// read_engram reports. Every line must be an observation bullet on the
+    /// source.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub observations: Vec<usize>,
+    /// The sections to move, by heading path (`## API > ### Auth`), the same
+    /// form edit_engram accepts. A section moves with its heading and every
+    /// deeper subsection under it.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub sections: Vec<String>,
+    /// The checksum from a prior read of the source, guarding the split
+    /// against a change since that read: both writes are refused as a conflict
+    /// if the source changed. Omit for last-write-wins.
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 /// Parameters for `move_engram`.
@@ -419,9 +509,11 @@ pub struct ConfigureParams {
     #[serde(default, deserialize_with = "null_as_default")]
     pub unset: Vec<String>,
     /// Pass "github" to link a GitHub account: starts a short code to
-    /// confirm at github.com/login/device, or reports an already-pending
-    /// one. Omit when `token` is supplied. Works whether or not
-    /// github.enabled is on yet; enabling is only needed for team domains.
+    /// confirm at github.com/login/device, then click Authorize on the page
+    /// that follows; the result carries next_steps to relay verbatim, and
+    /// calling configure again reports whether the sign-in landed. Omit
+    /// when `token` is supplied. Works whether or not github.enabled is on
+    /// yet; enabling is only needed for team domains.
     #[serde(default)]
     pub connect: Option<String>,
     /// A GitHub personal access token, connecting immediately instead of the
@@ -433,6 +525,10 @@ pub struct ConfigureParams {
     /// github.api_url`.
     #[serde(default)]
     pub host: Option<String>,
+    /// With connect: github, abandon a pending sign-in and start a fresh
+    /// code.
+    #[serde(default)]
+    pub restart: bool,
 }
 
 /// Parameters for `add_domain`. The mode follows the parameters: `repo` makes
@@ -473,6 +569,27 @@ pub struct AddDomainParams {
     pub branch: Option<String>,
 }
 
+/// Parameters for `remove_domain`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct RemoveDomainParams {
+    /// The registered domain to unregister.
+    pub domain: String,
+    /// Required to unregister a VIRTUAL domain, whose engrams live in the
+    /// database and are deleted with it. Ignored for a file domain, whose
+    /// files are never touched either way.
+    #[serde(default)]
+    pub purge: bool,
+    /// Every OTHER actor holding private drafts in this domain, by name.
+    /// Required when anybody but you is drafting here: a removal ends their
+    /// unshared work and nothing brings it back, so it is named rather than
+    /// assumed. The refusal says who, and how many drafts each of them holds.
+    /// Your own drafts need no naming, and naming yourself as well is taken
+    /// and changes nothing - so the actor list a removal preview or a
+    /// refusal reports can be sent back as it stands.
+    #[serde(default)]
+    pub end_drafts: Vec<String>,
+}
+
 /// Parameters for `share_changes`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShareChangesParams {
@@ -509,6 +626,13 @@ pub struct OriginStatusParams {
     /// domain.
     #[serde(default)]
     pub domain: Option<String>,
+    /// Name the unshared files instead of only counting them: each domain
+    /// then carries a detail block listing the changed paths grouped as
+    /// added, modified and deleted, plus how many generated folder listings
+    /// ride along. Ask for it whenever you have to say WHAT is unshared;
+    /// leave it off when the count is all you need.
+    #[serde(default)]
+    pub detail: bool,
 }
 
 /// Parameters for `resolve_conflict`.

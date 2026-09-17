@@ -77,8 +77,12 @@ async fn serve(opts: Options) -> Fixture {
         domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             trusted_header: None,
+            proxy_headers: None,
             anonymous: Some(opts.anonymous),
+            mcp: None,
+            oauth: None,
             max_users: None,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };
@@ -637,6 +641,89 @@ async fn acknowledging_removes_a_finding_and_withdrawing_brings_it_back() {
     assert_eq!(resp.status(), 404);
 }
 
+/// A body may name the evidence it is acknowledging, which is how a caller
+/// says which of an engram's two twin findings it read. Both halves of the
+/// rule hold here, on the wire: a scope the sweep is not raising is refused,
+/// and a scope on a rule that fires once per engram is ignored, because there
+/// is nothing to choose between and the caller has nothing to get wrong.
+///
+/// The twin rule needs embeddings, which this fixture has none of - which is
+/// exactly what makes it the refusal case: no `V301` finding is firing here,
+/// so no scope can name one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_scope_is_checked_for_the_rule_that_needs_one_and_ignored_otherwise() {
+    let fixture = serve(Options::default()).await;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    let session = login_session(fixture.addr, "ada", "s3cret").await;
+
+    // A pair nothing is firing on: the caller is naming evidence that is not
+    // there, which is a queue read too long ago rather than a bad request
+    // shape.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V301",
+            "scope": "eng/human-capture, eng/live-doc"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        problem["detail"].as_str().unwrap().contains("V301"),
+        "the refusal names the rule the scope belongs to: {problem}"
+    );
+
+    // The same field on a rule that answers for its engram: ignored, so the
+    // acknowledgment lands with the scope the server itself computed.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V006",
+            "scope": "eng/nothing-like-this"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let entry: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{entry}");
+    assert_ne!(
+        entry["scope"], "eng/nothing-like-this",
+        "a scope-less rule never wears a caller's scope: {entry}"
+    );
+
+    // And ignored on the way back out, so the withdrawal still finds it.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::DELETE,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V006",
+            "scope": "eng/nothing-like-this"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
 /// The write matrix the endpoint is held to: identity, role, CSRF, and the two
 /// ways a body can be wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -803,4 +890,167 @@ async fn a_multi_line_note_never_breaks_the_engram_it_lands_in() {
     let body = queue_as(fixture.addr, &session, "").await;
     assert_eq!(body["unparsed"], 0, "the engram is still readable: {body}");
     assert_eq!(body["acknowledged"]["total"], 1);
+}
+
+// --- Task 9: the queue speaks to the person reading it ----------------------
+
+/// A second server over one domain that reviews changes before they land,
+/// holding one engram the team agreed on. Kept apart from [`serve`] so the
+/// fixture every other test here counts findings against does not move.
+///
+/// The engine comes back beside the fixture: the draft is planted through it
+/// under one member's own identity, which is what an authenticated write on
+/// this instance resolves to, and the assertions are then made over HTTP.
+async fn serve_review() -> (Fixture, Arc<Engine>) {
+    let state = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("runbook.md"),
+        engram(
+            "Runbook",
+            "runbook",
+            None,
+            "How the team restarts the importer, as the team agreed it.\n",
+        ),
+    )
+    .unwrap();
+
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        auth: Some(AuthConfig {
+            trusted_header: None,
+            proxy_headers: None,
+            anonymous: Some(false),
+            mcp: None,
+            oauth: None,
+            max_users: None,
+            oidc: None,
+        }),
+        ..GlobalConfig::default()
+    };
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            cfg,
+            None,
+            Some(config_path.clone()),
+        )
+        // A draft is mirrored into the state directory, which must be the
+        // scratch one this fixture holds rather than the developer's own.
+        .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let router = http_router(
+        engine.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (
+        Fixture {
+            addr,
+            auth,
+            state,
+            _tmp: tmp,
+        },
+        engine,
+    )
+}
+
+/// The `V102` permalinks one session's queue carries, sorted.
+async fn dangling_rows(addr: std::net::SocketAddr, session: &(String, String)) -> Vec<String> {
+    let body = queue_as(addr, session, "?domains=team&rules=V102").await;
+    let mut out: Vec<String> = rows(&body)
+        .iter()
+        .map(|row| row["permalink"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The maintenance page answers the person reading it: in a domain that reviews
+/// changes, a member's queue carries the findings on their own drafts and never
+/// on anybody else's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_members_queue_carries_their_own_drafts_finding_and_nobody_elses() {
+    let (fixture, engine) = serve_review().await;
+    for name in ["ada", "bo"] {
+        fixture
+            .auth
+            .add_user(name, name, None, Role::Editor, "s3cret")
+            .await
+            .unwrap();
+    }
+    let ada = login_session(fixture.addr, "ada", "s3cret").await;
+    let bo = login_session(fixture.addr, "bo", "s3cret").await;
+
+    assert!(
+        dangling_rows(fixture.addr, &ada).await.is_empty(),
+        "the engram the team agreed on carries no dangling reference"
+    );
+
+    // Ada writes a reference nothing answers to into her own draft. The target
+    // matches no permalink and no title, which is what makes it dangle.
+    engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "runbook".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("See [[How Ada Would Restart It]] for the rewrite.".to_string()),
+                ..Default::default()
+            },
+            None,
+            &crystalline_service::Scope::User {
+                account: "ada".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        dangling_rows(fixture.addr, &ada).await,
+        vec!["runbook".to_string()],
+        "her own draft's broken reference is hers to fix"
+    );
+    assert!(
+        dangling_rows(fixture.addr, &bo).await.is_empty(),
+        "and nobody else is told about a reference in text they cannot read"
+    );
 }

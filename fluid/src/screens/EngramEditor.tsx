@@ -26,7 +26,9 @@ import * as Y from "yjs";
 
 import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
-import type { EngramDetail } from "../api/engram";
+import { heldJoin } from "../api/draftLinks";
+import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
+import type { EngramDetail, SimilarEngram } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
 import type { Vocabulary } from "../api/vocabulary";
@@ -38,8 +40,10 @@ import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { DraftLinkDialog } from "../components/DraftLinkDialog";
 import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
+import { SimilarEngramsPanel } from "../components/SimilarEngramsPanel";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -72,6 +76,7 @@ import {
   wikilinkCompletions,
   wikilinkResolverFacet,
 } from "../editor/wikilinkChips";
+import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
 import { useTheme } from "../theme/context";
@@ -399,12 +404,43 @@ function EditorSurface({ engram }: { engram: EngramDetail }) {
   // Anonymous can never reach this screen (`canWrite` gates it above); the
   // fallback only satisfies the types.
   const account = user?.name ?? "anonymous";
+  /**
+   * Whose document this surface opens a room over, and whether there is a
+   * room to open at all.
+   *
+   * A granted draft stands at the same address the team's own page stands at,
+   * and the read says whose it is. The room has to agree: a session opened
+   * with no owner named would be a room over THIS reader's own draft of that
+   * page, saving every keystroke into it while the header says the work
+   * belongs to somebody else.
+   *
+   * Editing somebody's draft is the second step after seeing it, and the join
+   * is what took it - so the owner is sent only where this window holds a
+   * join to exactly this draft. Without one there is no room: the buffer is
+   * the draft the read handed over, and a save is refused by the server with
+   * the sentence that says how to join. Read once for this surface, which is
+   * keyed by address and is one editing session.
+   */
+  const [room] = useState<{ owner?: string; open: boolean }>(() => {
+    const owner = engram.draftOwner;
+    if (!owner) {
+      return { open: true };
+    }
+    const join = heldJoin();
+    const inside =
+      join !== null &&
+      join.domain === engram.domain &&
+      join.permalink === engram.permalink &&
+      join.owner === owner;
+    return inside ? { owner, open: true } : { open: false };
+  });
   const collab = useCollabSession({
     domain: engram.domain,
     permalink: engram.permalink,
     account,
     displayName: user?.display ?? user?.name ?? "someone",
-    enabled: true,
+    enabled: room.open,
+    overlay: room.owner,
   });
   if (
     collab.mode === "connecting" ||
@@ -477,6 +513,7 @@ function Surface({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { resolved } = useTheme();
+  const { fullWidth } = useFullWidth();
   const { ytext, awareness } = collab;
   /**
    * The session this buffer belongs to, or null on the solo surface. Fixed
@@ -523,6 +560,9 @@ function Surface({
    */
   const [resolverBox] = useState(() => new Compartment());
   const [raw, setRaw] = useState(RAW_AT_MOUNT);
+  // Whether the share dialog is open. Mounted only while it is, so an editor
+  // nobody shares from never pays for the dialog primitive behind it.
+  const [sharing, setSharing] = useState(false);
   /**
    * Whether the caret is in a table, which is what the format bar's context
    * segment is drawn from. The listener inside the buffer reports crossings
@@ -551,6 +591,18 @@ function Surface({
    */
   const [attachError, setAttachError] = useState<string | null>(null);
   /**
+   * The nearest existing engrams the last save found itself close to, and
+   * the server's words on what to do about them - null when there is
+   * nothing to show, whether because the last save carried no advisory or
+   * because this one has already been dismissed. Local to this tab and
+   * never round-tripped: dismissing it does not tell the server anything,
+   * and the next save asks again from scratch.
+   */
+  const [advisory, setAdvisory] = useState<{
+    similar: SimilarEngram[];
+    guidance: string | null;
+  } | null>(null);
+  /**
    * The live buffer, for the upload flow. A ref rather than the `view` state
    * above, because the extensions are read once at mount and the handlers
    * inside them have to reach whatever view exists when a file is dropped.
@@ -568,9 +620,20 @@ function Surface({
     queryKey: graphKey(engram.domain, engram.permalink, NEIGHBORHOOD_DEPTH),
     queryFn: () => fetchGraph(engram.domain, engram.permalink),
   });
+  // Under the sidebar's own key, so this is a cache read rather than a
+  // request: the chips need it to tell `[[Log: Weekly Notes]]`, a title, from
+  // `[[ops:Runbook]]`, a domain, and only the registry knows which is which.
+  const domains = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
+  const domainNames = useMemo(
+    () => domains.data?.domains.map((entry) => entry.name),
+    [domains.data],
+  );
   const resolver = useMemo(
-    () => buildWikilinkResolver(engram, graph.data),
-    [engram, graph.data],
+    () => buildWikilinkResolver(engram, graph.data, domainNames),
+    [engram, graph.data, domainNames],
   );
   // `fullVocabularyKey` rather than `vocabularyKey`: `DomainHome` caches
   // `fetchTags` under the latter, a different shape, and the two landing on
@@ -678,6 +741,15 @@ function Surface({
       queryClient.setQueryData(
         engramDetailKey(saved.domain, saved.permalink),
         saved,
+      );
+      // What this save found itself close to, if anything: a fresh save
+      // answers with its own advisory or none, so this replaces whatever the
+      // last save (or this tab's own dismiss) left standing rather than
+      // merging with it.
+      setAdvisory(
+        saved.similar.length > 0
+          ? { similar: saved.similar, guidance: saved.guidance }
+          : null,
       );
       // A save is the fourth write that moves the tree, after create, move and
       // retire: the whole file is the document here, so one save can change
@@ -892,6 +964,24 @@ function Surface({
     ],
   );
 
+  // Written once and drawn in whichever place the width puts it: beside the
+  // buffer at the reading measure, under it at full width. The same element
+  // either way, so the two placements cannot drift apart in what they hand
+  // the panel.
+  const findings = (
+    <FindingsPanel
+      report={session.report}
+      pending={session.checking}
+      unavailable={session.validationUnavailable}
+      onJump={(line) => {
+        const view = session.viewRef.current;
+        if (view) {
+          jumpToLine(view, line);
+        }
+      }}
+    />
+  );
+
   return (
     <div className="flex flex-col gap-4">
       <header className="flex flex-col gap-2">
@@ -964,6 +1054,34 @@ function Surface({
               accessible name and the tooltip both still say Raw, and the
               document glyph says which of the two faces the buffer is wearing.
             */}
+            {/*
+              Sharing the draft, and only ever a draft: a link hands over work
+              the team has not seen, and there is nothing to hand over about a
+              page they all read already.
+
+              In this header row rather than in the right-hand column beside
+              it, because that column is not rendered at all at full width -
+              see the `<aside>` below. A control only half the app's readers
+              can reach is not a control.
+            */}
+            {engram.draftOwner && (
+              <span className="rounded bg-amber-100 px-2 py-1 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+                {engram.draftOwner}&apos;s draft
+              </span>
+            )}
+            {engram.draft && !engram.draftOwner && engram.path && (
+              <Tooltip label="Share this draft with one person">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSharing(true);
+                  }}
+                  className={BUTTON.secondary}
+                >
+                  Share draft
+                </button>
+              </Tooltip>
+            )}
             <Tooltip label="Raw">
               <button
                 type="button"
@@ -1069,6 +1187,31 @@ function Surface({
           )}
         </div>
       </header>
+      {/*
+        The save receipt's own advisory, drawn as a full-width panel like the
+        other post-header notices below rather than squeezed into the button
+        row the "Saved" tick stands in - that row is a line of small
+        controls, and a panel with a guidance sentence and a list of links
+        needs its own line. Guarded to the solo surface for the same reason
+        `advisory` is only ever set there: a room's autosave never reaches
+        the REST save route (3.2), so this can never fire while `inRoom`, but
+        the guard keeps that true by construction rather than by accident.
+      */}
+      {!inRoom && advisory && (
+        <SimilarEngramsPanel
+          similar={advisory.similar}
+          guidance={advisory.guidance}
+          onDismiss={() => {
+            setAdvisory(null);
+            // The Dismiss control is what held focus, and it leaves the
+            // document with the panel; without this the browser drops
+            // focus to `document.body` and the next Tab restarts at the
+            // top of the page instead of continuing from the buffer a
+            // keyboard reader was just in.
+            view?.focus();
+          }}
+        />
+      )}
       {session.hardErrors > 0 && (
         <p role="alert" className="text-sm text-red-800 dark:text-red-200">
           {String(session.hardErrors)} hard{" "}
@@ -1168,8 +1311,20 @@ function Surface({
         where a reader already expects it. The form is a view over the buffer
         rather than a second place a value lives: it reads `buffer` and writes
         back through ordinary transactions on the view.
+
+        That is also what makes the column safe to drop at full width: every
+        field the form writes is a line of the frontmatter block in the text
+        right there, and a hand edit to it lands on the form a render later.
+        The findings are a different matter and stay - the notice above names
+        them, and jumping to the line a finding is about is offered nowhere
+        else - so at full width they run under the buffer instead of beside
+        it.
       */}
-      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
+      <div
+        className={`grid gap-8 ${
+          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18rem]"
+        }`}
+      >
         <div className="rounded border border-slate-200 dark:border-slate-800">
           {/*
             The format bar sits inside the card, above the text it edits, and
@@ -1195,24 +1350,18 @@ function Surface({
             onDocChanged={session.setBuffer}
           />
         </div>
-        <aside className="flex flex-col gap-4">
-          <FrontmatterForm
-            doc={session.buffer}
-            view={view}
-            vocabulary={vocabulary.data ?? null}
-          />
-          <FindingsPanel
-            report={session.report}
-            pending={session.checking}
-            unavailable={session.validationUnavailable}
-            onJump={(line) => {
-              const view = session.viewRef.current;
-              if (view) {
-                jumpToLine(view, line);
-              }
-            }}
-          />
-        </aside>
+        {fullWidth ? (
+          findings
+        ) : (
+          <aside className="flex flex-col gap-4">
+            <FrontmatterForm
+              doc={session.buffer}
+              view={view}
+              vocabulary={vocabulary.data ?? null}
+            />
+            {findings}
+          </aside>
+        )}
       </div>
       {conflict !== null && resolving === conflict && (
         <CollabConflictDialog
@@ -1251,6 +1400,15 @@ function Surface({
           onClose={session.onConflictClose}
           onOverwrite={session.onConflictOverwrite}
           onTakeServer={session.onConflictTakeServer}
+        />
+      )}
+      {sharing && engram.path && (
+        <DraftLinkDialog
+          domain={engram.domain}
+          path={engram.path}
+          onClose={() => {
+            setSharing(false);
+          }}
         />
       )}
     </div>

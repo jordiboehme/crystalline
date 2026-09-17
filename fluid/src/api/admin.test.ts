@@ -353,6 +353,24 @@ describe("the admin client layer", () => {
     expect(receipt).toEqual({ filesKept: true, roomsClosed: 2 });
   });
 
+  it("carries the purge confirmation when one was collected", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "mind",
+      files_kept: false,
+      rooms_closed: 0,
+    });
+    const receipt = await unregisterDomain("mind", true);
+
+    // The server refuses a virtual domain's removal without this, because the
+    // engrams are the database's and go with it. The flag is the confirmation
+    // this app already collected, on the wire.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/mind?purge=true",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(receipt).toEqual({ filesKept: false, roomsClosed: 0 });
+  });
+
   it("counts a sync report's lists as well as its numbers", async () => {
     apiMock.mockResolvedValueOnce({
       domain: "eng",
@@ -422,6 +440,14 @@ describe("the admin client layer", () => {
         },
       ],
       conflictList: [],
+      // A domain that takes changes directly sends neither draft key, and
+      // neither is invented: nobody can draft there, so there is nothing to
+      // report and nothing to hide. `drafts` is null rather than empty for the
+      // same reason the count is - an empty list would say "nobody else is
+      // drafting here", which is a fact this report did not state.
+      reviewing: false,
+      myDrafts: null,
+      drafts: null,
       // The identity key the connection block carries on an instance that has
       // one: a report with no block says nothing about it rather than
       // defaulting to a mode nobody set.
@@ -436,6 +462,42 @@ describe("the admin client layer", () => {
       stackLinkPending: false,
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
+  });
+
+  it("reads what a reviewing domain is holding, and for whom", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      my_drafts: 2,
+      drafts: [
+        { actor: "ada", entries: 2 },
+        // A row with no name is dropped rather than drawn as a number beside
+        // an empty cell, which would read as "somebody" and say nothing.
+        { entries: 9 },
+        { actor: "bo", entries: 1 },
+      ],
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.reviewing).toBe(true);
+    expect(status.myDrafts).toBe(2);
+    expect(status.drafts).toEqual([
+      { actor: "ada", entries: 2 },
+      { actor: "bo", entries: 1 },
+    ]);
+
+    // A caller who may not see who else is drafting is sent no `drafts` key,
+    // and a count the index could not answer arrives as null. Neither is an
+    // empty list.
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      my_drafts: null,
+    });
+    const mine = await fetchSyncStatus("eng");
+    expect(mine.reviewing).toBe(true);
+    expect(mine.myDrafts).toBeNull();
+    expect(mine.drafts).toBeNull();
   });
 
   it("reads where the domain's chain of stacked proposals stands", async () => {

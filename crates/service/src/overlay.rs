@@ -24,13 +24,19 @@
 //! registers a file domain rooted at a path, and an optional
 //! `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN=owner/repo[/subpath][@branch]` attaches a
 //! GitHub origin to it so a headless node bootstraps the team domain itself on
-//! first contact. These domains are merged into the effective config last (env
-//! wins over a file entry of the same name) and are never written back to the
-//! file. Two grammar consequences follow from the `_ORIGIN` suffix rule and
-//! are load-bearing: a domain whose env fragment would end in `_ORIGIN` cannot
-//! be env-defined (that spelling is always read as an origin attachment), and
-//! a file domain whose name contains an underscore cannot be env-shadowed
-//! (env names map `_` to `-`, so they never collide with an underscore name).
+//! first contact. `CRYSTALLINE_DOMAIN_<NAME>_REVIEW=overlay` puts that domain
+//! in review mode, so every write on the node joins its author's own draft and
+//! the folder goes on saying what the team reviewed. These domains are merged
+//! into the effective config last (env wins over a file entry of the same name)
+//! and are never written back to the file. Three grammar consequences follow
+//! from the two suffix rules and are load-bearing: a domain whose env fragment
+//! would end in `_ORIGIN` cannot be env-defined (that spelling is always read
+//! as an origin attachment), a domain whose env fragment would end in `_REVIEW`
+//! cannot be env-defined either (so there is no env-defined domain named
+//! `code-review`, because `CRYSTALLINE_DOMAIN_CODE_REVIEW` is review mode for a
+//! domain named `code`), and a file domain whose name contains an underscore
+//! cannot be env-shadowed (env names map `_` to `-`, so they never collide with
+//! an underscore name).
 //!
 //! `CRYSTALLINE_GITHUB_TOKEN` carries a GitHub token for a headless node: see
 //! [`GITHUB_TOKEN_ENV`] and [`EnvOverlay::github_token`]. It is never applied
@@ -43,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
-use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
+use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig, ReviewMode};
 
 use crate::origin;
 use crate::settings;
@@ -62,6 +68,16 @@ pub const DOMAIN_ENV_PREFIX: &str = "CRYSTALLINE_DOMAIN_";
 /// The suffix on the variable that attaches an origin to an env-defined
 /// domain: `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN`.
 const DOMAIN_ORIGIN_SUFFIX: &str = "_ORIGIN";
+
+/// The suffix on the variable that puts an env-defined domain in review mode:
+/// `CRYSTALLINE_DOMAIN_<NAME>_REVIEW`. Read exactly the way
+/// [`DOMAIN_ORIGIN_SUFFIX`] is, and it narrows the grammar the same way: a
+/// domain whose fragment would end in `_REVIEW` cannot be env-defined.
+const DOMAIN_REVIEW_SUFFIX: &str = "_REVIEW";
+
+/// The one value [`DOMAIN_REVIEW_SUFFIX`] takes, the env spelling of
+/// [`crystalline_core::config::ReviewMode::Overlay`].
+const REVIEW_OVERLAY_VALUE: &str = "overlay";
 
 /// The variable carrying a GitHub token for a headless node:
 /// `CRYSTALLINE_GITHUB_TOKEN`. Checked before the keyring and the file store
@@ -90,6 +106,14 @@ const RESERVED_VARS: &[&str] = &[
     // it here or every run that uses it logs a spurious warning - the same
     // reason the postgres line above it is here.
     "CRYSTALLINE_TEST_TOKEN_STORE_DIR",
+    // `crystalline_remote::token`'s boolean kill switch
+    // (`refuse_real_keychain`): set, it refuses the real OS keychain
+    // backend everywhere in that module and falls back to the file store at
+    // whatever directory the caller already resolved, rather than
+    // redirecting to a directory of its own the way the variable above
+    // does. Read straight from the environment in `crates/remote`, never
+    // through the settings registry, so reserved here for the same reason.
+    "CRYSTALLINE_TEST_NO_KEYCHAIN",
     // The install-channel marker (see [`crate::stub::CHANNEL_ENV`]): the mcpb
     // manifest sets it so the degraded status server can tell the Desktop
     // extension apart from a plain install. It is read straight from the
@@ -143,14 +167,34 @@ pub struct EnvOverlay {
     config_path: Option<PathBuf>,
 }
 
-/// Redacts `github_token`: an `EnvOverlay` is long-lived on `Engine` and far
-/// more likely to reach a log line or a test failure message via `Debug` than
-/// via any deliberate print, so the secret is masked unconditionally rather
-/// than trusting every future caller to remember not to print it.
+/// The settings pairs with every credential value replaced, for `Debug`. An
+/// overlay reaches a log line or a panic message as a whole struct, and a
+/// secret must not ride along when it does. Which keys are credentials is
+/// the registry's call ([`settings::is_secret_key`]), so this list never
+/// drifts from what `config show` masks.
+fn redacted_settings(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+    pairs
+        .iter()
+        .map(|(key, value)| {
+            let shown = if settings::is_secret_key(key) {
+                settings::SECRET_DISPLAY
+            } else {
+                value.as_str()
+            };
+            (key.as_str(), shown)
+        })
+        .collect()
+}
+
+/// Redacts `github_token` and every secret setting: an `EnvOverlay` is
+/// long-lived on `Engine` and far more likely to reach a log line or a test
+/// failure message through `Debug` than through any deliberate print, so the
+/// secrets are masked unconditionally rather than trusting every future caller
+/// to remember not to print them.
 impl std::fmt::Debug for EnvOverlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnvOverlay")
-            .field("settings", &self.settings)
+            .field("settings", &redacted_settings(&self.settings))
             .field("domains", &self.domains)
             .field(
                 "github_token",
@@ -183,9 +227,14 @@ impl EnvOverlay {
     /// `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN=owner/repo[/subpath][@branch]`
     /// attaches a GitHub origin to the `<NAME>` domain: every variable ending
     /// in `_ORIGIN` is read as an origin attachment, and one whose base
-    /// `CRYSTALLINE_DOMAIN_<NAME>` is not itself defined is fatal. All
-    /// `CRYSTALLINE_DOMAIN_*` variables are collected first, so an origin may
-    /// appear before its base domain in the iterator without failing.
+    /// `CRYSTALLINE_DOMAIN_<NAME>` is not itself defined is fatal.
+    /// `CRYSTALLINE_DOMAIN_<NAME>_REVIEW=overlay` puts the `<NAME>` domain in
+    /// review mode and is read the same way, with the same orphan rule; any
+    /// other value is fatal naming the variable, since a value nobody
+    /// recognizes read as "off" would be a node quietly not reviewing anything.
+    /// All `CRYSTALLINE_DOMAIN_*` variables are collected first, so an origin
+    /// or a review attachment may appear before its base domain in the iterator
+    /// without failing.
     ///
     /// [`GITHUB_TOKEN_ENV`], when present and non-empty, is captured as
     /// [`EnvOverlay::github_token`]; an empty value reads as unset, the same
@@ -205,6 +254,7 @@ impl EnvOverlay {
         // regardless of the order the two variables arrive in.
         let mut domain_vars: Vec<(String, String)> = Vec::new();
         let mut origin_vars: Vec<(String, String)> = Vec::new();
+        let mut review_vars: Vec<(String, String)> = Vec::new();
 
         for (name, value) in vars {
             // A plain, non-Crystalline variable is not ours to reason about.
@@ -236,15 +286,21 @@ impl EnvOverlay {
                 continue;
             }
             if let Some(fragment) = name.strip_prefix(DOMAIN_ENV_PREFIX) {
-                // Every `_ORIGIN`-suffixed name is an origin attachment; every
-                // other is a domain definition. Both are resolved below. An
-                // empty `_ORIGIN` value reads as "no attachment", matching the
-                // empty-is-unset convention of every other variable (an empty
-                // domain PATH stays an error: the base variable declares a
-                // domain, so it has to say where the domain lives).
+                // Every `_ORIGIN`-suffixed name is an origin attachment and
+                // every `_REVIEW`-suffixed one is a review-mode attachment;
+                // every other is a domain definition. All three are resolved
+                // below. An empty attachment value reads as "no attachment",
+                // matching the empty-is-unset convention of every other
+                // variable (an empty domain PATH stays an error: the base
+                // variable declares a domain, so it has to say where the domain
+                // lives).
                 if fragment.ends_with(DOMAIN_ORIGIN_SUFFIX) {
                     if !value.is_empty() {
                         origin_vars.push((name, value));
+                    }
+                } else if fragment.ends_with(DOMAIN_REVIEW_SUFFIX) {
+                    if !value.is_empty() {
+                        review_vars.push((name, value));
                     }
                 } else {
                     domain_vars.push((name, value));
@@ -270,7 +326,7 @@ impl EnvOverlay {
             ))
         })?;
 
-        let domains = resolve_env_domains(domain_vars, origin_vars)?;
+        let domains = resolve_env_domains(domain_vars, origin_vars, review_vars)?;
 
         Ok(EnvOverlay {
             settings,
@@ -364,17 +420,22 @@ impl EnvOverlay {
     /// Every active override as `(variable, key, display value)`, for surfacing
     /// in `doctor` and the like: first the setting overrides, then the
     /// env-defined domains (keyed `domain.<name>`, their path as the display
-    /// value), then the GitHub token, if set (keyed `github.token`). The
-    /// `database.url` value and the GitHub token are both rendered as `(set)`
-    /// rather than shown, since either may be a credential; a domain path
-    /// carries no secret and is shown as-is.
+    /// value), then the GitHub token, if set (keyed `github.token`).
+    ///
+    /// Every credential is rendered as `(set)` rather than shown: which keys
+    /// those are is the registry's call ([`settings::is_secret_key`], the same
+    /// answer `config show` masks by), so this list never drifts from it -
+    /// `database.url` and the OIDC client secret are two of them today, and a
+    /// key added to the registry as a secret is masked here without this
+    /// sentence being touched. A domain path carries no secret and is shown
+    /// as-is.
     pub fn active_overrides(&self) -> Vec<(String, String, String)> {
         let mut out: Vec<(String, String, String)> = self
             .settings
             .iter()
             .map(|(key, value)| {
-                let display = if key == "database.url" {
-                    "(set)".to_string()
+                let display = if settings::is_secret_key(key) {
+                    settings::SECRET_DISPLAY.to_string()
                 } else {
                     value.clone()
                 };
@@ -403,12 +464,14 @@ impl EnvOverlay {
 /// Resolves the collected `CRYSTALLINE_DOMAIN_*` variables into the overlay's
 /// domain map: every domain-definition variable becomes a file [`DomainEntry`],
 /// then every `_ORIGIN` variable attaches a parsed [`OriginConfig`] to its base
-/// domain. An origin with no matching base domain, an invalid name, an empty
-/// path or a malformed origin value is fatal, each error naming the offending
-/// variable.
+/// domain and every `_REVIEW` variable puts its base domain in review mode. An
+/// attachment with no matching base domain, an invalid name, an empty path, a
+/// malformed origin value or a review value that names no mode is fatal, each
+/// error naming the offending variable.
 fn resolve_env_domains(
     domain_vars: Vec<(String, String)>,
     origin_vars: Vec<(String, String)>,
+    review_vars: Vec<(String, String)>,
 ) -> Result<IndexMap<String, EnvDomain>, OverlayError> {
     let mut domains: IndexMap<String, EnvDomain> = IndexMap::new();
     // The `<NAME>` fragment (for example `TEAM_KNOWLEDGE`) to the mapped domain
@@ -469,6 +532,32 @@ fn resolve_env_domains(
             .expect("name recorded when the base domain was resolved")
             .entry
             .origin = Some(origin);
+    }
+
+    for (var, value) in review_vars {
+        let fragment = var
+            .strip_prefix(DOMAIN_ENV_PREFIX)
+            .expect("collected with the domain prefix");
+        let base = fragment
+            .strip_suffix(DOMAIN_REVIEW_SUFFIX)
+            .expect("collected by its review suffix");
+        let Some(name) = fragment_to_name.get(base) else {
+            return Err(OverlayError(format!(
+                "environment variable {var} has no matching {DOMAIN_ENV_PREFIX}{base}"
+            )));
+        };
+        if value.trim() != REVIEW_OVERLAY_VALUE {
+            return Err(OverlayError(format!(
+                "invalid environment variable {var}: review mode is '{REVIEW_OVERLAY_VALUE}', the \
+                 mode where every write joins its author's own draft; unset the variable for a \
+                 domain that takes changes directly"
+            )));
+        }
+        domains
+            .get_mut(name)
+            .expect("name recorded when the base domain was resolved")
+            .entry
+            .review = Some(ReviewMode::Overlay);
     }
 
     Ok(domains)
@@ -727,6 +816,24 @@ mod tests {
         assert!(ov.is_empty());
     }
 
+    /// The `auth.oidc.*` setters refuse an empty value, because `unset` is how
+    /// a key is turned off. That refusal must never reach a blanked compose
+    /// variable: the empty-is-unset filter runs first, so `VAR=` skips the key
+    /// rather than failing startup. Pinned separately because reordering the
+    /// two would turn a blank line in a compose file into a daemon that does
+    /// not come up.
+    #[test]
+    fn a_blanked_oidc_variable_is_unset_rather_than_a_startup_failure() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_OIDC_ISSUER", ""),
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", ""),
+        ])
+        .unwrap();
+        assert!(!ov.overrides_key("auth.oidc.issuer"));
+        assert!(!ov.overrides_key("auth.oidc.client_secret"));
+        assert!(ov.is_empty());
+    }
+
     #[test]
     fn an_invalid_value_errors_naming_the_variable() {
         let err = overlay(&[("CRYSTALLINE_GITHUB_POLL_SECS", "10")]).unwrap_err();
@@ -816,6 +923,56 @@ mod tests {
             .find(|(_, key, _)| key == "database.backend")
             .expect("database.backend override present");
         assert_eq!(backend.2, "postgres", "a non-secret value is shown as-is");
+    }
+
+    /// The single sign-on client secret is a credential on the same terms as
+    /// the database url: `crystalline doctor` lists which variables are
+    /// active, and it must be able to say "this one is set" without printing
+    /// what it is set to.
+    #[test]
+    fn active_overrides_masks_the_oidc_client_secret() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_ID", "app-1234"),
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", "hunter2"),
+        ])
+        .unwrap();
+        let overrides = ov.active_overrides();
+
+        let secret = overrides
+            .iter()
+            .find(|(_, key, _)| key == "auth.oidc.client_secret")
+            .expect("auth.oidc.client_secret override present");
+        assert_eq!(secret.0, "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET");
+        assert_eq!(secret.2, settings::SECRET_DISPLAY);
+
+        let id = overrides
+            .iter()
+            .find(|(_, key, _)| key == "auth.oidc.client_id")
+            .expect("auth.oidc.client_id override present");
+        assert_eq!(id.2, "app-1234", "the client id is not a secret");
+    }
+
+    /// An overlay reaches a log line or a panic message as a whole struct, so
+    /// its `Debug` redacts every credential it carries, not only the token.
+    #[test]
+    fn debug_redacts_every_credential_in_the_overlay() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", "hunter2"),
+            ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
+            (
+                "CRYSTALLINE_DATABASE_URL",
+                "postgres://u:secret@db/crystalline",
+            ),
+            ("CRYSTALLINE_GITHUB_TOKEN", "ghp_notreal"),
+        ])
+        .unwrap();
+
+        let rendered = format!("{ov:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("postgres://"), "{rendered}");
+        assert!(!rendered.contains("ghp_notreal"), "{rendered}");
+        // The keys themselves still show, so the render stays diagnosable.
+        assert!(rendered.contains("auth.oidc.client_secret"), "{rendered}");
     }
 
     #[test]
@@ -1033,6 +1190,75 @@ mod tests {
                 .repo,
             "acme/brand"
         );
+    }
+
+    #[test]
+    fn a_review_variable_turns_the_mode_on_and_a_stray_one_is_fatal() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand"),
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "overlay"),
+            ("CRYSTALLINE_DOMAIN_SOLO", "/k/solo"),
+        ])
+        .unwrap();
+        assert!(
+            ov.env_domain("team").unwrap().entry.is_overlay(),
+            "the domain the variable names reviews changes"
+        );
+        assert!(
+            !ov.env_domain("solo").unwrap().entry.is_overlay(),
+            "and a domain with no such variable takes them directly"
+        );
+
+        // Order does not matter: the variables are collected before any of them
+        // is resolved, exactly as an origin attachment is.
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "overlay"),
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+        ])
+        .unwrap();
+        assert!(ov.env_domain("team").unwrap().entry.is_overlay());
+
+        // `VAR=` reads as unset, the way every other variable here does.
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", ""),
+            ("CRYSTALLINE_DOMAIN_LONER_REVIEW", ""),
+        ])
+        .unwrap();
+        assert!(!ov.env_domain("team").unwrap().entry.is_overlay());
+        assert!(ov.env_domain("loner").is_none());
+
+        // A review variable naming a domain the environment does not define is
+        // fatal, the way a stray `_ORIGIN` is: it is a deployment that believes
+        // it turned review on somewhere it did not.
+        let err = overlay(&[("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "overlay")]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM_REVIEW"), "{msg}");
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM"), "{msg}");
+
+        // And a value that names no mode is fatal naming the variable and what
+        // it will take, rather than being read as "off".
+        let err = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_REVIEW", "yes"),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM_REVIEW"), "{msg}");
+        assert!(msg.contains("overlay"), "{msg}");
+    }
+
+    #[test]
+    fn a_domain_whose_fragment_ends_in_review_cannot_be_env_defined() {
+        // The suffix is load-bearing: `CRYSTALLINE_DOMAIN_CODE_REVIEW` is read
+        // as review mode for a domain named `code`, never as a domain named
+        // `code-review`. The grammar note on this module says so, and this is
+        // what holds it.
+        let err = overlay(&[("CRYSTALLINE_DOMAIN_CODE_REVIEW", "/k/code-review")]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_CODE_REVIEW"), "{msg}");
+        assert!(msg.contains("CRYSTALLINE_DOMAIN_CODE"), "{msg}");
     }
 
     #[test]

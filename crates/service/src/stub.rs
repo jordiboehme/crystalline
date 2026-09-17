@@ -31,7 +31,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
@@ -243,16 +243,17 @@ impl ServerHandler for DegradedServer {
     /// The degraded handshake: identify as `crystalline` at this binary's
     /// version and hand the connecting agent the per-case degraded copy as its
     /// `instructions`, advertising only the tools capability.
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
         // The degraded server keeps rmcp's default `initialize`, so this field
-        // **is** its downgrade target for a version it does not serve
-        // (`negotiate_protocol_version`'s `server_fallback`, rmcp 3.1.2
-        // `service/server.rs:590`). It names the newest revision that still has
+        // **is** its downgrade target - both for a version it does not serve
+        // and for one it serves that has no handshake, the era among them
+        // (`negotiate_protocol_version`'s `server_fallback`, rmcp 3.2.0
+        // `service/server.rs:479`). It names the newest revision that still has
         // a handshake, for the reasons on
         // [`crate::mcp::newest_legacy_handshake_version`], and it is set
-        // explicitly because `ServerInfo::default()` would otherwise leave
+        // explicitly because `ServerConfig::default()` would otherwise leave
         // rmcp's own `LATEST` here - a value that moves when the crate does and
         // would one day answer a legacy handshake with a revision that has no
         // handshake at all.
@@ -356,7 +357,7 @@ mod tests {
         channel: Option<&str>,
     ) -> StubStatus {
         StubStatus {
-            reason: "cannot run an embedded MCP server: another Crystalline instance owns the index (pid 4242)".to_string(),
+            reason: "cannot run an embedded MCP server: this process asked for the index, but another Crystalline instance already owns it: pid 4242, v99.0.0, started by serve, and its record says it bound 127.0.0.1:7411".to_string(),
             binary_version: "0.8.2".to_string(),
             daemon_version: daemon_version.map(str::to_string),
             daemon_pid,

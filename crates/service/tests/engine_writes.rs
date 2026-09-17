@@ -7,7 +7,10 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::params::{DeleteParams, ReadParams, RetireParams, SaveParams};
+use crystalline_service::Scope;
+use crystalline_service::params::{
+    DeleteParams, ReadParams, RetireParams, SaveParams, SplitParams,
+};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -51,10 +54,14 @@ async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
 /// The checksum a read reports, which is the save's CAS token.
 async fn checksum_of(engine: &Engine, domain: &str, identifier: &str) -> (String, String) {
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: identifier.to_string(),
-            domain: Some(domain.to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: identifier.to_string(),
+                domain: Some(domain.to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     (
@@ -70,12 +77,15 @@ async fn save_writes_the_exact_bytes_and_moves_the_checksum() {
 
     let edited = content.replace("A rule about alpha.", "A sharper rule about alpha.");
     let saved = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: edited.clone(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: edited.clone(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(saved["permalink"], "alpha");
@@ -96,12 +106,15 @@ async fn a_zero_edit_save_is_byte_identical() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, content) = checksum_of(&engine, "eng", "alpha").await;
     engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content,
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content,
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -136,6 +149,8 @@ async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
+            model: None,
         })
         .await
         .unwrap_err();
@@ -163,13 +178,16 @@ async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
 async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
     let (_tmp, engine) = engine_fixture().await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: ALPHA.replace("stable", "draft"),
-            expected_checksum: "0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: ALPHA.replace("stable", "draft"),
+                expected_checksum:
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stale edit"), "{err}");
@@ -186,17 +204,22 @@ async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
+            model: None,
         })
         .await
         .unwrap();
     let (_, content) = checksum_of(&engine, "scratch", "note").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "scratch".to_string(),
-            identifier: "note".to_string(),
-            content,
-            expected_checksum: "not-the-checksum".to_string(),
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "scratch".to_string(),
+                identifier: "note".to_string(),
+                content,
+                expected_checksum: "not-the-checksum".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("stale edit"), "{err}");
@@ -259,6 +282,8 @@ async fn a_stale_edit_is_a_conflict_on_file_and_virtual_domains() {
             status: None,
             metadata: None,
             overwrite: false,
+            share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -286,12 +311,15 @@ async fn a_save_with_unparseable_frontmatter_is_refused_without_writing() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: "---\ntitle: [unclosed\n---\n\n# Alpha\n".to_string(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: "---\ntitle: [unclosed\n---\n\n# Alpha\n".to_string(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -314,12 +342,15 @@ async fn a_save_with_an_empty_frontmatter_block_is_refused_without_writing() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: "---\n---\n\n# Alpha\n\nA rule about alpha.\n".to_string(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: "---\n---\n\n# Alpha\n\nA rule about alpha.\n".to_string(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -341,12 +372,15 @@ async fn a_save_that_only_violates_a_verify_rule_still_lands() {
     let (checksum, content) = checksum_of(&engine, "eng", "alpha").await;
     let untagged = content.replace("tags:\n  - eng\n", "");
     engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: untagged.clone(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: untagged.clone(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -361,12 +395,15 @@ async fn a_save_that_does_not_parse_is_refused_without_writing() {
     let before = std::fs::read(tmp.path().join("eng/alpha.md")).unwrap();
     let (checksum, _) = checksum_of(&engine, "eng", "alpha").await;
     let err = engine
-        .save_engram(&SaveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            content: "not an engram at all".to_string(),
-            expected_checksum: checksum,
-        })
+        .save_engram(
+            &SaveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                content: "not an engram at all".to_string(),
+                expected_checksum: checksum,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -406,8 +443,501 @@ async fn retirement_sets_status_and_wires_the_supersede_pair() {
     let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
     assert!(alpha.contains("status: superseded"), "{alpha}");
     assert!(alpha.contains("valid_to: 2026-08-01"), "{alpha}");
+    assert!(alpha.contains("- superseded_by [[beta]]"), "{alpha}");
+    let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
+    assert!(beta.contains("- supersedes [[alpha]]"), "{beta}");
+}
+
+/// Issue #65: an engram whose title's own first word ends in a colon.
+///
+/// `[[Log: Weekly Garden Notes]]` splits like `[[domain:Target]]` - the parser
+/// is domain-agnostic and cannot tell the two apart - so a relation written by
+/// title pointed at a domain called `Log` that nobody has, and the pair the
+/// verb exists to wire came out broken. Every relation the engine writes for
+/// itself names the permalink instead: it is the stable identity, and it never
+/// carries a colon.
+#[tokio::test]
+async fn the_supersede_pair_links_by_permalink_so_a_colon_in_a_title_cannot_break_it() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/log-weekly.md"),
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "superseded".to_string(),
+            successor: Some("log-weekly".to_string()),
+            valid_to: None,
+        })
+        .await
+        .unwrap();
+
+    let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("- superseded_by [[log-weekly]]"), "{alpha}");
+    let successor = std::fs::read_to_string(tmp.path().join("eng/log-weekly.md")).unwrap();
+    assert!(successor.contains("- supersedes [[alpha]]"), "{successor}");
+
+    // Both halves resolve, which is the whole point: the title form did not.
+    for (identifier, rel_type) in [("alpha", "superseded_by"), ("log-weekly", "supersedes")] {
+        let read = engine
+            .read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("eng".to_string()),
+                    share_link: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let relation = read["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rel_type"] == rel_type)
+            .unwrap_or_else(|| panic!("{identifier} declares {rel_type}"));
+        assert_eq!(relation["resolved"], true, "{identifier} {rel_type}");
+    }
+}
+
+/// Issue #65, the half a person writes by hand: `[[Log: Weekly Garden Notes]]`
+/// typed into an engram's prose and into a relation bullet.
+///
+/// The two tests around this one pin the pair the ENGINE writes, which names
+/// permalinks and never carries a colon; this one pins the shape the fix
+/// actually exists for. A prefix naming no registered domain means the whole
+/// bracket text is a title at home, and a live instance resolves references in
+/// SQL rather than in core, so nothing but a read on a synced engine says
+/// whether the rule reached the running server.
+#[tokio::test]
+async fn a_hand_written_colon_title_resolves_through_read_engram() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/log-weekly.md"),
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("eng/reader.md"),
+        "---\ntype: engram\ntitle: Reader\npermalink: reader\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-02\n---\n\n# Reader\n\n- relates_to [[Log: Weekly Garden Notes]]\n\nAnd in prose, [[Log: Weekly Garden Notes]] again.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "reader".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let relation = read["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["rel_type"] == "relates_to")
+        .expect("reader declares relates_to");
+    assert_eq!(
+        relation["resolved"], true,
+        "the hand-written relation resolves: {read}"
+    );
+    let link = read["links"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("reader carries a prose link");
+    assert_eq!(
+        link["resolved"], true,
+        "and so does the prose wikilink: {read}"
+    );
+
+    // From the other end: the engram with the colon title is told who points at
+    // it, which is the same rows read from the other side.
+    let target = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "log-weekly".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        target["inbound"]["count"].as_u64().unwrap_or(0) >= 2,
+        "both references are counted inbound: {target}"
+    );
+}
+
+/// A minimal create: everything but the title left at the default a caller who
+/// names only a title and a body would get.
+fn write_params(
+    domain: &str,
+    title: &str,
+    content: &str,
+) -> crystalline_service::params::WriteParams {
+    crystalline_service::params::WriteParams {
+        domain: domain.to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        folder: None,
+        engram_type: None,
+        tags: vec![],
+        status: None,
+        metadata: None,
+        overwrite: false,
+        share_link: None,
+        model: None,
+    }
+}
+
+/// A title holding a slash produces a nested permalink nobody asked for, and a
+/// title holding a colon produces a link that reads as a cross-domain one. The
+/// write still lands - both are legal titles - and the receipt says what
+/// happened and what to write instead, because the alternative is an agent
+/// discovering it weeks later through a link that will not resolve.
+#[tokio::test]
+async fn a_title_holding_a_slash_or_a_colon_is_named_in_the_receipt() {
+    let (_tmp, engine) = engine_fixture().await;
+
+    let slashed = engine
+        .write_engram(&write_params("eng", "Q3/Q4 planning", "body"))
+        .await
+        .unwrap();
+    assert_eq!(slashed["permalink"], "q3/q4-planning");
+    let notices = slashed["notices"].as_array().expect("a notice rode along");
+    let text = notices[0].as_str().unwrap();
+    assert!(
+        text.contains("q3/q4-planning"),
+        "it names the permalink it produced: {text}"
+    );
+    assert!(
+        text.contains("`folder: \"q3\"`") && text.contains("--folder q3"),
+        "and a spelling a person can paste, on both surfaces they write from: {text}"
+    );
+    assert!(
+        text.contains("the title `Q4 planning`"),
+        "and the title back in the author's own words, not the slug it would \
+         become: {text}"
+    );
+
+    let coloned = engine
+        .write_engram(&write_params(
+            "eng",
+            "Murmur: the dispatch pipeline",
+            "body",
+        ))
+        .await
+        .unwrap();
+    let text = coloned["notices"][0].as_str().unwrap();
+    assert!(
+        text.contains("Murmur"),
+        "it names the prefix a link would read: {text}"
+    );
+    assert!(
+        text.contains("`[[murmur-the-dispatch-pipeline]]`"),
+        "and the bare permalink, which resolves at home whatever is registered: {text}"
+    );
+    assert!(
+        text.contains("`[[eng:murmur-the-dispatch-pipeline]]`"),
+        "and its cross-domain twin: {text}"
+    );
+    assert!(
+        !text.contains("crystalline://"),
+        "and never the scheme, which a wikilink splits at its own first colon: {text}"
+    );
+
+    // A trailing slash is not a nesting: `slugify` drops the empty segment, so
+    // `TODO/` lands at `todo` and there is nothing to report.
+    let trailing = engine
+        .write_engram(&write_params("eng", "TODO/", "body"))
+        .await
+        .unwrap();
+    assert_eq!(trailing["permalink"], "todo");
+    assert!(trailing.get("notices").is_none(), "{trailing}");
+
+    // Nor is a folder the caller asked for: the permalink is nested because
+    // they said so, and a notice there would be noise on every deliberate
+    // write.
+    let mut foldered = write_params("eng", "Deliberate", "body");
+    foldered.folder = Some("notes/deep".to_string());
+    let foldered = engine.write_engram(&foldered).await.unwrap();
+    assert_eq!(foldered["permalink"], "notes/deep/deliberate");
+    assert!(foldered.get("notices").is_none(), "{foldered}");
+
+    // A title whose colon is followed by nothing, and one whose prefix holds a
+    // space, are not what a link reads as a domain prefix, so neither earns the
+    // colon notice - the same three conditions `LinkTarget::parse` applies.
+    let bare = engine
+        .write_engram(&write_params("eng", "Deadline:", "body"))
+        .await
+        .unwrap();
+    assert!(bare.get("notices").is_none(), "{bare}");
+    let spaced = engine
+        .write_engram(&write_params("eng", "Log entry: Monday", "body"))
+        .await
+        .unwrap();
+    assert!(spaced.get("notices").is_none(), "{spaced}");
+
+    // A plain title carries no notice at all: the key is absent rather than an
+    // empty array, so nothing pays for a field it never uses.
+    let plain = engine
+        .write_engram(&write_params("eng", "Plain title", "body"))
+        .await
+        .unwrap();
+    assert!(plain.get("notices").is_none(), "{plain}");
+}
+
+/// The folder and the title a slash notice tells the author to write instead,
+/// lifted out of the sentence rather than retyped, so a test that follows the
+/// remedy follows the notice and not a copy of it.
+fn remedy_of(notice: &str) -> (String, String) {
+    let folder = notice
+        .split_once("folder: \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(folder, _)| folder.to_string())
+        .unwrap_or_else(|| panic!("the notice names a folder to pass: {notice}"));
+    let title = notice
+        .split_once("with the title `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(title, _)| title.to_string())
+        .unwrap_or_else(|| panic!("the notice names a title to keep: {notice}"));
+    (folder, title)
+}
+
+/// The slash remedy has to land where the write just said it landed, for every
+/// title the notice fires on rather than only the tidy one.
+///
+/// `slugify` drops a segment that contributes nothing - empty, whitespace,
+/// punctuation - while splitting the title does not, so the title's last
+/// segment is not always the one that produced the permalink's last segment. A
+/// remedy built from the wrong segment is either an empty pair of backticks
+/// where the author's words belong, or a title that looks pasteable and
+/// re-slugifies to a different engram. Both send a reader somewhere other than
+/// the address the same sentence just quoted.
+#[tokio::test]
+async fn the_slash_remedy_lands_at_the_address_the_write_landed_at() {
+    let (_tmp, engine) = engine_fixture().await;
+
+    // The tidy case, a trailing slash, a punctuation-only last segment and a
+    // whitespace-only one. Every one of them nests, so every one earns a
+    // notice that has to be followable.
+    for title in ["Q3/Q4 planning", "notes/2026/", "a/b/!!!", "a/b/ "] {
+        // Overwriting throughout: two of these titles slugify to the same
+        // address, which is the point of the case rather than an accident, and
+        // a collision would end the loop before the notice was read.
+        let mut probe = write_params("eng", title, "body");
+        probe.overwrite = true;
+        let written = engine.write_engram(&probe).await.unwrap();
+        let permalink = written["permalink"].as_str().unwrap().to_string();
+        let notice = written["notices"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{title}` landed nested, so it earns a notice: {written}"));
+        let (folder, leaf) = remedy_of(notice);
+        assert!(
+            !leaf.is_empty(),
+            "`{title}`: the remedy names the author's words, not an empty pair of \
+             backticks: {notice}"
+        );
+
+        // Follow it: the folder as its own argument, the title the notice
+        // handed back, and the same address it said the write landed at.
+        let mut followed = write_params("eng", &leaf, "body");
+        followed.folder = Some(folder.clone());
+        followed.overwrite = true;
+        let followed = engine.write_engram(&followed).await.unwrap();
+        assert_eq!(
+            followed["permalink"], permalink,
+            "`{title}`: the remedy (folder `{folder}`, title `{leaf}`) has to land where the \
+             write landed, or the notice sends its reader to a different engram"
+        );
+        assert!(
+            followed.get("notices").is_none(),
+            "`{title}`: and following it ends the notice rather than repeating it: {followed}"
+        );
+    }
+}
+
+/// The colon notice's own remedy, followed to the letter and then swept.
+///
+/// A notice that names a spelling which does not resolve manufactures exactly
+/// the dangling reference it exists to prevent, and it would do it on an
+/// agent's first obedient try. So every bracket form the sentence offers - each
+/// one lifted out of the text rather than retyped here, so the test follows the
+/// notice and not a copy of it - is written into a second engram, the domain is
+/// synced, and V102 must find nothing.
+#[tokio::test]
+async fn the_colon_notices_remedy_is_a_link_that_resolves() {
+    let (tmp, engine) = engine_fixture().await;
+
+    let receipt = engine
+        .write_engram(&write_params(
+            "eng",
+            "Murmur: the dispatch pipeline",
+            "How dispatch works.",
+        ))
+        .await
+        .unwrap();
+    let notice = receipt["notices"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the colon notice: {receipt}"));
+
+    // Every `[[...]]` the sentence spells except the first, which is the shape
+    // it is warning about. What is left is what it recommends.
+    let offered: Vec<String> = notice
+        .match_indices("[[")
+        .filter_map(|(i, _)| {
+            let rest = &notice[i + 2..];
+            rest.find("]]").map(|end| rest[..end].to_string())
+        })
+        .skip(1)
+        .collect();
+    assert!(
+        !offered.is_empty(),
+        "the notice offers a spelling to write instead: {notice}"
+    );
+
+    let body: String = offered
+        .iter()
+        .map(|form| format!("A reader follows [[{form}]] here.\n\n"))
+        .collect();
+    std::fs::write(
+        tmp.path().join("eng/reader.md"),
+        format!(
+            "---\ntype: engram\ntitle: Reader\npermalink: reader\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-02\n---\n\n# Reader\n\n{body}"
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let report = engine
+        .evolve_detect(
+            &crystalline_service::params::EvolveParams {
+                domains: vec!["eng".to_string()],
+                rules: vec!["V102".to_string()],
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report["queue"].as_array().map(Vec::len),
+        Some(0),
+        "every spelling the notice offers resolves; it offered {offered:?}: {report}"
+    );
+}
+
+/// The same rule on the other pair-writing verb, and the sharper case: the
+/// engram carrying the colon is the SOURCE, so both bullets are affected.
+#[tokio::test]
+async fn split_links_by_permalink_so_a_colon_in_a_title_cannot_break_the_pair() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/log-weekly.md"),
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n\n- [fact] The beans went in on Tuesday\n- [fact] The compost bin was turned\n- [decision] The tomatoes stay under glass\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let (checksum, _) = checksum_of(&engine, "eng", "log-weekly").await;
+    let lines = observation_lines(&engine, "log-weekly", &["beans went in"]).await;
+
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "log-weekly".to_string(),
+            title: "Sowing: What Went In".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: Some(checksum),
+        })
+        .await
+        .unwrap();
+
+    let new = std::fs::read_to_string(tmp.path().join("eng/sowing-what-went-in.md")).unwrap();
+    assert!(new.contains("- derived_from [[log-weekly]]"), "{new}");
+    let source = std::fs::read_to_string(tmp.path().join("eng/log-weekly.md")).unwrap();
+    assert!(
+        source.contains("- split_into [[sowing-what-went-in]]"),
+        "{source}"
+    );
+
+    for (identifier, rel_type) in [
+        ("log-weekly", "split_into"),
+        ("sowing-what-went-in", "derived_from"),
+    ] {
+        let read = engine
+            .read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("eng".to_string()),
+                    share_link: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let relation = read["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rel_type"] == rel_type)
+            .unwrap_or_else(|| panic!("{identifier} declares {rel_type}"));
+        assert_eq!(relation["resolved"], true, "{identifier} {rel_type}");
+    }
+}
+
+/// A re-retirement recognizes the bullet the older engine wrote.
+///
+/// The pair used to be wired by title and is wired by permalink now, so an
+/// archive holds both spellings. Recognizing only the new one would append a
+/// second bullet saying exactly what the first already says, every time
+/// somebody re-ran a retirement.
+#[tokio::test]
+async fn a_re_retirement_recognizes_a_supersede_bullet_written_by_title() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/beta.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Beta\n\nThe sharper rule.\n\n- supersedes [[Alpha]]\n",
+    )
+    .unwrap();
+    // Alpha as an older retirement left it: already retired, already declaring
+    // its successor, in the title spelling.
+    let alpha_path = tmp.path().join("eng/alpha.md");
+    let alpha_before = std::fs::read_to_string(&alpha_path)
+        .unwrap()
+        .replace("status: stable", "status: superseded")
+        + "\n- superseded_by [[Beta]]\n";
+    std::fs::write(&alpha_path, &alpha_before).unwrap();
+    engine.sync(None).await.unwrap();
+
+    engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "superseded".to_string(),
+            successor: Some("beta".to_string()),
+            valid_to: None,
+        })
+        .await
+        .unwrap();
+
+    let alpha = std::fs::read_to_string(&alpha_path).unwrap();
+    assert_eq!(alpha.matches("- superseded_by [[").count(), 1, "{alpha}");
     assert!(alpha.contains("- superseded_by [[Beta]]"), "{alpha}");
     let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
+    assert_eq!(beta.matches("- supersedes [[").count(), 1, "{beta}");
     assert!(beta.contains("- supersedes [[Alpha]]"), "{beta}");
 }
 
@@ -556,12 +1086,12 @@ async fn retiring_the_same_engram_twice_is_idempotent() {
 
     let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
     assert_eq!(
-        alpha.matches("- superseded_by [[Beta]]").count(),
+        alpha.matches("- superseded_by [[beta]]").count(),
         1,
         "{alpha}"
     );
     let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
-    assert_eq!(beta.matches("- supersedes [[Alpha]]").count(), 1, "{beta}");
+    assert_eq!(beta.matches("- supersedes [[alpha]]").count(), 1, "{beta}");
 }
 
 #[tokio::test]
@@ -726,7 +1256,7 @@ async fn restore_puts_the_exact_bytes_back_and_reindexes() {
     engine.sync(None).await.unwrap();
 
     let receipt = engine
-        .restore_engram("eng", "alpha.md", ALPHA)
+        .restore_engram("eng", "alpha.md", ALPHA, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(receipt["permalink"], "alpha");
@@ -739,7 +1269,7 @@ async fn restore_puts_the_exact_bytes_back_and_reindexes() {
     assert_eq!(content, ALPHA);
 
     let refused = engine
-        .restore_engram("eng", "alpha.md", "no frontmatter")
+        .restore_engram("eng", "alpha.md", "no frontmatter", &Scope::Unrestricted)
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("frontmatter"), "{refused}");
@@ -793,4 +1323,721 @@ async fn text_at_path_reports_what_is_there_and_nothing_when_it_is_gone() {
             .unwrap()
             .is_none()
     );
+}
+
+// ---------------------------------------------------------------------------
+// split_engram
+// ---------------------------------------------------------------------------
+
+/// A five-observation bundle that mixes lifecycles: two facts about the purge
+/// outlive the mix decision they were written beside. The shape `split_engram`
+/// exists for.
+const BUNDLE: &str = "---\ntype: decision\ntitle: Coolant Bundle\npermalink: coolant-bundle\ntags:\n  - coolant\n  - cooling\nstatus: stable\nrecorded_at: 2026-01-01\nvalid_to: 2026-08-01\n---\n\n# Coolant Bundle\n\n## Observations\n\n- [decision] Run the coolant loop on glycol mix B\n- [fact] The loop needs a 40 minute purge before a mix swap\n- [fact] The purge pump is rated for 12 bar\n- [gotcha] Mix B runs hot above 80 percent load\n- [convention] Log every mix swap in the ship register\n\n## Notes\n\nMix B was chosen when the fleet still ran the old pumps.\n";
+
+/// The bundle on disk in `eng`, synced, with the checksum of what was written.
+async fn bundle_fixture() -> (tempfile::TempDir, Arc<Engine>, String) {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(tmp.path().join("eng/coolant-bundle.md"), BUNDLE).unwrap();
+    engine.sync(None).await.unwrap();
+    let (checksum, _) = checksum_of(&engine, "eng", "coolant-bundle").await;
+    (tmp, engine, checksum)
+}
+
+/// The one-based lines of the observations whose text contains `needle`, read
+/// back exactly the way `read_engram` reports them to a caller.
+async fn observation_lines(engine: &Engine, identifier: &str, needles: &[&str]) -> Vec<usize> {
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: identifier.to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let observations = read["observations"].as_array().unwrap().clone();
+    needles
+        .iter()
+        .map(|needle| {
+            observations
+                .iter()
+                .find(|o| o["content"].as_str().unwrap_or_default().contains(needle))
+                .unwrap_or_else(|| panic!("no observation mentions {needle}"))["line"]
+                .as_u64()
+                .unwrap() as usize
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn split_moves_the_selected_observations_and_wires_the_pair_both_ways() {
+    let (tmp, engine, checksum) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["40 minute purge", "12 bar"]).await;
+
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: lines.clone(),
+            sections: Vec::new(),
+            expected_checksum: Some(checksum),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["source"]["permalink"], "coolant-bundle");
+    assert_eq!(receipt["new"]["permalink"], "purge-procedure");
+    assert_eq!(receipt["new"]["title"], "Purge Procedure");
+    assert_eq!(receipt["moved_observations"], 2);
+    assert_eq!(receipt["moved_sections"], 0);
+
+    // The new engram, re-read from disk: the moved bullets verbatim, the
+    // source's tags, a stable status, no window it inherited from the bundle.
+    let new = std::fs::read_to_string(tmp.path().join("eng/purge-procedure.md")).unwrap();
+    assert!(new.contains("- [fact] The loop needs a 40 minute purge before a mix swap"));
+    assert!(new.contains("- [fact] The purge pump is rated for 12 bar"));
+    assert!(new.contains("- derived_from [[coolant-bundle]]"));
+    assert!(new.contains("status: stable"), "{new}");
+    assert!(
+        new.contains("- coolant") && new.contains("- cooling"),
+        "{new}"
+    );
+    assert!(
+        !new.contains("valid_to"),
+        "the moved facts carry no window: {new}"
+    );
+    assert!(
+        !new.contains("glycol mix B"),
+        "only the selection moved: {new}"
+    );
+
+    // The source keeps what was not selected and gains the back-link.
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(!source.contains("40 minute purge"), "{source}");
+    assert!(!source.contains("12 bar"), "{source}");
+    assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
+    assert!(source.contains("- [convention] Log every mix swap in the ship register"));
+    assert!(
+        source.contains("- split_into [[purge-procedure]]"),
+        "{source}"
+    );
+
+    // Both halves resolve: each engram's relation points at an engram that is
+    // really there, which is what keeps V103 quiet about the pair.
+    for (identifier, rel_type) in [
+        ("coolant-bundle", "split_into"),
+        ("purge-procedure", "derived_from"),
+    ] {
+        let read = engine
+            .read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("eng".to_string()),
+                    share_link: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let relation = read["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rel_type"] == rel_type)
+            .unwrap_or_else(|| panic!("{identifier} declares {rel_type}"));
+        assert_eq!(relation["resolved"], true, "{identifier} {rel_type}");
+    }
+}
+
+#[tokio::test]
+async fn split_refuses_a_stale_checksum_and_writes_nothing() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: Some("deadbeef".to_string()),
+        })
+        .await
+        .expect_err("a stale checksum is refused");
+    assert!(format!("{err}").contains("stale"), "{err}");
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap(),
+        BUNDLE,
+        "the source is byte-identical"
+    );
+    assert!(
+        !tmp.path().join("eng/purge-procedure.md").exists(),
+        "nothing was created"
+    );
+}
+
+#[tokio::test]
+async fn split_moves_a_section_by_heading_path() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Mix B Background".to_string(),
+            folder: Some("history".to_string()),
+            observations: Vec::new(),
+            sections: vec!["## Notes".to_string()],
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["moved_sections"], 1);
+    assert_eq!(receipt["new"]["path"], "history/mix-b-background.md");
+
+    let new = std::fs::read_to_string(tmp.path().join("eng/history/mix-b-background.md")).unwrap();
+    assert!(new.contains("## Notes"), "{new}");
+    assert!(new.contains("Mix B was chosen when the fleet still ran the old pumps."));
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(!source.contains("## Notes"), "{source}");
+    assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
+}
+
+#[tokio::test]
+async fn split_refuses_a_selection_that_would_leave_the_source_a_stub() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(
+        &engine,
+        "coolant-bundle",
+        &[
+            "glycol mix B",
+            "40 minute purge",
+            "12 bar",
+            "80 percent load",
+            "ship register",
+        ],
+    )
+    .await;
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Everything".to_string(),
+            folder: None,
+            observations: lines,
+            sections: vec!["## Notes".to_string()],
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("a split that empties the source is refused");
+    let message = format!("{err}");
+    assert!(message.contains("retire"), "the fix is named: {message}");
+    assert!(
+        !tmp.path().join("eng/everything.md").exists(),
+        "nothing was created"
+    );
+}
+
+#[tokio::test]
+async fn split_refuses_an_empty_selection() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Nothing".to_string(),
+            folder: None,
+            observations: Vec::new(),
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("a split with nothing selected is refused");
+    assert!(format!("{err}").contains("observations"), "{err}");
+}
+
+#[tokio::test]
+async fn split_works_on_a_virtual_domain_too() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scratch".to_string(),
+            title: "Scratch Bundle".to_string(),
+            content: "# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["ops".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "scratch-bundle".to_string(),
+                domain: Some("scratch".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let line = read["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["content"].as_str().unwrap().contains("wardroom"))
+        .unwrap()["line"]
+        .as_u64()
+        .unwrap() as usize;
+
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "scratch".to_string(),
+            identifier: "scratch-bundle".to_string(),
+            title: "Register Location".to_string(),
+            folder: None,
+            observations: vec![line],
+            sections: Vec::new(),
+            expected_checksum: Some(read["checksum"].as_str().unwrap().to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["moved_observations"], 1);
+
+    let new = engine
+        .engram_text("scratch", "register-location")
+        .await
+        .unwrap();
+    assert!(new.content.contains("The register lives in the wardroom"));
+    assert!(new.content.contains("- derived_from [[scratch-bundle]]"));
+    let source = engine
+        .engram_text("scratch", "scratch-bundle")
+        .await
+        .unwrap();
+    assert!(!source.content.contains("wardroom"), "{}", source.content);
+    assert!(
+        source
+            .content
+            .contains("- split_into [[register-location]]")
+    );
+}
+
+/// The rollback: the new engram lands, the source edit fails, and the new
+/// engram is taken back out so the archive is exactly as it was.
+///
+/// The failure is made deterministic without a race: every engram write goes to
+/// a sibling temp file and is renamed into place, so taking write permission
+/// off the domain's root directory - while leaving the `history/` subfolder the
+/// new engram is filed in writable - lets the whole plan, the new engram and
+/// its reindex through and stops exactly one thing, the write back to the
+/// source. Unix only, since that is where a directory mode refuses a write to
+/// the user who owns it.
+#[cfg(unix)]
+#[tokio::test]
+async fn split_takes_the_new_engram_back_out_when_the_source_edit_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+    let root = tmp.path().join("eng");
+    std::fs::create_dir_all(root.join("history")).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: Some("history".to_string()),
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("the source cannot be written");
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("coolant-bundle.md")).unwrap(),
+        BUNDLE,
+        "the source never changed: {err}"
+    );
+    assert!(
+        !root.join("history/purge-procedure.md").exists(),
+        "the new engram was taken back out"
+    );
+    assert!(
+        engine.engram_text("eng", "purge-procedure").await.is_err(),
+        "and its index rows went with it"
+    );
+}
+
+#[tokio::test]
+async fn split_counts_a_line_named_twice_once() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Pump Rating".to_string(),
+            folder: None,
+            observations: vec![lines[0], lines[0]],
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["moved_observations"], 1,
+        "the receipt counts what moved"
+    );
+}
+
+/// The invariant the rollback must not break: once the source's bytes have been
+/// replaced, the new engram stays, whatever fails next.
+///
+/// The source no longer holds the moved bullets at that point, so deleting the
+/// engram that does hold them is the one outcome the verb must never produce.
+/// The failure is armed through `Engine::fail_next_source_edit`, the engine's
+/// one test seam, because the window it stands in for - a store or IO fault
+/// after an atomic rename - is not reachable from a test any other way.
+#[tokio::test]
+async fn split_keeps_both_files_when_the_reindex_fails_after_the_source_was_written() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["40 minute purge", "12 bar"]).await;
+    engine.fail_next_source_edit();
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("the reindex failed after the write");
+
+    // The error names both files and says what is stale.
+    let message = format!("{err}");
+    assert!(message.contains("coolant-bundle.md"), "{message}");
+    assert!(message.contains("purge-procedure.md"), "{message}");
+    assert!(message.contains("sync"), "{message}");
+
+    // Both files are on disk, and between them they hold every bullet: the
+    // moved ones in the new engram, the rest in the source.
+    let new = std::fs::read_to_string(tmp.path().join("eng/purge-procedure.md"))
+        .expect("the new engram was NOT taken back out");
+    assert!(new.contains("- [fact] The loop needs a 40 minute purge before a mix swap"));
+    assert!(new.contains("- [fact] The purge pump is rated for 12 bar"));
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
+    assert!(
+        source.contains("- split_into [[purge-procedure]]"),
+        "{source}"
+    );
+    assert!(!source.contains("40 minute purge"), "{source}");
+
+    // And the index catches up on the next sync, with nothing lost.
+    engine.sync(None).await.unwrap();
+    let reread = engine.engram_text("eng", "coolant-bundle").await.unwrap();
+    assert_eq!(reread.content, source);
+    assert!(
+        engine.engram_text("eng", "purge-procedure").await.is_ok(),
+        "the new engram is indexed too"
+    );
+}
+
+/// The seam is one-shot, so an ordinary split right after an armed one behaves
+/// exactly as it always does. Without this the seam could latch and silently
+/// change every later write in a process.
+#[tokio::test]
+async fn the_reindex_seam_fires_once() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+    engine.fail_next_source_edit();
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Pump Rating".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("armed");
+    engine.sync(None).await.unwrap();
+
+    let lines = observation_lines(&engine, "coolant-bundle", &["80 percent load"]).await;
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Mix B Heat Margin".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect("the seam is spent");
+}
+
+/// The other half of the same invariant, on the other storage kind: a virtual
+/// source's edit is one store transaction, so a compare-and-swap conflict
+/// leaves the stored bytes exactly as they were and the new engram must be
+/// taken back out again.
+///
+/// The seam arms a token nothing can match, so the conflict is the store's own
+/// rather than a fabricated error: `upsert_engram_checked` refuses, the
+/// transaction rolls back, and what the caller sees is the `Conflict` a
+/// concurrent edit really produces.
+#[tokio::test]
+async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_orphan() {
+    let (_tmp, engine) = engine_fixture().await;
+    engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scratch".to_string(),
+            title: "Scratch Bundle".to_string(),
+            content: "# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["ops".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .unwrap();
+    let before = engine
+        .engram_text("scratch", "scratch-bundle")
+        .await
+        .unwrap();
+    let line = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "scratch-bundle".to_string(),
+                domain: Some("scratch".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["content"].as_str().unwrap().contains("wardroom"))
+        .unwrap()["line"]
+        .as_u64()
+        .unwrap() as usize;
+
+    engine.fail_next_source_edit();
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "scratch".to_string(),
+            identifier: "scratch-bundle".to_string(),
+            title: "Register Location".to_string(),
+            folder: None,
+            observations: vec![line],
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("the compare and swap refused");
+
+    // The conflict the store raised, not an internal fault, so the caller knows
+    // to re-read and retry rather than to call somebody.
+    let message = format!("{err}");
+    assert!(message.contains("stale edit"), "{message}");
+    assert!(!message.contains("neither was undone"), "{message}");
+
+    // The source is byte-identical and the new engram is gone: the rollback
+    // still fires on this side of the write.
+    let after = engine
+        .engram_text("scratch", "scratch-bundle")
+        .await
+        .unwrap();
+    assert_eq!(after.content, before.content);
+    assert!(
+        engine
+            .engram_text("scratch", "register-location")
+            .await
+            .is_err(),
+        "the new engram was taken back out"
+    );
+}
+
+/// Every write verb takes the acting scope, and taking it changes nothing.
+///
+/// The scope is threaded so a later change has one place to route a write to
+/// an actor's draft overlay from; no verb consults it yet, and this is what
+/// pins that. The equality is not vacuous: every write receipt is a pure
+/// function of what the caller passed in - domain, permalink, path, title,
+/// type, status, action, operation, the moved counts - and the two checksums
+/// hash the caller's own document rather than anything the engine stamps. So
+/// two identical archives driven through the same sequence of verbs, one as
+/// the machine owner and one as a signed-in account, owe the same receipts
+/// word for word.
+#[tokio::test]
+async fn write_verbs_accept_a_scope_and_behave_as_before() {
+    let owner = every_write_verb(&Scope::Unrestricted).await;
+    let user = every_write_verb(&Scope::User {
+        account: "mira".to_string(),
+        admin: false,
+    })
+    .await;
+    assert_eq!(
+        owner, user,
+        "a signed-in account's writes answer what the machine owner's answer"
+    );
+}
+
+/// One fresh archive driven through every write verb under `scope`, answering
+/// the receipts in the order they were earned.
+async fn every_write_verb(scope: &Scope) -> Vec<(&'static str, serde_json::Value)> {
+    const ACTOR: &str = "tester/1.0";
+    let (_tmp, engine) = engine_fixture().await;
+    let mut receipts: Vec<(&'static str, serde_json::Value)> = Vec::new();
+
+    receipts.push((
+        "write",
+        engine
+            .write_engram_as(
+                &crystalline_service::params::WriteParams {
+                    domain: "eng".to_string(),
+                    title: "Gamma".to_string(),
+                    content: "# Gamma\n\nWhat the garden did this week.\n\n- [fact] The beans went in on Tuesday\n- [fact] The compost bin was turned\n- [decision] The tomatoes stay under glass\n".to_string(),
+                    folder: None,
+                    engram_type: None,
+                    tags: vec!["eng".to_string()],
+                    status: None,
+                    metadata: None,
+                    overwrite: false,
+                    share_link: None,
+                    model: None,
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    let (checksum, content) = checksum_of(&engine, "eng", "alpha").await;
+    receipts.push((
+        "save",
+        engine
+            .save_engram(
+                &SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    content: content.replace("A rule about alpha.", "A sharper rule."),
+                    expected_checksum: checksum,
+                },
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    let append: crystalline_service::params::EditParams =
+        serde_json::from_value(serde_json::json!({
+            "identifier": "alpha",
+            "domain": "eng",
+            "operation": "append",
+            "content": "A later thought.",
+        }))
+        .unwrap();
+    receipts.push((
+        "edit",
+        engine
+            .edit_engram_as(&append, Some(ACTOR), scope)
+            .await
+            .unwrap(),
+    ));
+
+    let lines = observation_lines(&engine, "gamma", &["beans went in"]).await;
+    let (gamma, _) = checksum_of(&engine, "eng", "gamma").await;
+    receipts.push((
+        "split",
+        engine
+            .split_engram_as(
+                &SplitParams {
+                    domain: "eng".to_string(),
+                    identifier: "gamma".to_string(),
+                    title: "Sowing".to_string(),
+                    folder: None,
+                    observations: lines,
+                    sections: Vec::new(),
+                    expected_checksum: Some(gamma),
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    receipts.push((
+        "retire",
+        engine
+            .retire_engram_as(
+                &RetireParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    status: "deprecated".to_string(),
+                    successor: None,
+                    valid_to: Some("2026-01-31".to_string()),
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    receipts.push((
+        "delete",
+        engine
+            .delete_engram_as(
+                &DeleteParams {
+                    identifier: "alpha".to_string(),
+                    domain: "eng".to_string(),
+                    expected_checksum: None,
+                },
+                Some(ACTOR),
+                scope,
+            )
+            .await
+            .unwrap(),
+    ));
+
+    receipts.push((
+        "restore",
+        engine
+            .restore_engram("eng", "alpha.md", ALPHA, scope)
+            .await
+            .unwrap(),
+    ));
+
+    receipts
 }

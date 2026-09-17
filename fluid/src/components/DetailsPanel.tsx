@@ -56,7 +56,15 @@ export function DetailsPanel({
   body,
   canDelete = false,
 }: DetailsPanelProps) {
-  const { type, status, tags, salience, verified, generatedBy } = frontmatter;
+  const {
+    type,
+    status,
+    tags,
+    salience,
+    verified,
+    generatedBy,
+    generatedModel,
+  } = frontmatter;
   const validity = validityOf(frontmatter);
   const stamp = latestVerification(verified);
 
@@ -104,7 +112,7 @@ export function DetailsPanel({
           )}
           {generatedBy !== null && (
             <Row label="Captured by">
-              <span>{formatActor(generatedBy)}</span>
+              <span>{withModel(formatActor(generatedBy), generatedModel)}</span>
             </Row>
           )}
           {stamp !== null && (
@@ -155,13 +163,25 @@ function Row({
 /**
  * Hand the engram's address to the clipboard.
  *
+ * Exported because this panel is not the only place it is drawn: at full width
+ * the page has no details column and the control moves into the article's own
+ * header, where "Share link" beside it copies the browser's URL rather than
+ * the `crystalline://` name. One component rather than two, so the name a
+ * reader hears cannot drift between the two places it is heard.
+ *
+ * That name says the scheme. In this panel the address is written out in the
+ * row above the button, so "Copy address" would have an antecedent; in the
+ * header it stands beside "Share link" with neither string on screen, and two
+ * generic verbs for two different strings is a guess a reader should not have
+ * to make. One name for both places, and it is the unambiguous one.
+ *
  * The outcome is announced in a live region beside the button rather than
  * written into the button's own label. A control that renames itself is a
  * control a reader navigating by name loses track of, and a label that changes
  * silently is no announcement at all: the region is in the document from the
  * start and empty, so the text arriving in it is what gets read out.
  */
-function CopyAddress({ address }: { address: string }) {
+export function CopyAddress({ address }: { address: string }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
 
   useEffect(() => {
@@ -179,7 +199,7 @@ function CopyAddress({ address }: { address: string }) {
   return (
     <span className="inline-flex items-center gap-1">
       <IconButton
-        label="Copy address"
+        label="Copy crystalline:// address"
         icon={Copy}
         onClick={() => {
           void (async () => {
@@ -247,5 +267,17 @@ function latestVerification(entries: VerifiedEntry[]): string | null {
   if (latest.by === null) {
     return day;
   }
-  return day === null ? latest.by : `${latest.by} on ${day}`;
+  const who = withModel(formatActor(latest.by), latest.model);
+  return day === null ? who : `${who} on ${day}`;
+}
+
+/**
+ * A writer with the model it reported, or the writer alone.
+ *
+ * Who wrote a page and with which model is one fact a reader weighs together,
+ * so it reads as one phrase rather than as a second row nobody connects to the
+ * first. A block that names no model says nothing about one.
+ */
+function withModel(who: string, model: string | null): string {
+  return model === null ? who : `${who} with ${model}`;
 }

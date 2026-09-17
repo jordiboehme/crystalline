@@ -12,7 +12,8 @@
 //!
 //! Files are the source of truth and the index is fully rebuildable, so a
 //! corrupt or stale index is never a data-loss risk: [`Store::wipe`] followed by
-//! a resync (the `reindex --full` path) recreates it from disk.
+//! a resync (the `reindex --wipe` path) recreates it from disk, and the ordinary
+//! `reindex --full` re-reads every file without destroying anything first.
 
 mod alias;
 pub mod embed;
@@ -39,18 +40,36 @@ pub use store::{
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, MetadataFilter,
-    NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RecentFilter, SearchHit, SearchMode,
-    SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, is_current_status,
-    is_retired_status, parse_metadata_filters, retired_factor, salience_prior,
+    InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector,
+    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, TagAlias,
+    TagCount, Vocabulary, is_current_status, is_retired_status, merge_vocabularies,
+    parse_metadata_filters, retired_factor, salience_prior,
 };
+/// The shared statement builders, reachable from `tests/plans.rs` and from
+/// nothing else.
+///
+/// `mod store` is private, and the hot-statement registry lives in an
+/// integration test, which is a separate crate: without this block the registry
+/// would have to hold a second copy of each statement, and a registry holding a
+/// copy is a registry that can be right about SQL nobody runs. `#[doc(hidden)]`
+/// rather than a `test-internals` feature, so the registry compiles against the
+/// same crate the binary ships rather than against a variant of it.
+///
+/// `reference_match` is not here and needs nothing: it is reached through
+/// `resolve_pending_sql`, which is the statement the registry names, and its
+/// own argument type is crate-private.
+#[doc(hidden)]
+pub use store::{link_frontier_sql, relation_frontier_sql, resolve_pending_sql};
 pub use sweep::{
-    AckCounts, AckEntry, Class, EngramFacts, Family, Finding, RULES, RuleInfo, SHARE_STALE_DAYS,
-    ShareFacts, SweepInput, SweepOptions, SweepReport, UnresolvedRef, detect, rank, rule_info,
+    AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,
+    RULES, RuleInfo, SHARE_STALE_DAYS, ShareFacts, SweepInput, SweepOptions, SweepReport,
+    UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
 };
 pub use sync::{
-    DomainScan, SyncReport, apply_scan, apply_scan_with_slab, refresh_tag_aliases, scan_domain,
-    scan_paths, sync_domain, sync_domain_with,
+    DomainScan, NoReindexHooks, ReindexHooks, SyncReport, apply_scan, apply_scan_with_slab,
+    refresh_tag_aliases, reindex_domains, resolve_forward_refs, scan_domain, scan_paths,
+    sync_domain, sync_domain_with,
 };
 pub use turso::TursoStore;
 pub use vocab::{TagCluster, tag_clusters, tag_clusters_with_aliases};

@@ -60,8 +60,12 @@ async fn instance(opts: &Options) -> (Arc<Engine>, Arc<AuthStore>, tempfile::Tem
     let cfg = GlobalConfig {
         auth: Some(AuthConfig {
             trusted_header: None,
+            proxy_headers: None,
             anonymous: Some(opts.anonymous),
+            mcp: None,
+            oauth: None,
             max_users: None,
+            oidc: None,
         }),
         service: Some(ServiceConfig {
             response_format: Some(ResponseFormat::Json),
@@ -87,7 +91,7 @@ async fn instance(opts: &Options) -> (Arc<Engine>, Arc<AuthStore>, tempfile::Tem
 /// Serve the REST router over an account-less instance.
 async fn serve(opts: Options) -> Fixture {
     let (engine, auth, tmp) = instance(&opts).await;
-    let state = RestState::new(engine, auth.clone())
+    let state = RestState::new(engine, auth.clone(), &[])
         .unwrap()
         .with_setup_token(opts.setup_token);
     let app = axum::Router::new().nest("/api/v1", router(state));

@@ -599,7 +599,7 @@ pub(super) async fn read_back(state: &RestState, name: &str) -> Result<User, Api
 }
 
 /// The form the store keys on: trimmed and lowercased, mirroring the store's
-/// own `normalize_name`.
+/// own `normalize_account_name`.
 ///
 /// Mirrored rather than shared because the store's folding is private to it and
 /// is the authority; nothing here writes with this value, it only compares
@@ -722,7 +722,7 @@ mod tests {
         // The phrase collision the last-admin branch order guards against
         // ("no such user: 'the last admin'" containing "the last admin") is no
         // longer reachable through a real name: spaces are refused by
-        // normalize_name before the store ever gets to say "no such user".
+        // normalize_account_name before the store ever gets to say "no such user".
         // The branch order stays anyway, as documentation of the hazard it
         // once guarded against.
         let named = store

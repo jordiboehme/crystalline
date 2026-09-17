@@ -58,6 +58,7 @@ fn node_of(f: &EngramFacts) -> GraphNode {
         engram_type: f.engram_type.clone(),
         salience: f.salience,
         status: f.status.clone(),
+        actor: String::new(),
     }
 }
 
@@ -334,6 +335,7 @@ fn v004_distinguishes_a_missing_relation_from_an_unresolved_one() {
         kind: EdgeKind::Relation,
         target_domain: None,
         target: "Newer Checklist".to_string(),
+        raw: "Newer Checklist".to_string(),
         line: Some(7),
     }];
 
@@ -579,6 +581,129 @@ fn v009_stays_quiet_when_no_changed_file_carries_a_date() {
     assert!(!fired(&report).contains(&"V009"), "{:?}", fired(&report));
 }
 
+/// A retired engram carrying `observations`, each written as the body bullet
+/// it was parsed from so the body and the facts agree.
+fn retired_with(id: i64, permalink: &str, observations: &[(usize, &str)]) -> EngramFacts {
+    let mut f = fact(id, permalink);
+    f.status = "superseded".to_string();
+    f.body = observations
+        .iter()
+        .map(|(_, text)| format!("- [fact] {text}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    f.observations = observations
+        .iter()
+        .map(|(line, text)| FactObservation {
+            line: *line,
+            text: (*text).to_string(),
+        })
+        .collect();
+    f
+}
+
+#[test]
+fn v010_names_observations_that_survive_in_no_live_engram() {
+    let retired = retired_with(
+        1,
+        "mix-b-decision",
+        &[
+            (7, "Run the coolant loop on glycol mix B"),
+            (8, "The loop needs a 40 minute purge before a mix swap"),
+        ],
+    );
+    let mut carried = fact(2, "purge-procedure");
+    carried.body =
+        "## Observations\n\n- [fact] The loop needs a 40 minute purge before a mix swap\n"
+            .to_string();
+
+    let report = detect(&input(vec![retired, carried]));
+    let finding = only(&report, "V010");
+    assert_eq!(finding.permalink, "mix-b-decision");
+    assert_eq!(finding.family, Family::Temporal);
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.line, Some(7));
+    assert!(
+        finding.evidence.contains("glycol mix B"),
+        "the missing bullet is quoted: {}",
+        finding.evidence
+    );
+    assert!(
+        !finding.evidence.contains("40 minute purge"),
+        "the carried bullet is not a finding: {}",
+        finding.evidence
+    );
+    assert_eq!(finding.fix, "split_engram observations=7");
+}
+
+#[test]
+fn v010_is_quiet_when_every_observation_was_carried_forward() {
+    // Case, spacing and the tags trailing the live bullet all differ; the
+    // normalized text is what has to survive, not the bytes.
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let mut carried = fact(2, "mix-c-decision");
+    carried.body = "- [decision]   RUN the loop   on glycol mix b #coolant #cooling\n".to_string();
+
+    let report = detect(&input(vec![retired, carried]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_is_quiet_when_a_live_bullet_carries_the_same_text() {
+    // The other haystack: the live engram's own observations, matched as whole
+    // normalized texts rather than scanned for inside its body. This is the
+    // shape `split_engram` itself writes, so it is the one that has to be free.
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let mut carried = retired_with(2, "mix-c-decision", &[(9, "Run the loop on glycol MIX b")]);
+    carried.status = "stable".to_string();
+    // Nothing to find in the body text, so a hit can only come from the set.
+    carried.body = short_body(3);
+
+    let report = detect(&input(vec![retired, carried]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_never_builds_a_corpus_for_a_domain_with_nothing_retired() {
+    // Behaviorally the same silence as any other quiet case; pinned separately
+    // because the early return it stands on is what keeps the rule free in the
+    // common domain.
+    let mut live = fact(1, "mix-c-decision");
+    live.observations = vec![FactObservation {
+        line: 7,
+        text: "Run the loop on glycol mix C".to_string(),
+    }];
+    let report = detect(&input(vec![live, fact(2, "purge-procedure")]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_is_quiet_once_the_split_landed() {
+    // The split already happened, so what is left in the retired engram is
+    // what expired, on purpose. The archive records that intent as the pair
+    // `split_engram` writes, and the rule reads it.
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let mut sweep = input(vec![retired, fact(2, "purge-procedure")]);
+    sweep.graph.edges = vec![rel(1, 2, "split_into"), rel(2, 1, "derived_from")];
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_never_speaks_about_a_live_engram() {
+    let mut live = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    live.status = "stable".to_string();
+    let report = detect(&input(vec![live]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_scopes_an_acknowledgment_to_the_missing_bullets() {
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let report = detect(&input(vec![retired]));
+    assert_eq!(only(&report, "V010").scope, "run the loop on glycol mix b");
+}
+
 // ---------------------------------------------------------------------------
 // V1xx - structural integrity
 // ---------------------------------------------------------------------------
@@ -607,7 +732,9 @@ fn v101_flags_a_live_reference_to_retired_knowledge() {
             .evidence
             .contains("replaced by engineering/fresh-guide")
     );
-    assert_eq!(finding.fix, "repoint at [[fresh guide]]");
+    // By permalink: the suggestion is a link an agent will paste, and a
+    // title carrying a colon would paste a link that does not resolve.
+    assert_eq!(finding.fix, "repoint at [[fresh-guide]]");
 }
 
 #[test]
@@ -637,6 +764,7 @@ fn v102_is_mechanical_only_with_a_near_exact_candidate() {
             kind: EdgeKind::Link,
             target_domain: None,
             target: "Deployment Pipline Runbook".to_string(),
+            raw: "Deployment Pipline Runbook".to_string(),
             line: Some(12),
         },
         UnresolvedRef {
@@ -645,6 +773,7 @@ fn v102_is_mechanical_only_with_a_near_exact_candidate() {
             kind: EdgeKind::Link,
             target_domain: None,
             target: "Nothing Like That At All".to_string(),
+            raw: "Nothing Like That At All".to_string(),
             line: Some(14),
         },
     ];
@@ -685,6 +814,7 @@ fn v102_names_an_unregistered_target_domain() {
         kind: EdgeKind::Link,
         target_domain: Some("archive".to_string()),
         target: "Old Notes".to_string(),
+        raw: "archive:Old Notes".to_string(),
         line: None,
     }];
 
@@ -698,6 +828,132 @@ fn v102_names_an_unregistered_target_domain() {
     );
 }
 
+/// A cross-domain reference whose prefix names a domain that IS registered: the
+/// repair has to keep the prefix on both sides. A left side that is the bracket
+/// text minus the prefix names a string that does not occur in the file, and a
+/// right side without it repoints the link at the writer's own domain - the
+/// same silent domain-drop the unregistered arm refuses.
+#[test]
+fn v102_keeps_a_registered_prefix_on_both_sides_of_the_repair() {
+    let mut sweep = input(vec![fact(1, "runbook")]);
+    // A second registered domain, holding the engram the typo meant.
+    sweep.known_domains.push("eng".to_string());
+    sweep.graph.nodes.push(GraphNode {
+        id: EngramId(9),
+        domain: "eng".to_string(),
+        permalink: "incident-response-checklist".to_string(),
+        title: "Incident Response Checklist".to_string(),
+        engram_type: "engram".to_string(),
+        salience: None,
+        status: "stable".to_string(),
+        actor: String::new(),
+    });
+
+    let mut reference = unresolved(1, "Incident Response Checklst");
+    reference.target_domain = Some("eng".to_string());
+    reference.raw = "eng:Incident Response Checklst".to_string();
+    sweep.unresolved = vec![reference];
+
+    let finding = only(&detect(&sweep), "V102");
+    assert_eq!(
+        finding.fix, "[[eng:Incident Response Checklst]] -> [[eng:Incident Response Checklist]]",
+        "the left side is what the file says and the right side still points at eng"
+    );
+    assert_eq!(
+        finding.class,
+        Class::Mechanical,
+        "the candidate is in the very domain the prefix names, so completing the \
+         spelling changes nothing the archive claims"
+    );
+}
+
+/// The same arm with no prefix at all: the bracket text and the raw are one
+/// string, so the repair reads exactly as it did before.
+#[test]
+fn v102_repairs_a_plain_typo_without_inventing_a_prefix() {
+    let mut target = fact(1, "release-checklist");
+    target.title = "Release Checklist".to_string();
+    let mut sweep = input(vec![target, fact(2, "runbook")]);
+    sweep.unresolved = vec![unresolved(2, "Release Checklst")];
+
+    let finding = only(&detect(&sweep), "V102");
+    assert_eq!(finding.fix, "[[Release Checklst]] -> [[Release Checklist]]");
+    assert_eq!(finding.class, Class::Mechanical);
+}
+
+/// A cross-domain reference into a domain the author means to register is not a
+/// spelling mistake, and the fuzzy score cannot tell the two apart: a short
+/// prefix costs almost nothing once the title is long, so
+/// `[[ops:Incident Response Checklist]]` scores 0.93 against a local
+/// `Incident Response Checklist`. The candidate is named either way, and the
+/// class stays Judgment, because dropping a domain somebody named changes what
+/// the archive claims and a person has to say yes to that.
+#[test]
+fn v102_keeps_an_unregistered_prefix_a_judgment_even_with_a_candidate() {
+    let mut target = fact(1, "incident-response-checklist");
+    target.title = "Incident Response Checklist".to_string();
+    let writer = fact(2, "writer");
+
+    let mut sweep = input(vec![target, writer]);
+    let mut reference = unresolved(2, "Incident Response Checklist");
+    reference.target_domain = Some("ops".to_string());
+    reference.raw = "ops:Incident Response Checklist".to_string();
+    sweep.unresolved = vec![reference];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V102");
+    assert_eq!(
+        finding.class,
+        Class::Judgment,
+        "an agent working the queue must not silently repoint a cross-domain \
+         reference at a local engram: {}",
+        finding.fix
+    );
+    assert!(
+        finding.fix.contains("Incident Response Checklist"),
+        "the candidate is still named, so the person deciding has it in hand: {}",
+        finding.fix
+    );
+}
+
+/// V102's repair reads a link the way the resolver does. An unresolved
+/// `[[Murmur: the dispatch pipeline]]` is scored against the whole bracket
+/// text, not against `the dispatch pipeline`: a prefix nobody registered is not
+/// a prefix, so the resolver has already read the whole of it as a title at
+/// home and the repair owes the same reading.
+#[test]
+fn v102_suggests_what_the_resolver_would_have_found() {
+    let mut target = fact(1, "murmur-the-dispatch-pipeline");
+    target.title = "Murmur: the dispatch pipelines".to_string();
+    let writer = fact(2, "writer");
+
+    let mut sweep = input(vec![target, writer]);
+    let mut reference = unresolved(2, "the dispatch pipeline");
+    reference.target_domain = Some("Murmur".to_string());
+    reference.raw = "Murmur: the dispatch pipeline".to_string();
+    sweep.unresolved = vec![reference];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V102");
+    // Judgment, not Mechanical: an unregistered prefix is as often a domain
+    // nobody connected yet as it is a title that happens to hold a colon, and
+    // the score cannot tell them apart. See
+    // `v102_keeps_an_unregistered_prefix_a_judgment_even_with_a_candidate`.
+    assert_eq!(finding.class, Class::Judgment);
+    assert!(
+        finding.fix.contains("Murmur: the dispatch pipelines"),
+        "the whole bracket text is what was scored: {}",
+        finding.fix
+    );
+    assert!(
+        finding
+            .evidence
+            .contains("target domain `Murmur` is not a registered domain"),
+        "and the evidence still says why the prefix was dropped: {}",
+        finding.evidence
+    );
+}
+
 #[test]
 fn v103_flags_a_one_sided_reciprocal() {
     let mut sweep = input(vec![fact(1, "release-summary"), fact(2, "raw-transcript")]);
@@ -708,7 +964,22 @@ fn v103_flags_a_one_sided_reciprocal() {
     assert_eq!(finding.permalink, "raw-transcript");
     assert_eq!(finding.class, Class::Mechanical);
     assert_eq!(finding.priority, 35);
-    assert_eq!(finding.fix, "append `- summarized_by [[release summary]]`");
+    assert_eq!(finding.fix, "append `- summarized_by [[release-summary]]`");
+}
+
+#[test]
+fn v103_flags_a_one_sided_split_pair() {
+    // The new engram declares `derived_from`, so the source it was split out
+    // of owes it a `split_into`. The finding attaches to the source, which is
+    // the engram missing the line.
+    let mut sweep = input(vec![fact(1, "purge-procedure"), fact(2, "mix-b-decision")]);
+    sweep.graph.edges = vec![rel(1, 2, "derived_from")];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V103");
+    assert_eq!(finding.permalink, "mix-b-decision");
+    assert_eq!(finding.class, Class::Mechanical);
+    assert_eq!(finding.fix, "append `- split_into [[purge-procedure]]`");
 }
 
 #[test]
@@ -801,6 +1072,97 @@ fn v105_flags_an_oversized_body() {
         !fired(&detect(&input(vec![unbounded]))).contains(&"V105"),
         "a zero budget disables the rule"
     );
+}
+
+/// A `type: source` engram is held to four times the domain's budget.
+/// Verbatim capture is what a source engram is FOR, so the rule that tells
+/// a writer to move the full text into one must not then flag the engram it
+/// just asked for. The factor is shared with verify's Q002 so the two keep
+/// flagging the same size.
+#[test]
+fn a_source_engram_gets_four_times_the_budget() {
+    let mut source = fact(1, "sources/transcript");
+    source.engram_type = "source".to_string();
+    source.token_budget = 2500;
+    source.tokens = 9_000;
+    let report = detect(&input(vec![source.clone()]));
+    assert!(
+        !report.findings.iter().any(|f| f.rule == "V105"),
+        "9000 tokens is inside a source engram's 10000: {:?}",
+        report.findings
+    );
+
+    source.tokens = 10_001;
+    let report = detect(&input(vec![source]));
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule == "V105")
+        .expect("over even the source budget");
+    assert!(
+        finding.evidence.contains("10000"),
+        "the evidence names the budget actually applied: {}",
+        finding.evidence
+    );
+}
+
+/// A budget of zero disables the rule for an engram whatever its type, so
+/// the factor never turns an opt-out into a very large budget.
+#[test]
+fn a_zero_budget_still_disables_v105_for_a_source_engram() {
+    let mut source = fact(1, "sources/transcript");
+    source.engram_type = "source".to_string();
+    source.token_budget = 0;
+    source.tokens = 1_000_000;
+    assert!(
+        !detect(&input(vec![source]))
+            .findings
+            .iter()
+            .any(|f| f.rule == "V105")
+    );
+}
+
+/// The three wordings, one per case. A non-source over budget keeps the
+/// split-by-granularity remedy; a source over its own larger budget cannot
+/// be compressed and splits into sequential parts; an engram whose
+/// observations alone blow the budget cannot be helped by either, because
+/// no granularity split moves a bullet somewhere smaller.
+#[test]
+fn v105_prescribes_a_different_split_per_case() {
+    let mut plain = fact(1, "big");
+    plain.token_budget = 2500;
+    plain.tokens = 4_000;
+    let plain_fix = only(&detect(&input(vec![plain])), "V105").fix;
+    assert!(plain_fix.contains("sources/"), "{plain_fix}");
+    assert!(plain_fix.contains("distilled summary"), "{plain_fix}");
+
+    let mut source = fact(2, "sources/transcript");
+    source.engram_type = "source".to_string();
+    source.token_budget = 2500;
+    source.tokens = 12_000;
+    let source_fix = only(&detect(&input(vec![source])), "V105").fix;
+    assert!(
+        source_fix.contains("Verbatim material does not compress"),
+        "{source_fix}"
+    );
+    assert!(
+        source_fix.contains("sequential part engrams"),
+        "{source_fix}"
+    );
+
+    let mut bullets = fact(3, "observed");
+    bullets.token_budget = 2500;
+    bullets.tokens = 4_000;
+    bullets.observations = vec![FactObservation {
+        line: 3,
+        text: "x".repeat(10_004),
+    }];
+    let bullets_fix = only(&detect(&input(vec![bullets])), "V105").fix;
+    assert!(
+        bullets_fix.contains("The observations alone exceed the budget"),
+        "{bullets_fix}"
+    );
+    assert!(bullets_fix.contains("split_engram"), "{bullets_fix}");
 }
 
 #[test]
@@ -948,6 +1310,381 @@ fn v203_respects_declared_tag_aliases() {
 }
 
 // ---------------------------------------------------------------------------
+// V3xx - meaning
+// ---------------------------------------------------------------------------
+
+/// A unit-length vector, the shape an embedding provider hands back.
+fn unit(v: &[f32]) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    v.iter().map(|x| x / n).collect()
+}
+
+#[test]
+fn v301_flags_a_twin_pair_on_lead_vectors_and_scopes_the_pair() {
+    let mut a = fact(1, "retry-queue");
+    a.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut b = fact(2, "retry-backoff");
+    b.lead_vector = Some(unit(&[0.98, 0.2, 0.0]));
+    let mut c = fact(3, "docking-clamps");
+    c.lead_vector = Some(unit(&[0.0, 1.0, 0.0]));
+
+    let report = detect(&input(vec![a, b, c]));
+    let finding = only(&report, "V301");
+    assert_eq!(finding.family, Family::Redundancy);
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.priority, 75);
+    assert_eq!(
+        finding.permalink, "retry-backoff",
+        "equal salience: the smaller address leads"
+    );
+    assert_eq!(
+        finding.scope,
+        "engineering/retry-backoff, engineering/retry-queue"
+    );
+    assert!(finding.evidence.contains("0.98"), "{}", finding.evidence);
+    assert!(finding.evidence.contains("engineering/retry-queue"));
+    assert!(report.truncations.is_empty());
+}
+
+/// Two rows standing at one path are never each other's twin, whoever wrote
+/// them.
+///
+/// A draft and the engram it is a draft of say close to the same thing by
+/// construction - that is what makes it a draft of that engram rather than a
+/// new one - so a twin finding on the pair would be the sweep telling an author
+/// to merge their own work into the version they are rewriting. The same holds
+/// for two actors' drafts of one path, which are two proposals for one engram
+/// and not two engrams. `path` is the key rather than `actor`, because it is
+/// the path that says the two rows are about the same engram; the actor is on
+/// the facts so a reader of a finding can see whose row it fired on.
+#[test]
+fn twins_at_one_path_across_actors_are_skipped() {
+    let mut base = fact(1, "retry-queue");
+    base.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut drafted = fact(2, "retry-queue-revised");
+    drafted.path = base.path.clone();
+    drafted.actor = "alice".to_string();
+    drafted.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut other = fact(3, "retry-queue-notes");
+    other.path = base.path.clone();
+    other.actor = "bob".to_string();
+    other.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+
+    let report = detect(&input(vec![base, drafted, other]));
+    assert!(
+        !fired(&report).contains(&"V301"),
+        "three rows at one path are one engram's rewrites, not twins: {:?}",
+        fired(&report)
+    );
+
+    // And the rule still speaks about two rows that really are two engrams,
+    // one of them a draft: the skip is about the path, not about drafts.
+    let mut base = fact(1, "retry-queue");
+    base.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut elsewhere = fact(2, "retry-backoff");
+    elsewhere.actor = "alice".to_string();
+    elsewhere.lead_vector = Some(unit(&[0.98, 0.2, 0.0]));
+    let report = detect(&input(vec![base, elsewhere]));
+    only(&report, "V301");
+}
+
+#[test]
+fn v301_stays_quiet_below_the_threshold_without_vectors_and_across_widths() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[0.8, 0.6]));
+    let c = fact(3, "three");
+    let mut d = fact(4, "four");
+    d.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let report = detect(&input(vec![a, b, c, d]));
+    assert!(!fired(&report).contains(&"V301"), "{:?}", fired(&report));
+    assert!(report.truncations.is_empty(), "{:?}", report.truncations);
+
+    // No provider installed at all: every lead vector absent. The rule is
+    // silent, which means no finding AND no truncation line - a skip would
+    // tell a reader something was cut when nothing was ever there.
+    let quiet = detect(&input(vec![fact(5, "five"), fact(6, "six")]));
+    assert!(!fired(&quiet).contains(&"V301"), "{:?}", fired(&quiet));
+    assert!(quiet.truncations.is_empty(), "{:?}", quiet.truncations);
+}
+
+#[test]
+fn v301_skips_retired_and_speculative_engrams() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    b.status = "draft".to_string();
+    let mut c = fact(3, "three");
+    c.lead_vector = Some(unit(&[1.0, 0.0]));
+    c.status = "superseded".to_string();
+    let report = detect(&input(vec![a, b, c]));
+    assert!(!fired(&report).contains(&"V301"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v301_counts_implemented_as_current() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    a.status = "implemented".to_string();
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    let report = detect(&input(vec![a, b]));
+    only(&report, "V301");
+}
+
+#[test]
+fn v301_is_suppressed_inside_a_v201_cluster() {
+    let mut a = fact(1, "release-process");
+    a.body = long_body("release");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "release-copy");
+    b.body = long_body("release").replace("pages whoever", "wakes whoever");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut c = fact(3, "release-paraphrase");
+    c.lead_vector = Some(unit(&[1.0, 0.0]));
+    let report = detect(&input(vec![a, b, c]));
+    assert!(fired(&report).contains(&"V201"));
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(
+        twins.len(),
+        2,
+        "the paraphrase twins each cluster member; the cluster pair itself is V201's: {:?}",
+        fired(&report)
+    );
+    assert!(
+        twins
+            .iter()
+            .all(|f| f.scope.contains("engineering/release-paraphrase"))
+    );
+}
+
+#[test]
+fn v301_caps_findings_at_ten_keeping_the_highest_cosines() {
+    let mut facts = Vec::new();
+    for i in 0..12 {
+        let mut f = fact(i as i64 + 1, &format!("twin-{i:02}"));
+        f.lead_vector = Some(unit(&[1.0, 0.002 * i as f32]));
+        facts.push(f);
+    }
+    let report = detect(&input(facts));
+    assert_eq!(
+        report.findings.iter().filter(|f| f.rule == "V301").count(),
+        10
+    );
+    assert!(
+        report
+            .truncations
+            .iter()
+            .any(|t| t == "V301 findings capped at 10"),
+        "{:?}",
+        report.truncations
+    );
+
+    // Selection is by cosine: with a cap of one, the closest pair wins.
+    let mut a = fact(1, "a");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "b");
+    b.lead_vector = Some(unit(&[1.0, 0.01]));
+    let mut c = fact(3, "c");
+    c.lead_vector = Some(unit(&[1.0, 0.3]));
+    let mut input = input(vec![a, b, c]);
+    input.options.max_twin_findings = 1;
+    let report = detect(&input);
+    let finding = only(&report, "V301");
+    assert_eq!(finding.scope, "engineering/a, engineering/b");
+}
+
+#[test]
+fn v301_reports_the_vector_cap_and_skips_the_rule() {
+    let mut facts = Vec::new();
+    for i in 0..4 {
+        let mut f = fact(i as i64 + 1, &format!("twin-{i}"));
+        f.lead_vector = Some(unit(&[1.0, 0.0]));
+        facts.push(f);
+    }
+    let mut input = input(facts);
+    input.options.max_twin_vectors = 3;
+    let report = detect(&input);
+    assert!(!fired(&report).contains(&"V301"));
+    assert!(
+        report
+            .truncations
+            .iter()
+            .any(|t| t == "V301 skipped: 4 lead vectors over the 3 cap"),
+        "{:?}",
+        report.truncations
+    );
+}
+
+#[test]
+fn v301_acknowledgment_is_scoped_to_the_pair() {
+    let mut hub = fact(1, "hub");
+    hub.lead_vector = Some(unit(&[1.0, 0.0]));
+    hub.salience = Some(9.0);
+    hub.acks.push(AckEntry {
+        rule: "V301".to_string(),
+        scope: Some("engineering/hub, engineering/twin-one".to_string()),
+        note: Some("distinct, linked".to_string()),
+    });
+    let mut one = fact(2, "twin-one");
+    one.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut two = fact(3, "twin-two");
+    two.lead_vector = Some(unit(&[1.0, 0.0]));
+
+    let report = detect(&input(vec![hub, one, two]));
+    assert_eq!(report.acknowledged.redundancy, 1);
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(twins.len(), 2, "{:?}", fired(&report));
+    let on_hub = twins
+        .iter()
+        .find(|f| f.permalink == "hub")
+        .expect("hub still leads its other pair");
+    assert_eq!(on_hub.scope, "engineering/hub, engineering/twin-two");
+    assert!(!on_hub.acknowledged);
+    // And it is a plain finding, not a stale one: the entry on the hub was
+    // given for the other pair, so its note says nothing about this one.
+    assert!(!on_hub.ack_stale);
+    assert_eq!(on_hub.ack_note, None);
+    assert_eq!(on_hub.ack_scope, None);
+
+    // A second acknowledgment, for this pair, stands beside the first and
+    // silences it alone.
+    let mut hub = fact(1, "hub");
+    hub.lead_vector = Some(unit(&[1.0, 0.0]));
+    hub.salience = Some(9.0);
+    hub.acks.push(AckEntry {
+        rule: "V301".to_string(),
+        scope: Some("engineering/hub, engineering/twin-one".to_string()),
+        note: Some("distinct, linked".to_string()),
+    });
+    hub.acks.push(AckEntry {
+        rule: "V301".to_string(),
+        scope: Some("engineering/hub, engineering/twin-two".to_string()),
+        note: Some("also distinct".to_string()),
+    });
+    let mut one = fact(2, "twin-one");
+    one.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut two = fact(3, "twin-two");
+    two.lead_vector = Some(unit(&[1.0, 0.0]));
+
+    let report = detect(&input(vec![hub, one, two]));
+    assert_eq!(report.acknowledged.redundancy, 2);
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(twins.len(), 1, "{:?}", fired(&report));
+    assert_eq!(twins[0].permalink, "twin-one");
+    // The two acknowledged pairs are quiet and the third is a plain finding:
+    // it hangs on an engram with no entry of its own, and two entries on the
+    // hub lend nothing to anybody.
+    assert!(!twins[0].ack_stale);
+    assert_eq!(twins[0].ack_note, None);
+    assert_eq!(twins[0].ack_scope, None);
+}
+
+#[test]
+fn twins_cosine_is_symmetric_and_refuses_mismatched_widths() {
+    use crate::sweep::twins::cosine;
+    assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-9);
+    assert!((cosine(&[1.0, 0.0], &[0.0, 1.0])).abs() < 1e-9);
+    assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+    assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    // A NaN component poisons the quotient, and NaN fails every threshold
+    // comparison, so the pair is dropped rather than ranked.
+    assert!(cosine(&[f32::NAN, 0.0], &[1.0, 0.0]).is_nan());
+}
+
+#[test]
+fn twins_never_retain_more_pairs_than_the_pair_cap() {
+    use crate::sweep::twins::find_twins;
+
+    // A dense scope: twelve vectors fanned across a narrow arc, so all 66
+    // pairs clear the threshold and the retention guard has real work to do.
+    let vectors: Vec<Vec<f32>> = (0..12).map(|i| unit(&[1.0, 0.01 * i as f32])).collect();
+    let refs: Vec<Option<&[f32]>> = vectors.iter().map(|v| Some(v.as_slice())).collect();
+
+    let unbounded = SweepOptions {
+        max_twin_pairs: 1000,
+        ..SweepOptions::default()
+    };
+    let all = find_twins(&refs, &unbounded);
+    assert_eq!(
+        all.pairs.len(),
+        66,
+        "the fixture has to be dense to test this"
+    );
+    assert_eq!(all.compared, 12);
+
+    // The guard discards from the bottom, so a bounded run is the prefix of
+    // the unbounded one: the same findings in the same order, never a
+    // different set.
+    // Zero included: the guard must not panic on an empty heap's peek.
+    for cap in [0usize, 1, 5, 12, 65] {
+        let options = SweepOptions {
+            max_twin_pairs: cap,
+            ..SweepOptions::default()
+        };
+        let bounded = find_twins(&refs, &options);
+        assert_eq!(bounded.pairs.len(), cap, "cap {cap}");
+        assert_eq!(bounded.pairs, all.pairs[..cap], "cap {cap}");
+        assert_eq!(bounded.compared, 12, "cap {cap}");
+        assert!(
+            !bounded.capped,
+            "cap {cap}: the pair guard is not the vector cap"
+        );
+    }
+}
+
+#[test]
+fn v301_keeps_its_findings_when_the_pair_guard_bites() {
+    // The default guard leaves room far above the finding cap, so a domain
+    // dense enough to trip it still fills the queue.
+    let mut facts = Vec::new();
+    for i in 0..12 {
+        let mut f = fact(i as i64 + 1, &format!("twin-{i:02}"));
+        f.lead_vector = Some(unit(&[1.0, 0.002 * i as f32]));
+        facts.push(f);
+    }
+    // The closest two of the twelve are word-for-word near-duplicates as well.
+    // Closest, so their pair is the first the guard retains and the first the
+    // finding loop would reach - which is what makes this the combination
+    // worth pinning: the retained set holds a pair `V201` already owns, and
+    // the suppression drops it from inside the emitted window rather than the
+    // cap quietly doing the work.
+    facts[10].body = long_body("release");
+    facts[11].body = long_body("release").replace("pages whoever", "wakes whoever");
+    let mut sweep = input(facts);
+    sweep.options.max_twin_pairs = 12;
+    let report = detect(&sweep);
+    assert!(fired(&report).contains(&"V201"), "{:?}", fired(&report));
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(twins.len(), 10);
+    assert!(
+        !twins.iter().any(|f| {
+            f.scope.contains("engineering/twin-10") && f.scope.contains("engineering/twin-11")
+        }),
+        "the pair the cluster already prescribes a merge for is not doubled as a twin: {:?}",
+        twins.iter().map(|f| f.scope.as_str()).collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Ranking, catalog and plumbing
 // ---------------------------------------------------------------------------
 
@@ -1074,6 +1811,31 @@ fn v108_flags_an_orphan_with_the_path_as_its_subject() {
         "assets/stray.png; image/png, 2048 bytes; modified 2026-08-01; no engram references or claims it"
     );
     assert!(!fired(&report).contains(&"V007"));
+}
+
+/// A reference the domain still holds at a path one reader's view replaced
+/// keeps the file referenced. The facts are that reader's - their draft says
+/// nothing about the deck - and the domain's own rows are what
+/// `shadowed_asset_refs` carries.
+#[test]
+fn a_reference_the_domain_still_holds_keeps_an_attachment_referenced() {
+    let mut sweep = input(vec![fact(1, "the-deck-rewritten")]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert_eq!(
+        fired(&report),
+        vec!["V108"],
+        "with nothing referencing it the file is an orphan"
+    );
+
+    sweep.shadowed_asset_refs = vec!["assets/deck.png".to_string()];
+    let report = detect(&sweep);
+    assert!(
+        !fired(&report).contains(&"V108"),
+        "deleting it is a shared act, so the shared reference answers for it: {:?}",
+        fired(&report)
+    );
 }
 
 #[test]
@@ -1307,8 +2069,8 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
 }
 
 #[test]
-fn the_catalog_carries_twenty_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 20);
+fn the_catalog_carries_twenty_two_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 22);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -1350,8 +2112,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
     assert_eq!(
         ids,
         vec![
-            "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V101", "V102",
-            "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203",
+            "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V010", "V101",
+            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203", "V301",
         ]
     );
     for rule in RULES {
@@ -1365,7 +2127,11 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         };
         assert_eq!(rule.family, expected, "{}", rule.id);
     }
-    assert!(rule_info("V301").is_none(), "V3xx stays reserved");
+    assert_eq!(
+        rule_info("V301").expect("V301 is in the catalog").family,
+        Family::Redundancy,
+        "semantic twins are redundancy, which is what they are"
+    );
 }
 
 #[test]
@@ -1480,6 +2246,49 @@ fn a_second_retired_link_changes_the_scope_and_the_ack_goes_stale() {
         "while the finding's own scope has moved on"
     );
     assert_eq!(report.acknowledged.total, 0);
+}
+
+/// A rule that is not pair-scoped keeps one entry however many findings it
+/// raises on one engram, and this is what that costs: acknowledging the second
+/// `V103` finding replaces the entry the first was given for, so that one
+/// comes back marked stale wearing the note it never asked for.
+///
+/// Deliberate, and pinned here because two documents claim it - the
+/// `merged_acks` doc and the `edit_engram` description an agent reads. Only
+/// [`is_pair_scoped`] buys the other behaviour.
+#[test]
+fn a_rule_firing_twice_on_one_engram_shares_the_one_acknowledgment() {
+    // Two one-sided reciprocal pairs pointing at the same engram: a summary
+    // and a split, so the hub owes two back-links and V103 fires twice on it.
+    let hub = fact(1, "mix-b-decision");
+    let summary = fact(2, "release-summary");
+    let split_out = fact(3, "purge-procedure");
+    let mut sweep = input(vec![hub, summary, split_out]);
+    sweep.graph.edges = vec![rel(2, 1, "summarizes"), rel(3, 1, "derived_from")];
+    assert_eq!(
+        fired_on(&detect(&sweep), "mix-b-decision"),
+        vec!["V103", "V103"],
+        "the fixture has to raise both halves on the one engram"
+    );
+
+    sweep.engrams[0].acks = vec![ack(
+        "V103",
+        Some("engineering/release-summary"),
+        "the summary owns the link",
+    )];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V103");
+    assert_eq!(finding.scope, "engineering/purge-procedure");
+    assert!(
+        finding.ack_stale,
+        "the pair nobody acknowledged wears the other's entry as stale"
+    );
+    assert_eq!(
+        finding.ack_note.as_deref(),
+        Some("the summary owns the link")
+    );
+    assert_eq!(report.acknowledged.total, 1);
 }
 
 #[test]
@@ -1633,7 +2442,7 @@ fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
         "engineering/alpha".to_string(),
         "engineering/beta".to_string(),
     ];
-    for rule in ["V101", "V102", "V103", "V107", "V201", "V202"] {
+    for rule in ["V010", "V101", "V102", "V103", "V107", "V201", "V202"] {
         assert_eq!(
             scope_for(rule, unsorted.clone()),
             "engineering/alpha, engineering/beta",
@@ -1664,7 +2473,7 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
     // empty-scope arm, which is the safe default, and this pins that the
     // catalog and the scope function are read together.
     let scoped = [
-        "V007", "V008", "V101", "V102", "V103", "V107", "V201", "V202",
+        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V201", "V202", "V301",
     ];
     for info in RULES {
         let produced = scope_for(info.id, vec!["one".to_string()]);
@@ -1789,6 +2598,9 @@ fn unresolved(from: i64, target: &str) -> UnresolvedRef {
         kind: EdgeKind::Link,
         target_domain: None,
         target: target.to_string(),
+        // The bracket text and the target are the same string when no prefix
+        // was written, which is what an unprefixed link actually stores.
+        raw: target.to_string(),
         line: Some(3),
     }
 }

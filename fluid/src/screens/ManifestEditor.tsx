@@ -51,6 +51,7 @@ import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
+import { useFullWidth } from "../layoutWidth";
 import { manifestRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import NotFound from "./NotFound";
@@ -140,6 +141,7 @@ function EditorSurface({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { resolved } = useTheme();
+  const { fullWidth } = useFullWidth();
   const { user } = useAuth();
   // Anonymous can never reach this screen (`canAdminister` gates it above);
   // the fallback only satisfies the types.
@@ -222,6 +224,22 @@ function EditorSurface({
       abandon: session.abandon,
     },
     leave,
+  );
+
+  // One element, drawn beside the buffer or under it depending on the width
+  // the frame is in, so the two placements cannot drift apart.
+  const findings = (
+    <FindingsPanel
+      report={session.report}
+      pending={session.checking}
+      unavailable={session.validationUnavailable}
+      onJump={(line) => {
+        const view = session.viewRef.current;
+        if (view) {
+          jumpToLine(view, line);
+        }
+      }}
+    />
   );
 
   return (
@@ -331,7 +349,18 @@ function EditorSurface({
           </button>
         </aside>
       )}
-      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
+      {/*
+        The engram editor's shape, for the same reason it has it - and it
+        answers the frame's full width the same way too: one column, with the
+        findings under the buffer rather than beside it. They are what the
+        notice above points at and the only way to jump to the line a finding
+        is about, so they are never the thing that goes.
+      */}
+      <div
+        className={`grid gap-8 ${
+          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18rem]"
+        }`}
+      >
         <div className="rounded border border-slate-200 dark:border-slate-800">
           {/* The same bar the engram editor carries, over the same kind of
               text: this buffer is markdown too. */}
@@ -347,19 +376,11 @@ function EditorSurface({
             onDocChanged={session.setBuffer}
           />
         </div>
-        <aside className="flex flex-col gap-4">
-          <FindingsPanel
-            report={session.report}
-            pending={session.checking}
-            unavailable={session.validationUnavailable}
-            onJump={(line) => {
-              const view = session.viewRef.current;
-              if (view) {
-                jumpToLine(view, line);
-              }
-            }}
-          />
-        </aside>
+        {fullWidth ? (
+          findings
+        ) : (
+          <aside className="flex flex-col gap-4">{findings}</aside>
+        )}
       </div>
       {closing.confirming && (
         <ConfirmLeaveDialog

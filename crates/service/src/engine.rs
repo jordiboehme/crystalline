@@ -14,7 +14,7 @@
 //! reprocesses it (the idempotency guard, see `research/single-instance-ipc.md`).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,12 +36,14 @@ use crystalline_core::{
 };
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind,
-    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, Family, FileStamp,
-    Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES, RecentFilter, SearchMode,
-    SearchQuery, ShareFacts, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
-    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EMBED_PAGE_SIZE,
+    EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
+    EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
+    InboundQuery, IndexError, RULES, RebuildKind, RecentFilter, ReindexHooks, SearchMode,
+    SearchQuery, ShareFacts, Store, StoredEngram, SweepInput, SweepOptions, SweepReport,
+    SyncReport, apply_scan, chunk_engram, configured_model_id, detect, is_retired_status,
+    order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, reindex_domains,
+    resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -51,11 +53,19 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::collab::session::AgentPeer;
+use crate::domain_view::DomainView;
 use crate::origin;
 use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
 use crate::poller;
+use crate::review::{self, ActorDrafts, FoldChoice, ReviewModeConfirm};
 use crate::settings;
+use crate::share_staging::{self, PreparedShare};
+use crate::similar::{
+    self, SIMILAR_BACKLOG_POLL, SIMILAR_BACKLOG_WAIT, SIMILAR_LIMIT, SIMILAR_PAGE, SIMILAR_TIMEOUT,
+    SimilarEngram, SimilarProbe,
+};
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
@@ -164,7 +174,7 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      Items marked mechanical complete intent the archive already records - fix those directly and summarize once. \
      Items marked judgment change what the archive claims - read the engram, propose and wait for a yes, one at a time. \
      A lifecycle finding never knows whether a change is a correction or a replacement; read and decide with the edit-versus-supersede test. \
-     Act only on the evidence stated: this sweep detects by dates, links and graph shape, never by meaning, so it cannot confirm a contradiction. \
+     Act only on the evidence stated: this sweep detects by dates, links, graph shape and embedding similarity, and similarity is not a contradiction - it cannot confirm that two engrams disagree. \
      Re-run the same scope when done.";
 
 /// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:
@@ -200,18 +210,27 @@ pub const DEFAULT_ACTOR: &str = "crystalline/mcp";
 /// the spec's `process:name` form.
 pub const CLI_ACTOR: &str = "process:crystalline-cli";
 
+/// The ceiling [`sanitize_actor`] keeps an actor token to, in kept characters.
+/// Exposed with it, because a caller composing an actor out of two halves has
+/// to budget against the same number to know what will survive the pass.
+pub(crate) const ACTOR_MAX_CHARS: usize = 120;
+
 /// Normalize a client-supplied identity into an OKF actor token: whitespace
 /// runs collapse to a single hyphen, control characters and the flow-mapping
 /// punctuation that would need quoting are dropped and the result is capped, so
 /// a client that calls itself "Some Client (beta)" still yields a clean
 /// `generated.by`.
-fn sanitize_actor(raw: &str) -> String {
-    const MAX_CHARS: usize = 120;
+///
+/// `pub(crate)` because an actor composed out of two halves has to sanitize
+/// each half on its own rather than the composition (`mcp::acting_actor`): a
+/// single pass over the joined string lets the client-supplied half spend the
+/// whole budget and truncate away the half the server asserts.
+pub(crate) fn sanitize_actor(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut kept = 0usize;
     let mut pending_gap = false;
     for c in raw.trim().chars() {
-        if kept >= MAX_CHARS {
+        if kept >= ACTOR_MAX_CHARS {
             break;
         }
         if c.is_whitespace() {
@@ -230,6 +249,35 @@ fn sanitize_actor(raw: &str) -> String {
         kept += 1;
     }
     out.trim_matches('-').to_string()
+}
+
+/// The model a write records beside the actor it is recording, or `None` when
+/// none was reported and whenever the actor is a person.
+///
+/// **A `human:` actor never carries a model.** The prefix is what OKF's trust
+/// tier and the evolve sweep read as "a person wrote this", so a model reported
+/// beside it would say a model produced words a person typed. Every other actor
+/// takes the model as reported, a client-composed one and a configured agent
+/// identity like `team-bot/1.0` alike.
+///
+/// **The drop lives here rather than at the surface that takes the parameter**,
+/// because this is the first place the actor is actually known: `identity.actor`
+/// can pin a `human:` form that no caller can see ([`Engine::actor`]). The
+/// value is sanitized with [`sanitize_actor`] on the way through, so a reported
+/// id can no more break the flow mapping it is written into than an actor can,
+/// and an id that sanitizes away is absence.
+///
+/// The prefix is matched the way the sweep matches it: case-insensitively, over
+/// a byte slice taken with `get` so an actor whose sixth byte lands inside a
+/// multi-byte character simply does not match.
+pub(crate) fn stamped_model(actor: &str, model: Option<&str>) -> Option<String> {
+    if actor
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("human:"))
+    {
+        return None;
+    }
+    model.map(sanitize_actor).filter(|m| !m.is_empty())
 }
 
 /// The default host-lock heartbeat interval, seconds. Overridable via
@@ -286,6 +334,22 @@ pub enum EngineError {
     /// A content mutation was attempted against a read-only instance.
     #[error("this instance is read-only; content mutations are disabled")]
     ReadOnly,
+    /// The caller is known, may see the thing they addressed, and is not
+    /// allowed to do this to it. Distinct from [`EngineError::UnknownDomain`],
+    /// which is what a caller who may not see it gets: this variant is only
+    /// ever raised about something the caller can already see, so it discloses
+    /// nothing by existing. The message names who *can*, because "forbidden"
+    /// on a domain somebody reads every day is otherwise indistinguishable
+    /// from a bug.
+    #[error("{0}")]
+    Forbidden(String),
+    /// The request would destroy knowledge that only exists here, and it did
+    /// not say so. Not a permission problem and not a malformed request: the
+    /// caller may do this and asked for it correctly, and the server is
+    /// refusing to guess that the loss was intended. The message names the flag
+    /// that says it was, on every surface that has one.
+    #[error("{0}")]
+    ConfirmationRequired(String),
     /// An interactive connect action (`connect_with_token`,
     /// `start_device_connect`) was attempted while `CRYSTALLINE_GITHUB_TOKEN`
     /// is set. This machine's identity is fixed by the environment, so there
@@ -311,6 +375,15 @@ pub enum EngineError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// The caller asked for something this domain's own shape cannot honor as
+    /// asked, and the message names the way in. Not a permission problem: the
+    /// caller may well be allowed, and on a domain that takes changes directly
+    /// the very same call would land. Distinct from [`EngineError::Invalid`]
+    /// too, which is a malformed request - this one is well formed and simply
+    /// arrived without something the domain requires, so the message is
+    /// teaching text rather than a complaint.
+    #[error("{0}")]
+    Refused(String),
     /// An error from the storage or parse layer.
     #[error("{0}")]
     Internal(String),
@@ -345,6 +418,37 @@ fn stale_edit_message(expected: &str, found: &str) -> String {
         "stale edit: engram changed since it was read \
          (expected {expected}, found {found}); re-read and retry"
     )
+}
+
+/// The gate a whole-document write goes through before anything is written: a
+/// document that is not an engram would poison the index on reindex.
+///
+/// This is the one hard gate, and it is deliberately narrow: the text must
+/// parse (clean UTF-8, frontmatter that is a YAML mapping) and must carry
+/// frontmatter that actually says something, because a save that drops it
+/// silently strips the engram's type, title, permalink, tags and status at
+/// once, leaving the index to fall back to the path slug. An empty block is
+/// that same strip wearing delimiters, so it is refused the same way.
+/// Everything a document can get wrong while still being an engram - a missing
+/// tag, a permalink that is not a slug, an inverted validity window - is the
+/// validation endpoint's business to report, not this path's to refuse: an
+/// engram that already carries such a flaw must stay editable, since fixing it
+/// here is what the editor is for.
+///
+/// One function for the save and the restore, which have always refused the
+/// same shapes in the same words; a co-editing room's saver reaches it through
+/// the save it calls.
+fn refuse_not_an_engram(content: &str) -> Result<()> {
+    let parsed = parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+    if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
+        return Err(EngineError::Invalid(
+            "the document carries no frontmatter, so it is not an engram; \
+             keep the --- delimited frontmatter block, and the type, title, \
+             permalink and tags in it, at the top of the file"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Renders one side of a conflict for [`Engine::origin_conflict_detail`]: an
@@ -540,7 +644,7 @@ pub enum WatchEvent {
 /// file domain, or the database for a virtual domain. This is the one seam every
 /// content mutation branches on; everything after `parse_engram` is shared (see
 /// [`Engine::index_markdown`]).
-enum ContentSource {
+pub(crate) enum ContentSource {
     /// A file domain rooted at this filesystem path.
     File {
         /// The tilde-expanded domain root.
@@ -589,15 +693,31 @@ pub struct Engine {
     // the caller on the model. `None` when no worker is wired (standalone
     // one-shot commands and most tests), which keeps the inline pass.
     embed_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    // One embedding pass at a time, whoever asks: the worker, a verb that just
+    // wrote, the daemon's startup task or the self-heal tick. See [`EmbedGate`].
+    embed_gate: Arc<std::sync::Mutex<EmbedGate>>,
     // Swappable so the daemon can build the (possibly downloading) provider in the
     // background without blocking readiness or text search.
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
     model_id: String,
     chunk_params: ChunkParams,
-    // When true the four content-mutating methods refuse early with
+    // When true the content-mutating methods refuse early with
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    // The first of this file's two test seams: when armed, the next source edit
+    // fails on its far side, once. See `Engine::fail_next_source_edit`.
+    // Compiled only into a test build (`cfg(test)` for this crate's unit tests,
+    // the `testing` feature for its integration tests), so a released binary
+    // carries neither the flag nor the branches that read it.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_source_edit: std::sync::atomic::AtomicBool,
+    // The second, and it is a stopwatch rather than a failure: when armed, the
+    // next edit of a draft sleeps this many milliseconds between reading the
+    // draft and writing it back, holding whatever it holds. See
+    // `Engine::hold_next_draft_edit`, and the same compile-out applies.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_draft_edit: std::sync::atomic::AtomicU64,
     // The effective `skills.serve` value, snapshotted while this engine is
     // built and never re-read. See `Engine::skills_serve` for why it is frozen
     // and `Engine::with_env_overlay` for why the snapshot is taken twice.
@@ -651,6 +771,12 @@ pub struct Engine {
     // real `crystalline_core::config::origin_state_dir`, a real machine path
     // no test may touch.
     origins_dir_override: Option<PathBuf>,
+    // Overrides the state directory the overlay journal is read and written
+    // under, for tests: `None` means the real
+    // `crystalline_core::config::state_dir`, a real machine path no test may
+    // touch - and the journal sweeps are recursive deletes under it, so a test
+    // engine that reaches a removal path must set this.
+    state_dir_override: Option<PathBuf>,
     // The `configure` tool's connect actions: production always resolves a
     // fresh `RealConnectAuth`; tests inject a fake so the pending-connect
     // state machine runs with no real device flow or network access.
@@ -707,6 +833,176 @@ pub struct Engine {
     // request and the engine is the only thing the subscriber and the flipper
     // share; see `crate::subscribers`.
     list_subscribers: Arc<crate::subscribers::ListSubscribers>,
+    // Serializes a domain registration against a domain removal, for the
+    // whole of each: `Engine::unregister_domain` holds it across its sweep and
+    // its tail, and the REST create holds it across its own registration
+    // (`RestState::domain_admin` delegates here). It lives on the engine
+    // rather than on one surface's state because MCP and REST reach the same
+    // verbs and a lock held by only one of them serializes only that one.
+    // What it does NOT close is the bare `domain_add_*`/`origin_add` verbs,
+    // which take no lock of their own; see `Engine::domain_remove`'s known
+    // race.
+    domain_admin: tokio::sync::Mutex<()>,
+    // The fence a removal raises against new co-editing joins while it sweeps
+    // the domain's rooms. Write-held by `Engine::unregister_domain`, read-held
+    // by each collab join (`RestState::join_pass` delegates here), so a join
+    // and a removal of the same domain cannot interleave.
+    join_fence: tokio::sync::RwLock<()>,
+    // The open co-editing rooms, so a removal can save and close the rooms of
+    // the domain it is about to unregister. A `Weak`, because
+    // `CollabSessions` holds an `Arc<Engine>` and a strong handle here would
+    // be a cycle neither side ever drops; `None` (nothing installed) is every
+    // engine that serves no web surface, which has no rooms to close.
+    collab: std::sync::OnceLock<std::sync::Weak<crate::collab::session::CollabSessions>>,
+    // The private-domain resolver every scoped read is filtered through,
+    // installed once when the HTTP surface starts (`daemon::http_base`, the
+    // one funnel both router builders reach, right after the `AuthStore` it
+    // wraps exists).
+    //
+    // A `OnceLock` rather than a field on the constructor because the engine
+    // is built long before - and often without - an accounts database: a
+    // one-shot CLI command, the embedded stdio MCP stack and every test engine
+    // never install one, and `Engine::hidden_domains` answers `None` for them,
+    // which is the same answer the `Scope::Unrestricted` those surfaces pass
+    // would have produced anyway. Set once and never replaced, so a second
+    // router built over one engine keeps the first store rather than silently
+    // swapping the authority mid-flight.
+    domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The sessions currently working inside somebody else's draft. Always
+    // present rather than a `OnceLock` like the resolver above: it is a plain
+    // in-memory registry with no store behind it, so an engine that nobody
+    // ever joins anything through simply holds an empty one. See
+    // [`crate::join`] for why a join belongs to a session and not to an
+    // account.
+    joins: Arc<crate::join::Joins>,
+}
+
+/// One drafted engram, as the share-link surface hands it to the account a
+/// link was redeemed by.
+///
+/// Four fields and no more, because this is the whole of what crosses between
+/// two actors' overlays: where the draft stands, what it answers to, what it
+/// says, and the version token a save of it has to present. No neighbours, no
+/// backlinks, no advisory - a granted draft is one page handed over by its
+/// author, not a corner of the index opened up.
+#[derive(Clone, Debug)]
+pub struct GrantedDraft {
+    /// The domain-relative path the draft stands at.
+    pub path: String,
+    /// The address it answers to, which is how a save of it is addressed.
+    pub permalink: String,
+    /// The markdown as its author last left it, frontmatter and all.
+    pub content: String,
+    /// The lowercase hex SHA-256 of `content`: the `expected_checksum` a save
+    /// of this draft presents, and the `ETag` a reader of it holds.
+    pub checksum: String,
+}
+
+/// One granted draft as a read payload: the shape [`Engine::read_engram`]
+/// answers with, filled in for a page whose rows belong to somebody else.
+///
+/// Written out here rather than shared with the read path it mirrors, because
+/// half of what that path does cannot be done for a granted draft and the
+/// other half must not be. The inbound summary is absent (nothing points at a
+/// draft), the outbound edges are all unresolved (a grant widens one path, not
+/// a neighbourhood), and two keys are added that no other read carries:
+/// `draft` and `draft_owner`, which are what keep a draft standing where the
+/// team's page stands from being mistaken for it.
+fn granted_draft_json(domain: &str, owner: &str, draft: &GrantedDraft) -> Result<Value> {
+    let engram = parse_engram(&draft.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+    let relations: Vec<Value> = engram
+        .relations
+        .iter()
+        .map(|r| {
+            json!({
+                "line": r.line,
+                "rel_type": r.rel_type,
+                "target": r.target,
+                "resolved": false,
+            })
+        })
+        .collect();
+    let links: Vec<Value> = engram
+        .links
+        .iter()
+        .map(|l| json!({ "line": l.line, "target": l.target, "resolved": false }))
+        .collect();
+    let title = if engram.frontmatter.title.is_empty() {
+        draft.permalink.clone()
+    } else {
+        engram.frontmatter.title.clone()
+    };
+    Ok(json!({
+        "domain": domain,
+        "permalink": draft.permalink,
+        "title": title,
+        "type": engram.frontmatter.engram_type,
+        "status": engram.frontmatter.status.clone().unwrap_or_default(),
+        "path": draft.path,
+        "url": format!("crystalline://{domain}/{}", draft.permalink),
+        "content": draft.content,
+        "checksum": draft.checksum,
+        "frontmatter": engram.frontmatter,
+        "observations": engram.observations,
+        "relations": relations,
+        "links": links,
+        "draft": true,
+        "draft_owner": owner,
+    }))
+}
+
+/// What a scoped read hands the store as its domain filter, once the caller's
+/// own filter and the domains it may not see have been reconciled.
+///
+/// Three answers rather than an `Option<Vec<String>>`, because the empty vector
+/// is ambiguous where it matters most: the store reads "no filter" as "every
+/// domain", so a caller whose entire filter was hidden would be answered with a
+/// sweep of everything. [`ScopedDomains::Nothing`] is that case, named.
+#[derive(Debug, PartialEq)]
+enum ScopedDomains {
+    /// Nothing is hidden from this caller, so the query keeps the filter it was
+    /// given - empty (every domain) or not. The machine owner's answer, and the
+    /// answer on any installation where nobody made a domain private.
+    AsAsked,
+    /// Query exactly these domains.
+    Only(Vec<String>),
+    /// Nothing in range is readable by this caller. The answer is an empty
+    /// result, which is what a domain nobody registered already produces.
+    Nothing,
+}
+
+/// Mark one graph node as the reader's own draft, and say nothing at all about
+/// a base row.
+///
+/// Emitted only when there is something to say, so a domain that takes changes
+/// directly answers the JSON it always answered, key for key - which is what
+/// the byte-identity test pins. A reader only ever meets their own drafts in a
+/// slice, so the flag needs no owner beside it.
+fn mark_draft(node_json: &mut Value, node: &GraphNode) {
+    if node.actor.is_empty() {
+        return;
+    }
+    if let Some(obj) = node_json.as_object_mut() {
+        obj.insert("draft".to_string(), json!(true));
+    }
+}
+
+/// Cut every node in a hidden domain out of a graph slice, and with it every
+/// edge that had an end there.
+///
+/// A dangling edge is as much of a disclosure as the node it points at - it
+/// says an engram exists, in a domain the caller was told nothing about - so
+/// the two go together, and this runs before anything ranks or caps the slice.
+/// A no-op when nothing is hidden, which is every unscoped read.
+fn retain_visible(slice: &mut GraphSlice, hidden: &HashSet<String>) {
+    if hidden.is_empty() {
+        return;
+    }
+    slice.nodes.retain(|node| !hidden.contains(&node.domain));
+    let kept: HashSet<i64> = slice.nodes.iter().map(|node| node.id.0).collect();
+    slice
+        .edges
+        .retain(|edge| kept.contains(&edge.from.0) && kept.contains(&edge.to.0));
 }
 
 /// One identity's cached GitHub credential for one host: the resolved store
@@ -728,11 +1024,50 @@ struct CachedGithub {
 pub enum ShareActor {
     /// The machine owner: the CLI, control-socket clients and stdio MCP.
     Owner,
-    /// An authenticated account: Fluid and the REST API.
+    /// An authenticated account: Fluid, the REST API and an HTTP MCP session
+    /// that authenticated at the door (`auth.mcp`), which acts as the account
+    /// whose token opened it.
     Account(String),
-    /// An agent over HTTP MCP, a transport with no user auth of its own:
-    /// resolved through the `github.agent_identity` setting.
+    /// An agent over HTTP MCP on an instance that does not make agents
+    /// authenticate, so the transport carries no user auth and there is nobody
+    /// to be: resolved through the `github.agent_identity` setting.
     HttpAgent,
+}
+
+/// What a removal knows about how much knowledge is at stake.
+///
+/// The two absent cases are not the same fact, and keeping them apart is the
+/// whole point of the type: a domain the index holds no row for has synced
+/// nothing, while a count that could not be read is a number that exists and is
+/// unavailable. Collapsing them into one `None` is how a purge gate fails open,
+/// and it is what leaves a confirmation question quietly missing the figure it
+/// promises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemovalCount {
+    /// The index answered: this many engrams.
+    Known(i64),
+    /// The index answered and holds no row for this domain.
+    Absent,
+    /// The index could not be read. For a virtual domain this only reaches a
+    /// caller that already set `purge`; without it the unknown count is a
+    /// refusal.
+    Unreadable,
+}
+
+impl RemovalCount {
+    /// The count as a preview reports it: the number, or null for either
+    /// absent case. `engrams_unknown` beside it is what tells them apart.
+    fn as_json(self) -> Value {
+        match self {
+            RemovalCount::Known(n) => Value::from(n),
+            RemovalCount::Absent | RemovalCount::Unreadable => Value::Null,
+        }
+    }
+
+    /// Whether the count is absent because the index could not be read.
+    fn is_unreadable(self) -> bool {
+        matches!(self, RemovalCount::Unreadable)
+    }
 }
 
 /// Which credential a SHARE PREVIEW may compute on when the acting identity has
@@ -764,7 +1099,105 @@ pub enum PreviewCredential {
 /// under - the CLI and stdio MCP have no account to be, so they share one local
 /// name rather than inventing one per machine. `crystalline connect github
 /// --personal` with no `--as` writes exactly this slot.
+///
+/// It is also the actor key the machine owner's private drafts carry in a
+/// domain that reviews changes: the overlay rows, the journal folder, the files
+/// overlay inside it. So it is a reserved login, refused case-folded by
+/// [`crate::rest::auth_store::normalize_new_account_name`], because an account
+/// holding this name would be acting in the machine owner's own unshared work
+/// everywhere at once.
 pub const OWNER_IDENTITY_NAME: &str = "owner";
+
+/// What a write is told when it reaches a domain that reviews changes before
+/// they land and nobody can say whose draft it would join.
+///
+/// A draft belongs to an actor. With no identity there is no actor, so there
+/// is nothing to write into - and the one thing that must never happen instead
+/// is the write falling through onto the folder the team reviewed. So the verb
+/// refuses, and the refusal teaches the way in rather than stating a rule: an
+/// agent that reads it can act on it in one step.
+pub const OVERLAY_NEEDS_IDENTITY: &str = "this domain reviews changes before they land, so a write needs to know whose draft it joins - connect with your MCP token (issued in Fluid under profile > Agent access) and try again";
+
+/// What somebody who can SEE another person's draft is told when they try to
+/// write into it without having joined it.
+///
+/// A share-link and a join are two different things on purpose: being handed a
+/// draft to read is not agreeing to type into somebody else's work, and an
+/// agent holding its account's links has not been told to edit anything. So
+/// this refusal is not a wall, it is a fork, and it names both ways through -
+/// join the draft and the writing lands in its author's overlay where they
+/// will see it, or write your own and it lands in yours, where it always did.
+/// What somebody working inside a shared draft is told when they reach for a
+/// file that draft does not carry.
+///
+/// A fork rather than a wall, like [`granted_needs_join`] beside it, and it
+/// names the file: the two ways forward are asking the person whose work it is,
+/// which is the only way somebody else's staged file should ever change, and
+/// drafting one's own copy, which needs nobody's permission.
+pub fn joined_files_are_the_drafts(owner: &str, draft: &str, path: &str) -> String {
+    format!(
+        "this session is working inside {owner}'s draft of '{draft}', and a join carries that \
+         page and the files it points at - '{path}' is neither. It is somebody else's work: ask \
+         its author to change it, or draft your own copy in your own overlay."
+    )
+}
+
+/// What a write inside somebody's draft is told when it would land somewhere
+/// else.
+///
+/// One sentence for the two surfaces that can be inside a draft - a request
+/// carrying a join, and a co-editing room over an overlay document - because
+/// it is one rule: you are inside ONE page, and a write that resolved to
+/// another page is not that page's. A room reaches it when the document's own
+/// frontmatter starts claiming to be a different engram, which is the way an
+/// address moves without anybody saying so.
+pub fn joined_write_is_elsewhere(owner: &str, draft: &str, path: &str) -> String {
+    format!(
+        "this session is working inside {owner}'s draft of '{draft}', so a write to '{path}' has \
+         nowhere to land: leave that draft first, and the write goes back to being your own"
+    )
+}
+
+pub fn granted_needs_join(owner: &str, path: &str) -> String {
+    format!(
+        "'{path}' is {owner}'s draft, shared with you to read: writing into it is a second step. \
+         Join the draft and your changes land in {owner}'s copy, where {owner} reviews them; or \
+         draft your own copy in your own overlay and leave theirs as it stands."
+    )
+}
+
+/// What somebody inside a join is told when the draft they joined is no longer
+/// there - its author renamed it, folded it, or took it back.
+///
+/// Without this the refusal for a write at any other path names the draft they
+/// joined, which is a sentence about a page that has moved and no way to tell
+/// that from a mistyped address.
+pub fn joined_draft_is_gone(owner: &str, draft: &str) -> String {
+    format!(
+        "the draft you joined - {owner}'s '{draft}' - is not there any more: it was renamed, \
+         folded into the domain, or taken back. Leave it, and ask {owner} for a fresh link if \
+         there is still work to do together."
+    )
+}
+
+/// What a share hears when its OWN proposal is already open in a domain that
+/// reviews changes.
+///
+/// The next share would stack a layer on that one, which review mode cannot
+/// serve (`Engine::refuse_open_proposal_while_reviewing` gives the two
+/// reasons), so the way through is to withdraw what is open and share again -
+/// which this actor may do, because the proposal is theirs.
+pub const REVIEW_NO_STACKING: &str = "this domain reviews changes; stacking on an open layer is not supported while it does - withdraw it and share again";
+
+/// What a share hears when SOMEBODY ELSE's proposal is open in a domain that
+/// reviews changes: a `{actor}` slot and the wait.
+///
+/// A separate string from [`REVIEW_NO_STACKING`] because the way forward is
+/// different in kind. This actor cannot withdraw a proposal that is not theirs,
+/// so telling them to would be telling them to do something they may not do -
+/// and telling them to "share a fresh proposal instead" would be telling them
+/// to do the very thing being refused.
+const REVIEW_PROPOSAL_IS_ANOTHERS: &str = "a proposal by {actor} is open, and this domain takes one proposal at a time while it reviews changes - wait for theirs to merge, or ask them to withdraw it, then share again";
 
 /// The refusal a write verb answers with in personal mode when the acting
 /// identity has connected no GitHub account of its own (spec section 6, and the
@@ -848,6 +1281,12 @@ fn is_personal_token_missing(e: &EngineError) -> bool {
 /// instruction is to reconnect their own identity rather than to run the
 /// machine-wide connect. Every other error passes through: an offline machine
 /// or a rate limit is the same event whoever was acting.
+///
+/// The collaborator rewrite is deliberately keyed to `Api { status: 403 }`
+/// alone. An organization-policy refusal ([`RemoteError::SsoAuthorizationRequired`],
+/// [`RemoteError::OauthAppRestricted`]) is also a 403 upstream, but the
+/// provider has already turned it into the accurate instruction, and adding
+/// a collaborator would not clear either of them.
 fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> RemoteError {
     let Some(login) = login else {
         return e;
@@ -946,6 +1385,106 @@ impl Drop for ActivityGuard {
     }
 }
 
+/// The single-flight state of the engine's embedding pass.
+///
+/// `running` says a pass is walking the backlog; `again` says a request
+/// arrived while it was. Two passes over one backlog do not share it - each
+/// keeps its own cursor, so the second re-embeds whatever the first has in
+/// flight, splitting the CPU and doubling the in-flight pages for no extra
+/// coverage. One pass at a time is therefore an engine invariant rather than a
+/// call-site convention, and it holds for callers with no worker wired too.
+///
+/// Both flips happen under the one mutex, which is what keeps the invariant
+/// from costing work: a caller either finds the pass running and hands it
+/// `again`, or finds it finished and claims the next pass itself. There is no
+/// instant where a request is neither served by the running pass nor able to
+/// start its own.
+#[derive(Default)]
+pub(crate) struct EmbedGate {
+    running: bool,
+    again: bool,
+}
+
+/// What a request for an embedding pass did.
+///
+/// The two are worth telling apart wherever a caller reports the result to a
+/// person: a turned-away request is work in progress, not an empty backlog, and
+/// rendering it as "0 chunks embedded" is the silently-successful answer this
+/// whole area has been fixing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedOutcome {
+    /// This call walked the backlog and embedded that many chunks.
+    Embedded(usize),
+    /// A pass was already walking the backlog, so this request was folded into
+    /// it: that pass walks the backlog again and covers whatever this caller
+    /// had just written. Nothing was dropped and nothing needs re-asking.
+    AlreadyRunning,
+}
+
+impl EmbedOutcome {
+    /// The count for a caller that only wants a number, a turned-away request
+    /// reading as zero.
+    pub fn embedded(self) -> usize {
+        match self {
+            EmbedOutcome::Embedded(n) => n,
+            EmbedOutcome::AlreadyRunning => 0,
+        }
+    }
+}
+
+/// Holds the claim on the embedding pass, releasing it on drop so a store
+/// error, a panic or a dropped future cannot strand it.
+pub(crate) struct EmbedPass {
+    gate: Arc<std::sync::Mutex<EmbedGate>>,
+    released: bool,
+}
+
+impl EmbedPass {
+    /// Claim the pass, or `None` when one is already running - in which case
+    /// the running pass is told to walk the backlog once more, so the caller's
+    /// work is served by that walk instead of being dropped.
+    fn claim(gate: &Arc<std::sync::Mutex<EmbedGate>>) -> Option<EmbedPass> {
+        let mut state = gate.lock().unwrap();
+        if state.running {
+            state.again = true;
+            return None;
+        }
+        state.running = true;
+        // A walk starts at the head of the backlog, so it already covers
+        // whatever an earlier request was asking for.
+        state.again = false;
+        drop(state);
+        Some(EmbedPass {
+            gate: Arc::clone(gate),
+            released: false,
+        })
+    }
+
+    /// Called once per walk: `true` to walk again because a request arrived
+    /// during the one just finished, `false` to end the pass - which releases
+    /// the claim there and then, in the same critical section a fresh caller
+    /// checks.
+    fn walk_again(&mut self) -> bool {
+        let mut state = self.gate.lock().unwrap();
+        if state.again {
+            state.again = false;
+            true
+        } else {
+            state.running = false;
+            self.released = true;
+            false
+        }
+    }
+}
+
+impl Drop for EmbedPass {
+    fn drop(&mut self) {
+        if !self.released {
+            self.gate.lock().unwrap().running = false;
+        }
+    }
+}
+
 impl Engine {
     /// Build an engine around an already-open store, an optional provider and a
     /// config. A `None` provider can be installed later with [`Engine::set_provider`].
@@ -974,10 +1513,15 @@ impl Engine {
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
             embed_tx: None,
+            embed_gate: Arc::default(),
             provider: std::sync::RwLock::new(provider),
             model_id,
             chunk_params,
             read_only: false,
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            hold_next_draft_edit: std::sync::atomic::AtomicU64::new(0),
             skills_serve,
             instance_id: String::new(),
             label: String::new(),
@@ -989,6 +1533,7 @@ impl Engine {
             origin_provider_override: None,
             origin_provider_override_login: None,
             origins_dir_override: None,
+            state_dir_override: None,
             connect_auth: Arc::new(RealConnectAuth),
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
@@ -997,7 +1542,476 @@ impl Engine {
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
+            domain_admin: tokio::sync::Mutex::new(()),
+            join_fence: tokio::sync::RwLock::new(()),
+            collab: std::sync::OnceLock::new(),
+            domain_access: std::sync::OnceLock::new(),
+            joins: Arc::new(crate::join::Joins::default()),
         }
+    }
+
+    /// Arm a one-shot failure of the next source edit, on its far side.
+    ///
+    /// A test seam, and the only one in this file. It stands for one thing - a
+    /// fault at the moment the source's bytes are committed - and each storage
+    /// kind answers that differently, which is the whole point of arming it:
+    ///
+    /// - a **file** domain fails the reindex that follows the rename, so the
+    ///   bytes are already on disk and nothing may be undone;
+    /// - a **virtual** domain is handed a compare-and-swap token nothing can
+    ///   match, so the store raises its own conflict and rolls the transaction
+    ///   back, exactly as a concurrent edit would, and the caller may undo
+    ///   whatever it wrote first.
+    ///
+    /// Neither is reachable from a test any other way: a rename either happens
+    /// or does not, a real concurrent edit cannot be timed to land between one
+    /// call's read and its write, and every input-shaped failure of the reindex
+    /// is refused earlier by [`Engine::plan_split`]. The seam exists because
+    /// [`Engine::split_engram_as`] must never undo its own new engram once the
+    /// source has been rewritten, and must still undo it when the source is
+    /// untouched, and an invariant nothing exercises is an invariant that rots.
+    ///
+    /// Nothing in the daemon, the CLI or the MCP surface calls this, and the two
+    /// branches that read it are one relaxed swap each, one per storage kind. It
+    /// is consumed by the next source edit on any domain rather than by the next
+    /// split, so arm it immediately before the call under test.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_source_edit(&self) {
+        self.fail_next_source_edit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Hold the next edit of a draft open between its read and its write, once,
+    /// so a test can put a second writer of the same draft in that window.
+    ///
+    /// The lost update this exists to catch cannot be timed from outside: both
+    /// writers are futures on one runtime, and whether the reader yields
+    /// between its read and its write depends on whether an uncontended mutex
+    /// happens to suspend. A sleep inside the window makes the interleaving a
+    /// fact instead of a coincidence, which is what lets
+    /// `a_capture_and_an_edit_of_one_draft_serialize` fail for the right reason
+    /// when the arms take two different locks and pass when they take one.
+    ///
+    /// Armed for ONE edit and consumed by it, like the failure seam above, and
+    /// compiled out of a released binary the same way.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_draft_edit(&self, millis: u64) {
+        self.hold_next_draft_edit
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hold above, consuming the arming. Does nothing at all outside a test
+    /// build, where the counter does not exist.
+    async fn take_draft_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let millis = self
+                .hold_next_draft_edit
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            if millis > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            }
+        }
+    }
+
+    /// Whether the failure seam is armed, consuming the arming. Constant
+    /// `false` outside a test build, where the flag does not exist: the two
+    /// source-edit branches then compile to what they would have been without a
+    /// seam at all.
+    fn take_armed_failure(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_source_edit
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
+    /// Install the co-editing registry, so a removal can close the rooms of the
+    /// domain it unregisters.
+    ///
+    /// Held as a `Weak`: the registry owns an `Arc<Engine>`, so a strong handle
+    /// here would be a cycle neither half ever drops. Called once, by
+    /// `RestState::new`, which is the only thing that builds a registry. A
+    /// second call is ignored, for the reason
+    /// [`Engine::set_domain_access`] gives.
+    pub fn set_collab_sessions(&self, sessions: &Arc<crate::collab::session::CollabSessions>) {
+        let _ = self.collab.set(Arc::downgrade(sessions));
+    }
+
+    /// The open co-editing rooms, or `None` on every engine that serves no web
+    /// surface - a one-shot CLI command, the embedded stdio stack, most tests.
+    ///
+    /// `None` is what makes those installs byte-identical to their old selves:
+    /// no registry, no rooms, so every read and every edit takes the file or
+    /// the row path it always took.
+    fn collab_rooms(&self) -> Option<Arc<crate::collab::session::CollabSessions>> {
+        self.collab.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Hold the domain-admin lock for the whole of a registration or a removal.
+    ///
+    /// One lock on the engine rather than one per surface: REST's create takes
+    /// it, [`Engine::unregister_domain`] takes it, and both surfaces reach the
+    /// same verbs, so a lock held by only one of them would serialize only that
+    /// one. See the field for what it does not close.
+    ///
+    /// Lock order where both are taken (a removal): this one, then
+    /// [`Engine::fence_joins`]. Nothing else takes both.
+    pub async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.domain_admin.lock().await
+    }
+
+    /// Raise the join fence: while this guard lives, no collab upgrade may open
+    /// a room, because [`Engine::join_pass`] is what the upgrade route waits on
+    /// before it joins.
+    ///
+    /// Held by a removal across its sweep and the unregistration, which is what
+    /// makes the sweep final rather than a snapshot: a join already in flight
+    /// finishes and inserts its room before the guard is granted (so the sweep
+    /// collects it), and a join that arrives afterwards waits, then finds a
+    /// domain that no longer exists and is refused. Process-wide rather than
+    /// per-domain because a removal is short and a second primitive per domain
+    /// name would buy nothing measurable.
+    pub async fn fence_joins(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.join_fence.write().await
+    }
+
+    /// The pass a collab upgrade holds across its join, so a join and a removal
+    /// of the same domain cannot interleave. See [`Engine::fence_joins`] for
+    /// the argument this half completes; the guard is dropped as soon as the
+    /// join returns, never held across the socket's life.
+    pub async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.join_fence.read().await
+    }
+
+    /// Install the private-domain resolver. Called once, when the HTTP surface
+    /// starts and the accounts store it reads exists.
+    ///
+    /// A second call is ignored rather than refused: the surfaces that build a
+    /// router are the only callers, and an engine that already knows how to
+    /// resolve a scope must not have that authority replaced by a later,
+    /// possibly different, store.
+    pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
+        let _ = self.domain_access.set(access);
+    }
+
+    /// The private domains `scope` may not see, or `None` for no filtering at
+    /// all.
+    ///
+    /// `None` in two cases, which are the same case in practice: no resolver is
+    /// installed (a one-shot CLI command, the embedded stdio stack, a test
+    /// engine - all of which are the machine owner), or the scope is
+    /// [`Scope::Unrestricted`]. Everything else gets a set to subtract, empty
+    /// on an installation where nobody has made a domain private.
+    ///
+    /// The privacy answer alone, and it is not the serving screen. A read that
+    /// answers from the index takes [`Engine::hidden_for`], which adds the
+    /// domains whose rows outlived their registration; this one is for a caller
+    /// reasoning about who may see what rather than about what may be served.
+    ///
+    /// [`Scope::Unrestricted`]: crate::scope::Scope::Unrestricted
+    pub async fn hidden_domains(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<HashSet<String>>> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        access
+            .hidden_domains(scope)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// What `scope` may do on one domain, for a surface that has to refuse a
+    /// write rather than hide the domain.
+    ///
+    /// [`DomainRight::Own`] when no resolver is installed, which is the same
+    /// answer [`Engine::hidden_domains`] gives on that engine: a one-shot CLI
+    /// command, the embedded stdio stack and a test engine are all the machine
+    /// owner. A resolver that cannot answer is an error rather than a
+    /// permissive default - a write that cannot learn what its caller may do
+    /// refuses instead of proceeding on an assumption, exactly as the REST
+    /// write gate does.
+    ///
+    /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
+    pub async fn domain_right(
+        &self,
+        scope: &crate::scope::Scope,
+        domain: &str,
+    ) -> Result<crate::scope::DomainRight> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(crate::scope::DomainRight::Own);
+        };
+        access.right(scope, domain).await.map_err(|e| {
+            EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
+        })
+    }
+
+    /// What `scope` may do on one domain when the request is a write: the
+    /// domain answer capped by the instance role, which is the rule the JSON
+    /// API has always applied and the one the MCP write gate reads here.
+    ///
+    /// Same two special cases [`Engine::domain_right`] carries, for the same
+    /// reasons: no resolver installed is the machine owner, and a resolver that
+    /// cannot answer is an error rather than a permissive default.
+    pub async fn write_right(
+        &self,
+        scope: &crate::scope::Scope,
+        domain: &str,
+    ) -> Result<crate::scope::DomainRight> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(crate::scope::DomainRight::Own);
+        };
+        access.write_right(scope, domain).await.map_err(|e| {
+            EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
+        })
+    }
+
+    /// Refuse a domain this caller must not be answered from, and say nothing
+    /// about a name the index has never heard of.
+    ///
+    /// The narrow half of [`Engine::require_domain`], for a verb that already
+    /// has its own words for a domain nobody registered and its own order for
+    /// saying them. A screened domain is refused here with exactly the bytes an
+    /// unregistered one gets, which is the whole point; anything else falls
+    /// through untouched, so adding this gate to a verb cannot change what that
+    /// verb answered before on any input the index holds rows for.
+    ///
+    /// [`Engine::hidden_for`] screens two things and both are refused here: a
+    /// private domain, and a domain whose rows outlived their registration. The
+    /// second is a name the verb behind this gate would have refused for itself
+    /// a line later, since nothing unregistered resolves to a content source -
+    /// so this is one line earlier, not one refusal more.
+    pub async fn refuse_hidden_domain(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        let hidden = self.hidden_for(scope).await?;
+        if hidden.contains(name) {
+            self.domain_entry_scoped(name, &hidden)?;
+        }
+        Ok(())
+    }
+
+    /// Every domain name a read must answer as though it were not there: the
+    /// private domains this caller may not see, plus every domain the index
+    /// still holds that nobody has registered here.
+    ///
+    /// **The two are one rule, which is why they are one set.** A caller naming
+    /// a private domain gets what naming a domain nobody registered gets, which
+    /// is nothing; this says the same thing about a caller who named no domain
+    /// at all. An index row whose domain is unregistered is not a hit, not a
+    /// count and not a facet value - it is left in the index (a filter, never a
+    /// deletion, so nothing here can lose knowledge) and simply stops being an
+    /// answer. That matters because a removal used to leave rows behind
+    /// deliberately, and those rows went on outranking the knowledge their owner
+    /// still keeps.
+    ///
+    /// Resolved once per call and threaded inward. Every verb that answers from
+    /// the index asks for it here rather than deciding for itself, so a read
+    /// added later inherits the screen instead of having to remember it.
+    ///
+    /// Either half failing propagates rather than resolving to an empty set: a
+    /// read that cannot learn what it may answer from refuses, and never widens.
+    pub(crate) async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
+        let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
+        hidden.extend(self.unregistered_domains().await?);
+        Ok(hidden)
+    }
+
+    /// The domains the index holds that this instance has no registration for.
+    ///
+    /// Asked of the index on every call rather than cached, so a domain removed
+    /// or registered while this engine runs takes effect on the next read rather
+    /// than at the next restart. It is one column of a table with a row per
+    /// domain ([`Store::domain_names`], deliberately not `domain_stats`, whose
+    /// per-domain counts this would pay for and never look at).
+    ///
+    /// "Registered" is [`Engine::registered_domain_names`], all three tiers
+    /// [`Engine::domain_entry`] resolves a name through, so the named and the
+    /// unnamed answer agree: a domain a named read would resolve by re-reading
+    /// the configuration file is one an unnamed sweep serves.
+    ///
+    /// The file is only re-read when it can change the answer - when the index
+    /// holds a name the snapshot and the overlay do not know - and then once
+    /// for the whole call rather than once per name. An installation with no
+    /// orphan (every installation, once Part B has collected) pays the cheap
+    /// in-memory check and no file read at all.
+    ///
+    /// [`Store::domain_names`]: crystalline_index::Store::domain_names
+    async fn unregistered_domains(&self) -> Result<HashSet<String>> {
+        let known: HashSet<String> = self.known_domain_names().into_iter().collect();
+        let names = {
+            let store = self.store.lock().await;
+            store.domain_names().await?
+        };
+        let unknown: HashSet<String> = names
+            .into_iter()
+            .filter(|name| !known.contains(name))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(unknown);
+        }
+        let registered = self.registered_domain_names();
+        Ok(unknown
+            .into_iter()
+            .filter(|name| !registered.contains(name))
+            .collect())
+    }
+
+    /// The private domain names and the ones this caller may not see, from one
+    /// read of the visibility records.
+    ///
+    /// For the one caller that needs both: a domain listing subtracts the
+    /// hidden names and then marks each row it kept private or shared. Asking
+    /// for the two separately would sweep the same table twice for one answer.
+    ///
+    /// The privacy half only, unlike [`Engine::hidden_for`], and it needs no
+    /// more: the only caller is [`Engine::list_domains`], which builds its rows
+    /// from the registrations rather than from the index, so a domain nobody
+    /// registered has no row there to keep back in the first place.
+    ///
+    /// An engine with no resolver installed - a one-shot CLI command, the
+    /// embedded stdio stack, a test engine - answers with two empty sets:
+    /// there is no accounts database on those, so no domain has ever been made
+    /// private through one.
+    async fn visibility_for(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<(HashSet<String>, HashSet<String>)> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok((HashSet::new(), HashSet::new()));
+        };
+        let visibility = access
+            .visibility(scope)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        Ok((visibility.private, visibility.hidden.unwrap_or_default()))
+    }
+
+    /// The domain list a scoped store query is given: the caller's own filter
+    /// with the screened names subtracted, or - when the caller named none and
+    /// something is screened out - every domain the store holds minus those.
+    ///
+    /// `hidden` is [`Engine::hidden_for`]'s whole answer, so "screened out"
+    /// covers both halves of it: a private domain this caller may not see, and
+    /// a domain the index holds that nobody registered here. An unnamed sweep
+    /// therefore narrows to the registered domains that have rows, which is the
+    /// same rule a named read gets from [`Engine::domain_entry_scoped`].
+    ///
+    /// [`ScopedDomains::AsAsked`] is the answer when there is nothing to screen
+    /// out at all: nothing is subtracted, no extra query runs and the store sees
+    /// exactly the filter it always saw. That is the ordinary installation - no
+    /// private domains and no rows outliving their registration - so the sweep
+    /// below is a cost only where something actually has to be kept back.
+    ///
+    /// [`ScopedDomains::Nothing`] is the case an empty list would silently
+    /// widen. A caller that named only screened-out domains has asked for
+    /// nothing it may read, and `Some(vec![])` is not that request - the search
+    /// verbs drop an empty filter and sweep everything. So it is its own answer,
+    /// and the caller returns the empty page a name nobody registered would have
+    /// produced.
+    async fn scoped_domains(
+        &self,
+        requested: &[String],
+        hidden: &HashSet<String>,
+    ) -> Result<ScopedDomains> {
+        if hidden.is_empty() {
+            return Ok(ScopedDomains::AsAsked);
+        }
+        if !requested.is_empty() {
+            let kept: Vec<String> = requested
+                .iter()
+                .filter(|name| !hidden.contains(*name))
+                .cloned()
+                .collect();
+            return Ok(if kept.is_empty() {
+                ScopedDomains::Nothing
+            } else {
+                ScopedDomains::Only(kept)
+            });
+        }
+        // The store's own domain list, intersected with what may be served
+        // rather than assumed to be servable: every name it returns that this
+        // instance has no registration for is already in `hidden`, so the
+        // filter below is the whole of the rule. A registered domain with no
+        // rows yet is absent from the list, which costs nothing - a domain with
+        // no rows has nothing to return to any query this list narrows.
+        let store = self.store.lock().await;
+        let names = store.domain_names().await?;
+        drop(store);
+        let visible: Vec<String> = names
+            .into_iter()
+            .filter(|name| !hidden.contains(name))
+            .collect();
+        Ok(if visible.is_empty() {
+            ScopedDomains::Nothing
+        } else {
+            ScopedDomains::Only(visible)
+        })
+    }
+
+    /// The vocabulary in scope for a screened caller: the tags, categories,
+    /// types and statuses of everything it may be answered from, and of nothing
+    /// else.
+    ///
+    /// Named, the screened domain reports the empty vocabulary an unregistered
+    /// name reports. Unnamed, the sweep cannot be one store query with a filter
+    /// laid over its answer, because a [`crystalline_index::Vocabulary`] is
+    /// aggregated counts with no domain on them: it is one query per served
+    /// domain, merged back into one answer. With nothing screened out - the
+    /// ordinary installation - it is the single unfiltered query it always was.
+    ///
+    /// Shared by [`Engine::vocabulary`], which reports it, and
+    /// [`Engine::retag`], which prechecks a rename or a merge against it. Keep
+    /// the two on this one seam: a tag the listing says is not there must not
+    /// be a tag the merge says exists.
+    ///
+    /// **Base by design**, which is why every scan here names no actor. The
+    /// vocabulary is the agreement a domain has reached, so a word one author
+    /// is trying out in a draft is not in it, and a person shown the list is
+    /// shown the team's. The one surface that reads an actor's own view is the
+    /// sweep's tag-drift rule, through [`DomainView::vocabulary`], because that
+    /// finding is about what that one author wrote.
+    async fn scoped_vocabulary(
+        &self,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<crystalline_index::Vocabulary> {
+        Ok(match (domain, hidden.is_empty()) {
+            (_, true) => {
+                let store = self.store.lock().await;
+                store.vocabulary(domain, None).await?
+            }
+            (Some(domain), false) if hidden.contains(domain) => {
+                crystalline_index::Vocabulary::default()
+            }
+            (Some(domain), false) => {
+                let store = self.store.lock().await;
+                store.vocabulary(Some(domain), None).await?
+            }
+            (None, false) => {
+                let names = match self.scoped_domains(&[], hidden).await? {
+                    ScopedDomains::Only(names) => names,
+                    // `AsAsked` cannot arrive with something hidden, and
+                    // `Nothing` means there is no domain to sweep.
+                    _ => Vec::new(),
+                };
+                let store = self.store.lock().await;
+                let mut parts = Vec::with_capacity(names.len());
+                for name in &names {
+                    parts.push(store.vocabulary(Some(name), None).await?);
+                }
+                drop(store);
+                crystalline_index::merge_vocabularies(parts)
+            }
+        })
     }
 
     /// Turn on shared-database collaboration for this engine by giving it a
@@ -1102,6 +2116,17 @@ impl Engine {
         self
     }
 
+    /// Override the state directory the overlay journal lives under, in place
+    /// of the real `crystalline_core::config::state_dir`. Test-only, and the
+    /// one override a test cannot do without if it reaches a removal path:
+    /// [`crate::overlay_journal::journal_remove_domain`] removes a folder tree,
+    /// and without this it would remove one under the developer's own state
+    /// directory.
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Engine {
+        self.state_dir_override = Some(dir);
+        self
+    }
+
     /// Inject a fake [`ConnectAuth`] for the `configure` tool's connect
     /// actions, bypassing the real device flow and token validation.
     /// Test-only: production code always leaves this at the default
@@ -1146,6 +2171,14 @@ impl Engine {
     /// a full snapshot.
     pub fn github_enabled(&self) -> bool {
         self.config.read().unwrap().github_enabled()
+    }
+
+    /// Whether the MCP endpoint authenticates (`auth.mcp`), read the same cheap
+    /// way as [`Engine::github_enabled`]. This is the setting that creates the
+    /// legacy open tier, and a write gate reads it once per write, so it must
+    /// not clone the whole config to get at one bool.
+    pub fn auth_mcp(&self) -> bool {
+        self.config.read().unwrap().auth_mcp()
     }
 
     /// Whose GitHub identity a share on this instance runs as, read live from
@@ -1271,6 +2304,39 @@ impl Engine {
         Ok(claim)
     }
 
+    /// Whether another instance holds this domain's host lock and is still
+    /// heartbeating on it, as of `now`.
+    ///
+    /// The liveness rule is [`Engine::claim_file_host`]'s, not a second one:
+    /// a heartbeat older than `stale_secs` is stale, and a takeover is exactly
+    /// what a claim would be allowed to do at that point. Read through the
+    /// threshold rather than through a lexical `stale_before` string because
+    /// this compares one instant rather than filtering a query, and a parse
+    /// that fails is read as live - the direction that keeps rows.
+    ///
+    /// Only [`Engine::collect_orphaned_domains`] asks. On a shared database
+    /// several instances register different domains against one index, so a
+    /// domain this instance has no registration for may be another's current
+    /// work, and another instance's live registration is a registration.
+    fn hosted_elsewhere(&self, row: &DomainStats, now: DateTime<Utc>) -> bool {
+        let Some(holder) = row.host_instance_id.as_deref().filter(|h| !h.is_empty()) else {
+            return false;
+        };
+        if holder == self.instance_id {
+            return false;
+        }
+        let Some(beat) = row.host_heartbeat_at.as_deref() else {
+            return false;
+        };
+        match DateTime::parse_from_rfc3339(beat) {
+            Ok(beat) => {
+                now.signed_duration_since(beat.with_timezone(&Utc))
+                    <= Duration::seconds(self.stale_secs)
+            }
+            Err(_) => true,
+        }
+    }
+
     /// Claim the host lock for a file domain by name (resolving its root and
     /// locking the store), for the daemon's watch-arming path. A no-op that
     /// reports `Acquired` when collaboration is off or the domain is virtual, so
@@ -1359,8 +2425,15 @@ impl Engine {
     /// selected nothing. Search itself deliberately does not resolve its
     /// `domains` filter - an unmatched name there is simply a narrower filter -
     /// and that stays as it is.
-    pub fn require_domain(&self, name: &str) -> Result<()> {
-        self.domain_entry(name)?;
+    ///
+    /// Scoped, and async for it: this raises the one error that names every
+    /// other domain, so an unfiltered answer here would tell a caller asking
+    /// for a domain that does not exist the name of every private domain on the
+    /// instance. A domain the caller may not see is refused as an unregistered
+    /// one, and the set the refusal lists is the visible set.
+    pub async fn require_domain(&self, name: &str, scope: &crate::scope::Scope) -> Result<()> {
+        let hidden = self.hidden_for(scope).await?;
+        self.domain_entry_scoped(name, &hidden)?;
         Ok(())
     }
 
@@ -1382,8 +2455,21 @@ impl Engine {
     /// a file domain, or the database for a virtual domain. Errors when the
     /// domain is not registered (the write path wants that), the layered lookup
     /// mirroring [`Engine::domain_entry`].
-    fn content_source(&self, name: &str) -> Result<ContentSource> {
+    pub(crate) fn content_source(&self, name: &str) -> Result<ContentSource> {
         let entry = self.domain_entry(name)?;
+        Ok(self.source_of(&entry))
+    }
+
+    /// [`Engine::content_source`] for a scoped read: a domain the caller may
+    /// not see resolves to no source at all, with the same
+    /// [`EngineError::UnknownDomain`] a name nobody registered gets, its
+    /// `registered` list filtered to the visible set.
+    pub(crate) fn content_source_scoped(
+        &self,
+        name: &str,
+        hidden: &HashSet<String>,
+    ) -> Result<ContentSource> {
+        let entry = self.domain_entry_scoped(name, hidden)?;
         Ok(self.source_of(&entry))
     }
 
@@ -1395,6 +2481,809 @@ impl Engine {
             Some(root) if !entry.is_virtual() => ContentSource::File { root },
             _ => ContentSource::Virtual,
         }
+    }
+
+    /// Whether this domain reviews changes before they land. A name nobody
+    /// registers reviews nothing: the verb that asked is about to refuse it as
+    /// unregistered anyway, and answering "yes" here would route a write into a
+    /// draft of a domain that does not exist.
+    pub(crate) fn reviews_changes(&self, name: &str) -> bool {
+        self.domain_entry(name)
+            .map(|entry| entry.is_overlay())
+            .unwrap_or(false)
+    }
+
+    /// Whose drafts a READ may lay over the base, for the verbs that answer
+    /// across domains: search, the similar advisory and the graph.
+    ///
+    /// [`DomainView::for_read`] asks this question of one domain and answers
+    /// `None` where that domain takes changes directly, so a read of an engram
+    /// in such a domain sees the folder whatever rows are left in the index.
+    /// These three verbs have no single domain to ask - one query spans them -
+    /// so they ask whether ANY domain they can touch reviews changes, and name
+    /// no actor at all when none does. An instance with no reviewing domain
+    /// anywhere therefore asks exactly the question it asked before the actor
+    /// dimension existed, and a domain that stopped reviewing with rows still
+    /// in the index (a fold that failed halfway, an edited config, an
+    /// environment variable unset) stops shadowing its own folder.
+    ///
+    /// **The residue, because it is real.** A query that spans a reviewing
+    /// domain AND one that has stopped reviewing still carries the actor, so
+    /// the stale rows of the second are still shadowing there. Screening it per
+    /// domain means the index deciding row by row, which is a `SearchQuery`
+    /// carrying a set of reviewing domain ids into both backends' statements -
+    /// a schema-shaped change this wave's migrations are pinned against. What
+    /// closes it instead is the recovery being reachable: the rows are folded
+    /// or discarded (`crystalline domain review <name> direct`), and
+    /// `restore_overlays` no longer mirrors them back on the next sync.
+    fn reading_actor(&self, scope: &crate::scope::Scope, requested: &[String]) -> Option<String> {
+        let actor = crate::scope::overlay_actor(scope)?;
+        let reviewing = if requested.is_empty() {
+            // Every domain in range is every domain this process knows, and the
+            // question is asked of what is already in memory: the effective
+            // config plus the domains discovered since startup. NOT through
+            // `registered_domain_names`, which re-reads and re-parses the
+            // config file - this runs on every search, every write receipt's
+            // advisory and every graph slice, and a file read on that path is
+            // the shape of regression this wave has already paid for once. The
+            // cost of the narrower answer is one sync pass: a domain another
+            // process put into review mode a moment ago names no actor until
+            // this process notices it, which costs its own drafts a place in
+            // this reader's search until then and nothing else.
+            let config = self.config.read().unwrap();
+            let discovered = self.discovered_domains.read().unwrap();
+            config.domains.values().any(DomainEntry::is_overlay)
+                || discovered.values().any(DomainEntry::is_overlay)
+        } else {
+            requested.iter().any(|name| self.reviews_changes(name))
+        };
+        reviewing.then_some(actor)
+    }
+
+    /// The open document's text for this engram, when a room is open over it in
+    /// this view: the one probe the verbs that guard on a checksum share.
+    ///
+    /// **Why it is shared.** `read_engram` answers from the room while one is
+    /// open, and the checksum it hands back is the LIVE text's - that is what
+    /// makes read-then-edit work while somebody is typing. A verb that then
+    /// compared the caller's checksum against the stored text would refuse
+    /// exactly the caller who did what the receipt told them to do, and send
+    /// them back to a read that answers the same value again. So the read, the
+    /// split and the delete ask this one question and compare against one
+    /// answer.
+    ///
+    /// **It must be called above every file lock.** The room's saver holds the
+    /// session state lock across `Engine::save_engram`, which takes the file
+    /// lock, so a probe under that lock closes a cycle nothing times out of.
+    /// `no_engine_function_composes_into_a_room_under_a_file_write_lock` scans
+    /// for exactly that and names `.live_text(` among its needles, so a caller
+    /// that gets this wrong fails the suite rather than the field.
+    async fn live_text_at(&self, desc: &EngramDescriptor, view: &DomainView<'_>) -> Option<String> {
+        let rooms = self.collab_rooms()?;
+        rooms
+            .live_text(&desc.domain, &desc.permalink, view.actor())
+            .await
+    }
+
+    /// [`Engine::actor`] for a write that joins a draft overlay: the identity
+    /// the calling surface composed, and never the configured
+    /// `identity.actor`.
+    ///
+    /// The setting is an operator's answer to "what should this machine's
+    /// writes be signed as", which is the right answer for work that lands in
+    /// the shared folder. A draft is one account's own, so the account is what
+    /// its provenance has to say - otherwise every actor's drafts in a reviewed
+    /// domain are signed with the same house name and the review cannot tell
+    /// them apart.
+    fn draft_actor(&self, client: Option<&str>) -> String {
+        client
+            .map(sanitize_actor)
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(|| DEFAULT_ACTOR.to_string())
+    }
+
+    /// The actor a write records, given where it is landing: the composed
+    /// identity for a draft, the configured one for a direct write.
+    fn actor_for(&self, client: Option<&str>, overlay: Option<&str>) -> String {
+        match overlay {
+            Some(_) => self.draft_actor(client),
+            None => self.actor(client),
+        }
+    }
+
+    /// A draft's record: the parsed document with the WHOLE of it kept in the
+    /// `content` column, and the permalink the row will answer to - the
+    /// frontmatter's when it carries one, the path's slug when it does not.
+    pub(crate) fn overlay_record(path: &str, text: &str) -> Result<EngramRecord> {
+        let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let mut record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
+        record.content = text.to_string();
+        Ok(record)
+    }
+
+    /// Write one actor's deletion of a base row: a tombstone row standing at
+    /// that path under the base row's own identity, and its mirror.
+    ///
+    /// The row is chunkless, which is the same shape the journal restore
+    /// writes, so the two paths produce one thing rather than two: a deletion's
+    /// text does not belong in the embedding backlog, and an actor who deletes
+    /// a draft they had been writing must not leave that draft's chunks behind.
+    /// [`Store::upsert_overlay`] keeps the row id stable across rewrites, so
+    /// the chunks are cleared explicitly rather than left keyed to it.
+    ///
+    /// Answers `Some(warning)` for a mirror that failed after the row landed,
+    /// for the reason [`Engine::write_overlay_entry`] gives at length.
+    pub(crate) async fn write_overlay_tombstone(
+        &self,
+        domain: &str,
+        actor: &str,
+        desc: &EngramDescriptor,
+        base_text: &str,
+    ) -> Result<Option<String>> {
+        let state_dir = self.journal_state_dir()?;
+        let record = EngramRecord {
+            path: desc.path.clone(),
+            // The path, not the base row's permalink, and this is forced
+            // rather than chosen: the index holds one permalink per actor per
+            // domain (`idx_engram_permalink_actor`), and a move writes a
+            // tombstone at the source and an entry at the destination, both
+            // inheriting the one permalink the base row carries. A tombstone
+            // is not an engram and answers to no address - every reader finds
+            // it by path and skips it - so the column holds the row's own
+            // identity in this actor's dimension instead. The journal restore
+            // rebuilds a tombstone the same way, so the two shapes stay one.
+            permalink: desc.path.clone(),
+            title: desc.title.clone(),
+            engram_type: desc.engram_type.clone(),
+            status: desc.status.clone(),
+            recorded_at: None,
+            valid_from: None,
+            valid_to: None,
+            timestamp: None,
+            description: None,
+            content: base_text.to_string(),
+            metadata: Value::Object(serde_json::Map::new()),
+            tags: Vec::new(),
+            observations: Vec::new(),
+            relations: Vec::new(),
+            links: Vec::new(),
+            stamp: virtual_stamp(base_text),
+            actor: String::new(),
+            tombstone: true,
+        };
+        self.commit_overlay_row(desc.domain_id, actor, &record)
+            .await?;
+        let warning = match crate::overlay_journal::journal_tombstone(
+            &state_dir, domain, actor, &desc.path,
+        ) {
+            Ok(()) => None,
+            Err(e) => Some(unmirrored(domain, actor, &desc.path, &e, true)),
+        };
+        if let Some(text) = &warning {
+            tracing::warn!(domain, actor, path = desc.path.as_str(), "{text}");
+        }
+        Ok(warning)
+    }
+
+    /// The row half of both overlay writers, in one transaction: the row, its
+    /// chunks (none for a tombstone) and the forward references it settles.
+    pub(crate) async fn commit_overlay_row(
+        &self,
+        domain_id: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<()> {
+        let store = self.store.lock().await;
+        store.begin().await?;
+        let written = async {
+            let id = store.upsert_overlay(domain_id, actor, record).await?;
+            let chunks = if record.tombstone {
+                Vec::new()
+            } else {
+                chunk_engram(
+                    &record.title,
+                    record.description.as_deref(),
+                    &record.content,
+                    &self.chunk_params,
+                )
+            };
+            store.replace_chunks(id, &chunks).await?;
+            // This author's own rows, re-resolved in this author's own view -
+            // and the base resolvers deliberately NOT run here. They resolve
+            // against the base alone, so they could never bind what a draft
+            // write just created, and running them first would settle the new
+            // draft's links onto base rows before the author's own rows got
+            // their preference. There is nothing for them to do either way: an
+            // overlay write adds no base row.
+            store.reresolve_actor_references(domain_id, actor).await?;
+            Ok::<(), EngineError>(())
+        }
+        .await;
+        match written {
+            Ok(()) => {
+                store.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = store.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Take every draft the team's folder has caught up with out of the
+    /// overlay, and count what is left standing against a base that moved.
+    ///
+    /// The clear-only pass: with no pull to attribute a divergence to, this
+    /// ends what has landed and finds no new conflicts. The pull paths run the
+    /// same walk with what the pull applied, which is what switches the
+    /// conflicts on.
+    ///
+    /// **It settles nothing it did not clear.** Every conflict standing in the
+    /// domain's record is left exactly as it was, and only the paths this pass
+    /// took out of the overlay leave it: a maintenance sweep that ended landed
+    /// drafts must never be the reason an actor's surfaced conflict disappears.
+    ///
+    /// Takes the domain's origin lock, which the inner pass deliberately does
+    /// not: every other writer of the convergence record - the two pull paths,
+    /// a share, a withdrawal and a resolution - is already inside it, and the
+    /// record is saved as one whole struct, so a writer outside the lock could
+    /// load it before somebody else's edit and save over it afterwards. This is
+    /// the one entry point with no caller holding the lock for it, so it takes
+    /// it itself.
+    pub async fn converge_overlays(&self, domain: &str) -> Result<ConvergenceReport> {
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
+        self.converge_pulled_overlays(domain, &[]).await
+    }
+
+    /// The convergence pass a pull runs, given the paths that pull applied.
+    ///
+    /// **Where it runs.** After every pull that advanced the base: the engine's
+    /// own pull path ([`Engine::origin_update_one`]), which is the poller's too
+    /// (`origin_poll_tick` decides which domains are due and delegates the pull
+    /// here, so polling and on-demand updating stay one code path), and the
+    /// pull a share of a reviewing domain opens with
+    /// ([`Engine::overlay_share_tree`]) - that pull advances the base like any
+    /// other, and a draft the team has since merged would otherwise be proposed
+    /// straight back at them.
+    ///
+    /// **What converges.** A draft whose bytes are now the base's own bytes has
+    /// become the folder, and a tombstone converges when the path it deletes is
+    /// no longer in the base. Both are read against the base SNAPSHOT under the
+    /// state directory rather than the files beside it, for the reason
+    /// [`crate::share_staging::build`] reads the same copies: a stray direct
+    /// edit of the reviewed folder is nobody's draft and must not be mistaken
+    /// for what the team reviewed. Neither test needs to know what the pull
+    /// did, so both are asked of every entry.
+    ///
+    /// **What diverges.** An entry at a path this pull applied that did not
+    /// converge: the team's answer at that path moved and the author's draft
+    /// still says the older thing. Scoped to the applied paths on purpose - a
+    /// draft that simply has not been shared yet is unshared work, not a
+    /// conflict, and calling every one of them a conflict after every unrelated
+    /// pull would make the count say nothing.
+    ///
+    /// **An address the pull brings in.** A base file this pull applied whose
+    /// permalink a live draft holds at another path is that author's
+    /// divergence too - recorded and surfaced, never a silent drop of the draft
+    /// and never a rewrite of what the team reviewed. It has to surface because
+    /// nothing downstream can carry both rows: a search merges its hits by
+    /// permalink and would drop one of the two without a word, and a draft
+    /// holding an address the reviewed folder already spends could never be
+    /// folded back into that folder. It is the read-side twin of
+    /// [`Engine::refuse_permalink_held_elsewhere`] and deliberately not that
+    /// function: this one asks the base snapshot, which is current the moment
+    /// the pull lands, while the index rows behind `find_engram` are only
+    /// current once the sync after it has run.
+    ///
+    /// **A base path the pull RENAMED takes the draft with it** (ruling: the
+    /// draft moves with the base rather than clearing, because the draft's
+    /// content still applies - the team filed the same page under a new name,
+    /// and ending the draft would throw away work nobody asked to end). The
+    /// signal is the address plus the deletion: the pull removed the base at
+    /// the draft's path and a base it applied now answers to the address that
+    /// draft holds. Row and mirror move as ONE, through
+    /// [`Engine::drop_overlay_entry`] and [`Engine::write_overlay_entry`] - a
+    /// move that took the row and left the mirror would put the draft back at
+    /// the old path on the next `reindex --wipe`. A destination this actor is
+    /// already drafting at is a divergence instead: two drafts are never merged
+    /// behind their author's back. A local `move_engram` cannot produce this
+    /// case at all, because in review mode it moves within the acting actor's
+    /// own overlay and never renames a base path, which is why upstream is the
+    /// only way in and why this is where the answer lives.
+    ///
+    /// **A tombstone at a renamed path clears**, and that is the honest answer
+    /// rather than a better one: a tombstone's permalink is its own path by
+    /// design ([`Engine::write_overlay_tombstone`] says why), so it carries no
+    /// address for a rename to be recognized by, and the base it deleted is
+    /// gone. The page reappears for that actor under its new name.
+    ///
+    /// **The record is MERGED, never rebuilt.** A conflict is a fact about one
+    /// actor's draft, not about the pull that happened to notice it, so a path
+    /// this pass did not touch keeps whatever it was: a path that converged
+    /// leaves the record, a path this pass found diverged goes in (replacing
+    /// only its own entry), and a path standing from an earlier pull stays
+    /// standing. Rebuilding it would mean the next pull about an unrelated file
+    /// silently dropping a conflict the machinery had already surfaced, which
+    /// on a ticking poller is a window one tick wide. The only other ways out
+    /// of the record are the entry itself going away - an actor who no longer
+    /// holds a row at a path has no conflict there - and a resolution
+    /// (`Engine::settle_convergence`).
+    ///
+    /// A recorded conflict cannot go stale while it stands. Byte-equality is
+    /// asked of EVERY entry on every pass, whatever the pull touched (see
+    /// `settle_overlay_entry`'s first arm), so an author who edits their draft
+    /// until it says what the folder says has it cleared by the next pass
+    /// rather than left listed. What a merge preserves is only the case that is
+    /// still true: a draft that still differs from the base that moved under
+    /// it.
+    ///
+    /// A domain that takes changes directly returns at the first line and
+    /// touches nothing - no store read, no base file, no journal.
+    async fn converge_pulled_overlays(
+        &self,
+        domain: &str,
+        touched: &[String],
+    ) -> Result<ConvergenceReport> {
+        if !self.reviews_changes(domain) {
+            return Ok(ConvergenceReport::default());
+        }
+        let Ok((_, _, state_dir)) = self.origin_spec_for_domain(domain) else {
+            // A reviewing domain with no origin has no base snapshot to
+            // converge against. Nothing to do and nothing to report.
+            return Ok(ConvergenceReport::default());
+        };
+        // The read-only id lookup, never an upserting one: a domain this index
+        // has never been told about holds no drafts, and asking must not
+        // register one.
+        let (domain_id, mut held) = {
+            let store = self.store.lock().await;
+            let Some(domain_id) = store.domain_id(domain).await? else {
+                return Ok(ConvergenceReport::default());
+            };
+            let mut held: Vec<ActorHolding> = Vec::new();
+            for (actor, _) in store.overlay_counts(domain_id).await? {
+                let entries = store.overlay_entries(domain_id, &actor).await?;
+                held.push(ActorHolding {
+                    actor,
+                    entries,
+                    files: Vec::new(),
+                });
+            }
+            (domain_id, held)
+        };
+        // The files beside the rows, and the actor set is their UNION: an actor
+        // holding nothing but files is in no `overlay_counts` answer, so a pass
+        // drawn from the rows alone would never look at their files at all -
+        // neither to clear one the team has caught up with nor to record the
+        // conflict when it has not.
+        //
+        // A files overlay that could not be read is not an empty one, so this
+        // pass leaves those actors' files exactly where they stand rather than
+        // reporting them settled; the rows still converge, and the next pull
+        // looks again.
+        {
+            let files = self.overlay_domain_files(domain);
+            for (actor, read) in files.per_actor {
+                if files.unreadable || read.unreadable {
+                    tracing::warn!(
+                        domain,
+                        actor = actor.as_str(),
+                        "the files '{actor}' has drafted could not be listed, so this pull \
+                         converged their rows and left their files where they stand"
+                    );
+                    continue;
+                }
+                match held.iter_mut().find(|holding| holding.actor == actor) {
+                    Some(holding) => holding.files = read.entries,
+                    None => held.push(ActorHolding {
+                        actor,
+                        entries: Vec::new(),
+                        files: read.entries,
+                    }),
+                }
+            }
+        }
+        // **Two state directories, and they are not interchangeable.**
+        // `state_dir` above is this domain's own origin state, which is where
+        // the base snapshot's copies live; `journal_dir` is the machine's
+        // overlay root, which is where the drafts and their files live. A read
+        // of one under the other finds nothing and says so quietly.
+        let journal_dir = self.journal_state_dir()?;
+        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        // A conflict in a draft nobody holds any more is not a conflict. The
+        // prune runs whatever the pass then decides, so an actor whose rows all
+        // went away leaves no entry behind either.
+        prune_settled_conflicts(&mut record, &held);
+        if held
+            .iter()
+            .all(|holding| holding.entries.is_empty() && holding.files.is_empty())
+        {
+            record.cleared = 0;
+            let report = ConvergenceReport {
+                cleared: 0,
+                diverged: record.diverged(),
+            };
+            self.save_convergence(&journal_dir, domain, &record);
+            return Ok(report);
+        }
+        let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
+        let addresses = pulled_addresses(&state_dir, &touched)?;
+
+        let mut cleared = 0u64;
+        for ActorHolding {
+            actor,
+            entries,
+            files,
+        } in &held
+        {
+            // Named here because convergence answers to nobody: it is a
+            // comparison of the base snapshot against each actor's entries, so
+            // it reads BOTH sides raw and never through a projection of one
+            // over the other. The view is used only as the writer that ends a
+            // converged draft, which is why it screens nothing.
+            let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+            let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+            for entry in entries {
+                let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
+                match settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own) {
+                    Settle::Leave => {}
+                    Settle::Clear => {
+                        view.drop(domain_id, &entry.path).await?;
+                        record.settle(actor, &entry.path);
+                        cleared += 1;
+                    }
+                    Settle::Diverge => record.diverge(actor, &entry.path),
+                    Settle::MoveTo(dest) => {
+                        match self
+                            .move_draft_with_the_base(
+                                domain, domain_id, actor, &state_dir, entry, &dest,
+                            )
+                            .await
+                        {
+                            // The draft stands somewhere else now, or it has
+                            // become the folder: either way nothing is left at
+                            // the old path for a conflict to be about.
+                            Ok(landed) => {
+                                record.settle(actor, &entry.path);
+                                if landed {
+                                    cleared += 1;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    domain,
+                                    actor = actor.as_str(),
+                                    path = entry.path.as_str(),
+                                    "the base moved to '{dest}' and this draft could not follow \
+                                     it, so it stands where it was: {e}"
+                                );
+                                record.diverge(actor, &entry.path);
+                            }
+                        }
+                    }
+                }
+            }
+            // And their files, in the same pass and into the same record: a
+            // conflict is one actor's conflict at one path, whatever kind of
+            // thing stands there.
+            for file in files {
+                let base = crystalline_remote::state::read_base_file(&state_dir, &file.path)?;
+                let bytes = if file.tombstone {
+                    None
+                } else {
+                    crate::overlay_files::read(&journal_dir, domain, actor, &file.path).map_err(
+                        |source| EngineError::Io {
+                            path: format!("the files overlay of '{domain}' at '{}'", file.path),
+                            source,
+                        },
+                    )?
+                };
+                match settle_overlay_file(file, base.as_deref(), bytes.as_deref(), &touched) {
+                    Settle::Clear => {
+                        crate::overlay_files::clear(&journal_dir, domain, actor, &file.path)
+                            .map_err(|source| EngineError::Io {
+                                path: format!("the files overlay of '{domain}' at '{}'", file.path),
+                                source,
+                            })?;
+                        record.settle(actor, &file.path);
+                        cleared += 1;
+                    }
+                    Settle::Diverge => record.diverge(actor, &file.path),
+                    // A file answers to no address, so no rename can carry one:
+                    // `settle_overlay_file` never answers `MoveTo`, and if it
+                    // ever did the honest thing would be to leave the bytes
+                    // where their author put them.
+                    Settle::Leave | Settle::MoveTo(_) => {}
+                }
+            }
+            // Once this actor's entries have settled, their references are read
+            // again against what they hold now: a draft this pass ended takes
+            // its address back to the base row at that path, and one that moved
+            // with a renamed base carries its links to the new name. This is
+            // the spec's "re-resolved on the next convergence pass", and it is
+            // the one pass that sees every one of an actor's rows at once.
+            if !entries.is_empty() {
+                let store = self.store.lock().await;
+                store.reresolve_actor_references(domain_id, actor).await?;
+            }
+        }
+        record.cleared = cleared;
+        let report = ConvergenceReport {
+            cleared,
+            diverged: record.diverged(),
+        };
+        self.save_convergence(&journal_dir, domain, &record);
+        Ok(report)
+    }
+
+    /// Write one domain's convergence record, and never fail a pull over it.
+    ///
+    /// The record is a report, and the rows and mirrors it describes have
+    /// already moved by the time it is written: failing here would turn a
+    /// record this machine could not save into a failed pull over work that
+    /// landed, so it only warns.
+    ///
+    /// **That "the next pass corrects it" is only half true.** A stale record
+    /// is a subset of the truth for an entry that is still there but should
+    /// have been cleared - the next pass that touches that path settles it
+    /// correctly either way. It is not a subset for an entry that is MISSING:
+    /// a path that diverged this pass and never made it into the saved
+    /// record because the save failed settles as `Leave` on every later pass
+    /// that does not touch it again, forever. Not a regression against the
+    /// in-memory record this replaced, which had the same window (a crash
+    /// before it was written loses it the same way) and a wider one (it did
+    /// not survive a restart at all either), so this is a known gap rather
+    /// than new behaviour.
+    ///
+    /// **Every caller holds the domain's origin lock.** The whole struct is
+    /// written at once - the conflicts and the proposal owners beside them - so
+    /// two writers that both loaded before either saved would lose one of the
+    /// two edits, and the lock is what makes that impossible. The writers are
+    /// the two pull paths ([`Engine::origin_update_one`] and the pull a share
+    /// opens with), a share recording whose the proposal is, a withdrawal
+    /// forgetting it, a resolution settling one path, and
+    /// [`Engine::converge_overlays`], which takes the lock itself because
+    /// nothing takes it for that one.
+    fn save_convergence(
+        &self,
+        journal_dir: &Path,
+        domain: &str,
+        record: &crate::overlay_journal::ConvergenceRecord,
+    ) {
+        if let Err(e) = crate::overlay_journal::journal_save_record(journal_dir, domain, record) {
+            tracing::warn!(domain, "the convergence record could not be saved: {e}");
+        }
+    }
+
+    /// Move one draft from the path the pull emptied to the path the same
+    /// address now stands at. Answers whether it converged there instead.
+    ///
+    /// The source goes first and the destination second, which is the order
+    /// [`Engine::move_within_overlay`] is forced into for the same reason: one
+    /// actor holds one row per permalink per domain, so until the source is
+    /// gone the destination cannot take the address. Which is why a failed
+    /// destination puts the source back - through the unchecked writer, since
+    /// what it restores is the state the check had already allowed and the
+    /// text lives in that row and nowhere else.
+    ///
+    /// The destination's mirror is the one half that can fail on its own
+    /// without unsaying anything: [`Engine::put_overlay_entry`] writes the row
+    /// first and answers a failed mirror as a warning, which is the convention
+    /// every overlay write in this file follows. So the move is row-and-mirror
+    /// together in intent and the warning is logged rather than swallowed; the
+    /// row is what the index serves, and the next `reindex --wipe` is what
+    /// would notice the difference.
+    async fn move_draft_with_the_base(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        state_dir: &Path,
+        entry: &StoredEngram,
+        dest: &str,
+    ) -> Result<bool> {
+        let landed = crystalline_remote::state::read_base_file(state_dir, dest)?
+            .is_some_and(|base| base == entry.content.as_bytes());
+        let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+        // The removal defers the ending of this draft's share-links and joins,
+        // because a move that could not write its destination puts the source
+        // back and did not happen - and a move that did not happen must not
+        // have ended anybody's link on the way to not happening. Every way out
+        // of here below either ends them or is that failure.
+        view.drop_mid_move(domain_id, &entry.path).await?;
+        if landed {
+            // The rename carried this actor's own words with it: the draft is
+            // the folder now, under its new name. There is no destination to
+            // wait for and nothing left to share - everybody who can read the
+            // domain reads that text anyway - so the links end here.
+            self.end_draft_grants(domain, actor, &entry.path).await;
+            return Ok(true);
+        }
+        match view.write(domain_id, dest, &entry.content).await {
+            Ok(None) => {}
+            // The row landed and its mirror did not. Logged rather than
+            // swallowed: the index serves the row either way, and it is the
+            // next `reindex --wipe` that would notice the difference.
+            Ok(Some(warning)) => tracing::warn!(domain, actor, path = dest, "{warning}"),
+            Err(e) => {
+                if let Err(undo) = view
+                    .write_unchecked(domain_id, &entry.path, &entry.content)
+                    .await
+                {
+                    tracing::error!(
+                        domain,
+                        actor,
+                        path = entry.path.as_str(),
+                        "a draft could not follow the base to '{dest}' and could not be put back \
+                         either: {undo}"
+                    );
+                }
+                return Err(e);
+            }
+        }
+        // The draft stands somewhere else now, so the links minted on the path
+        // it left end with it: a grant was minted on a path, and re-sharing the
+        // page under its new name is the author's to do.
+        self.end_draft_grants(domain, actor, &entry.path).await;
+        Ok(false)
+    }
+
+    /// What the last convergence has to say to one caller, or `None` when
+    /// nothing has ever converged this domain.
+    ///
+    /// Read off the record beside the journal rather than out of memory, which
+    /// is what makes a conflict survive a restart: the pass that found it may
+    /// have run in a process that is long gone.
+    ///
+    /// The counts are the domain's; the paths are the caller's own and nobody
+    /// else's. Whoever holds the domain additionally sees how many each actor
+    /// is holding open - the same split, and the same shape, Task 8's `drafts`
+    /// key already reports counts in, and for the same reason: a count of
+    /// somebody's unsettled work is a coordination fact, and what the draft
+    /// says is theirs alone.
+    fn converged_json(&self, domain: &str, actor: Option<&str>, everyone: bool) -> Option<Value> {
+        let journal_dir = self.journal_state_dir().ok()?;
+        let record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        // Absent until a convergence pass has actually run here. The record can
+        // exist for another reason - it also remembers whose open proposal is
+        // whose - and a key that appeared the moment somebody shared would say
+        // "a pull converged nothing" where nothing had looked yet, which is the
+        // distinction this key's absence is FOR. It cannot always keep that
+        // promise, though: a pass that ran and genuinely cleared nothing,
+        // raising no conflict, leaves `cleared == 0` with `conflicts` empty
+        // exactly like a domain nobody has ever pulled - this check answers
+        // `None` for either, and the two conflate here.
+        if record.cleared == 0 && record.conflicts.is_empty() {
+            return None;
+        }
+        let mine: &[String] = actor
+            .and_then(|who| record.conflicts.get(who))
+            .map_or(&[], Vec::as_slice);
+        let mut value = json!({
+            "cleared": record.cleared,
+            "diverged": record.diverged(),
+            "mine": mine,
+        });
+        if everyone && let Some(object) = value.as_object_mut() {
+            let counts: Vec<(String, u64)> = record
+                .conflicts
+                .iter()
+                .map(|(actor, paths)| (actor.clone(), paths.len() as u64))
+                .collect();
+            object.insert("actors".to_string(), json!(review::counts_json(&counts)));
+        }
+        Some(value)
+    }
+
+    /// Take one path out of one actor's recorded conflicts, and answer how
+    /// many they have left. A resolution settles it whichever way it went, so
+    /// this runs for every arm.
+    ///
+    /// `cleared` beside it is deliberately left alone: it counts what the last
+    /// convergence pass took out of the overlay, which a later resolution
+    /// cannot change, so after a resolve the two numbers no longer sum to what
+    /// that pass saw and that is the honest arithmetic rather than a drift.
+    fn settle_convergence(&self, domain: &str, actor: &str, path: &str) -> u64 {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return 0;
+        };
+        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        let left = record.settle(actor, path);
+        self.save_convergence(&journal_dir, domain, &record);
+        left
+    }
+
+    /// Settle one actor's recorded conflict at one FILE path, under the
+    /// domain's origin lock, and only when there is one to settle.
+    ///
+    /// **The lock is the point.** [`Engine::save_convergence`] writes the whole
+    /// record at once - the conflicts and the proposal owners beside them - so
+    /// two writers that both loaded before either saved lose one of the two
+    /// edits, and its doc states that every caller holds the domain's origin
+    /// lock. [`Engine::origin_resolve`] earns its place on that list by taking
+    /// one; an upload is not an origin verb and holds nothing of its own, so it
+    /// takes the lock here. Without it a draft upload racing a poller tick's
+    /// pull would drop another actor's conflicts, or the record of whose open
+    /// proposal is whose.
+    ///
+    /// **The read in front of it is not an optimization alone.** Every draft
+    /// upload would otherwise do a full read-modify-write of the record and
+    /// queue behind the domain's origin lock to do it, for a path that is not in
+    /// conflict at all - which is every upload but the rare one. A record this
+    /// read finds nothing in is a record this call has nothing to say about, and
+    /// a conflict that appears between the read and the lock is recorded by a
+    /// pull that has not finished yet, so the next write of the same path
+    /// settles it.
+    ///
+    /// **A lock that cannot be taken skips the settle rather than failing the
+    /// write.** A reviewing domain always has an origin (the mode requires one),
+    /// so this is the domain being unregistered underneath; losing somebody's
+    /// upload over a bookkeeping write would be the wrong way round.
+    async fn settle_file_convergence(&self, domain: &str, actor: &str, path: &str) {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return;
+        };
+        let record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        if !record
+            .conflicts
+            .get(actor)
+            .is_some_and(|paths| paths.iter().any(|held| held == path))
+        {
+            return;
+        }
+        let Ok(lock) = self.origin_lock_registered(domain) else {
+            tracing::warn!(
+                domain,
+                actor,
+                path,
+                "a draft file was written at a path recorded as a conflict, and the domain's \
+                 origin lock could not be taken to settle it; the record is behind until the \
+                 next write of this path"
+            );
+            return;
+        };
+        let _guard = lock.lock().await;
+        self.settle_convergence(domain, actor, path);
+    }
+
+    /// Record which overlay actor a proposal belongs to, or forget one that has
+    /// been withdrawn.
+    ///
+    /// Best effort: what this feeds is the wording of a refusal, never a write
+    /// of anybody's knowledge, and a proposal whose owner is not recorded reads
+    /// as somebody else's - which is the safe way round, since it never tells
+    /// one actor to withdraw a proposal that is not theirs.
+    ///
+    /// **Last writer wins, not first**, which matters only once more than one
+    /// actor can touch one open proposal: while `REVIEW_NO_STACKING` refuses a
+    /// second actor's share against an open proposal, this is never called
+    /// twice for the same number by two different actors, so the map's one
+    /// entry is always the opener's. If a later design serves stacked
+    /// proposals and calls this for a second sharer, the insert here
+    /// overwrites the recorded owner with the last sharer rather than keeping
+    /// the opener - the map is also never pruned of a merged or closed
+    /// proposal, only a withdrawn one. Both are tracked in `plans/backlog.md`
+    /// beside the per-actor proposal chain entry, not fixed here: neither is
+    /// reachable while one proposal at a time is enforced upstream of this
+    /// map.
+    fn record_proposal_actor(&self, domain: &str, number: u64, actor: Option<&str>) {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return;
+        };
+        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        match actor {
+            Some(actor) => {
+                record
+                    .proposals
+                    .insert(number.to_string(), actor.to_string());
+            }
+            None => {
+                record.proposals.remove(&number.to_string());
+            }
+        }
+        self.save_convergence(&journal_dir, domain, &record);
     }
 
     /// The content source to read a resolved engram through: a locally
@@ -1427,22 +3316,47 @@ impl Engine {
         })
     }
 
+    /// [`Engine::domain_entry`] for a scoped read: a domain the caller may not
+    /// see is answered exactly as a domain nobody registered.
+    ///
+    /// Both halves matter. The hidden name errors instead of resolving, and the
+    /// error's `registered` list has the hidden names taken out of it - an
+    /// unfiltered list would name every private domain on the instance in the
+    /// error text of a request for a domain that does not exist.
+    fn domain_entry_scoped(&self, name: &str, hidden: &HashSet<String>) -> Result<DomainEntry> {
+        if hidden.contains(name) {
+            return Err(self.unknown_domain(name, hidden));
+        }
+        match self.domain_entry(name) {
+            Err(EngineError::UnknownDomain { domain, .. }) => {
+                Err(self.unknown_domain(&domain, hidden))
+            }
+            other => other,
+        }
+    }
+
+    /// The [`EngineError::UnknownDomain`] a scoped caller gets: the registered
+    /// set it names, minus what the caller may not see. A hidden domain and a
+    /// name nobody ever registered produce the same bytes, which is the point -
+    /// existence is the secret being kept.
+    fn unknown_domain(&self, name: &str, hidden: &HashSet<String>) -> EngineError {
+        EngineError::UnknownDomain {
+            domain: name.to_string(),
+            registered: self
+                .known_domain_names()
+                .into_iter()
+                .filter(|known| !hidden.contains(known))
+                .collect(),
+        }
+    }
+
     /// Re-read the global config from disk looking for a domain registered
     /// after this engine started. A hit is cached in `discovered_domains` and,
     /// for a file domain on the daemon, reported over `watch_tx` so the watcher
     /// starts watching its root without a restart. A virtual domain has no root,
     /// so it is cached but never watched.
     fn refresh_domain(&self, name: &str) -> Option<DomainEntry> {
-        // Re-read the same file this engine persists to (its `--config`
-        // override, else the default global path) and layer the overlay back
-        // on, so a post-startup re-read sees the same effective config a fresh
-        // load would, environment overrides included.
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
-            None => crystalline_core::config::global_config_path().ok()?,
-        };
-        let file = overlay::load_file(&path).ok()?;
-        let fresh = self.overlay.apply(&file);
+        let fresh = self.reread_config()?;
         let entry = fresh.domains.get(name)?.clone();
         self.discovered_domains
             .write()
@@ -1457,8 +3371,150 @@ impl Engine {
         Some(entry)
     }
 
-    /// Every domain name this engine currently knows about: the startup
-    /// snapshot plus anything discovered since.
+    /// The effective config as the file has it right now: the same file this
+    /// engine persists to (its `--config` override, else the default global
+    /// path) with the environment overlay layered back on, so a post-startup
+    /// re-read sees what a fresh load would, environment overrides included.
+    /// `None` when the path cannot be resolved or the file cannot be read.
+    ///
+    /// Shared by [`Engine::refresh_domain`], which caches what it finds and
+    /// arms a watch for it, and [`Engine::diagnostic_file_domains`], which
+    /// deliberately does neither. Keep the two together: they read the same
+    /// file the same way and only differ in what they do with the answer.
+    fn reread_config(&self) -> Option<GlobalConfig> {
+        let path = self.config_file_path()?;
+        let file = overlay::load_file(&path).ok()?;
+        Some(self.overlay.apply(&file))
+    }
+
+    /// The configuration file this engine reads and persists to: its
+    /// `--config` override, else the default global path. `None` when the
+    /// default path cannot be resolved at all (no home directory to put it
+    /// in), which is the one case where there is no file to speak of.
+    ///
+    /// Says nothing about whether the file exists or parses; a caller that
+    /// needs to know reads it.
+    fn config_file_path(&self) -> Option<PathBuf> {
+        match &self.config_path {
+            Some(p) => Some(p.clone()),
+            None => crystalline_core::config::global_config_path().ok(),
+        }
+    }
+
+    /// The file domains a diagnostic read covers, as `(name, root)` pairs:
+    /// everything [`Engine::sync_targets`] would sync, plus every file domain
+    /// the config file names right now, so a domain registered after this
+    /// daemon started is diagnosed rather than reported as entirely
+    /// unindexed. `only` narrows the set to one domain; naming a virtual
+    /// domain is an empty answer (a virtual domain has no files to stamp),
+    /// and naming a domain nobody registered is an error.
+    ///
+    /// Deliberately not routed through [`Engine::domain_entry`]: that path
+    /// ends in [`Engine::refresh_domain`], which caches the hit and arms a
+    /// watch, so merely diagnosing a domain would start indexing it and the
+    /// "not indexed yet" a report just printed would quietly fix itself
+    /// behind the reader's back. A diagnosis only reads.
+    fn diagnostic_file_domains(&self, only: Option<&str>) -> Result<Vec<(String, PathBuf)>> {
+        let mut targets = self.sync_targets(None)?;
+        let fresh = self.reread_config();
+        if let Some(fresh) = &fresh {
+            for (name, entry) in &fresh.domains {
+                if targets.iter().any(|(n, _)| n == name) {
+                    continue;
+                }
+                if let Some(root) = entry.file_path().filter(|_| !entry.is_virtual()) {
+                    targets.push((name.clone(), root));
+                }
+            }
+        }
+        if let Some(name) = only {
+            let registered = self.known_domain_names().iter().any(|n| n == name)
+                || fresh.is_some_and(|c| c.domains.contains_key(name));
+            if !registered {
+                return Err(EngineError::UnknownDomain {
+                    domain: name.to_string(),
+                    registered: self.known_domain_names(),
+                });
+            }
+            targets.retain(|(n, _)| n == name);
+        }
+        Ok(targets)
+    }
+
+    /// Every domain name this instance has a registration for, resolved the way
+    /// a *named* lookup resolves one: the startup snapshot, the discovered
+    /// overlay, then a re-read of the configuration file on disk - the three
+    /// tiers of [`Engine::domain_entry`], so what one verb calls registered
+    /// another cannot call an orphan.
+    ///
+    /// A union of the three and not a replacement by the newest: the file is
+    /// not a superset of the snapshot (an engine can be built over a
+    /// configuration that was never written to that file, which is what a
+    /// one-shot command and every test engine are), and `domain_entry` is an OR
+    /// across the tiers, so this is too.
+    ///
+    /// One file read per call, never one per name, and never a write: unlike
+    /// [`Engine::refresh_domain`] nothing found here is cached into the
+    /// discovered overlay and no watch is armed for it, because merely asking
+    /// whether a domain is registered must not start indexing it. The file read
+    /// failing is read as no further registrations, so the answer narrows and
+    /// never widens on an unreadable configuration.
+    ///
+    /// **This is the set collection may key on.** A caller deciding that rows
+    /// are collectable, or stamping `last_registered` for one that is not, must
+    /// resolve "registered" through here rather than through
+    /// [`Engine::known_domain_names`], whose two tiers miss a registration this
+    /// process has never been asked about by name.
+    pub fn registered_domain_names(&self) -> HashSet<String> {
+        let mut names: HashSet<String> = self.known_domain_names().into_iter().collect();
+        if let Some(fresh) = self.reread_config() {
+            names.extend(fresh.domains.keys().cloned());
+        }
+        names
+    }
+
+    /// [`Engine::registered_domain_names`] for the one caller that may not
+    /// accept a narrowed answer: `None` when the configuration file could not
+    /// be read, `Some` of the same three-tier union when it could.
+    ///
+    /// The difference is the whole point. Serving narrows on an unreadable
+    /// file and is right to: the worst it costs is a domain that is not
+    /// answered for until the file is readable again. A caller that DELETES on
+    /// absence cannot narrow, because a file it could not read is not evidence
+    /// that anything is absent from it - and a file that is not there at all
+    /// is indistinguishable from one in which every domain was just removed.
+    /// So a missing file is `None` here as surely as an unparseable one, even
+    /// though [`overlay::load_file`] reads a missing file as an empty
+    /// configuration (which is the right answer for every other caller: an
+    /// installation configured entirely by environment variables has no file
+    /// and is not misconfigured).
+    ///
+    /// Still the union of all three tiers, never the file alone: the file is
+    /// not a superset of the startup snapshot, and a domain registered in the
+    /// snapshot is registered.
+    fn registered_domain_names_checked(&self) -> Option<HashSet<String>> {
+        let path = self.config_file_path()?;
+        if !path.is_file() {
+            return None;
+        }
+        let file = overlay::load_file(&path).ok()?;
+        let fresh = self.overlay.apply(&file);
+        let mut names: HashSet<String> = self.known_domain_names().into_iter().collect();
+        names.extend(fresh.domains.keys().cloned());
+        Some(names)
+    }
+
+    /// Every domain name this engine has been *told* about: the startup
+    /// snapshot plus anything a named lookup has discovered since.
+    ///
+    /// Two of the three tiers [`Engine::domain_entry`] resolves through, so it
+    /// is not the registered set and must not be used as one: a domain the
+    /// configuration file gained since startup, and that nothing has named
+    /// here yet, is registered and absent from this. It names what this
+    /// instance is currently syncing and what an error message may list, both
+    /// of which want the cheap in-memory answer. Use
+    /// [`Engine::registered_domain_names`] to decide whether a domain is
+    /// registered at all.
     fn known_domain_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .config
@@ -1474,8 +3530,13 @@ impl Engine {
 
     /// Forget a domain removed by `domain remove` while this engine is live:
     /// drop it from the discovered overlay and, on the daemon, tell the
-    /// watcher to stop watching its root. The index rows are never touched
-    /// here; they are left for the next full reindex.
+    /// watcher to stop watching its root.
+    ///
+    /// The index rows are not touched here because they are not this
+    /// function's business: `domain_remove` clears them in the same removal,
+    /// and any that outlive it (a removal on another instance, an upgrade that
+    /// inherited them) are the orphan collector's, which ages them out on the
+    /// daemon's sweep. A reindex is never the remedy for a row.
     pub fn forget_domain(&self, name: &str) {
         self.discovered_domains.write().unwrap().remove(name);
         if let Some(tx) = &self.watch_tx {
@@ -1498,25 +3559,184 @@ impl Engine {
         identifier: &str,
         domain: Option<&str>,
     ) -> Result<(EngramDescriptor, ContentSource)> {
+        self.resolve_scoped(identifier, domain, &HashSet::new())
+            .await
+    }
+
+    /// [`Engine::resolve`] for a call that has already named the domain it acts
+    /// on: an identifier may not move the call to a different one.
+    ///
+    /// Every write verb takes a `domain` beside its identifier, and every
+    /// surface gates on THAT name - the REST layer resolves the caller's rights
+    /// for it before the verb runs, and an MCP tool call is gated the same way.
+    /// The absolute `crystalline://` form, though, overrides the domain hint
+    /// wherever it is accepted ([`Engine::resolve_scoped`]'s first branch), so
+    /// a write that resolved it would act on a domain nobody gated: a move out
+    /// of a private domain into a readable one, a superseded pair written into
+    /// a private engram's file, an `evolve_ack` stamped into one. The reads
+    /// are safe because they resolve through the scoped resolver and a hidden
+    /// domain is simply absent from it; the writes carry the acting scope but
+    /// resolve nothing with it, and this is the boundary that makes that
+    /// unnecessary.
+    ///
+    /// So the rule is the narrow one that costs nothing legitimate: on a call
+    /// that names a domain, an absolute identifier naming a DIFFERENT one is
+    /// refused. The same-domain absolute form still resolves, and a bare
+    /// permalink or title is domain-relative as it always was. The refusal is
+    /// the [`EngineError::NotFound`] a missing engram produces, built from the
+    /// caller's own words, so it discloses nothing about whether that domain
+    /// exists at all - a hidden domain, an unregistered one and a permalink
+    /// nobody wrote are one answer.
+    ///
+    /// The comparison is exact. Domain names are matched exactly everywhere
+    /// else in this engine (the registry is a map keyed by the name as
+    /// written), so folding case here would be this one place disagreeing with
+    /// the lookup it stands in front of.
+    ///
+    /// **The completeness claim this buys**, which the surfaces above rely on:
+    /// a write verb resolves only inside the domain its parameters name, so
+    /// gating those names - `domain`, plus `destination_domain` on a move,
+    /// which are the only domain-valued fields any write parameter carries -
+    /// gates the whole call.
+    pub(crate) async fn resolve_in(
+        &self,
+        identifier: &str,
+        domain: &str,
+    ) -> Result<(EngramDescriptor, ContentSource)> {
+        if let Some(url) = CrystallineUrl::parse(identifier)
+            && url.domain != domain
+        {
+            return Err(EngineError::NotFound(format!(
+                "no engram '{}' in domain '{}'",
+                url.permalink, url.domain
+            )));
+        }
+        self.resolve(identifier, Some(domain)).await
+    }
+
+    /// [`Engine::resolve_scoped`] with this reader's own drafts shadowing the
+    /// base rows, and the text they should be read through.
+    ///
+    /// **The registered-set screen composes ahead of the actor dimension, and
+    /// this is where that order is kept.** `hidden` has already been resolved
+    /// by the caller through [`Engine::hidden_for`] and it is applied first, by
+    /// the very same [`Engine::resolve_scoped`] a direct read uses: a draft in
+    /// a domain this reader may not see, and a draft in a domain this instance
+    /// has no registration for, are both absent before whose-draft-is-it is
+    /// ever asked. Asking in the other order would make a draft the one thing
+    /// that could name a private domain.
+    ///
+    /// A bare identifier with no domain named FINDS base rows only: the
+    /// cross-domain form counts its matches to decide whether an identifier is
+    /// ambiguous, and drafts would make that count depend on who is asking, so
+    /// naming the domain is how a reader reaches a draft at a path the files
+    /// never held. It still honours a tombstone, and that costs nothing: by the
+    /// time one base row has been resolved the domain is known, so "has this
+    /// reader deleted it" is one lookup away and a deletion is a deletion
+    /// however the engram was addressed.
+    async fn resolve_shadowed(
+        &self,
+        identifier: &str,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+        scope: &crate::scope::Scope,
+    ) -> Result<(EngramDescriptor, ContentSource, Option<String>)> {
+        let named = match CrystallineUrl::parse(identifier) {
+            Some(url) => Some(url.domain),
+            None => domain.map(str::to_string),
+        };
+        // A name nobody registered builds no view and is left to
+        // `resolve_scoped` to answer, exactly as it was before the view
+        // existed: the miss it produces is the one an engram that was never
+        // written produces, and an early refusal here would not be.
+        let view = named
+            .as_deref()
+            .filter(|name| !hidden.contains(*name))
+            .and_then(|name| DomainView::for_read(self, name, hidden, scope).ok());
+        let Some(actor) = view.as_ref().and_then(|view| view.actor()) else {
+            let (desc, source) = self.resolve_scoped(identifier, domain, hidden).await?;
+            // A bare identifier with no domain named reaches here, and by now
+            // the domain IS known: the descriptor says which one. So a path
+            // this reader has tombstoned is absent for them however they
+            // addressed it. Only the DRAFT half stays conditional on naming a
+            // domain - see the doc above.
+            let view = DomainView::for_read(self, &desc.domain, hidden, scope)?;
+            let Some(actor) = view.actor().map(str::to_string) else {
+                return Ok((desc, source, None));
+            };
+            // The rule is `DomainView::shadow`'s, the same function the write
+            // path resolves through: a tombstone says this PATH holds nothing
+            // for them, and the address may well have moved to another path of
+            // their own. The miss it would raise does not name a domain,
+            // because this identifier did not.
+            let (desc, source) = view
+                .shadow(identifier, Ok((desc, source)), || {
+                    format!("no engram matches '{identifier}'")
+                })
+                .await?;
+            return Ok((desc, source, Some(actor)));
+        };
+        let view = view
+            .as_ref()
+            .expect("an overlay actor is only resolved for a named domain");
+        let name = view.domain().to_string();
+        // **A tombstone is about a PATH, and an address can move off it**, and
+        // that rule lives in `DomainView::shadow` rather than here: the write
+        // path resolves through the very same function, so what this reader can
+        // open at an address is what they can save at it.
+        let base = self.resolve_scoped(identifier, domain, hidden).await;
+        let (desc, source) = view
+            .shadow(identifier, base, || {
+                format!("no engram '{identifier}' in domain '{name}'")
+            })
+            .await?;
+        Ok((desc, source, Some(actor.to_string())))
+    }
+
+    /// [`Engine::resolve`] with the domains the caller may not see subtracted.
+    ///
+    /// A hidden domain resolves as an empty one rather than as a refusal: the
+    /// lookup is skipped and the miss falls through to the very same
+    /// [`EngineError::NotFound`] an engram that was never written produces,
+    /// byte for byte, because it is produced by the same line. That equality is
+    /// the property this whole path exists for - a caller must not be able to
+    /// tell "you may not see this" from "there is nothing here" - and it holds
+    /// by construction rather than by two messages being kept in step.
+    ///
+    /// The bare cross-domain form filters its matches before it counts them, so
+    /// a hidden domain neither makes an identifier ambiguous nor gets its name
+    /// printed into the ambiguity error.
+    async fn resolve_scoped(
+        &self,
+        identifier: &str,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<(EngramDescriptor, ContentSource)> {
         if let Some(url) = CrystallineUrl::parse(identifier) {
-            let store = self.store.lock().await;
-            let d = store
-                .find_engram(&url.domain, &url.permalink)
-                .await?
-                .ok_or_else(|| {
-                    EngineError::NotFound(format!(
-                        "no engram '{}' in domain '{}'",
-                        url.permalink, url.domain
-                    ))
-                })?;
-            drop(store);
+            let found = if hidden.contains(&url.domain) {
+                None
+            } else {
+                let store = self.store.lock().await;
+                store.find_engram(&url.domain, &url.permalink).await?
+            };
+            let d = found.ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    url.permalink, url.domain
+                ))
+            })?;
             let source = self.read_source(&url.domain);
             return Ok((d, source));
         }
 
         if let Some(dom) = domain {
-            let store = self.store.lock().await;
-            let d = store.find_engram(dom, identifier).await?.ok_or_else(|| {
+            let found = if hidden.contains(dom) {
+                None
+            } else {
+                let store = self.store.lock().await;
+                store.find_engram(dom, identifier).await?
+            };
+            let d = found.ok_or_else(|| {
                 // The one wrong shape agents keep producing is the domain
                 // glued onto the permalink; the error teaches the fix so a
                 // stumble recovers in one step.
@@ -1533,15 +3753,17 @@ impl Engine {
                     )),
                 }
             })?;
-            drop(store);
             let source = self.read_source(dom);
             return Ok((d, source));
         }
 
-        // Bare identifier across all domains.
+        // Bare identifier across all domains, minus the ones this caller may
+        // not see. Filtered before the count, so a hidden twin neither turns a
+        // single match into an ambiguity nor names itself in the error.
         let store = self.store.lock().await;
         let mut matches = store.find_engram_any(identifier).await?;
         drop(store);
+        matches.retain(|d| !hidden.contains(&d.domain));
         match matches.len() {
             0 => Err(EngineError::NotFound(format!(
                 "no engram matches '{identifier}'"
@@ -1663,7 +3885,7 @@ impl Engine {
     /// Load an engram's parsed form through a content source: the file on disk
     /// for a file domain, or the stored `content` column for a virtual domain.
     /// Backs validation and schema inference across both kinds.
-    async fn load_engram(
+    pub(crate) async fn load_engram(
         &self,
         source: &ContentSource,
         domain_id: DomainId,
@@ -1683,7 +3905,7 @@ impl Engine {
     /// file when a file domain holds it on disk, else the stored `content`
     /// column. This keeps files-are-truth for the host while serving virtual and
     /// non-host reads from the database.
-    async fn load_content(
+    pub(crate) async fn load_content(
         &self,
         source: &ContentSource,
         desc: &EngramDescriptor,
@@ -1708,34 +3930,90 @@ impl Engine {
 
     // --- write ---------------------------------------------------------------
 
-    /// Create or overwrite an engram, then index it. A file domain writes the
-    /// markdown file first (files-are-truth) then reindexes it from disk; a
-    /// virtual domain builds the markdown in memory and indexes it straight into
-    /// the database, touching no filesystem.
-    pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
-        self.write_engram_as(p, None).await
+    /// What a write says about a title that will not be read back the way it
+    /// was written.
+    ///
+    /// Two shapes, both legal and both surprising. A `/` in a title slugifies
+    /// into a path separator, so the engram lands nested under a folder the
+    /// caller never named. A `:` parses as a cross-domain prefix, so
+    /// `[[Murmur: the dispatch pipeline]]` resolves as a title only while no
+    /// domain called `Murmur` is registered - and the day one is, every such
+    /// link silently means something else. Neither is refused: the title is the
+    /// author's. What the receipt owes them is the permalink that came out and
+    /// a spelling they can paste.
+    ///
+    /// Both remedies are literals rather than the name of a parameter, because
+    /// the reader is about to type one. And the colon's remedy is deliberately
+    /// NOT a `crystalline://` address: [`crystalline_core::engram::LinkTarget`]
+    /// splits a wikilink at its own first colon, so `[[crystalline://...]]`
+    /// reads `crystalline` as the domain prefix and dangles - advice that would
+    /// manufacture the very finding this notice exists to prevent. A permalink
+    /// can never hold a colon, so the bare permalink and its `domain:permalink`
+    /// twin are the two spellings that always mean what they say.
+    ///
+    /// Empty when the title holds neither, so the receipt gains no key at all
+    /// in the common case.
+    fn title_notices(title: &str, domain: &str, permalink: &str) -> Vec<String> {
+        let mut notices = Vec::new();
+        // The TITLE's own slug, not the permalink: the permalink is nested
+        // whenever the caller passed a `folder`, which is the deliberate case
+        // and earns no notice, and `slugify` drops a segment that contributes
+        // nothing, so a title `TODO/` lands at `todo` and nests nothing.
+        //
+        // The folder named in the remedy comes off the permalink, so it carries
+        // any folder the caller already passed and can be pasted as it stands.
+        // The title comes off the TITLE, so the author reads their own words
+        // back rather than the slug those words became - but off the last
+        // segment that CONTRIBUTES a slug segment, not simply the last one.
+        // Splitting keeps an empty, blank or punctuation-only tail that
+        // `slugify` threw away, and naming it would hand back either an empty
+        // pair of backticks or a title like `!!!` that re-slugifies to a
+        // different address than the one this same sentence just quoted. The
+        // search cannot come up empty: the guard has already proved the title
+        // holds at least two slug-contributing segments.
+        if slugify(title).contains('/')
+            && let Some((folder, _)) = permalink.rsplit_once('/')
+            && let Some(leaf) = title
+                .rsplit('/')
+                .map(str::trim)
+                .find(|segment| !slugify(segment).is_empty())
+        {
+            notices.push(format!(
+                "the title holds a `/`, so this engram landed at the nested permalink \
+                 `{permalink}`. To place an engram in a folder on purpose, pass the folder as \
+                 its own argument - `folder: \"{folder}\"` over MCP or REST, `--folder {folder}` \
+                 on the command line - with the title `{leaf}` and no slash in it."
+            ));
+        }
+        // The three conditions `LinkTarget::parse` applies before it reads a
+        // prefix as a domain, spelled the same way here: a title this function
+        // stays quiet about is one no link would ever split.
+        if let Some((prefix, rest)) = title.split_once(':')
+            && !prefix.trim().is_empty()
+            && !rest.trim().is_empty()
+            && !prefix.trim().contains(char::is_whitespace)
+        {
+            notices.push(format!(
+                "the title holds a `:`, so a link written as `[[{title}]]` reads `{}` as a domain \
+                 prefix. It resolves to this engram while no domain of that name is registered, \
+                 and stops the day one is. The form that always works is the bare permalink \
+                 `[[{permalink}]]` inside {domain}, or `[[{domain}:{permalink}]]` from another \
+                 domain: a permalink never holds a colon, so neither is ever read as a prefix.",
+                prefix.trim()
+            ));
+        }
+        notices
     }
 
-    /// [`Engine::write_engram`] with the writer's identity: `client` is the
-    /// caller's own idea of who is writing (an MCP client's
-    /// `clientname/version` from the initialize handshake, or the CLI's process
-    /// actor), which [`Engine::actor`] resolves against the `identity.actor`
-    /// setting before it lands in the engram's `generated.by`.
-    pub async fn write_engram_as(&self, p: &WriteParams, client: Option<&str>) -> Result<Value> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        let actor = self.actor(client);
-        let source = self.content_source(&p.domain)?;
-        let engram_type = p
-            .engram_type
-            .clone()
-            .unwrap_or_else(|| "engram".to_string());
-        let status = p.status.clone().unwrap_or_else(|| "stable".to_string());
-        let tags = p.tags.clone();
-
-        let folder = p.folder.clone().unwrap_or_default();
-        let title_slug = slugify(&p.title);
+    /// Where an engram titled `title` under `folder` would be written: the
+    /// domain-relative path and the permalink it will answer to.
+    ///
+    /// One function because two verbs create engrams - [`Engine::write_engram`]
+    /// and [`Engine::split_engram`] - and a second copy of these screens is a
+    /// second chance to leave one of them out.
+    fn engram_destination(folder: Option<&str>, title: &str) -> Result<(String, String)> {
+        let folder = folder.map(str::to_string).unwrap_or_default();
+        let title_slug = slugify(title);
         if title_slug.is_empty() {
             return Err(EngineError::Invalid(
                 "title does not slugify to a permalink; provide a title with letters or digits"
@@ -1767,37 +4045,185 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(&rel)));
         }
         let permalink = slugify(&rel);
+        Ok((rel, permalink))
+    }
 
-        // The whole existence-check-then-write, for a file domain, under that
-        // file's lock: the check and the write it authorizes must be one step,
-        // or two creates of one title both find the permalink free, both write,
-        // and the second answers "created" over the first's body instead of the
-        // conflict that says the name was taken. Taken before the store lock,
-        // like every other holder. See `Engine::write_lock`.
-        let file_lock = match &source {
-            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &rel))),
-            ContentSource::Virtual => None,
-        };
-        let _guard = match &file_lock {
-            Some(lock) => Some(lock.lock().await),
+    /// Whether `permalink` already answers for somebody at another path than
+    /// `rel`, from this writer's own point of view: the writer's own shadowed
+    /// view in review mode (a name another actor is drafting under is free,
+    /// and a path this writer has tombstoned is free again), the plain index
+    /// otherwise. `None` means free; `Some(path)` names where it is taken.
+    ///
+    /// Shared by [`Engine::write_engram_present`]'s two collision checks - the
+    /// early, unlocked one that answers before `build_markdown` can raise a
+    /// different error, and the later one under the write lock that is the
+    /// actual race guard - so the two can never drift into two readings of
+    /// "taken".
+    async fn permalink_taken(
+        &self,
+        domain: &str,
+        rel: &str,
+        permalink: &str,
+        overlay_draft: Option<(&str, DomainId)>,
+    ) -> Result<Option<String>> {
+        let store = self.store.lock().await;
+        Ok(match overlay_draft {
+            Some((actor, domain_id)) => match store.overlay_entry(domain_id, actor, rel).await? {
+                Some(entry) if entry.tombstone => None,
+                Some(entry) => Some(entry.path),
+                None => store
+                    .find_engram(domain, permalink)
+                    .await?
+                    .map(|existing| existing.path),
+            },
+            None => store
+                .find_engram(domain, permalink)
+                .await?
+                .map(|existing| existing.path),
+        })
+    }
+
+    /// Create or overwrite an engram, then index it. A file domain writes the
+    /// markdown file first (files-are-truth) then reindexes it from disk; a
+    /// virtual domain builds the markdown in memory and indexes it straight into
+    /// the database, touching no filesystem.
+    pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
+        self.write_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::write_engram`] with the writer's identity: `client` is the
+    /// caller's own idea of who is writing (an MCP client's
+    /// `clientname/version` from the initialize handshake, or the CLI's process
+    /// actor), which [`Engine::actor`] resolves against the `identity.actor`
+    /// setting before it lands in the engram's `generated.by`.
+    ///
+    /// `scope` is who is acting, resolved once by whichever surface took the
+    /// request (see [`crate::scope::Scope`]). Every write verb carries it, so
+    /// that routing a write to one actor's own draft overlay has a single
+    /// place to happen rather than one per surface. No verb consults it yet:
+    /// the wrappers with no `_as` suffix pass
+    /// [`Unrestricted`](crate::scope::Scope::Unrestricted), which is what the
+    /// CLI and the control socket are, and what every caller acted with before
+    /// the parameter existed.
+    pub async fn write_engram_as(
+        &self,
+        p: &WriteParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.write_engram_joined(p, client, scope, None).await
+    }
+
+    /// [`Engine::write_engram_as`], with the join a session may be holding.
+    ///
+    /// A capture inside a join replaces the granted page with the document the
+    /// caller composed, which is the one thing this verb can do inside
+    /// somebody's draft: its destination is derived from the title rather than
+    /// resolved from a page, so a capture that lands anywhere else is a
+    /// capture of the caller's own and has nothing to do with the draft.
+    ///
+    /// **The path screen therefore runs only when a join actually took**, and
+    /// the asymmetry with [`Engine::save_engram_joined`] is deliberate. An
+    /// UNJOINED capture at a granted path is the second way forward
+    /// [`granted_needs_join`] names out loud - draft your own copy and leave
+    /// theirs as it stands - and that is what it has always done here.
+    /// Screening it would take that fork away.
+    pub async fn write_engram_joined(
+        &self,
+        p: &WriteParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<Value> {
+        self.write_engram_present(p, client, scope, join, None)
+            .await
+    }
+
+    /// [`Engine::write_engram_joined`], with the agent as a named peer in the
+    /// room the capture may land in.
+    ///
+    /// The bottom rung, and the only one that knows about the strip - the same
+    /// shape [`Engine::edit_engram_present`] has, for the same reason: the room
+    /// is keyed on the overlay owner, and who that is - this actor's own draft,
+    /// the author's draft they were invited into, or the document a direct
+    /// domain keeps - is the view's answer and is resolved here.
+    ///
+    /// `None` is every surface that is not an agent working for somebody: the
+    /// CLI, the control socket, the JSON API.
+    pub async fn write_engram_present(
+        &self,
+        p: &WriteParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+        peer: Option<&AgentPeer>,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let source = self.content_source(&p.domain)?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
+        let overlay = view.actor();
+        let join = join.filter(|_| view.joined().is_some());
+        let actor = self.actor_for(client, overlay);
+        let engram_type = p
+            .engram_type
+            .clone()
+            .unwrap_or_else(|| "engram".to_string());
+        let status = p.status.clone().unwrap_or_else(|| "stable".to_string());
+        let tags = p.tags.clone();
+
+        let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title)?;
+
+        // A join is into ONE draft: a capture inside one that resolved
+        // anywhere else has nowhere to land, and is told so rather than
+        // writing into the owner's overlay at a path they never shared.
+        if let Some(join) = join {
+            self.screen_granted_path(&p.domain, &rel, scope, Some(join))
+                .await?;
+        }
+
+        // The domain's index id, resolved once here rather than once per
+        // collision check below: `overlay` and its domain id can never
+        // diverge, so the pair is paired in the type rather than re-paired at
+        // every read.
+        let overlay_draft = match overlay {
+            Some(actor) => Some((actor, self.domain_source(&p.domain).await?.0)),
             None => None,
         };
 
-        // Enforce overwrite semantics against the existing permalink.
+        // **Ahead of `build_markdown`, deliberately.** A malformed capture at
+        // a permalink that is already taken answers "permalink already
+        // exists", the more useful of the two messages and the one this verb
+        // gave before `build_markdown` was hoisted ahead of the collision
+        // check: `build_markdown` can refuse on unbuildable content (a bad
+        // date, a malformed `verified` entry), and that refusal must not hide
+        // a plainer one this writer could already act on. Unlocked and
+        // best-effort - the actual race guard is the second, locked check
+        // below, right before the write it authorizes - so a permalink freed
+        // or taken between the two still gets the correct, authoritative
+        // answer there.
+        if !p.overwrite
+            && let Some(at) = self
+                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+                .await?
         {
-            let store = self.store.lock().await;
-            if let Some(existing) = store.find_engram(&p.domain, &permalink).await?
-                && !p.overwrite
-            {
-                return Err(EngineError::Conflict(format!(
-                    "permalink '{permalink}' already exists in domain '{}' (at {}); pass overwrite=true to replace",
-                    p.domain, existing.path
-                )));
-            }
+            return Err(EngineError::Conflict(format!(
+                "permalink '{permalink}' already exists in domain '{}' (at {at}); pass overwrite=true to replace",
+                p.domain
+            )));
         }
 
+        // The document this capture would land, built before any file lock is
+        // taken because nothing about it needs one: it is the caller's own
+        // arguments plus this instant, and a call that cannot produce a
+        // well-formed engram is better refused with no lock in hand.
         let today = chrono::Utc::now().date_naive();
         let now = now_offset();
+        // The model the agent reported, held against the actor this write
+        // records: a person's write never carries one (`stamped_model`).
+        let model = stamped_model(&actor, p.model.as_deref());
         let markdown = build_markdown(
             &engram_type,
             &p.title,
@@ -1806,10 +4232,150 @@ impl Engine {
             &status,
             &today.format("%Y-%m-%d").to_string(),
             &actor,
+            model.as_deref(),
             now,
             p.metadata.as_ref(),
             &p.content,
         )?;
+
+        let mut receipt = json!({
+            "domain": p.domain,
+            "permalink": permalink,
+            "path": rel,
+            "title": p.title,
+            "type": engram_type,
+            "status": status,
+            "action": if p.overwrite { "written" } else { "created" },
+        });
+        // Attached here rather than at the end: `write_engram_as` leaves by
+        // three exits - the live-room arm, the draft arm and the base arm -
+        // and a title reads back the same way whichever one a write took.
+        let notices = Self::title_notices(&p.title, &p.domain, &permalink);
+        if !notices.is_empty() {
+            receipt["notices"] = json!(notices);
+        }
+
+        // **The live arm, and it stands ahead of every arm that writes**, the
+        // way the edit's does (`Engine::apply_source_edit_staged`). While a
+        // co-editing room is open over this permalink the room's text IS the
+        // engram: somebody has it on screen, the file and the row are both a
+        // save behind, and a capture that replaced the file would be replaced
+        // right back by the room's own saver a moment later - with the
+        // person's unsaved work gone and nothing to say where it went. So the
+        // document is morphed to what this capture would have written, its
+        // history and their cursor are kept, and their session is what makes
+        // it durable.
+        //
+        // **Ahead of the FILE LOCK as well, and that ordering is the whole of
+        // a deadlock.** The room's saver takes the two the other way round: it
+        // holds the session state lock across `Engine::save_engram`, which
+        // takes this same path's write lock. An arm that composed into the
+        // room while holding the file lock would close a cycle with a save
+        // already in flight, and neither side times out - the file lock would
+        // be held for ever, so every later write, edit, save and delete of
+        // that engram would hang and the unsaved work would never land. The
+        // edit's live arm keeps the same discipline by standing above the arms
+        // that lock; `no_engine_function_composes_into_a_room_under_a_file_write_lock`
+        // pins it for both.
+        //
+        // **`overwrite` is this arm's own precondition, not the collision
+        // check's.** Replacing a whole document somebody is looking at is only
+        // ever what a replacement may do, and the check below would not say so:
+        // an engram deleted while its room is still open leaves the permalink
+        // free - the room learns of the deletion on its next save - so a plain
+        // capture would pass the check and morph the open page into a brand
+        // new engram with a receipt saying "created". A capture that never
+        // asked to replace anything takes the ordinary create path beside the
+        // room instead. Nothing is silently clobbered once it does: the room's
+        // next save still carries the checksum of the version it read, the CAS
+        // against the file this capture just wrote refuses, and the save falls
+        // into the external-change path instead (`raise_deleted` when the
+        // engram is absent, `merge_external` when it is present - which it now
+        // is) - so the person is shown a merge or a conflict against the
+        // capture's engram, never an overwrite of it.
+        if p.overwrite
+            && let Some(rooms) = self.collab_rooms()
+            && rooms.has_live_room(&p.domain, &permalink, overlay).await
+        {
+            let applied = rooms
+                .apply_text(&p.domain, &permalink, overlay, markdown, &actor, peer)
+                .await
+                .map_err(EngineError::Conflict)?;
+            if overlay.is_some() {
+                receipt["draft"] = json!(true);
+            }
+            if let Some(owner) = view.joined() {
+                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+            }
+            // Where it went, in the words the live edit says it in: `present`
+            // names who is about to watch the page change under them.
+            receipt["landed"] = json!("live");
+            receipt["present"] = json!(applied.participants);
+            // The tails, and which of them this arm owes: none of them. The
+            // generated folder indexes, the embedding nudge and - for a
+            // virtual domain whose MANIFEST is the one engram whose text is
+            // also configuration - the routing cache all describe bytes that
+            // are nowhere yet, so all three belong to the room's saver, which
+            // runs them when the text lands (`Engine::save_engram`), pinned
+            // end to end by
+            // `a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache`.
+            return Ok(receipt);
+        }
+
+        // The whole existence-check-then-write under one lock: the check and
+        // the write it authorizes must be one step, or two creates of one title
+        // both find the permalink free, both write, and the second answers
+        // "created" over the first's body instead of the conflict that says the
+        // name was taken. Which lock depends on where this write lands - the
+        // draft's mirror when it lands in an overlay, the file's own path when
+        // it lands in the folder - because a draft's writers contend with each
+        // other and not with the file nobody is writing. See
+        // `Engine::draft_lock` and `Engine::write_lock`. Taken before the store
+        // lock, like every other holder.
+        let write_lock = match overlay_draft {
+            Some((who, _)) => Some(self.draft_lock(&p.domain, who, &rel)?),
+            None => match &source {
+                ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &rel))),
+                ContentSource::Virtual => None,
+            },
+        };
+        let _guard = match &write_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
+        // Enforce overwrite semantics against what this writer can see there,
+        // one more time, now under the write lock: the check above is
+        // unlocked and answers only for the nicer message ahead of
+        // `build_markdown`, so two concurrent creates of one title racing
+        // each other past it must still be caught HERE, atomically with the
+        // write below - `overlay_draft` was resolved once, above, and is
+        // reused rather than re-paired.
+        if !p.overwrite
+            && let Some(at) = self
+                .permalink_taken(&p.domain, &rel, &permalink, overlay_draft)
+                .await?
+        {
+            return Err(EngineError::Conflict(format!(
+                "permalink '{permalink}' already exists in domain '{}' (at {at}); pass overwrite=true to replace",
+                p.domain
+            )));
+        }
+
+        // The third place a write can land, and the reason it comes first: on a
+        // domain in review mode the folder and the database both stay as the
+        // team left them, so neither arm below may run.
+        if let Some((_, domain_id)) = overlay_draft {
+            let warning = view.write(domain_id, &rel, &markdown).await?;
+            receipt["draft"] = json!(true);
+            // Whose draft it landed in, when that is not the caller's own, in
+            // the words the joined save and the joined edit both use.
+            if let Some(owner) = view.joined() {
+                receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+            }
+            note_unmirrored(&mut receipt, warning);
+            return Ok(receipt);
+        }
 
         match &source {
             ContentSource::File { root } => {
@@ -1840,16 +4406,90 @@ impl Engine {
         }
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
+        self.nudge_embed();
 
-        Ok(json!({
-            "domain": p.domain,
-            "permalink": permalink,
-            "path": rel,
-            "title": p.title,
-            "type": engram_type,
-            "status": status,
-            "action": if p.overwrite { "written" } else { "created" },
-        }))
+        Ok(receipt)
+    }
+
+    /// Whether a capture would replace a document somebody has open, and who
+    /// is in there: the two things `write_engram` needs before it asks.
+    ///
+    /// Asked of the engine rather than worked out by the caller because both
+    /// halves of the room key are the engine's - the permalink is derived from
+    /// the title exactly as the write derives it, and the overlay owner is the
+    /// view's answer, so a draft's room and the team's room over one name are
+    /// never confused for each other.
+    ///
+    /// `None` when no room is open over the destination, which is nearly every
+    /// capture, and for a destination this caller cannot resolve at all - a
+    /// domain nobody registered, a reserved title: there is no document to ask
+    /// about, and the write itself raises the real error a moment later rather
+    /// than having it guessed at here.
+    ///
+    /// The agent stands in the room while the question is put, the way a read
+    /// of a live document stands it there: somebody deciding whether to let
+    /// their page be replaced is owed the name of who is asking. Its own slot
+    /// is left out of the names, which answer "who is in there with you". The
+    /// chip stands even when the write is then refused or never confirmed, and
+    /// that is the true thing to draw: an agent that reached for somebody's
+    /// open page was in there, whatever came of it.
+    ///
+    /// A read-only instance answers `None` rather than a question: the write
+    /// refuses with [`EngineError::ReadOnly`] a moment later, and asking
+    /// somebody to authorize what the server will refuse anyway is a question
+    /// in the wrong words.
+    ///
+    /// **This answers for a REPLACEMENT, and says nothing about whether the
+    /// call in front of it is one.** [`Engine::write_engram_present`]'s live
+    /// arm only takes a found room when `p.overwrite` is also true - that is
+    /// the arm's own precondition, not a room-existence question - and this
+    /// preview tests nothing of the kind. `mcp.rs` asks it for any capture
+    /// that resolves onto an open document, wholesale or not, and a yes
+    /// becomes `overwrite = true` on the call that lands, which is what makes
+    /// the arm's precondition hold; a caller that took a yes without setting
+    /// `overwrite` would be handed a question about a capture that never
+    /// takes the live arm.
+    pub async fn live_write_target(
+        &self,
+        p: &WriteParams,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+        peer: Option<&AgentPeer>,
+    ) -> Option<LiveWriteTarget> {
+        if self.read_only {
+            return None;
+        }
+        let rooms = self.collab_rooms()?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join)
+            .await
+            .ok()?;
+        let overlay = view.actor();
+        let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title).ok()?;
+        // The same screen the write runs, run before anybody is named: a
+        // grantee working inside one draft who aims a capture at another path
+        // in the owner's overlay is refused by the write, and a question that
+        // named who is in the room over that page would have disclosed it
+        // ahead of the gate that refuses.
+        if let Some(join) = join.filter(|_| view.joined().is_some()) {
+            self.screen_granted_path(&p.domain, &rel, scope, Some(join))
+                .await
+                .ok()?;
+        }
+        if !rooms.has_live_room(&p.domain, &permalink, overlay).await {
+            return None;
+        }
+        let mine = match peer {
+            Some(peer) => {
+                rooms
+                    .touch_agent_presence(&p.domain, &permalink, overlay, peer)
+                    .await
+            }
+            None => None,
+        };
+        let present = rooms
+            .participants(&p.domain, &permalink, overlay, mine)
+            .await;
+        Some(LiveWriteTarget { permalink, present })
     }
 
     /// Save an engram's complete markdown text verbatim, guarded by the
@@ -1872,34 +4512,67 @@ impl Engine {
     /// document verbatim means an author may have edited the `permalink` line
     /// in the frontmatter, and the index takes the permalink from the file. A
     /// caller that saved a rename is told where its engram went.
-    pub async fn save_engram(&self, p: &SaveParams) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn save_engram(&self, p: &SaveParams, scope: &crate::scope::Scope) -> Result<Value> {
+        self.save_engram_joined(p, scope, None).await
+    }
+
+    /// [`Engine::save_engram`], with the join a session may be holding.
+    ///
+    /// The same verb, and the join is the only difference: a caller working
+    /// inside somebody else's draft (see [`crate::join`]) saves into the
+    /// OWNER's overlay rather than into their own, and the receipt says whose
+    /// draft it landed in. `None` is the ordinary save, which is what
+    /// [`Engine::save_engram`] passes and what every surface but the HTTP one
+    /// has.
+    ///
+    /// Two gates ride here rather than in the routes, so a second surface that
+    /// learns to join inherits both. A join is into ONE draft, so a save
+    /// addressed at anything else is refused rather than landing in the
+    /// owner's overlay at a path they never shared. And a save at a path this
+    /// caller was GRANTED but has not joined is refused too, in words that
+    /// name both ways forward: visibility and editing are two states, and a
+    /// save that silently forked the grantee's own copy would have decided
+    /// that for them.
+    pub async fn save_engram_joined(
+        &self,
+        p: &SaveParams,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        // A document that is not an engram would poison the index on reindex,
-        // so it is refused before anything is written. This is the one hard
-        // gate, and it is deliberately narrow: the text must parse (clean
-        // UTF-8, frontmatter that is a YAML mapping) and must carry frontmatter
-        // that actually says something, because a save that drops it silently
-        // strips the engram's type, title, permalink, tags and status at once,
-        // leaving the index to fall back to the path slug. An empty block is
-        // that same strip wearing delimiters, so it is refused the same way.
-        // Everything a document can get wrong while still being an engram - a
-        // missing tag, a permalink that is not a slug, an inverted validity
-        // window - is the validation endpoint's business to report, not this
-        // path's to refuse: an engram that already carries such a flaw must
-        // stay editable, since fixing it here is what the editor is for.
-        let parsed =
-            parse_engram_lossless(&p.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
-        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
-            return Err(EngineError::Invalid(
-                "the document carries no frontmatter, so it is not an engram; \
-                 keep the --- delimited frontmatter block, and the type, title, \
-                 permalink and tags in it, at the top of the file"
-                    .into(),
-            ));
-        }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
+        let overlay = view.actor();
+        // The join as this view actually took it: one naming another domain,
+        // or a domain that has stopped reviewing changes, is not a join into
+        // this write at all and must not gate it.
+        let join = join.filter(|_| view.joined().is_some());
+        refuse_not_an_engram(&p.content)?;
+        let (desc, source) = match view.resolve(&p.identifier).await {
+            Ok(resolved) => resolved,
+            // A name this caller's own view cannot resolve, when they are
+            // holding a link to a draft that answers to it: the miss IS the
+            // rule, since the granted draft is deliberately absent from every
+            // ordinary read they make, and answering "no such engram" to
+            // somebody who was handed that very page to read would be true and
+            // useless. So the refusal teaches instead, in the same words a
+            // save at a path they CAN resolve gets. Nothing about the draft is
+            // revealed that the link did not already hand over.
+            Err(EngineError::NotFound(missing)) => {
+                return match self
+                    .teach_granted_miss(&p.domain, &p.identifier, scope)
+                    .await?
+                {
+                    Some(teaching) => Err(EngineError::Refused(teaching)),
+                    None => Err(EngineError::NotFound(missing)),
+                };
+            }
+            Err(e) => return Err(e),
+        };
         // A reserved name never resolves to an engram today (sync skips both),
         // so this is defence in depth rather than a reachable branch: the
         // generated `index.md` is derived from its folder and would be
@@ -1915,6 +4588,13 @@ impl Engine {
         // not become a way to write into the attachment folder.
         if is_assets_reserved(&desc.path) {
             return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
+        }
+        self.screen_granted_path(&desc.domain, &desc.path, scope, join)
+            .await?;
+
+        // The third place a save can land: this actor's own draft.
+        if overlay.is_some() {
+            return self.save_into_overlay(&view, p, &desc, &source).await;
         }
 
         match &source {
@@ -2004,6 +4684,7 @@ impl Engine {
             self.refresh_routing_cache().await;
         }
         self.refresh_index_files(&desc.domain).await;
+        self.nudge_embed();
 
         Ok(json!({
             "domain": desc.domain,
@@ -2011,6 +4692,146 @@ impl Engine {
             "path": desc.path,
             "checksum": sha256_hex(p.content.as_bytes()),
         }))
+    }
+
+    /// Save a co-editing room's text into the overlay document the room is a
+    /// room over.
+    ///
+    /// The room's counterpart of [`Engine::save_engram`], and the difference
+    /// between them is where the actor comes from. A request carries a scope
+    /// and the write is routed from it; a room carries a view it built from
+    /// the key it was opened under, which names the owner whose draft this
+    /// room IS. Everything after that is the same write, through the same
+    /// function, with the same compare-and-swap.
+    ///
+    /// **`expected_path` is the path the room is a room over, and a save that
+    /// resolves anywhere else is refused.** A room addresses its saves by the
+    /// permalink its own text carries, and that line is typed by whoever is in
+    /// the room, so without this screen a person invited into one page holds a
+    /// write over every page in its author's overlay: the address ladder
+    /// answers a TITLE as well as a permalink
+    /// ([`DomainView::resolve_draft`], and `find_engram` on the base side),
+    /// while the address check in front of a draft write deliberately does not
+    /// treat a title as an address - so a document that renames its own
+    /// permalink to another engram's title stands at the granted path and
+    /// resolves to the other one from the next save on. This is the room's
+    /// counterpart of [`Engine::screen_granted_path`], which refuses the same
+    /// move for a request carrying a join, and it speaks the same sentence.
+    ///
+    /// The refusal is an ordinary save refusal: the room stays open, the text
+    /// stays in the document, and the author is told why - which is the right
+    /// outcome for "this document now claims to be a different page".
+    ///
+    /// One gate a request meets is deliberately absent, because it is not
+    /// about this caller: the teaching refusal for a name only a share-link
+    /// resolves (a room resolves through the owner's own view, where the page
+    /// is simply there). The grant-and-join decision is the door's, made once
+    /// at the upgrade rather than four times a second - and the screen below
+    /// is what keeps that decision true for the life of the room.
+    ///
+    /// The receipt is the overlay one: `draft: true`, and the permalink the
+    /// draft answers to after the write, which an author who edited the
+    /// frontmatter line has just moved.
+    pub(crate) async fn save_engram_in_overlay(
+        &self,
+        view: &DomainView<'_>,
+        p: &SaveParams,
+        expected_path: &str,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        refuse_not_an_engram(&p.content)?;
+        let (desc, source) = view.resolve(&p.identifier).await?;
+        if desc.path != expected_path {
+            return Err(EngineError::Refused(joined_write_is_elsewhere(
+                view.writing_actor()?,
+                expected_path,
+                &desc.path,
+            )));
+        }
+        // The same two reserved screens the request-driven save makes, on the
+        // resolved path, which is the authority on what would be written.
+        if crystalline_core::is_reserved_path(&desc.path) {
+            return Err(EngineError::Invalid(reserved_name_error(&desc.path)));
+        }
+        if is_assets_reserved(&desc.path) {
+            return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
+        }
+        self.save_into_overlay(view, p, &desc, &source).await
+    }
+
+    /// The overlay arm of a save: the whole document into the view's own
+    /// actor's draft of `desc.path`, verbatim, checked against the version the
+    /// caller read - which in review mode is their own draft where they hold
+    /// one, so a second save does not conflict against the first.
+    ///
+    /// One function rather than one per surface, because the CAS under the
+    /// mirror lock, the permalink re-derivation and the receipt are one
+    /// agreement about what landing in a draft means. Its callers are the
+    /// request-driven save above and the co-editing room's saver, which reaches
+    /// it with a view it built itself over the owner of the document the room
+    /// is a room over.
+    ///
+    /// Everything a caller must decide BEFORE this is deliberately not here:
+    /// whose view it is, whether the document parses, whether the path is
+    /// writable, and - for a request - whether a grant or a join routes it.
+    /// This function writes.
+    async fn save_into_overlay(
+        &self,
+        view: &DomainView<'_>,
+        p: &SaveParams,
+        desc: &EngramDescriptor,
+        source: &ContentSource,
+    ) -> Result<Value> {
+        let who = view.writing_actor()?;
+        // Written directly rather than through `apply_source_edit`, and
+        // that is the save's own contract rather than an omission: the
+        // shared edit path stamps `generated`, and a save of what was read
+        // has to land byte-identical. The compare and the write are held
+        // apart from every other writer of the same draft by the one lock
+        // they all take, keyed on the draft's own mirror path. See
+        // `Engine::draft_lock`.
+        let lock = self.draft_lock(&desc.domain, who, &desc.path)?;
+        let _guard = lock.lock().await;
+        let current = view.text_at(source, desc).await?.ok_or_else(|| {
+            EngineError::NotFound(format!(
+                "no engram '{}' in domain '{}'",
+                p.identifier, desc.domain
+            ))
+        })?;
+        let found = sha256_hex(current.as_bytes());
+        if found != p.expected_checksum {
+            return Err(EngineError::Conflict(stale_edit_message(
+                &p.expected_checksum,
+                &found,
+            )));
+        }
+        let warning = view.write(desc.domain_id, &desc.path, &p.content).await?;
+        // Where the draft now answers, derived exactly as the row's own
+        // permalink is: an author who edited the frontmatter's permalink
+        // line has just moved the address, and the receipt has to say so.
+        let permalink = parse_engram(&p.content)
+            .map(|engram| {
+                EngramRecord::from_engram(&engram, &desc.path, virtual_stamp(&p.content)).permalink
+            })
+            .unwrap_or_else(|_| desc.permalink.clone());
+        let mut receipt = json!({
+            "domain": desc.domain,
+            "permalink": permalink,
+            "path": desc.path,
+            "checksum": sha256_hex(p.content.as_bytes()),
+            "draft": true,
+        });
+        // Whose draft it landed in, when that is not the caller's own. The
+        // one thing a joined save has to say that an ordinary one does
+        // not: somebody typing inside a colleague's draft is owed a
+        // receipt that names whose work they just changed.
+        if let Some(owner) = view.joined() {
+            receipt["joined"] = json!(format!("landed in {owner}'s draft"));
+        }
+        note_unmirrored(&mut receipt, warning);
+        Ok(receipt)
     }
 
     /// Write an engram file back into existence with this exact content, then
@@ -2023,20 +4844,43 @@ impl Engine {
     /// PATH rather than by identifier: the engram is gone from the index, so
     /// there is nothing left to resolve. No CAS token either, for the same
     /// reason - there is no stored version to compare against.
-    pub async fn restore_engram(&self, domain: &str, path: &str, content: &str) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn restore_engram(
+        &self,
+        domain: &str,
+        path: &str,
+        content: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let parsed =
-            parse_engram_lossless(content).map_err(|e| EngineError::Invalid(e.to_string()))?;
-        if !parsed.has_frontmatter || parsed.raw_frontmatter.trim().is_empty() {
-            return Err(EngineError::Invalid(
-                "the document carries no frontmatter, so it is not an engram; \
-                 keep the --- delimited frontmatter block, and the type, title, \
-                 permalink and tags in it, at the top of the file"
-                    .into(),
-            ));
+        let view = DomainView::for_write(self, domain, scope).await?;
+        self.restore_engram_in_view(&view, domain, path, content)
+            .await
+    }
+
+    /// [`Engine::restore_engram`] through a view somebody already built.
+    ///
+    /// The split exists for the co-editing room, which has a view of its own -
+    /// the overlay document it is a room over, or the one a direct domain
+    /// keeps - and no scope to derive one from. A request reaches it through
+    /// the verb above, with the view its scope routed to; both write exactly
+    /// what they always wrote.
+    pub(crate) async fn restore_engram_in_view(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
         }
+        let overlay = view.actor();
+        refuse_not_an_engram(content)?;
         // Normalized and screened before the two reserved checks read it, the
         // same order the create and move paths use. A stored path is already in
         // this shape, so nothing a caller sends today changes.
@@ -2052,6 +4896,26 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(path)));
         }
         let (domain_id, source) = self.domain_source(domain).await?;
+        // The third place a restore can land: in review mode the recovered
+        // document is this actor's draft of the path, never a file written
+        // back into what the team reviewed.
+        if overlay.is_some() {
+            let warning = view.write(domain_id, path, content).await?;
+            let permalink = parse_engram(content)
+                .map(|engram| {
+                    EngramRecord::from_engram(&engram, path, virtual_stamp(content)).permalink
+                })
+                .unwrap_or_else(|_| path.trim_end_matches(".md").to_string());
+            let mut receipt = json!({
+                "domain": domain,
+                "permalink": permalink,
+                "path": path,
+                "checksum": sha256_hex(content.as_bytes()),
+                "draft": true,
+            });
+            note_unmirrored(&mut receipt, warning);
+            return Ok(receipt);
+        }
         match &source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, path);
@@ -2094,6 +4958,7 @@ impl Engine {
                 });
             receipt_permalink(found, path.trim_end_matches(".md").to_string())
         };
+        self.nudge_embed();
         Ok(json!({
             "domain": domain,
             "permalink": permalink,
@@ -2102,11 +4967,398 @@ impl Engine {
         }))
     }
 
+    /// The teaching sentence for a write that named a draft this caller holds
+    /// a link to but cannot resolve, or `None` when the name is nothing of the
+    /// sort.
+    ///
+    /// Asked only when an ordinary resolution has already missed, and only for
+    /// a caller holding at least one live link in this domain - which is
+    /// almost nobody, almost never. The name is matched against what the link
+    /// actually opens: the draft's own address, its path, and the path with
+    /// the suffix off, which are the three spellings the editor and the API
+    /// address an engram by.
+    async fn teach_granted_miss(
+        &self,
+        domain: &str,
+        identifier: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .granted_draft_named(domain, identifier, None, scope)
+            .await?
+            .map(|(owner, path)| granted_needs_join(&owner, &path)))
+    }
+
+    /// Present a share-link and open a join on the draft it names.
+    ///
+    /// **The agent's door into somebody else's draft, and it is the same door
+    /// a browser goes through.** The two REST steps a person takes in one
+    /// call: accepting the link, which binds it to their account for good, and
+    /// joining it, which is the second and separate decision to type into
+    /// somebody's work. One call, because an agent that was handed a link and
+    /// passed it to a verb has decided both. The join it opens belongs to the
+    /// HOLDER that presented it - a browser session, an MCP session, a process,
+    /// or a token identity that has no session at all and is ended by idleness
+    /// instead - and ends when that holder does; the key is what the caller
+    /// holds, and nothing else in this process hands it out.
+    ///
+    /// The order is the REST route's order and it is load bearing: the domain
+    /// screen comes BEFORE the redemption, because redeeming binds the link
+    /// irreversibly and an account that may not read the domain would
+    /// otherwise burn it for the person it was meant for.
+    ///
+    /// Every way a link fails to open anything is one refusal, deliberately:
+    /// an invented link, a revoked one, an expired one, one already bound to
+    /// somebody else and one into a domain this caller may not read are five
+    /// different facts and none of them is this caller's to learn.
+    pub async fn open_share_link(
+        &self,
+        token: &str,
+        scope: &crate::scope::Scope,
+        holder: &crate::join::Holder,
+    ) -> Result<OpenedLink> {
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Err(EngineError::Refused(
+                "a draft share-link binds to an account, and this session has none: sign in \
+                 before presenting one"
+                    .to_string(),
+            ));
+        };
+        let Some(access) = self.domain_access.get() else {
+            // Every install that serves no accounts: a one-shot command, the
+            // embedded stdio stack, a daemon with the web surface off. There
+            // are no share-links there to present, and saying so is better
+            // than the dead-link sentence, which would suggest this one had
+            // simply expired.
+            return Err(EngineError::Refused(
+                "this instance serves no accounts, so it mints and opens no draft share-links: \
+                 drafts here belong to whoever runs it"
+                    .to_string(),
+            ));
+        };
+        let dead = || {
+            EngineError::NotFound(
+                "this draft link opens nothing: it may have been revoked, it may have expired, \
+                 it may already belong to somebody else, or the draft it was for may have been \
+                 folded or discarded. Ask whoever shared it for a fresh one."
+                    .to_string(),
+            )
+        };
+        let named = access
+            .overlay_grant_domain(token)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?
+            .ok_or_else(dead)?;
+        // The same screen every other read of a domain makes, on the grantee:
+        // a link is its author's word about one draft and never about a
+        // domain, so a private domain this account is not a member of stays a
+        // domain it has never heard of.
+        let hidden = self.hidden_for(scope).await?;
+        if self.domain_entry_scoped(&named, &hidden).is_err() {
+            return Err(dead());
+        }
+        let crate::scope::RedeemedLink {
+            domain,
+            owner,
+            path,
+            expires_at,
+        } = access
+            .redeem_overlay_grant(token, &account)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?
+            .ok_or_else(dead)?;
+        // A grant lasts exactly as long as the thing it grants, and a join
+        // into a draft that is gone is a join to nothing.
+        if self
+            .overlay_draft_at(&domain, &owner, &path)
+            .await?
+            .is_none()
+        {
+            return Err(EngineError::NotFound(format!(
+                "this link was for {owner}'s draft of '{path}', and that draft is no longer \
+                 there: it was folded into the domain, discarded, or moved somewhere else. Ask \
+                 for a fresh link, or look for the page in the domain itself."
+            )));
+        }
+        // Seeing a draft and editing it are two states, and this is the one
+        // that needs the right: an account that may only read the domain opens
+        // the link and reads the draft, and is told why it may not type in it.
+        let right = access
+            .write_right(scope, &domain)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        if right < crate::scope::DomainRight::Write {
+            // Bound, readable, and not joined - which is a whole answer rather
+            // than a failure. A read crossed the grant and got what the grant
+            // is for; only a write needed the second step, and only a write is
+            // refused by this sentence.
+            return Ok(OpenedLink::ReadOnly(format!(
+                "you may read {owner}'s draft of '{path}' and not edit it: your access on \
+                 '{domain}' is {}, and editing somebody's draft needs the same editor access \
+                 that writing anything else here needs. Suggest changes to whoever shared it, \
+                 or ask for editor access on the domain.",
+                crate::rest::member_level_word(right)
+            )));
+        }
+        let join = crate::join::Join {
+            account,
+            // Which of this account's callers is inside the draft, and what
+            // ending ends it. Decided by the surface rather than here: only it
+            // knows whether this request is a browser session, an MCP session,
+            // a process or a stateless peer with a token and no session at
+            // all. See [`crate::join::Holder`].
+            holder: holder.clone(),
+            domain,
+            path,
+            owner,
+            // The link's own window, stamped on once: an expiry is the one way
+            // a grant ends that nobody announces, so the join carries the
+            // moment rather than the saver re-reading the row.
+            expires_at: crate::join::grant_deadline(expires_at.as_deref()),
+        };
+        // A cap met is the same shape as the read-only answer above and for
+        // the same reason: the link bound, the draft is readable, and the join
+        // is what could not be opened.
+        let key = match self.joins().open(join.clone()) {
+            Ok(key) => key,
+            Err(crate::join::JoinRefusal::AccountFull) => {
+                return Ok(OpenedLink::ReadOnly(
+                    "you are already working inside as many drafts as this instance keeps open \
+                     for one account: leave one of them and this one will open"
+                        .to_string(),
+                ));
+            }
+            Err(crate::join::JoinRefusal::InstanceFull) => {
+                return Ok(OpenedLink::ReadOnly(
+                    "this instance is already holding as many drafts open as it will hold at \
+                     once, across everybody: leave one of yours, or try again shortly"
+                        .to_string(),
+                ));
+            }
+        };
+        Ok(OpenedLink::Joined { key, join })
+    }
+
+    /// The draft this caller holds a live link to that `identifier` names, as
+    /// `(owner, path)`, or `None` when the name is nothing of the sort.
+    ///
+    /// `owner` narrows it to one author's, which is what a caller asking to
+    /// open a room over somebody's document needs: it names whose, and the
+    /// answer has to be about that person rather than about whoever this
+    /// account happens to hold a link from. `None` asks about any of them,
+    /// which is what the teaching refusal above needs.
+    ///
+    /// Asked only where an answer would change what a caller is told, and only
+    /// for a caller holding at least one live link in this domain - which is
+    /// almost nobody, almost never. The name is matched against what the link
+    /// actually opens: the draft's own address, its path, and the path with
+    /// the suffix off, which are the three spellings the editor and the API
+    /// address an engram by. A link whose draft has gone matches nothing, so a
+    /// dead link teaches nothing and opens nothing.
+    pub(crate) async fn granted_draft_named(
+        &self,
+        domain: &str,
+        identifier: &str,
+        owner: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<(String, String)>> {
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Ok(None);
+        };
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        let held = access
+            .overlay_grants_held(&account, domain)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        for (path, held_owner) in held {
+            if held_owner == account || owner.is_some_and(|want| want != held_owner) {
+                continue;
+            }
+            let Some(draft) = self.overlay_draft_at(domain, &held_owner, &path).await? else {
+                continue;
+            };
+            let names = [
+                draft.permalink.as_str(),
+                path.as_str(),
+                path.trim_end_matches(".md"),
+            ];
+            if names.contains(&identifier) {
+                return Ok(Some((held_owner, path)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// What a join may do to the OWNER's files, and what it may not.
+    ///
+    /// A join is into one page. The files overlay is not that page, so without
+    /// a rule here a session joined to one draft would hold a write capability
+    /// over every attachment its owner has - able to overwrite a picture staged
+    /// for a different draft of theirs, or to stage their deletion of a file the
+    /// team reviewed, to be folded later under their name. That is the one
+    /// cross-account write capability in the system, so it is bounded to the
+    /// work that was actually shared.
+    ///
+    /// **A join carries the granted engram and the attachments that engram
+    /// references**, and the two things that follow are the whole of the rule:
+    ///
+    /// * a path that stands nowhere - not in the folder the team reviewed and
+    ///   not in the owner's own overlay - may be created, because adding an
+    ///   illustration to the page you were invited into is the reason a join
+    ///   reaches the files at all;
+    /// * a path the granted draft references **at this moment** may be
+    ///   overwritten or deleted, because a page and the pictures it shows are
+    ///   one piece of work.
+    ///
+    /// Everything else is refused, in words that name the file and the two ways
+    /// forward. "At this moment" is deliberate and is why the draft is read
+    /// here rather than at join time: the reference set is whatever the shared
+    /// page says now, so a joiner who adds a reference and then uploads to it
+    /// is inside the rule, and one whose reference was removed by the author is
+    /// outside it again.
+    ///
+    /// A join whose draft has gone carries no references at all, so only the
+    /// create arm stays open - which is the same answer the freshness check
+    /// gives everywhere else, reached by the same reasoning.
+    async fn screen_joined_attachment(
+        &self,
+        domain: &str,
+        path: &str,
+        join: &crate::join::Join,
+        deleting: bool,
+    ) -> Result<()> {
+        let referenced = match self
+            .overlay_draft_at(domain, &join.owner, &join.path)
+            .await?
+        {
+            Some(draft) => parse_engram(&draft.content)
+                .map(|engram| crystalline_core::find_asset_refs(&engram.body))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if referenced.iter().any(|reference| reference == path) {
+            return Ok(());
+        }
+        // A deletion has no create arm: there is nothing to make at a path
+        // nothing stands at, and `attachment_delete_in` answers that miss on
+        // its own.
+        if !deleting
+            && !self
+                .anybody_holds_attachment(domain, &join.owner, path)
+                .await?
+        {
+            return Ok(());
+        }
+        Err(EngineError::Refused(joined_files_are_the_drafts(
+            &join.owner,
+            &join.path,
+            path,
+        )))
+    }
+
+    /// Whether anything stands at one attachment path as far as a join is
+    /// concerned: the folder the team reviewed, or the owner's own files
+    /// overlay.
+    ///
+    /// Both halves, because either one makes the path somebody else's work. A
+    /// path the owner has DELETED in their overlay still counts as standing,
+    /// since the file is in the folder and their deletion of it is a draft
+    /// change of theirs - which is exactly the kind of decision a join into a
+    /// different page must not reach around.
+    async fn anybody_holds_attachment(
+        &self,
+        domain: &str,
+        owner: &str,
+        path: &str,
+    ) -> Result<bool> {
+        match self.attachment_delete_size(domain, path).await {
+            Ok(_) => return Ok(true),
+            Err(EngineError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let state_dir = self.journal_state_dir()?;
+        match crate::overlay_files::held(&state_dir, domain, owner, path) {
+            Ok(crate::overlay_files::Held::Nothing) => Ok(false),
+            Ok(_) => Ok(true),
+            // A path this substrate refuses is one the write verb refuses a
+            // line later in words the caller already knows, so this screen
+            // says nothing about it and lets that refusal happen.
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Refuse a write that is inside the wrong draft, or inside one this
+    /// caller may see and has not joined.
+    ///
+    /// Two refusals in one place, because they are two halves of one rule:
+    /// **a share-link grants visibility, and editing is a second, explicit
+    /// step.** The one caller who has taken that step gets a routed write at
+    /// exactly the path they took it for; everybody else who can see a draft
+    /// is told, in the same words, what their two ways forward are.
+    ///
+    /// Nothing happens at all for the common case - no join, no grant - and
+    /// the grant lookup is skipped entirely for a caller with no account,
+    /// since a link binds to an account and nobody else can hold one.
+    async fn screen_granted_path(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<()> {
+        if let Some(join) = join {
+            if join.path != path {
+                // A join whose own draft has gone is not a join to a different
+                // path, it is a join to nothing: its author renamed it, folded
+                // it or took it back, and a refusal naming the page they joined
+                // would be a sentence about somewhere that is not there.
+                if self
+                    .overlay_draft_at(domain, &join.owner, &join.path)
+                    .await?
+                    .is_none()
+                {
+                    return Err(EngineError::Refused(joined_draft_is_gone(
+                        &join.owner,
+                        &join.path,
+                    )));
+                }
+                return Err(EngineError::Refused(joined_write_is_elsewhere(
+                    &join.owner,
+                    &join.path,
+                    path,
+                )));
+            }
+            return Ok(());
+        }
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Ok(());
+        };
+        let Some(owner) = self.granted_owner(&account, domain, path).await? else {
+            return Ok(());
+        };
+        if owner == account {
+            return Ok(());
+        }
+        // **Only while there is still a draft to join.** A link outlives the
+        // draft it was for whenever its author takes that draft away without
+        // the domain leaving review mode - a deletion, a move, a rename - and
+        // a grantee still told to join it could neither join (the link answers
+        // that the draft is gone) nor write. A dead row would have taken a
+        // path away from somebody it was never about, so it takes nothing: the
+        // write goes back to being their own, which is what it always was.
+        if self.overlay_draft_at(domain, &owner, path).await?.is_none() {
+            return Ok(());
+        }
+        Err(EngineError::Refused(granted_needs_join(&owner, path)))
+    }
+
     /// A registered domain's row id and content source, upserting the row the
     /// way a create does. The domain-addressed half of what
     /// [`Engine::resolve`] does for an identifier, for a write path whose
     /// engram is not in the index to resolve.
-    async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
+    pub(crate) async fn domain_source(&self, domain: &str) -> Result<(DomainId, ContentSource)> {
         let source = self.content_source(domain)?;
         let store = self.store.lock().await;
         let domain_id = match &source {
@@ -2139,10 +5391,36 @@ impl Engine {
     ///
     /// Bytes are never loaded: a listing of a domain full of slide decks costs
     /// one query.
+    ///
+    /// **The substrate, not the projection.** This answers what the domain
+    /// holds, the same for everybody, which is what the machinery that carries
+    /// no caller's scope needs - a cross-domain move's carry, the split's
+    /// screen, an archive export. A surface answering a person asks
+    /// [`Engine::attachment_list_as`], which lays that caller's own drafted
+    /// files over it.
     pub async fn attachment_list(&self, domain: &str) -> Result<Vec<AttachmentRow>> {
         let (domain_id, _) = self.domain_source(domain).await?;
         let store = self.store.lock().await;
         Ok(store.list_attachments(domain_id).await?)
+    }
+
+    /// [`Engine::attachment_list`] as this caller sees it.
+    ///
+    /// The name-addressed verb above is the **substrate**: the folder's own
+    /// rows, the same for everybody, which is what the machinery that holds no
+    /// scope needs. This one is the **projection**: on a domain that reviews
+    /// changes a file the caller uploaded is listed for them alone and a file
+    /// they deleted is absent for them, exactly as their drafted pages are.
+    /// Every surface that answers a person asks this one.
+    pub async fn attachment_list_as(
+        &self,
+        domain: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Vec<AttachmentRow>> {
+        let hidden = self.hidden_for(scope).await?;
+        DomainView::for_read(self, domain, &hidden, scope)?
+            .attachments()
+            .await
     }
 
     /// One attachment's bytes and its metadata row.
@@ -2235,6 +5513,23 @@ impl Engine {
                 Ok((bytes, row))
             }
         }
+    }
+
+    /// [`Engine::attachment_read`] as this caller sees it: their own bytes
+    /// where they hold some, a miss where they have deleted the path, and the
+    /// folder's answer otherwise. The projection to
+    /// [`Engine::attachment_read`]'s substrate, as
+    /// [`Engine::attachment_list_as`] is to [`Engine::attachment_list`].
+    pub async fn attachment_read_as(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<(Vec<u8>, AttachmentRow)> {
+        let hidden = self.hidden_for(scope).await?;
+        DomainView::for_read(self, domain, &hidden, scope)?
+            .attachment_bytes(path)
+            .await
     }
 
     /// Create or replace one attachment, returning the row that now describes
@@ -2366,6 +5661,192 @@ impl Engine {
         }
         crate::maintenance::record_pending(domain);
         Ok(())
+    }
+
+    /// What an attachment write landed as: the row that now describes it, and
+    /// whether it is this actor's draft rather than the domain's own file.
+    ///
+    /// Create or replace one attachment as this caller sees the domain.
+    ///
+    /// The routing decision review mode turns an upload into, in one place. A
+    /// domain that takes changes directly runs
+    /// [`Engine::attachment_write`] byte for byte, and its receipt carries no
+    /// `draft` at all. A domain that reviews changes lands the bytes in this
+    /// actor's files overlay instead: **no write in review mode reaches the
+    /// folder**, which is the rule the whole mode rests on, and the receipt
+    /// says `draft: true`.
+    ///
+    /// **The write right and the identity refusal are the view's.**
+    /// [`DomainView::for_write`] screens the registered set, then refuses a
+    /// caller with no identity with [`OVERLAY_NEEDS_IDENTITY`] - the same
+    /// sentence, in the same words, an engram write is refused with, because it
+    /// is the same question: there is no identity for a draft to belong to.
+    /// The surface gate in front of it (REST `require_domain_write`) still
+    /// stands where it always did.
+    pub(crate) async fn attachment_write_in(
+        &self,
+        view: &DomainView<'_>,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<WrittenAttachment> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
+            return Err(EngineError::Invalid(over_cap_error(
+                path,
+                bytes.len() as u64,
+            )));
+        }
+        if let Some(actor) = view.actor() {
+            let row = view.put_file(path, &bytes).await?;
+            // The write IS the resolution, for a file. A conflict resolution
+            // settles an engram's markdown and `origin_resolve` says so to
+            // anybody who names an attachment path; what settles a file is
+            // uploading it again to keep your version or deleting it to take
+            // the team's, so both of those take the path out of the recorded
+            // conflicts on the way out.
+            self.settle_file_convergence(view.domain(), actor, path)
+                .await;
+            crate::maintenance::record_pending(view.domain());
+            return Ok(WrittenAttachment { row, draft: true });
+        }
+        let row = self.attachment_write(view.domain(), path, bytes).await?;
+        Ok(WrittenAttachment { row, draft: false })
+    }
+
+    /// The view-taking write above under the acting scope, for the surfaces
+    /// that hold a scope rather than a view.
+    pub async fn attachment_write_as(
+        &self,
+        domain: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        scope: &crate::scope::Scope,
+    ) -> Result<WrittenAttachment> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        self.attachment_write_joined(domain, path, bytes, scope, None)
+            .await
+    }
+
+    /// [`Engine::attachment_write_as`], with the join a session may be
+    /// holding.
+    ///
+    /// **Files follow the join**, which is the whole of the rule: an upload
+    /// made while working inside somebody else's draft lands in the OWNER's
+    /// files overlay, through
+    /// [`crate::overlay_files::target_actor`], and is staged, folded and
+    /// discarded with that draft. Anything else would put an image in one
+    /// overlay and the page that references it in another, so folding the
+    /// draft would land a page pointing at a file nobody folded.
+    ///
+    /// The path screen is the save's, for the same reason and in the same
+    /// words: a caller who can see a draft but has not joined it is told what
+    /// their two ways forward are rather than having one chosen for them.
+    pub async fn attachment_write_joined(
+        &self,
+        domain: &str,
+        path: &str,
+        bytes: Vec<u8>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<WrittenAttachment> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let view = DomainView::for_write_joined(self, domain, scope, join).await?;
+        // Two different screens, because a join and a grant bound two
+        // different things. An attachment does not stand at the draft's path -
+        // it stands beside it, in the files overlay - so the path equality the
+        // save enforces would refuse every upload made inside a join, which is
+        // the one thing a join is supposed to make possible. What bounds a
+        // JOINED write is which files the granted page carries; see
+        // [`Engine::screen_joined_attachment`]. What bounds an unjoined one is
+        // the grant, exactly as it bounds a save.
+        match (view.joined(), join) {
+            (Some(_), Some(join)) => {
+                self.screen_joined_attachment(domain, path, join, false)
+                    .await?
+            }
+            _ => self.screen_granted_path(domain, path, scope, None).await?,
+        }
+        self.attachment_write_in(&view, path, bytes).await
+    }
+
+    /// Remove one attachment as this caller sees the domain, answering whether
+    /// the deletion landed as a draft.
+    ///
+    /// A direct domain removes the file or the blob and the row, as it always
+    /// has. In review mode the folder is not touched: a reviewed file is hidden
+    /// behind this actor's own deletion marker until the deletion is reviewed
+    /// like any other change, and a file only this actor holds simply goes,
+    /// since a marker over a base nothing holds is exactly what convergence
+    /// would clear again.
+    pub(crate) async fn attachment_delete_in(
+        &self,
+        view: &DomainView<'_>,
+        path: &str,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        if let Some(actor) = view.actor() {
+            view.tombstone_file(path).await?;
+            // The other half of what settles a diverged file: see
+            // [`Engine::attachment_write_in`].
+            self.settle_file_convergence(view.domain(), actor, path)
+                .await;
+            crate::maintenance::record_pending(view.domain());
+            return Ok(true);
+        }
+        self.attachment_delete(view.domain(), path).await?;
+        Ok(false)
+    }
+
+    /// The view-taking delete above under the acting scope.
+    pub async fn attachment_delete_as(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        self.attachment_delete_joined(domain, path, scope, None)
+            .await
+    }
+
+    /// [`Engine::attachment_delete_as`], with the join a session may be
+    /// holding. The deletion follows the join exactly as the upload does, and
+    /// for the same reason: see [`Engine::attachment_write_joined`].
+    pub async fn attachment_delete_joined(
+        &self,
+        domain: &str,
+        path: &str,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let view = DomainView::for_write_joined(self, domain, scope, join).await?;
+        // The same pair of screens the upload makes, and ahead of the delete
+        // rather than inside it: the deletion marker is what a fold would
+        // carry out, so a refused deletion that had staged one anyway would be
+        // a deletion nobody refused.
+        match (view.joined(), join) {
+            (Some(_), Some(join)) => {
+                self.screen_joined_attachment(domain, path, join, true)
+                    .await?
+            }
+            _ => self.screen_granted_path(domain, path, scope, None).await?,
+        }
+        self.attachment_delete_in(&view, path).await
     }
 
     // --- attachments a cross-domain move carries ------------------------------
@@ -2727,7 +6208,8 @@ impl Engine {
     /// relations so verify's T005 and the evolve sweep see a reciprocal link
     /// rather than a dangling one.
     pub async fn retire_engram(&self, p: &RetireParams) -> Result<Value> {
-        self.retire_engram_as(p, None).await
+        self.retire_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// [`Engine::retire_engram`] with the retiring identity, resolved by
@@ -2737,15 +6219,28 @@ impl Engine {
     /// status is checked against [`Self::RETIREMENT_STATUSES`], the
     /// successor rule (required for `superseded`, refused otherwise) is
     /// enforced, `valid_to` is parsed and, when a successor is named, it is
-    /// resolved in the same domain so a missing successor is `NotFound`
-    /// before the target is touched. The target is then written first, and
-    /// only then the successor's reciprocal `- supersedes [[..]]` line
+    /// resolved before the target is touched, so a missing successor is
+    /// `NotFound` rather than a half-written pair. That resolution goes
+    /// through [`Engine::resolve_in`], which is what actually holds the
+    /// successor to this domain: the absolute `crystalline://` form overrides
+    /// a domain hint wherever it is accepted, so "the same domain" is a rule
+    /// enforced there rather than a property of passing the name in. The
+    /// target is then written first, and only then the successor's reciprocal
+    /// `- supersedes [[..]]` line
     /// (appended only when not already present, so a repeat call is
     /// idempotent). A failure on the successor write leaves the target
     /// retired with a one-sided pair; nothing here rolls that back, since the
     /// evolve sweep already flags a `superseded_by` with no matching
     /// `supersedes` as its own finding.
-    pub async fn retire_engram_as(&self, p: &RetireParams, client: Option<&str>) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn retire_engram_as(
+        &self,
+        p: &RetireParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -2783,13 +6278,17 @@ impl Engine {
             })
             .transpose()?;
 
-        let actor = self.actor(client);
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
+        let (desc, source) = view.resolve(&p.identifier).await?;
 
         // Resolved before the target is touched: a missing successor must
-        // never leave the target half-retired.
+        // never leave the target half-retired. Through the same view, so a
+        // retirement in review mode can name a successor that only exists as
+        // this actor's draft.
         let successor = match &p.successor {
-            Some(identifier) => Some(self.resolve(identifier, Some(&p.domain)).await?),
+            Some(identifier) => Some(view.resolve(identifier).await?),
             None => None,
         };
         // A successor that resolves to the target itself would append a
@@ -2806,144 +6305,98 @@ impl Engine {
                 p.successor.as_deref().unwrap_or_default()
             )));
         }
+        // The permalink, not the title. A title is prose and may carry a
+        // colon, which `[[...]]` parses as a cross-domain prefix (issue #65);
+        // a permalink is the stable identity and never carries one. Fluid goes
+        // on rendering the title, which it reads off the engram the link lands
+        // on rather than off the bracket text.
+        //
+        // The title comes along only to recognize the bullet a previous
+        // retirement wrote in the older spelling, so re-retiring an engram
+        // that already declares its successor by title appends nothing.
+        let successor_permalink = successor.as_ref().map(|(d, _)| d.permalink.clone());
         let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
 
         // -- target: status, optional valid_to, optional superseded_by line --
-        match &source {
-            ContentSource::File { root } => {
-                let abs = join_rel(root, &desc.path);
-                // Held across the read, the retirement edit and the write, for
-                // the reason `edit_engram_as` gives: this is a read-modify-write
-                // with nothing to refuse a concurrent change on, so serializing
-                // is what stops one from being dropped. See `Engine::write_lock`.
-                let lock = self.write_lock(&abs);
-                let _guard = lock.lock().await;
-                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                    path: abs.display().to_string(),
-                    source,
-                })?;
-                let edited = Self::build_retirement_edit(
-                    &current,
-                    &p.status,
-                    valid_to,
-                    successor_title.as_deref(),
-                    &actor,
-                );
-                let edited = Self::enforce_temporal(edited)?;
-                write_file(&abs, &edited)?;
-                let store = self.store.lock().await;
-                self.reindex_file(&*store, desc.domain_id, root, &desc.path)
-                    .await?;
-            }
-            ContentSource::Virtual => {
-                let current = {
-                    let store = self.store.lock().await;
-                    store
-                        .engram_content(desc.domain_id, &desc.path)
-                        .await?
-                        .ok_or_else(|| {
-                            EngineError::NotFound(format!(
-                                "no content stored for '{}' in domain '{}'",
-                                desc.permalink, desc.domain
-                            ))
-                        })?
-                };
-                let edited = Self::build_retirement_edit(
-                    &current,
-                    &p.status,
-                    valid_to,
-                    successor_title.as_deref(),
-                    &actor,
-                );
-                let edited = Self::enforce_temporal(edited)?;
-                let stamp = virtual_stamp(&edited);
-                let store = self.store.lock().await;
-                self.index_markdown(
-                    &*store,
-                    desc.domain_id,
-                    &desc.path,
-                    &edited,
-                    stamp,
-                    None,
-                    true,
-                )
-                .await?;
-            }
-        }
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
-        self.refresh_index_files(&desc.domain).await;
+        //
+        // The retirement itself, as one closure the shared edit path applies to
+        // whatever text it reads: a draft in review mode, the open document
+        // while somebody has the page up, the file or the row otherwise. One
+        // copy of the edit and one path to write it back is what keeps a
+        // retired draft the same shape as an edited one.
+        let retire_target = |current: &str| -> Result<String> {
+            Ok(Self::build_retirement_edit(
+                current,
+                &p.status,
+                valid_to,
+                successor_permalink.as_deref(),
+                successor_title.as_deref(),
+                &actor,
+            ))
+        };
+        // **One arm, for every kind of domain and whoever is in the room.** The
+        // shared edit path reads this actor's own text - their draft in review
+        // mode, the open document while somebody has the page up, the file or
+        // the row otherwise - applies the retirement to it and writes it back
+        // where it came from. A direct-mode retirement used to be a raw
+        // read-edit-write of the file beside the room, so a person typing had
+        // the page retired underneath them and their next save came back as a
+        // three-way merge or a conflict they had to settle by hand. Now a
+        // retirement composes like every other in-place rewrite, and
+        // `a_retirement_in_a_direct_domain_composes_into_the_open_room` says so.
+        let mut warning = self
+            .apply_source_edit(&desc, &source, &view, None, &actor, None, retire_target)
+            .await?;
 
         // -- successor: reciprocal supersedes line, appended once --
         if let Some((succ_desc, succ_source)) = &successor {
-            let line = format!("- supersedes [[{}]]", desc.title);
-            match succ_source {
-                ContentSource::File { root } => {
-                    let abs = join_rel(root, &succ_desc.path);
-                    // The successor's own file, under its own lock: appending
-                    // the reciprocal line is another read-modify-write. Taken
-                    // after the target's has been released, never with it, so
-                    // two retirements naming each other cannot deadlock.
-                    let lock = self.write_lock(&abs);
-                    let _guard = lock.lock().await;
-                    let current =
-                        std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        })?;
-                    if !current.contains(&line) {
-                        let edited =
-                            touch_generated(&append_body(&current, &line), &actor, now_offset());
-                        write_file(&abs, &edited)?;
-                        let store = self.store.lock().await;
-                        self.reindex_file(&*store, succ_desc.domain_id, root, &succ_desc.path)
-                            .await?;
-                    }
-                }
-                ContentSource::Virtual => {
-                    let current = {
-                        let store = self.store.lock().await;
-                        store
-                            .engram_content(succ_desc.domain_id, &succ_desc.path)
-                            .await?
-                            .ok_or_else(|| {
-                                EngineError::NotFound(format!(
-                                    "no content stored for '{}' in domain '{}'",
-                                    succ_desc.permalink, succ_desc.domain
-                                ))
-                            })?
-                    };
-                    if !current.contains(&line) {
-                        let edited =
-                            touch_generated(&append_body(&current, &line), &actor, now_offset());
-                        let stamp = virtual_stamp(&edited);
-                        let store = self.store.lock().await;
-                        self.index_markdown(
-                            &*store,
-                            succ_desc.domain_id,
-                            &succ_desc.path,
-                            &edited,
-                            stamp,
-                            None,
-                            true,
-                        )
-                        .await?;
-                    }
-                }
+            let line = format!("- supersedes [[{}]]", desc.permalink);
+            // Recognized in either spelling, for the reason `declares` gives:
+            // a successor wired by an older retirement carries the title form.
+            let already = |current: &str| {
+                Self::declares(current, "supersedes", &desc.permalink, Some(&desc.title))
+            };
+            // The successor's side of the pair goes through the same one arm,
+            // for the same reasons: in review mode nothing this verb writes
+            // belongs in the folder the team reviewed, and a successor
+            // somebody has open is a document rather than a file. The text the
+            // "already said this" test reads is that same text, so a
+            // re-retirement appends nothing twice whichever of the three the
+            // successor is living in at that moment.
+            let current = match self.live_text_at(succ_desc, &view).await {
+                Some(live) => live,
+                None => match overlay {
+                    Some(_) => view.text_at(succ_source, succ_desc).await?.ok_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "no engram '{}' in domain '{}'",
+                            succ_desc.permalink, succ_desc.domain
+                        ))
+                    })?,
+                    None => self.load_content(succ_source, succ_desc).await?,
+                },
+            };
+            if !already(&current) {
+                let succ_warning = self
+                    .apply_source_edit(succ_desc, succ_source, &view, None, &actor, None, |c| {
+                        Ok(append_body(c, &line))
+                    })
+                    .await?;
+                warning = warning.or(succ_warning);
             }
-            if matches!(succ_source, ContentSource::Virtual) {
-                self.refresh_routing_cache().await;
-            }
-            self.refresh_index_files(&succ_desc.domain).await;
         }
+        self.nudge_embed();
 
-        Ok(json!({
+        let mut receipt = json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
             "status": p.status,
             "successor": successor.map(|(d, _)| d.permalink),
-        }))
+        });
+        if overlay.is_some() {
+            receipt["draft"] = json!(true);
+        }
+        note_unmirrored(&mut receipt, warning);
+        Ok(receipt)
     }
 
     /// Build the target engram's retirement edit: set `status`, set
@@ -2959,6 +6412,7 @@ impl Engine {
         current: &str,
         status: &str,
         valid_to: Option<NaiveDate>,
+        successor_permalink: Option<&str>,
         successor_title: Option<&str>,
         actor: &str,
     ) -> String {
@@ -2967,36 +6421,388 @@ impl Engine {
             edited =
                 set_frontmatter_field(&edited, "valid_to", &date.format("%Y-%m-%d").to_string());
         }
-        if let Some(title) = successor_title {
-            let line = format!("- superseded_by [[{title}]]");
-            if !current.contains(&line) {
+        if let Some(permalink) = successor_permalink {
+            let line = format!("- superseded_by [[{permalink}]]");
+            if !Self::declares(current, "superseded_by", permalink, successor_title) {
                 edited = append_body(&edited, &line);
             }
         }
-        touch_generated(&edited, actor, now_offset())
+        touch_generated(&edited, actor, None, now_offset())
+    }
+
+    /// Whether the text already declares this relation to this engram, in
+    /// either spelling.
+    ///
+    /// The engine writes the permalink form now and wrote the title form
+    /// before, so an archive holds both and a re-retirement must recognize the
+    /// one it finds rather than appending a second bullet saying what the first
+    /// already says. Exact on both, because both are spellings the engine
+    /// itself produced: this recognizes its own past output, it does not try to
+    /// parse what a person may have typed.
+    fn declares(current: &str, rel_type: &str, permalink: &str, title: Option<&str>) -> bool {
+        let mut forms = vec![format!("- {rel_type} [[{permalink}]]")];
+        if let Some(title) = title {
+            forms.push(format!("- {rel_type} [[{title}]]"));
+        }
+        forms.iter().any(|line| current.contains(line.as_str()))
+    }
+
+    /// Move part of an engram into a new one, in a single guided step: the
+    /// selected observations and sections leave the source, land in a new
+    /// engram carrying the source's tags and a `stable` status, and the two are
+    /// wired together with `derived_from` on the new engram and `split_into` on
+    /// the source.
+    ///
+    /// The verb behind "split before you retire". Validity is set per engram
+    /// rather than per bullet, so an engram that bundles facts with different
+    /// lifecycles has to give up its still-valid facts when the one fact that
+    /// expired retires the file. Doing that by hand is a write, two edits and a
+    /// pair of links, with every step a chance to lose a bullet; this is that
+    /// sequence as one call, and `V010` is the sweep rule that finds the
+    /// engrams needing it.
+    pub async fn split_engram(&self, p: &SplitParams) -> Result<Value> {
+        self.split_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::split_engram`] with the splitting identity, resolved by
+    /// [`Engine::actor`] and stamped into both engrams' `generated` block.
+    ///
+    /// **Everything that can be refused is refused before anything is
+    /// written**: the source resolves inside the domain the request named (see
+    /// [`Engine::resolve_in`]), its checksum is compared, every selected line is
+    /// checked to be an observation the source really carries, every section
+    /// path is resolved, and the remainder is measured against verify's `Q001`
+    /// minimum so a split can never quietly empty an engram. Only then does the
+    /// new engram get written, and only then the source edited.
+    ///
+    /// **The new engram goes first, and a failed source edit takes it back out
+    /// only while the source is untouched.** First because the failure that
+    /// leaves the knowledge in two places is survivable and the one that leaves
+    /// it in none is not. The source edit carries the checksum of the text this
+    /// call planned against, so a concurrent edit refuses it rather than
+    /// dropping somebody's work; a refusal before the source's bytes change -
+    /// that conflict, a read that fails, a write the filesystem refuses -
+    /// deletes the new engram again and hands the caller the failure with the
+    /// archive exactly as it was.
+    ///
+    /// **Once the source has been rewritten, nothing is undone**, and that is
+    /// the invariant rather than an omission: the source no longer holds the
+    /// moved observations, so deleting the engram that does hold them is the
+    /// one outcome this verb must never produce. `apply_source_edit_staged`
+    /// reports which side of the write it failed on
+    /// ([`SourceEditFailure::wrote`]), and on the far side both engrams are
+    /// kept and the error names them and says the source's index row may be
+    /// stale. What is left then is a correct pair with a stale index row for
+    /// the source, which a sync, a watcher tick or `reindex` repairs.
+    ///
+    /// **Only a file domain can reach that state.** A virtual source is edited
+    /// inside one store transaction that rolls back on any error, so a failure
+    /// there is always the untouched case: a concurrent edit comes back as the
+    /// `Conflict` it is and the new engram is taken back out, with the stored
+    /// bytes exactly as they were.
+    ///
+    /// **A moved section takes its relation bullets with it**, since a section
+    /// moves as text. That can leave a relation the source declared one-sided;
+    /// the evolve sweep raises it as `V103` and the fix is one append.
+    ///
+    /// **What the new engram inherits, and what it does not.** The moved
+    /// content, the source's tags and the source's `type` carry over, because
+    /// splitting a guide into two guides is what a reader expects. The
+    /// lifecycle does not: the new engram is `stable` with no validity window,
+    /// since the facts being moved out are the ones that still hold. Nothing
+    /// else from the source's frontmatter follows it.
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn split_engram_as(
+        &self,
+        p: &SplitParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
+        let (desc, source) = view.resolve(&p.identifier).await?;
+        // The text the split moves observations out of is what this actor sees
+        // there: the open document when somebody has this page up, their own
+        // draft when they hold one, the reviewed file otherwise. Splitting the
+        // base under a draft would move lines the splitter is not looking at,
+        // and splitting the file under an open room would plan against a
+        // version the room has already moved past - the staged edit below
+        // composes into that room and compares this very checksum against it,
+        // so a plan made from the stored text could never land while anybody
+        // was typing. The probe stands here, above every lock this verb reaches.
+        // See `Engine::live_text_at`.
+        let stored = || async {
+            match overlay {
+                Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
+                    EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        p.identifier, p.domain
+                    ))
+                }),
+                None => self.load_content(&source, &desc).await,
+            }
+        };
+        let content = match self.live_text_at(&desc, &view).await {
+            Some(live) => live,
+            None => stored().await?,
+        };
+        let checksum = sha256_hex(content.as_bytes());
+        if let Some(expected) = p.expected_checksum.as_deref()
+            && expected != checksum
+        {
+            return Err(EngineError::Conflict(stale_edit_message(
+                expected, &checksum,
+            )));
+        }
+        let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let plan = Self::plan_split(&content, &engram, p, &desc.permalink)?;
+
+        // One trimmed title everywhere: the heading, the link the source gets
+        // and the receipt all name the engram the same way.
+        let title = p.title.trim().to_string();
+
+        // The new engram, written through the ordinary capture path so the
+        // permalink screens, the collision refusal and the provenance stamp are
+        // the ones every other new engram gets.
+        let body = format!(
+            "# {title}\n\n{}\n\n- derived_from [[{}]]",
+            plan.moved, desc.permalink
+        );
+        let created = self
+            .write_engram_as(
+                &WriteParams {
+                    domain: p.domain.clone(),
+                    title: title.clone(),
+                    content: body,
+                    folder: p.folder.clone(),
+                    engram_type: Some(engram.frontmatter.engram_type.clone()),
+                    tags: engram.frontmatter.tags.clone(),
+                    status: Some("stable".to_string()),
+                    metadata: None,
+                    overwrite: false,
+                    // A split writes the splitter's own new engram, which is
+                    // nobody's shared draft: a link presented on the split
+                    // would be a link to the page being split, not to this.
+                    share_link: None,
+                    model: None,
+                },
+                client,
+                // The splitter's own scope: the new engram is written by
+                // whoever asked for the split, wherever their writes land.
+                scope,
+            )
+            .await?;
+        // Where the capture path put it, which is also what the rollback below
+        // has to address. Absent means the receipt shape changed under this
+        // code: the rollback is skipped and said out loud rather than run
+        // against an empty identifier, which would delete nothing and report
+        // nothing.
+        let new_permalink = created["permalink"].as_str().map(str::to_string);
+        let new_path = created["path"].as_str().unwrap_or_default().to_string();
+
+        // By permalink, for the reason `derived_from` above is: a title is
+        // prose and may carry a colon that `[[...]]` reads as a cross-domain
+        // prefix (issue #65). The fallback for the one case with no permalink
+        // to name - a receipt whose shape changed under this code, which the
+        // rollback below reports rather than acts on - is the slug of the
+        // title, which is what the capture path would have derived anyway, and
+        // never the title itself: that would write the very shape this change
+        // is about.
+        let back_link = new_permalink
+            .clone()
+            .unwrap_or_else(|| crystalline_core::slugify(&title));
+        let remaining = append_body(&plan.remaining, &format!("- split_into [[{back_link}]]"));
+        let edited = self
+            .apply_source_edit_staged(
+                &desc,
+                &source,
+                &view,
+                Some(&checksum),
+                &actor,
+                // A split moves words it did not write, so its tail records
+                // the agent without a model, exactly as it records the actor.
+                None,
+                None,
+                move |_| Ok(remaining),
+            )
+            .await;
+        let source_warning = match edited {
+            Ok(warning) => warning,
+            Err(failure) => {
+                if failure.wrote {
+                    // The source's bytes are the edited ones, so the moved
+                    // observations live in the new engram and nowhere else.
+                    // Deleting it here is the one thing that would lose them.
+                    return Err(EngineError::Internal(format!(
+                        "the split wrote both engrams but the index update for '{}' failed: {}. Both are kept and neither was undone ({} and {}); the index row for '{}' may be stale until the next sync or reindex picks it up",
+                        desc.permalink, failure.error, desc.path, new_path, desc.permalink
+                    )));
+                }
+                // The source is untouched, so the new engram is knowledge the
+                // archive now holds twice. Take it back, and report the underlying
+                // failure rather than the cleanup: what the caller has to act on is
+                // that the source moved under them.
+                match new_permalink {
+                    Some(permalink) => {
+                        let _ = self
+                            .delete_engram_as(
+                                &DeleteParams {
+                                    identifier: permalink,
+                                    domain: p.domain.clone(),
+                                    expected_checksum: None,
+                                },
+                                client,
+                                // The splitter's own scope again: in review mode
+                                // the engram to take back is in the splitter's
+                                // draft, and the owner wrapper would look for it
+                                // in the owner's.
+                                scope,
+                            )
+                            .await;
+                    }
+                    None => tracing::warn!(
+                        receipt = %created,
+                        "split rollback skipped: the capture receipt named no permalink"
+                    ),
+                }
+                return Err(failure.error);
+            }
+        };
+
+        let mut receipt = json!({
+            "domain": desc.domain,
+            "source": {
+                "permalink": desc.permalink,
+                "path": desc.path,
+                "title": desc.title,
+            },
+            "new": {
+                "permalink": created["permalink"],
+                "path": created["path"],
+                "title": title,
+            },
+            "moved_observations": plan.observations,
+            "moved_sections": plan.sections,
+        });
+        // A split is two writes, and in review mode both of them are drafts:
+        // the engram it created and the source it edited. Its receipt says so
+        // like every other routed verb's, or a caller reads a split of the
+        // folder the team reviewed.
+        if overlay.is_some() {
+            receipt["draft"] = json!(true);
+        }
+        // Either write's mirror can fail on its own, and the create's warning
+        // is already on the receipt this verb built its own from.
+        note_unmirrored(
+            &mut receipt,
+            source_warning.warning.or_else(|| {
+                created
+                    .get("draft_warning")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+        );
+        Ok(receipt)
+    }
+
+    /// Work out what a split would move and what it would leave, or refuse.
+    /// Pure text over the parsed source, so every refusal happens before the
+    /// first write.
+    fn plan_split(
+        content: &str,
+        engram: &Engram,
+        p: &SplitParams,
+        permalink: &str,
+    ) -> Result<SplitPlan> {
+        let mut moving: BTreeSet<usize> = BTreeSet::new();
+        // Both counts answer the same question - how many distinct things
+        // moved - so both are collected as sets: a line named twice moves once,
+        // and two paths that resolve to the same heading move one section.
+        let mut observations: BTreeSet<usize> = BTreeSet::new();
+        let mut sections: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for line in &p.observations {
+            if !engram.observations.iter().any(|o| o.line == *line) {
+                return Err(EngineError::Invalid(format!(
+                    "line {line} is not an observation bullet on '{permalink}'; \
+                     read_engram reports the line of every observation it carries"
+                )));
+            }
+            moving.insert(*line);
+            observations.insert(*line);
+        }
+        for path in &p.sections {
+            let (start, end) =
+                crystalline_core::emit::section_line_range(content, path).map_err(section_err)?;
+            moving.extend(start..end);
+            sections.insert((start, end));
+        }
+        if moving.is_empty() {
+            return Err(EngineError::Invalid(
+                "split_engram needs something to move: pass observations (the line numbers \
+                 read_engram reports) or sections (heading paths such as '## Notes')"
+                    .into(),
+            ));
+        }
+
+        let mut moved: Vec<&str> = Vec::new();
+        let mut kept: Vec<&str> = Vec::new();
+        for (i, line) in content.split('\n').enumerate() {
+            if moving.contains(&(i + 1)) {
+                moved.push(line);
+            } else {
+                kept.push(line);
+            }
+        }
+        let remaining = kept.join("\n");
+        // Measured on the knowledge that would be left, before the
+        // `split_into` line is appended: a bookkeeping relation is not what
+        // makes an engram worth keeping.
+        let left = parse_engram(&remaining)
+            .map(|e| crystalline_index::content_line_count(&e.body))
+            .unwrap_or(0);
+        if left < crystalline_index::MIN_CONTENT_LINES {
+            return Err(EngineError::Invalid(format!(
+                "that selection would leave '{permalink}' with {left} content line(s), under the \
+                 {} verify rule Q001 requires; move less, or retire the whole engram instead of \
+                 splitting it",
+                crystalline_index::MIN_CONTENT_LINES
+            )));
+        }
+
+        Ok(SplitPlan {
+            moved: moved.join("\n").trim_matches('\n').to_string(),
+            remaining,
+            observations: observations.len(),
+            sections: sections.len(),
+        })
     }
 
     // --- read ----------------------------------------------------------------
 
-    /// One engram's exact file text and identity: what the collab session
-    /// layer loads at open and probes with on its idle external-change check.
-    /// Deliberately thin - [`Engine::read_engram`] resolves references and
-    /// builds hints this caller never reads.
+    /// One engram's exact file text and identity, addressed by domain name:
+    /// the base view of that domain, read the way the collab session layer
+    /// reads it at open. Deliberately thin - [`Engine::read_engram`] resolves
+    /// references and builds hints this caller never reads.
+    ///
+    /// **Whose text** is a view's to say, and this name-addressed form answers
+    /// with the folder the team reviewed, whoever else is drafting - which is
+    /// what it answered before there was anything else it could have answered.
+    /// A caller that already holds a reader's own view asks that view instead.
     pub async fn engram_text(&self, domain: &str, identifier: &str) -> Result<EngramText> {
-        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
-        let content = self.load_content(&source, &desc).await?;
-        let checksum = sha256_hex(content.as_bytes());
-        Ok(EngramText {
-            domain: desc.domain,
-            permalink: desc.permalink,
-            path: desc.path,
-            content,
-            checksum,
-        })
+        DomainView::base(self, domain, &HashSet::new())?
+            .engram_text(identifier)
+            .await
     }
 
     /// The exact text a domain holds at a domain-relative PATH right now, or
-    /// `None` when nothing is there.
+    /// `None` when nothing is there: the base view of that domain.
     ///
     /// Path-addressed on purpose, and the counterpart of
     /// [`Engine::restore_engram`]: a collab room whose engram vanished from
@@ -3011,47 +6817,9 @@ impl Engine {
         domain: &str,
         path: &str,
     ) -> Result<Option<EngramText>> {
-        let source = self.content_source(domain)?;
-        let content = match &source {
-            ContentSource::File { root } => {
-                let abs = join_rel(root, path);
-                match std::fs::read_to_string(&abs) {
-                    Ok(text) => text,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(source) => {
-                        return Err(EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        });
-                    }
-                }
-            }
-            ContentSource::Virtual => {
-                let (domain_id, _) = self.domain_source(domain).await?;
-                let store = self.store.lock().await;
-                match store.engram_content(domain_id, path).await? {
-                    Some(text) => text,
-                    None => return Ok(None),
-                }
-            }
-        };
-        let permalink = {
-            let store = self.store.lock().await;
-            store
-                .list_engrams(domain, Some(path), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == path)
-                .map(|found| found.permalink)
-                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
-        };
-        Ok(Some(EngramText {
-            domain: domain.to_string(),
-            permalink,
-            path: path.to_string(),
-            checksum: sha256_hex(content.as_bytes()),
-            content,
-        }))
+        DomainView::base(self, domain, &HashSet::new())?
+            .engram_text_at_path(path)
+            .await
     }
 
     /// Read an engram's full markdown and resolved frontmatter. The content
@@ -3059,22 +6827,308 @@ impl Engine {
     /// database (virtual domains, and non-host reads over a shared database). The
     /// returned `checksum` is the CAS token an `edit_engram` can pass back as
     /// `expected_checksum` to detect a change since this read.
-    pub async fn read_engram(&self, p: &ReadParams) -> Result<Value> {
-        let (desc, source) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
-        let content = self.load_content(&source, &desc).await?;
+    ///
+    /// `scope` decides what may be read at all: an engram in a domain the
+    /// caller may not see is [`EngineError::NotFound`], the same miss an engram
+    /// nobody wrote produces, and the inbound sample below never names a domain
+    /// the caller cannot see.
+    /// The draft this caller holds a share-link to, when the identifier they
+    /// read names it - the ONE read in this engine that answers with another
+    /// actor's work.
+    ///
+    /// **Why a read widens at all.** A grant is visibility, and a person's
+    /// agent is that person: it signs in as the same account, and it has no
+    /// screen to open a link on. If only the browser could see a granted
+    /// draft, somebody could be handed a colleague's page and their own agent
+    /// could not be shown what they were looking at. So the account's agent
+    /// sees it where its person does - at the path the link was for.
+    ///
+    /// **And nowhere else.** The widening is this function and this function
+    /// only: search, listing, the reference candidate set and every other read
+    /// are untouched, so a grantee's view of the domain is exactly what it was
+    /// except at one path. That is the whole of ruling 1's "reads outside the
+    /// granted path never show it", and
+    /// `a_grantees_search_still_excludes_the_owners_draft` asserts it from the
+    /// other side.
+    ///
+    /// Three properties are deliberate and each is visible in the answer:
+    ///
+    /// * **it says whose it is.** `draft: true` and `draft_owner` ride on the
+    ///   payload, because a granted draft standing where the team's own page
+    ///   stands must never be mistaken for that page;
+    /// * **no transitivity.** The references are reported as they parse and
+    ///   nothing resolves: a link in the granted draft onto another of the
+    ///   owner's drafts names a page that was not shared, and resolving it
+    ///   would make one grant into a tour of an overlay. A link onto a page
+    ///   the team holds is unresolved here too, which is the cost of the rule
+    ///   and is stated rather than hidden;
+    /// * **nothing points at it.** A draft has no inbound references, because
+    ///   nobody can write a reference to a page only its author can read.
+    ///
+    /// **It is asked before the resolution, so the granted draft stands OVER
+    /// the base row at that path**, and that is a decision rather than an
+    /// artefact of where the call sits: a draft always stands over the base for
+    /// whoever may see it, which is the rule this whole mode runs on, and the
+    /// link is what says the grantee may. The alternative - the team's page
+    /// wins and a grant only ever adds a page no file holds - would mean a
+    /// redraft of a shared page stayed invisible to the grantee's agent while
+    /// its person was reading it on screen. Moving the call in
+    /// [`Engine::read_engram`] into the `NotFound` arm is the whole of the
+    /// flip, if that is ever the wanted answer.
+    ///
+    /// `None` - the ordinary answer, for every caller and every identifier -
+    /// short-circuits before any store read when the caller has no account, so
+    /// the common path costs nothing.
+    async fn granted_read(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+        hidden: &HashSet<String>,
+    ) -> Result<Option<Value>> {
+        let Some(account) = crate::scope::overlay_actor(scope) else {
+            return Ok(None);
+        };
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        // Which domain the identifier is asking about. An absolute address
+        // names its own; otherwise the caller's `domain` does, and a read with
+        // neither is not a read this can answer - a grant names one domain,
+        // and guessing which is not something a widening may do.
+        let domain = match CrystallineUrl::parse(&p.identifier) {
+            Some(url) => url.domain,
+            None => match p.domain.as_deref() {
+                Some(named) => named.to_string(),
+                None => return Ok(None),
+            },
+        };
+        // **The registered-set screen, the same one every other read makes.**
+        // A grant is the author's word about one draft and never about a
+        // domain, so it must not outlive the grantee's access to the domain
+        // that draft is in: an account whose membership was taken away, or a
+        // domain that has since been made private, is answered here exactly as
+        // it is answered everywhere else - there is no grant to widen with.
+        // `domain_entry_scoped` rather than the bare `hidden` set, so this is
+        // the identical check `Engine::require_domain` makes (it covers a
+        // domain nobody registered too), and its refusal is turned into `None`
+        // rather than raised: the ordinary read path below is what answers a
+        // caller who named a domain they may not see, and it already answers
+        // it without saying the domain exists.
+        if self.domain_entry_scoped(&domain, hidden).is_err() {
+            return Ok(None);
+        }
+        let held = access
+            .overlay_grants_held(&account, &domain)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        if held.is_empty() {
+            return Ok(None);
+        }
+        let bare = CrystallineUrl::parse(&p.identifier)
+            .map(|url| url.permalink)
+            .unwrap_or_else(|| p.identifier.clone());
+        // This reader's own view of the domain, for the one question below
+        // that is about THEM rather than about the grant. The read-only id
+        // lookup, never an upserting one: asking about a domain this index has
+        // never seen must not register it.
+        let own = DomainView::for_read(self, &domain, hidden, scope)?;
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(&domain).await?
+        };
+        for (path, owner) in held {
+            if owner == account {
+                continue;
+            }
+            // The freshness check every other grant surface makes: a link
+            // whose draft has gone opens nothing, so it widens nothing.
+            let Some(draft) = self.overlay_draft_at(&domain, &owner, &path).await? else {
+                continue;
+            };
+            let names = [
+                draft.permalink.as_str(),
+                path.as_str(),
+                path.trim_end_matches(".md"),
+            ];
+            if !names.contains(&bare.as_str()) {
+                continue;
+            }
+            // **The reader's own row at that path wins.** A link handed to
+            // somebody is not a reason to hide their own unfolded work from
+            // them: the precedence is the mode's own - your own draft, then
+            // what a grant widens, then the page the team holds - and the
+            // granted draft is still exactly where the link put it, on the
+            // surface that opened it. A deletion of their own counts here too:
+            // it is their decision about that path, and standing somebody
+            // else's draft on top of it would answer around it.
+            if let Some(domain_id) = domain_id
+                && own.holds_own_entry(domain_id, &path).await?
+            {
+                continue;
+            }
+            return Ok(Some(granted_draft_json(&domain, &owner, &draft)?));
+        }
+        Ok(None)
+    }
+
+    /// Who is in the room over one document, for the read payload's `present`.
+    ///
+    /// Asked only when [`CollabSessions::live_text`] already answered, so the
+    /// second lookup is over a room that was open a moment ago; a room that
+    /// closed in between answers an empty list rather than an error, which is
+    /// the true thing to say about who is in a room nobody is in.
+    async fn live_participants(
+        &self,
+        desc: &EngramDescriptor,
+        view: &DomainView<'_>,
+        except: Option<yrs::ClientID>,
+    ) -> Vec<String> {
+        match self.collab_rooms() {
+            Some(rooms) => {
+                rooms
+                    .participants(&desc.domain, &desc.permalink, view.actor(), except)
+                    .await
+            }
+            None => Vec::new(),
+        }
+    }
+
+    pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
+        self.read_engram_in(p, scope, true, None).await
+    }
+
+    /// [`Engine::read_engram`], with the reading agent as a named peer in the
+    /// room it may be answered from.
+    ///
+    /// A read that comes back live is a read over somebody's shoulder: the
+    /// bytes are their unsaved work, and the person who typed them is owed the
+    /// same name in the strip an edit puts there. So the claim is made here
+    /// too, and it expires the same way. A read answered from the file or the
+    /// row puts nothing anywhere, which is nearly every read.
+    pub async fn read_engram_present(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+        peer: Option<&AgentPeer>,
+    ) -> Result<Value> {
+        self.read_engram_in(p, scope, true, peer).await
+    }
+
+    /// [`Engine::read_engram`] with the live document deliberately ignored:
+    /// the stored version, and its checksum.
+    ///
+    /// **For the surface where a checksum is a VERSION TOKEN rather than a
+    /// description.** The JSON API hands its checksum over as an `ETag`, the
+    /// browser sends it back as `If-Match`, and the durable write it guards
+    /// compares against the row or the file. A checksum of somebody's unsaved
+    /// document would be a token no save could ever match, so a reader who
+    /// opened a page while a colleague had it open would be told their edit was
+    /// stale, handed the same token again, and told so again - until the
+    /// colleague's session happened to save. That surface has its own live view
+    /// of a document, and it is the co-editing socket.
+    ///
+    /// An agent's read is the other case and takes the live text: it has no
+    /// socket, its `expected_checksum` is compared by the verb that composes
+    /// into the document, and being answered the bytes the engram actually says
+    /// right now is the whole of Task 14.
+    pub(crate) async fn read_engram_stored(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.read_engram_in(p, scope, false, None).await
+    }
+
+    async fn read_engram_in(
+        &self,
+        p: &ReadParams,
+        scope: &crate::scope::Scope,
+        live_wins: bool,
+        peer: Option<&AgentPeer>,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        // The one path a read crosses between two overlays on: a draft this
+        // caller was handed a link to. Asked first, so the grant stands over
+        // whatever the team's own folder holds at that path - a draft always
+        // stands over the base for whoever may see it, and the link is what
+        // says they may. See `Engine::granted_read`.
+        if let Some(granted) = self.granted_read(p, scope, &hidden).await? {
+            return Ok(granted);
+        }
+        let (desc, source, overlay) = self
+            .resolve_shadowed(&p.identifier, p.domain.as_deref(), &hidden, scope)
+            .await?;
+        // The reader's own view of the domain the identifier landed in, which
+        // is the one `resolve_shadowed` just answered through.
+        let view = DomainView::for_read(self, &desc.domain, &hidden, scope)?;
+        let content = match &overlay {
+            Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    p.identifier, desc.domain
+                ))
+            })?,
+            None => self.load_content(&source, &desc).await?,
+        };
+        // **A co-editing room over this document outranks both.** While one is
+        // open the room's text is what the engram says: somebody is typing
+        // into it, the file and the row are both a save behind, and a reader
+        // answered from either would be reading a version the room has already
+        // moved past. The checksum below is the live text's too, so an edit
+        // guarded with it is guarded against the document rather than against
+        // the file - which is what makes read-then-edit work at all while
+        // somebody is in there.
+        let live = match live_wins {
+            true => self.live_text_at(&desc, &view).await,
+            false => None,
+        };
+        let present = match &live {
+            Some(_) => {
+                // The agent stands in the room first and is then told who is
+                // in it: `present` is who this read is reading over, and the
+                // reader is not one of them - not on the call that mints its
+                // slot and not on the ones that find it standing. Another
+                // agent working in the same document is.
+                let mine = match (self.collab_rooms(), peer) {
+                    (Some(rooms), Some(peer)) => {
+                        rooms
+                            .touch_agent_presence(&desc.domain, &desc.permalink, view.actor(), peer)
+                            .await
+                    }
+                    _ => None,
+                };
+                self.live_participants(&desc, &view, mine).await
+            }
+            None => Vec::new(),
+        };
+        let is_live = live.is_some();
+        let content = live.unwrap_or(content);
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let checksum = sha256_hex(content.as_bytes());
 
         // Enrich the response with reference resolution: which outbound links
         // land, and who points back in. The descriptor carries the ids, so this
         // works for file, virtual and non-host reads alike.
-        let (outbound, inbound) = {
+        //
+        // Outbound is asked of the row this reader is actually looking at, and
+        // judged in their view - see [`DomainView::outbound`], which is both
+        // halves of that sentence. Inbound stays the base row's, deliberately:
+        // who points here is a fact about the address the team shares, and
+        // nobody can write a reference to a draft only its author can read.
+        let outbound = view.outbound(&desc).await?;
+        let inbound = {
             let store = self.store.lock().await;
-            let outbound = store.outbound_refs(desc.id).await?;
-            let inbound = store
+            let mut inbound = store
                 .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
                 .await?;
-            (outbound, inbound)
+            // Who points here is answered for the caller asking: a reference
+            // out of a domain this caller may not see names that domain and one
+            // of its file paths, so it is dropped before the count as well as
+            // before the sample. The count states what the sample is drawn
+            // from, and a count of references that cannot be shown would be a
+            // second, quieter way of saying the domain is there.
+            inbound.retain(|r| !hidden.contains(&r.src_domain));
+            inbound
         };
 
         // A parsed reference resolves when a matching indexed row (same source
@@ -3146,6 +7200,22 @@ impl Engine {
             .as_object_mut()
             .expect("read_engram response is a JSON object");
 
+        // One line saying whose page this is. Emitted only when the reader is
+        // looking at a draft of their own - over a base row or at a path no
+        // file holds - so a direct domain's payload never grows a key, and a
+        // reader never sees the word about anybody else's work.
+        if view.draft_at(desc.domain_id, &desc.path).await?.is_some() {
+            obj.insert("draft".to_string(), json!(true));
+        }
+
+        // Two lines saying the bytes above are somebody's unsaved work and who
+        // is holding them. Emitted only when a room is actually open, so every
+        // other read on this instance answers exactly what it always did.
+        if is_live {
+            obj.insert("live".to_string(), json!(true));
+            obj.insert("present".to_string(), json!(present));
+        }
+
         // Inbound summary: how many references point here, with a small capped
         // sample so a heavily linked engram never bloats the response. Omitted
         // entirely when nothing points here.
@@ -3204,6 +7274,15 @@ impl Engine {
     ///
     /// An engram nobody wrote is [`EngineError::NotFound`], the same resolution
     /// every other read of one identifier opens with.
+    ///
+    /// Scoped: the anchor resolves through [`Engine::resolve_scoped`], so an
+    /// engram in a domain the caller may not see is the not-found a missing
+    /// one produces, and the domains it may not see are subtracted inside the
+    /// query rather than from its answer. This list names other domains by
+    /// name and path - it is the one read on this surface whose *rows* are
+    /// mostly about somewhere else - so a referrer inside a hidden domain is
+    /// absent from the page, from the total and from the per-relation summary
+    /// alike. [`crate::scope::Scope::Unrestricted`] subtracts nothing.
     pub async fn inbound_references(
         &self,
         p: &ReadParams,
@@ -3211,8 +7290,12 @@ impl Engine {
         rel: Option<&str>,
         page: Option<usize>,
         limit: Option<usize>,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        let (desc, _) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+        let hidden = self.hidden_for(scope).await?;
+        let (desc, _) = self
+            .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden)
+            .await?;
         // Clamped rather than refused, the way the listing clamps its own: a
         // hand-written page number below one is answered with the first page,
         // and a page size past [`MAX_INBOUND_LIMIT`] is answered with that
@@ -3221,6 +7304,11 @@ impl Engine {
         // back at it.
         let page = page.unwrap_or(1).max(1);
         let limit = limit.unwrap_or(10).clamp(1, MAX_INBOUND_LIMIT);
+        // Sorted so the query text is stable for one caller across calls,
+        // which keeps a prepared-statement cache and a log line honest; the
+        // set itself is unordered.
+        let mut exclude: Vec<String> = hidden.iter().cloned().collect();
+        exclude.sort();
         let found = {
             let store = self.store.lock().await;
             store
@@ -3231,6 +7319,7 @@ impl Engine {
                     title: &desc.title,
                     q,
                     rel,
+                    exclude_domains: &exclude,
                     page,
                     limit,
                 })
@@ -3273,34 +7362,141 @@ impl Engine {
     /// a compare-and-swap guard so a stale edit is refused rather than silently
     /// clobbering a concurrent change (see `expected_checksum`).
     pub async fn edit_engram(&self, p: &EditParams) -> Result<Value> {
-        self.edit_engram_as(p, None).await
+        self.edit_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
     }
 
     /// [`Engine::edit_engram`] with the editor's identity, resolved by
     /// [`Engine::actor`] and written into the engram's `generated` block. An
     /// engram that still carries the legacy `timestamp` key migrates to
     /// `generated` here, on its next edit.
-    pub async fn edit_engram_as(&self, p: &EditParams, client: Option<&str>) -> Result<Value> {
+    ///
+    /// `scope` is the acting scope every write verb carries; see
+    /// [`Engine::write_engram_as`].
+    pub async fn edit_engram_as(
+        &self,
+        p: &EditParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.edit_engram_joined(p, client, scope, None).await
+    }
+
+    /// [`Engine::edit_engram_as`], with the join a session may be holding.
+    ///
+    /// **The compose verb, and so the one a join is actually for.** A person
+    /// invited into somebody's draft is invited to work on that page, and an
+    /// agent invited into it edits the page - it does not re-address it, move
+    /// it or take it away, which is why those verbs take no join. The two
+    /// gates `Engine::save_engram_joined` carries ride here for the same
+    /// reason they ride there rather than in the routes, so a second surface
+    /// that learns to join inherits both: an edit is into ONE draft, and an
+    /// edit at a path this caller was GRANTED but has not joined is refused in
+    /// words that name both ways forward.
+    ///
+    /// `None` is the ordinary edit, which is what every surface but a joined
+    /// one passes and what this verb did before joins existed.
+    pub async fn edit_engram_joined(
+        &self,
+        p: &EditParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+    ) -> Result<Value> {
+        self.edit_engram_present(p, client, scope, join, None).await
+    }
+
+    /// [`Engine::edit_engram_joined`], with the agent as a named peer in the
+    /// room the edit may land in.
+    ///
+    /// The bottom rung, and the only one that knows about the strip. `peer` is
+    /// display alone: it changes nothing about what is written or where, and
+    /// the provenance the edit records is `client` exactly as it always was.
+    /// It is carried this far down rather than resolved from the receipt
+    /// because the room is keyed on the overlay owner, and who that is - your
+    /// own draft, the author's draft you were invited into, or the document a
+    /// direct domain keeps - is the view's answer, resolved here.
+    ///
+    /// `None` is every surface that is not an agent working for somebody: the
+    /// CLI, the control socket, a call nobody authenticated.
+    pub async fn edit_engram_present(
+        &self,
+        p: &EditParams,
+        client: Option<&str>,
+        scope: &crate::scope::Scope,
+        join: Option<&crate::join::Join>,
+        peer: Option<&AgentPeer>,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let actor = self.actor(client);
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
+        let overlay = view.actor();
+        // The join as this view actually took it: one naming another domain,
+        // or a domain that has stopped reviewing changes, is not a join into
+        // this edit at all and must not gate it.
+        let join = join.filter(|_| view.joined().is_some());
+        let actor = self.actor_for(client, overlay);
+        let (desc, source) = match view.resolve(&p.identifier).await {
+            Ok(resolved) => resolved,
+            // A name this caller's own view cannot resolve, when they hold a
+            // link to a draft that answers to it: the miss IS the rule, since
+            // the granted draft is deliberately absent from every ordinary
+            // read they make. So the refusal teaches instead, in the same
+            // words a save at that name gets.
+            Err(EngineError::NotFound(missing)) => {
+                return match self
+                    .teach_granted_miss(&p.domain, &p.identifier, scope)
+                    .await?
+                {
+                    Some(teaching) => Err(EngineError::Refused(teaching)),
+                    None => Err(EngineError::NotFound(missing)),
+                };
+            }
+            Err(e) => return Err(e),
+        };
+        self.screen_granted_path(&desc.domain, &desc.path, scope, join)
+            .await?;
         // An `evolve_ack` assignment is the one set_frontmatter key whose value
         // the server completes rather than takes: the scope comes from running
         // detection over this engram's domain, which needs the store and so
         // cannot happen inside the pure text edit below. Computed before the
         // write lock is taken, so a sweep never runs while a file is held.
-        let ack = self.ack_draft(p, &desc, &actor).await?;
+        let ack = self.ack_draft(p, &desc, &actor, scope).await?;
 
-        self.apply_source_edit(
-            &desc,
-            &source,
-            p.expected_checksum.as_deref(),
-            &actor,
-            |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
-        )
-        .await?;
+        // The staged form rather than the shorthand, for the one thing it
+        // reports that this verb says out loud: whether the edit composed into
+        // a live co-editing document instead of a file or a row.
+        // The model the agent reported, held against the actor this edit
+        // records: a person's edit never carries one (`stamped_model`).
+        let model = stamped_model(&actor, p.model.as_deref());
+        let edited = self
+            .apply_source_edit_staged(
+                &desc,
+                &source,
+                &view,
+                p.expected_checksum.as_deref(),
+                &actor,
+                model.as_deref(),
+                peer,
+                |current| {
+                    // The REPORTED model here, not the one resolved against
+                    // this actor: the block this call stamps is held against
+                    // the actor it records (above), and a `verified` entry is
+                    // held against the actor IT records, which only the arm
+                    // that builds it knows.
+                    self.apply_edit(
+                        current,
+                        p,
+                        &desc.permalink,
+                        &actor,
+                        p.model.as_deref(),
+                        ack.as_ref(),
+                    )
+                },
+            )
+            .await
+            .map_err(|failure| failure.error)?;
 
         let mut response = json!({
             "domain": desc.domain,
@@ -3308,6 +7504,26 @@ impl Engine {
             "path": desc.path,
             "operation": p.operation,
         });
+        if overlay.is_some() {
+            response["draft"] = json!(true);
+        }
+        // Whose draft it landed in, when that is not the caller's own - the
+        // one thing a joined edit has to say that an ordinary one does not.
+        // Somebody composing inside a colleague's draft is owed a plain
+        // sentence about where the words went, in the same words the joined
+        // save says it in.
+        if let Some(owner) = view.joined() {
+            response["joined"] = json!(format!("landed in {owner}'s draft"));
+        }
+        // Where it went, said only when that is not where an edit ordinarily
+        // goes: somebody has this page open, the text is in their document,
+        // and their session is what writes it down. `present` names them, so
+        // an agent can say whose screen it just appeared on.
+        if let Some(live) = &edited.live {
+            response["landed"] = json!("live");
+            response["present"] = json!(live.participants);
+        }
+        note_unmirrored(&mut response, edited.warning);
         match &ack {
             Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
             Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
@@ -3327,25 +7543,197 @@ impl Engine {
     /// silently dropping it. For a virtual domain the store's own compare and
     /// swap plays that part, with the checksum of what was just read standing
     /// in when the caller presents none.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_source_edit<F>(
         &self,
         desc: &EngramDescriptor,
         source: &ContentSource,
+        view: &DomainView<'_>,
         expected_checksum: Option<&str>,
         actor: &str,
+        model: Option<&str>,
         apply: F,
-    ) -> Result<()>
+    ) -> Result<Option<String>>
     where
         F: FnOnce(&str) -> Result<String>,
     {
+        // The live landing is dropped here rather than plumbed on: the callers
+        // that reach this shorthand (a retirement, a split's tail, a
+        // successor's back-link) build receipts about what they moved rather
+        // than about where the bytes went, and every one of them composes into
+        // an open room correctly without saying so. The verb that says so is
+        // `edit_engram_as`, which calls the staged form for exactly that.
+        //
+        // The agent peer goes the same way and for the same reason: these
+        // verbs carry no peer to name, because none of their surfaces resolves
+        // one. The text still composes into the open room; what an author does
+        // not get is a chip for the agent that retired the page under them.
+        self.apply_source_edit_staged(
+            desc,
+            source,
+            view,
+            expected_checksum,
+            actor,
+            model,
+            None,
+            apply,
+        )
+        .await
+        .map(|edited| edited.warning)
+        .map_err(|failure| failure.error)
+    }
+
+    /// [`Engine::apply_source_edit`], reporting whether the source's bytes were
+    /// already replaced when it failed.
+    ///
+    /// One caller needs that, and only one: [`Engine::split_engram_as`] writes a
+    /// second engram before this runs and may only take that engram back while
+    /// the source is provably untouched. No error kind answers the question -
+    /// the reindex that follows the rename reads the file back and raises the
+    /// same `Io` a refused write raises - so the stage is reported by the code
+    /// that knows it rather than guessed from the error afterwards.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_source_edit_staged<F>(
+        &self,
+        desc: &EngramDescriptor,
+        source: &ContentSource,
+        view: &DomainView<'_>,
+        expected_checksum: Option<&str>,
+        actor: &str,
+        model: Option<&str>,
+        peer: Option<&AgentPeer>,
+        apply: F,
+    ) -> std::result::Result<SourceEdited, SourceEditFailure>
+    where
+        F: FnOnce(&str) -> Result<String>,
+    {
+        // **The live arm, and it comes before every other one.** While a
+        // co-editing room is open over this document, the room's text IS the
+        // engram: somebody has it on screen, the file and the row are both
+        // behind it, and the room's own saver is what makes anything durable.
+        // So an edit composes into the document, the caller's
+        // `expected_checksum` is evaluated against the text the document
+        // holds, and the write below is not reached at all.
+        //
+        // Ahead of the overlay arm as well as the file and virtual ones, which
+        // is what the arm order has to be rather than what it was written as:
+        // the overlay arm returns, so an arm behind it is unreachable in every
+        // domain that reviews changes - which is where most rooms are.
+        //
+        // Nothing here is reachable from a room's own save. A room saves
+        // through `Engine::save_engram_in_overlay` and `Engine::save_engram`,
+        // neither of which is this function, so a live landing can never
+        // recurse into the room that produced it.
+        if let Some(rooms) = self.collab_rooms() {
+            let overlay = view.actor();
+            if let Some(live) = rooms
+                .live_text(&desc.domain, &desc.permalink, overlay)
+                .await
+            {
+                // The document's text is what a caller guarding this edit read
+                // a moment ago, so it is what the guard compares against - the
+                // file's checksum would refuse every guarded edit made while
+                // anybody had the page open.
+                if let Some(expected) = expected_checksum {
+                    let found = sha256_hex(live.as_bytes());
+                    if found != expected {
+                        return Err(SourceEditFailure::before(EngineError::Conflict(
+                            stale_edit_message(expected, &found),
+                        )));
+                    }
+                }
+                let edited = apply(&live).map_err(SourceEditFailure::before)?;
+                // The same two passes every other arm makes, in the same
+                // order. An edit that skipped them would put a document in
+                // front of a person that the saver then refuses, minutes
+                // later, for a reason nobody watching could connect to this.
+                let edited = touch_generated(&edited, actor, model, now_offset());
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                let applied = rooms
+                    .apply_text(&desc.domain, &desc.permalink, overlay, edited, actor, peer)
+                    .await
+                    .map_err(|detail| SourceEditFailure::before(EngineError::Conflict(detail)))?;
+                // No mirror warning: nothing was mirrored, because nothing was
+                // written. The room's saver owes that warning when it lands.
+                return Ok(SourceEdited {
+                    warning: None,
+                    live: Some(applied),
+                });
+            }
+        }
+
+        // The third arm, and it comes first because it is the one that must
+        // reach neither of the others: on a domain in review mode the folder
+        // and the database both go on saying what the team reviewed, and the
+        // edit joins this actor's own draft instead.
+        //
+        // Every failure on this arm is a `before`: the row and its chunks go
+        // down in one transaction that rolls back whole, so an edit that
+        // refuses leaves the draft holding exactly the bytes it held.
+        if let Some(who) = view.actor() {
+            // Keyed on the draft's own mirror path, which is the file this
+            // write actually produces, so two edits of one draft serialize on
+            // it exactly as two edits of one engram serialize on its file - and
+            // so does a capture, a save, a delete and a move of the same draft.
+            // See `Engine::draft_lock`.
+            let lock = self
+                .draft_lock(&desc.domain, who, &desc.path)
+                .map_err(SourceEditFailure::before)?;
+            let _guard = lock.lock().await;
+            let current = view
+                .text_at(source, desc)
+                .await
+                .map_err(SourceEditFailure::before)?
+                .ok_or_else(|| {
+                    SourceEditFailure::before(EngineError::NotFound(format!(
+                        "no engram '{}' in domain '{}'",
+                        desc.permalink, desc.domain
+                    )))
+                })?;
+            if let Some(expected) = expected_checksum {
+                let found = sha256_hex(current.as_bytes());
+                if found != expected {
+                    return Err(SourceEditFailure::before(EngineError::Conflict(
+                        stale_edit_message(expected, &found),
+                    )));
+                }
+            }
+            // The test seam, and it sits here because here is the window: the
+            // draft has been read and has not been written back yet. See
+            // `Engine::hold_next_draft_edit`.
+            self.take_draft_hold().await;
+            let edited = apply(&current).map_err(SourceEditFailure::before)?;
+            let edited = touch_generated(&edited, actor, model, now_offset());
+            let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+            if self.take_armed_failure() {
+                return Err(SourceEditFailure::before(EngineError::Internal(
+                    "reindex failed (test seam)".to_string(),
+                )));
+            }
+            let warning = view
+                .write(desc.domain_id, &desc.path, &edited)
+                .await
+                .map_err(SourceEditFailure::before)?;
+            // Neither tail below runs. A draft of the MANIFEST is one actor's
+            // proposal about the domain's routing, not the domain's routing,
+            // and a draft belongs in no folder's generated index - both of
+            // those are properties of what the team reviewed.
+            return Ok(SourceEdited {
+                warning,
+                live: None,
+            });
+        }
+
         match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
-                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                    path: abs.display().to_string(),
-                    source,
+                let current = std::fs::read_to_string(&abs).map_err(|source| {
+                    SourceEditFailure::before(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    })
                 })?;
                 // The CAS token, when the caller presents one: compared inside
                 // the lock, against the bytes just read, exactly as save_engram
@@ -3353,38 +7741,67 @@ impl Engine {
                 if let Some(expected) = expected_checksum {
                     let found = sha256_hex(current.as_bytes());
                     if found != expected {
-                        return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+                        return Err(SourceEditFailure::before(EngineError::Conflict(
+                            stale_edit_message(expected, &found),
+                        )));
                     }
                 }
-                let edited = apply(&current)?;
-                let edited = touch_generated(&edited, actor, now_offset());
-                let edited = Self::enforce_temporal(edited)?;
-                write_file(&abs, &edited)?;
+                let edited = apply(&current).map_err(SourceEditFailure::before)?;
+                let edited = touch_generated(&edited, actor, model, now_offset());
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                // The last step that can fail with the file as it was:
+                // `write_bytes` renames a sibling temp into place, and a rename
+                // either happens or does not, so a refusal here leaves the
+                // source's bytes untouched.
+                write_file(&abs, &edited).map_err(SourceEditFailure::before)?;
+                if self.take_armed_failure() {
+                    return Err(SourceEditFailure::after(EngineError::Internal(
+                        "reindex failed (test seam)".to_string(),
+                    )));
+                }
                 let store = self.store.lock().await;
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
-                    .await?;
+                    .await
+                    .map_err(SourceEditFailure::after)?;
             }
             ContentSource::Virtual => {
                 let current = {
                     let store = self.store.lock().await;
                     store
                         .engram_content(desc.domain_id, &desc.path)
-                        .await?
+                        .await
+                        .map_err(|e| SourceEditFailure::before(EngineError::from(e)))?
                         .ok_or_else(|| {
-                            EngineError::NotFound(format!(
+                            SourceEditFailure::before(EngineError::NotFound(format!(
                                 "no content stored for '{}' in domain '{}'",
                                 desc.permalink, desc.domain
-                            ))
+                            )))
                         })?
                 };
                 let expected = expected_checksum
                     .map(str::to_string)
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = apply(&current)?;
-                let edited = touch_generated(&edited, actor, now_offset());
-                let edited = Self::enforce_temporal(edited)?;
+                let edited = apply(&current).map_err(SourceEditFailure::before)?;
+                let edited = touch_generated(&edited, actor, model, now_offset());
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let stamp = virtual_stamp(&edited);
+                // The seam, on this arm: a token nothing can match, so the
+                // store raises its own compare-and-swap conflict and rolls the
+                // transaction back. See `Engine::fail_next_source_edit`.
+                let expected = if self.take_armed_failure() {
+                    "0".repeat(64)
+                } else {
+                    expected
+                };
                 let store = self.store.lock().await;
+                // Every failure here is a `before`, and that is exact rather
+                // than generous: `index_markdown` runs the compare and swap,
+                // the chunking and the reference resolution inside one store
+                // transaction and rolls it back on any error, so a virtual
+                // source that refuses still holds the bytes it held. A
+                // concurrent edit therefore comes back as the `Conflict` it is
+                // and the caller may undo whatever it wrote first, which is the
+                // failure that actually happens in the field.
                 self.index_markdown(
                     &*store,
                     desc.domain_id,
@@ -3394,7 +7811,8 @@ impl Engine {
                     Some(&expected),
                     true,
                 )
-                .await?;
+                .await
+                .map_err(SourceEditFailure::before)?;
             }
         }
 
@@ -3406,19 +7824,34 @@ impl Engine {
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
         self.refresh_index_files(&desc.domain).await;
-        Ok(())
+        // One call for both arms, and exactly right there: this tail is
+        // reached only when the arm that ran committed its bytes, so a refused
+        // edit never schedules a pass for a chunk that was not rewritten.
+        self.nudge_embed();
+        // A direct write has no mirror to fail, so it has nothing to warn about.
+        Ok(SourceEdited {
+            warning: None,
+            live: None,
+        })
     }
 
     /// Apply one edit operation to an engram's markdown, returning the edited
     /// text. Content-agnostic: the same logic serves file and virtual edits.
     /// `actor` is the resolved editor identity, which `set_frontmatter` stamps
     /// into a verification when the caller names no other one.
+    ///
+    /// `model` is the model the caller REPORTED, not one already held against
+    /// an actor: the only operation that records it here is a verification, and
+    /// a verification is held against the actor it names rather than the one
+    /// making the call ([`stamped_model`]).
+    #[allow(clippy::too_many_arguments)]
     fn apply_edit(
         &self,
         source: &str,
         p: &EditParams,
         permalink: &str,
         actor: &str,
+        model: Option<&str>,
         ack: Option<&AckDraft>,
     ) -> Result<String> {
         Ok(match p.operation.as_str() {
@@ -3463,7 +7896,9 @@ impl Engine {
                 let section = self.require_section(p)?;
                 insert_after_section(source, section, content).map_err(section_err)?
             }
-            "set_frontmatter" => Self::apply_set_frontmatter(source, p, permalink, actor, ack)?,
+            "set_frontmatter" => {
+                Self::apply_set_frontmatter(source, p, permalink, actor, model, ack)?
+            }
             other => {
                 return Err(EngineError::Invalid(format!(
                     "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
@@ -3479,12 +7914,16 @@ impl Engine {
     /// engram's address or its write history.
     ///
     /// An absent or empty value clears the field, except on `status`, which is
-    /// required, and on `verified`, which stamps a verification instead.
+    /// required, and on `verified`, which stamps a verification instead. That
+    /// verification carries `model` - the reported one - only where the actor
+    /// it names is not a person; see the arm.
+    #[allow(clippy::too_many_arguments)]
     fn apply_set_frontmatter(
         source: &str,
         p: &EditParams,
         permalink: &str,
         actor: &str,
+        model: Option<&str>,
         ack: Option<&AckDraft>,
     ) -> Result<String> {
         let key = p
@@ -3575,8 +8014,16 @@ impl Engine {
                     .map(sanitize_actor)
                     .filter(|a| !a.is_empty())
                     .unwrap_or_else(|| actor.to_string());
+                // The model is held against the entry's OWN actor rather than
+                // the one this call is acting as, because that is the actor the
+                // record ends up claiming wrote the check. A caller may name
+                // somebody else as the verifier, and where that somebody is a
+                // person the entry carries no model, exactly as a person's
+                // `generated` block carries none.
+                let model = stamped_model(&by, model);
                 let entry = crystalline_core::Verified {
                     by,
+                    model,
                     at: Some(now_offset()),
                 };
                 // Keep other actors' verifications and replace this actor's, so
@@ -3598,15 +8045,18 @@ impl Engine {
                     AckDraft::Record(entry) => entry,
                     // A removal reads the entries the file holds right now,
                     // under the lock, so a concurrent acknowledgment is either
-                    // fully there or not there at all when it filters.
+                    // fully there or not there at all when it filters. It
+                    // names a rule and never a pair: `remove <rule-id>` is the
+                    // whole of the value form an agent writes here, so every
+                    // entry the rule has goes.
                     AckDraft::Remove(rule) => {
-                        if !has_ack(source, rule) {
+                        if !has_ack(source, rule, None) {
                             return Err(EngineError::Invalid(format!(
                                 "no acknowledgment for {rule} on '{permalink}'; nothing to remove"
                             )));
                         }
                         return guarded_ack_write(
-                            without_ack(source, rule),
+                            without_ack(source, rule, None),
                             "removal",
                             &p.identifier,
                         );
@@ -3680,16 +8130,41 @@ impl Engine {
     /// domain, so a move carries content between the two truths: a same-domain
     /// move is a rename (no reparse), a cross-domain move reads the source
     /// content and re-indexes it into the destination's source.
-    pub async fn move_engram(&self, p: &MoveParams) -> Result<Value> {
+    ///
+    /// `scope` bounds the *side effect*, which is the half a surface cannot
+    /// gate for itself. Whether this caller may write either end is decided at
+    /// the edge (the REST write gate, the MCP domain gate); what only this
+    /// function can decide is which other domains it rewrites a link inside.
+    /// A cross-domain move rewrites every bare `[[target]]` that pointed at the
+    /// moved engram into the prefixed form, and those linking engrams live in
+    /// domains the mover may never have been shown. So the rewrite skips a
+    /// domain this caller may not see: its link is left as it was - dangling,
+    /// which its own members see as an unresolved-reference finding on the next
+    /// sweep - rather than silently edited by somebody with no access to it,
+    /// and `links_rewritten` counts the visible rewrites only, so a receipt
+    /// never counts a file its reader may not know exists.
+    pub async fn move_engram(&self, p: &MoveParams, scope: &crate::scope::Scope) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let (src, src_source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // Resolved once, before anything is written, and used twice below: to
+        // look the destination up, and to bound the inbound rewrite.
+        let hidden = self.hidden_for(scope).await?;
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
+        let (src, src_source) = view.resolve(&p.identifier).await?;
         let dest_domain = p
             .destination_domain
             .clone()
             .unwrap_or_else(|| p.domain.clone());
-        let dest_source = self.content_source(&dest_domain)?;
+        // Scoped, and that is load bearing rather than tidy. This lookup raises
+        // the one error that names every registered domain, and a surface gate
+        // above it can only check the spelling it normalizes: a padded or empty
+        // `destination_domain` passes a gate that trims or skips it and arrives
+        // here verbatim. Resolving it against the caller's own visible set
+        // closes that for every spelling, present and future, instead of asking
+        // one more pair of normalizers to agree.
+        let dest_source = self.content_source_scoped(&dest_domain, &hidden)?;
         let dest_rel = normalize_md(&p.destination);
         if dest_rel.is_empty() {
             return Err(EngineError::Invalid("destination path is empty".into()));
@@ -3708,6 +8183,53 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(&dest_rel)));
         }
         let cross = dest_domain != p.domain;
+
+        // The third place a move can land, and it is two writes rather than
+        // one: a tombstone where the team's file is, so this actor stops
+        // seeing the engram there, and an entry at the destination, so they
+        // see it where they moved it to. The folder itself does not move,
+        // which is the whole of review mode - the rename is reviewed like any
+        // other change.
+        if let Some(who) = overlay {
+            // Two writes - a tombstone where the team's file is, an entry at
+            // the destination - so two draft locks, taken in key order so two
+            // moves that cross each other cannot each hold what the other
+            // wants. `move_within` refuses a cross-domain move outright, so
+            // both paths are this actor's own drafts in this one domain. See
+            // `Engine::draft_lock`.
+            let (first, second) = match src.path <= dest_rel {
+                true => (src.path.as_str(), dest_rel.as_str()),
+                false => (dest_rel.as_str(), src.path.as_str()),
+            };
+            let low = self.draft_lock(&p.domain, who, first)?;
+            let _low = low.lock().await;
+            // A move onto its own path is refused inside `move_within`, and it
+            // is skipped here rather than taken twice: one path is one lock.
+            let high = match first == second {
+                true => None,
+                false => Some(self.draft_lock(&p.domain, who, second)?),
+            };
+            let _high = match &high {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            return view
+                .move_within(p, &src, &src_source, &dest_rel, cross)
+                .await;
+        }
+
+        // After the overlay branch, so a move OUT of a reviewing domain keeps
+        // its own refusal ("share the change first"), and before anything is
+        // read or written, so a refusal costs nothing. This is the move INTO
+        // one: the view above is the SOURCE domain's, so a move from a domain
+        // that takes changes directly would otherwise write the destination's
+        // folder - the engram and every attachment it carries.
+        if cross {
+            self.refuse_write_into_reviewed_folder(
+                &dest_domain,
+                "a move from another domain cannot land there",
+            )?;
+        }
 
         // Destination collision check, on disk or in the database.
         self.ensure_dest_free(&dest_source, &dest_domain, &dest_rel)
@@ -3846,6 +8368,36 @@ impl Engine {
             if r.src_domain == dest_domain || r.to_target.contains(':') {
                 continue;
             }
+            // A reference that named a domain in its brackets is not a bare
+            // link and is left alone. The needle below is built from
+            // `to_target`, which is the text AFTER the colon, so for
+            // `[[open:Thing]]` - or for a colon title like
+            // `[[Log: Weekly Notes]]`, which parses the same way and resolves
+            // by title - the file does not hold `[[Thing]]` at that spot. The
+            // usual outcome is a miss and a `continue`; the outcome this guard
+            // exists for is a hit somewhere else in the same file, where a
+            // genuinely bare `[[Thing]]` pointing at something entirely
+            // different would be rewritten and counted as a success. The
+            // unresolved half of `inbound_refs` filters on `to_domain IS NULL`
+            // already; the resolved half cannot, because a reader wants every
+            // reference that points here, so the filter belongs to the rewrite.
+            if r.to_domain.is_some() {
+                continue;
+            }
+            // A linking engram in a domain this caller may not see is left
+            // exactly as it was: see the scope note on this function.
+            //
+            // Defensive since the guard above landed, and kept for that
+            // reason. A reference reaching this point is bare, and a bare
+            // reference resolves in its own domain, so an inbound bare
+            // reference to the moved engram is in the domain the engram is
+            // LEAVING - which the mover had to be able to see in order to move
+            // out of it. There is no input today that reaches this `continue`;
+            // it is what keeps the rule true if the query above ever widens
+            // again.
+            if hidden.contains(&r.src_domain) {
+                continue;
+            }
             let needle = format!("[[{}]]", r.to_target);
             let prefixed = format!("[[{dest_domain}:{}]]", r.to_target);
             match self.read_source(&r.src_domain) {
@@ -3857,8 +8409,12 @@ impl Engine {
                     if !text.contains(&needle) {
                         continue;
                     }
-                    let replaced =
-                        touch_generated(&text.replace(&needle, &prefixed), &actor, now_offset());
+                    let replaced = touch_generated(
+                        &text.replace(&needle, &prefixed),
+                        &actor,
+                        None,
+                        now_offset(),
+                    );
                     write_file(&linker_abs, &replaced)?;
                     let store = self.store.lock().await;
                     self.reindex_file(&*store, r.src_domain_id, &root, &r.src_path)
@@ -3874,8 +8430,12 @@ impl Engine {
                     if !text.contains(&needle) {
                         continue;
                     }
-                    let replaced =
-                        touch_generated(&text.replace(&needle, &prefixed), &actor, now_offset());
+                    let replaced = touch_generated(
+                        &text.replace(&needle, &prefixed),
+                        &actor,
+                        None,
+                        now_offset(),
+                    );
                     let stamp = virtual_stamp(&replaced);
                     let store = self.store.lock().await;
                     self.index_markdown(
@@ -4002,11 +8562,20 @@ impl Engine {
             ));
         }
 
+        // What this instance has no registration for is not part of this verb's
+        // world: not a tag that exists, not an engram to list, not a file to
+        // rewrite. Resolved once, before the first store lock (the lock is not
+        // reentrant), and threaded through both reads below.
+        //
+        // The privacy half of `hidden_for` is deliberately absent: renaming a
+        // tag is `Scope::Unrestricted` only, so there is no caller here with a
+        // narrower view than the machine's own.
+        let unregistered = self.unregistered_domains().await?;
+
         // Precheck against the vocabulary in scope: a rename must not collide
         // with an existing tag, a merge must land on one.
         let new_exists = {
-            let store = self.store.lock().await;
-            let vocab = store.vocabulary(domain).await?;
+            let vocab = self.scoped_vocabulary(domain, &unregistered).await?;
             vocab.tags.iter().any(|t| t.name == new_f)
         };
         let scope = match domain {
@@ -4025,10 +8594,17 @@ impl Engine {
             )));
         }
 
-        // The engrams carrying the old tag, ordered by domain then path.
+        // The engrams carrying the old tag, ordered by domain then path, with
+        // every unregistered domain's dropped here at the single point where
+        // the list is built: `listed`, the dry run, the rewrite loop, the count
+        // and the alias recording all read from it, so one filter covers all of
+        // them and no later addition can forget it.
         let targets = {
             let store = self.store.lock().await;
-            store.engrams_with_tag(&old_f, domain).await?
+            let mut found = store.engrams_with_tag(&old_f, domain).await?;
+            drop(store);
+            found.retain(|d| !unregistered.contains(&d.domain));
+            found
         };
         let listed: Vec<Value> = targets
             .iter()
@@ -4213,9 +8789,33 @@ impl Engine {
     /// the domain"), and the identifier says which thing without ambiguity: an
     /// engram can never live under the reserved `assets/` folder.
     pub async fn delete_engram(&self, p: &DeleteParams) -> Result<Value> {
+        self.delete_engram_as(p, None, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::delete_engram`] with the deleting identity and the acting
+    /// scope, the pair every other write verb takes.
+    ///
+    /// `scope` decides where the deletion lands. On a direct domain it removes
+    /// the file and the row, as it always has. On a domain in review mode it
+    /// writes this actor's tombstone: the file stays, the base row stays, and
+    /// the path reads as absent for its author and for nobody else, until the
+    /// deletion is reviewed like any other change.
+    ///
+    /// `client` is still read by neither arm. A delete stamps no `generated`
+    /// block - there is no document left to stamp - and a tombstone stands
+    /// under the base row's own identity rather than under a new one.
+    pub async fn delete_engram_as(
+        &self,
+        p: &DeleteParams,
+        _client: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let view = DomainView::for_write(self, &p.domain, scope).await?;
+        let overlay = view.actor();
         if let Some(path) = attachment_identifier(&p.identifier) {
             // Refused rather than ignored: `expected_checksum` is a promise
             // about markdown a caller read, and an attachment's bytes are not
@@ -4226,33 +8826,130 @@ impl Engine {
                     "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
                 )));
             }
-            self.attachment_delete(&p.domain, &path).await?;
-            return Ok(json!({
+            // Through the view this verb already built, so an attachment
+            // delete lands where an engram delete lands: in review mode as
+            // this actor's own deletion, with the folder untouched.
+            let draft = self.attachment_delete_in(&view, &path).await?;
+            let mut receipt = json!({
                 "domain": p.domain,
                 "path": path,
                 "attachment": true,
                 "deleted": true,
-            }));
+            });
+            if draft {
+                receipt["draft"] = json!(true);
+            }
+            return Ok(receipt);
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = view.resolve(&p.identifier).await?;
+        // **The open document outranks both substrates, and the probe is above
+        // the lock.** A caller's `expected_checksum` came from a read, and a
+        // read of a page somebody has open answers the live text and its
+        // checksum - so comparing against the file here would refuse the
+        // caller who did exactly what the read told them to, for as long as
+        // the person kept typing, with a re-read that answers the same value
+        // again. The deletion itself still takes the file or the row: a delete
+        // does not compose into a document, it ends the engram the document is
+        // of, and the room is closed by the removal that follows. See
+        // `Engine::live_text_at` for why this cannot move below the lock.
+        let live = self.live_text_at(&desc, &view).await;
         // Held across the comparison and the removal, so a guarded delete
-        // cannot check a file that a concurrent save then rewrites underneath
-        // it. See `Engine::write_lock`.
-        let file_lock = match &source {
-            ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &desc.path))),
-            ContentSource::Virtual => None,
+        // cannot check a text that a concurrent save then rewrites underneath
+        // it - the draft's own lock when this deletion lands in an overlay, the
+        // file's when it lands in the folder. See `Engine::draft_lock` and
+        // `Engine::write_lock`.
+        let write_lock = match overlay {
+            Some(who) => Some(self.draft_lock(&p.domain, who, &desc.path)?),
+            None => match &source {
+                ContentSource::File { root } => Some(self.write_lock(&join_rel(root, &desc.path))),
+                ContentSource::Virtual => None,
+            },
         };
-        let _guard = match &file_lock {
+        let _guard = match &write_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // The text the guard compares against is the one this caller read: the
+        // open document where there is one, and in review mode their own draft
+        // where they hold one.
+        let visible = match &live {
+            Some(live) => Some(live.clone()),
+            None => match overlay {
+                Some(_) => view.text_at(&source, &desc).await?,
+                None => Some(self.load_content(&source, &desc).await?),
+            },
+        };
         if let Some(expected) = &p.expected_checksum {
-            let current = self.load_content(&source, &desc).await?;
+            let current = visible.clone().ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    p.identifier, p.domain
+                ))
+            })?;
             let found = sha256_hex(current.as_bytes());
             if &found != expected {
                 return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
             }
         }
+
+        // The third place a delete can land, and neither arm below runs for
+        // it: the file the team reviewed stays where it is, and this actor's
+        // deletion of it stands beside it as a draft.
+        if let Some(who) = overlay {
+            if visible.is_none() {
+                return Err(EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    p.identifier, p.domain
+                )));
+            }
+            let mut warning = None;
+            // A draft of a path no file holds is this actor's alone, so
+            // deleting it takes the draft and its mirror away rather than
+            // standing a tombstone over a base row that was never there.
+            // By PATH, not by permalink: a tombstone stands over the base row
+            // at a path, so "is there one to stand over" is a question about
+            // that path. Asking by permalink would take the tombstone branch
+            // for a draft whose permalink happens to match a base row
+            // somewhere else, and then read a file that path does not have.
+            let base = {
+                let store = self.store.lock().await;
+                store
+                    .list_engrams(&desc.domain, Some(&desc.path), None)
+                    .await?
+                    .into_iter()
+                    .find(|found| found.path == desc.path)
+            };
+            match base {
+                None => {
+                    view.drop(desc.domain_id, &desc.path).await?;
+                }
+                Some(_) => {
+                    // The tombstone stands under the BASE row's own identity
+                    // and its own text, never under the draft it replaces:
+                    // that is the shape the journal restore rebuilds after a
+                    // wipe, and the two have to be one shape or a restored
+                    // deletion says something different from a written one.
+                    let base_text = self.load_content(&source, &desc).await?;
+                    warning = self
+                        .write_overlay_tombstone(&desc.domain, who, &desc, &base_text)
+                        .await?;
+                }
+            }
+            // Either way the draft that stood here is over - dropped outright,
+            // or replaced by this actor's deletion of the team's page - so
+            // every link on it and every session inside it ends with it.
+            self.end_draft_grants(&desc.domain, who, &desc.path).await;
+            let mut receipt = json!({
+                "domain": desc.domain,
+                "permalink": desc.permalink,
+                "path": desc.path,
+                "deleted": true,
+                "draft": true,
+            });
+            note_unmirrored(&mut receipt, warning);
+            return Ok(receipt);
+        }
+
         if let ContentSource::File { root } = &source {
             let abs = join_rel(root, &desc.path);
             std::fs::remove_file(&abs).map_err(|source| EngineError::Io {
@@ -4326,6 +9023,26 @@ impl Engine {
     /// caller can act on rather than a silent one, and the alternative is
     /// answering "attachments: none" for an engram nobody could read.
     pub async fn delete_preview(&self, p: &DeleteParams) -> Result<Value> {
+        self.delete_preview_as(p, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::delete_preview`] under the acting scope, the pair
+    /// [`Engine::delete_engram_as`] takes.
+    ///
+    /// The scope is what keeps round one honest about round two on a domain
+    /// that reviews changes. An attachment only this caller's own overlay holds
+    /// is a file the delete would really remove, so a preview built on the
+    /// folder alone would refuse a delete that was going to succeed - and a
+    /// path this caller has already deleted is one the delete would miss, so a
+    /// preview built on the folder would promise bytes that are not theirs to
+    /// take. Both directions are the same rule: **a preview must never be
+    /// stricter than the act it previews**, and it must not be laxer either.
+    pub async fn delete_preview_as(
+        &self,
+        p: &DeleteParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -4335,7 +9052,10 @@ impl Engine {
                     "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
                 )));
             }
-            let size = self.attachment_delete_size(&p.domain, &path).await?;
+            let hidden = self.hidden_for(scope).await?;
+            let size = DomainView::for_read(self, &p.domain, &hidden, scope)?
+                .attachment_delete_size(&path)
+                .await?;
             return Ok(json!({
                 "domain": p.domain,
                 "path": path,
@@ -4343,7 +9063,7 @@ impl Engine {
                 "attachment": true,
             }));
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         let content = self.load_content(&source, &desc).await?;
         let attachments = self.previewable_attachments(&desc, &content).await;
         Ok(json!({
@@ -4419,7 +9139,7 @@ impl Engine {
     /// and only the row stands. No bytes are read and nothing is written -
     /// unlike the read, which heals the row it serves, so round one no longer
     /// mutates the derived layer at all.
-    async fn attachment_delete_size(&self, domain: &str, path: &str) -> Result<u64> {
+    pub(crate) async fn attachment_delete_size(&self, domain: &str, path: &str) -> Result<u64> {
         validate_attachment_path(path)?;
         let (domain_id, source) = self.domain_source(domain).await?;
         let row = {
@@ -4497,8 +9217,17 @@ impl Engine {
     // --- search --------------------------------------------------------------
 
     /// Search across domains, embedding the query when the mode needs it.
-    pub async fn search_engrams(&self, p: &SearchParams) -> Result<Value> {
-        self.search_engrams_under(p, None).await
+    ///
+    /// `scope` decides which domains are in range at all: a caller that named a
+    /// domain it may not see gets what naming an unregistered domain gets - no
+    /// hits from it, and no error saying it is there - and a caller that named
+    /// none searches every domain minus those.
+    pub async fn search_engrams(
+        &self,
+        p: &SearchParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.search_engrams_under(p, None, scope).await
     }
 
     /// [`Engine::search_engrams`] narrowed to one domain-relative folder, which
@@ -4521,8 +9250,11 @@ impl Engine {
         &self,
         p: &SearchParams,
         folder: Option<&str>,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let requested = parse_mode(p.search_type.as_deref())?;
+        let hidden = self.hidden_for(scope).await?;
+        let scoped = self.scoped_domains(&p.domains, &hidden).await?;
         let text = p.query.clone().filter(|s| !s.trim().is_empty());
         let mut query = SearchQuery {
             text: text.clone(),
@@ -4533,6 +9265,15 @@ impl Engine {
             after: p.after.clone(),
             min_similarity: p.min_similarity,
             path_prefix: folder.and_then(folder_prefix),
+            // Whose rows this search is entitled to: the base dimension plus
+            // this caller's own drafts, where any domain in range reviews
+            // changes at all. One value for the whole query, because a search
+            // spans domains and the screen is a column predicate rather than a
+            // per-domain decision - see `Engine::reading_actor`, which is where
+            // the question and its residue are written down. A reader with no
+            // identity names no actor either way and gets the base dimension
+            // alone.
+            actor: self.reading_actor(scope, &p.domains),
             limit: p.limit.unwrap_or(10).clamp(1, MAX_PAGE_LIMIT),
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
@@ -4561,6 +9302,25 @@ impl Engine {
                 .await?
         };
         query.mode = effective;
+
+        // The visibility filter is applied after the mode is settled and before
+        // the query is embedded: a search of nothing this caller may read costs
+        // no embedding call and no store round trip, and still reports the mode
+        // the same search over a visible domain would have reported.
+        match scoped {
+            ScopedDomains::AsAsked => {}
+            ScopedDomains::Only(domains) => query.domains = Some(domains),
+            ScopedDomains::Nothing => {
+                return Ok(json!({
+                    "mode": mode_str(effective),
+                    "total": 0,
+                    "page": query.page,
+                    "limit": query.limit,
+                    "count": 0,
+                    "hits": Value::Array(Vec::new()),
+                }));
+            }
+        }
         if matches!(effective, SearchMode::Semantic | SearchMode::Hybrid)
             && let Some(provider) = &provider
         {
@@ -4583,6 +9343,233 @@ impl Engine {
             "count": page.items.len(),
             "hits": serde_json::to_value(&page.items).unwrap_or(Value::Null),
         }))
+    }
+
+    /// The nearest current engrams to `probe_text` that `scope` may see: the
+    /// retrieval behind the write receipt's `similar` list.
+    ///
+    /// Vector-only on purpose - prose never goes through the lexical parser,
+    /// where parentheses and AND/OR/NOT in an ordinary sentence read as
+    /// operators. The mode is settled the way search settles it, so with no
+    /// provider or no active embeddings for this model the answer is empty
+    /// rather than a text search in disguise. `exclude` is the engram that was
+    /// just written, matched on domain and permalink; the retirement set is
+    /// dropped after the page comes back, which is why the page is one wider
+    /// than the list. Ranking only: no score leaves this function.
+    ///
+    /// **The candidate set is the writer's own view of the index.** The
+    /// advisory is a search, so it asks the same question about whose rows are
+    /// in range: a writer in review mode whose neighbours are all still drafts
+    /// would otherwise be told there is nothing near what they just wrote. Two
+    /// consequences, and both are the shape rather than an accident.
+    ///
+    /// The base row at a path the writer is drafting is not a candidate at all,
+    /// so a draft never lists the engram it is a draft of - it would be told to
+    /// merge its own work into the team's wording of it. And `exclude` is
+    /// matched by address across every actor's rows, because a hit says which
+    /// engram it is and never whose row carried it - so the caller has to hand
+    /// in the address the ROW answers to, which is not always the one its
+    /// receipt names; [`Engine::attach_similar`] resolves that and says why.
+    ///
+    /// **A writer's own drafts can fill the list, and the cut stands.** The
+    /// drafts are not additional, they are rows on one ladder, so an author
+    /// holding several drafts on a topic is told about those and not about the
+    /// reviewed engram further away. That is the ranking answering the question
+    /// it was asked. Reserving a slot for a base row, or marking which
+    /// neighbours are the caller's own drafts, both need a fact no hit carries -
+    /// whether the row behind it was a draft - and putting it on
+    /// [`crystalline_index::SearchHit`] would widen every search answer on
+    /// every surface for this one advisory. So the policy is the cut, stated
+    /// here and pinned by
+    /// `an_authors_own_drafts_can_fill_the_advisory_and_the_cut_stands`.
+    ///
+    /// The scoping reconciliation, the mode decision and the phasing that never
+    /// holds the store lock across the embed call are all
+    /// [`Engine::search_engrams_under`]'s, repeated here rather than shared: the
+    /// two bodies differ enough (no text, vector only, no envelope, typed rows,
+    /// two post-filters) that a common helper would cost more than it saves, so
+    /// a change to either belongs in both. One thing differs on purpose. That
+    /// function settles the mode before it applies the scoping, so its envelope
+    /// reports a truthful mode even to a caller who may see nothing; this one
+    /// scopes first, because it has no envelope to be truthful in and would
+    /// rather skip the coverage read for a caller with nothing to search.
+    pub async fn similar_engrams(
+        &self,
+        probe_text: &str,
+        exclude: Option<(&str, &str)>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Vec<SimilarEngram>> {
+        let Some(provider) = self.provider() else {
+            return Ok(Vec::new());
+        };
+        let hidden = self.hidden_for(scope).await?;
+        let domains = match self.scoped_domains(&[], &hidden).await? {
+            ScopedDomains::AsAsked => None,
+            ScopedDomains::Only(domains) => Some(domains),
+            ScopedDomains::Nothing => return Ok(Vec::new()),
+        };
+        let effective = {
+            let store = self.store.lock().await;
+            self.effective_mode(&*store, SearchMode::Semantic, true, true)
+                .await?
+        };
+        if !matches!(effective, SearchMode::Semantic) {
+            return Ok(Vec::new());
+        }
+        let vecs = provider
+            .embed_queries(&[probe_text.to_string()])
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let Some(embedding) = vecs.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let query = SearchQuery {
+            domains,
+            mode: SearchMode::Semantic,
+            query_embedding: Some(embedding),
+            active_model: Some(self.model_id.clone()),
+            // The advisory is a search, so it is the same question about whose
+            // rows are in range, asked the same way (`Engine::reading_actor`).
+            // A writer in review mode whose neighbours are all still drafts
+            // would otherwise be told there is nothing near what they just
+            // wrote; an instance where nothing reviews anything names nobody.
+            actor: self.reading_actor(scope, &[]),
+            // Pure cosine order: the fade would only reorder hits this drops.
+            retired_weight: Some(1.0),
+            limit: SIMILAR_PAGE,
+            page: 1,
+            ..SearchQuery::default()
+        };
+        let page = {
+            let store = self.store.lock().await;
+            store.search(&query).await?
+        };
+        Ok(page
+            .items
+            .into_iter()
+            .filter(|hit| !is_retired_status(&hit.status))
+            .filter(|hit| exclude.is_none_or(|(d, p)| !(hit.domain == d && hit.permalink == p)))
+            .take(SIMILAR_LIMIT)
+            .map(|hit| SimilarEngram {
+                domain: hit.domain,
+                permalink: hit.permalink,
+                title: hit.title,
+                status: hit.status,
+                engram_type: hit.engram_type,
+            })
+            .collect())
+    }
+
+    /// Put the neighbours advisory on a write receipt, or leave it alone.
+    ///
+    /// Runs after the write has landed and can neither fail nor delay it past
+    /// [`SIMILAR_TIMEOUT`]: every failure - no provider, no embeddings, a
+    /// store error, the clock - is a debug line and an unchanged receipt. Off
+    /// when `capture.similar` is off. The probe first waits, briefly, for the
+    /// embed worker to drain what was just written, so a capture made a moment
+    /// ago can be a neighbour of this one.
+    ///
+    /// The receipt must already name the engram that landed, as top-level
+    /// string `domain` and `permalink` keys: they are what the advisory
+    /// excludes itself by, and what an edit looks its title up from. A receipt
+    /// shaped any other way is left untouched.
+    pub async fn attach_similar(
+        &self,
+        receipt: &mut Value,
+        probe: SimilarProbe<'_>,
+        scope: &crate::scope::Scope,
+    ) {
+        if !self.config.read().unwrap().capture_similar() {
+            return;
+        }
+        let (Some(domain), Some(permalink)) = (
+            receipt
+                .get("domain")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            receipt
+                .get("permalink")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ) else {
+            return;
+        };
+        // The path the receipt names, for the overlay verbs that carry one. A
+        // receipt without it is a direct domain's, which has no draft to
+        // resolve an address against.
+        let receipt_path = receipt
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let work = async {
+            // This writer's own view of the domain they just wrote in. The
+            // write itself already screened the domain (`refuse_hidden_domain`
+            // on the way in), so there is nothing left for this pass to screen.
+            let view = DomainView::for_read(self, &domain, &HashSet::new(), scope)?;
+            let text = match probe {
+                SimilarProbe::Write {
+                    title,
+                    description,
+                    body,
+                } => similar::write_probe_text(title, description, body),
+                SimilarProbe::Markdown { text } => similar::markdown_probe_text(text),
+                SimilarProbe::Edit { new_text } => {
+                    // Through this caller's own view of the domain, not the
+                    // base rows alone. An engram that exists only as their
+                    // draft has no base row to read a title off, and a
+                    // base-only lookup answered `None` there - which skipped
+                    // the advisory silently, on exactly the writes a domain in
+                    // review mode is made of.
+                    let title = view
+                        .resolve(&permalink)
+                        .await
+                        .ok()
+                        .map(|(desc, _)| desc.title);
+                    title.and_then(|t| similar::edit_probe_text(&t, new_text))
+                }
+            };
+            let Some(text) = text else {
+                return Ok(Vec::new());
+            };
+            // The address to exclude is the one the row a search would answer
+            // with carries, which is not always the one the receipt names. A
+            // draft over a base row resolves to the BASE descriptor, so an
+            // edit's receipt names the address the team knows the engram by,
+            // while the draft's own row carries whatever address its
+            // frontmatter gave it. Excluding the receipt's alone hands the
+            // writer their own draft as a neighbour, under guidance that tells
+            // them to merge into it. Excluding the draft's loses nothing:
+            // wherever a draft stands at a path, the base row at that path is
+            // shadowed out of the candidate set anyway.
+            let exclude = view
+                .draft_permalink_at(receipt_path.as_deref())
+                .await?
+                .unwrap_or_else(|| permalink.clone());
+            self.await_embed_backlog(SIMILAR_BACKLOG_WAIT).await;
+            self.similar_engrams(&text, Some((&domain, &exclude)), scope)
+                .await
+        };
+        match tokio::time::timeout(SIMILAR_TIMEOUT, work).await {
+            Ok(Ok(found)) => similar::attach(receipt, &found),
+            Ok(Err(e)) => tracing::debug!("similar probe skipped: {e}"),
+            Err(_) => tracing::debug!("similar probe cut at {SIMILAR_TIMEOUT:?}"),
+        }
+    }
+
+    /// Wait, at most `budget`, for the embed worker to clear the backlog.
+    /// Without a worker there is nothing to wait for and no wait happens.
+    async fn await_embed_backlog(&self, budget: std::time::Duration) {
+        if self.embed_tx.is_none() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            match self.embedding_backlog().await {
+                Ok(0) | Err(_) => return,
+                Ok(_) if tokio::time::Instant::now() >= deadline => return,
+                Ok(_) => tokio::time::sleep(SIMILAR_BACKLOG_POLL).await,
+            }
+        }
     }
 
     async fn effective_mode(
@@ -4609,24 +9596,67 @@ impl Engine {
     // --- context -------------------------------------------------------------
 
     /// Traverse the graph around a `crystalline://` anchor.
-    pub async fn build_context(&self, p: &ContextParams) -> Result<Value> {
+    ///
+    /// `scope` bounds the neighbourhood twice over: an anchor in a domain the
+    /// caller may not see is the not-found an anchor that matched nothing gets,
+    /// and a neighbour in such a domain is cut out of the slice before anything
+    /// is ranked, so it neither appears nor lends its mass to what does.
+    pub async fn build_context(
+        &self,
+        p: &ContextParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let url = CrystallineUrl::parse(&p.anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{}' is not a crystalline:// URL", p.anchor))
         })?;
         let depth = p.depth.unwrap_or(1).clamp(1, 3);
         let max_related = p.max_related.unwrap_or(10);
         let domain_filter = Some(p.domains.clone()).filter(|d| !d.is_empty());
+        let hidden = self.hidden_for(scope).await?;
 
-        let store = self.store.lock().await;
+        // A hidden domain skips the lookup and keeps the branch: a glob over one
+        // falls into the same "matched no engrams" an empty glob produces, and a
+        // named anchor into the same not-found a missing engram produces. Both
+        // are reached by the same lines a visible domain reaches, which is what
+        // makes the two indistinguishable.
+        let visible_anchor = !hidden.contains(&url.domain);
+        // The registered-set screen composes ahead of the actor dimension: the
+        // overlay question is asked only about a domain this reader may see, so
+        // a draft of their own is no way into one they may not.
+        //
+        // No view at all for a domain this reader may not see, and none for a
+        // name nobody registered either: both keep the base seeds they were
+        // handed, and both fall through to the same miss. Building one for
+        // either would answer one of them with a refusal the other never gets.
+        let view = visible_anchor
+            .then(|| DomainView::for_read(self, &url.domain, &hidden, scope).ok())
+            .flatten();
         let seeds: Vec<EngramDescriptor> = if url.glob {
-            store
-                .list_engrams(&url.domain, None, None)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+            let base = if visible_anchor {
+                let store = self.store.lock().await;
+                store.list_engrams(&url.domain, None, None).await?
+            } else {
+                Vec::new()
+            };
+            match &view {
+                Some(view) => view.list_over(base).await?,
+                None => base,
+            }
+            .into_iter()
+            .filter(|d| url.matches(&d.domain, &d.permalink))
+            .collect()
         } else {
-            match store.find_engram(&url.domain, &url.permalink).await? {
+            let found = if visible_anchor {
+                let store = self.store.lock().await;
+                store.find_engram(&url.domain, &url.permalink).await?
+            } else {
+                None
+            };
+            let anchored = match &view {
+                Some(view) => view.anchor(found, &url.permalink).await?,
+                None => found,
+            };
+            match anchored {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -4644,7 +9674,22 @@ impl Engine {
         }
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let slice = store.neighbors(&ids, depth).await?;
+        // The traversal is asked as this caller, not as the anchor domain's
+        // overlay: a slice crosses domains, so whose rows it may walk is one
+        // question about the reader - the same one a search asks, through the
+        // same `Engine::reading_actor` - rather than one domain's mode deciding
+        // what another domain's edges say. The hop can land anywhere, so the
+        // range it asks about is every registered domain.
+        let reading = self.reading_actor(scope, &[]);
+        let store = self.store.lock().await;
+        let mut slice = store.neighbors(&ids, depth, reading.as_deref()).await?;
+        // Cut before the ranking, not at output selection like the caller's own
+        // `domains` filter below. The two look alike and are not: a presentation
+        // filter leaves a node in the graph so it still conducts mass as a
+        // bridge, and a node this caller may not see must not be in the graph at
+        // all - a path that only exists through a private engram is a fact about
+        // that engram.
+        retain_visible(&mut slice, &hidden);
 
         // Rank the full slice before any filtering so a domain-filtered node
         // still conducts mass as a bridge; the domain filter applies only at
@@ -4693,14 +9738,16 @@ impl Engine {
         {
             let is_seed = seed_ids.contains(&node.id.0);
             kept.insert(node.id.0);
-            nodes.push(json!({
+            let mut out = json!({
                 "id": node.id.0,
                 "domain": node.domain,
                 "permalink": node.permalink,
                 "title": node.title,
                 "type": node.engram_type,
                 "seed": is_seed,
-            }));
+            });
+            mark_draft(&mut out, node);
+            nodes.push(out);
         }
         let edges: Vec<Value> = slice
             .edges
@@ -4758,23 +9805,57 @@ impl Engine {
         anchor: &str,
         depth: u8,
         max_nodes: usize,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let url = CrystallineUrl::parse(anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{anchor}' is not a crystalline:// URL"))
         })?;
         let depth = depth.clamp(1, 2);
         let max_nodes = max_nodes.clamp(1, MAX_GRAPH_NODES);
+        let hidden = self.hidden_for(scope).await?;
 
         let store = self.store.lock().await;
-        let seeds: Vec<EngramDescriptor> = if url.glob {
-            store
-                .list_engrams(&url.domain, None, None)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+        // A hidden domain skips the lookup and keeps the branch, so it answers
+        // with the same miss a visible domain with nothing in it answers with.
+        // See [`Engine::build_context`], which seeds the same way.
+        let visible_anchor = !hidden.contains(&url.domain);
+        let base: Vec<EngramDescriptor> = if url.glob {
+            if visible_anchor {
+                store.list_engrams(&url.domain, None, None).await?
+            } else {
+                Vec::new()
+            }
         } else {
-            match store.find_engram(&url.domain, &url.permalink).await? {
+            match visible_anchor {
+                true => store
+                    .find_engram(&url.domain, &url.permalink)
+                    .await?
+                    .into_iter()
+                    .collect(),
+                false => Vec::new(),
+            }
+        };
+        drop(store);
+        // See [`Engine::build_context`], which seeds through a view the same
+        // way: a domain this reader may not see builds none.
+        let view = visible_anchor
+            .then(|| DomainView::for_read(self, &url.domain, &hidden, scope).ok())
+            .flatten();
+        let seeds: Vec<EngramDescriptor> = if url.glob {
+            match &view {
+                Some(view) => view.list_over(base).await?,
+                None => base,
+            }
+            .into_iter()
+            .filter(|d| url.matches(&d.domain, &d.permalink))
+            .collect()
+        } else {
+            let found = base.into_iter().next();
+            let anchored = match &view {
+                Some(view) => view.anchor(found, &url.permalink).await?,
+                None => found,
+            };
+            match anchored {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -4784,7 +9865,6 @@ impl Engine {
                 }
             }
         };
-        drop(store);
         if seeds.is_empty() {
             return Err(EngineError::NotFound(format!(
                 "anchor '{anchor}' matched no engrams"
@@ -4793,7 +9873,13 @@ impl Engine {
 
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let slice = self.sweep_neighbors(&ids, depth).await?;
+        let mut slice = self
+            .sweep_neighbors(&ids, depth, crate::scope::overlay_actor(scope).as_deref())
+            .await?;
+        // Before the ranking and before the cap, so a hidden neighbour is
+        // neither drawn nor counted in `hidden` - that number reports what the
+        // cap cut, and a node this caller may not see was never in the picture.
+        retain_visible(&mut slice, &hidden);
 
         let mass = context_rank(&slice, &seed_ids);
         let weight = {
@@ -4831,14 +9917,16 @@ impl Engine {
             .take(max_nodes)
         {
             kept.insert(node.id.0);
-            nodes.push(json!({
+            let mut out = json!({
                 "id": node.id.0,
                 "domain": node.domain,
                 "permalink": node.permalink,
                 "title": node.title,
                 "status": node.status,
                 "type": node.engram_type,
-            }));
+            });
+            mark_draft(&mut out, node);
+            nodes.push(out);
         }
         // An edge is only meaningful when both of its ends survived the cap; one
         // that lost an end would render as an arrow into nothing. The relation
@@ -4871,22 +9959,93 @@ impl Engine {
 
     // --- recent --------------------------------------------------------------
 
-    /// Recent engrams within a timeframe.
-    pub async fn recent_activity(&self, p: &RecentParams) -> Result<Value> {
+    /// Recent engrams within a timeframe, from the domains `scope` may read.
+    ///
+    /// The visibility filter is pushed into the query rather than applied to
+    /// what comes back: the row limit is enforced in SQL, so dropping rows
+    /// afterwards would quietly shorten a scoped caller's answer instead of
+    /// filling it with the next visible engram.
+    pub async fn recent_activity(
+        &self,
+        p: &RecentParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let timeframe = p.timeframe.clone().unwrap_or_else(|| "7d".to_string());
+        let hidden = self.hidden_for(scope).await?;
+        let domains = match self.scoped_domains(&p.domains, &hidden).await? {
+            ScopedDomains::AsAsked => Some(p.domains.clone()).filter(|d| !d.is_empty()),
+            ScopedDomains::Only(domains) => Some(domains),
+            ScopedDomains::Nothing => {
+                return Ok(json!({
+                    "timeframe": timeframe,
+                    "count": 0,
+                    "engrams": Value::Array(Vec::new()),
+                }));
+            }
+        };
         let filter = RecentFilter {
-            domains: Some(p.domains.clone()).filter(|d| !d.is_empty()),
+            domains,
             after: timeframe_cutoff(&timeframe),
             engram_types: Some(p.types.clone()).filter(|t| !t.is_empty()),
             limit: 50,
         };
-        let store = self.store.lock().await;
-        let items = store.recent(&filter).await?;
+        let mut items = {
+            let store = self.store.lock().await;
+            store.recent(&filter).await?
+        };
+        // This reader's own drafts, folded in after the screen above exactly as
+        // they are on a browse: the domains `hidden_for` already allowed, and
+        // only then whose drafts they are.
+        self.fold_recent_drafts(&filter, &hidden, scope, &mut items)
+            .await?;
         Ok(json!({
             "timeframe": timeframe,
             "count": items.len(),
             "engrams": serde_json::to_value(&items).unwrap_or(Value::Null),
         }))
+    }
+
+    /// Fold every reviewing domain's drafts into a recency listing.
+    ///
+    /// The cross-domain half: which domains this reader may see, which of them
+    /// the filter allows, and the one re-sort and re-cut over the whole folded
+    /// list. What each domain's own drafts do to the page is
+    /// [`DomainView::recent_into`], asked once per domain.
+    async fn fold_recent_drafts(
+        &self,
+        filter: &RecentFilter,
+        hidden: &HashSet<String>,
+        scope: &crate::scope::Scope,
+        items: &mut Vec<EngramSummary>,
+    ) -> Result<()> {
+        let reviewed: Vec<DomainView<'_>> = self
+            .registered_domain_names()
+            .into_iter()
+            .filter(|name| !hidden.contains(name))
+            .filter(|name| {
+                filter
+                    .domains
+                    .as_ref()
+                    .is_none_or(|only| only.iter().any(|d| d == name))
+            })
+            .filter_map(|name| DomainView::for_read(self, &name, hidden, scope).ok())
+            .filter(|view| view.actor().is_some())
+            .collect();
+        if reviewed.is_empty() {
+            return Ok(());
+        }
+        for view in reviewed {
+            view.recent_into(filter, items).await?;
+        }
+        // The statement's own order, re-applied over the folded list.
+        items.sort_by(|a, b| {
+            b.recorded_at
+                .cmp(&a.recorded_at)
+                .then_with(|| a.permalink.cmp(&b.permalink))
+        });
+        let limit = if filter.limit == 0 { 20 } else { filter.limit };
+        items.truncate(limit);
+        Ok(())
     }
 
     // --- list domains --------------------------------------------------------
@@ -4901,7 +10060,32 @@ impl Engine {
     /// [`crystalline_core::behavior_bullets`]. Remote clients never show the
     /// model the initialize instructions, so this one call is their whole
     /// onboarding - the routing lines and the rules that govern them together.
-    pub async fn list_domains(&self, p: &ListDomainsParams) -> Result<Value> {
+    ///
+    /// A domain `scope` may not see is absent from the listing, not marked as
+    /// withheld: this is the index a caller routes by, and a name in it is the
+    /// whole of what a private domain keeps.
+    ///
+    /// Each row it does keep carries `private`, so a client that draws a badge
+    /// reads it off the listing rather than asking after every domain in it.
+    /// That is not the same fact as the one above and it is not a leak of it:
+    /// a caller who may not see a domain never gets a row for it to read.
+    ///
+    /// The rows come back sorted by name, case-insensitively, so the sidebar
+    /// and the CLI inherit one order rather than settling it three times.
+    /// Registration order is what the config map preserves and it is
+    /// meaningless to anybody reading the listing.
+    ///
+    /// The routing prompt sorts the same way and by the same comparison, in
+    /// [`crystalline_core::generate_prompt_unscoped`], rather than through this
+    /// call: it builds its block from the config directly. The two are the same
+    /// index seen twice - once at session start, once when an agent asks again
+    /// mid-session - so they agree.
+    pub async fn list_domains(
+        &self,
+        p: &ListDomainsParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let (private, hidden) = self.visibility_for(scope).await?;
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
@@ -4910,7 +10094,17 @@ impl Engine {
         // Cloned out from behind the lock before any `.await` below, matching
         // the `hosted`/`discovered_domains` convention elsewhere in this file.
         let domains = self.config.read().unwrap().domains.clone();
-        for (name, entry) in &domains {
+        // Sorted by name rather than left in registration order, which is what
+        // the map preserves and what a reader scanning a sidebar has no use
+        // for. Case-insensitive first, so capitalization never sorts a domain
+        // away from its neighbours, then exact as the tie-break so two names
+        // differing only in case have one settled order.
+        let mut listed: Vec<_> = domains
+            .iter()
+            .filter(|(name, _)| !hidden.contains(*name))
+            .collect();
+        listed.sort_by_cached_key(|(name, _)| (name.to_lowercase(), (*name).clone()));
+        for (name, entry) in listed {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);
             let mut obj = json!({
@@ -4921,7 +10115,39 @@ impl Engine {
                 "observations": s.map(|d| d.observations),
                 "relations": s.map(|d| d.relations),
                 "last_sync": s.and_then(|d| d.last_sync.clone()),
+                // Whether this domain is private, so a client badges the row it
+                // already has instead of asking after each one. Every domain a
+                // caller may not read was dropped above, so this only ever says
+                // "private" about a domain that caller can already see.
+                //
+                // False on an installation with no accounts database, which is
+                // every domain on it: privacy is a membership record, and a
+                // machine with no accounts has none.
+                "private": private.contains(name),
+                // Whether this domain reviews changes before they land, so a
+                // client says which way a write in it will go rather than
+                // finding out from the receipt. Absent as `null` on a domain
+                // that takes changes directly, which is how a domain starts
+                // out.
+                "review": entry.is_overlay().then_some("overlay"),
             });
+            // What THIS caller is holding in a domain that reviews changes, so
+            // a screen can say "you have work waiting here" off the listing it
+            // already reads. It rides here rather than only on the domain's
+            // sync status because that status is gated with the share verbs: a
+            // plain member of a reviewing domain could not reach their own
+            // count, which is a fact about them rather than about the team.
+            // Absent on a domain that takes changes directly, exactly as
+            // `review` is and for the same reason; null when the index could
+            // not be counted, which is not the same as holding nothing.
+            if entry.is_overlay() {
+                obj["my_drafts"] = crate::review::DraftView::new(
+                    self.overlay_counts_by_actor(name).await,
+                    crate::scope::overlay_actor(scope),
+                    false,
+                )
+                .mine();
+            }
             // In a shared database a file domain names its current host so an
             // agent and an operator see who syncs what; `hosted_here` is true when
             // this instance holds the lock.
@@ -5230,6 +10456,29 @@ impl Engine {
     /// `None` branch below. So the re-read stays for as long as `domain
     /// remove` is the one mutation path that does not refresh `self.config`.
     pub fn routing_text(&self) -> String {
+        crystalline_core::render_instructions(&self.routing_output(&HashSet::new()))
+    }
+
+    /// [`Engine::routing_text`] with the domain lines replaced by the count
+    /// line: every behavior rule, no domain named.
+    ///
+    /// What the legacy `initialize` handshake serves over HTTP. `get_info` is
+    /// synchronous and rmcp calls it with no request context, so that one
+    /// channel has no caller to resolve and cannot leave a private domain's
+    /// bullets out of a per-caller block; it hands out the countable half
+    /// instead and points at `list_domains`, which does resolve a caller. See
+    /// [`crystalline_core::render_counted_instructions`] for the residue that
+    /// leaves. Stdio never calls this: a local session is the machine owner.
+    pub fn routing_text_counted(&self) -> String {
+        crystalline_core::render_counted_instructions(&self.routing_output(&HashSet::new()))
+    }
+
+    /// The routing block's model over every registered domain except the named
+    /// ones. The body of [`Engine::routing_text`],
+    /// [`Engine::routing_text_counted`] and [`Engine::routing_text_scoped`], so
+    /// a filtered block is the unfiltered one minus some bullets rather than a
+    /// second rendering.
+    fn routing_output(&self, hidden: &HashSet<String>) -> crystalline_core::PromptOutput {
         // (1) The effective config, composed the same way a fresh load would
         // see it. With a config path this is a fresh file read plus the overlay;
         // a read error falls back to the in-memory effective config.
@@ -5259,10 +10508,47 @@ impl Engine {
 
         // (2) Generate over every registered domain from the cached virtual map,
         // (3) force the engine's effective read-only mode, then (4) render.
+        // A domain the caller may not see is dropped from both halves: out of
+        // the config so it names no routing line, and out of the cached bullets
+        // so nothing of its MANIFEST is rendered.
+        let mut global = global;
         let virtual_bullets = self.routing_virtual.read().unwrap().clone();
+        let virtual_bullets = if hidden.is_empty() {
+            virtual_bullets
+        } else {
+            global.domains.retain(|name, _| !hidden.contains(name));
+            virtual_bullets
+                .into_iter()
+                .filter(|(name, _)| !hidden.contains(name))
+                .collect()
+        };
         let mut output = crystalline_core::generate_prompt_unscoped(&global, &virtual_bullets);
         output.read_only = self.read_only();
-        crystalline_core::render_instructions(&output)
+        output
+    }
+
+    /// [`Engine::routing_text`] for a caller who may not see every domain: the
+    /// same block, with the hidden domains' routing bullets left out.
+    ///
+    /// Async because resolving a scope reads the accounts database, which is
+    /// also why the sync render cannot do this and does not try. The sync one
+    /// stays, and stays unfiltered, for the surfaces that have no caller to
+    /// resolve: the CLI and the control socket are the machine owner, and they
+    /// already have the files on disk.
+    ///
+    /// The MCP handshake (`get_info`, which rmcp calls without a request
+    /// context) is the one channel that is neither - an HTTP peer whose
+    /// initialize instructions this server cannot key on anybody - and it is
+    /// answered by [`Engine::routing_text_counted`] rather than by this: no
+    /// caller to resolve means no bullets at all rather than everybody's. The
+    /// era's own instructions channel (`server/discover`) does carry a request
+    /// context, and the `onboarding` prompt carries one too, so both are
+    /// scoped through here.
+    pub async fn routing_text_scoped(&self, scope: &crate::scope::Scope) -> Result<String> {
+        let hidden = self.hidden_for(scope).await?;
+        Ok(crystalline_core::render_instructions(
+            &self.routing_output(&hidden),
+        ))
     }
 
     // --- browse --------------------------------------------------------------
@@ -5291,10 +10577,18 @@ impl Engine {
     /// it selects within the cap rather than across the whole folder. The tree
     /// is a navigation aid; a folder too big to draw is what the paged listing
     /// is for.
-    pub async fn browse_domain(&self, p: &BrowseParams) -> Result<Value> {
+    ///
+    /// A domain `scope` may not see is refused exactly as an unregistered one,
+    /// down to the registered set the error names.
+    pub async fn browse_domain(
+        &self,
+        p: &BrowseParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         // A domain-exists check, not a filesystem-root requirement, so a virtual
         // domain browses.
-        self.domain_entry(&p.domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        self.domain_entry_scoped(&p.domain, &hidden)?;
         let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
         let prefix = folder_prefix(&raw);
         let depth = p.depth.unwrap_or(1).clamp(1, TREE_MAX_DEPTH);
@@ -5312,10 +10606,20 @@ impl Engine {
         // into SQL in every case, the root included, so a client that refetches
         // its tree can never pull tens of thousands of rows across per request.
         let store = self.store.lock().await;
-        let level = store
+        let mut level = store
             .browse_level(&p.domain, prefix.as_deref(), depth, TREE_LEVEL_CAP)
             .await?;
         drop(store);
+
+        // This reader's own drafts shadow the level they are in: a path they
+        // have tombstoned leaves it, a path they are drafting is described by
+        // their draft, and a draft at a path the domain's files never held
+        // joins it. Applied AFTER the domain screen above, which is the order
+        // the whole actor dimension composes in.
+        {
+            let view = DomainView::for_read(self, &p.domain, &hidden, scope)?;
+            view.level(prefix.as_deref(), depth, &mut level).await?;
+        }
 
         // Whether the level was cut is a fact about the rows, decided before the
         // glob narrows them: a glob that matches two of five hundred rows has
@@ -5358,8 +10662,17 @@ impl Engine {
     /// Validate a domain's engrams against its schema engrams. Engram content is
     /// loaded from disk for a file domain and from the database for a virtual
     /// domain, so validation covers both kinds.
-    pub async fn validate_engrams(&self, p: &ValidateParams) -> Result<Value> {
-        let source = self.content_source(&p.domain)?;
+    ///
+    /// A domain `scope` may not see is refused as an unregistered one before
+    /// anything is listed: the report names permalinks, paths and per-engram
+    /// messages, which is a reading of the domain's contents by another route.
+    pub async fn validate_engrams(
+        &self,
+        p: &ValidateParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let schema_descs = store.list_engrams(&p.domain, None, Some("schema")).await?;
         let targets = if let Some(id) = &p.identifier {
@@ -5479,8 +10792,12 @@ impl Engine {
     ///
     /// The recording is best effort by design - see [`crate::maintenance`] -
     /// and the response is returned exactly as detection built it.
-    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
-        let value = self.evolve_detect(p).await?;
+    pub async fn evolve_engrams(
+        &self,
+        p: &EvolveParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let value = self.evolve_detect(p, scope).await?;
         // The swept scope is read back out of the response rather than
         // re-derived from the parameters: an unscoped call defaults to every
         // registered domain, and only the response knows which those were.
@@ -5517,7 +10834,7 @@ impl Engine {
     /// shapes the merged result. Nothing is written and nothing is remembered,
     /// so "what is left" is re-derived by calling again with the same scope.
     ///
-    /// Six details of the assembly are load-bearing, each guarding a class of
+    /// Seven details of the assembly are load-bearing, each guarding a class of
     /// silently wrong finding:
     ///
     /// - the resolved degrees are counted over the **merged** graph slices, so
@@ -5546,8 +10863,18 @@ impl Engine {
     ///   and would report claimed attachments as orphans. This is the same
     ///   split [`Engine::peer_engram_text`] makes for the move's referent
     ///   count, and the two agree on what a reference is: an `assets/` link in
-    ///   the body or the `analyzes` key, compared as exact paths.
-    pub async fn evolve_detect(&self, p: &EvolveParams) -> Result<Value> {
+    ///   the body or the `analyzes` key, compared as exact paths;
+    /// - the lead vectors reach `V301` only when a provider is installed, so
+    ///   meaning is compared on exactly the machines that compute it. A machine
+    ///   with an index full of embeddings and no provider says nothing about
+    ///   meaning rather than scoring against whatever an older model left
+    ///   behind.
+    pub async fn evolve_detect(
+        &self,
+        p: &EvolveParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
@@ -5557,23 +10884,29 @@ impl Engine {
         let families = parse_families(&p.families)?;
         let rules = parse_rules(&p.rules)?;
 
-        // Every registered domain, both as the default scope and as `V102`'s
-        // idea of which `[[domain:Target]]` prefixes name a real domain.
+        // Every registered domain this caller may see, both as the default
+        // scope and as `V102`'s idea of which `[[domain:Target]]` prefixes name
+        // a real domain. Filtered on both counts deliberately: a finding names
+        // the domain, permalink and file path it fired on, and `V102`'s verdict
+        // on a cross-domain target is itself an answer about whether that
+        // domain exists.
         let mut known_domains = self.known_domain_names();
+        known_domains.retain(|name| !hidden.contains(name));
         known_domains.sort();
         known_domains.dedup();
 
-        let mut scope: Vec<String> = Vec::new();
+        let mut swept_scope: Vec<String> = Vec::new();
         if p.domains.is_empty() {
-            scope = known_domains.clone();
+            swept_scope = known_domains.clone();
         } else {
             for name in &p.domains {
                 // The same resolution every other tool uses, so an unknown name
                 // errors identically and a domain registered after startup is
-                // still found.
-                self.domain_entry(name)?;
-                if !scope.contains(name) {
-                    scope.push(name.clone());
+                // still found - and a domain this caller may not see is one of
+                // the names that errors.
+                self.domain_entry_scoped(name, &hidden)?;
+                if !swept_scope.contains(name) {
+                    swept_scope.push(name.clone());
                 }
             }
         }
@@ -5587,9 +10920,9 @@ impl Engine {
         // One domain at a time: `SweepInput` is domain-scoped (two rules are
         // domain-relative) and processing them in turn bounds the memory an
         // unscoped sweep needs to whatever the largest domain costs.
-        for name in &scope {
+        for name in &swept_scope {
             let Some(swept) = self
-                .sweep_domain(name, today, &known_domains, p.include_acknowledged)
+                .sweep_domain(name, today, &known_domains, p.include_acknowledged, scope)
                 .await?
             else {
                 continue;
@@ -5667,6 +11000,17 @@ impl Engine {
                     "evidence": f.evidence,
                     "fix": f.fix,
                 });
+                // The pair a twin row is about, which is the value an
+                // acknowledgment for it is given for and the value the ack
+                // route takes back. Only a pair-scoped rule carries it: it is
+                // the one rule that fires more than once on an engram, so it
+                // is the one whose rows a caller has to be able to tell apart.
+                // Every other rule's acknowledgment is named by the engram and
+                // the rule alone, and a column repeating what those two fields
+                // already say would cost every queue tokens for nothing.
+                if crystalline_index::is_pair_scoped(f.rule) && !f.scope.is_empty() {
+                    row["scope"] = Value::String(f.scope.clone());
+                }
                 // The acknowledgment columns ride along only when they say
                 // something, so an ordinary queue row stays the flat shape every
                 // renderer already knows.
@@ -5680,8 +11024,10 @@ impl Engine {
                 // stale row is deliberately not what the finding fires on now:
                 // the row's own evidence and fix columns say that, and the pair
                 // is what shows a reader why the acknowledgment stopped
-                // matching. Named beside `ack_note` rather than plain `scope`,
-                // which at the top level already names the swept domains.
+                // matching. Named beside `ack_note` rather than sharing the
+                // `scope` above it, because the two disagree on exactly the
+                // rows that matter - and it is this one a withdrawal names,
+                // since it is the entry the file holds.
                 if let Some(scope) = f.ack_scope.as_deref().filter(|s| !s.is_empty()) {
                     row["ack_scope"] = Value::String(scope.to_string());
                 }
@@ -5711,7 +11057,7 @@ impl Engine {
 
         Ok(json!({
             "scope": {
-                "domains": scope,
+                "domains": swept_scope,
                 "families": families.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
                 "rules": rules,
                 "min_priority": p.min_priority,
@@ -5781,7 +11127,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let (desc, _) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, _) = self.resolve_in(&p.identifier, &p.domain).await?;
         Ok(json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
@@ -5797,6 +11143,14 @@ impl Engine {
     /// which matches whatever it finds later. That is the honest reading of
     /// "acknowledge this before it appears".
     ///
+    /// **A caller that names the pair gets that pair**, which is what
+    /// [`EditParams::ack_scope`] carries. It is honoured for a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule and ignored for
+    /// every other, whose acknowledgment answers for the engram and so has
+    /// nothing to choose between; and it is checked rather than trusted, by
+    /// [`Engine::named_scope`]. So detection still runs on this path - it just
+    /// validates a request instead of resolving one.
+    ///
     /// A removal needs none of that: it names an entry that is already on the
     /// engram, so it travels to the text edit as the rule id alone and the
     /// filtering happens there, under the lock, against what the file holds.
@@ -5805,20 +11159,68 @@ impl Engine {
         p: &EditParams,
         desc: &EngramDescriptor,
         actor: &str,
+        scope: &crate::scope::Scope,
     ) -> Result<Option<AckDraft>> {
         Ok(match Self::ack_intent(p)? {
             None => None,
             Some(AckIntent::Remove { rule }) => Some(AckDraft::Remove(rule)),
-            Some(AckIntent::Record { rule, note }) => Some(AckDraft::Record(EvolveAck {
-                scope: self
-                    .firing_scope(&desc.domain, &desc.permalink, &rule)
-                    .await?,
-                rule,
-                note,
-                by: actor.to_string(),
-                at: Some(now_offset()),
-            })),
+            Some(AckIntent::Record { rule, note }) => {
+                let named = p
+                    .ack_scope
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
+                let scope = match named {
+                    Some(named) => Some(
+                        self.named_scope(&desc.domain, &desc.permalink, &rule, named, scope)
+                            .await?,
+                    ),
+                    None => {
+                        self.firing_scope(&desc.domain, &desc.permalink, &rule, scope)
+                            .await?
+                    }
+                };
+                Some(AckDraft::Record(EvolveAck {
+                    scope,
+                    rule,
+                    note,
+                    by: actor.to_string(),
+                    at: Some(now_offset()),
+                }))
+            }
         })
+    }
+
+    /// `named` back, once detection confirms `rule` is really firing on
+    /// `permalink` for it. The refusal is the point: an acknowledgment is a
+    /// record that somebody read a finding and ruled it intentional, so one
+    /// given for evidence no sweep can see is a claim about nothing.
+    ///
+    /// What it protects against is a queue read too long ago. Two twin
+    /// findings on one engram differ only by their pair, so a page still
+    /// showing yesterday's rows would otherwise silence a pair its reader
+    /// never saw, with their note on it - the exact confusion the pair is
+    /// carried to prevent.
+    ///
+    /// Compared as the whole string, because a scope **is** one value: the
+    /// sweep sorts and joins its parts before it renders one, so two callers
+    /// naming the same pair send the same bytes, and a pair that gained a
+    /// member is a different scope rather than a near miss.
+    async fn named_scope(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+        named: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<String> {
+        let firing = self.firing_findings(domain, permalink, rule, scope).await?;
+        if firing.iter().any(|f| f.scope == named) {
+            return Ok(named.to_string());
+        }
+        Err(EngineError::Invalid(format!(
+            "no {rule} finding on '{permalink}' for '{named}'; re-read the queue and acknowledge a row it still shows"
+        )))
     }
 
     /// What `rule` is currently firing on `permalink` for, as the scope an
@@ -5830,29 +11232,60 @@ impl Engine {
     /// re-acknowledging a finding an older entry already silences still sees
     /// the evidence it fires on and records the current scope rather than
     /// dropping to a scope-less entry.
+    ///
+    /// **The unacknowledged finding wins when the rule fires more than once
+    /// here**, which only the pair-scoped rule does
+    /// ([`crystalline_index::is_pair_scoped`]): an engram that twins two others
+    /// carries two `V301` findings and neither one is "the" finding. Taking
+    /// the first row every time made the second acknowledgment re-record the
+    /// pair the first already covered, so the other pair could never be
+    /// acknowledged at all. With every pair acknowledged the first row wins
+    /// again, which is what makes a re-acknowledgment update a note in place.
     async fn firing_scope(
         &self,
         domain: &str,
         permalink: &str,
         rule: &str,
+        scope: &crate::scope::Scope,
     ) -> Result<Option<String>> {
+        let firing = self.firing_findings(domain, permalink, rule, scope).await?;
+        Ok(firing
+            .iter()
+            .find(|f| !f.acknowledged)
+            .or(firing.first())
+            .map(|f| f.scope.clone())
+            .filter(|scope| !scope.is_empty()))
+    }
+
+    /// Every finding `rule` is raising on `permalink` right now, in queue
+    /// order and with the suppressed ones included, which is what both readers
+    /// need: [`Engine::firing_scope`] to resolve a scope and
+    /// [`Engine::named_scope`] to check one. A domain that sweeps to nothing
+    /// answers with no findings rather than an error - there is no evidence
+    /// there to name.
+    async fn firing_findings(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Vec<Finding>> {
         let mut known_domains = self.known_domain_names();
         known_domains.sort();
         known_domains.dedup();
         let today = Utc::now().date_naive();
         let Some(swept) = self
-            .sweep_domain(domain, today, &known_domains, true)
+            .sweep_domain(domain, today, &known_domains, true, scope)
             .await?
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         Ok(swept
             .report
             .findings
             .into_iter()
-            .find(|f| f.rule == rule && f.permalink == permalink)
-            .map(|f| f.scope)
-            .filter(|scope| !scope.is_empty()))
+            .filter(|f| f.rule == rule && f.permalink == permalink)
+            .collect())
     }
 
     /// Acknowledge a finding: record on the engram that this rule's finding was
@@ -5874,13 +11307,31 @@ impl Engine {
     /// without another lookup - the catalog is right there in the message - and
     /// an acknowledgment of a rule nobody has could not be recorded even on an
     /// engram that does exist.
+    ///
+    /// `scope` names the pair the acknowledgment is for, which only a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule has more than one
+    /// of; it is ignored for every other rule and checked rather than trusted
+    /// for that one (see [`Engine::named_scope`]). `None` leaves the choice to
+    /// the server, which is what an agent's `set_frontmatter` does.
+    ///
+    /// `acting` is who is asking, and it is a different thing entirely from
+    /// the `scope` above: this recording is an [`Engine::edit_engram_as`] in
+    /// the end, and every write verb takes the acting scope (see
+    /// [`Engine::write_engram_as`]), so the surface's answer is passed through
+    /// rather than a stand-in invented here.
+    // Eight, and the eighth is the acting scope every write verb now takes.
+    // Bundling the six the caller supplies into a struct would put a type
+    // between the REST handler and its one call for no reader's benefit.
+    #[allow(clippy::too_many_arguments)]
     pub async fn acknowledge_finding_as(
         &self,
         domain: &str,
         identifier: &str,
         rule: &str,
         note: Option<&str>,
+        scope: Option<&str>,
         client: Option<&str>,
+        acting: &crate::scope::Scope,
     ) -> Result<Value> {
         let screened = rule.trim().to_ascii_uppercase();
         if rule_info(&screened).is_none() {
@@ -5896,25 +11347,36 @@ impl Engine {
             operation: "set_frontmatter".to_string(),
             key: Some(EVOLVE_ACK_KEY.to_string()),
             value: Some(value),
+            ack_scope: scope.map(str::to_string),
             ..EditParams::default()
         };
-        let result = self.edit_engram_as(&params, client).await?;
+        let result = self.edit_engram_as(&params, client, acting).await?;
         Ok(result.get("evolve_ack").cloned().unwrap_or(Value::Null))
     }
 
     /// Withdraw an acknowledgment, leaving the engram's other entries alone.
-    /// `false` when the engram carries none for that rule, which the surface
+    /// `false` when the engram carries none this names, which the surface
     /// answers as a 404 rather than pretending a removal happened.
     ///
+    /// `scope` narrows the withdrawal to the one entry given for that pair,
+    /// and like the recording half it speaks only for a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule: every other rule
+    /// keeps one entry, so there is nothing to narrow. `None` takes every
+    /// entry the rule has, which is the whole of it for the ten and all pairs
+    /// at once for the one.
+    ///
     /// Fluid's half of the take-back an agent asks for with the `remove
-    /// <rule-id>` value form; both filter through [`without_ack`], and they
-    /// differ only in how an entry that is not there is reported.
+    /// <rule-id>` value form; both filter through [`without_ack`]. They differ
+    /// in how an entry that is not there is reported, and in that the agent's
+    /// form names a rule and never a pair.
     pub async fn unacknowledge_finding_as(
         &self,
         domain: &str,
         identifier: &str,
         rule: &str,
+        scope: Option<&str>,
         client: Option<&str>,
+        acting: &crate::scope::Scope,
     ) -> Result<bool> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -5923,17 +11385,30 @@ impl Engine {
         if rule_info(&rule).is_none() {
             return Err(EngineError::Invalid(unknown_rule_message(&rule)));
         }
-        let actor = self.actor(client);
-        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        let view = DomainView::for_write(self, domain, acting).await?;
+        let overlay = view.actor();
+        let actor = self.actor_for(client, overlay);
+        let scope = scope
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
+        let (desc, source) = view.resolve(identifier).await?;
         // Checked before the write so an engram carrying no such entry answers
         // "nothing to withdraw" without a rewrite, a reindex or a touched
-        // generated block.
-        let current = self.load_source(&source, &desc).await?;
-        if !has_ack(&current, &rule) {
+        // generated block. Read through the overlay, so an acknowledgment a
+        // draft carries is what a withdrawal in review mode looks at.
+        let current = match overlay {
+            Some(_) => view.text_at(&source, &desc).await?.ok_or_else(|| {
+                EngineError::NotFound(format!("no engram '{identifier}' in domain '{domain}'"))
+            })?,
+            None => self.load_source(&source, &desc).await?,
+        };
+        if !has_ack(&current, &rule, scope) {
             return Ok(false);
         }
-        self.apply_source_edit(&desc, &source, None, &actor, |current| {
-            Ok(without_ack(current, &rule))
+        // The answer here is a bool, so a mirror warning has nowhere to ride
+        // out; `write_overlay_entry` has already logged it.
+        self.apply_source_edit(&desc, &source, &view, None, &actor, None, |current| {
+            Ok(without_ack(current, &rule, scope))
         })
         .await?;
         Ok(true)
@@ -5969,6 +11444,20 @@ impl Engine {
     /// path, which needs the same verdict about one engram before it can record
     /// what a finding was acknowledged for.
     ///
+    /// **Run in the caller's own dimension**, which is what makes a draft's
+    /// findings its author's: on a domain that reviews changes, the listing,
+    /// the text behind each fact, the graph the degrees are counted over, the
+    /// lead vectors and the dangling references are all taken as that actor
+    /// reads them, and the acknowledgments a fact carries are the ones written
+    /// into the document they are reading. Base findings stay everybody's,
+    /// because a base row nobody has redrafted is in everybody's listing.
+    /// Outside review mode - and for a caller with no identity - every one of
+    /// those is the base answer, unchanged.
+    ///
+    /// What is deliberately NOT per actor is the run recorder in
+    /// [`Engine::evolve_engrams`]: a sweep having run is a fact about the
+    /// machine's maintenance backlog, whoever asked for it.
+    ///
     /// `Ok(None)` for a domain with no engrams: no domain row to query against
     /// and nothing to detect. An empty domain is quiet, not an error.
     async fn sweep_domain(
@@ -5977,19 +11466,55 @@ impl Engine {
         today: NaiveDate,
         known_domains: &[String],
         include_acknowledged: bool,
+        scope: &crate::scope::Scope,
     ) -> Result<Option<DomainSweep>> {
         let mut unparsed = 0usize;
         let source = self.content_source(name)?;
+        // One view, built once and asked five times below - the listing, the
+        // entries, the base text behind them, the draft references and the
+        // actor key the lead vectors are read in - where each of those used to
+        // derive the same actor for itself. The caller has already screened the
+        // domain (`evolve_detect` resolves every name through
+        // `domain_entry_scoped` before it gets here), so this pass screens
+        // nothing further.
+        let view = DomainView::for_read(self, name, &HashSet::new(), scope)?;
+        let overlay = view.actor();
         let store = self.store.lock().await;
-        let descs = store.list_engrams(name, None, None).await?;
+        let base = store.list_engrams(name, None, None).await?;
         drop(store);
+        // The sweep looks at exactly what its caller reads, through the same
+        // helper every read verb shadows a listing with: a path this caller is
+        // drafting is their own row, a path they have deleted is absent, and a
+        // draft at a path no file holds is a row like any other. `None` - a
+        // domain that takes changes directly, or a caller with no identity -
+        // hands the base listing straight back, so a sweep outside review mode
+        // is byte for byte the one that was there before.
+        //
+        // Shadowed rather than additive, and that is the whole ruling: a
+        // finding about a base row its author has already redrafted is a
+        // finding about text they no longer see. The lock is dropped first
+        // because the helper takes it itself.
+        let descs = view.list_over(base).await?;
         // No engrams means no domain row to query against and nothing to
-        // detect. An empty domain is quiet, not an error.
+        // detect. An empty domain is quiet, not an error. Read off the listing
+        // rather than the registration, so a domain whose only rows are one
+        // actor's drafts still sweeps for that actor.
         let Some(domain_id) = descs.first().map(|d| d.domain_id) else {
             return Ok(None);
         };
 
-        let graph = self.sweep_graph(&descs).await?;
+        let held = view.entries(domain_id).await?;
+        let drafts = DomainView::held_text(&held);
+        let drafts = &drafts;
+        // What the domain's own rows reference at the paths this caller's view
+        // replaced or removed, which is the other half of the union `V108` asks
+        // its question of. Read from the base text, never from the draft.
+        let shadowed_asset_refs = view.shadowed_asset_refs(domain_id, &held).await;
+
+        // Traversed in the caller's dimension too, or every draft would come
+        // back with no edges at all and `V104` would report the engrams
+        // somebody is working on hardest as orphans.
+        let graph = self.sweep_graph(&descs, overlay).await?;
         let mut inbound: HashMap<i64, usize> = HashMap::new();
         let mut outbound: HashMap<i64, usize> = HashMap::new();
         for edge in &graph.edges {
@@ -5997,22 +11522,84 @@ impl Engine {
             *inbound.entry(edge.to.0).or_default() += 1;
         }
 
+        // Read before the store lock is taken: the provider lives behind its
+        // own guard and the sweep has no reason to hold both.
+        let embedded = self.provider().is_some();
+
+        // One query in this caller's own dimension: the base rows their drafts
+        // do not shadow and their own drafts together, each judged against what
+        // they hold at the target's address. It replaced a pass that assembled
+        // the draft half in Rust beside this one - which could not see the
+        // colon-prefixed title form and could not be asked about a base row at
+        // all, so a base link a reader's own draft had already answered was
+        // still raised at them.
+        let unresolved = view.unresolved(domain_id).await?;
+        // The `vocabulary` TOOL stays shared and the V203 FINDING moved, which
+        // is the half of the Task 9 ruling that held and the half that did not.
+        // What a person is shown is still the domain's agreement - a word one
+        // author is trying out in a draft is not the team's vocabulary - but a
+        // drift finding is about what THAT author wrote, and reading it off the
+        // team's list told them their own new word was already established, or
+        // said nothing at all about the one beside it.
+        let vocab = view.vocabulary().await?;
+        // The attachment set in the caller's own dimension, like every other
+        // input on this path. A file this caller drafted is one they can see, so
+        // `V107` must not call their own reference to it dangling; a file they
+        // have deleted reads absent for them. On a domain that takes changes
+        // directly the view has no actor and this is the base listing, byte for
+        // byte the query that was here before.
+        //
+        // **This is also `V108`'s input**, so the orphan rule reads the actor
+        // view from here on: a file only this actor holds is theirs to be
+        // orphaned or referenced. The union rule that keeps a reference dropped
+        // in a draft from orphaning a shared file is `shadowed_asset_refs`'
+        // above and is untouched by this.
+        let attachments = view.attachments().await?;
+        // Asked before the store lock, like the two above it: the view takes
+        // the lock itself.
         let store = self.store.lock().await;
-        let unresolved = store.unresolved_refs(domain_id).await?;
-        let vocab = store.vocabulary(Some(name)).await?;
-        // Metadata only, one query: the attachment rules compare paths,
-        // sizes and hashes and never read a byte of any file.
-        let attachments = store.list_attachments(domain_id).await?;
+        // Lead vectors for V301, only with a provider installed: without one
+        // the rule stays silent whatever a previous run left embedded, so a
+        // sweep on a machine that never embeds never speaks about meaning.
+        //
+        // Asked in the caller's own dimension. On a domain that does not review
+        // changes this is `None` and the answer is the base rows, byte for byte
+        // what it always was. On one that does, a path this caller is drafting
+        // contributes THEIR row's vector rather than the reviewed file's - so
+        // `V301` never tells an author their own rewrite is a twin of the
+        // version they are rewriting, and never speaks about a version they are
+        // not reading. The listing above is shadowed with the same rows, so the
+        // vector and the fact it attaches to are one engram's.
+        let mut lead_vectors: HashMap<i64, Vec<f32>> = if embedded {
+            store
+                .lead_vectors(domain_id, &self.model_id, overlay)
+                .await?
+                .into_iter()
+                .map(|lv| (lv.engram_id.0, lv.vector))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         drop(store);
 
         let verify_config = domain_verify_config(&source);
         let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
         for d in &descs {
-            // Files-are-truth for a file domain, the stored content for a
-            // virtual one. An engram that no longer parses is counted and
-            // skipped rather than failing the whole sweep, since one broken
-            // file must not hide every finding behind it.
-            let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
+            // This caller's own draft of the path when they hold one, and
+            // otherwise files-are-truth for a file domain, the stored content
+            // for a virtual one. Assembling the reviewed file's text under a
+            // draft's row would be the quietest way to get this wrong: every
+            // rule would then speak about text its author is not reading.
+            //
+            // An engram that no longer parses is counted and skipped rather
+            // than failing the whole sweep, since one broken file must not hide
+            // every finding behind it.
+            let held = drafts.get(&d.path);
+            let parsed = match held {
+                Some(text) => parse_engram(text).ok(),
+                None => self.load_engram(&source, d.domain_id, &d.path).await,
+            };
+            let Some(engram) = parsed else {
                 unparsed += 1;
                 continue;
             };
@@ -6038,6 +11625,14 @@ impl Engine {
                 permalink: d.permalink.clone(),
                 title,
                 path: d.path.clone(),
+                // Which dimension this fact came out of: the empty string for a
+                // row the domain's files or its database hold, and the caller's
+                // own actor key for their draft standing at that path. What
+                // `V301`'s path skip reads the dimension out of.
+                actor: match held {
+                    Some(_) => overlay.unwrap_or_default().to_string(),
+                    None => String::new(),
+                },
                 status,
                 engram_type: fm.engram_type.trim().to_ascii_lowercase(),
                 tags: fm.tags.clone(),
@@ -6062,6 +11657,21 @@ impl Engine {
                     .map(str::to_string),
                 asset_refs: crystalline_core::find_asset_refs(&engram.body),
                 acks: ack_entries(fm),
+                // Filled in by the caller that has the store: the sweep is
+                // pure, so the lead embeddings are handed to it, never fetched
+                // from inside it. Removed rather than cloned - one engram is
+                // assembled once, and the vector is the largest field here.
+                lead_vector: lead_vectors.remove(&d.id.0),
+                // The parser's own bullets, so `V010` compares what an
+                // observation asserts rather than re-deriving it from the body.
+                observations: engram
+                    .observations
+                    .iter()
+                    .map(|o| FactObservation {
+                        line: o.line,
+                        text: o.content.clone(),
+                    })
+                    .collect(),
                 body: engram.body,
             });
         }
@@ -6076,8 +11686,15 @@ impl Engine {
             tag_aliases: vocab.aliases,
             known_domains: known_domains.to_vec(),
             attachments,
+            shadowed_asset_refs,
             share: self.share_facts(name).await,
             include_acknowledged,
+            // The sweep module's own constants, never literals repeated here:
+            // the thresholds and the twin caps are one place, and nothing
+            // configures them yet. The twin caps hold an invariant the defaults
+            // satisfy and a future settings surface has to keep - the pairs
+            // retained bound the findings emitted, so `max_twin_pairs` stays
+            // above `max_twin_findings` or the cap on findings is unreachable.
             options: SweepOptions::default(),
         };
         let report = detect(&input);
@@ -6108,11 +11725,70 @@ impl Engine {
         })
     }
 
+    /// How many substantive changes one team domain holds that the team has
+    /// not seen, for the share ask a write receipt carries
+    /// ([`crate::nudge::write_verb_trailer`]).
+    ///
+    /// [`Engine::share_facts`] narrowed to its count, which is what keeps the
+    /// receipt's answer and the sweep's `V009` one reading: the same offline
+    /// walk ([`crate::origin::unshared_work`]) and the same
+    /// substantive-changes-only filter.
+    ///
+    /// Two things separate it from the sweep's version, and both are about
+    /// where it runs: on the path of a write that has already succeeded.
+    ///
+    /// **It never waits for the origin lock.** That lock is held across the
+    /// network by a pull, a share and a connect, and the poller takes it on a
+    /// timer, so waiting for it here would hold a receipt until somebody else's
+    /// forge call came back. A domain whose origin is mid-operation therefore
+    /// contributes nothing, on the same terms as a domain whose tree cannot be
+    /// walked: nothing is KNOWN to be unshared, and a delta that cannot be read
+    /// is no reason to speak. Taking the lock at all is what keeps the walk off
+    /// a half-written pair (see [`Engine::share_facts`]).
+    ///
+    /// **And it never runs on a runtime thread.** The walk reads and hashes
+    /// every file in the domain root, which is blocking I/O measured in
+    /// hundreds of milliseconds on a large or networked tree; run inline it
+    /// would occupy a tokio worker and, with the guard held across it, queue a
+    /// real share or the poller's pull behind a question about one sentence.
+    /// The owned guard travels into the blocking task and is released with it,
+    /// so the lock is held for exactly the walk and not a moment of scheduling
+    /// either side of it.
+    ///
+    /// The caller memoizes this per domain
+    /// ([`crate::nudge`]), so a machine whose team domains are fully
+    /// shared pays for the walk once a minute rather than once a write.
+    ///
+    /// `None` for a domain with no origin, no recorded origin state, no
+    /// readable working tree, an origin operation in flight, or a blocking task
+    /// that panicked.
+    pub(crate) async fn unshared_change_count(&self, name: &str) -> Option<u64> {
+        let guard = self.origin_lock(name).try_lock_owned().ok()?;
+        let (_spec, root, state_dir) = self.origin_spec_for_domain(name).ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            origin::unshared_work(&root, &state_dir).map(|work| work.count() as u64)
+        })
+        .await
+        .ok()?
+    }
+
     /// The resolved graph around a whole domain, at depth 1 so every
     /// cross-domain target carries a status.
-    async fn sweep_graph(&self, descs: &[EngramDescriptor]) -> Result<GraphSlice> {
+    ///
+    /// In one caller's dimension, the same one their engram list was shadowed
+    /// in: `None` for a domain that takes changes directly, and that actor's
+    /// key for one that reviews them. The two have to agree or the degrees are
+    /// counted against nodes that are not in the fact list - a draft seeded
+    /// into a base-only traversal comes back with no edges at all, which reads
+    /// as an orphan on exactly the engram somebody is working on.
+    async fn sweep_graph(
+        &self,
+        descs: &[EngramDescriptor],
+        actor: Option<&str>,
+    ) -> Result<GraphSlice> {
         let ids: Vec<EngramId> = descs.iter().map(|d| d.id).collect();
-        self.sweep_neighbors(&ids, 1).await
+        self.sweep_neighbors(&ids, 1, actor).await
     }
 
     /// [`Store::neighbors`] over a seed list of any size, merged into one slice.
@@ -6132,13 +11808,18 @@ impl Engine {
     /// consolidation ranking and the orphan rule read. The merged nodes are
     /// sorted by id, so a chunked sweep answers in the same ascending order a
     /// single-chunk one does and every caller's ordering holds either way.
-    async fn sweep_neighbors(&self, ids: &[EngramId], depth: u8) -> Result<GraphSlice> {
+    async fn sweep_neighbors(
+        &self,
+        ids: &[EngramId],
+        depth: u8,
+        actor: Option<&str>,
+    ) -> Result<GraphSlice> {
         let mut graph = GraphSlice::default();
         let mut seen_nodes: HashSet<i64> = HashSet::new();
         let mut seen_edges: HashSet<(i64, i64, String, u8)> = HashSet::new();
         for chunk in ids.chunks(NEIGHBOR_CHUNK) {
             let store = self.store.lock().await;
-            let slice = store.neighbors(chunk, depth).await?;
+            let slice = store.neighbors(chunk, depth, actor).await?;
             drop(store);
             for node in slice.nodes {
                 if seen_nodes.insert(node.id.0) {
@@ -6164,8 +11845,17 @@ impl Engine {
     /// Infer a Picoschema from a domain's engrams of a type. Engram content is
     /// loaded from disk for a file domain and from the database for a virtual
     /// domain.
-    pub async fn infer_schema(&self, p: &InferParams) -> Result<Value> {
-        let source = self.content_source(&p.domain)?;
+    ///
+    /// Scoped like [`Engine::validate_engrams`]: the inferred field names are
+    /// generalized out of the domain's own engrams, so a domain the caller may
+    /// not see is refused as an unregistered one.
+    pub async fn infer_schema(
+        &self,
+        p: &InferParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let descs = store
             .list_engrams(&p.domain, None, Some(&p.engram_type))
@@ -6197,10 +11887,24 @@ impl Engine {
     /// rather than erroring, matching the store contract, so an agent can probe a
     /// fresh domain safely. `domain` echoes the request, `null` for an all-domain
     /// sweep.
-    pub async fn vocabulary(&self, p: &VocabularyParams) -> Result<Value> {
-        let store = self.store.lock().await;
-        let vocab = store.vocabulary(p.domain.as_deref()).await?;
-        drop(store);
+    ///
+    /// Scoped: a named domain the caller may not see reports the same empty
+    /// lists an unknown one does, and an all-domain sweep covers the domains the
+    /// caller may read. Tag names and their counts are content, so a sweep that
+    /// summed a private domain into its totals would publish that domain's
+    /// vocabulary to everyone who asked for the whole picture.
+    ///
+    /// The sweep is one query per visible domain, merged by
+    /// [`crystalline_index::merge_vocabularies`], and only when something is
+    /// hidden - the store's own sweep is all-domains or one domain, with no
+    /// domain list to hand it. Every unscoped caller keeps the single query.
+    pub async fn vocabulary(
+        &self,
+        p: &VocabularyParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let vocab = self.scoped_vocabulary(p.domain.as_deref(), &hidden).await?;
         // Every count list is present unconditionally, empty when nothing is in
         // use, so a client reads a list rather than testing for a missing key.
         // Only the two advisory keys below (clusters, aliases) are omitted when
@@ -6406,6 +12110,16 @@ impl Engine {
     ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
+        }
+        // An import writes the folder the team shares under an admin's hand,
+        // and a domain that reviews changes has no answer for whose draft that
+        // would be. The preview is exempt because it writes nothing: a question
+        // about a refusal is not the refusal.
+        if !dry_run {
+            self.refuse_write_into_reviewed_folder(
+                domain,
+                "an imported archive cannot land there",
+            )?;
         }
         // Delta 2 vs `import_domain`: a file domain is served too, so the source
         // decides how a write lands rather than being refused outright.
@@ -6799,6 +12513,98 @@ impl Engine {
 
     // --- sync / reindex (ctl + CLI) ------------------------------------------
 
+    /// Put every draft the overlay journal mirrors for one domain back into the
+    /// index, answering with how many rows were written.
+    ///
+    /// An overlay entry is primary data that no file on disk describes, so an
+    /// index that lost its rows - a `reindex --wipe`, a database restored from
+    /// an older copy, a fresh index file - cannot rebuild them by walking the
+    /// domain. The journal under the state directory is the copy that can, and
+    /// this is where it is read back. It runs in the sync domain pass, so the
+    /// first sync after a rebuild is what heals the drafts; on every other sync
+    /// it finds every row already there and writes nothing.
+    ///
+    /// **Store rows win.** An actor already holding a row at a path keeps it,
+    /// so a restore only ever fills a gap and a live draft is never overwritten
+    /// by an older mirror of itself.
+    ///
+    /// **Refused for a domain nobody registers**, which is the half that keeps
+    /// the two removal paths honest: both of them sweep the journal, but a
+    /// mirror that outlived its sweep (an interrupted removal, a folder no
+    /// process could delete) must not be able to resurrect drafts for a domain
+    /// that no longer exists. Resolved through
+    /// [`Engine::registered_domain_names`], the same set collection keys on.
+    pub async fn restore_overlays(&self, domain: &str) -> Result<u64> {
+        if !self.registered_domain_names().contains(domain) {
+            return Err(EngineError::UnknownDomain {
+                domain: domain.to_string(),
+                registered: self.known_domain_names(),
+            });
+        }
+        let state_dir = self.journal_state_dir()?;
+        // **A domain that reviews nothing takes nothing back.** The mirror can
+        // outlive the mode - a fold that failed halfway, a config key edited
+        // out, an environment variable unset - and this pass runs on every sync
+        // of every domain, so without this the leftover rows would be written
+        // back into the index for ever rather than merely left behind once. The
+        // bytes stay on disk: they are somebody's work, and putting the domain
+        // back into review mode is what brings them back. Resolved after the
+        // state directory, so an engine that can reach no journal still learns
+        // that first.
+        if !self.reviews_changes(domain) {
+            return Ok(0);
+        }
+        // A domain with nothing mirrored never reaches the store: the sync pass
+        // calls this for every domain on every pass, and resolving a domain id
+        // is a write.
+        let counts = crate::overlay_journal::journal_counts(&state_dir, domain);
+        if counts.total == 0 && !counts.unreadable {
+            return Ok(0);
+        }
+        let entry = self.domain_entry(domain)?;
+        let kind = if entry.is_virtual() {
+            DomainKind::Virtual
+        } else {
+            DomainKind::File
+        };
+        let path = entry.file_path();
+        let path_str = path.as_ref().map(|p| p.to_string_lossy());
+        let store = self.store.lock().await;
+        let id = store
+            .upsert_domain(domain, path_str.as_deref(), kind)
+            .await?;
+        let restored = crate::overlay_journal::restore_into(
+            &*store,
+            &state_dir,
+            domain,
+            id,
+            &self.chunk_params,
+        )
+        .await?;
+        Ok(restored)
+    }
+
+    /// [`Engine::restore_overlays`] as the sync pass runs it: best effort, and
+    /// never a reason to fail the sync it rides on. A draft that could not be
+    /// restored is a draft the next sync tries again for; a sync that refused
+    /// because of one would leave the base rows unindexed too.
+    async fn restore_overlays_quietly(&self, domain: &str) {
+        match self.restore_overlays(domain).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                domain = domain,
+                restored = n,
+                "restored {n} mirrored draft(s) into '{domain}' from the overlay journal"
+            ),
+            Err(e) => tracing::warn!(
+                domain = domain,
+                error = format!("{e:#}"),
+                "the overlay journal for '{domain}' could not be restored; the drafts it \
+                 mirrors stay out of the index until the next sync"
+            ),
+        }
+    }
+
     /// Sync one or all registered domains, returning per-domain reports.
     pub async fn sync(&self, only: Option<&str>) -> Result<Value> {
         self.sync_take_over(only, false).await
@@ -6815,7 +12621,11 @@ impl Engine {
         let _activity = ActivityState::begin(&self.activity, "sync", only);
         let targets = self.sync_targets(only)?;
         let collab = !self.instance_id.is_empty();
-        let mut reports = Vec::new();
+        // Each domain this run applied, paired with the report its apply
+        // produced, for the final cross-domain resolution pass. A domain that
+        // was skipped (hosted elsewhere) or failed to scan wrote nothing and is
+        // not in the list at all.
+        let mut applied: Vec<(DomainId, SyncReport)> = Vec::new();
         let mut skipped = Vec::new();
         let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
@@ -6858,7 +12668,7 @@ impl Engine {
                 let snapshot = store.file_stamps(domain).await?;
                 (domain, snapshot)
             };
-            let scan = match scan_domain(name, root, snapshot, &self.chunk_params).await {
+            let scan = match scan_domain(name, root, snapshot, &self.chunk_params, false).await {
                 Ok(scan) => scan,
                 Err(e) if only.is_none() => {
                     // One denied domain must not block the rest of the
@@ -6880,8 +12690,23 @@ impl Engine {
             if changed_anything(&report) {
                 self.refresh_index_files(name).await;
             }
-            reports.push(report);
+            // The files are in; the drafts no file describes come back from the
+            // journal. A no-op on every sync but the first one after a rebuild.
+            self.restore_overlays_quietly(name).await;
+            applied.push((domain, report));
         }
+        // Every domain of this run is in now, so the references that pointed
+        // forward into a domain the loop had not reached yet can resolve. A
+        // single-domain run is a no-op inside the pass.
+        {
+            let store = self.store.lock().await;
+            resolve_forward_refs(&*store, &mut applied)
+                .await
+                .map_err(|e| {
+                    EngineError::Internal(format!("resolving forward references failed: {e}"))
+                })?;
+        }
+        let reports: Vec<SyncReport> = applied.into_iter().map(|(_, report)| report).collect();
         Ok(json!({
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
             "skipped": skipped,
@@ -6952,60 +12777,39 @@ impl Engine {
         Ok(report)
     }
 
-    /// Reindex all file domains. `full` clears each file domain's rows first
-    /// (per-domain, not a global wipe) and resyncs from disk, so virtual-domain
-    /// rows, whose only source of truth is the database, are never destroyed. In
-    /// collaboration mode a domain hosted by another live instance is left
-    /// untouched (neither cleared nor resynced), so a non-host never rebuilds the
-    /// host's rows out from under it.
+    /// Reindex all file domains. `full` re-reads, re-parses and re-upserts every
+    /// file rather than only the ones whose modification time or size moved, and
+    /// destroys nothing on the way: each domain serves its previous complete
+    /// rows until its own rebuild commits, files gone from disk are pruned as a
+    /// sync prunes them, and a chunk whose text is unchanged keeps its
+    /// embedding. Virtual-domain rows are never touched at all - they have no
+    /// files to rebuild from. In collaboration mode a domain hosted by another
+    /// live instance is left untouched, so a non-host never rebuilds the host's
+    /// rows out from under it.
+    ///
+    /// The true wipe is not here: it needs the index file to itself, which the
+    /// daemon is holding, so it lives on the daemonless
+    /// `crystalline reindex --wipe`.
+    ///
+    /// The loop is [`crystalline_index::reindex_domains`], shared with the
+    /// daemonless `crystalline reindex`: this side supplies only what is the
+    /// daemon's own business, the host claim before a domain is touched and the
+    /// generated index files after one changed.
     pub async fn reindex(&self, full: bool) -> Result<Value> {
         let _activity = ActivityState::begin(&self.activity, "reindex", None);
         let targets = self.sync_targets(None)?;
-        let collab = !self.instance_id.is_empty();
-        let mut reports = Vec::new();
-        // Two short store-lock windows per domain with the scan in between, the
-        // same shape as `sync_take_over`, so a large domain's walk-and-hash pass
-        // no longer holds the mutex. The first window claims the host, clears the
-        // domain when `full` and snapshots the stamps; the snapshot is taken AFTER
-        // the clear so the scan classifies every file as new against empty stamps -
-        // the correct full-rebuild semantics. In collaboration mode a domain hosted
-        // by another live instance is left untouched (neither cleared nor scanned).
-        for (name, root) in targets {
-            let (domain, snapshot) = {
-                let store = self.store.lock().await;
-                if collab {
-                    match self.claim_file_host(&*store, &name, &root, false).await? {
-                        HostClaim::Acquired => {}
-                        HostClaim::HeldByOther(host) => {
-                            tracing::info!(
-                                "skipping reindex of '{name}' hosted by instance {}",
-                                host.instance_id
-                            );
-                            continue;
-                        }
-                    }
-                }
-                let domain = store
-                    .upsert_domain(&name, Some(&root.to_string_lossy()), DomainKind::File)
-                    .await?;
-                if full {
-                    store.clear_domain(domain).await?;
-                }
-                let snapshot = store.file_stamps(domain).await?;
-                (domain, snapshot)
-            };
-            let scan = scan_domain(&name, &root, snapshot, &self.chunk_params).await?;
-            let report = {
-                let store = self.store.lock().await;
-                apply_scan(&*store, domain, scan).await.map_err(|e| {
-                    EngineError::Internal(format!("reindex of '{name}' failed: {e}"))
-                })?
-            };
-            if changed_anything(&report) {
-                self.refresh_index_files(&name).await;
-            }
-            reports.push(report);
-        }
+        let hooks = DaemonReindexHooks {
+            engine: self,
+            collab: !self.instance_id.is_empty(),
+        };
+        let reports = reindex_domains(
+            &*self.store,
+            &targets,
+            &self.chunk_params,
+            full.then_some(RebuildKind::Full),
+            &hooks,
+        )
+        .await?;
         Ok(json!({
             "full": full,
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
@@ -7042,6 +12846,41 @@ impl Engine {
                 Ok(targets)
             }
         }
+    }
+
+    /// The recorded file stamps of one or every registered file domain, keyed
+    /// by domain name and then by domain-relative path: what a caller
+    /// compares the files on disk against to tell an indexed file from one
+    /// the index has never seen. `crystalline doctor`'s orphan and unindexed
+    /// checks read it over ctl, since this daemon holds the index file itself
+    /// and a second opener would only collide with it.
+    ///
+    /// A store read, not a pure one: it upserts each domain row exactly as
+    /// [`Engine::sync_take_over`] does, because stamps are keyed by domain id
+    /// and a domain nobody has synced yet has no row to read. Nothing about
+    /// what this daemon watches, syncs or caches changes here (see
+    /// [`Engine::diagnostic_file_domains`]).
+    ///
+    /// Each entry carries the engram's mtime, size and checksum, more than a
+    /// presence check needs, because a stamp is what the index records: a
+    /// caller comparing content rather than presence should not need a second
+    /// verb for it.
+    pub async fn domain_file_stamps(&self, only: Option<&str>) -> Result<Value> {
+        let targets = self.diagnostic_file_domains(only)?;
+        let mut domains = serde_json::Map::new();
+        let store = self.store.lock().await;
+        for (name, root) in &targets {
+            let domain = store
+                .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                .await?;
+            let stamps = store.file_stamps(domain).await?;
+            domains.insert(
+                name.clone(),
+                serde_json::to_value(&stamps).unwrap_or(Value::Null),
+            );
+        }
+        drop(store);
+        Ok(json!({ "domains": Value::Object(domains) }))
     }
 
     /// Diagnostics for ctl `status`: per-domain stats, embedding coverage and the
@@ -7177,29 +13016,78 @@ impl Engine {
 
     /// Embed outstanding chunks for the active model in bounded batches, locking
     /// the store only to pull jobs and to store vectors so long embeds do not
-    /// block searches. Returns the number of chunks embedded.
+    /// block searches. Returns the number of chunks embedded, which is `0` both
+    /// when there was nothing to embed and when another pass was already
+    /// walking the backlog; [`Self::embed_pending_outcome`] tells those apart
+    /// and is what a caller reporting a count to a person wants.
     pub async fn embed_pending(&self) -> Result<usize> {
         self.embed_pending_with_page(EMBED_PAGE_SIZE).await
+    }
+
+    /// [`Self::embed_pending`], saying which of the two things happened rather
+    /// than folding a turned-away request into a zero.
+    pub async fn embed_pending_outcome(&self) -> Result<EmbedOutcome> {
+        self.embed_pass_with_page(EMBED_PAGE_SIZE).await
     }
 
     /// [`Self::embed_pending`] with an explicit backlog page size. Production
     /// callers take [`EMBED_PAGE_SIZE`] through the wrapper; the parameter lets
     /// a test drive several pages over a small corpus.
+    pub async fn embed_pending_with_page(&self, page_size: usize) -> Result<usize> {
+        Ok(self.embed_pass_with_page(page_size).await?.embedded())
+    }
+
+    /// The pass itself, reporting its outcome.
     ///
     /// A batch the provider rejects is logged and skipped, not fatal: its chunks
     /// keep no embedding and stay in the backlog, visible in `status`, for a
     /// later pass, so one poisoned batch cannot starve the whole queue. Only
     /// store errors abort the pass.
-    pub async fn embed_pending_with_page(&self, page_size: usize) -> Result<usize> {
+    ///
+    /// One pass runs at a time. A caller that arrives while another pass is
+    /// walking the backlog is turned away at once instead of walking it a
+    /// second time with its own cursor: two passes do not share a backlog, they
+    /// shadow each other. Nothing is dropped by that - the running pass is told
+    /// to walk again, and a walk starts at the head of the backlog, so it picks
+    /// up whatever the second caller had just written.
+    async fn embed_pass_with_page(&self, page_size: usize) -> Result<EmbedOutcome> {
+        if self.provider().is_none() {
+            return Ok(EmbedOutcome::Embedded(0));
+        }
+        let Some(mut pass) = EmbedPass::claim(&self.embed_gate) else {
+            tracing::debug!("an embed pass is already running; it walks the backlog again");
+            return Ok(EmbedOutcome::AlreadyRunning);
+        };
+        let page_size = page_size.max(1);
+        let mut embedded = 0usize;
+        let mut activity: Option<ActivityGuard> = None;
+        loop {
+            embedded += self.embed_one_walk(page_size, &mut activity).await?;
+            if !pass.walk_again() {
+                break;
+            }
+        }
+        Ok(EmbedOutcome::Embedded(embedded))
+    }
+
+    /// One walk of the backlog, head to tail, for [`Self::embed_pass_with_page`].
+    /// The activity is the caller's so a pass that walks twice stays one
+    /// operation in `status`.
+    async fn embed_one_walk(
+        &self,
+        page_size: usize,
+        activity: &mut Option<ActivityGuard>,
+    ) -> Result<usize> {
         let Some(provider) = self.provider() else {
             return Ok(0);
         };
         let model = self.model_id.clone();
-        let page_size = page_size.max(1);
         // In collaboration mode the scan is scoped to the file domains this
         // instance hosts plus all virtual domains, so a non-host does not
         // wastefully re-embed a chunk another instance owns; standalone it
-        // embeds everything. The scope holds for the whole pass.
+        // embeds everything. The scope holds for the whole walk and is read
+        // again for the next one, so a domain this instance took over while the
+        // pass ran is covered by it.
         let scope = {
             let store = self.store.lock().await;
             self.embed_scope(&*store).await?
@@ -7209,7 +13097,6 @@ impl Engine {
         // pull a page and to write vectors, never across the embed call.
         let mut embedded = 0usize;
         let mut cursor: Option<(i64, i64)> = None;
-        let mut activity: Option<ActivityGuard> = None;
         loop {
             let mut jobs = {
                 let store = self.store.lock().await;
@@ -7229,7 +13116,7 @@ impl Engine {
             // land in the same batch.
             order_jobs_for_batching(&mut jobs);
             if activity.is_none() {
-                activity = Some(ActivityState::begin(&self.activity, "embed", None));
+                *activity = Some(ActivityState::begin(&self.activity, "embed", None));
             }
             for batch in jobs.chunks(EMBED_BATCH) {
                 let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
@@ -7275,14 +13162,35 @@ impl Engine {
         Ok(embedded)
     }
 
+    /// Whether an embedding pass is walking the backlog right now. Cheap: one
+    /// flag behind the single-flight gate, no store round trip. A periodic
+    /// trigger reads it so it does not chain a fresh full-backlog walk onto the
+    /// end of every long pass, since "the backlog is non-empty" stays true for
+    /// the whole life of one.
+    pub fn embed_in_flight(&self) -> bool {
+        self.embed_gate.lock().unwrap().running
+    }
+
     /// Schedules a background embedding pass when a worker is wired,
     /// returning whether it was scheduled; callers run an inline pass when
-    /// it was not.
+    /// it was not. "Scheduled" is all it reports: the signal is queued, and
+    /// whether the pass then runs, coalesces into a running one or finds the
+    /// backlog already drained is the worker's business, never the caller's.
     pub fn request_embed(&self) -> bool {
         match &self.embed_tx {
             Some(tx) => tx.send(()).is_ok(),
             None => false,
         }
+    }
+
+    /// Ask the embed worker to pick up what a write just chunked, without
+    /// waiting for it. A write never embeds inline: the point of the worker is
+    /// that a write returns at the speed of the disk, and a virtual domain -
+    /// never watched - would otherwise sit unembedded until the self-heal
+    /// tick. With no worker wired this is a no-op, as [`Engine::request_embed`]
+    /// already is.
+    pub(crate) fn nudge_embed(&self) {
+        let _ = self.request_embed();
     }
 
     // --- configure -------------------------------------------------------------
@@ -7467,7 +13375,28 @@ impl Engine {
     /// receipt (`crystalline install`'s own memory of which harnesses are
     /// onboarded), never a caller-supplied list: provisioning targets every
     /// harness this machine has actually wired up.
-    pub async fn provision(&self, action: &ProvisionAction) -> Result<Value> {
+    pub async fn provision(
+        &self,
+        action: &ProvisionAction,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        // Resolved once, and used two different ways below because the two
+        // arms owe different things. `Status` is a pure read, so it must not
+        // even compute over a domain this caller may not see: the config it is
+        // given is narrowed first. `Allow`, `Deny` and `Apply` reconcile this
+        // *machine's* harnesses, and narrowing what they reconcile over would
+        // make a stranger's call retire a hidden domain's installed artifacts -
+        // worse than the disclosure it would close - so those keep the whole
+        // config and only their report is narrowed.
+        //
+        // One consequence of narrowing `Status` at the input, recorded because
+        // it is a choice rather than an accident: a hidden domain's artifacts
+        // fall out of the desired set with it, so its installed files read back
+        // as orphaned or drifted in that caller's `harnesses` counts. Numbers
+        // only - `HarnessStatus` carries no name - and the alternative is
+        // computing the harness rows over a config the caller may not see,
+        // which trades a count nobody acts on for the disclosure this closes.
+        let hidden = self.hidden_for(scope).await?;
         let install_receipt = crystalline_core::provision::install_receipt_path()
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
@@ -7482,7 +13411,15 @@ impl Engine {
 
         match action {
             ProvisionAction::Status => {
-                let config = self.config.read().unwrap().clone();
+                let mut config = self.config.read().unwrap().clone();
+                // The whole of the scoping for this arm: `provision::status`
+                // walks `config.domains` and pushes one entry per registered
+                // domain whether or not it declares anything, so its report is
+                // a complete list of domain names. Subtracting first drops a
+                // hidden domain out of `domains`, `pending` and
+                // `virtual_with_decision` at once, and out of the counts that
+                // are derived from them.
+                config.domains.retain(|name, _| !hidden.contains(name));
                 let report = crystalline_core::provision::status(
                     &config,
                     &receipt_path,
@@ -7522,13 +13459,13 @@ impl Engine {
                     *file_guard = file;
                     *self.config.write().unwrap() = effective;
                 }
-                self.run_provision_apply(&receipt_path, &harnesses)
+                self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
             ProvisionAction::Apply => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                self.run_provision_apply(&receipt_path, &harnesses)
+                self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
         }
     }
@@ -7536,7 +13473,12 @@ impl Engine {
     /// Reconcile every opted-in domain's declared artifacts into `harnesses`
     /// through the real system MCP runner - the shared tail of
     /// `provision`'s `Allow`, `Deny` and `Apply` arms.
-    fn run_provision_apply(&self, receipt_path: &Path, harnesses: &[HarnessKind]) -> Result<Value> {
+    fn run_provision_apply(
+        &self,
+        receipt_path: &Path,
+        harnesses: &[HarnessKind],
+        hidden: &HashSet<String>,
+    ) -> Result<Value> {
         let config = self.config.read().unwrap().clone();
         let mut mcp = crate::harness_cli::SystemMcpRunner;
         let env_domains: HashSet<&str> = self
@@ -7552,7 +13494,39 @@ impl Engine {
             &env_domains,
         )
         .map_err(|e| EngineError::Internal(e.to_string()))?;
-        Ok(apply_report_json(&report))
+        let mut value = apply_report_json(&report);
+        // The reconcile ran over the whole machine, as it must; the report goes
+        // back to one caller, so it names only the domains that caller may see.
+        // Two of the three arrays carry a domain name and both are narrowed
+        // here. `harnesses[].actions[].target` is the third and carries none -
+        // its keys are `{kind}/{rel}` built from the artifact's own filename.
+        if let Some(pending) = value["pending"].as_array_mut() {
+            pending.retain(|entry| {
+                entry["domain"]
+                    .as_str()
+                    .is_none_or(|name| !hidden.contains(name))
+            });
+        }
+        // `notices` is free prose, so it is filtered by what the prose does
+        // rather than by a field: every notice that names a domain writes it
+        // between backticks (the virtual-domain skip, the unsupported-kind
+        // skip, both collision notices, the foreign-file keep and the
+        // already-registered MCP server), so a backtick-anchored match drops
+        // exactly those and leaves a notice about a visible domain that merely
+        // happens to contain the hidden name as a substring. Anchored rather
+        // than bare on purpose: a bare match would silence a visible domain's
+        // own collision notice whenever a hidden domain's name appeared inside
+        // one of the file names it reports.
+        if let Some(notices) = value["notices"].as_array_mut() {
+            notices.retain(|notice| {
+                notice.as_str().is_none_or(|text| {
+                    !hidden
+                        .iter()
+                        .any(|name| text.contains(&format!("`{name}`")))
+                })
+            });
+        }
+        Ok(value)
     }
 
     // --- domain add (local and virtual) ---------------------------------------
@@ -7749,6 +13723,1535 @@ impl Engine {
         }))
     }
 
+    /// What a caller is told when they may see a domain and may not end it.
+    ///
+    /// One sentence for both surfaces, naming who can rather than saying only
+    /// that the caller cannot: an instance admin always, and for a private
+    /// domain its owner. The owner is never named - who owns a domain is a
+    /// membership fact, and a refusal is not the place to hand it out.
+    fn removal_refusal(name: &str) -> EngineError {
+        EngineError::Forbidden(format!(
+            "unregistering domain '{name}' is for an instance admin, or for the owner of a \
+             private domain; ask an admin to remove it"
+        ))
+    }
+
+    /// What a caller is told when a removal would delete a virtual domain's
+    /// engrams and nothing said the loss was intended.
+    ///
+    /// One sentence for every surface, naming the flag in each of their
+    /// spellings, because the rule is one rule and the surfaces are three. It
+    /// speaks only about a virtual domain: a file or team domain's markdown is
+    /// never touched by a removal, so there is nothing there to confirm.
+    /// `held` is `None` when the count could not be read at all, which is a
+    /// refusal in its own right: an unreadable index is not an empty one, and
+    /// the one branch that decides whether knowledge is deleted must not read
+    /// a failure as "there was nothing there".
+    fn purge_refusal(name: &str, held: Option<i64>) -> EngineError {
+        let holding = match held {
+            Some(1) => "holding 1 engram".to_string(),
+            Some(n) => format!("holding {n} engrams"),
+            None => "whose engrams could not be counted, because the index could not be read"
+                .to_string(),
+        };
+        EngineError::ConfirmationRequired(format!(
+            "domain '{name}' is a virtual domain {holding}: its knowledge lives in the \
+             database, so unregistering it DELETES those engrams and leaves no files to \
+             re-adopt. Export or share what is worth keeping first, then repeat the removal \
+             with purge set - 'purge: true' over MCP, '?purge=true' on the JSON API, '--purge' \
+             at the command line. A file or team domain needs no purge, since a removal never \
+             touches its files."
+        ))
+    }
+
+    /// The kind a removal speaks about: three, where the registry itself knows
+    /// two.
+    ///
+    /// A team domain is a file domain carrying an origin, and for every other
+    /// purpose that distinction is the origin's business. It matters here
+    /// because the recovery differs: re-adding the FOLDER of a team domain
+    /// registers a plain local one and drops the origin, the base commit and
+    /// the team connection, so a confirmation that offered that recovery would
+    /// be telling somebody the wrong thing on the way to a destructive act.
+    fn removal_kind(entry: &DomainEntry) -> &'static str {
+        if entry.is_virtual() {
+            "virtual"
+        } else if entry.origin.is_some() {
+            "team"
+        } else {
+            "file"
+        }
+    }
+
+    /// How many engrams the index holds for `name`, refusing a virtual domain
+    /// that holds knowledge unless `purge` says the loss was intended.
+    ///
+    /// The count and the refusal come out of one read on purpose: they are the
+    /// same fact asked twice, and a preview whose count disagreed with the
+    /// refusal that follows it would be worse than either alone.
+    ///
+    /// **The KIND is the primary key of this decision, and it comes from the
+    /// config entry, which cannot fail to be read.** Only a virtual domain can
+    /// lose knowledge to a removal, so a file or team domain never reaches the
+    /// refusal at all and its count is a display value: an unreadable index
+    /// costs it nothing more than an absent number. That ordering is what keeps
+    /// this gate from failing open, and it is why the kind is tested before the
+    /// count rather than after it.
+    ///
+    /// **For a virtual domain, a count that cannot be read is a refusal.** An
+    /// error from the index is not the same fact as an empty index, and reading
+    /// it as one would delete somebody's only copy of their knowledge on the
+    /// strength of a failed query - `domain_stats` is an aggregate sweep over
+    /// every domain and can time out on a database whose targeted delete would
+    /// have succeeded, so "the clear would probably have failed too" is not an
+    /// argument a confirmation gate may rest on. With `purge` already set there
+    /// is nothing left to confirm, so the error costs the caller only the
+    /// number in the receipt.
+    ///
+    /// A `None` count for a virtual domain that COULD be read is a domain the
+    /// index has no row for, which is one nothing ever synced; it is not
+    /// knowledge to protect, since there is nothing recorded to lose. In
+    /// practice that case is unreachable for a domain a caller could be looking
+    /// at, because `domain_add_virtual` scaffolds a MANIFEST engram into the
+    /// database from the moment the domain exists.
+    async fn removal_engrams(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        purge: bool,
+    ) -> Result<RemovalCount> {
+        let store = self.store.lock().await;
+        let stats = store.domain_stats().await;
+        drop(store);
+        let counted = match &stats {
+            Ok(rows) => match rows.iter().find(|d| d.name == name) {
+                Some(row) => RemovalCount::Known(row.engrams),
+                None => RemovalCount::Absent,
+            },
+            Err(_) => RemovalCount::Unreadable,
+        };
+        // The kind first: a file or team domain loses no knowledge here, so a
+        // read that failed only costs it the number.
+        if !entry.is_virtual() {
+            return Ok(counted);
+        }
+        match (counted, purge) {
+            (RemovalCount::Unreadable, false) => return Err(Engine::purge_refusal(name, None)),
+            (RemovalCount::Unreadable, true) => {
+                // Already confirmed: the removal proceeds. Nothing is lost
+                // from the removal's own receipt, which never carried a count -
+                // the number belongs to the PREVIEW, and a preview that could
+                // not read it says so with `engrams_unknown`. What is lost is
+                // the chance to have shown the figure before the decision, and
+                // that decision was already taken. Logged rather than swallowed
+                // silently, because an index that cannot be swept is worth
+                // knowing about.
+                tracing::warn!(
+                    domain = name,
+                    error = stats
+                        .as_ref()
+                        .err()
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_default(),
+                    "the engram count for '{name}' could not be read; the confirmed removal \
+                     proceeds without it"
+                );
+            }
+            (RemovalCount::Known(n), false) if n > 0 => {
+                return Err(Engine::purge_refusal(name, Some(n)));
+            }
+            _ => {}
+        }
+        Ok(counted)
+    }
+
+    /// Every actor's draft count in one domain, as the index rows have them,
+    /// or `None` when the index could not be asked at all.
+    ///
+    /// **The rows are the authority and the journal is their mirror.** A draft
+    /// row can land while its journal entry fails - `write_overlay_entry`
+    /// reports that as a `draft_warning` and keeps the row - so a count read
+    /// from the mirror would quietly drop exactly those, in front of the calls
+    /// that end somebody's unshared work for good. This is the one place a
+    /// count is derived, so the removal's question, the status surfaces and the
+    /// drafts route cannot answer "who is drafting here" three different ways.
+    ///
+    /// **A deletion counts as an entry.** A draft that takes a file away is
+    /// unshared work exactly as a draft that writes one is, and a count that
+    /// left it out would tell somebody they hold nothing while a removal is
+    /// still theirs to lose.
+    ///
+    /// A pure read, and deliberately: [`Store::domain_id`] is the read-only way
+    /// to a domain id, so a status call on a read-only instance can ask this
+    /// without registering anything. A domain the index holds no row for has no
+    /// drafts in it either - a registration nothing has synced yet - and that
+    /// is an honest empty rather than an unknown.
+    pub(crate) async fn overlay_counts_by_actor(&self, name: &str) -> Option<Vec<(String, u64)>> {
+        let mut held: BTreeMap<String, u64> = BTreeMap::new();
+        {
+            let store = self.store.lock().await;
+            let id = match store.domain_id(name).await {
+                Ok(Some(id)) => Some(id),
+                // A domain this index holds no row for has no drafted rows in
+                // it - a registration nothing has synced yet - and that is an
+                // honest empty rather than an unknown. It can still hold FILES,
+                // so this is a `None` to skip the row half with and never an
+                // early return.
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        domain = name,
+                        error = format!("{e:#}"),
+                        "the index could not say which domain '{name}' is, so nobody's drafts in \
+                         it can be counted"
+                    );
+                    return None;
+                }
+            };
+            if let Some(id) = id {
+                match store.overlay_counts(id).await {
+                    Ok(counts) => held.extend(counts),
+                    Err(e) => {
+                        tracing::warn!(
+                            domain = name,
+                            error = format!("{e:#}"),
+                            "the drafts held in domain '{name}' could not be counted"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        if let Some(files) = self.overlay_file_counts(name)? {
+            for (actor, entries) in files {
+                *held.entry(actor).or_default() += entries;
+            }
+        }
+        Some(held.into_iter().collect())
+    }
+
+    /// Every actor's files-overlay count in one domain, `None` when it could
+    /// not be read at all, and `Some(None)` for a domain that cannot hold one.
+    ///
+    /// **Only a domain that reviews changes is walked**, which is what keeps a
+    /// domain taking changes directly byte for byte the answer it was: nothing
+    /// writes a files overlay outside review mode, so a walk there could only
+    /// ever report zero - and a state directory somebody has damaged would turn
+    /// every direct domain's count into an unknown over a tree that holds
+    /// nothing. It also keeps a directory walk off the listing of a machine
+    /// whose domains all take changes directly.
+    ///
+    /// A state directory that cannot be resolved is unknown rather than empty:
+    /// this tree is the only place a draft file's bytes exist, so "nowhere to
+    /// look" is not "nothing there".
+    ///
+    /// The one corner where a direct domain is not byte for byte what it was:
+    /// it is not this function (gated, so a direct domain never reaches the
+    /// tree) but its ungated listing twin, which flags every actor of a direct
+    /// domain whose `<state>/overlays/<domain>` is damaged. What that changes
+    /// is one case and only one: a **mid-fold recovery** there - a domain the
+    /// key came off mid-verb, still holding rows or visible files - refuses
+    /// where it used to fold half. That is the more correct answer, and it is
+    /// named here rather than discovered. A plain statement that an
+    /// already-direct domain takes changes directly is untouched:
+    /// [`Engine::refuse_unlistable_files`] applies only where the domain
+    /// reviews changes or a draft file is actually visible.
+    fn overlay_file_counts(&self, name: &str) -> Option<Option<BTreeMap<String, u64>>> {
+        if !self.reviews_changes(name) {
+            return Some(None);
+        }
+        let Ok(state_dir) = self.journal_state_dir() else {
+            tracing::warn!(
+                domain = name,
+                "the files overlay of '{name}' could not be located, so what anybody has \
+                 drafted there is unknown"
+            );
+            return None;
+        };
+        let held = crate::overlay_files::by_actor(&state_dir, name);
+        if held.unlistable().is_some() {
+            return None;
+        }
+        Some(Some(held.counts()))
+    }
+
+    /// Sweep a domain's overlay journal as part of ending it, answering with
+    /// how many mirrored drafts went.
+    ///
+    /// Best effort, like [`Engine::forget_domain_records`] beside it and for
+    /// the same reason: by the time this runs the rows are already cleared, and
+    /// answering with an error would tell the caller their removal did not
+    /// happen when it did. A journal that could not be removed is logged, and
+    /// nothing restores from it either way - [`Engine::restore_overlays`]
+    /// refuses a domain nobody registers.
+    async fn sweep_domain_journal(&self, name: &str) -> u64 {
+        let state_dir = match self.journal_state_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    error = format!("{e:#}"),
+                    "the overlay journal for '{name}' could not be located and was not swept"
+                );
+                return 0;
+            }
+        };
+        match crate::overlay_journal::journal_remove_domain(&state_dir, name) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    domain = name,
+                    error = format!("{e:#}"),
+                    "the overlay journal for '{name}' could not be swept; the drafts it \
+                     mirrors are unreachable (nothing restores into an unregistered domain) \
+                     but the folder is left on disk"
+                );
+                0
+            }
+        }
+    }
+
+    /// The one refusal for a write that would land in the folder of a domain
+    /// that reviews changes, wherever it comes from.
+    ///
+    /// Review mode rests on one rule: the folder the team shares changes only
+    /// by a pull, and everything else joins its author's own draft. Two verbs
+    /// can still reach that folder sideways, and neither has an answer for
+    /// "whose draft is this" - a cross-domain move builds its view from the
+    /// SOURCE domain, and an archive import is an admin handing a domain a zip
+    /// that belongs to nobody in particular. So both are refused here, in one
+    /// sentence, which teaches the rule and names the way in: write it there,
+    /// as a draft, and share it.
+    ///
+    /// `what` is what the caller was doing, so the refusal reads as an answer
+    /// to their own request rather than as a fact about the domain.
+    pub(crate) fn refuse_write_into_reviewed_folder(&self, domain: &str, what: &str) -> Result<()> {
+        if !self.reviews_changes(domain) {
+            return Ok(());
+        }
+        Err(EngineError::Refused(format!(
+            "domain '{domain}' reviews changes before they land, so its folder changes only \
+             through a reviewed proposal and {what} has nowhere to go: a draft belongs to one \
+             domain's overlay. Write it there - the write joins your own draft - and share it, \
+             or take review mode off first"
+        )))
+    }
+
+    /// Whether `name` is a domain the environment defines, as the conflict both
+    /// surfaces answer with.
+    ///
+    /// An environment-defined domain is immune to unregistration: the variable
+    /// is its source of truth, so no version of this request would succeed and
+    /// the way out is to unset the variable. Spelled once here so a preview and
+    /// the removal itself cannot word it differently.
+    ///
+    /// [`Engine::set_review_mode`] answers with it too, including for the call
+    /// that takes review mode OFF, and that is deliberate rather than
+    /// over-broad: `CRYSTALLINE_DOMAIN_<NAME>_REVIEW` rides on an env-defined
+    /// domain, whose review key is not in the config file this would write, and
+    /// the environment would put the mode straight back on the effective config
+    /// while the fold was still running. So the exit for such a domain is the
+    /// variable first and the verb second: unset it, restart, and then
+    /// `crystalline domain review <name> direct` (or its REST twin) folds or
+    /// discards the drafts that are left - which works, because leaving review
+    /// mode never asks whether the domain is in it, only what rows it holds.
+    /// Pinned by `a_domain_that_reviews_nothing_can_still_fold_the_drafts_it_holds`.
+    fn env_domain_conflict(&self, name: &str) -> Option<EngineError> {
+        self.overlay.env_domain(name).map(|env| {
+            EngineError::Conflict(format!(
+                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                env.var
+            ))
+        })
+    }
+
+    /// The one gate on ending a domain, for every surface.
+    ///
+    /// Two steps, in this order and for the reason the write gate states:
+    ///
+    /// 1. **A domain this caller may not see is the not-found.** Decided first,
+    ///    so a stranger naming a private domain learns exactly what a stranger
+    ///    naming a domain nobody registered learns. A permission refusal here
+    ///    would be an existence oracle.
+    /// 2. **Then the right, which must be [`DomainRight::Own`].** That is the
+    ///    whole of Jordi's rule, and it falls out of the ladder rather than
+    ///    being restated: an instance admin owns every domain, a private
+    ///    domain's owner owns theirs, and nobody else ever reaches `Own` - a
+    ///    manager stops at `Manage`, and on a shared domain the best a
+    ///    non-admin gets is `Write`. So "owner-of-private or admin, shared
+    ///    domains admins only" is one comparison.
+    ///
+    /// [`Scope::Anonymous`] is refused by an arm of its own rather than by the
+    /// fold. The fold would refuse it too, but only because a resolver happens
+    /// to be installed; nobody in particular does not end a domain on an
+    /// instance that never made anyone authenticate either, and that is a rule
+    /// rather than a consequence.
+    ///
+    /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
+    /// [`Scope::Anonymous`]: crate::scope::Scope::Anonymous
+    pub async fn require_domain_owner(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        self.require_domain_owner_refusing(name, scope, Engine::removal_refusal(name))
+            .await
+    }
+
+    /// The same gate, worded for a call that is about the domain rather than
+    /// about ending it.
+    ///
+    /// One ladder, two sentences: the rule about who holds a domain is the same
+    /// whether they are ending it or reading who is drafting in it, and a
+    /// second copy of the ladder is how the two would drift apart. `refusal` is
+    /// built by the caller so its own verb is the one named in the answer.
+    async fn require_domain_owner_refusing(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+        refusal: EngineError,
+    ) -> Result<()> {
+        self.require_domain(name, scope).await?;
+        if matches!(scope, crate::scope::Scope::Anonymous) {
+            return Err(refusal);
+        }
+        if self.domain_right(scope, name).await? < crate::scope::DomainRight::Own {
+            return Err(refusal);
+        }
+        Ok(())
+    }
+
+    /// Who is drafting in one domain and how much, for whoever holds it.
+    ///
+    /// The coordination view: names and counts, never a path and never a line
+    /// of anybody's work. A draft is unshared by definition, and what its
+    /// author has not shared stays theirs until they do; what the person
+    /// answerable for the domain needs in order to coordinate is that somebody
+    /// is holding something and roughly how much, which is exactly this.
+    ///
+    /// A deletion counts as an entry, for the reason
+    /// [`Engine::overlay_counts_by_actor`] gives. A domain that takes changes
+    /// directly answers with an empty list rather than a refusal: nobody can
+    /// draft there, so nobody is, and a client asking the same question of
+    /// every domain gets one shape back.
+    ///
+    /// Gated exactly as unregistering it is - an instance admin, or a private
+    /// domain's owner - and a caller who may not see the domain is answered as
+    /// one naming a domain nobody registered.
+    pub async fn domain_drafts(&self, name: &str, scope: &crate::scope::Scope) -> Result<Value> {
+        self.require_domain_owner_refusing(
+            name,
+            scope,
+            EngineError::Forbidden(format!(
+                "who is drafting in domain '{name}' is for an instance admin, or for the owner \
+                 of a private domain; your own drafts are in this domain's status"
+            )),
+        )
+        .await?;
+        match self.overlay_counts_by_actor(name).await {
+            Some(counts) => Ok(json!({ "actors": crate::review::counts_json(&counts) })),
+            None => Err(EngineError::Internal(format!(
+                "who is drafting in domain '{name}' could not be read, because the index could \
+                 not be asked"
+            ))),
+        }
+    }
+
+    /// What a removal would end, for a surface that asks before it acts.
+    ///
+    /// `{ domain, kind, engrams, files_kept }` - the three things somebody
+    /// needs in order to answer the question, plus the one that decides how it
+    /// is worded: a file or team domain's files stay on disk and a virtual
+    /// domain's rows ARE its knowledge.
+    ///
+    /// Every refusal the removal itself would raise is raised here first, in
+    /// the same order - the gate, the environment conflict, the unconfirmed
+    /// purge, the unnamed drafts of other actors - so a question is never put
+    /// about a removal that would refuse anyway. Advisory rather than
+    /// authoritative: the removal re-decides all of it under its own lock,
+    /// which is where the decision has to hold.
+    pub async fn domain_remove_preview(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+        purge: bool,
+        end_drafts: &[String],
+    ) -> Result<Value> {
+        self.require_domain_owner(name, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(name) {
+            return Err(conflict);
+        }
+        let entry = self.domain_entry(name)?;
+        let engrams = self.removal_engrams(name, &entry, purge).await?;
+        let counts = self.overlay_counts_by_actor(name).await;
+        crate::review::removal_choices(
+            name,
+            counts.as_deref(),
+            crate::scope::overlay_actor(scope).as_deref(),
+            end_drafts,
+        )?;
+        let (drafts, drafts_unknown) = match &counts {
+            Some(counts) => (crate::review::counts_json(counts), false),
+            None => (Vec::new(), true),
+        };
+        Ok(json!({
+            "domain": name,
+            "kind": Engine::removal_kind(&entry),
+            "drafts": drafts,
+            // The same distinction `engrams_unknown` draws, for the same
+            // reason: nobody drafting here and "the index could not be asked"
+            // are different answers to a question about somebody's unshared
+            // work. Two things can set it now
+            // ([`Engine::overlay_counts_by_actor`]): an index that could not
+            // answer, and a files overlay that could not be listed. The journal
+            // mirror beside them still sets nothing, because the count was
+            // never the mirror's to give - but the files under the same
+            // `overlays/<domain>` root are not a mirror, they are the only copy
+            // of what they hold, so they do.
+            "drafts_unknown": drafts_unknown,
+            "engrams": engrams.as_json(),
+            // Why the count is absent, so the question can say which: an index
+            // that could not be read is a number that exists and is
+            // unavailable, and it reads nothing like a domain that has synced
+            // nothing yet.
+            "engrams_unknown": engrams.is_unreadable(),
+            "files_kept": !entry.is_virtual(),
+        }))
+    }
+
+    /// Unregister a domain, gate and ordering included: the one entry point
+    /// every surface calls.
+    ///
+    /// [`Engine::domain_remove`] below is the registry step alone. This is the
+    /// whole of it, and the order of the four steps is not free to rearrange
+    /// (see [`crate::collab::session::CollabSessions::dispose_domain`], which
+    /// records the argument in full):
+    ///
+    /// 1. The domain-admin lock and the join fence go up, so no socket can open
+    ///    a room in this domain from here on and no registration of the same
+    ///    name can interleave. Without the fence the sweep would close what is
+    ///    open and a join arriving one instant later would open a fresh room
+    ///    over a domain that is about to vanish.
+    /// 2. Every refusal is decided **inside** those guards: the gate
+    ///    ([`Engine::require_domain_owner`]), the environment conflict, the
+    ///    unconfirmed purge of a virtual domain's engrams, and the private
+    ///    drafts of every OTHER actor, which have to be named before they are
+    ///    ended ([`crate::review::removal_choices`]). That ordering is the
+    ///    point of holding the lock at all - a gate decided outside it is a
+    ///    check somebody's ownership transfer can land behind - and it is what
+    ///    makes the preview above advisory rather than authoritative.
+    /// 3. The rooms are swept while the domain is STILL registered, so each
+    ///    room's final save lands in the file that stays on disk.
+    /// 4. Only then is the domain unregistered, and only then are its
+    ///    visibility and membership records swept.
+    ///
+    /// **The records go last, and that direction is deliberate.** They live in
+    /// the accounts database and the registration lives in the config file, so
+    /// there is no transaction spanning both and there cannot be one. Sweeping
+    /// first and then failing the unregistration would leave a domain that is
+    /// still registered and now SHARED - visible to everyone, the opposite of
+    /// what its owner asked for. Failing the other way round leaves an acl row
+    /// for a domain nobody has registered, which grants nothing until a domain
+    /// of that name exists again; it is logged, and the residue is that a later
+    /// re-add of the same name comes back private under the old owner rather
+    /// than shared. That is the safe direction, and it is the same shape as the
+    /// store's own domain row, which [`Engine::domain_remove`] also leaves in
+    /// place.
+    ///
+    /// The report is [`Engine::domain_remove`]'s plus `rooms_closed`, so a
+    /// client can say how many co-editing sessions it just ended.
+    pub async fn unregister_domain(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+        purge: bool,
+        end_drafts: &[String],
+    ) -> Result<Value> {
+        // Ahead of the guards, and only this one: its answer is the same for
+        // every caller and every name, so it discloses nothing and there is
+        // nothing for a concurrent change to move.
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let _admin = self.domain_admin().await;
+        let _fence = self.fence_joins().await;
+        self.require_domain_owner(name, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(name) {
+            return Err(conflict);
+        }
+        // Before the sweep, not after: a removal that is going to refuse must
+        // not have closed somebody's co-editing room on the way to refusing.
+        let entry = self.domain_entry(name)?;
+        self.removal_engrams(name, &entry, purge).await?;
+        // Beside the purge and for the same reason, and before the sweep for
+        // the same one again: a removal that is going to refuse must not have
+        // closed somebody's co-editing room on the way to refusing. The count
+        // is re-read here rather than carried from the preview, because the
+        // preview ran outside these guards and somebody may have started
+        // drafting since.
+        crate::review::removal_choices(
+            name,
+            self.overlay_counts_by_actor(name).await.as_deref(),
+            crate::scope::overlay_actor(scope).as_deref(),
+            end_drafts,
+        )?;
+        // Counted here and not after the sweep, and here rather than below the
+        // registry step: the files overlay is only walked for a domain that
+        // reviews changes, and one line further down this domain is not
+        // registered at all. The journal's own `remove_dir_all` takes these
+        // files with the drafts by construction, so what is missing without
+        // this line is the NUMBER - a removal that swept files it never
+        // mentioned in front of the person who confirmed it.
+        // Gated on the domain still reviewing changes, like every other reader
+        // of that count: a domain whose fold failed mid-way and left files
+        // behind reports a number that excludes them, while the journal sweep
+        // below still takes them. The same under-report the orphan collector
+        // beside it carries, and named here rather than hidden.
+        let files_swept: u64 = self
+            .overlay_file_counts(name)
+            .flatten()
+            .map(|per_actor| per_actor.values().sum())
+            .unwrap_or(0);
+        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
+            Some(sessions) => sessions.dispose_domain(name).await,
+            None => 0,
+        };
+        let mut report = self.domain_remove(name).await?;
+        self.forget_domain_records(name).await;
+        // Every draft in this domain has just ended, whichever way each one
+        // ended, so every link on one and every session inside one ends with
+        // them - the same call, for the same reason, that leaving review mode
+        // makes.
+        self.end_domain_grants(name).await;
+        // The rows are cleared; the mirror that would bring them back goes with
+        // them. A domain's removal takes every actor's drafts with it, and
+        // leaving the journal behind would mean a domain re-added under this
+        // name resurrecting somebody's old private drafts into it.
+        let drafts_swept = self.sweep_domain_journal(name).await + files_swept;
+        if let Value::Object(map) = &mut report {
+            map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
+            map.insert("drafts_swept".to_string(), Value::from(drafts_swept));
+        }
+        Ok(report)
+    }
+
+    // --- review mode -------------------------------------------------------
+
+    /// The sessions this process is holding joins for. See [`crate::join`].
+    pub fn joins(&self) -> &Arc<crate::join::Joins> {
+        &self.joins
+    }
+
+    /// One named actor's draft at one path, or `None` when they hold none
+    /// there.
+    ///
+    /// **The one read in this engine that answers about somebody else's draft
+    /// by name**, and it exists for the share-link surface alone: minting a
+    /// link has to know the author is holding what they are sharing, and
+    /// redeeming one has to hand the grantee the draft the link was for. Both
+    /// are the grant itself rather than a read that happened to widen, which
+    /// is why they go through a named seam instead of through a view.
+    ///
+    /// It is not a [`DomainView`] and deliberately cannot become one: it takes
+    /// a path rather than an identifier, so it can never resolve a name onto
+    /// somebody else's draft, and it answers one row rather than a listing, so
+    /// it can never be folded into a search.
+    ///
+    /// **Its callers, by name and exhaustively**, and
+    /// `another_actors_draft_is_read_only_by_the_grant_surface` in
+    /// crates/service/tests/overlay_domains.rs scans for any other:
+    /// `rest::draft_links`'s `mint` and `list`, which name the CALLER's own
+    /// account and so read nobody else's rows at all; `rest::draft_links`'s
+    /// `open_link`, which names the grant row's `owner`; and, on the engine
+    /// side, [`Engine::granted_read`], [`Engine::teach_granted_miss`],
+    /// [`Engine::screen_granted_path`] and
+    /// [`Engine::screen_joined_attachment`], each of which names an owner that
+    /// came out of a grant row this instance minted. **No caller takes an
+    /// actor from a request**, and one that did would be answering one reader
+    /// with another reader's unshared work.
+    ///
+    /// `None` for a domain that takes changes directly, for one this index has
+    /// never been told about, and for an actor holding nothing there - three
+    /// ways of saying the same thing, which is that there is no draft to
+    /// share.
+    pub async fn overlay_draft_at(
+        &self,
+        domain: &str,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<GrantedDraft>> {
+        if !self.reviews_changes(domain) {
+            return Ok(None);
+        }
+        let held = {
+            let store = self.store.lock().await;
+            // The read-only id lookup, never an upserting one: asking about a
+            // domain this index has never seen must not register it.
+            let Some(domain_id) = store.domain_id(domain).await? else {
+                return Ok(None);
+            };
+            store.overlay_entry(domain_id, actor, path).await?
+        };
+        let Some(entry) = held else {
+            return Ok(None);
+        };
+        // A tombstone is this actor's deletion of the base page, not a draft of
+        // it: there is nothing to open and nothing to edit, so it is not
+        // shareable and a link on a path that became one has nothing to give.
+        if entry.tombstone {
+            return Ok(None);
+        }
+        Ok(Some(GrantedDraft {
+            path: entry.path,
+            permalink: entry.permalink,
+            content: entry.content,
+            checksum: entry.sha256,
+        }))
+    }
+
+    /// Whose draft `account` may see at that path, or `None` for the ordinary
+    /// answer of nobody's.
+    ///
+    /// One hop into the accounts database, through the resolver the HTTP
+    /// surface installs. `None` when no resolver is installed at all - a
+    /// one-shot CLI command, the embedded stdio stack, a test engine - which
+    /// is the right answer rather than a missing one: those surfaces are the
+    /// machine owner, who has every draft on disk already and needs no link to
+    /// be handed one.
+    pub async fn granted_owner(
+        &self,
+        account: &str,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        access
+            .overlay_grant_for(account, domain, path)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// End every share-link and every join into ONE draft, because that draft
+    /// has just ended.
+    ///
+    /// Called where an actor's own draft is taken away - discarded outright
+    /// when nothing in the folder stands under it, or replaced by their
+    /// deletion of the page the team holds. A grant lasts exactly as long as
+    /// the thing it grants, and a row that merely LOOKED dead while nothing
+    /// stood at the path would spring back onto whatever its author drafted
+    /// there next. The freshness check every grant surface makes stays where
+    /// it is, as the belt to this.
+    ///
+    /// Reported rather than propagated, for the reason
+    /// [`Engine::end_domain_grants`] gives: a delete that happened is not
+    /// unsaid by a link that outlived it.
+    pub(crate) async fn end_draft_grants(&self, domain: &str, owner: &str, path: &str) {
+        self.joins.end_draft(domain, owner, path);
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.end_overlay_grants(domain, owner, path).await {
+            tracing::warn!(
+                domain = %domain,
+                path = %path,
+                error = %e,
+                "could not end the draft share-links of a draft that was taken away"
+            );
+        }
+    }
+
+    /// End every share-link and every join into one domain, because every
+    /// draft in it has just ended.
+    ///
+    /// Called by the fold, which is the one moment that ends all of them at
+    /// once: whatever each actor chose, folded or discarded, no draft in the
+    /// domain survives it, so no link on one and no session in one can stand.
+    /// A grant ends with the thing it grants.
+    ///
+    /// Silently does nothing about links when no accounts database is
+    /// installed - the CLI, the stdio stack, a test engine - for the reason
+    /// [`Engine::granted_owner`] answers `None` there: no link was ever minted
+    /// on such an instance. The joins are ended either way, since the registry
+    /// is this engine's own.
+    pub(crate) async fn end_domain_grants(&self, domain: &str) {
+        self.joins.end_domain(domain);
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.end_domain_overlay_grants(domain).await {
+            // A fold that happened is not unsaid by a link that outlived it,
+            // and the link opens nothing either way: `redeem_overlay_grant`
+            // hands back a path, and the draft at that path is gone. Reported
+            // rather than propagated, so the fold's own answer stays the
+            // fold's.
+            tracing::warn!(
+                domain = %domain,
+                error = %e,
+                "could not end the draft share-links of a domain that left review mode"
+            );
+        }
+    }
+
+    /// Every actor's drafts in one domain, ordered by actor and by path.
+    ///
+    /// The one place a per-actor view of an overlay is derived, so the fold
+    /// plan below and Task 8's removal gate answer from the same rows rather
+    /// than each deriving their own. The rows are the authority and the journal
+    /// is their mirror: a draft whose mirror failed to land is still a draft its
+    /// author is holding (`write_overlay_entry` reports that as a warning and
+    /// keeps the row), and a plan read from the journal would quietly drop
+    /// exactly those.
+    pub(crate) async fn overlay_actor_drafts(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+    ) -> Result<Vec<ActorDrafts>> {
+        // The actor set is the UNION of the two, and that is load bearing
+        // rather than tidy: an actor holding only files appears in neither
+        // `overlay_counts` nor `overlay_entries`, so a list drawn from the rows
+        // alone would leave them out of the plan - `review::choices` would
+        // never ask what happens to their files, and the sweep that ends every
+        // actor's work would never reach them. Their bytes would survive into a
+        // domain that no longer reviews anything, belonging to nobody.
+        let files = self.overlay_domain_files(domain);
+        let mut actors: BTreeSet<String> = files.per_actor.keys().cloned().collect();
+        let held = {
+            let store = self.store.lock().await;
+            let mut held: BTreeMap<String, Vec<StoredEngram>> = BTreeMap::new();
+            for (actor, _) in store.overlay_counts(domain_id).await? {
+                let entries = store.overlay_entries(domain_id, &actor).await?;
+                if entries.is_empty() {
+                    continue;
+                }
+                actors.insert(actor.clone());
+                held.insert(actor, entries);
+            }
+            held
+        };
+        let mut out = Vec::new();
+        for actor in actors {
+            let entries = held.get(&actor).cloned().unwrap_or_default();
+            let own = files.per_actor.get(&actor);
+            // An actor whose files folder is there, readable and empty holds
+            // nothing at all, and nothing is not a thing to decide about:
+            // listing them would put a `bob (0 draft(s))` line in the plan that
+            // `review::choices` then demands an answer for, and would make a
+            // domain holding nothing impossible to take out of review mode
+            // without naming somebody who is not there. The LISTING keeps them
+            // (the sweep wants exactly those folders); this per-actor view is
+            // where they drop out.
+            if entries.is_empty()
+                && own.is_some_and(|read| read.entries.is_empty() && !read.unreadable)
+                && !files.unreadable
+            {
+                continue;
+            }
+            out.push(ActorDrafts {
+                entries,
+                files: own.map(|read| read.entries.clone()).unwrap_or_default(),
+                // An actor whose own folder could not be enumerated is flagged
+                // and **listed**: the plan reports them and says their files
+                // could not be read, where dropping them made a plan claim
+                // there was nothing to decide over somebody's only copy of
+                // their work. The domain's own folder failing is unknown for
+                // everybody in it, so it is carried on every actor rather than
+                // on none.
+                files_unreadable: files.unreadable || own.is_some_and(|read| read.unreadable),
+                actor,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every actor's files-overlay entries in one domain, with the honesty
+    /// flags beside them.
+    ///
+    /// The listing twin of [`Engine::overlay_file_counts`], and **deliberately
+    /// not gated the way that one is**: the tree is walked whatever mode the
+    /// domain is in.
+    ///
+    /// Its callers are the fold and the convergence pass, and the fold takes
+    /// the review key off in the middle of itself. A read that asked the key
+    /// would see an actor's files on the first call and not on a repeat - the
+    /// mid-fold recovery [`Engine::set_review_mode`] documents - so the repeat
+    /// would sweep files it had never folded. The count beside this one is
+    /// gated because its callers are listings of every domain, where a direct
+    /// domain must answer byte for byte what it always did.
+    fn overlay_domain_files(&self, domain: &str) -> crate::overlay_files::DomainFiles {
+        let Ok(state_dir) = self.journal_state_dir() else {
+            // **Nothing rather than unknown, and only here.** A process that
+            // cannot resolve its own state directory has never written an
+            // overlay file either - every write goes through this same resolver
+            // - so for this reader there is nothing it is failing to see, and
+            // the fold it feeds would refuse every domain on a machine whose
+            // state directory has gone missing rather than folding the rows it
+            // can still reach. The counting twin asks the resolver itself and
+            // answers `unknown` there, which is the right answer for a removal
+            // gate: that one is about what a person is being asked to end.
+            tracing::warn!(
+                domain,
+                "the files overlay of '{domain}' could not be located; no file can have been \
+                 written there by this process, so this reads as nothing rather than as an \
+                 unknown"
+            );
+            return crate::overlay_files::DomainFiles {
+                per_actor: BTreeMap::new(),
+                unreadable: false,
+            };
+        };
+        crate::overlay_files::by_actor(&state_dir, domain)
+    }
+
+    /// The refusal leaving review mode owes when any part of this domain's
+    /// files overlay cannot be listed, or [`None`] when all of it can.
+    ///
+    /// **Whatever anybody answered, and whether or not that actor is listed.**
+    /// An unreadable listing used to drop a file-only actor out of the plan
+    /// entirely while the sweep at the end - a walk of the tree, not of the
+    /// plan - went on removing every actor it could reach. So a confirm with no
+    /// folding actor at all destroyed a readable actor's only copy of their
+    /// work after the plan had said there was nothing to decide. The decision
+    /// is keyed off the listing itself for that reason, never off who is
+    /// folding.
+    ///
+    /// It is the same class of refusal an unreadable row count raises on a
+    /// removal without purge: the branch that decides whether somebody's only
+    /// copy of their work ends must never read a failure as "there was nothing
+    /// there".
+    fn refuse_unlistable_files(&self, domain: &str) -> Option<EngineError> {
+        let files = self.overlay_domain_files(domain);
+        let whose = files.unlistable()?;
+        // **Only where there is something for it to protect.** A domain that
+        // takes changes directly and holds no draft file anybody can see has no
+        // fold for a half-read listing to spoil, and the sweep that could have
+        // destroyed something is guarded on its own account. Refusing there
+        // would turn `PUT {"mode":"direct"}` on a domain that already takes
+        // changes directly - a statement that writes nothing - into an error
+        // over a tree nobody in that domain can write to.
+        let anything_held = files
+            .per_actor
+            .values()
+            .any(|read| !read.entries.is_empty());
+        if !self.reviews_changes(domain) && !anything_held {
+            return None;
+        }
+        let whose = match whose {
+            Some(actor) => format!("the files '{actor}' has drafted in domain '{domain}'"),
+            None => format!("the files overlay of domain '{domain}'"),
+        };
+        Some(EngineError::Conflict(format!(
+            "{whose} could not be read, and leaving review mode ends every draft in it one way \
+             or the other. Nothing was folded, nothing was ended and the domain reviews changes \
+             still; answer again once the state directory can be read"
+        )))
+    }
+
+    /// Turn review mode on for a domain, or take it off and settle every
+    /// actor's drafts on the way out.
+    ///
+    /// **Turning it on** is a promise: from here on, a change to this domain
+    /// joins its author's own draft and reaches the folder the team shares only
+    /// through a reviewed proposal. Three things have to be true for that
+    /// promise to be keepable, and each refusal says which one is not:
+    ///
+    /// 1. **A GitHub origin.** Review with no proposal flow behind it is a gate
+    ///    with no door: the drafts would have nowhere to go and the mode would
+    ///    only stop people writing.
+    /// 2. **A folder, so not a virtual domain.** A virtual domain's engrams ARE
+    ///    its rows, so a fold would have nothing to land in.
+    /// 3. **Nothing unshared in the folder already.** Work already sitting in
+    ///    the tree went round no review at all, and turning the mode on over it
+    ///    would bless it silently. The refusal names the paths and says to share
+    ///    or revert them first. When [`crate::origin::unshared_work`] answers
+    ///    `None` (no origin state recorded yet, or a tree that cannot be
+    ///    walked) that is "nothing KNOWN to be unshared" rather than "clean",
+    ///    and it is read as permission: a domain connected but never pulled has
+    ///    no snapshot to compare against, and refusing every one of those would
+    ///    make the mode unreachable exactly where it is wanted.
+    ///
+    /// **Taking it off** ends every actor's private drafts, so it is never
+    /// decided by omission. [`ReviewModeConfirm::Preview`] answers the plan -
+    /// who holds what, which drafts are deletions, which paths more than one
+    /// actor is drafting and which drafts could not land - and writes nothing.
+    /// [`ReviewModeConfirm::Confirmed`] carries one [`FoldChoice`] per actor
+    /// holding drafts: an actor left out refuses naming them, and an actor named
+    /// who holds nothing refuses too, because both are somebody meaning a
+    /// different domain or a different moment.
+    ///
+    /// The order of the confirmed path is not free to rearrange, and it is the
+    /// removal's order with the same argument made about a different pair:
+    ///
+    /// 1. Every refusal is decided **inside** the domain-admin lock and the join
+    ///    fence, including the collision check, so nothing is written at all by
+    ///    a call that is going to refuse.
+    /// 2. The key comes off, and only then are the co-editing rooms swept
+    ///    ([`crate::collab::session::CollabSessions::dispose_domain`]). **That
+    ///    pair is the reason this step exists at all**: a room is a room over
+    ///    one overlay document, so a room swept while the domain is still
+    ///    reviewing lands its unsaved text in a DRAFT row - refreshing one the
+    ///    plan was drawn against, or making one for an actor no answer covers -
+    ///    and step 4 drops every actor's rows a moment later, so that text
+    ///    would be typed into a bin. Swept one instant after the key comes off,
+    ///    the same save lands in the file: the room's view falls back to the
+    ///    folder's own text the moment the domain stops reviewing changes (see
+    ///    `crate::collab::session`'s `room_view`), which is exactly what the
+    ///    removal path means by sweeping while the domain is still
+    ///    registered - there, the drafts are what unregistering ends, so a
+    ///    swept room's save goes into the draft and out with it.
+    ///    The sweep is told which actors are being DISCARDED and closes a room
+    ///    over one of their drafts WITHOUT saving it: discard means those rows
+    ///    are dropped unwritten, and a room whose view has just fallen back to
+    ///    the folder would otherwise publish the very text this call said must
+    ///    not reach it. What was unsaved ends with the draft it was typed
+    ///    into, which is what discarding it means.
+    /// 3. The folds land as ordinary file writes and deletions, over the files
+    ///    those saves just landed in. Where a fold and a room are about the same
+    ///    path the fold is the last word - which is the answer the plan was
+    ///    confirmed for, and is worth being exact about: the draft row is that
+    ///    room's last AUTOSAVE, so a delta typed since it and flushed by the
+    ///    sweep a moment ago is superseded by slightly older text. The other
+    ///    order loses the same bytes (the fold would be overwritten instead),
+    ///    so this is the cost of folding a path somebody is editing rather than
+    ///    a cost of the ordering. Nothing writes an index row here: the sync at
+    ///    the end reads the tree the way it reads every other change to it.
+    /// 4. Every actor's rows and mirror go, folded and discarded alike, before
+    ///    the sync - both because the restore runs in every sync pass and would
+    ///    put a missed mirror straight back, and because a draft row still
+    ///    holding an address would meet the base row the fold just gave it to.
+    ///    They go over the overlay as it stands then, not as the plan found it,
+    ///    so a draft written into the window between the two is dropped rather
+    ///    than stranded.
+    /// 5. Then the domain syncs, which is what puts the folds in the index.
+    ///
+    /// A failure in the middle of step 3 leaves the domain taking changes
+    /// directly with part of its overlay folded, and the recovery is the same
+    /// call again: leaving review mode does not require the domain to be in it,
+    /// so a repeat picks up the drafts that are left and finishes.
+    ///
+    /// `folds` naming the same actor twice is refused rather than resolved:
+    /// two answers about one person's unshared work is a caller that does not
+    /// know what it is asking for.
+    pub async fn set_review_mode(
+        &self,
+        domain: &str,
+        mode: Option<crystalline_core::config::ReviewMode>,
+        confirm: ReviewModeConfirm,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let previewing = matches!(confirm, ReviewModeConfirm::Preview);
+        // Ahead of the guards, and only this one: its answer is the same for
+        // every caller and every name, so it discloses nothing.
+        //
+        // **The preview is refused with everything else, deliberately.** It
+        // reads like a question, but `leave_review_mode` resolves the domain id
+        // through `upsert_domain` before it can ask anything, and that is a
+        // write. Serving it here would mean a route this surface declares
+        // `read_only_exempt: false` writing on a read-only instance, which is
+        // the kind of gap nothing downstream would ever notice. A read-only
+        // instance has nothing to answer about anyway: it refuses every write
+        // that could have made a draft.
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let _admin = self.domain_admin().await;
+        let _fence = self.fence_joins().await;
+        self.require_domain_owner(domain, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(domain) {
+            return Err(conflict);
+        }
+        let entry = self.domain_entry(domain)?;
+        match mode {
+            Some(crystalline_core::config::ReviewMode::Overlay) => {
+                self.enable_review_mode(domain, &entry, previewing).await
+            }
+            None => self.leave_review_mode(domain, &entry, confirm).await,
+        }
+    }
+
+    /// The enable half of [`Engine::set_review_mode`]: the three gates, then
+    /// the config key.
+    async fn enable_review_mode(
+        &self,
+        domain: &str,
+        entry: &DomainEntry,
+        previewing: bool,
+    ) -> Result<Value> {
+        let receipt = |applied: bool| {
+            json!({
+                "domain": domain,
+                "mode": "overlay",
+                "review": "overlay",
+                "applied": applied,
+            })
+        };
+        if entry.is_overlay() {
+            // Already what was asked for. Answered rather than refused, the way
+            // privatizing an already-private domain is: a PUT states a mode,
+            // and this one already holds.
+            return Ok(receipt(!previewing));
+        }
+        if entry.is_virtual() {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' is a virtual domain: its engrams live in the database and it \
+                 has no folder for a reviewed change to land in, so it cannot review changes. \
+                 Register the knowledge as a file domain connected to a GitHub repository first"
+            )));
+        }
+        if entry.origin.is_none() {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' has no GitHub origin, and review mode with nothing to propose \
+                 a reviewed change to is a gate with no door: connect it to a GitHub repository \
+                 first, then enable review"
+            )));
+        }
+        let Some(root) = entry.file_path() else {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' has no folder on this machine, so there is nothing here to \
+                 review changes to"
+            )));
+        };
+        let state_dir = self.origin_state_dir(domain)?;
+        if let Some(unshared) = crate::origin::unshared_work(&root, &state_dir)
+            && !unshared.paths.is_empty()
+        {
+            return Err(EngineError::Conflict(format!(
+                "domain '{domain}' has {} unshared change(s) in its folder that the team has not \
+                 reviewed: {}. Review mode is the promise that every change is reviewed before it \
+                 lands, and this work went round it, so share or revert these first, then enable \
+                 review",
+                unshared.paths.len(),
+                unshared.paths.join(", ")
+            )));
+        }
+        if previewing {
+            return Ok(receipt(false));
+        }
+        self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+        Ok(receipt(true))
+    }
+
+    /// The disable half of [`Engine::set_review_mode`]: the per-actor plan, and
+    /// the folds and discards that carry it out.
+    async fn leave_review_mode(
+        &self,
+        domain: &str,
+        entry: &DomainEntry,
+        confirm: ReviewModeConfirm,
+    ) -> Result<Value> {
+        let root = entry.file_path();
+        let domain_id = {
+            let store = self.store.lock().await;
+            store
+                .upsert_domain(
+                    domain,
+                    root.as_ref().map(|r| r.to_string_lossy()).as_deref(),
+                    if entry.is_virtual() {
+                        DomainKind::Virtual
+                    } else {
+                        DomainKind::File
+                    },
+                )
+                .await?
+        };
+        let drafts = self.overlay_actor_drafts(domain, domain_id).await?;
+        let base = {
+            let store = self.store.lock().await;
+            store.list_engrams(domain, None, None).await?
+        };
+
+        let choices = match &confirm {
+            ReviewModeConfirm::Preview => {
+                return Ok(review::plan_json(domain, entry, &drafts, &base));
+            }
+            ReviewModeConfirm::Confirmed { folds } => folds,
+        };
+        // **Before the choices are even read**, and whatever they say. Leaving
+        // review mode ends every draft in the domain one way or the other, so a
+        // part of the overlay nobody can list is a part of the answer nobody
+        // can give - and asking somebody to decide about drafts this machine
+        // cannot enumerate is putting a question it could not honour. The plan
+        // above still answers and reports the actor whose files could not be
+        // read, so the refusal here is never the first the caller hears of it.
+        if let Some(refusal) = self.refuse_unlistable_files(domain) {
+            return Err(refusal);
+        }
+        let choices = review::choices(domain, &drafts, choices)?;
+        let folding: Vec<&ActorDrafts> = drafts
+            .iter()
+            .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
+            .collect();
+        if let Some(refusal) = review::collision(domain, &folding, &base) {
+            return Err(EngineError::Conflict(refusal));
+        }
+
+        // Nothing to do, said as nothing done. The conjunction is the point:
+        // a domain that is not reviewing AND holds no drafts is a `PUT
+        // {"mode":"direct"}` that states what already holds, and closing every
+        // co-editing room in it, syncing it and refreshing the routing cache
+        // would be a lot of consequence for a statement. A domain the key has
+        // already come off but whose overlay is not empty is the mid-fold
+        // recovery [`Engine::set_review_mode`] documents, and that one has to
+        // run.
+        if !entry.is_overlay() && drafts.is_empty() {
+            return Ok(review::left_json(domain, Vec::new(), Vec::new(), 0));
+        }
+
+        // The key comes off first, and then the rooms go, and that pair is the
+        // whole of step 2: see the ordering on [`Engine::set_review_mode`].
+        //
+        // The sweep is told which actors are being DISCARDED, and a room over
+        // one of their drafts is closed without being saved. Every other room
+        // saves first, as it always did. Discard means the rows are dropped
+        // unwritten, so a room over one of them - with the key already off,
+        // and its view already fallen back to the folder - would otherwise
+        // publish into the reviewed tree the one text this call said must not
+        // go there.
+        //
+        // **This trusts `choices` to be total, and that trust is load
+        // bearing.** `discarded` is read straight off the confirmed map above
+        // with no further check that every drafting actor is in it -
+        // `review::choices`'s own refusal a few lines up is what makes the
+        // set total, by answering `ConfirmationRequired` for any actor its
+        // caller left out. If that refusal ever loosens, an actor holding
+        // drafts but missing from the map would fall through this filter
+        // unnamed, and their room would save into the tree rather than close
+        // discarding - the publish this call exists to prevent.
+        self.write_review_key(domain, None)?;
+        let discarded: HashSet<String> = choices
+            .iter()
+            .filter(|(_, choice)| **choice == FoldChoice::Discard)
+            .map(|(actor, _)| actor.clone())
+            .collect();
+        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
+            Some(sessions) => sessions.dispose_domain_discarding(domain, &discarded).await,
+            None => 0,
+        };
+
+        // **And the same question again, of the folder the folded rooms just
+        // wrote into.** The key is off, so every swept room that saved wrote
+        // into the folder,
+        // and a participant who edited the frontmatter's permalink line has
+        // moved a base engram's address between the check above and this line; a fold validated
+        // against the older folder would write a second engram at that address
+        // and the first thing to notice would be the `sync` at the end - by
+        // which time the files are written, every actor's rows are dropped and
+        // every later sync of this domain fails the same way, with nothing left
+        // to undo it from. Asked here instead, the refusal costs the rooms
+        // their sockets and nothing else: the key goes back on, no file is
+        // written and no row is dropped, so the same call works once one of the
+        // two engrams has an address of its own.
+        let base = {
+            let store = self.store.lock().await;
+            store.list_engrams(domain, None, None).await?
+        };
+        if let Some(refusal) = review::collision(domain, &folding, &base) {
+            self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+            return Err(EngineError::Conflict(format!(
+                "{refusal}. The folder changed while this domain's co-editing rooms were being \
+                 closed, so nothing was folded and the domain reviews changes again; what those \
+                 rooms saved is in the folder now, which `origin status` lists as out-of-band work"
+            )));
+        }
+
+        let mut folded = Vec::new();
+        let mut discarded = Vec::new();
+        for held in &drafts {
+            match choices.get(&held.actor) {
+                Some(FoldChoice::Fold) => {
+                    let (mut written, mut deleted) = (0u64, 0u64);
+                    if let Some(root) = &root {
+                        for draft in &held.entries {
+                            let abs = join_rel(root, &draft.path);
+                            if draft.tombstone {
+                                match std::fs::remove_file(&abs) {
+                                    Ok(()) => deleted += 1,
+                                    // A deletion of a file that is already gone
+                                    // is the state the deletion asked for.
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(source) => {
+                                        return Err(EngineError::Io {
+                                            path: abs.display().to_string(),
+                                            source,
+                                        });
+                                    }
+                                }
+                            } else {
+                                write_file(&abs, &draft.content)?;
+                                written += 1;
+                            }
+                        }
+                    }
+                    // And the files, after the rows. A page folds as a file
+                    // write and the sync at the end indexes it; an attachment
+                    // has no sync pass of its own, so each one goes through the
+                    // same pair the upload verb uses - the bytes under this
+                    // file's own write lock, and the row built from those bytes
+                    // with the modification instant read back off the file.
+                    let (wrote, removed) = self.fold_files(domain, held).await?;
+                    written += wrote;
+                    deleted += removed;
+                    folded.push(json!({
+                        "actor": held.actor,
+                        "written": written,
+                        "deleted": deleted,
+                    }));
+                }
+                _ => discarded.push(json!({
+                    "actor": held.actor,
+                    "entries": held.entry_count(),
+                })),
+            }
+        }
+
+        // Rows and mirror together, for every actor, and over the overlay as it
+        // stands NOW rather than as the plan found it: see step 4 of the
+        // ordering.
+        for held in self.overlay_actor_drafts(domain, domain_id).await? {
+            let view = DomainView::for_actor(self, domain, &HashSet::new(), &held.actor)?;
+            for draft in &held.entries {
+                view.drop(domain_id, &draft.path).await?;
+            }
+        }
+        // The files go with the rows, folded and discarded alike: whichever
+        // answer each actor gave, drafting in this domain is over, and a files
+        // overlay left behind would be bytes belonging to nobody in a domain
+        // that reviews nothing.
+        //
+        // Swept over the tree itself rather than over the loop above, because
+        // the review key came off in step 2: an actor holding only files is not
+        // in a listing that asks a domain whether it reviews changes any more,
+        // and theirs are exactly the bytes nothing else would ever reach.
+        self.sweep_every_actors_files(domain);
+
+        // Every share-link on a draft here, and every session joined to one,
+        // ends with the drafts themselves. A grant lasts as long as the thing
+        // it grants: a folded draft is in the folder where everybody can read
+        // it anyway, and a discarded one is not there at all, so a link that
+        // outlived either would name a draft that is not there and a session
+        // still joined would be joined to nothing.
+        self.end_domain_grants(domain).await;
+
+        // The folds are ordinary file writes, so the ordinary sync is what puts
+        // them in the index - and it refreshes the generated folder indexes on
+        // the way. The routing cache is not its job, and a folded MANIFEST is
+        // the domain's routing, so that one is refreshed here.
+        //
+        // **The refresh happens whether the sync succeeded or not**, and the
+        // error is carried past it rather than returned through it. A failed
+        // sync is the one tail this call cannot offer a repeat of: the rows are
+        // already dropped by then, so a second call finds an overlay-less
+        // domain that is no longer reviewing and the no-op above answers it
+        // without doing anything. The files are on disk either way and a later
+        // sync picks them up, but the routing cache is in this process's memory
+        // and nothing else would ever refresh it, so a folded MANIFEST would go
+        // on routing agents by what the domain said before the fold until the
+        // daemon restarted.
+        let synced = self.sync(Some(domain)).await;
+        self.refresh_routing_cache().await;
+        self.nudge_embed();
+        synced?;
+
+        Ok(review::left_json(domain, folded, discarded, rooms_closed))
+    }
+
+    /// Land one folding actor's files in the folder the team shares, answering
+    /// `(written, deleted)`.
+    ///
+    /// Each write is the upload verb's own pair: the bytes under this file's
+    /// per-file [`Engine::write_lock`], and the row built from those bytes with
+    /// the modification instant read back off the file, so the folded file
+    /// costs the next sync walk no re-hash. Each deletion is
+    /// [`Engine::attachment_delete`]'s pair the same way - the file and the
+    /// row - and a path that is already gone is the state the deletion asked
+    /// for rather than a failure, exactly as the engram arm above treats one.
+    ///
+    /// A virtual domain never reaches this: review mode refuses one, and a
+    /// domain with no folder has nowhere for a file to land.
+    async fn fold_files(&self, domain: &str, held: &ActorDrafts) -> Result<(u64, u64)> {
+        if held.files.is_empty() {
+            return Ok((0, 0));
+        }
+        let state_dir = self.journal_state_dir()?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let ContentSource::File { root } = &source else {
+            return Ok((0, 0));
+        };
+        let (mut written, mut deleted) = (0u64, 0u64);
+        for file in &held.files {
+            let abs = contained_asset_path(root, &file.path)?;
+            if file.tombstone {
+                let lock = self.write_lock(&abs);
+                let guard = lock.lock().await;
+                match std::fs::remove_file(&abs) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                }
+                let store = self.store.lock().await;
+                store.delete_attachment(domain_id, &file.path).await?;
+                drop(store);
+                drop(guard);
+                deleted += 1;
+                continue;
+            }
+            let bytes = crate::overlay_files::read(&state_dir, domain, &held.actor, &file.path)
+                .map_err(|source| EngineError::Io {
+                    path: format!("the files overlay of '{domain}' at '{}'", file.path),
+                    source,
+                })?
+                .ok_or_else(|| {
+                    EngineError::Conflict(format!(
+                        "'{}' drafted {} in domain '{domain}' and its bytes are no longer \
+                         there, so the fold has nothing to land",
+                        held.actor, file.path
+                    ))
+                })?;
+            // The file lock before the store lock, like every other writer
+            // here. See `Engine::write_lock`.
+            let lock = self.write_lock(&abs);
+            let _guard = lock.lock().await;
+            write_bytes(&abs, &bytes)?;
+            let row = attachment_row(&file.path, &bytes, asset_modified(&abs))?;
+            let store = self.store.lock().await;
+            store.upsert_attachment(domain_id, &row).await?;
+            written += 1;
+        }
+        Ok((written, deleted))
+    }
+
+    /// Drop every actor's files overlay in one domain, as the last half of
+    /// leaving review mode.
+    ///
+    /// Read off the tree itself rather than off the plan, because the plan was
+    /// drawn before the key came off: what is swept is every actor the tree
+    /// still names, which is exactly the set that would otherwise be left. The
+    /// cost of that is the same one the row drop loop already documents - a
+    /// file uploaded between the plan and this line is not in anybody's fold
+    /// and goes here - and it is sharper for a file than for a row: a dropped
+    /// row is still mirrored in the journal, and these bytes are the only copy
+    /// there is. The window is the tail of one verb, behind the domain-admin
+    /// lock and the join fence.
+    ///
+    /// **Nothing at all is swept when any part of the listing could not be
+    /// read.** A partial sweep would end exactly the actors whose work could
+    /// still be seen while leaving the unreadable one, which is the wrong half
+    /// of an answer nobody gave; leaving everything lets a repeat do the whole
+    /// thing once the tree can be read. `leave_review_mode` refuses long before
+    /// this line in that case ([`Engine::refuse_unlistable_files`]), so this is
+    /// the second lock on the same door rather than the first.
+    ///
+    /// Best effort otherwise, like the journal sweep on the removal path and
+    /// for the same reason: by the time this runs the answer has been carried
+    /// out - the files are in the folder, or the actor said to end them - and
+    /// failing here would report a fold that happened as one that did not. What
+    /// is left behind is logged, and a domain's removal sweeps the whole tree
+    /// anyway.
+    fn sweep_every_actors_files(&self, domain: &str) {
+        let Ok(state_dir) = self.journal_state_dir() else {
+            return;
+        };
+        let held = crate::overlay_files::by_actor(&state_dir, domain);
+        if held.unlistable().is_some() {
+            tracing::warn!(
+                domain,
+                "the files overlay of '{domain}' could not be fully read while leaving review \
+                 mode, so none of it was swept; what is there is nobody's draft now and goes \
+                 with the domain if it is ever unregistered"
+            );
+            return;
+        }
+        for actor in held.per_actor.keys() {
+            if let Err(e) = crate::overlay_files::remove_actor(&state_dir, domain, actor) {
+                tracing::warn!(
+                    domain,
+                    actor = actor.as_str(),
+                    "the files '{actor}' drafted in '{domain}' could not be removed after \
+                     leaving review mode: {e}"
+                );
+            }
+        }
+    }
+
+    /// Write a domain's `review` key through the file config and into the
+    /// effective one, the write-lock-first order every config mutation here
+    /// follows so no env value bakes into the saved file.
+    ///
+    /// A domain absent from the file snapshot answers
+    /// [`EngineError::UnknownDomain`], which is reachable in one shape and is
+    /// the same answer [`Engine::domain_remove`] gives it: a domain another
+    /// process registered in the config file after this engine started is in
+    /// the discovered-domain cache (where `domain_entry` finds it after missing
+    /// in `self.config`, so the gates above pass) and not in the snapshot this
+    /// persists from.
+    /// The refusal is confusing rather than damaging - nothing is written - and
+    /// closing it means every config mutation here re-reading the file under
+    /// its own lock, which is a change to all of them rather than to this one.
+    fn write_review_key(
+        &self,
+        domain: &str,
+        review: Option<crystalline_core::config::ReviewMode>,
+    ) -> Result<()> {
+        let mut file_guard = self.file_config.write().unwrap();
+        let mut file = file_guard.clone();
+        let Some(entry) = file.domains.get_mut(domain) else {
+            return Err(EngineError::UnknownDomain {
+                domain: domain.to_string(),
+                registered: self.known_domain_names(),
+            });
+        };
+        entry.review = review;
+        self.persist_config(&file)?;
+        let effective = self.overlay.apply(&file);
+        *file_guard = file;
+        *self.config.write().unwrap() = effective;
+        // A domain discovered after this engine started keeps a cached entry of
+        // its own beside the two configs above, and `domain_entry` falls back
+        // to it when `self.config` has no such name. The effective config just
+        // written does hold the name (it is what this call persisted), so the
+        // fallback is not reached and this write changes no answer today; it is
+        // here so the cache cannot go on saying a domain reviews changes after
+        // this call decided it does not, whichever of the two a later reader
+        // happens to reach.
+        if let Some(found) = self.discovered_domains.write().unwrap().get_mut(domain) {
+            found.review = review;
+        }
+        Ok(())
+    }
+
+    /// Retire the visibility and membership records of a domain that is no
+    /// longer registered.
+    ///
+    /// Best effort, and deliberately not a failure of the removal it follows:
+    /// by the time this runs the domain is gone, and answering with an error
+    /// would tell the caller their removal did not happen when it did. A
+    /// failure is logged and the residue is documented on
+    /// [`Engine::unregister_domain`].
+    ///
+    /// A no-op on an engine with no resolver installed, which is every
+    /// installation with no accounts database: privacy is a membership record,
+    /// and a machine with no accounts has none.
+    async fn forget_domain_records(&self, name: &str) {
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.forget_domain(name).await {
+            tracing::warn!(
+                domain = name,
+                error = format!("{e:#}"),
+                "domain '{name}' was unregistered but its visibility and membership records \
+                 could not be cleared; a domain later re-added under this name will come back \
+                 private under its old owner until an admin makes it shared"
+            );
+        }
+    }
+
     /// Unregister a domain: the config entry goes, the watcher and discovery
     /// forget it and its index rows are cleared so search stops serving it.
     /// Files are never touched - for a file domain they stay on disk exactly
@@ -7771,11 +15274,26 @@ impl Engine {
     /// its freshly-indexed rows wiped by this call's tail, since both resolve
     /// the same `DomainId` by name. Closing this needs the add verbs to take
     /// the same per-name lock this verb would need to hold across its own
-    /// tail, which is a cross-verb change out of scope here; a caller that
-    /// cannot tolerate the window should serialize admin mutations for a
-    /// given name at its own layer - which the REST surface does, in
-    /// `RestState::domain_admin`: one mutex held across the whole of a create
-    /// and the whole of an unregister.
+    /// tail, which is a cross-verb change out of scope here.
+    ///
+    /// [`Engine::domain_admin`] narrows the window without closing it, and it
+    /// is worth being exact about which half. [`Engine::unregister_domain`] -
+    /// the entry point every surface goes through - holds it across this whole
+    /// call, and the REST create holds it across its own registration, so those
+    /// two cannot interleave whichever surface each arrives on. The bare
+    /// `domain_add_local`, `domain_add_virtual` and `origin_add` verbs take no
+    /// lock at all, so an add reaching the engine directly can still race a
+    /// removal for the same name. That is the residue above, and it is the same
+    /// residue as before the lock moved onto this type; what changed is that
+    /// the lock is no longer one surface's, so it no longer leaves a second
+    /// surface's callers unserialized against each other.
+    ///
+    /// **This is the registry step alone.** [`Engine::unregister_domain`] is
+    /// the entry point: it decides who may end a domain, raises the join fence,
+    /// sweeps the co-editing rooms and retires the domain's visibility records
+    /// around this call. Reaching for this one directly skips all of that; the
+    /// only caller that does so on purpose is the REST create's rollback, which
+    /// already holds the lock the entry point would take.
     pub async fn domain_remove(&self, name: &str) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -7843,6 +15361,371 @@ impl Engine {
             "files_kept": files_kept,
             "index_cleared": true,
         }))
+    }
+
+    /// Drop the engram rows of every domain that is no longer registered, and
+    /// report every domain considered.
+    ///
+    /// `domain_remove` clears a domain's rows as it unregisters it, so nothing
+    /// this instance removes ever becomes an orphan. This is for the rows that
+    /// got past that: a removal on a version that left them behind, a
+    /// configuration hand-edited or restored from a backup, an index carried
+    /// between machines. They are already unserved (a row whose domain nobody
+    /// registered is not a hit, not a count and not a facet value), so this
+    /// costs nothing to defer and the grace period is a matter of disk.
+    ///
+    /// **`grace` is who is asking**, and it is the only difference between the
+    /// two callers:
+    ///
+    /// - `Some(d)` is the **daemon's unattended sweep**. A domain is collected
+    ///   only when its `last_registered` stamp says it has been gone longer
+    ///   than `d`. `last_registered` reading `None` is *never stamped*, not
+    ///   *stamped infinitely long ago*: such a domain has its clock started on
+    ///   this sweep and is collected on no sweep that could not already see its
+    ///   age, so the first sweep after an upgrade - when every inherited row
+    ///   reads `None` - collects nothing.
+    /// - `None` is **a person asking** (`doctor --fix`, and `doctor`'s report
+    ///   with `dry_run`). Every unregistered domain is collected whatever its
+    ///   stamp says, a `None` stamp included. The grace period exists to wait
+    ///   for exactly this signal, so waiting past it would be waiting for
+    ///   something that has already happened - and an index inherited from a
+    ///   version that stranded its rows has nothing but `None` stamps, which
+    ///   must clear on first contact rather than a week after it.
+    ///
+    /// Two conditions hold on both paths and are never waived. The domain is
+    /// **not hosted by a live peer**: on a shared database several instances
+    /// register different domains against one index, so a domain with another
+    /// instance's host lock on it and a heartbeat inside the stale threshold is
+    /// another instance's current work, and its registration is a registration
+    /// (`kept: "hosted_elsewhere"`). And the domain is
+    /// **absent from the configuration**, resolved through
+    /// [`Engine::registered_domain_names_checked`] - the three tiers a *named*
+    /// lookup resolves through, so a domain the file gained after startup is
+    /// registered here as it is everywhere else. A configuration that could not
+    /// be read (unparseable, or not there) is not evidence of absence: the
+    /// sweep then establishes no registered set, stamps nothing, collects
+    /// nothing and says so in `skipped`.
+    ///
+    /// Every registered domain is stamped *first*, before anything is
+    /// considered, which is what makes a week of the machine being off, or of
+    /// this process being read-only, cost nothing.
+    ///
+    /// Domains that are reported and never collected, on either path. A
+    /// **virtual** domain's engram rows are not a derived copy of files on
+    /// disk, they are the knowledge itself - `domain_remove` refuses to drop
+    /// them without an explicit purge, and this answers nobody's confirmation,
+    /// so it reports one (`"kept": "virtual"`) and leaves the removal to the
+    /// person and that command. A domain **hosted by a live peer** belongs to
+    /// that peer. A domain with **no engram rows** has nothing to collect.
+    ///
+    /// A **read-only** instance keeps every candidate, each reading
+    /// `kept: "read_only"`: it reports the age of each one, and deliberately
+    /// not a judgement about it, since the judgement is a decision it could not
+    /// carry out. It does stamp its registered domains, which is index
+    /// maintenance rather than a content write, and on a shared database is the
+    /// only thing standing between the domains it serves and a peer's sweep.
+    ///
+    /// The virtual guard reads `DomainStats::kind`, which is the index's own
+    /// column and the only workable source (an orphan is by definition absent
+    /// from the configuration). `DomainKind::from_stored` resolves an
+    /// unrecognized string to `File`, which for a caller that deletes is the
+    /// unsafe direction; it is unreachable while both backends pin the column
+    /// `NOT NULL DEFAULT 'file'`, and this is the caller that would notice
+    /// first if that ever changed.
+    ///
+    /// `dry_run` writes nothing whatsoever - no removal and no stamp - and
+    /// reports the same set a real run would collect, on both paths. It is the
+    /// only argument that silences the stamp.
+    ///
+    /// The domain row itself always stays, exactly as `domain_remove` leaves
+    /// it, so nothing downstream sees a dangling reference. The routing cache
+    /// is deliberately not refreshed: it is built from registered domains, and
+    /// nothing touched here is one.
+    ///
+    /// The report:
+    ///
+    /// ```json
+    /// {
+    ///   "grace_seconds": 604800,
+    ///   "on_demand": false,
+    ///   "dry_run": false,
+    ///   "read_only": false,
+    ///   "stamped": 2,
+    ///   "considered": [
+    ///     { "domain": "gone", "kind": "file", "engrams": 30,
+    ///       "last_registered": "2026-09-01T09:00:00+00:00",
+    ///       "age_seconds": 1123200, "age_days": 13, "collected": true },
+    ///     { "domain": "vault", "kind": "virtual", "engrams": 12,
+    ///       "last_registered": null, "age_seconds": null, "age_days": null,
+    ///       "collected": false, "kept": "virtual",
+    ///       "reason": "a virtual domain's engram rows are its only copy ..." }
+    ///   ],
+    ///   "collected": ["gone"],
+    ///   "engrams_removed": 30
+    /// }
+    /// ```
+    ///
+    /// `considered` holds one row per unregistered domain the index knows - a
+    /// registered one is not a candidate and never appears. A row that was kept
+    /// carries `kept`, one of `virtual`, `hosted_elsewhere`, `no_rows`,
+    /// `grace`, `unstamped` or `read_only`, for a caller that branches on it,
+    /// and a `reason` in words
+    /// for one that prints. `grace_seconds` is `null` when a person asked, and
+    /// `on_demand` says the same thing as a boolean. `skipped` is present only
+    /// when the whole sweep declined to collect.
+    pub async fn collect_orphaned_domains(
+        &self,
+        grace: Option<Duration>,
+        dry_run: bool,
+    ) -> Result<Value> {
+        let now = Utc::now();
+        // A dry run writes nothing at all: not a removal, and not a stamp
+        // either, so a preview cannot move a clock the caller is only asking
+        // about. A read-only instance is the other way round: it stamps and it
+        // never removes. Stamping is index maintenance, which read-only mode
+        // does not gate (see the field's own comment, and the host-lock rows a
+        // read-only instance already writes) - and on a shared database it is
+        // the only defence a read-only peer has for the domains it registers,
+        // since another instance's sweep ages them out otherwise.
+        let stamps = !dry_run;
+        let removes = !dry_run && !self.read_only;
+
+        let Some(registered) = self.registered_domain_names_checked() else {
+            return Ok(json!({
+                "grace_seconds": grace.map(|g| g.num_seconds()),
+                "on_demand": grace.is_none(),
+                "dry_run": dry_run,
+                "read_only": self.read_only,
+                "stamped": 0,
+                "considered": [],
+                "collected": [],
+                "engrams_removed": 0,
+                "skipped": "the configuration could not be read, and a domain cannot be shown \
+                            absent from a file nobody can read; nothing was stamped and nothing \
+                            collected",
+            }));
+        };
+
+        // The registered set is stamped FIRST, before a single domain is
+        // considered. A registered domain that went unstamped would age like
+        // a removed one, and for a caller that collects on the stamp that is
+        // data loss.
+        let stamped = if stamps {
+            let names: Vec<&str> = registered.iter().map(String::as_str).collect();
+            let store = self.store.lock().await;
+            store.stamp_registered(&names, &now.to_rfc3339()).await?;
+            names.len()
+        } else {
+            0
+        };
+
+        let stats = {
+            let store = self.store.lock().await;
+            store.domain_stats().await?
+        };
+
+        let mut considered: Vec<Value> = Vec::new();
+        let mut collected: Vec<String> = Vec::new();
+        let mut engrams_removed: i64 = 0;
+        // Unregistered domains that have never been stamped. They are not in
+        // the registered set, so the call above cannot reach them, and without
+        // a second one they would read `None` forever and never age at all -
+        // which would leave every row an upgrade inherits immortal. This is a
+        // clock starting, not a claim that they are registered.
+        let mut start_clock: Vec<String> = Vec::new();
+
+        // How many drafts the journal mirrors for one domain. `None` from the
+        // state directory reads as nothing mirrored, which is the narrow answer:
+        // a sweep that cannot see the journal keeps a domain rather than
+        // collecting one.
+        let journal_dir = self.journal_state_dir().ok();
+        let mirrored = |name: &str| -> (u64, bool) {
+            match journal_dir.as_deref() {
+                Some(dir) => {
+                    let counts = crate::overlay_journal::journal_counts(dir, name);
+                    (counts.total, counts.unreadable)
+                }
+                // No state directory at all is the narrowest answer there is:
+                // nothing counted, and nothing known either.
+                None => (0, true),
+            }
+        };
+
+        let mut drafts_swept: u64 = 0;
+        for row in stats.iter().filter(|d| !registered.contains(&d.name)) {
+            // Once per row, not once per use: this is a directory walk.
+            let (drafts, drafts_unknown) = mirrored(&row.name);
+            let age = row
+                .last_registered
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|seen| now.signed_duration_since(seen.with_timezone(&Utc)));
+
+            // Why this domain was kept, as a word a caller can branch on and a
+            // sentence one can print. `None` is the only outcome that deletes.
+            // Virtual is tested before read-only, and the order is the
+            // message rather than the outcome: neither collects anything. A
+            // read-only instance that reported `read_only` for a virtual
+            // domain would have the doctor print "this instance is read-only",
+            // which is true and useless - the rows are the domain's only copy
+            // on every instance, and `domain remove --purge` is the one way
+            // out wherever the reader is standing.
+            let kept: Option<(&str, &str)> = if matches!(row.kind, DomainKind::Virtual) {
+                Some((
+                    "virtual",
+                    "a virtual domain's engram rows are its only copy; end it with \
+                     'domain remove --purge', which asks first",
+                ))
+            } else if self.read_only {
+                Some(("read_only", "this instance is read-only"))
+            } else if self.hosted_elsewhere(row, now) {
+                Some((
+                    "hosted_elsewhere",
+                    "another instance holds this domain's host lock and is still \
+                     heartbeating; its registration is a registration",
+                ))
+            } else if row.engrams == 0 && drafts == 0 {
+                // `DomainStats::engrams` counts base rows only, so a domain
+                // holding nothing but one actor's private drafts reads as empty
+                // here. It is not: it holds rows the removal would clear and a
+                // mirror that would restore them, so it goes down the same age
+                // ladder as any other domain rather than being kept forever as
+                // having nothing to collect. Counted from the journal because
+                // the row count is the one thing a candidate's id cannot be
+                // resolved for without writing, and a dry run writes nothing.
+                //
+                // A journal that could not be read counts zero and lands here
+                // too, and that is the safe direction rather than an accident:
+                // this branch KEEPS the domain, so a sweep that cannot see what
+                // is mirrored collects nothing instead of deleting rows it
+                // cannot account for. The reason says which of the two it was.
+                Some((
+                    "no_rows",
+                    if drafts_unknown {
+                        "no engram rows to collect, and the overlay journal could not be read, \
+                         so nothing here is collected until it can be"
+                    } else {
+                        "no engram rows to collect"
+                    },
+                ))
+            } else {
+                match grace {
+                    // A person asking is the signal the grace period exists to
+                    // wait for, so there is nothing left to wait for and no
+                    // stamp to consult: an inherited index whose rows all read
+                    // `None` clears on first contact rather than a week after.
+                    None => None,
+                    Some(grace) => match age {
+                        None => {
+                            start_clock.push(row.name.clone());
+                            Some((
+                                "unstamped",
+                                if stamps {
+                                    "never seen registered before; its clock starts now"
+                                } else {
+                                    "never seen registered before; a real run would start its \
+                                     clock now"
+                                },
+                            ))
+                        }
+                        Some(age) if age < grace => Some(("grace", "within the grace period")),
+                        Some(_) => None,
+                    },
+                }
+            };
+
+            let collect = kept.is_none();
+            if collect {
+                collected.push(row.name.clone());
+                if removes {
+                    // The id the way `domain_remove` resolves it, with the
+                    // row's own path and kind so the upsert updates nothing:
+                    // the domain row must come through this exactly as it
+                    // went in.
+                    let path = Some(row.path.as_str()).filter(|p| !p.is_empty());
+                    let store = self.store.lock().await;
+                    let id = store.upsert_domain(&row.name, path, row.kind).await?;
+                    store.clear_domain(id).await?;
+                    drop(store);
+                    engrams_removed += row.engrams;
+                    // This path never goes through `unregister_domain`, so the
+                    // journal sweep is repeated here rather than inherited. A
+                    // mirror left behind for a collected domain is worse than a
+                    // leak: the drafts would come back on the next sync for a
+                    // domain nobody registers.
+                    drafts_swept += self.sweep_domain_journal(&row.name).await;
+                    let age_text = match age {
+                        Some(age) => format!("last seen registered {} days ago", age.num_days()),
+                        None => "never seen registered".to_string(),
+                    };
+                    tracing::info!(
+                        domain = row.name.as_str(),
+                        engrams = row.engrams,
+                        age = age_text.as_str(),
+                        "collected {} engram rows of '{}', {}",
+                        row.engrams,
+                        row.name,
+                        age_text
+                    );
+                }
+            }
+
+            let mut entry = json!({
+                "domain": row.name,
+                "kind": if matches!(row.kind, DomainKind::Virtual) { "virtual" } else { "file" },
+                "engrams": row.engrams,
+                // Beside the engram count rather than folded into it: they are
+                // different knowledge. `engrams` is what the domain's files
+                // say, `drafts` is what people hold privately on top of it, and
+                // a domain can have none of the first and some of the second.
+                "drafts": drafts,
+                // The same honesty `drafts_unknown` carries on the removal
+                // preview: a zero that nothing could confirm is not a zero.
+                "drafts_unknown": drafts_unknown,
+                "last_registered": row.last_registered,
+                "age_seconds": age.map(|a| a.num_seconds()),
+                "age_days": age.map(|a| a.num_days()),
+                "collected": collect,
+            });
+            if let Some((kept, reason)) = kept {
+                entry["kept"] = json!(kept);
+                entry["reason"] = json!(reason);
+            }
+            considered.push(entry);
+        }
+
+        if stamps && !start_clock.is_empty() {
+            let names: Vec<&str> = start_clock.iter().map(String::as_str).collect();
+            let store = self.store.lock().await;
+            store.stamp_registered(&names, &now.to_rfc3339()).await?;
+        }
+
+        let mut report = json!({
+            "grace_seconds": grace.map(|g| g.num_seconds()),
+            "on_demand": grace.is_none(),
+            "dry_run": dry_run,
+            "read_only": self.read_only,
+            "stamped": stamped,
+            "considered": considered,
+            "collected": collected,
+            "engrams_removed": engrams_removed,
+            "drafts_swept": drafts_swept,
+        });
+        if self.read_only {
+            // Each path says exactly what it did. A read-only instance stamps
+            // and never removes, so a real run has stamped by the time this is
+            // written - but a preview has written nothing at all, `stamped` is
+            // zero on it, and a sentence claiming otherwise is the same lie in
+            // the other direction.
+            report["skipped"] = json!(if dry_run {
+                "this instance is read-only; nothing was changed, and a real run here would \
+                 stamp the registered domains and still remove nothing"
+            } else {
+                "this instance is read-only; the registered domains were stamped and nothing \
+                 was removed"
+            });
+        }
+        Ok(report)
     }
 
     // --- origin (GitHub collaboration) ----------------------------------------
@@ -8035,6 +15918,7 @@ impl Engine {
                         poll_secs: None,
                     }),
                     provision: None,
+                    review: None,
                 },
             );
             self.persist_config(&file)?;
@@ -8156,11 +16040,16 @@ impl Engine {
     /// never aborts the others, each per-domain failure is collected into the
     /// `errors` array instead. Allowed on a read-only instance: a pull is a
     /// derived-truth update like sync, not a user-authored content write.
-    pub async fn origin_update(&self, domain: Option<&str>) -> Result<Value> {
+    pub async fn origin_update(
+        &self,
+        domain: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
-        let targets = self.origin_targets(domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        let targets = self.origin_targets(domain, &hidden)?;
 
         let mut domains = Vec::new();
         let mut errors = Vec::new();
@@ -8206,6 +16095,17 @@ impl Engine {
             .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
         self.sync(Some(name)).await?;
+        // The pull advanced the base, so every draft standing over this domain
+        // is asked whether the folder has caught up with it. After the sync,
+        // not before: the pass reads the base snapshot for content but the rest
+        // of this call expects a domain whose rows are current. A failure here
+        // is a warning rather than a failed update - the pull has already
+        // landed on disk, and the next pull runs the whole pass again.
+        if !report.up_to_date
+            && let Err(e) = self.converge_pulled_overlays(name, &report.applied).await
+        {
+            tracing::warn!("converging the drafts in '{name}' after updating failed: {e}");
+        }
         if !self.request_embed()
             && let Err(e) = self.embed_pending().await
         {
@@ -8365,17 +16265,89 @@ impl Engine {
     /// filesystem root) never aborts the others: it is collected into the
     /// `errors` array instead, mirroring `origin_update`. Allowed on a
     /// read-only instance (a pure read).
-    pub async fn origin_status(&self, domain: Option<&str>) -> Result<Value> {
+    ///
+    /// `detail` names the unshared work instead of only counting it: each
+    /// domain entry then carries a `detail` block grouping the changed paths
+    /// by kind (see [`origin::local_change_detail`]). It is opt-in because it
+    /// costs a second walk of every domain's working tree, so `local_changes`
+    /// stays the bare count for every caller that only wants to know whether
+    /// there is anything to share.
+    pub async fn origin_status(
+        &self,
+        domain: Option<&str>,
+        detail: bool,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
-        let targets = self.origin_targets(domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        let targets = self.origin_targets(domain, &hidden)?;
         let connection = self.origin_status_connection().await?;
 
+        let actor = crate::scope::overlay_actor(scope);
         let mut domains = Vec::new();
         let mut errors = Vec::new();
         for (name, entry) in targets {
-            match self.origin_status_one(&name, &entry).await {
+            // Read here rather than inside the per-domain body, and that is not
+            // tidiness: the body runs under this domain's origin lock, and
+            // taking the store lock inside it would invent a lock pair that
+            // exists nowhere else in the engine. The counts are a read of rows
+            // nobody else in this call touches, so taking them first costs
+            // nothing and orders nothing.
+            //
+            // Only for a domain that reviews changes, and only because the body
+            // reports these keys for no other kind: a domain taking changes
+            // directly would pay a store lock and two queries per status call
+            // for an answer nothing reads, and the instance-wide `/sync`
+            // overview asks this of every team domain at once.
+            let (view, converged) = if entry.is_overlay() {
+                // Whoever owns the domain sees who else is drafting in it. One
+                // comparison covers the whole rule: an instance admin owns
+                // every domain, a private domain's owner owns theirs, and
+                // nobody else ever reaches `Own`.
+                //
+                // A membership that cannot be read is answered "no" rather than
+                // propagated, and both halves of that are deliberate. A
+                // permission question with no answer is not a yes, and this
+                // function is documented never to fail a whole report over one
+                // domain - a `?` here would abort every other domain's status
+                // over one unreadable acl row.
+                let everyone = match self.domain_right(scope, &name).await {
+                    Ok(right) => right >= crate::scope::DomainRight::Own,
+                    Err(e) => {
+                        tracing::warn!(
+                            domain = %name,
+                            error = format!("{e:#}"),
+                            "who holds domain '{name}' could not be read, so its status says \
+                             nothing about who else is drafting there"
+                        );
+                        false
+                    }
+                };
+                (
+                    crate::review::DraftView::new(
+                        self.overlay_counts_by_actor(&name).await,
+                        actor.clone(),
+                        everyone,
+                    ),
+                    // Read here for the reason the counts are: a plain
+                    // in-memory read of what the last pull recorded, which
+                    // orders nothing and cannot fail.
+                    self.converged_json(&name, actor.as_deref(), everyone),
+                )
+            } else {
+                // Never read: the per-domain body reports the draft keys only
+                // for a reviewing domain, which this is not.
+                (
+                    crate::review::DraftView::new(None, actor.clone(), false),
+                    None,
+                )
+            };
+            match self
+                .origin_status_one(&name, &entry, detail, &view, converged.as_ref())
+                .await
+            {
                 Ok(v) => domains.push(v),
                 Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
             }
@@ -8406,7 +16378,20 @@ impl Engine {
     /// instance-credential write the wave promises never happens, so permission
     /// is withheld and the debt stays recorded until the next share, amend or
     /// withdrawal pays it off on the acting identity's own credential.
-    async fn origin_status_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+    ///
+    /// `detail` is threaded through both arms on purpose. The retry arm is the
+    /// offline one, and offline is exactly when a caller cannot look the change
+    /// list up anywhere else, so a status that degrades to local state still
+    /// names what is unshared rather than dropping the one answer it can still
+    /// give from the working tree alone.
+    async fn origin_status_one(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        detail: bool,
+        drafts: &crate::review::DraftView,
+        converged: Option<&Value>,
+    ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
@@ -8417,8 +16402,68 @@ impl Engine {
             let config = self.config.read().unwrap();
             config.github_stacks() && config.github_share_identity() == ShareIdentityMode::Instance
         };
+        let change_detail = || {
+            detail
+                .then(|| origin::local_change_detail(&root, &state_dir))
+                .flatten()
+        };
+        // In review mode every legitimate change joins its author's draft, so
+        // anything the working tree holds that the origin does not got there
+        // some other way: an editor, a script, a restored backup. It is
+        // reported rather than blocked - the folder belongs to whoever holds
+        // the machine - and the key is absent on a domain that takes changes
+        // directly, where a local change is ordinary unshared work and
+        // `local_changes` already says so.
+        // Emitted for every reviewing domain, empty when nothing is known to be
+        // unshared - the opposite of the rule `detail` follows beside it, and
+        // deliberately. `detail` is absent when the walk never happened because
+        // "nothing unshared" and "this could not be told" must not render the
+        // same; here the key's presence is what says the domain reviews at all,
+        // so making it absent for a domain that has never been pulled would say
+        // "this domain takes changes directly", which is a different and wrong
+        // thing.
+        let out_of_band = entry.is_overlay().then(|| {
+            origin::unshared_work(&root, &state_dir)
+                .map(|work| work.paths)
+                .unwrap_or_default()
+        });
+        let with_out_of_band = |mut value: Value| {
+            if let Some(paths) = &out_of_band
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("out_of_band".to_string(), json!(paths));
+                // Under the same condition and for the same reason the block
+                // above gives: on a reviewing domain every caller is told what
+                // they are holding, and whoever owns the domain is told who
+                // else is holding anything. On a domain that takes changes
+                // directly neither key appears at all - `my_drafts: 0` there
+                // would say "you are holding nothing here", which reads as
+                // "you could be", and nobody can draft in a domain that is not
+                // reviewing.
+                object.insert("my_drafts".to_string(), drafts.mine());
+                if let Some(everyone) = drafts.everyone() {
+                    object.insert("drafts".to_string(), everyone);
+                }
+                // What the last pull's convergence did here, absent until a
+                // pull has converged something or flagged a conflict for this
+                // domain - read off the durable record beside the journal, so
+                // a restart does not turn "nothing has looked yet" into
+                // "nothing converged". Absent rather than zeroed, for the
+                // reason `behind` is null when nothing probed it: the two are
+                // different answers.
+                if let Some(converged) = converged {
+                    object.insert("converged".to_string(), converged.clone());
+                }
+            }
+            value
+        };
         match ops::status(&spec, &root, &state_dir, probe.as_deref(), settle_owed_link).await {
-            Ok(report) => Ok(origin::status_report_json(name, &report, None)),
+            Ok(report) => Ok(with_out_of_band(origin::status_report_json(
+                name,
+                &report,
+                None,
+                change_detail(),
+            ))),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
                 // (see `origin::is_probe_transport_error`), so a probe that
@@ -8427,11 +16472,12 @@ impl Engine {
                 // status still comes back offline.
                 self.drop_github_credential_on_auth(&e);
                 let report = ops::status(&spec, &root, &state_dir, None, settle_owed_link).await?;
-                Ok(origin::status_report_json(
+                Ok(with_out_of_band(origin::status_report_json(
                     name,
                     &report,
                     Some(e.to_string()),
-                ))
+                    change_detail(),
+                )))
             }
             Err(e) => Err(e.into()),
         }
@@ -8484,7 +16530,9 @@ impl Engine {
             }
             return;
         }
-        let Ok(targets) = self.origin_targets(None) else {
+        // The poller is the machine itself rather than a caller, so nothing is
+        // subtracted: it polls every origin this daemon hosts.
+        let Ok(targets) = self.origin_targets(None, &HashSet::new()) else {
             return;
         };
         let github_poll_secs = self
@@ -8618,7 +16666,11 @@ impl Engine {
     async fn origins_status_block(&self) -> Value {
         let (connected, token_store) = self.origin_connection_offline();
         let rate_limit_wait_until = self.origin_poller.rate_limited_until();
-        let targets = self.origin_targets(None).unwrap_or_default();
+        // `status`'s own block, which the CLI and the control socket read: the
+        // machine owner, so nothing is subtracted.
+        let targets = self
+            .origin_targets(None, &HashSet::new())
+            .unwrap_or_default();
 
         let mut domains = Vec::new();
         for (name, entry) in targets {
@@ -8647,6 +16699,114 @@ impl Engine {
             "token_store": token_store,
             "rate_limit_wait_until": rate_limit_wait_until,
             "domains": domains,
+        })
+    }
+
+    /// Whose drafts a share of `domain` is of, or `None` when the domain takes
+    /// changes directly and a share is the folder walk it always was.
+    ///
+    /// Asked FIRST by both share verbs, ahead of the credential and ahead of
+    /// every forge call: an agent with no identity holds no draft, so there is
+    /// nothing for a share to be of whatever this instance's GitHub
+    /// configuration says, and the refusal that teaches the way in is the one a
+    /// write already gets. Resolving a credential before saying so would answer
+    /// a question about the forge to a caller whose problem is that nobody knows
+    /// whose work this is.
+    fn overlay_share_identity(&self, domain: &str, actor: &ShareActor) -> Result<Option<String>> {
+        if !self.reviews_changes(domain) {
+            return Ok(None);
+        }
+        share_staging::overlay_share_actor(actor).map(Some)
+    }
+
+    /// The tree a share or a preview of `domain` runs against, or `None` when
+    /// `drafting` is `None` and the folder on disk is the answer it always was.
+    ///
+    /// The single seam review mode adds to sharing, so the share and the preview
+    /// behind its confirmation question cannot describe two different things.
+    /// Two steps, in this order:
+    ///
+    /// 1. a pull of the REAL folder, which is the pull `ops::propose` would run
+    ///    for itself. It has to happen against the folder rather than the staged
+    ///    tree: a pull advances the base snapshot as it applies upstream work,
+    ///    so a pull into staging would leave the team's folder behind its own
+    ///    base, and no later pull would bring it back. Run here, it lands where
+    ///    it belongs;
+    /// 2. the staged tree itself ([`Engine::stage_overlay_share`]), and with it
+    ///    the commit the folder now stands at. The caller hands that to
+    ///    [`crate::share_staging::PinnedHead`], which is what turns "the inline
+    ///    pull has nothing left to do" from likely into true.
+    ///
+    /// `origin` is what [`Engine::origin_spec_for_domain`] resolved, borrowed
+    /// whole: the spec, the domain's folder and its origin state directory.
+    async fn overlay_share_tree(
+        &self,
+        domain: &str,
+        drafting: Option<&str>,
+        provider: &dyn Provider,
+        origin: (&OriginSpec, &Path, &Path),
+        acting: Option<&str>,
+    ) -> Result<Option<PreparedShare>> {
+        let Some(who) = drafting else {
+            return Ok(None);
+        };
+        let (spec, root, state_dir) = origin;
+        let report = ops::pull(provider, spec, root, state_dir)
+            .await
+            .inspect_err(|e| self.drop_github_credential_on_auth(e))
+            .map_err(|e| enrich_write_error(e, acting, &spec.repo))?;
+        // This pull advances the base like any other, so the same convergence
+        // runs on it - and it runs BEFORE the tree is staged, so a draft the
+        // team has already merged is not proposed straight back at them.
+        //
+        // The sync in front of it is what makes the two call sites one rule
+        // rather than two. A rename finishes through `write_overlay_entry`,
+        // whose address check reads index rows; against rows that still
+        // describe the pre-pull folder the old base row would still hold the
+        // draft's address and the destination write would be refused, so the
+        // same rename would come out a move here and a divergence there. The
+        // scan is incremental, and the share's own tail syncs again after the
+        // proposal, where a second pass over unchanged files costs a walk.
+        if !report.up_to_date {
+            if let Err(e) = self.sync(Some(domain)).await {
+                tracing::warn!("indexing what the pull before sharing '{domain}' applied: {e}");
+            }
+            if let Err(e) = self.converge_pulled_overlays(domain, &report.applied).await {
+                tracing::warn!("converging the drafts in '{domain}' before sharing failed: {e}");
+            }
+        }
+        Ok(Some(
+            self.stage_overlay_share(domain, who, state_dir).await?,
+        ))
+    }
+
+    /// Reads what one actor's share is made of - the base snapshot the pull just
+    /// settled and that actor's own index rows - and hands both to
+    /// [`crate::share_staging::build`].
+    ///
+    /// Thin on purpose: the filesystem work and its lifetime live in
+    /// [`crate::share_staging`], and what belongs here is which two things are
+    /// read and with which lookup. **The rows, never the journal beside them**:
+    /// the journal is the durable mirror a rebuilt index is restored from, and a
+    /// mirror that had fallen behind would quietly change what a share carries.
+    /// And **the read-only id lookup**, never an upserting one: a share of a
+    /// domain this index has never been told about holds no drafts, and asking
+    /// must not register one.
+    async fn stage_overlay_share(
+        &self,
+        domain: &str,
+        actor: &str,
+        state_dir: &Path,
+    ) -> Result<PreparedShare> {
+        let state = crystalline_remote::state::OriginState::load(state_dir)?.ok_or_else(|| {
+            EngineError::Conflict(format!(
+                "domain '{domain}' has no origin state; add the domain from its origin first"
+            ))
+        })?;
+        let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+        Ok(PreparedShare {
+            staging: view.materialise(state_dir, &state.files).await?,
+            pinned: state.base_commit,
         })
     }
 
@@ -8706,12 +16866,43 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let drafting = self.overlay_share_identity(domain, &actor)?;
+        if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
+            self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
+        }
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
+        // In review mode the share is of the actor's own drafts, which are in
+        // the index and on nobody's disk, so the tree `ops` detects against is
+        // staged here. `None` is a domain that takes changes directly, whose
+        // share is the folder walk it always was.
+        let staging = self
+            .overlay_share_tree(
+                domain,
+                drafting.as_deref(),
+                provider.as_ref(),
+                (&spec, &root, &state_dir),
+                acting.as_deref(),
+            )
+            .await?;
+        // The share runs against the staged tree, and the provider it runs with
+        // holds the inline pull to the commit that tree was staged over: a merge
+        // landing in staging would be deleted with it while the base snapshot
+        // advanced past it, and nothing would ever put it back.
+        let pinned = staging.as_ref().map(|prepared| {
+            share_staging::PinnedHead::new(provider.as_ref(), prepared.pinned.clone())
+        });
+        let share_provider: &dyn Provider = match &pinned {
+            Some(pinned) => pinned,
+            None => provider.as_ref(),
+        };
+        let detect_in = staging
+            .as_ref()
+            .map_or(root.as_path(), |prepared| prepared.staging.root());
         match ops::propose(
-            provider.as_ref(),
+            share_provider,
             &spec,
-            &root,
+            detect_in,
             domain,
             &state_dir,
             ops::ShareOptions {
@@ -8732,7 +16923,17 @@ impl Engine {
             Ok(outcome) => {
                 self.index_what_the_share_pull_applied(domain, "sharing")
                     .await;
-                Ok(origin::propose_outcome_json(&outcome))
+                let receipt = origin::propose_outcome_json(&outcome);
+                // Whose the proposal is, in the sense review mode means it. The
+                // forge record cannot say (see
+                // `Engine::refuse_open_proposal_while_reviewing`), so it is
+                // recorded here, beside the drafts it carried.
+                if let Some(who) = drafting.as_deref()
+                    && let Some(number) = proposal_number_of(&receipt)
+                {
+                    self.record_proposal_actor(domain, number, Some(who));
+                }
+                Ok(receipt)
             }
             Err(RemoteError::ConflictsPending { count }) => {
                 // The conflicts refusal is the loudest case for syncing: the
@@ -8754,6 +16955,72 @@ impl Engine {
             }
             Err(e) => Err(enrich_write_error(e, acting.as_deref(), &spec.repo).into()),
         }
+    }
+
+    /// Refuse a share that would stack a layer on an open one while the domain
+    /// reviews changes - in the words of whose that open proposal is.
+    ///
+    /// Two things a stacked layer needs are not there in review mode. A layer
+    /// is detected against the CHAIN TIP, which may be another actor's open
+    /// layer - a member would be proposing a change on top of work they never
+    /// wrote and may not even be shown. And amending a layer replays the layers
+    /// above it from the working tree, which in a reviewing domain holds no
+    /// layer's content at all: the folder says what the team reviewed, and
+    /// every layer lives in somebody's overlay.
+    ///
+    /// **So a reviewing domain carries one proposal at a time, and that costs
+    /// two different refusals rather than one.** The proposal is this actor's
+    /// own, and withdrawing it is a thing they may do
+    /// ([`REVIEW_NO_STACKING`]); or it is somebody else's, and it is not
+    /// theirs to withdraw, so the honest answer names whose it is and what to
+    /// wait for ([`REVIEW_PROPOSAL_IS_ANOTHERS`]). One refusal for both would
+    /// tell a member who has never shared anything to "share a fresh proposal
+    /// instead", which is precisely what they were doing.
+    ///
+    /// **Whose it is comes from the journal's own record**, not from the forge
+    /// record's `author_login`: that names the GitHub account a share's
+    /// credential was connected as, and in the default instance identity mode
+    /// every actor's share goes out on one login. A proposal opened before this
+    /// was recorded, or by another machine, has no owner here and reads as
+    /// somebody else's - the safe way round, since it never tells one actor to
+    /// withdraw a proposal that is not theirs.
+    ///
+    /// The refusal stays narrow: it needs a forge that actually serves stacks
+    /// (probed once and recorded) and a layer already open, so the first share
+    /// of a domain, and every share on a forge that stacks nothing, goes
+    /// through exactly as it did.
+    fn refuse_open_proposal_while_reviewing(
+        &self,
+        domain: &str,
+        state_dir: &Path,
+        actor: &str,
+    ) -> Result<()> {
+        let Some(state) = crystalline_remote::state::OriginState::load(state_dir)
+            .ok()
+            .flatten()
+            .filter(|state| state.stacks_available == Some(true))
+        else {
+            return Ok(());
+        };
+        let Some(open) = state
+            .proposals
+            .iter()
+            .find(|p| p.status == crystalline_remote::state::ProposalStatus::Open)
+        else {
+            return Ok(());
+        };
+        let record = self
+            .journal_state_dir()
+            .map(|dir| crate::overlay_journal::journal_record(&dir, domain))
+            .unwrap_or_default();
+        let owner = record.proposals.get(&open.number.to_string());
+        if owner.is_some_and(|who| who == actor) {
+            return Err(EngineError::Refused(REVIEW_NO_STACKING.to_string()));
+        }
+        let named = owner.map_or("another member", String::as_str);
+        Err(EngineError::Refused(
+            REVIEW_PROPOSAL_IS_ANOTHERS.replace("{actor}", named),
+        ))
     }
 
     /// Indexes whatever the pull inside a share or a preview wrote to the
@@ -8828,6 +17095,12 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let drafting = self.overlay_share_identity(domain, &actor)?;
+        if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
+            // The preview carries the share's own gates, so nobody is asked to
+            // confirm a share this instance would then refuse.
+            self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
+        }
         let (provider, login) = match self.resolve_share_provider(&actor) {
             Ok(resolved) => resolved,
             Err(e)
@@ -8839,10 +17112,34 @@ impl Engine {
             Err(e) => return Err(e),
         };
         let acting = self.personal_write_login(login.as_deref());
+        // The share's own staging, for the share's own reason: a preview that
+        // planned against the folder would promise a share of files nobody
+        // drafted (see `Engine::overlay_share_tree`).
+        let staging = self
+            .overlay_share_tree(
+                domain,
+                drafting.as_deref(),
+                provider.as_ref(),
+                (&spec, &root, &state_dir),
+                acting.as_deref(),
+            )
+            .await?;
+        // Pinned exactly as the share pins it, and for the same reason: a
+        // preview's own inline pull would merge into the staged tree too.
+        let pinned = staging.as_ref().map(|prepared| {
+            share_staging::PinnedHead::new(provider.as_ref(), prepared.pinned.clone())
+        });
+        let preview_provider: &dyn Provider = match &pinned {
+            Some(pinned) => pinned,
+            None => provider.as_ref(),
+        };
+        let detect_in = staging
+            .as_ref()
+            .map_or(root.as_path(), |prepared| prepared.staging.root());
         let plan = ops::propose_preview(
-            provider.as_ref(),
+            preview_provider,
             &spec,
-            &root,
+            detect_in,
             domain,
             &state_dir,
             ops::ShareOptions {
@@ -8861,7 +17158,12 @@ impl Engine {
         .map_err(|e| enrich_write_error(e, acting.as_deref(), &spec.repo))?;
         self.index_what_the_share_pull_applied(domain, "previewing a share")
             .await;
-        Ok(origin::share_plan_json(&plan, &root))
+        // Provenance preselection is a guess at whose work a mixed delta holds,
+        // and in review mode there is nothing left to guess: every path in the
+        // plan is one of this actor's own drafts. So the plan is served without
+        // it rather than with a column answering a question nobody asked.
+        let provenance = drafting.is_none().then_some(root.as_path());
+        Ok(origin::share_plan_json(&plan, provenance))
     }
 
     /// Previews which proposal a withdrawal would take out, without touching
@@ -8907,6 +17209,10 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        // The withdrawal's own identity gate, in round one: on a reviewing
+        // domain a revert puts one actor's overlay back, and nobody in
+        // particular has none to put back.
+        self.overlay_share_identity(domain, &actor)?;
         let (_provider, _login) = self.resolve_share_provider(&actor)?;
         // Probe-free, so no forge call of any kind: the settlement permission
         // is withheld for the same reason the provider was dropped.
@@ -8947,20 +17253,56 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        // Whose withdrawal this is, on a domain that reviews changes - and the
+        // refusal an agent with no identity gets, in the words every draft verb
+        // refuses in. `None` is a domain that takes changes directly, where a
+        // revert is the working-tree restore it always was.
+        let drafting = self.overlay_share_identity(domain, &actor)?;
+        // What the chain holds BEFORE the withdrawal, so an overlay revert can
+        // find the record it is undoing. Read here and not back off the saved
+        // state afterwards: the ordinary path settles the record into
+        // `history`, which `OriginState::push_history` caps at twenty, so a
+        // busy domain can evict the very proposal this call just withdrew - and
+        // a revert that then found nothing would quietly restore nothing while
+        // the receipt said the withdrawal had worked.
+        let open_before: Vec<crystalline_remote::state::Proposal> = if drafting.is_some() && revert
+        {
+            crystalline_remote::state::OriginState::load(&state_dir)?
+                .map(|state| state.proposals)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
-        let report = ops::withdraw(
+        let mut report = ops::withdraw(
             provider.as_ref(),
             &spec,
             &root,
             &state_dir,
             proposal,
-            revert,
+            // A revert of a reviewing domain never reaches the folder: what
+            // the withdrawal undoes is the actor's own overlay, and the folder
+            // on disk is what the team reviewed and nobody withdrew.
+            revert && drafting.is_none(),
             stacks_allowed,
         )
         .await
         .inspect_err(|e| self.drop_github_credential_on_auth(e))
         .map_err(|e| enrich_write_error(e, acting.as_deref(), &spec.repo))?;
+
+        if drafting.is_some() {
+            // The proposal is gone from the chain, so whose it was is no longer
+            // a question anything asks.
+            self.record_proposal_actor(domain, report.number, None);
+        }
+        if let (Some(who), true) = (drafting.as_deref(), revert) {
+            self.revert_into_overlay(domain, who, &open_before, &mut report)
+                .await?;
+            // Nothing on disk moved, so there is nothing to sync: the overlay
+            // writes nudged the embedder themselves.
+            return Ok(origin::withdraw_report_json(&report));
+        }
 
         if !report.restored.is_empty() || !report.deleted.is_empty() {
             self.sync(Some(domain)).await?;
@@ -8974,6 +17316,94 @@ impl Engine {
             }
         }
         Ok(origin::withdraw_report_json(&report))
+    }
+
+    /// Puts one actor's own view back the way it stood before the withdrawn
+    /// proposal was shared: every path that proposal carried stops being their
+    /// draft.
+    ///
+    /// The undo is a clear and never a write, and that follows from what a
+    /// review-mode share is. A share of a reviewing domain is made ENTIRELY of
+    /// the acting actor's overlay entries, so the state before it was "this
+    /// actor held nothing at these paths" - a proposed addition, a proposed
+    /// rewrite and a proposed deletion all go back to the same thing, which is
+    /// the base showing through again.
+    ///
+    /// **It reverts the ACTING actor's overlay, whosever the proposal was.**
+    /// Nothing in this task restricts a withdrawal to the proposal's author, so
+    /// an actor withdrawing somebody else's proposal finds none of its paths in
+    /// their own overlay and reverts nothing - an empty `restored` and
+    /// `deleted` beside a withdrawal that did happen. That is the honest
+    /// outcome of the two rules meeting (a revert is per actor, a withdrawal is
+    /// not) and not a silent failure of either; who may withdraw whose proposal
+    /// is a question the program has not answered yet.
+    ///
+    /// **A draft edited since it was shared is never touched**, the rule
+    /// [`ops::withdraw`]'s own revert keeps for a file: the recorded digest is
+    /// what says whether what stands here is still what was proposed, and
+    /// anything else is newer work. Such a path is named in `skipped_diverged`
+    /// exactly as the folder path would be.
+    ///
+    /// The one case a revert would have to WRITE rather than clear - a path a
+    /// lower layer of a stack added and this layer changed, whose pre-share
+    /// content is that layer's blob - cannot arise here, because stacking on an
+    /// open layer is refused outright while a domain reviews
+    /// ([`Engine::origin_share`]). If stacks ever reach review mode, this is
+    /// the half that has to learn to write.
+    async fn revert_into_overlay(
+        &self,
+        domain: &str,
+        actor: &str,
+        open_before: &[crystalline_remote::state::Proposal],
+        report: &mut crystalline_remote::ops::WithdrawReport,
+    ) -> Result<()> {
+        // The record as it stood before the withdrawal resolved its own target,
+        // matched on the number the withdrawal reports.
+        let Some(withdrawn) = open_before.iter().find(|p| p.number == report.number) else {
+            return Ok(());
+        };
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(domain).await?
+        };
+        let Some(domain_id) = domain_id else {
+            return Ok(());
+        };
+        for file in &withdrawn.files {
+            let held = {
+                let store = self.store.lock().await;
+                store.overlay_entry(domain_id, actor, &file.path).await?
+            };
+            let Some(held) = held else {
+                continue;
+            };
+            // What was proposed, against what this actor holds now. A
+            // tombstone proposed a deletion and carries no content of its own,
+            // so its digest is the absence the proposal recorded.
+            let unchanged = match file.sha256.as_deref() {
+                Some(proposed) => {
+                    !held.tombstone && sha256_hex(held.content.as_bytes()) == proposed
+                }
+                None => held.tombstone,
+            };
+            if !unchanged {
+                report.skipped_diverged.push(file.path.clone());
+                continue;
+            }
+            DomainView::for_actor(self, domain, &HashSet::new(), actor)?
+                .drop(domain_id, &file.path)
+                .await?;
+            match file.change {
+                // A page only this actor had goes away with the proposal.
+                crystalline_remote::state::ProposedChange::Added => {
+                    report.deleted.push(file.path.clone());
+                }
+                // A rewrite or a deletion of a page the team has: the team's
+                // own version shows through again.
+                _ => report.restored.push(file.path.clone()),
+            }
+        }
+        Ok(())
     }
 
     /// One conflict's full detail: both recorded sides plus the current local
@@ -9053,19 +17483,22 @@ impl Engine {
     /// `github.enabled`'s message when collaboration is off, and with
     /// `EngineError::ReadOnly` on a read-only instance.
     ///
-    /// `_actor` completes the write-verb signature every surface passes an
-    /// actor to, and is deliberately unused: resolving writes this machine's
-    /// working tree and its origin state and makes no provider call at all, so
-    /// there is no credential to resolve and nothing for an identity to change.
-    /// The resolved content reaches the forge later, on the next share, under
-    /// whoever performs that.
+    /// `actor` makes no provider call of its own - resolving writes this
+    /// machine and reaches the forge later, on the next share, under whoever
+    /// performs that. What it decides is WHOSE the resolution is: on a domain
+    /// that reviews changes the conflict being settled is one actor's draft
+    /// standing against a base that moved under it, so the resolution joins
+    /// that actor's overlay and never the folder the team reviewed. An agent
+    /// with no identity is refused there in the words every draft verb refuses
+    /// in; on a domain that takes changes directly the identity changes
+    /// nothing, exactly as before.
     pub async fn origin_resolve(
         &self,
         domain: &str,
         path: &str,
         keep: Option<&str>,
         content: Option<&[u8]>,
-        _actor: ShareActor,
+        actor: ShareActor,
     ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
@@ -9073,10 +17506,64 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // An attachment is not an engram and this verb settles engrams. The
+        // path would be normalized to `<path>.md` on the next line and then
+        // miss everything, so the refusal comes first and says what to do
+        // instead: the bytes are settled by writing them again or by deleting
+        // them, which is the same pair of verbs that put them there.
+        if is_assets_reserved(path) {
+            return Err(EngineError::Invalid(format!(
+                "'{path}' is an attachment, and a conflict resolution settles an engram's \
+                 markdown; upload the file again to keep your version or delete it to take the \
+                 one the team has"
+            )));
+        }
         let resolution = origin::resolution_from(keep, content)?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        // One spelling from here down. A caller who names `notes/plan` and a
+        // caller who names `notes/plan.md` mean one engram, and the draft
+        // lookup, the recorded-conflict lookup and `ops::resolve` have to be
+        // asked about the same one or a missing suffix would turn a resolution
+        // into a refusal.
+        let path = &normalize_md(path);
+        if let Some(who) = self.overlay_share_identity(domain, &actor)? {
+            let held = {
+                let store = self.store.lock().await;
+                match store.domain_id(domain).await? {
+                    Some(domain_id) => {
+                        Some((domain_id, store.overlay_entry(domain_id, &who, path).await?))
+                    }
+                    None => None,
+                }
+            };
+            match held {
+                Some((domain_id, Some(_))) => {
+                    return self
+                        .resolve_in_overlay(domain, domain_id, &who, path, resolution)
+                        .await;
+                }
+                // Nothing of this caller's stands here. A conflict the pull
+                // recorded is the FOLDER's and never anybody's draft: it got
+                // there because the reviewed folder was edited out of band and
+                // upstream then changed the same file, and settling it is what
+                // puts the folder back level with its own base. So it is
+                // settled the way it always was, on the folder - review mode is
+                // not a reason to leave a conflict standing in the team's own
+                // files with no verb that can reach it. The overlay rows are
+                // untouched by that path: a sync writes the base dimension and
+                // a draft is somebody else's row entirely.
+                _ if !self.folder_conflict_at(&state_dir, path)? => {
+                    return Err(EngineError::NotFound(format!(
+                        "you are not drafting '{path}' in domain '{domain}', and no conflict \
+                         stands there either. This domain reviews changes, so what a resolution \
+                         settles is your own draft: draft the change first, then settle it"
+                    )));
+                }
+                _ => {}
+            }
+        }
         let report = ops::resolve(&root, &state_dir, path, resolution)?;
 
         self.sync(Some(domain)).await?;
@@ -9089,6 +17576,71 @@ impl Engine {
         Ok(json!({
             "resolved": report.resolved,
             "remaining": report.remaining,
+        }))
+    }
+
+    /// Whether the domain's own origin state records a conflict at `path`: one
+    /// the pull put in the folder every actor shares, which no draft of
+    /// anybody's is or ever was.
+    fn folder_conflict_at(&self, state_dir: &Path, path: &str) -> Result<bool> {
+        Ok(crystalline_remote::state::OriginState::load(state_dir)?
+            .is_some_and(|state| state.conflicts.iter().any(|c| c.path == path)))
+    }
+
+    /// Settles one actor's conflict inside their own overlay: the draft that
+    /// was standing against a base that moved under it.
+    ///
+    /// Three answers and one shape. Keeping the team's version ENDS the draft -
+    /// what the folder says is what this actor reads at that path again - and
+    /// merged content becomes their new draft, written through the one overlay
+    /// writer so it carries the address rule every draft carries. Keeping their
+    /// own changes nothing on purpose: the draft as it stands IS the answer,
+    /// and the conflict was never a record for a write to clear, only the last
+    /// pull's reading of a draft against a folder that had moved. All three
+    /// settle the conflict, so all three take it out of what
+    /// [`Engine::converged_json`] reports.
+    ///
+    /// The domain's own conflict records are deliberately untouched: those are
+    /// [`ops::resolve`]'s, they belong to the folder every actor shares, and
+    /// clearing one from inside a draft would settle it on everybody's behalf.
+    ///
+    /// **No recorded conflict is required**, and that is a widening worth
+    /// naming: any path this actor is drafting can be resolved, whether or not
+    /// a pull ever flagged it. Requiring the record would make a conflict
+    /// unsettleable whenever the record could not be read, and the arms are
+    /// what a draft's author may already do to their own draft anyway - the
+    /// merged arm is `write_engram` by another name, and the `theirs` arm is
+    /// their own deletion of their own draft.
+    async fn resolve_in_overlay(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        path: &str,
+        resolution: ops::Resolution<'_>,
+    ) -> Result<Value> {
+        let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+        match resolution {
+            ops::Resolution::Mine => {}
+            ops::Resolution::Theirs => {
+                view.drop(domain_id, path).await?;
+            }
+            ops::Resolution::Merged(bytes) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    EngineError::Invalid(
+                        "the merged content is not valid UTF-8, so it is not an engram".to_string(),
+                    )
+                })?;
+                view.write(domain_id, path, text).await?;
+            }
+        }
+        let remaining = self.settle_convergence(domain, actor, path);
+        Ok(json!({
+            "resolved": path,
+            "remaining": remaining,
+            // The receipt says where the resolution landed: in this actor's
+            // draft, not in the folder the team reviewed.
+            "draft": true,
         }))
     }
 
@@ -9107,10 +17659,25 @@ impl Engine {
     /// (erroring if it is not registered or has no origin) or every
     /// registered domain with an origin, mirroring `sync_targets`'s
     /// config-then-discovered layering.
-    fn origin_targets(&self, domain: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
+    ///
+    /// `hidden` is the caller's own set of domains it may not see, and it binds
+    /// both arms. A named one is refused exactly as an unregistered one, with
+    /// the registered list in the error filtered to what this caller may see.
+    /// The unnamed arm - "every domain with an origin" - drops them, which is
+    /// the whole of what makes the aggregate form safe: without it a stranger
+    /// asking for the standing of "every shared domain" is handed a private
+    /// team domain's name, its open proposals and its conflicts, and
+    /// `origin_update` additionally pulls into it. Every machine-owner caller
+    /// (the CLI, the control socket, the poller, the status block) passes an
+    /// empty set, which is the answer they would resolve to anyway.
+    fn origin_targets(
+        &self,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<Vec<(String, DomainEntry)>> {
         match domain {
             Some(name) => {
-                let entry = self.domain_entry(name)?;
+                let entry = self.domain_entry_scoped(name, hidden)?;
                 if entry.origin.is_none() {
                     return Err(EngineError::Invalid(format!(
                         "domain '{name}' has no origin; connect it with `crystalline domain add --origin`"
@@ -9122,7 +17689,7 @@ impl Engine {
                 let mut out: Vec<(String, DomainEntry)> = Vec::new();
                 let config = self.config.read().unwrap();
                 for (name, entry) in &config.domains {
-                    if entry.origin.is_some() {
+                    if entry.origin.is_some() && !hidden.contains(name) {
                         out.push((name.clone(), entry.clone()));
                     }
                 }
@@ -9130,7 +17697,7 @@ impl Engine {
                     if config.domains.contains_key(name) {
                         continue;
                     }
-                    if entry.origin.is_some() {
+                    if entry.origin.is_some() && !hidden.contains(name) {
                         out.push((name.clone(), entry.clone()));
                     }
                 }
@@ -9253,6 +17820,51 @@ impl Engine {
             .clone()
     }
 
+    /// The one lock a draft is written under, for every verb that writes one.
+    ///
+    /// A draft has no file in the domain's folder - that is the whole of review
+    /// mode - so the base file's lock holds nothing apart from it: in a
+    /// reviewing domain nobody writes the folder at all, and two writers of one
+    /// draft that took it would be two writers holding a mutex neither of them
+    /// contends. The draft's own mirror in the overlay journal IS the file this
+    /// write produces, so its path is the key, and every arm that writes a
+    /// draft takes it: the capture, the edit, the save, the delete and both
+    /// halves of a move.
+    ///
+    /// What the lock is held across is a read-modify-write with no compare
+    /// behind it. A capture replaces the whole row; an edit reads the draft,
+    /// applies its operation and writes the result; a save compares a checksum
+    /// it read a moment ago. Each store write is atomic on its own, which is
+    /// exactly why a lost update here is invisible - the capture's receipt says
+    /// it landed and the edit that resumed with the older text quietly replaces
+    /// it. Serializing them makes the loser read the winner's bytes and either
+    /// refuse (a stale checksum, a taken permalink) or build on them.
+    ///
+    /// Keyed through [`crate::overlay_journal::entry_path`] rather than by
+    /// hand, so the lock and the mirror can never come to name two different
+    /// places, and taken before the store lock like every other holder. See
+    /// [`Engine::write_lock`], whose map this shares: a base file's path and a
+    /// draft mirror's path are different keys in one map, so no cycle is formed
+    /// and a domain that takes changes directly is untouched by this.
+    ///
+    /// Keyed on the PATH, so two captures by one actor at two paths that both
+    /// claim one permalink are not serialized against each other and both
+    /// land; the conflict target is `(domain_id, path, actor)`, so no store
+    /// constraint backstops it. The direct-mode file arm has the same hole
+    /// under the same key, so this is parity, not a regression (whole-branch
+    /// re-review, 2026-09-17).
+    fn draft_lock(
+        &self,
+        domain: &str,
+        actor: &str,
+        path: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let state_dir = self.journal_state_dir()?;
+        let mirror = crate::overlay_journal::entry_path(&state_dir, domain, actor, path)
+            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        Ok(self.write_lock(&mirror))
+    }
+
     /// The base directory per-domain origin state lives under: the test
     /// override, or the real state directory.
     fn origins_base_dir(&self) -> Result<PathBuf> {
@@ -9265,8 +17877,52 @@ impl Engine {
 
     /// One domain's origin state directory (base snapshot, conflict records,
     /// `state.json`).
-    fn origin_state_dir(&self, domain: &str) -> Result<PathBuf> {
+    ///
+    /// `pub(crate)` rather than private: [`crate::nudge::memo_key`] keys its
+    /// share-walk memo on this path beside a domain's folder, because two
+    /// domain names can register the same folder under different origins
+    /// directories, and the memoized answer depends on which one.
+    pub(crate) fn origin_state_dir(&self, domain: &str) -> Result<PathBuf> {
         Ok(self.origins_base_dir()?.join(domain))
+    }
+
+    /// The state directory the overlay journal lives under: the test override,
+    /// or the real one. `<state_dir>/overlays/<domain>/<actor>/<path>` is the
+    /// journal's own layout, which [`crate::overlay_journal`] owns.
+    /// **This resolver performs no I/O, and that is load bearing.** Its failure
+    /// means "this process knows no path at all", a fact about the environment,
+    /// which is why [`Engine::overlay_domain_files`] may read it as nothing
+    /// there is rather than as something it cannot see: nothing can ever have
+    /// been written through a resolver that answers no path. A `create_dir_all`
+    /// or a `canonicalize` added here would turn a real permission failure on
+    /// the state root into that same answer, and the silent omission that arm
+    /// is safe from today would reopen. Every directory failure is detected
+    /// strictly after this call, inside `overlay_files::by_actor`.
+    pub(crate) fn journal_state_dir(&self) -> Result<PathBuf> {
+        match &self.state_dir_override {
+            Some(p) => Ok(p.clone()),
+            // **Under the test seam this refuses instead of falling back**, and
+            // it is the one resolver in this file that does. Every other one
+            // reaching a real machine path costs a test a read; this one is
+            // reached by `journal_remove_domain`, which is
+            // `std::fs::remove_dir_all` under `<state_dir>/overlays/<domain>`.
+            // A fixture that forgot [`Engine::with_state_dir`] would delete a
+            // developer's own drafts by domain name, silently (the sweep is
+            // best effort) and unrecoverably (the journal is the only copy of a
+            // draft a rebuild cannot make again) - and would read their real
+            // journal into its test index on the way. An audit of the fixtures
+            // is not enough; the resolver has to say no.
+            #[cfg(any(test, feature = "testing"))]
+            None => Err(EngineError::Internal(
+                "this engine was built without a state directory, so it reaches no overlay \
+                 journal: a test that touches drafts, a removal or a sync must say where the \
+                 journal lives with `Engine::with_state_dir`"
+                    .to_string(),
+            )),
+            #[cfg(not(any(test, feature = "testing")))]
+            None => crystalline_core::config::state_dir()
+                .map_err(|e| EngineError::Internal(e.to_string())),
+        }
     }
 
     /// Resolves the provider an origin operation runs its GitHub calls
@@ -9398,9 +18054,10 @@ impl Engine {
     /// The personal identity name a write runs under, in personal mode.
     ///
     /// The machine owner has no account to be, so it gets the one fixed local
-    /// name; an account is itself; an HTTP-MCP agent is whoever
-    /// `github.agent_identity` names, or a refusal that says which setting to
-    /// write.
+    /// name; an account is itself, whether it signed in to Fluid or
+    /// authenticated an MCP session; an unauthenticated HTTP-MCP agent is
+    /// whoever `github.agent_identity` names, or a refusal that says which
+    /// setting to write.
     fn acting_identity_name(
         &self,
         actor: &ShareActor,
@@ -9743,20 +18400,21 @@ impl Engine {
     }
 
     /// [`Engine::pending_view`] for one identity.
+    ///
+    /// `expires_in_secs` is what is LEFT of the code's life, not the flow's
+    /// original expiry: a caller that polls sees the number fall, which is
+    /// what tells a person (or a model relaying to one) that the flow is
+    /// alive rather than wedged. It saturates at 0 rather than going
+    /// negative; a code whose clock has run out stays reported until the
+    /// background task lands its own expiry error, which is the outcome that
+    /// clears the slot.
     fn pending_view_for(&self, identity: &TokenIdentity) -> Option<Value> {
         self.pending_connect
             .lock()
             .unwrap()
             .as_ref()
             .filter(|p| p.identity == *identity)
-            .map(|p| {
-                json!({
-                    "pending": true,
-                    "user_code": p.user_code,
-                    "verification_url": p.verification_url,
-                    "expires_in_secs": p.expires_in_secs,
-                })
-            })
+            .map(PendingConnect::view)
     }
 
     /// Takes the pending INSTANCE flow's outcome if it has landed, clearing
@@ -9786,6 +18444,20 @@ impl Engine {
         landed
     }
 
+    /// The stored guidance for `identity`'s pending flow, read without
+    /// taking anything. Called BEFORE [`Engine::take_finished_pending_for`]
+    /// on the same identity: that call clears the slot the guidance lives
+    /// on, so a caller that wants both the outcome and the guidance it
+    /// landed with has to read this one first.
+    fn pending_next_steps_for(&self, identity: &TokenIdentity) -> Option<String> {
+        self.pending_connect
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|p| p.identity == *identity)
+            .map(|p| p.next_steps.clone())
+    }
+
     /// Drops a pending flow belonging to `identity`, leaving another
     /// identity's alone. What a connect that settles the same credential by
     /// another route (a pasted token) and a disconnect both do: the flow in
@@ -9803,9 +18475,21 @@ impl Engine {
     /// user reports `pending_connect`; one that landed since the last call
     /// is reported here exactly once and the slot is cleared - a successful
     /// sign-in folds into `connected`/`user`, while an expired or declined
-    /// one surfaces as an error (its message is already actionable) instead
-    /// of being silently swallowed.
+    /// one is built from [`Engine::origin_connection_json`] the same way the
+    /// success case is, so a re-connect attempt on an instance that already
+    /// has a working credential still reports `connected: true` and that
+    /// credential's `user`/`token_store` - with `error` and `next_steps` (the
+    /// guidance the flow started with, see [`Engine::pending_next_steps_for`])
+    /// added beside them, telling the caller to connect again and click
+    /// Authorize this time, rather than surfacing a bare error a model has
+    /// nothing to act on.
     async fn configure_connection_block(&self) -> Result<Value> {
+        // Read before `take_finished_pending` below, which clears the very
+        // slot this comes from: an outcome cannot land without a
+        // `PendingConnect` first existing for the same identity, so the
+        // `unwrap_or_default` a few lines down is unreachable in practice -
+        // kept only so a landed outcome can never itself fail this call.
+        let landed_guidance = self.pending_next_steps_for(&TokenIdentity::Instance);
         if let Some(outcome) = self.take_finished_pending() {
             return match outcome {
                 Ok(_user) => {
@@ -9813,7 +18497,16 @@ impl Engine {
                     github["pending_connect"] = Value::Null;
                     Ok(github)
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => {
+                    let mut github = self.origin_connection_json().await?;
+                    github["pending_connect"] = Value::Null;
+                    github["error"] = json!(e.to_string());
+                    github["next_steps"] = json!(Self::retry_guidance(
+                        &e,
+                        landed_guidance.as_deref().unwrap_or_default()
+                    ));
+                    Ok(github)
+                }
             };
         }
         if let Some(view) = self.pending_view() {
@@ -9827,6 +18520,39 @@ impl Engine {
         let mut github = self.origin_connection_json().await?;
         github["pending_connect"] = Value::Null;
         Ok(github)
+    }
+
+    /// What to tell the caller after a device flow lands as a failure: retry
+    /// wording that names the reason distinctly for an expired code versus a
+    /// declined one where the outcome can tell them apart, falling back to a
+    /// generic reason otherwise, followed by `landed_guidance` (the same
+    /// confirmation guidance the flow started with, so the authorized-apps
+    /// url and the Authorize reminder are never phrased twice). Its only
+    /// caller is [`Engine::configure_connection_block`] right above; kept as
+    /// an associated function (it needs no `self`) rather than a free one so
+    /// it stays beside that caller.
+    fn retry_guidance(e: &RemoteError, landed_guidance: &str) -> String {
+        let reason = match e {
+            RemoteError::AuthExpired => "the code expired before it was authorized",
+            // `poll_device_flow_once` (crates/remote/src/github/auth.rs) maps
+            // GitHub's `access_denied` to exactly this status and message; a
+            // 403 from elsewhere in the same background task
+            // (validate_token, an enterprise SAML/token restriction) is a 403
+            // too, so the message is matched as well as the status rather
+            // than assuming every 403 here is a declined device-flow
+            // confirmation.
+            RemoteError::Api {
+                status: 403,
+                message,
+            } if message.as_str() == "the sign-in was declined on GitHub" => {
+                "the sign-in was declined on GitHub"
+            }
+            _ => "the sign-in did not complete",
+        };
+        format!(
+            "{reason}. Call configure with connect \"github\" again to start a new sign-in, \
+             and this time click Authorize on the page after the code. {landed_guidance}"
+        )
     }
 
     /// The token-store host this connect targets: `github.api_url`'s bare
@@ -10003,12 +18729,16 @@ impl Engine {
             .await?;
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan(token_host.as_deref())?;
-        plan.save(&StoredToken {
-            access_token: token.to_string(),
-            host: token_host.unwrap_or_else(|| "github.com".to_string()),
-            user: user.clone(),
-            created_at: chrono::Utc::now(),
-        })?;
+        save_off_runtime(
+            plan,
+            StoredToken {
+                access_token: token.to_string(),
+                host: token_host.unwrap_or_else(|| "github.com".to_string()),
+                user: user.clone(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await?;
         self.clear_pending_for(&TokenIdentity::Instance);
 
         let mut github = self.origin_connection_json().await?;
@@ -10030,7 +18760,13 @@ impl Engine {
     /// the flow, never blocking on the user confirming the code. Refuses up
     /// front, before starting anything, when `CRYSTALLINE_GITHUB_TOKEN` is
     /// set: this machine's identity is already fixed by the environment.
-    pub async fn start_device_connect(&self, host: Option<&str>) -> Result<Value> {
+    ///
+    /// `restart` abandons a sign-in already pending and starts a fresh code,
+    /// for the person who never saw the first one or let it go stale. Without
+    /// it a second call reports the outstanding code as before, now with one
+    /// sentence naming `restart` so the way out is in the response rather
+    /// than in somebody's memory.
+    pub async fn start_device_connect(&self, host: Option<&str>, restart: bool) -> Result<Value> {
         if self.overlay.github_token().is_some() {
             return Err(EngineError::EnvTokenConnect);
         }
@@ -10038,10 +18774,18 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let Some(view) = self
-            .begin_device_flow(&TokenIdentity::Instance, host)
+            .begin_device_flow(&TokenIdentity::Instance, host, restart)
             .await?
         else {
-            let github = self.configure_connection_block().await?;
+            let mut github = self.configure_connection_block().await?;
+            // The code is the one already outstanding, so say how to give up
+            // on it. Only on this branch: the sentence is about a SECOND
+            // connect call, and repeating it on a first one would advertise
+            // abandoning a code the caller has not even relayed yet.
+            if let Some(next_steps) = github["pending_connect"]["next_steps"].as_str() {
+                let extended = format!("{next_steps} {RESTART_SENTENCE}");
+                github["pending_connect"]["next_steps"] = json!(extended);
+            }
             return self.configure_snapshot_with(github);
         };
 
@@ -10073,14 +18817,52 @@ impl Engine {
     /// saved and every status reads the store, so the only thing dropped is an
     /// unread error line for a flow nobody came back to look at - and the slot
     /// is taken over.
+    ///
+    /// `restart` is the escape hatch for the one case that used to have none:
+    /// a flow whose code the person lost, or never saw, with a slot that only
+    /// ever answered with that same unusable code. With it set, this identity's
+    /// pending flow is ABANDONED - its background task aborted and its record
+    /// dropped, so the fresh `outcome` slot below cannot be written by the old
+    /// task - and a new sign-in is started. It abandons only this identity's
+    /// flow: another identity's still refuses with
+    /// [`EngineError::ConnectInProgress`], since a restart is a statement
+    /// about one's own sign-in, never a licence to cancel somebody else's.
     async fn begin_device_flow(
         &self,
         identity: &TokenIdentity,
         host: Option<&str>,
+        restart: bool,
     ) -> Result<Option<Value>> {
         {
             let mut guard = self.pending_connect.lock().unwrap();
             match guard.as_ref() {
+                // A landed outcome is not a flow to abandon, so the
+                // restart arm asks for one that is still running. Without
+                // that, `restart: true` against a sign-in that already
+                // finished threw away its one-shot report and answered with a
+                // fresh code beside `connected: true`. Falling through to the
+                // arm below instead answers `None`, which is what makes the
+                // caller's status read drain the outcome and say what
+                // happened; the slot is clear afterwards, so a second restart
+                // starts fresh.
+                Some(p)
+                    if p.identity == *identity
+                        && restart
+                        && p.outcome.lock().unwrap().is_none() =>
+                {
+                    // Abort first, then drop: the task stops at its next poll
+                    // and the record it would have written into is gone
+                    // either way, since the fresh flow below builds its own
+                    // outcome slot.
+                    if let Some(handle) = &p.abort {
+                        handle.abort();
+                    }
+                    tracing::info!(
+                        identity = %identity_label(identity),
+                        "github device sign-in abandoned on request; starting a fresh code"
+                    );
+                    *guard = None;
+                }
                 Some(p) if p.identity == *identity => return Ok(None),
                 Some(p) if p.outcome.lock().unwrap().is_some() => *guard = None,
                 Some(_) => return Err(EngineError::ConnectInProgress),
@@ -10091,50 +18873,123 @@ impl Engine {
         let api_url = self.connect_api_url(host);
         let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
         let client_id = self.oauth_client_id();
-        let start = self
-            .connect_auth
-            .start_device_flow(&auth_base, &client_id)
-            .await?;
-
-        let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let pending = PendingConnect {
-            identity: identity.clone(),
-            user_code: start.user_code.clone(),
-            verification_url: start.verification_url.clone(),
-            expires_in_secs: start.expires_in_secs,
-            outcome: outcome_slot.clone(),
-        };
-        let view = json!({
-            "pending": true,
-            "user_code": pending.user_code,
-            "verification_url": pending.verification_url,
-            "expires_in_secs": pending.expires_in_secs,
-        });
-        *self.pending_connect.lock().unwrap() = Some(pending);
-
-        let auth = self.connect_auth.clone();
+        let label = identity_label(identity);
+        // Where this identity's token will be saved, resolved BEFORE anything
+        // is started. It is fallible, and it used to run after the pending
+        // record was already in the slot, which left a failure holding a slot
+        // with no task in it. Resolved here, a failure costs nothing at all:
+        // no code has been asked for and no record exists.
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
-        tokio::spawn(async move {
-            let result: std::result::Result<String, RemoteError> = async {
-                let access_token = auth.run_device_flow(&auth_base, &client_id, &start).await?;
+        let start = match self
+            .connect_auth
+            .start_device_flow(&auth_base, &client_id)
+            .await
+        {
+            Ok(start) => start,
+            Err(e) => {
+                tracing::warn!(
+                    identity = %label,
+                    step = "start",
+                    error = %e,
+                    "github device sign-in could not be started"
+                );
+                return Err(e.into());
+            }
+        };
+        tracing::info!(
+            identity = %label,
+            user_code = %start.user_code,
+            expires_in_secs = start.expires_in_secs,
+            "github device sign-in started",
+        );
+
+        let next_steps = crystalline_remote::github::auth::confirmation_guidance(&auth_base);
+        let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let auth = self.connect_auth.clone();
+        let task_label = label.clone();
+        // Cloned for the record below, which is now built after the spawn: the
+        // task owns the poll's copy of the start and the outcome slot.
+        let user_code = start.user_code.clone();
+        let verification_url = start.verification_url.clone();
+        let expires_in_secs = start.expires_in_secs;
+        let record_slot = outcome_slot.clone();
+        let task = tokio::spawn(async move {
+            let result: std::result::Result<String, (&'static str, RemoteError)> = async {
+                let access_token = auth
+                    .run_device_flow(&auth_base, &client_id, &start)
+                    .await
+                    .map_err(|e| ("poll", e))?;
+                tracing::info!(
+                    identity = %task_label,
+                    "github device sign-in: access token received from GitHub"
+                );
                 let user = auth
                     .validate_token(api_url.as_deref(), &access_token)
-                    .await?;
-                plan.save(&StoredToken {
+                    .await
+                    .map_err(|e| ("validate", e))?;
+                tracing::info!(
+                    identity = %task_label,
+                    login = %user,
+                    "github device sign-in: token validated"
+                );
+                let stored = StoredToken {
                     access_token,
                     host: token_host
                         .clone()
                         .unwrap_or_else(|| "github.com".to_string()),
                     user: user.clone(),
                     created_at: chrono::Utc::now(),
-                })?;
+                };
+                // The save touches the OS keychain, which is a blocking call
+                // with a bound but no cancellation: off the runtime's worker
+                // it goes, so a slow keychain cannot stall unrelated work.
+                save_off_runtime(plan, stored)
+                    .await
+                    .map_err(|e| ("save", e))?;
                 Ok(user)
             }
             .await;
+            let result = match result {
+                Ok(user) => Ok(user),
+                Err((step, e)) => {
+                    tracing::warn!(
+                        identity = %task_label,
+                        step,
+                        error = %e,
+                        "github device sign-in failed"
+                    );
+                    Err(e)
+                }
+            };
             *outcome_slot.lock().unwrap() = Some(result);
         });
+
+        // The record is built and inserted AFTER the task, complete, under one
+        // lock. It used to be inserted first and have its abort handle written
+        // back under a second acquisition, which left a window: two concurrent
+        // restarts of the same identity could store the first task's handle on
+        // the second record, and a later restart would then abort a task that
+        // was already dead while a live one kept polling GitHub. One
+        // acquisition, one whole record, no window.
+        let pending = PendingConnect {
+            identity: identity.clone(),
+            user_code,
+            verification_url,
+            expires_in_secs,
+            started_at: tokio::time::Instant::now(),
+            next_steps: next_steps.clone(),
+            outcome: record_slot,
+            abort: Some(task.abort_handle()),
+        };
+        // The view comes from the record in hand rather than from a read-back
+        // of the slot. A `clear_pending_for` landing in that window - a pasted
+        // token, a disconnect - made the read-back answer `None`, and a flow
+        // that HAD started was then reported as no flow at all.
+        let view = pending.view();
+        *self.pending_connect.lock().unwrap() = Some(pending);
         Ok(Some(view))
     }
 
@@ -10207,12 +19062,16 @@ impl Engine {
             .await?;
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan_for(&identity, token_host.as_deref())?;
-        plan.save(&StoredToken {
-            access_token: token.to_string(),
-            host: token_host.unwrap_or_else(|| "github.com".to_string()),
-            user,
-            created_at: chrono::Utc::now(),
-        })?;
+        save_off_runtime(
+            plan,
+            StoredToken {
+                access_token: token.to_string(),
+                host: token_host.unwrap_or_else(|| "github.com".to_string()),
+                user,
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await?;
         // A pasted token settles this identity now, so a device flow of this
         // person's still in flight must not land on top of it later.
         self.clear_pending_for(&identity);
@@ -10226,13 +19085,20 @@ impl Engine {
     ///
     /// One sign-in at a time across the whole engine: a second account's
     /// connect while this one runs is [`EngineError::ConnectInProgress`], and
-    /// the same account asking again reports the code already outstanding.
-    pub async fn start_github_identity_device_flow(&self, account: &str) -> Result<GithubIdentity> {
+    /// the same account asking again reports the code already outstanding -
+    /// unless `restart` is set, which abandons this account's own pending
+    /// flow and issues a fresh code. A restart never touches another
+    /// identity's flow; that is still refused.
+    pub async fn start_github_identity_device_flow(
+        &self,
+        account: &str,
+        restart: bool,
+    ) -> Result<GithubIdentity> {
         let identity = personal_identity(account)?;
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.begin_device_flow(&identity, None).await?;
+        self.begin_device_flow(&identity, None, restart).await?;
         self.github_identity_status(account).await
     }
 
@@ -10395,6 +19261,14 @@ fn context_rank(slice: &GraphSlice, seed_ids: &HashSet<i64>) -> HashMap<i64, f64
     ids.into_iter().zip(rank).collect()
 }
 
+/// What a second connect call adds to the outstanding flow's guidance: the
+/// way to give up on a code the person cannot use. Appended only on that
+/// branch (see [`Engine::start_device_connect`]), so a first connect never
+/// advertises abandoning a code nobody has tried yet.
+const RESTART_SENTENCE: &str = "If this code is not usable - it was never seen, or it has gone \
+                                stale - call configure again with connect \"github\" and restart \
+                                true to abandon it and get a fresh one.";
+
 /// The one-line status paired with `github_enabled` in a fresh connect
 /// response (see [`Engine::connect_with_token`] and
 /// [`Engine::start_device_connect`]), so an agent narrates enablement from
@@ -10436,10 +19310,17 @@ pub struct GithubConnection {
     pub error: Option<String>,
 }
 
+/// The half of a running device flow a surface has to show: the code, where
+/// to enter it, and how long is LEFT to do so.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GithubPending {
     pub user_code: String,
     pub verification_url: String,
+    /// Seconds REMAINING before the code expires, recomputed on every read
+    /// and saturating at 0 - not the flow's original lifetime. A caller that
+    /// polls therefore watches it fall, which is what distinguishes a live
+    /// sign-in from a wedged one; a countdown in a UI can simply start from
+    /// this number.
     pub expires_in_secs: u64,
 }
 
@@ -10487,11 +19368,60 @@ struct PendingConnect {
     /// Where the user confirms the code.
     verification_url: String,
     /// How many seconds from when the flow started it stops being valid.
+    /// Never reported as such: every surface reports what is LEFT of it,
+    /// derived here against `started_at` (see [`Engine::pending_view_for`]).
     expires_in_secs: u64,
+    /// When the flow started, so a pending view counts down instead of
+    /// repeating the original expiry on every call. A frozen number is what
+    /// made a live sign-in look stuck; a falling one is the cheapest possible
+    /// proof that the flow is still running.
+    ///
+    /// `tokio::time::Instant` rather than `std::time::Instant` deliberately:
+    /// the daemon's clock here is the runtime's, so a test can pause it and
+    /// advance it rather than sleeping through a real code lifetime.
+    started_at: tokio::time::Instant,
+    /// The background task running this flow, so a restart can abandon it
+    /// rather than leave it to land on top of the fresh sign-in. Filled in
+    /// immediately after the spawn (the handle does not exist yet when this
+    /// record is built), and `None` only in that instant.
+    abort: Option<tokio::task::AbortHandle>,
+    /// What to do after the code is entered and how to tell whether it
+    /// landed, computed once at flow start from that flow's own auth base
+    /// (see [`crystalline_remote::github::auth::confirmation_guidance`]) so
+    /// a GHES sign-in and a github.com one each carry their own applications
+    /// url. Read back by every surface that reports this pending flow.
+    next_steps: String,
     /// `None` while still waiting on the user; set once by the background
     /// task that runs the flow to completion, to either the signed-in login
     /// or the error that ended the flow (expired, declined, offline).
     outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
+}
+
+impl PendingConnect {
+    /// How many seconds of this code's life are left, saturating at 0. The
+    /// one place the countdown is computed, so the MCP view and the REST one
+    /// can never report different numbers for the same flow.
+    fn remaining_secs(&self) -> u64 {
+        self.expires_in_secs
+            .saturating_sub(self.started_at.elapsed().as_secs())
+    }
+
+    /// What a caller is shown about this flow: the code, where to type it, how
+    /// long it lives and what to do next.
+    ///
+    /// A method on the record rather than on the engine, so the answer can be
+    /// built from a record in hand as well as from one read back out of the
+    /// slot - which is what keeps a flow that HAS started from being reported
+    /// as no flow when something clears the slot in between.
+    fn view(&self) -> Value {
+        json!({
+            "pending": true,
+            "user_code": self.user_code,
+            "verification_url": self.verification_url,
+            "expires_in_secs": self.remaining_secs(),
+            "next_steps": self.next_steps,
+        })
+    }
 }
 
 /// How a connect flow persists a freshly issued token: where it writes and the
@@ -10528,12 +19458,59 @@ enum SaveTarget {
     },
 }
 
+/// How a credential's owner is named in a log line: `instance` for the
+/// machine's own, `personal:<account>` for one person's. Never a token, never
+/// a device code - just enough to tell two concurrent sign-ins apart in a
+/// daemon log a colleague pastes into a support thread.
+fn identity_label(identity: &TokenIdentity) -> String {
+    match identity {
+        TokenIdentity::Instance => "instance".to_string(),
+        TokenIdentity::Personal(name) => format!("personal:{name}"),
+    }
+}
+
+/// Runs a [`TokenSavePlan`] on the blocking pool, so the OS keychain write it
+/// performs never occupies an async worker. `crystalline_remote::token` bounds
+/// every keychain call at fifteen seconds, so this cannot park a blocking
+/// thread forever either; the two together are why a wedged keychain now
+/// degrades a sign-in instead of freezing the daemon.
+///
+/// A panic in the save is reported as a credential failure rather than
+/// unwrapped: the caller is a background flow whose whole job is to land an
+/// outcome, and a task that disappeared without one is exactly the silence
+/// this change exists to remove.
+async fn save_off_runtime(
+    plan: TokenSavePlan,
+    token: StoredToken,
+) -> std::result::Result<(), RemoteError> {
+    // Where the token landed is only known after the write - `save_resolving`
+    // falls through to the file store on its own - so the line is emitted
+    // here, back on the runtime, rather than inside the blocking closure.
+    // Both connect paths save through this function, so both get the line.
+    let identity = identity_label(&plan.identity);
+    match tokio::task::spawn_blocking(move || plan.save(&token)).await {
+        Ok(Ok(store)) => {
+            tracing::info!(identity = %identity, store, "github token saved");
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(RemoteError::Credential {
+            detail: format!("could not save the GitHub token: {e}"),
+        }),
+    }
+}
+
 impl TokenSavePlan {
     /// Writes `token` once (through the override file or `save_resolving`) then
     /// refreshes this host's cache entry, so the very next `github_credential`
     /// serves the new identity without another keychain read. A connect is
     /// therefore one keychain write and zero reads.
-    fn save(&self, token: &StoredToken) -> std::result::Result<(), RemoteError> {
+    ///
+    /// Answers WHERE the token landed (`"keyring"` or `"file"`), which only
+    /// this call knows: `save_resolving` falls through to the file store by
+    /// itself when the keychain refuses or does not answer in time.
+    /// [`save_off_runtime`] turns that into the one "token saved" log line.
+    fn save(&self, token: &StoredToken) -> std::result::Result<&'static str, RemoteError> {
         let store = match &self.target {
             SaveTarget::File(store) => {
                 store.save(token)?;
@@ -10550,6 +19527,7 @@ impl TokenSavePlan {
         // refreshed the instance entry would both strand the stale personal
         // client (the very next share would use the token just replaced) and
         // hand the machine's reads somebody's personal credential.
+        let kind = store.kind();
         let key = credential_cache_key(&self.identity, self.host.as_deref());
         self.cache.lock().unwrap().insert(
             key,
@@ -10558,7 +19536,7 @@ impl TokenSavePlan {
                 token: token.clone(),
             },
         );
-        Ok(())
+        Ok(kind)
     }
 }
 
@@ -10766,9 +19744,21 @@ pub async fn open_standalone(
     // through so a domain registered mid-command persists to, and re-reads from,
     // the same file even when it came from `CRYSTALLINE_CONFIG`.
     let read_only = effective.read_only();
-    let engine = Engine::new(store, file, None, Some(path))
+    let mut engine = Engine::new(store, file, None, Some(path))
         .with_read_only(read_only)
         .with_env_overlay(overlay);
+    // The daemonless engine is told where this machine's state directory is,
+    // rather than leaving [`Engine::journal_state_dir`] to resolve it. Both
+    // halves matter. In production it is the same path either way, and saying
+    // it here is what keeps a one-shot `crystalline write` into a domain in
+    // review mode able to mirror the draft it just wrote. Under the test seam
+    // the resolver refuses instead of falling back, so without this line every
+    // draft a CLI test writes would fail - and with it, the path resolves
+    // inside whatever isolated `HOME` that test set, which is the same
+    // directory `crystalline reindex --wipe` already restores drafts from.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        engine = engine.with_state_dir(state);
+    }
     // Build the provider (which may download the model) only when the index
     // already holds embeddings for the active model, so a text or filter search
     // never triggers a surprise download. With no embeddings, search falls back
@@ -10824,7 +19814,13 @@ pub async fn run_embed_worker(
         while rx.try_recv().is_ok() {}
         match engine.embed_pending().await {
             Ok(0) => {}
-            Ok(_) => {
+            Ok(n) => {
+                // The count the daemon's startup pass used to log itself. It
+                // belongs here now that every pass comes through the worker,
+                // and stays at info: the worker coalesces a burst of requests
+                // into one pass, so a large first index is one line, not
+                // thousands.
+                tracing::info!("embedded {n} chunk(s)");
                 // The engine passive-checkpoints on its own past a hardcoded
                 // un-backfilled-frame threshold, so this is disk reclamation
                 // of the post-bulk-embed high-water mark, not growth control.
@@ -10882,8 +19878,8 @@ fn parse_families(requested: &[String]) -> Result<Vec<Family>> {
 }
 
 /// Parse the requested rule ids into their catalog spellings, erroring on an
-/// unknown id with the whole catalog named. The reserved `V3xx` range is not in
-/// the catalog, so asking for it errors here rather than returning silence.
+/// unknown id with the whole catalog named. An id outside the catalog errors
+/// here rather than returning silence.
 fn parse_rules(requested: &[String]) -> Result<Vec<&'static str>> {
     let mut out: Vec<&'static str> = Vec::new();
     for raw in requested {
@@ -10954,6 +19950,109 @@ fn host_refusal(name: &str, host: &DomainHost) -> String {
         "domain '{name}' is hosted by instance {} (last heartbeat {}); this instance serves it read-from-database only. Pass --take-over to migrate hosting here.",
         host.instance_id, host.heartbeat_at
     )
+}
+
+/// What presenting a draft share-link did.
+///
+/// Two answers rather than an answer and an error, because binding the link and
+/// joining the draft are two steps and only the first of them decides whether
+/// the caller may SEE the draft. A reader who may not edit it, and one already
+/// working in as many drafts as this instance keeps open for one account, have
+/// each redeemed the link and may read what it opens; a read that failed on
+/// either would be answering a question nobody asked. Every way the link itself
+/// fails to open anything stays an error, because that caller has to be told.
+pub enum OpenedLink {
+    /// The link bound and this holder is inside the draft.
+    Joined {
+        /// The key this holder presents the join with.
+        key: String,
+        /// The join itself, which is what routes a write.
+        join: crate::join::Join,
+    },
+    /// The link bound and the draft is readable; the join was refused, and the
+    /// sentence says why. A write is refused with it; a read is not.
+    ReadOnly(String),
+}
+
+/// The document a wholesale capture would replace, when somebody has it open.
+///
+/// Both fields are what the question needs and neither is the caller's to
+/// derive: the permalink is where the title would land, and `present` is who
+/// is in the room with the agent asking - its own slot left out, the way every
+/// other answer about a room leaves it out.
+pub struct LiveWriteTarget {
+    /// The permalink the capture resolved to, so the question names the engram
+    /// rather than the title typed at it.
+    pub permalink: String,
+    /// Who is in the room over it right now, in the order the room reports.
+    pub present: Vec<String>,
+}
+
+/// What one source edit did: the mirror warning it may owe, and - when a
+/// co-editing room was open over the engram - the live document it landed in
+/// instead of the file or the row.
+///
+/// Two fields rather than one return value each, because both travel to the
+/// same place: the receipt the caller builds. `live` is `None` for nearly
+/// every edit there is, which is the ordinary write path saying it wrote
+/// ordinarily.
+struct SourceEdited {
+    /// The unmirrored-draft warning, when the write owed one.
+    warning: Option<String>,
+    /// The live document this edit composed into, when one was open.
+    live: Option<crate::collab::session::LiveApplied>,
+}
+
+/// A source edit that failed, and whether the source may already carry the new
+/// bytes when it did.
+///
+/// The flag is the whole point of the type. [`Engine::split_engram_as`] writes a
+/// second engram before it edits the source, and it may only take that engram
+/// back while the source is provably as it was; once the source has been
+/// rewritten, deleting the new engram is what would lose the moved
+/// observations, since the source no longer holds them.
+struct SourceEditFailure {
+    /// Whether the source's stored bytes may already be the edited ones.
+    wrote: bool,
+    /// The failure itself, reported to the caller unchanged.
+    error: EngineError,
+}
+
+impl SourceEditFailure {
+    /// A failure with the source still as it was: the read, the checksum
+    /// compare, the edit itself, the temporal enforcement or a refused write.
+    fn before(error: EngineError) -> SourceEditFailure {
+        SourceEditFailure {
+            wrote: false,
+            error,
+        }
+    }
+
+    /// A failure with the source's bytes already replaced, or possibly
+    /// replaced: the reindex that follows a file write, and any failure of the
+    /// virtual store call that both swaps and indexes.
+    fn after(error: EngineError) -> SourceEditFailure {
+        SourceEditFailure { wrote: true, error }
+    }
+}
+
+/// What a split resolved to: the text leaving the source, the text staying and
+/// how much of each kind of thing moved.
+struct SplitPlan {
+    /// The selected lines, in source order, with surrounding blank lines
+    /// trimmed off.
+    moved: String,
+    /// The source with those lines gone, frontmatter and all.
+    remaining: String,
+    /// How many distinct observation bullets moved. A bullet that also sits
+    /// inside a moved section is counted here as well, since the caller named
+    /// it both ways.
+    observations: usize,
+    /// How many distinct sections moved: line ranges rather than paths, so two
+    /// spellings of one heading count once. A path naming a subsection of
+    /// another moved section is a different range and counts separately, which
+    /// is the honest answer to "how many sections did you name that moved".
+    sections: usize,
 }
 
 fn section_err(e: crystalline_core::emit::EditError) -> EngineError {
@@ -11160,7 +20259,7 @@ fn reserved_name_error(rel: &str) -> String {
 
 /// Join a forward-slashed domain-relative path onto a root, per-segment so it is
 /// correct on every platform.
-fn join_rel(root: &Path, rel: &str) -> PathBuf {
+pub(crate) fn join_rel(root: &Path, rel: &str) -> PathBuf {
     let mut p = root.to_path_buf();
     for seg in rel.split('/').filter(|s| !s.is_empty()) {
         p.push(seg);
@@ -11179,7 +20278,7 @@ fn join_rel(root: &Path, rel: &str) -> PathBuf {
 /// file, so a save, a move or a restore addressing that engram has to keep
 /// working. [`is_contained_rel`] adds the character rules on top, for the paths
 /// that arrive from outside.
-fn is_within_domain(rel: &str) -> bool {
+pub(crate) fn is_within_domain(rel: &str) -> bool {
     !rel.is_empty()
         && !Path::new(rel).is_absolute()
         && rel
@@ -11192,7 +20291,7 @@ fn is_within_domain(rel: &str) -> bool {
 /// filename here. A backslash or a colon inside a segment is refused because
 /// both are separators or drive and stream markers on Windows, where a name
 /// that looks contained on one platform escapes on another.
-fn is_contained_rel(rel: &str) -> bool {
+pub(crate) fn is_contained_rel(rel: &str) -> bool {
     is_within_domain(rel) && rel.split('/').all(|seg| !seg.contains(['\\', ':']))
 }
 
@@ -11275,7 +20374,7 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
 /// [`crystalline_core::validate_asset_path`]'s rules - the reserved prefix, the
 /// segment rules, the character rules, the length ceiling and the extension
 /// allowlist - reported as a malformed request.
-fn validate_attachment_path(path: &str) -> Result<()> {
+pub(crate) fn validate_attachment_path(path: &str) -> Result<()> {
     crystalline_core::validate_asset_path(path)
         .map_err(|e| EngineError::Invalid(format!("attachment path '{path}': {e}")))
 }
@@ -11322,10 +20421,25 @@ fn contained_asset_path(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(abs)
 }
 
+/// What an attachment write landed as: the row that now describes it, and
+/// whether it is this actor's own draft rather than the domain's file.
+///
+/// `draft` is the whole of what review mode adds to an upload, so it rides out
+/// on the receipt rather than being inferred from the domain's configuration by
+/// whoever renders it.
+#[derive(Debug, Clone)]
+pub struct WrittenAttachment {
+    /// The row describing the bytes as stored.
+    pub row: AttachmentRow,
+    /// Whether the bytes landed in the writer's own files overlay rather than
+    /// in the folder the team reviewed.
+    pub draft: bool,
+}
+
 /// The metadata row describing these bytes at this path. The mime comes from
 /// the extension and never from a caller, which is why this cannot be built
 /// before [`validate_attachment_path`] has accepted the path.
-fn attachment_row(path: &str, bytes: &[u8], modified: String) -> Result<AttachmentRow> {
+pub(crate) fn attachment_row(path: &str, bytes: &[u8], modified: String) -> Result<AttachmentRow> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let mime = crystalline_core::attachment_mime(name).ok_or_else(|| {
         EngineError::Invalid(format!(
@@ -11465,14 +20579,6 @@ fn asset_tail(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// The `assets/` path an engram's `analyzes` claim names, or `None` when it
-/// claims nothing under the folder.
-///
-/// `analyzes` is ordinary custom frontmatter (the agent's act of claiming an
-/// attachment it read), so the value is whatever was written there: a leading
-/// `./` is stripped and the folder segment is folded to its canonical
-/// spelling, and anything that does not address the reserved folder at all is
-/// not a claim.
 /// One domain's sweep: its report and how many of its engrams no longer parse.
 struct DomainSweep {
     /// The ranked findings for that domain, acknowledgments already applied.
@@ -11652,47 +20758,90 @@ fn acks_of(source: &str) -> Vec<EvolveAck> {
         .unwrap_or_default()
 }
 
-/// Whether the engram acknowledges `rule` at all.
+/// Whether the engram acknowledges `rule` at all, or - when `scope` names a
+/// pair - acknowledges that pair.
 ///
-/// Case-folded, like every other rule comparison on this path: a hand-written
-/// `- { rule: v101 }` suppresses findings, so it has to be findable - and
-/// withdrawable - too.
-fn has_ack(source: &str, rule: &str) -> bool {
-    acks_of(source)
-        .iter()
-        .any(|a| a.rule.eq_ignore_ascii_case(rule))
+/// Case-folded on the rule, like every other rule comparison on this path: a
+/// hand-written `- { rule: v101 }` suppresses findings, so it has to be
+/// findable - and withdrawable - too. The scope is compared exactly, being one
+/// value the sweep renders rather than something anybody types.
+fn has_ack(source: &str, rule: &str, scope: Option<&str>) -> bool {
+    acks_of(source).iter().any(|a| ack_names(a, rule, scope))
 }
 
-/// The engram's markdown with `rule`'s acknowledgment dropped and every other
-/// entry left exactly as it was. Removing the last one removes the key rather
-/// than leaving an empty one ([`set_evolve_ack`] on an empty slice).
+/// Whether one entry is what `rule` and an optional `scope` name. The scope
+/// half is what makes a withdrawal able to take one twin pair back and leave
+/// the engram's other pair silenced; without one, every entry for the rule is
+/// named.
+///
+/// An entry that carries no scope of its own - a hand-written line, or an
+/// acknowledgment given before its rule fired - is never what a named pair
+/// means: it was given for nothing in particular, so a request naming a pair
+/// leaves it alone rather than removing an answer it did not ask about.
+fn ack_names(entry: &EvolveAck, rule: &str, scope: Option<&str>) -> bool {
+    entry.rule.eq_ignore_ascii_case(rule)
+        && match scope {
+            Some(scope) => entry.scope.as_deref() == Some(scope),
+            None => true,
+        }
+}
+
+/// The engram's markdown with the acknowledgment `rule` and an optional
+/// `scope` name dropped, and every other entry left exactly as it was.
+/// Removing the last one removes the key rather than leaving an empty one
+/// ([`set_evolve_ack`] on an empty slice).
 ///
 /// The one removal both surfaces run: Fluid's withdraw
 /// ([`Engine::unacknowledge_finding_as`]) and an agent's `remove <rule-id>`
-/// value. They differ only in how they report an entry that is not there - a
+/// value. They differ in how they report an entry that is not there - a
 /// `false` the REST layer answers as a 404, an error the agent reads - which is
-/// why the presence test is [`has_ack`] beside this rather than folded into it.
-fn without_ack(source: &str, rule: &str) -> String {
+/// why the presence test is [`has_ack`] beside this rather than folded into it,
+/// and in that only the first can name a pair: the agent's value form carries a
+/// rule id and nothing else, so it takes every entry the rule has.
+fn without_ack(source: &str, rule: &str, scope: Option<&str>) -> String {
     let kept: Vec<EvolveAck> = acks_of(source)
         .into_iter()
-        .filter(|a| !a.rule.eq_ignore_ascii_case(rule))
+        .filter(|a| !ack_names(a, rule, scope))
         .collect();
     set_evolve_ack(source, &kept)
 }
 
-/// The engram's acknowledgments with `entry` folded in: one entry per rule, so
-/// re-acknowledging a finding replaces what it said rather than stacking a
-/// second line nobody reads. The replacement keeps the original position, which
-/// keeps a hand-ordered list hand-ordered.
+/// The engram's acknowledgments with `entry` folded in: **one entry per rule,
+/// except for a pair-scoped rule, which keeps one per pair**. Re-acknowledging
+/// replaces what the entry said rather than stacking a second line nobody
+/// reads. The replacement keeps the original position, which keeps a
+/// hand-ordered list hand-ordered.
+///
+/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` - and it
+/// exists because a twin finding is about a pair rather than about the engram:
+/// an engram that twins two others carries two twin findings and neither is the
+/// engram's answer about the rule. Keying those by rule alone made the second
+/// acknowledgment overwrite the first, which silenced one pair and left the
+/// other standing with somebody else's note on it. Every other rule's entry
+/// **is** that answer, so replacing it on re-acknowledgment is what keeps
+/// exactly one entry there however often the evidence moves, and that in turn
+/// is what lets a later drift come back marked stale (the sweep can only call
+/// an entry stale when it is the only one for its rule). That is the rule even
+/// for one that can fire more than once on an engram - `V103` fires once per
+/// reciprocal pair - and the cost is deliberate: those findings share the one
+/// entry, so the second acknowledgment replaces the first and the finding it
+/// was not given for comes back stale wearing that note.
+///
+/// A scope-less entry - what a hand-written line or an acknowledgment given
+/// before the rule fires carries - is a pair of its own under the pair-scoped
+/// rule, and keeps matching whatever that rule finds.
 fn merged_acks(source: &str, entry: EvolveAck) -> Vec<EvolveAck> {
+    let per_pair = crystalline_index::is_pair_scoped(&entry.rule);
     let mut entries = acks_of(source);
     let mut replaced = false;
     entries.retain_mut(|existing| {
-        if !existing.rule.eq_ignore_ascii_case(&entry.rule) {
+        if !existing.rule.eq_ignore_ascii_case(&entry.rule)
+            || (per_pair && existing.scope != entry.scope)
+        {
             return true;
         }
-        // A hand-edited file may name one rule twice; the entry just written is
-        // the survivor and the rest go, so the list stays one entry per rule.
+        // A hand-edited file may name one key twice; the entry just written is
+        // the survivor and the rest go, so the list stays one entry per key.
         if replaced {
             return false;
         }
@@ -11717,7 +20866,15 @@ fn ack_json(entry: &EvolveAck) -> Value {
     })
 }
 
-fn asset_claim(fm: &Frontmatter) -> Option<String> {
+/// The `assets/` path an engram's `analyzes` claim names, or `None` when it
+/// claims nothing under the folder.
+///
+/// `analyzes` is ordinary custom frontmatter (the agent's act of claiming an
+/// attachment it read), so the value is whatever was written there: a leading
+/// `./` is stripped and the folder segment is folded to its canonical
+/// spelling, and anything that does not address the reserved folder at all is
+/// not a claim.
+pub(crate) fn asset_claim(fm: &Frontmatter) -> Option<String> {
     let raw = fm.extra.get("analyzes")?.as_str()?.trim();
     crystalline_core::canonical_asset_path(raw.trim_start_matches("./"))
 }
@@ -11923,7 +21080,7 @@ fn rewrite_line_asset_refs(line: &str, renames: &BTreeMap<String, String>) -> St
 
 /// A file's modification instant in the spelling the sync walker records, so a
 /// row written here and a row written by a scan compare equal.
-fn asset_modified(abs: &Path) -> String {
+pub(crate) fn asset_modified(abs: &Path) -> String {
     let mtime = std::fs::metadata(abs)
         .map(|meta| mtime_secs(&meta))
         .unwrap_or_else(|_| Utc::now().timestamp());
@@ -11933,7 +21090,7 @@ fn asset_modified(abs: &Path) -> String {
 }
 
 /// The miss message every attachment verb reports, one spelling.
-fn missing_attachment(domain: &str, path: &str) -> String {
+pub(crate) fn missing_attachment(domain: &str, path: &str) -> String {
     format!("no attachment '{path}' in domain '{domain}'")
 }
 
@@ -11998,11 +21155,353 @@ fn assets_reserved_error(rel: &str) -> String {
     )
 }
 
+/// Put a mirror's failure on a draft's receipt, when there was one.
+///
+/// One field on every routed verb, so a caller learns the same thing the same
+/// way whichever verb it called, and a receipt with no such field means the
+/// draft is mirrored.
+pub(crate) fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
+    if let Some(text) = warning {
+        receipt["draft_warning"] = json!(text);
+    }
+}
+
+/// What a draft's receipt says when the row landed and this machine could not
+/// mirror it under the state directory.
+///
+/// One string for both shapes a draft's mirror can take: an ordinary write,
+/// and a tombstone, which `deleted` tells apart. Teaching text rather than a
+/// diagnostic: for a write, the draft is there and usable, the one thing that
+/// would lose it is named, and so is the way to make the copy exist again.
+/// For a tombstone a wipe does not lose an edit, it drops the tombstone row
+/// itself and finds nothing in the journal to restore, so the base row comes
+/// back - the deletion is reverted and the engram reappears - and "write it
+/// again" is not a remedy there (the path already resolves as absent for its
+/// author, so a second delete only answers "no engram"). The underlying error
+/// rides along because the cause is almost always a state directory that is
+/// not writable, which the reader can see and fix.
+pub(crate) fn unmirrored(
+    domain: &str,
+    actor: &str,
+    path: &str,
+    reason: &std::io::Error,
+    deleted: bool,
+) -> String {
+    if deleted {
+        format!(
+            "the deletion of '{path}' landed in the index, but this machine could not mirror it \
+             under its state directory ({reason}), so a 'crystalline reindex --wipe' would drop \
+             the tombstone and find nothing in the journal to restore, bringing the base row back \
+             - the deletion is reverted and the engram reappears; make the overlays folder for \
+             domain '{domain}' writable, or share the change while it is still here. Nobody but \
+             '{actor}' can see it either way."
+        )
+    } else {
+        format!(
+            "the draft of '{path}' landed in the index, but this machine could not mirror it under \
+             its state directory ({reason}), so a 'crystalline reindex --wipe' would lose it; make \
+             the overlays folder for domain '{domain}' writable and write again to mirror it, or \
+             share the change while it is still here. Nobody but '{actor}' can see it either way."
+        )
+    }
+}
+
+#[cfg(test)]
+mod unmirrored_tests {
+    use super::*;
+
+    fn io_error() -> std::io::Error {
+        std::io::Error::other("permission denied")
+    }
+
+    /// The tombstone shape names the reappearance on a wipe and never offers
+    /// "write again", which is not a remedy for a deletion.
+    #[test]
+    fn the_tombstone_wording_names_reappearance_and_drops_write_again() {
+        let text = unmirrored("jordi", "human:jordi", "notes/old", &io_error(), true);
+        assert!(
+            text.contains("reappears"),
+            "tombstone wording must name the reappearance, got: {text}"
+        );
+        assert!(
+            !text.contains("write again"),
+            "tombstone wording must not offer to write again, got: {text}"
+        );
+        assert!(
+            text.contains("share the change while it is still here"),
+            "tombstone wording must still offer to share, got: {text}"
+        );
+    }
+
+    /// The ordinary draft shape keeps offering "write again", which is the
+    /// remedy a lost edit actually has.
+    #[test]
+    fn the_draft_wording_keeps_write_again() {
+        let text = unmirrored("jordi", "human:jordi", "notes/old", &io_error(), false);
+        assert!(
+            text.contains("write again"),
+            "draft wording must offer to write again, got: {text}"
+        );
+    }
+}
+
+/// A browse prefix as a lowercased folder prefix: empty for the root, and
+/// otherwise ending in the slash that makes it a folder. The Rust counterpart
+/// of the backends' own `folder_slash`, used to cut draft paths to the level
+/// being browsed.
+pub(crate) fn folder_slash_lower(prefix: &str) -> String {
+    if prefix.is_empty() {
+        return String::new();
+    }
+    let mut out = prefix.to_lowercase();
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    out
+}
+
+/// The descriptor of one overlay entry, read out of the document the row
+/// carries.
+///
+/// `None` for a tombstone, which is a deletion rather than an engram, and for a
+/// row whose markdown no longer parses - a draft nobody can read is a draft
+/// nothing can traverse either. The `id` is the draft row's OWN id, which is
+/// the whole point: it is the key its observations, relations, links and chunks
+/// hang off, so a traversal seeded with it walks the edges its author wrote.
+pub(crate) fn overlay_descriptor(
+    domain: &str,
+    domain_id: crystalline_index::DomainId,
+    entry: &crystalline_index::StoredEngram,
+) -> Option<EngramDescriptor> {
+    if entry.tombstone {
+        return None;
+    }
+    let engram = parse_engram(&entry.content).ok()?;
+    let record = EngramRecord::from_engram(&engram, &entry.path, virtual_stamp(&entry.content));
+    Some(EngramDescriptor {
+        id: entry.id,
+        domain_id,
+        domain: domain.to_string(),
+        path: entry.path.clone(),
+        permalink: entry.permalink.clone(),
+        title: record.title,
+        engram_type: record.engram_type,
+        status: record.status,
+    })
+}
+
+/// Describe a browse row by the draft standing at its path: the permalink,
+/// title, type and status the reader's own document carries, so a listing says
+/// what they would open rather than what the file says.
+pub(crate) fn overwrite_from_draft(
+    row: &mut EngramDescriptor,
+    draft: &crystalline_index::StoredEngram,
+) {
+    row.permalink = draft.permalink.clone();
+    row.id = draft.id;
+    if let Ok(engram) = parse_engram(&draft.content) {
+        let record = EngramRecord::from_engram(&engram, &draft.path, virtual_stamp(&draft.content));
+        row.title = record.title;
+        row.engram_type = record.engram_type;
+        row.status = record.status;
+    }
+}
+
+/// What one pull's convergence pass did to the drafts standing over a domain
+/// that reviews changes before they land.
+///
+/// How many drafts ended because the folder now says what they said, and how
+/// many stand unsettled against a base that moved under them.
+/// `Engine::converge_pulled_overlays` is where each of the two is decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConvergenceReport {
+    /// Entries taken out of the overlay, row and mirror together.
+    pub cleared: u64,
+    /// Entries left standing as their author's conflict.
+    pub diverged: u64,
+}
+
+/// The proposal number a share receipt names, whichever outcome it carried: a
+/// fresh proposal reports it at the top level, an update inside the `proposal`
+/// it rewrote.
+fn proposal_number_of(receipt: &Value) -> Option<u64> {
+    receipt["number"]
+        .as_u64()
+        .or_else(|| receipt["proposal"]["number"].as_u64())
+}
+
+/// Drop every recorded conflict whose entry is no longer there: an actor who
+/// stopped holding a row at a path has no conflict at it, and an actor holding
+/// nothing at all has none anywhere.
+///
+/// `held` is every actor with rows in this domain, and their rows.
+fn prune_settled_conflicts(
+    record: &mut crate::overlay_journal::ConvergenceRecord,
+    held: &[ActorHolding],
+) {
+    record.conflicts.retain(|actor, paths| {
+        let Some(holding) = held.iter().find(|holding| &holding.actor == actor) else {
+            return false;
+        };
+        // Both lists, or a file conflict this pass recorded would be pruned by
+        // the next pull about something else: the entry IS still held, it is
+        // simply not a row. That is the window one tick wide this function's
+        // doc warns about, on the other kind of entry.
+        paths.retain(|at| {
+            holding.entries.iter().any(|entry| &entry.path == at)
+                || holding.files.iter().any(|file| &file.path == at)
+        });
+        !paths.is_empty()
+    });
+}
+
+/// Everything one actor holds in a domain's overlay: the rows they drafted and
+/// the files beside them.
+///
+/// One struct rather than a pair, because every reader of it needs both halves
+/// and a pair invited exactly the reading that dropped one of them.
+struct ActorHolding {
+    actor: String,
+    entries: Vec<StoredEngram>,
+    files: Vec<crate::overlay_files::FileEntry>,
+}
+
+/// What a pull leaves one overlay entry to be.
+enum Settle {
+    /// Untouched by this pull and still its author's draft.
+    Leave,
+    /// The folder has caught up with it: take it out, row and mirror.
+    Clear,
+    /// Its author has a conflict to settle.
+    Diverge,
+    /// The base it drafts moved to this path, so the draft goes with it.
+    MoveTo(String),
+}
+
+/// What one pull leaves one entry to be. Pure, so the rule is readable in one
+/// place and the engine above it only does the writing.
+///
+/// `base` is the entry path's own bytes in the base snapshot AFTER the pull,
+/// `touched` the paths the pull applied, `addresses` the permalinks those
+/// applied paths now answer to, and `own` every path this same actor is
+/// holding, which is what keeps a rename from writing over a second draft.
+fn settle_overlay_entry(
+    entry: &StoredEngram,
+    base: Option<&[u8]>,
+    touched: &HashSet<&str>,
+    addresses: &HashMap<String, String>,
+    own: &HashSet<&str>,
+) -> Settle {
+    let at = entry.path.as_str();
+    let pulled = touched.contains(at);
+    if entry.tombstone {
+        return match base {
+            None => Settle::Clear,
+            Some(_) if pulled => Settle::Diverge,
+            Some(_) => Settle::Leave,
+        };
+    }
+    // The address this draft holds, standing at a path the pull brought in -
+    // and never at a path this actor is drafting at themselves, since no
+    // rename may write over a second draft and no collision is invented
+    // between two rows one person already holds apart.
+    let elsewhere = addresses
+        .get(&entry.permalink)
+        .filter(|held| held.as_str() != at && !own.contains(held.as_str()));
+    match base {
+        Some(bytes) if bytes == entry.content.as_bytes() => Settle::Clear,
+        Some(_) if pulled => Settle::Diverge,
+        Some(_) => match elsewhere {
+            Some(_) => Settle::Diverge,
+            None => Settle::Leave,
+        },
+        None => match (pulled, elsewhere) {
+            // The pull took the base away and the address it carried stands
+            // somewhere else now: the page was renamed, and the draft applies
+            // to it still.
+            (true, Some(dest)) => Settle::MoveTo(dest.clone()),
+            // The pull took the base away and nothing carries its address: the
+            // team retired the page this draft is a draft of.
+            (true, None) => Settle::Diverge,
+            // Nothing happened at this path, but the address this draft holds
+            // was just spent by a file the team has.
+            (false, Some(_)) => Settle::Diverge,
+            (false, None) => Settle::Leave,
+        },
+    }
+}
+
+/// What one pull leaves one overlay FILE to be. Pure, beside
+/// [`settle_overlay_entry`] and answering the same four-way question with the
+/// two arms that cannot apply to a file left out.
+///
+/// `base` is the path's own bytes in the base snapshot AFTER the pull, `bytes`
+/// what this actor holds there (`None` for a deletion), and `touched` the paths
+/// the pull applied.
+///
+/// A file answers to no address, so there is no rename for it to follow and no
+/// address for another file to spend: the `MoveTo` and `elsewhere` arms of the
+/// row rule have nothing to read here. What is left is the pair that matters -
+/// the folder has caught up, or it has moved somewhere else.
+fn settle_overlay_file(
+    entry: &crate::overlay_files::FileEntry,
+    base: Option<&[u8]>,
+    bytes: Option<&[u8]>,
+    touched: &HashSet<&str>,
+) -> Settle {
+    let pulled = touched.contains(entry.path.as_str());
+    if entry.tombstone {
+        return match base {
+            // The team deleted it too, so the marker has nothing left to hide.
+            None => Settle::Clear,
+            Some(_) if pulled => Settle::Diverge,
+            Some(_) => Settle::Leave,
+        };
+    }
+    match (base, bytes) {
+        // The folder holds exactly these bytes now: the draft is the team's
+        // file, under any pull or none. Asked of every entry on every pass, so
+        // an author who uploads the team's own version again has it cleared by
+        // the next pass rather than left listed.
+        (Some(base), Some(bytes)) if base == bytes => Settle::Clear,
+        // The pull changed or removed what stood under this file, and what the
+        // actor holds is not it.
+        (_, _) if pulled => Settle::Diverge,
+        _ => Settle::Leave,
+    }
+}
+
+/// The addresses the base files a pull applied answer to, permalink to path.
+///
+/// Read from the base snapshot's own copies rather than the index rows, because
+/// this runs before the sync that refreshes those rows - in a share it runs
+/// well before it - and an address read from a stale row would answer a
+/// question about the folder as it was.
+fn pulled_addresses(state_dir: &Path, touched: &HashSet<&str>) -> Result<HashMap<String, String>> {
+    let mut addresses = HashMap::new();
+    for at in touched {
+        let Some(bytes) = crystalline_remote::state::read_base_file(state_dir, at)? else {
+            continue;
+        };
+        // A file that is not an engram at all - a README the team keeps beside
+        // its knowledge - answers to no address and takes no part in this.
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(engram) = parse_engram(text) else {
+            continue;
+        };
+        let record = EngramRecord::from_engram(&engram, at, virtual_stamp(text));
+        addresses.insert(record.permalink, (*at).to_string());
+    }
+    Ok(addresses)
+}
+
 /// A synthesized file stamp for a virtual write: the current epoch seconds, the
 /// content byte length and its SHA-256. The sha doubles as the CAS token, so a
 /// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
 /// without ever touching a filesystem.
-fn virtual_stamp(content: &str) -> FileStamp {
+pub(crate) fn virtual_stamp(content: &str) -> FileStamp {
     FileStamp {
         mtime: chrono::Utc::now().timestamp(),
         size: content.len() as u64,
@@ -12010,7 +21509,7 @@ fn virtual_stamp(content: &str) -> FileStamp {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     crystalline_index::hex_lower(&hasher.finalize())
@@ -12061,6 +21560,7 @@ fn build_markdown(
     status: &str,
     recorded_at: &str,
     actor: &str,
+    model: Option<&str>,
     now: DateTime<FixedOffset>,
     metadata: Option<&Value>,
     body: &str,
@@ -12076,6 +21576,7 @@ fn build_markdown(
     fm.recorded_at = chrono::NaiveDate::parse_from_str(recorded_at, "%Y-%m-%d").ok();
     fm.generated = Some(crystalline_core::Generated {
         by: actor.to_string(),
+        model: model.map(str::to_string),
         at: Some(now),
     });
     // Models routinely double-encode nested tool arguments, so an object
@@ -12106,6 +21607,16 @@ fn build_markdown(
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
     crystalline_core::temporal::normalize_verified(&mut fm)
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
+    // `normalize_verified` promotes a caller-supplied `metadata.verified`
+    // into the typed field verbatim, model and all: it enforces the entry's
+    // SHAPE, not the same actor rule the verb path applies through
+    // `stamped_model` when this write stamps its OWN `generated.by`/model.
+    // Run every entry through it here too, or a `human:` actor named in
+    // `metadata.verified` keeps a model this same write would have dropped
+    // had it arrived through the verb instead.
+    for entry in &mut fm.verified {
+        entry.model = stamped_model(&entry.by, entry.model.as_deref());
+    }
 
     let engram = Engram {
         frontmatter: fm,
@@ -12152,6 +21663,64 @@ fn json_to_yaml(v: &Value) -> YamlValue {
                 .map(|(k, v)| (k.clone(), json_to_yaml(v)))
                 .collect(),
         ),
+    }
+}
+
+/// What the daemon adds around each domain of a shared reindex run: the
+/// collaboration host claim before a domain is touched, and a refresh of the
+/// generated index files after one changed.
+///
+/// The daemonless CLI needs neither, which is why they are hooks rather than
+/// part of [`crystalline_index::reindex_domains`] itself.
+struct DaemonReindexHooks<'a> {
+    engine: &'a Engine,
+    collab: bool,
+}
+
+#[async_trait::async_trait]
+impl ReindexHooks for DaemonReindexHooks<'_> {
+    /// Claim the file-host lock in the driver's first lock window, with the
+    /// driver's own store guard, so the claim and the domain's upsert stay in
+    /// one window exactly as they were before the loop was shared. A domain
+    /// held by another live instance is skipped: the driver neither clears nor
+    /// scans it, so a non-host never rebuilds the host's rows out from under
+    /// it.
+    async fn before_domain(
+        &self,
+        store: &dyn Store,
+        name: &str,
+        root: &Path,
+    ) -> crystalline_index::Result<bool> {
+        if !self.collab {
+            return Ok(true);
+        }
+        // The claim reaches the store through the engine's own helper, which
+        // returns the engine's error type; the driver speaks the index crate's,
+        // so a failure crosses over as its text. Every failure this call can
+        // raise is a store failure to begin with.
+        let claim = self
+            .engine
+            .claim_file_host(store, name, root, false)
+            .await
+            .map_err(|e| IndexError::Db(e.to_string()))?;
+        match claim {
+            HostClaim::Acquired => Ok(true),
+            HostClaim::HeldByOther(host) => {
+                tracing::info!(
+                    "skipping reindex of '{name}' hosted by instance {}",
+                    host.instance_id
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Files changed under us, so the generated index files follow. Runs with
+    /// no store lock held, and takes none of its own.
+    async fn after_apply(&self, name: &str, report: &SyncReport) {
+        if changed_anything(report) {
+            self.engine.refresh_index_files(name).await;
+        }
     }
 }
 
@@ -12206,6 +21775,7 @@ mod context_rank_tests {
             engram_type: "engram".to_string(),
             salience,
             status: "current".to_string(),
+            actor: String::new(),
         }
     }
 
@@ -12467,6 +22037,8 @@ mod lock_tests {
                     status: None,
                     metadata: None,
                     overwrite: false,
+                    share_link: None,
+                    model: None,
                 })
                 .await
         });
@@ -12573,12 +22145,15 @@ mod lock_tests {
 
         let renamed = original.replace("permalink: alpha", "permalink: renamed");
         let receipt = engine
-            .save_engram(&SaveParams {
-                domain: "eng".to_string(),
-                identifier: "alpha".to_string(),
-                content: renamed.clone(),
-                expected_checksum: sha256_hex(original.as_bytes()),
-            })
+            .save_engram(
+                &SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    content: renamed.clone(),
+                    expected_checksum: sha256_hex(original.as_bytes()),
+                },
+                &crate::scope::Scope::Unrestricted,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -12595,12 +22170,15 @@ mod lock_tests {
         // An ordinary save still reports the address it was given.
         let plain = renamed.replace("The body.", "A sharper body.");
         let receipt = engine
-            .save_engram(&SaveParams {
-                domain: "eng".to_string(),
-                identifier: "renamed".to_string(),
-                content: plain.clone(),
-                expected_checksum: sha256_hex(renamed.as_bytes()),
-            })
+            .save_engram(
+                &SaveParams {
+                    domain: "eng".to_string(),
+                    identifier: "renamed".to_string(),
+                    content: plain.clone(),
+                    expected_checksum: sha256_hex(renamed.as_bytes()),
+                },
+                &crate::scope::Scope::Unrestricted,
+            )
             .await
             .unwrap();
         assert_eq!(receipt["permalink"], "renamed");
@@ -12645,12 +22223,15 @@ mod lock_tests {
         let expected = sha256_hex(original.as_bytes());
         let task = tokio::spawn(async move {
             saver
-                .save_engram(&SaveParams {
-                    domain: "eng".to_string(),
-                    identifier: "alpha".to_string(),
-                    content: mine,
-                    expected_checksum: expected,
-                })
+                .save_engram(
+                    &SaveParams {
+                        domain: "eng".to_string(),
+                        identifier: "alpha".to_string(),
+                        content: mine,
+                        expected_checksum: expected,
+                    },
+                    &crate::scope::Scope::Unrestricted,
+                )
                 .await
         });
 
@@ -12967,12 +22548,12 @@ mod share_actor_tests {
             .with_connect_auth(Arc::new(HangingAuth));
 
         engine
-            .start_github_identity_device_flow("alice")
+            .start_github_identity_device_flow("alice", false)
             .await
             .expect("the flow starts and stays pending");
         assert!(
             matches!(
-                engine.start_github_identity_device_flow("bob").await,
+                engine.start_github_identity_device_flow("bob", false).await,
                 Err(EngineError::ConnectInProgress)
             ),
             "a standing flow is what blocks the next one"
@@ -12981,7 +22562,7 @@ mod share_actor_tests {
         engine.forget_cached_credential(Some("alice")).unwrap();
 
         engine
-            .start_github_identity_device_flow("bob")
+            .start_github_identity_device_flow("bob", false)
             .await
             .expect("alice's flow was cancelled, so the slot is free");
     }
@@ -13230,7 +22811,7 @@ mod share_actor_tests {
         for err in [
             engine.github_identity_status("ann+lee").await.unwrap_err(),
             engine
-                .start_github_identity_device_flow("ann+lee")
+                .start_github_identity_device_flow("ann+lee", false)
                 .await
                 .unwrap_err(),
             engine
@@ -13548,6 +23129,35 @@ mod share_actor_tests {
         );
     }
 
+    /// The two organization-policy refusals are 403s upstream too, but the
+    /// provider has already said what actually has to happen, and adding a
+    /// collaborator clears neither. They reach the caller word for word.
+    #[test]
+    fn organization_policy_refusals_survive_personal_mode_unchanged() {
+        let sso = RemoteError::SsoAuthorizationRequired {
+            org: "acme".to_string(),
+            url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+        };
+        let expected = sso.to_string();
+        let enriched = enrich_write_error(sso, Some("alice"), "acme/knowledge");
+        assert_eq!(enriched.to_string(), expected);
+        assert!(
+            !enriched.to_string().contains("ask a maintainer"),
+            "{enriched}"
+        );
+
+        let restricted = RemoteError::OauthAppRestricted {
+            org: "acme".to_string(),
+        };
+        let expected = restricted.to_string();
+        let enriched = enrich_write_error(restricted, Some("alice"), "acme/knowledge");
+        assert_eq!(enriched.to_string(), expected);
+        assert!(
+            !enriched.to_string().contains("ask a maintainer"),
+            "{enriched}"
+        );
+    }
+
     /// An expired personal token names the reconnect flow: the instance-level
     /// "use configure to sign in again" is the wrong instruction for a person
     /// whose own connection lapsed.
@@ -13577,7 +23187,10 @@ mod share_actor_tests {
         let tokens = tmp.path().join("tokens");
         write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
 
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["share_identity"], "instance");
         assert!(
             status["connection"].get("owner_identity").is_none(),
@@ -13591,7 +23204,10 @@ mod share_actor_tests {
             })
             .await
             .unwrap();
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["share_identity"], "personal");
         assert_eq!(
             status["connection"]["owner_identity"]["account"],
@@ -13604,7 +23220,10 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["owner_identity"]["connected"], true);
         assert_eq!(status["connection"]["owner_identity"]["user"], "owner-gh");
     }
@@ -13629,7 +23248,10 @@ mod share_actor_tests {
             .unwrap();
 
         // Instance mode has no personal slot in play at all, agent or owner.
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert!(
             status["connection"].get("agent_identity").is_none(),
             "instance mode reports no personal slot: {status}"
@@ -13642,7 +23264,10 @@ mod share_actor_tests {
             })
             .await
             .unwrap();
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         let agent = &status["connection"]["agent_identity"];
         assert_eq!(agent["account"], "share-bot");
         assert_eq!(agent["connected"], false, "nothing is on file for it yet");
@@ -13652,7 +23277,10 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal("share-bot"), "bot-gh");
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["agent_identity"]["connected"], true);
         assert_eq!(status["connection"]["agent_identity"]["user"], "bot-gh");
         assert_eq!(
@@ -13681,7 +23309,10 @@ mod share_actor_tests {
             .await
             .unwrap();
 
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert!(
             status["connection"].get("agent_identity").is_none(),
             "{status}"

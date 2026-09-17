@@ -461,6 +461,8 @@ fn transform_engram(
     if fm.generated.is_none() && fm.timestamp.is_none() {
         fm.generated = Some(Generated {
             by: IMPORT_ACTOR.to_string(),
+            // An import writes no words of its own, so it reports no model.
+            model: None,
             at: Some(now),
         });
         changes.push(format!(

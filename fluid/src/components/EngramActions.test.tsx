@@ -31,12 +31,17 @@ const ENGRAM = {
     staleAfter: null,
     verified: [],
     generatedBy: null,
+    generatedModel: null,
   },
   observations: [],
   relations: [],
   links: [],
   inboundCount: 0,
   inboundRefs: [],
+  similar: [],
+  guidance: null,
+  draft: false,
+  draftOwner: null,
 } satisfies EngramDetail;
 
 afterEach(() => {

@@ -94,6 +94,21 @@ export function getCsrfToken(): string | null {
 }
 
 /**
+ * Navigate the whole page to `location`, never a fetch.
+ *
+ * A handful of answers on this API are places to go rather than data to
+ * render - an OAuth decision's redirect back to the client that asked, a
+ * single sign-on hop to the provider - and a background fetch would follow
+ * either invisibly and land nowhere anybody could act on. This is the one
+ * seam every such screen calls through instead of reaching for
+ * `window.location.assign` itself, so a test can watch where a screen
+ * decided to send the browser without jsdom having to follow it there.
+ */
+export function navigateTo(location: string): void {
+  window.location.assign(location);
+}
+
+/**
  * Encode one path segment. Slashes are escaped, because a segment that is not
  * a permalink must never widen the path it sits in.
  */

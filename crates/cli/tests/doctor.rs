@@ -270,6 +270,229 @@ fn detects_unindexed_files_without_fixing_them() {
     );
 }
 
+/// Reproduces a colleague's real-world report: a file whose frontmatter
+/// repeats a key never becomes indexed no matter how many times `sync` runs,
+/// so `doctor` must tell it apart from a file that is merely unsynced.
+/// Covers a nested path, since `verify` reports an absolute path and the
+/// unindexed set holds forward-slashed paths relative to the domain root -
+/// the two must be normalised to the same shape before they can be compared.
+#[test]
+fn tells_an_unsyncable_file_from_an_unsynced_one() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+
+    // A well-formed file that simply has not been synced yet.
+    write(&domain_dir, "good.md", &engram("Good", "good"));
+
+    // A nested file whose frontmatter repeats the `tags` key: `verify` calls
+    // this E001, and no amount of syncing will ever index it.
+    write(
+        &domain_dir,
+        "a/b/bad.md",
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["domains"][0]["unindexed"],
+        serde_json::json!(["good.md"]),
+        "the duplicate-key file must not show up as merely unindexed: {report}"
+    );
+    let unsyncable = &report["domains"][0]["unsyncable"];
+    assert_eq!(unsyncable[0]["path"], serde_json::json!("a/b/bad.md"));
+    assert!(
+        unsyncable[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate entry with key"),
+        "unsyncable message should explain why: {unsyncable}"
+    );
+
+    // The human report renders a runnable sync command with no path or colon
+    // glued onto it, and a separate block for the unsyncable file.
+    let mut human_cmd = bin();
+    let _home = shield_ambient_home(&mut human_cmd);
+    let human_out = human_cmd
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(human_out).unwrap();
+    assert!(
+        stdout.contains("run: crystalline sync --domain eng\n"),
+        "the suggested command must be pasteable, with nothing glued after the domain name: {stdout}"
+    );
+    assert!(
+        stdout.contains("cannot be indexed until the frontmatter is fixed (verify rule E001)"),
+        "unsyncable files get their own explanation: {stdout}"
+    );
+    assert!(
+        stdout.contains("a/b/bad.md: ") && stdout.contains("duplicate entry with key"),
+        "the unsyncable line names the file and the reason: {stdout}"
+    );
+}
+
+/// The plain invocation on a machine with no daemon: nothing to ask, so the
+/// index is opened here and every index-backed check runs exactly as it
+/// always did. The daemon route must not change what a person sees when there
+/// is no daemon, so this pins the direct branch by name.
+#[test]
+#[cfg(unix)]
+fn without_a_daemon_the_index_is_read_directly() {
+    let home = tempfile::tempdir().unwrap();
+    let domain_dir = home.path().join("kb-eng");
+    let mut init = bin();
+    common::isolate(&mut init, home.path());
+    init.args(["domain", "init"])
+        .arg(&domain_dir)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+
+    // No --config and no --db: the default paths inside the isolated home,
+    // which is what makes this the socket-first branch with no socket to find.
+    let mut add = bin();
+    common::isolate(&mut add, home.path());
+    add.args(["domain", "add", "eng"])
+        .arg(&domain_dir)
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    common::isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["--json", "doctor"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["index"]["source"],
+        serde_json::json!("direct"),
+        "with no daemon the index is opened here: {report}"
+    );
+    assert_eq!(
+        report["domains"][0]["index_checked"],
+        serde_json::json!(true),
+        "and the index-backed checks ran: {report}"
+    );
+    assert!(
+        report["embeddings"].is_object(),
+        "including the embedding summary, which needs the open store: {report}"
+    );
+}
+
+/// A diagnostic tool that dies when one of its sources is unavailable is no
+/// diagnostic tool. With an index nobody can open, every check that does not
+/// need it still runs, the report says what stopped the ones that do and what
+/// to do about it, and the exit code still reports a problem.
+#[test]
+fn an_unreadable_index_still_produces_a_report() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(&domain_dir, "a.md", &engram("A", "a"));
+
+    // Not a database at all. The route does not matter to the report: an
+    // unopenable file, a file another process holds and a file this user
+    // cannot read all land in the same branch.
+    std::fs::write(&db, b"this is not a database\n").unwrap();
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["index"]["source"],
+        serde_json::json!("unavailable"),
+        "{report}"
+    );
+    let reason = report["index"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("did not run") && reason.contains("Check that the file is readable"),
+        "the reason reads as guidance, not as a bare error: {reason}"
+    );
+    assert_eq!(
+        report["domains"][0]["index_checked"],
+        serde_json::json!(false),
+        "the index-backed checks are marked as not run: {report}"
+    );
+    assert_eq!(
+        report["domains"][0]["path_exists"],
+        serde_json::json!(true),
+        "while the checks that need no index still ran: {report}"
+    );
+    assert!(
+        report["service"].is_object(),
+        "the service section is one of them: {report}"
+    );
+
+    // The human report says the same thing, and never claims the domain is ok.
+    let mut human = bin();
+    let _home = shield_ambient_home(&mut human);
+    let stdout = String::from_utf8(
+        human
+            .args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("index:\n  [problem] the index at "),
+        "the index section carries the problem: {stdout}"
+    );
+    assert!(
+        stdout.contains("index checks skipped (orphan rows, unindexed files)"),
+        "and each domain says which of its checks did not run: {stdout}"
+    );
+    let domains_block = stdout.split("service:").next().unwrap_or_default();
+    assert!(
+        !domains_block.contains("\n  ok\n"),
+        "a domain whose index checks never ran is never reported as ok: {stdout}"
+    );
+    assert!(
+        stdout.contains("embeddings: not read, the index checks did not run"),
+        "the embedding line says why it is empty rather than 'no index yet': {stdout}"
+    );
+}
+
 #[test]
 fn detects_a_registered_domain_whose_path_vanished() {
     let work = tempfile::tempdir().unwrap();
@@ -440,6 +663,17 @@ fn apply_home(cmd: &mut Command, home: &Path) {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CACHE_HOME", home.join("cache"))
+        // `crystalline_remote::token`'s test seam: none of the three
+        // variables above reach it, since the OS keychain service name is a
+        // hardcoded constant rather than derived from any base directory, so
+        // without this a `doctor` run whose config turns `github.enabled` on
+        // (`write_team_domain_config`, below) asks the real login keychain
+        // for a `github` credential the moment `check_github` runs. This is
+        // the boolean kill switch, not `CRYSTALLINE_TEST_TOKEN_STORE_DIR`:
+        // it falls back to the file store at whatever `origins_state_dir()`
+        // already resolves to under the isolated `XDG_STATE_HOME` above,
+        // rather than redirecting to a directory of its own.
+        .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
         // A developer machine's own Copilot home must never leak into the
         // harnesses section's path resolution.
         .env_remove("COPILOT_HOME");
@@ -1487,4 +1721,290 @@ fn provisioning_section_honors_the_domain_filter() {
     assert_eq!(pending[0]["domain"], json!("harbor"));
 
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The other half of the colleague's report: running `sync` by hand on a
+/// domain holding an unparseable file used to print a normal-looking summary
+/// plus one `failed:` line and still exit 0, so nothing in an automated
+/// pipeline ever saw the partial failure. `doctor` already exits 1 on a
+/// problem and `verify` exits 2; a `sync` that silently succeeded was the
+/// outlier.
+#[test]
+fn sync_fails_the_process_when_a_file_could_not_be_indexed() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(
+        &domain_dir,
+        "bad.md",
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    );
+
+    let out = bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("added"),
+        "the summary line still prints before the failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("failed: "),
+        "the per-file failure line still prints: {stdout}"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains('1') && stderr.to_lowercase().contains("fail"),
+        "the process failure names the count: {stderr}"
+    );
+}
+
+/// A clean domain (nothing failed) still exits 0, so the new failure path
+/// only fires on an actual `failed` entry, never on an ordinary sync.
+#[test]
+fn sync_still_succeeds_when_nothing_failed() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(&domain_dir, "good.md", &engram("Good", "good"));
+
+    bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+}
+
+// --- rows whose domain nobody registers any more -----------------------------
+//
+// The 0.17.0 shape, reproduced by hand: two domains indexed, then one of them
+// unregistered with its rows left behind. The removal is a config edit rather
+// than `domain remove`, because 0.18.0's removal already clears the rows - a
+// test built on it would assert on an index with no orphan in it at all.
+
+/// Drop `name` from the config file without touching the index, which is
+/// exactly what a 0.17.0 removal left behind.
+fn unregister(config: &Path, name: &str) {
+    let mut cfg: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(config).unwrap();
+    cfg.domains.shift_remove(name);
+    crystalline_core::config::save_yaml(config, &cfg).unwrap();
+}
+
+/// Two domains synced, one unregistered afterwards.
+fn orphan_fixture(work: &Path) -> (PathBuf, PathBuf) {
+    let config = work.join("config.yaml");
+    let db = work.join("index.db");
+    let kept = setup_domain(work, "eng", &config);
+    let gone = setup_domain(work, "retired", &config);
+    write(&kept, "a.md", &engram("A", "a"));
+    write(&gone, "b.md", &engram("B", "b"));
+    bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    unregister(&config, "retired");
+    (config, db)
+}
+
+/// The report: the rows are named, counted and counted as a problem, and not
+/// one of them is removed by a run that was only asked to look.
+#[test]
+fn reports_the_rows_of_a_domain_nobody_registers() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = orphan_fixture(work.path());
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "the orphan is named: {report}");
+    assert!(
+        rows[0]["engrams"].as_i64().unwrap() >= 2,
+        "with the rows at stake: {report}"
+    );
+    assert_eq!(
+        rows[0]["age_days"],
+        Value::Null,
+        "an index inherited from a version that never stamped has no age: {report}"
+    );
+    assert_eq!(rows[0]["collected"], false, "nothing was removed: {report}");
+    assert_eq!(rows[0]["collectable"], true, "and --fix would: {report}");
+
+    // The human render says what is true of them and names the one command
+    // that ends them now. A full reindex is never the advice.
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let human = cmd
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.contains("retired") && human.contains("never seen registered"),
+        "the render names the domain and how long it has been gone: {human}"
+    );
+    assert!(
+        human.contains("crystalline doctor --fix"),
+        "and names the immediate path: {human}"
+    );
+    assert!(
+        !human.to_lowercase().contains("reindex"),
+        "and never the heaviest command in the tool: {human}"
+    );
+
+    // A second look finds the same rows: looking removes nothing.
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let again = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let again: Value = serde_json::from_slice(&again).unwrap();
+    assert_eq!(
+        again["orphaned_rows"]["domains"][0]["engrams"], rows[0]["engrams"],
+        "every row is where it was: {again}"
+    );
+}
+
+/// The fix: a person asking is the signal the grace period waits for, so the
+/// rows go on the run that was asked, not a week later.
+#[test]
+fn fix_collects_the_rows_of_a_domain_nobody_registers() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = orphan_fixture(work.path());
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "{report}");
+    assert_eq!(
+        rows[0]["collected"], true,
+        "the never-stamped orphan is collected on the run a person asked for: {report}"
+    );
+
+    // And it is gone: the next look has nothing left to report.
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let after = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after: Value = serde_json::from_slice(&after).unwrap();
+    assert_eq!(
+        after["orphaned_rows"]["domains"],
+        serde_json::json!([]),
+        "a domain with no rows left is nothing to report: {after}"
+    );
+}
+
+/// A read-only instance collects nothing and says so, with the rows it would
+/// have collected still named: that operator is exactly the one who wants to
+/// know what is sitting in their index, and a `--fix` that silently did
+/// nothing would tell them the opposite.
+#[test]
+fn a_read_only_instance_reports_the_rows_and_collects_none_of_them() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = orphan_fixture(work.path());
+    let mut cfg: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(&config).unwrap();
+    cfg.service = Some(crystalline_core::config::ServiceConfig {
+        read_only: Some(true),
+        ..crystalline_core::config::ServiceConfig::default()
+    });
+    crystalline_core::config::save_yaml(&config, &cfg).unwrap();
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "the rows are named: {report}");
+    assert_eq!(rows[0]["collected"], false, "and not collected: {report}");
+    assert_eq!(rows[0]["kept"], "read_only", "{report}");
+    assert!(
+        report["orphaned_rows"]["skipped"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"),
+        "and the report says why: {report}"
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let human = cmd
+        .args(["doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.contains("nothing was collected: this instance is read-only"),
+        "the render says it too: {human}"
+    );
 }

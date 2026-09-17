@@ -62,6 +62,11 @@ export interface EngramObservation {
 export interface VerifiedEntry {
   /** The actor that checked the knowledge, absent on a legacy date. */
   by: string | null;
+  /**
+   * The model the verifying agent reported, or null where it reported none.
+   * A person's verification never carries one.
+   */
+  model: string | null;
   /** When it was checked. */
   at: string | null;
 }
@@ -90,6 +95,12 @@ export interface EngramFrontmatter {
    * absence is absence rather than an unknown writer.
    */
   generatedBy: string | null;
+  /**
+   * The model out of `generated.model`: what produced the words, as the agent
+   * that wrote them reported it, or null where the block names none. A block
+   * written before the key existed carries none, and so does a person's.
+   */
+  generatedModel: string | null;
 }
 
 /** One of the capped inbound references the detail payload samples. */
@@ -126,6 +137,40 @@ export interface EngramDetail {
   inboundCount: number;
   /** The capped sample of them the payload carries. */
   inboundRefs: InboundRef[];
+  /** The nearest existing engrams a write found; empty when none or when the advisory is off. */
+  similar: SimilarEngram[];
+  /** What to do about them, in the server's words; null when `similar` is empty. */
+  guidance: string | null;
+  /**
+   * Whether this is the reader's OWN draft rather than the page the domain
+   * holds: true only on a domain that reviews changes, and only for the
+   * account whose overlay the row is in. Absent everywhere else, which is
+   * why it reads as false rather than as a missing key.
+   *
+   * What the editor needs it for is sharing: a draft is the only thing a
+   * share-link can be minted on, because a link hands over work the team has
+   * not seen and there is nothing to hand over about a page they all read.
+   */
+  draft: boolean;
+  /**
+   * Whose draft this is, when it is not the reader's own: the one payload key
+   * that names another account, and it is only ever present at a path the
+   * reader holds a share-link to.
+   *
+   * Null for everything else, which is nearly everything. What reads it is the
+   * editor: a granted draft opened there must say whose work it is, and must
+   * not offer to share a page the reader does not own.
+   */
+  draftOwner: string | null;
+}
+
+/** One neighbour a write or save found itself close to. */
+export interface SimilarEngram {
+  domain: string;
+  permalink: string;
+  title: string;
+  status: string;
+  type: string;
 }
 
 /** The `crystalline://` address of one engram, which is what it is called. */
@@ -219,14 +264,15 @@ function readVerified(record: Record<string, unknown> | null): VerifiedEntry[] {
       const entry = asObject(value);
       const by = asString(entry?.by);
       const at = asString(entry?.at);
-      return by === null && at === null ? null : { by, at };
+      const model = asString(entry?.model);
+      return by === null && at === null ? null : { by, model, at };
     })
     .filter((entry): entry is VerifiedEntry => entry !== null);
   if (entries.length > 0) {
     return entries;
   }
   const legacy = asString(record?.last_verified);
-  return legacy === null ? [] : [{ by: null, at: legacy }];
+  return legacy === null ? [] : [{ by: null, model: null, at: legacy }];
 }
 
 /** Read the frontmatter block. */
@@ -251,6 +297,33 @@ function readFrontmatter(
     // Write provenance is a `{ by, at }` mapping, so the actor is a field
     // inside it rather than a key of its own.
     generatedBy: asString(asObject(record?.generated)?.by),
+    // The model sits beside the actor inside the same mapping, and is left out
+    // of a block whose writer reported none.
+    generatedModel: asString(asObject(record?.generated)?.model),
+  };
+}
+
+/**
+ * One entry of the `similar` list, or null when it names no address.
+ *
+ * `domain` and `permalink` are the two fields a link needs; anything missing
+ * either is dropped rather than rendered as a link to nowhere. `title` falls
+ * back to the permalink, and `status`/`type` fall back to empty strings, the
+ * same shape the rest of this reader gives an engram with no frontmatter.
+ */
+function readSimilar(value: unknown): SimilarEngram | null {
+  const entry = asObject(value);
+  const domain = asString(entry?.domain);
+  const permalink = asString(entry?.permalink);
+  if (domain === null || permalink === null) {
+    return null;
+  }
+  return {
+    domain,
+    permalink,
+    title: asString(entry?.title) ?? permalink,
+    status: asString(entry?.status) ?? "",
+    type: asString(entry?.type) ?? "",
   };
 }
 
@@ -298,6 +371,12 @@ export function readEngramDetail(
       .filter((entry): entry is EngramReference => entry !== null),
     inboundCount: asNumber(inbound?.count) ?? inboundRefs.length,
     inboundRefs,
+    similar: asArray(record?.similar)
+      .map(readSimilar)
+      .filter((entry): entry is SimilarEngram => entry !== null),
+    guidance: asString(record?.guidance),
+    draft: record?.draft === true,
+    draftOwner: asString(record?.draft_owner),
   };
 }
 

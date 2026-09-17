@@ -179,7 +179,7 @@ async fn next_control_syncing(
 async fn a_clean_external_edit_merges_into_the_room_and_the_file() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     // Mine: refine the heading. Theirs: an external append at the end,
     // written behind the session's back. The two hunks have the untouched
@@ -221,7 +221,7 @@ async fn a_clean_external_edit_merges_into_the_room_and_the_file() {
 async fn an_idle_session_pulls_external_edits_in_without_writing() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let _doc = sync_client(&joined).await;
     let path = tmp.path().join("eng/alpha.md");
     let external = std::fs::read_to_string(&path)
@@ -253,7 +253,7 @@ async fn an_idle_session_pulls_external_edits_in_without_writing() {
 async fn colliding_edits_suspend_saving_until_the_room_resolves_mine() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     let path = tmp.path().join("eng/alpha.md");
     // Both sides rewrite the same body line.
@@ -304,7 +304,7 @@ async fn colliding_edits_suspend_saving_until_the_room_resolves_mine() {
 async fn resolving_theirs_replaces_the_live_text_and_touches_nothing() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     let path = tmp.path().join("eng/alpha.md");
     let theirs = ALPHA.replace("A rule about alpha.", "THEIRS");
@@ -371,7 +371,7 @@ async fn resolving_theirs_replaces_the_live_text_and_touches_nothing() {
 async fn an_external_delete_is_its_own_conflict_and_mine_restores_the_file() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     replace_all(&joined, &doc, &ALPHA.replace("A rule", "An unsaved rule")).await;
     std::fs::remove_file(tmp.path().join("eng/alpha.md")).unwrap();
@@ -421,7 +421,7 @@ async fn a_deleted_conflict_never_restores_over_a_file_that_came_back() {
     // path first: their bytes survive and the room is asked again.
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     replace_all(&joined, &doc, &ALPHA.replace("A rule", "An unsaved rule")).await;
 
@@ -486,7 +486,7 @@ async fn resolving_mine_adopts_their_text_as_the_base_so_the_choice_lands() {
     // landed when the file still held theirs.
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let _doc = sync_client(&joined).await;
     let path = tmp.path().join("eng/alpha.md");
     let external = ALPHA
@@ -529,7 +529,7 @@ async fn resolving_mine_adopts_their_text_as_the_base_so_the_choice_lands() {
 async fn accepting_an_external_delete_closes_the_session() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
-    let mut joined = sessions.join("eng", "alpha").await.unwrap();
+    let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
     let doc = sync_client(&joined).await;
     replace_all(&joined, &doc, &ALPHA.replace("A rule", "A doomed rule")).await;
     let path = tmp.path().join("eng/alpha.md");

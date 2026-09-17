@@ -4,7 +4,7 @@
  * the sidebar becomes once a domain is open.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -248,6 +248,36 @@ describe("the layout", () => {
     // Outside a domain there is nothing to switch between yet: the flat list
     // is the whole sidebar, and it stays that way.
     expect(screen.queryByRole("button", { name: /^Domain:/ })).toBeNull();
+  });
+
+  it("badges a private domain in the sidebar and leaves a shared one plain", async () => {
+    serveSignedIn({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+          {
+            name: "lab",
+            kind: "file",
+            engrams: 2,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/");
+
+    const domains = await screen.findByRole("navigation", { name: "Domains" });
+    const lab = await within(domains).findByRole("link", { name: /^lab/ });
+    expect(lab).toHaveTextContent("private");
+    // The badge rides on the listing's own field, so a row that does not say
+    // it is private wears nothing - the same as a row from a server that
+    // never heard of the field.
+    expect(
+      within(domains).getByRole("link", { name: /^eng/ }),
+    ).not.toHaveTextContent("private");
   });
 
   it("says what went wrong instead of emptying the sidebar", async () => {
@@ -533,6 +563,39 @@ describe("the sidebar inside a domain", () => {
     expect(
       await screen.findByRole("button", { name: "Domain: ops" }),
     ).toBeVisible();
+  });
+
+  it("badges a private domain in the switcher", async () => {
+    // The sidebar has two forms and the same domain has to read the same way
+    // in both: the flat list outside a domain, and this switcher inside one.
+    serveInDomain({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+          {
+            name: "ops",
+            kind: "file",
+            engrams: 2,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Domain: eng" }),
+    );
+
+    expect(
+      await screen.findByRole("menuitemradio", { name: /^ops/ }),
+    ).toHaveTextContent("private");
+    expect(
+      screen.getByRole("menuitemradio", { name: /^eng/ }),
+    ).not.toHaveTextContent("private");
   });
 
   it("splits a folder row: the name browses it, the icon opens it here", async () => {
@@ -975,5 +1038,159 @@ describe("the sidebar's own width", () => {
       await within(nav).findByRole("link", { name: /^eng/ }),
     ).toBeVisible();
     expect(localStorage.getItem("fluid.nav")).toBe("expanded");
+  });
+});
+
+/**
+ * The other half of the frame's shape: how wide what you came to read is
+ * allowed to be. The sidebar folding is a choice about the column beside the
+ * content; this is a choice about the content itself, and it is remembered the
+ * same way, for the same reason.
+ */
+describe("the content's own width", () => {
+  it("takes the whole window and remembers it", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const widen = await screen.findByRole("button", { name: "Use full width" });
+    // In the frame's own top bar rather than on the screen inside it: this is
+    // a choice about every screen, and it is drawn where the theme control is.
+    expect(widen.closest("header")).not.toBeNull();
+    expect(widen.closest("main")).toBeNull();
+    // The name says which way it will switch rather than which way it is, so
+    // a reader who hears it knows what pressing it does.
+    expect(await screen.findByRole("main")).not.toHaveAttribute("data-width");
+
+    await user.click(widen);
+
+    // One attribute on the frame is the whole of what the stylesheet reads:
+    // the measure is lifted under it, everywhere, with no screen saying so.
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+    expect(
+      screen.getByRole("button", { name: "Use reading width" }),
+    ).toBeVisible();
+    expect(localStorage.getItem("fluid.layout.width")).toBe("full");
+  });
+
+  it("reads a stored full width at mount", async () => {
+    localStorage.setItem("fluid.layout.width", "full");
+    serveSignedIn();
+
+    renderApp("/");
+
+    expect(
+      await screen.findByRole("button", { name: "Use reading width" }),
+    ).toBeVisible();
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+  });
+
+  it("goes back to the measure, and remembers that too", async () => {
+    localStorage.setItem("fluid.layout.width", "full");
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Use reading width" }),
+    );
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+    expect(localStorage.getItem("fluid.layout.width")).toBe("reading");
+  });
+
+  it("answers the bare backslash from anywhere", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByRole("main");
+    await user.keyboard("\\");
+
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+
+    await user.keyboard("\\");
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("answers it on a keyboard where the backslash needs a modifier", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("main");
+
+    // Synthesized rather than typed: jsdom's keyboard has one layout, and
+    // these are the events other layouts send. On a German, French, Spanish,
+    // Italian or Nordic keyboard the backslash IS a modified key - AltGr on
+    // Windows and Linux, which a browser reports as Ctrl and Alt together,
+    // and Shift+Option on macOS. The key is "\\" in every one of them, so
+    // the shortcut the help overlay advertises has to fire.
+    fireEvent.keyDown(document.body, {
+      key: "\\",
+      ctrlKey: true,
+      altKey: true,
+    });
+
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+
+    fireEvent.keyDown(document.body, {
+      key: "\\",
+      shiftKey: true,
+      altKey: true,
+    });
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("leaves Cmd and Ctrl on the backslash to whoever owns them", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("main");
+
+    // Without Alt beside it, a modified backslash is the browser's or the
+    // system's rather than this app's.
+    fireEvent.keyDown(document.body, { key: "\\", metaKey: true });
+    fireEvent.keyDown(document.body, { key: "\\", ctrlKey: true });
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("leaves the backslash alone while somebody is writing one", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const search = await screen.findByRole("searchbox", { name: "Search" });
+    await user.click(search);
+    await user.keyboard("\\");
+
+    // The character lands in the field it was typed into and nothing else
+    // happens: a bare key is only a shortcut where no field has the focus.
+    expect(search).toHaveValue("\\");
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("is on the palette and in the shortcut map", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByRole("main");
+    await user.keyboard("{Meta>}k{/Meta}");
+
+    await user.click(
+      await screen.findByRole("option", { name: /toggle full width/i }),
+    );
+
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+
+    // And written down where a reader goes looking for the key itself.
+    await user.keyboard("?");
+    const help = await screen.findByRole("dialog", {
+      name: /keyboard shortcuts/i,
+    });
+    expect(help).toHaveTextContent(/full width/i);
   });
 });

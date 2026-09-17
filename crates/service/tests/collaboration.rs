@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::{Store, TursoStore};
+use crystalline_service::Scope;
 use crystalline_service::engine::{Engine, EngineError};
 use crystalline_service::params::*;
 use tokio::sync::Mutex;
@@ -34,12 +35,19 @@ fn pg_url() -> Option<String> {
     }
 }
 
+/// A recycled pid must never adopt a schema a panicking run left behind.
 #[cfg(feature = "postgres")]
 fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("ctc_{}_{}", std::process::id(), n)
+    format!(
+        "ctc_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
 }
 
 /// Run a body against Turso (always) and Postgres (when configured). The body is
@@ -95,6 +103,8 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
+        model: None,
     }
 }
 
@@ -116,6 +126,9 @@ fn edit_params(
         expected_replacements: None,
         include_subsections: false,
         expected_checksum,
+        ack_scope: None,
+        share_link: None,
+        model: None,
     }
 }
 
@@ -147,7 +160,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
     engine_a.sync(None).await.unwrap();
     // domain_stats (through A) shows A hosts eng.
     let a_domains = engine_a
-        .list_domains(&ListDomainsParams::default())
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
         .await
         .unwrap();
     let eng_entry = a_domains["domains"]
@@ -175,20 +188,27 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
 
     // B searches A's hosted domain from the database.
     let hits = engine_b
-        .search_engrams(&SearchParams {
-            query: Some("turbines".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("turbines".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1, "B searches A's hosted domain from the DB");
 
     // B reads A's engram, served from the database content column (file gone).
     let read = engine_b
-        .read_engram(&ReadParams {
-            identifier: "alpha".to_string(),
-            domain: Some("eng".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -209,10 +229,13 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
         .await
         .unwrap();
     let a_hits = engine_a
-        .search_engrams(&SearchParams {
-            query: Some("photosynthesis".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("photosynthesis".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(a_hits["total"], 1, "A searches B's virtual engram");
@@ -220,10 +243,14 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
     // A stale-checksum edit conflicts: B reads, A moves the engram on, B's edit
     // with the now-stale checksum is refused.
     let b_read = engine_b
-        .read_engram(&ReadParams {
-            identifier: "shared-insight".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "shared-insight".to_string(),
+                domain: Some("notes".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let stale = b_read["checksum"].as_str().unwrap().to_string();
@@ -252,7 +279,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
     // B migrates hosting with --take-over and acquires the file domain.
     engine_b.sync_take_over(Some("eng"), true).await.unwrap();
     let b_domains = engine_b
-        .list_domains(&ListDomainsParams::default())
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
         .await
         .unwrap();
     let eng_after = b_domains["domains"]
@@ -278,4 +305,62 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
 both_backends!(
     two_instances_collaborate_over_one_database,
     collaboration_flow
+);
+
+/// A non-host never rebuilds the host's rows out from under it, and under a
+/// forced reindex that now means something sharper than before: the skip has to
+/// happen before the domain is stamped, or a domain nobody rebuilt would carry
+/// a rebuild marker forever.
+///
+/// The claim moved into the shared driver's `before_domain` hook when the two
+/// reindex loops were collapsed, so this pins the branch at its new home: B's
+/// forced reindex of a domain A hosts writes no report for it, leaves its rows
+/// alone and leaves it unmarked.
+async fn a_forced_reindex_skips_a_domain_another_instance_hosts(store: Arc<Mutex<dyn Store>>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng_dir = tmp.path().join("eng");
+    std::fs::create_dir_all(&eng_dir).unwrap();
+    std::fs::write(eng_dir.join("MANIFEST.md"), manifest("Eng")).unwrap();
+    std::fs::write(
+        eng_dir.join("alpha.md"),
+        engram("Alpha", "alpha", "hosted file body about turbines"),
+    )
+    .unwrap();
+
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("eng".to_string(), DomainEntry::file(eng_dir.clone()));
+
+    let engine_a =
+        Engine::new(store.clone(), cfg.clone(), None, None).with_instance_id("inst-a".to_string());
+    let engine_b =
+        Engine::new(store.clone(), cfg.clone(), None, None).with_instance_id("inst-b".to_string());
+
+    // A hosts and indexes it.
+    engine_a.sync(None).await.unwrap();
+
+    let result = engine_b.reindex(true).await.unwrap();
+    let reports = result["reports"].as_array().cloned().unwrap_or_default();
+    assert!(
+        reports.is_empty(),
+        "B rebuilt nothing: the domain A hosts is not its to rebuild, got {result}"
+    );
+
+    let store = store.lock().await;
+    let stats = store.domain_stats().await.unwrap();
+    let eng = stats.iter().find(|d| d.name == "eng").expect("domain eng");
+    assert_eq!(eng.engrams, 2, "A's rows are untouched");
+    assert!(
+        eng.rebuild_started.is_none(),
+        "a domain that was skipped was never stamped as rebuilding"
+    );
+    assert_eq!(
+        eng.host_instance_id.as_deref(),
+        Some("inst-a"),
+        "and the host lock still belongs to A"
+    );
+}
+both_backends!(
+    a_forced_reindex_leaves_a_domain_another_instance_hosts_alone,
+    a_forced_reindex_skips_a_domain_another_instance_hosts
 );

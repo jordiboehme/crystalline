@@ -280,6 +280,8 @@ export type DomainMode = "local" | "virtual" | "github";
 /**
  * A domain to register. Every field but `mode` belongs to one of the modes:
  * a local or virtual domain is named, a team domain names a repository.
+ * `private` applies to every mode alike: it registers the domain private and
+ * owned by the creating account instead of shared with the whole instance.
  */
 export interface CreateDomainBody {
   mode: DomainMode;
@@ -287,6 +289,13 @@ export interface CreateDomainBody {
   repo?: string;
   branch?: string;
   path?: string;
+  // Indexed off the generated schema rather than hand-typed `boolean`: the
+  // `const wire: CreateDomainWireBody = body` check below already catches a
+  // required field going missing or changing shape, but not this one being
+  // dropped from the schema outright (an excess optional field on a
+  // variable, as opposed to an object literal, is not flagged). Indexing it
+  // is what turns that removal into a compile error here too.
+  private?: NonNullable<CreateDomainWireBody["private"]>;
 }
 
 /** What a registration reports back: the name it took, and where it landed. */
@@ -325,12 +334,23 @@ export interface UnregisterReceipt {
   roomsClosed: number;
 }
 
-/** Unregister a domain. Files on disk are never touched. */
+/**
+ * Unregister a domain. Files on disk are never touched.
+ *
+ * `purge` confirms the one case where something IS deleted: a virtual domain's
+ * engrams live in the database and go with it, and the server refuses that
+ * removal (409) unless the request says the loss was intended. The rule is the
+ * engine's rather than this client's - the same route now serves a private
+ * domain's owner, not only an admin - so this passes what the confirmation
+ * collected instead of deciding anything.
+ */
 export async function unregisterDomain(
   name: string,
+  purge = false,
 ): Promise<UnregisterReceipt> {
+  const query = purge ? "?purge=true" : "";
   const report = asObject(
-    await api<unknown>(`/domains/${encodeSegment(name)}`, {
+    await api<unknown>(`/domains/${encodeSegment(name)}${query}`, {
       method: "DELETE",
     }),
   );
@@ -389,6 +409,20 @@ export interface SyncConflict {
 }
 
 /** Where a team domain stands relative to its GitHub origin. */
+/**
+ * One actor's unshared drafts in a reviewing domain: a name and a count.
+ *
+ * Never a path and never a line of the work. A draft is unshared by definition
+ * - its author has not decided it is ready - so what a coordination view is
+ * allowed to say is that somebody is holding something and how much.
+ */
+export interface DraftHolder {
+  /** Whose drafts these are. */
+  actor: string;
+  /** How many they hold, deletions included. */
+  entries: number;
+}
+
 export interface SyncStatus {
   repo: string;
   branch: string | null;
@@ -413,6 +447,33 @@ export interface SyncStatus {
   declinedProposals: number;
   /** Files a pull could not merge and somebody has to settle, as a count. */
   conflicts: number;
+  /**
+   * Whether this domain reviews changes before they land.
+   *
+   * Read from the presence of the count below rather than from a flag of its
+   * own, because that is how the server says it: a domain that takes changes
+   * directly sends neither draft key at all, since nobody can draft there.
+   */
+  reviewing: boolean;
+  /**
+   * How many drafts this session's own account is holding here, or null when
+   * the server could not count them.
+   *
+   * Null and zero are different sentences, as they are for `ownedChanges`
+   * beside this: zero is "you are holding nothing here" and null is "this could
+   * not be read", and only one of them is safe to act on.
+   */
+  myDrafts: number | null;
+  /**
+   * Who is drafting here and how much, or null when this caller was not sent
+   * it.
+   *
+   * The presence of the key is the server's answer to whether this caller may
+   * see who else is holding work - the domain's owner, or an instance admin -
+   * so nothing on this side works that out. Null is "not sent", which draws
+   * nothing; an empty array is "nobody is drafting here", which is a fact.
+   */
+  drafts: DraftHolder[] | null;
   /** Whether the origin is ahead, or null when the probe could not say. */
   behind: boolean | null;
   /**
@@ -683,6 +744,18 @@ function readConflict(value: unknown): SyncConflict | null {
   };
 }
 
+/**
+ * One row of the per-actor view: a name and a count, or nothing.
+ *
+ * A row with no name is dropped rather than drawn as an empty cell beside a
+ * number, which would read as "somebody" and say nothing.
+ */
+function readDraftHolder(value: unknown): DraftHolder | null {
+  const record = asObject(value);
+  const actor = asString(record?.actor);
+  return actor === null ? null : { actor, entries: asCount(record?.entries) };
+}
+
 /** Read a sync status out of the engine's own per-domain report. */
 function readSyncStatus(payload: unknown): SyncStatus {
   const record = asObject(payload);
@@ -700,6 +773,19 @@ function readSyncStatus(payload: unknown): SyncStatus {
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
     conflicts: asCount(record?.conflicts),
+    // The key's presence is what says the domain reviews at all: the server
+    // leaves both draft keys out of a domain that takes changes directly,
+    // where `0 drafts` would read as "you could have some".
+    reviewing: record !== null && "my_drafts" in record,
+    myDrafts: asNumber(record?.my_drafts),
+    // An array or nothing. A caller who may not see who else is drafting is
+    // sent no key, and a count the index could not answer arrives as null:
+    // neither is an empty list, which would say "nobody else is drafting here".
+    drafts: Array.isArray(record?.drafts)
+      ? record.drafts
+          .map(readDraftHolder)
+          .filter((holder): holder is DraftHolder => holder !== null)
+      : null,
     behind: typeof record?.behind === "boolean" ? record.behind : null,
     probeError: asString(record?.probe_error),
     mode: asString(record?.mode),

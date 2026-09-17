@@ -65,6 +65,10 @@ function capabilitiesOf(me: MeResponse | undefined): Capabilities {
     // exactly as they were.
     canShare: me?.can_share ?? role === "admin",
     needsSetup: me?.needs_setup ?? false,
+    // A probe from a server that predates the field is read as OAuth having
+    // never been turned on, the same fallback `canShare`'s own older sibling
+    // takes: an instance too old to say has never served it.
+    oauth: me?.oauth ?? false,
     serverVersion: me?.version ?? "",
   };
 }

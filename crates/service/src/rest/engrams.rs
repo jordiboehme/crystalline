@@ -37,12 +37,13 @@ use utoipa::IntoParams;
 use super::auth::Identity;
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, RestState,
-    csv, if_match, if_none_match_matches, precondition_failed,
+    csv, if_match, if_none_match_matches, precondition_failed, require_domain_write,
 };
 use crate::engine::EngineError;
 use crate::params::{
     DeleteParams, MoveParams, ReadParams, RetireParams, SaveParams, SearchParams, WriteParams,
 };
+use crate::similar::SimilarProbe;
 
 /// The query string `GET /domains/{domain}/engrams` takes: the filter side of
 /// [`SearchParams`], minus the domain the path already names and minus the
@@ -191,10 +192,12 @@ pub struct ListQuery {
 )]
 pub async fn list(
     State(state): State<RestState>,
+    identity: Identity,
     ApiPath(domain): ApiPath<String>,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    state.engine.require_domain(&domain)?;
+    let scope = identity.scope();
+    state.engine.require_domain(&domain, &scope).await?;
     let value = state
         .engine
         .search_engrams_under(
@@ -212,6 +215,7 @@ pub async fn list(
                 ..SearchParams::default()
             },
             query.path.as_deref(),
+            &scope,
         )
         .await?;
     Ok(Json(value))
@@ -262,7 +266,16 @@ pub async fn list(
     responses(
         (
             status = 200,
-            description = "The engine's own read payload, unchanged.",
+            description = "The engine's own read payload, unchanged.\n\nOn a \
+                           domain that reviews changes a read answers the \
+                           caller's own draft of the page where they hold one, \
+                           and `draft` is true. At a path a draft share-link \
+                           was minted on, the grantee's read answers the \
+                           author's draft instead, with `draft` true and \
+                           `draft_owner` naming them: a draft standing where \
+                           the team's page stands must never be mistaken for \
+                           that page, so a client shows whose work it is. Both \
+                           keys are absent on every ordinary read.",
             body = Object,
             headers(
                 ("etag" = String, description = "The quoted checksum of the \
@@ -315,15 +328,25 @@ pub async fn list(
 )]
 pub async fn detail(
     State(state): State<RestState>,
+    identity: Identity,
     headers: HeaderMap,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
     let value = state
         .engine
-        .read_engram(&ReadParams {
-            identifier: permalink,
-            domain: Some(domain),
-        })
+        .read_engram_stored(
+            &ReadParams {
+                identifier: permalink,
+                domain: Some(domain),
+                // The draft-link routes are this surface's way into a granted
+                // draft: they redeem and join through the session cookie, so a
+                // share-link never rides a REST read. The stored read for the
+                // same reason its checksum is an ETag: see
+                // `Engine::read_engram_stored`.
+                share_link: None,
+            },
+            &identity.scope(),
+        )
         .await?;
     let checksum = checksum_of(&value)?.to_string();
     if if_none_match_matches(&headers, &checksum) {
@@ -476,6 +499,7 @@ pub struct InboundQueryParams {
 )]
 pub async fn inbound(
     State(state): State<RestState>,
+    identity: Identity,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
     ApiQuery(query): ApiQuery<InboundQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
@@ -485,11 +509,18 @@ pub async fn inbound(
             &ReadParams {
                 identifier: permalink,
                 domain: Some(domain),
+                // The draft-link routes are this surface's way into a granted
+                // draft: they redeem and join through the session cookie, so a
+                // share-link never rides a REST read. The stored read for the
+                // same reason its checksum is an ETag: see
+                // `Engine::read_engram_stored`.
+                share_link: None,
             },
             query.q.as_deref(),
             query.rel.as_deref(),
             query.page,
             query.limit,
+            &identity.scope(),
         )
         .await?;
     Ok(Json(value))
@@ -600,7 +631,12 @@ pub struct MoveBody {
 /// The answer is the detail read rather than the write verb's own receipt, so
 /// a client that has just created an engram holds the same payload the detail
 /// route serves, `ETag` included, and can go straight to editing it without a
-/// second round trip.
+/// second round trip. One thing rides beside it: when the neighbours probe
+/// found engrams close in meaning to what just landed, the `similar` list and
+/// its `guidance` string are copied off the receipt onto the answer, so a
+/// create is also the search the author did not run. A title that slugifies
+/// into something its author would not expect back carries `notices` beside
+/// them. Every one of those keys is absent when there is nothing to say.
 ///
 /// A permalink already taken is the engine's `Conflict`, answered 409: this
 /// route never overwrites, so a client that means to replace something saves it
@@ -623,7 +659,16 @@ pub struct MoveBody {
     responses(
         (
             status = 201,
-            description = "The engine's own read payload for the new engram.",
+            description = "The engine's own read payload for the new engram, \
+                           plus - when the `capture.similar` advisory found \
+                           neighbours - a `similar` list of up to three \
+                           engrams {domain, permalink, title, status, type} \
+                           and a `guidance` string. A title that will not read \
+                           back the way it was written - one holding a `/`, \
+                           which lands the engram nested, or a `:`, which a \
+                           link reads as a domain prefix - also carries a \
+                           `notices` list of sentences naming what happened \
+                           and what to write instead.",
             body = Object,
             headers(("etag" = String, description = "The quoted checksum of the \
                      engram as written, the token a later save carries in \
@@ -691,7 +736,7 @@ pub async fn create(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<CreateEngramBody>,
 ) -> Result<Response, ApiError> {
-    let caller = identity.require_editor()?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     // The provenance the engram records. `human:` rather than a bare name so
     // `generated.by` says what kind of author this was: an MCP client writes
     // its own `clientname/version` there, and the two must not be mistaken for
@@ -702,24 +747,29 @@ pub async fn create(
     // is the only place that knows what would actually be written. Repeating
     // the check here would mean repeating that derivation, which is the kind of
     // second copy that drifts.
-    let written = state
+    // Bound rather than passed inline: the neighbours probe below reads the
+    // title and the body back out of it, and borrows them, so the params have
+    // to outlive the write that consumed them.
+    let params = WriteParams {
+        domain: domain.clone(),
+        title: body.title,
+        content: body.content,
+        folder: body.folder,
+        engram_type: body.engram_type,
+        tags: body.tags,
+        status: body.status,
+        metadata: body.metadata,
+        // Never from this route: replacing an engram goes through the PUT,
+        // which demands the token of the version being replaced.
+        overwrite: false,
+        // Nor from this one: a browser inside somebody's draft holds a join
+        // key and sends that, through the routes that take one.
+        share_link: None,
+        model: None,
+    };
+    let mut written = state
         .engine
-        .write_engram_as(
-            &WriteParams {
-                domain: domain.clone(),
-                title: body.title,
-                content: body.content,
-                folder: body.folder,
-                engram_type: body.engram_type,
-                tags: body.tags,
-                status: body.status,
-                metadata: body.metadata,
-                // Never from this route: replacing an engram goes through the
-                // PUT, which demands the token of the version being replaced.
-                overwrite: false,
-            },
-            Some(&actor),
-        )
+        .write_engram_as(&params, Some(&actor), &identity.scope())
         .await
         // The engine reports a taken permalink as a conflict, which this
         // surface answers 409 rather than the 422 its generic classification
@@ -738,11 +788,29 @@ pub async fn create(
     // restoring a backup is administration rather than authoring and would put
     // a whole domain on the queue for work nobody did.
     crate::maintenance::record_pending(&domain);
+    // What the author already knows about this topic, asked for after the write
+    // has landed and released the store lock rather than inside the engine
+    // verb: the probe takes that lock again and it is not reentrant. It never
+    // fails and never delays the answer past its own two-second ceiling; a
+    // probe that finds nothing leaves the receipt untouched.
+    let scope = identity.scope();
+    state
+        .engine
+        .attach_similar(&mut written, SimilarProbe::for_write(&params), &scope)
+        .await;
     let permalink = written["permalink"]
         .as_str()
         .ok_or_else(|| ApiError::internal("the write did not report a permalink to read back"))?
         .to_string();
-    detail_response(&state, &domain, &permalink, StatusCode::CREATED).await
+    detail_response(
+        &state,
+        &domain,
+        &permalink,
+        StatusCode::CREATED,
+        &scope,
+        Some(&written),
+    )
+    .await
 }
 
 /// `PUT /domains/{domain}/engrams/{*permalink}` - save an engram's complete
@@ -760,7 +828,9 @@ pub async fn create(
 /// - **412** when the token no longer matches, carrying the version the server
 ///   holds now (`current_etag`, `current_content`) so a client can show a merge
 ///   view instead of asking its author to retype the edit.
-/// - **200** with the detail read of what landed and its new `ETag`.
+/// - **200** with the detail read of what landed and its new `ETag`, carrying
+///   the same `similar` and `guidance` keys a create does when the neighbours
+///   probe found anything.
 ///
 /// One consequence of writing the text verbatim is worth knowing: an author who
 /// edits the `permalink` in the frontmatter moves the engram's address, since
@@ -790,7 +860,19 @@ pub async fn create(
                    since the index takes the permalink from the file. Such a \
                    save is answered 200 with the engram read at its new \
                    address, so a client can follow the move rather than lose \
-                   track of what it just wrote.",
+                   track of what it just wrote.\n\nOn a domain that reviews \
+                   changes the save lands in the caller's own private draft \
+                   and the folder the team reads does not move. A save made \
+                   from inside somebody else's draft - `X-Crystalline-Join` \
+                   naming a live join this session opened through a \
+                   share-link - lands in THAT person's draft instead, and is \
+                   answered with the draft itself rather than with a detail \
+                   read: the same body `POST /draft-links/accept` returns \
+                   (`domain`, `path`, `owner`, `permalink`, `editable`, \
+                   `reason`, `content`, `checksum`, `join_key`, `joined`), \
+                   because the caller's ordinary view does not carry the \
+                   owner's draft and a read-back would answer 404 for a write \
+                   that landed.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -807,12 +889,30 @@ pub async fn create(
                            from the detail read.",
             example = "\"3f8a1c05e2\"",
         ),
+        (
+            "X-Crystalline-Join" = Option<String>,
+            Header,
+            description = "The key of a live join this session opened on a \
+                           draft share-link (`POST /draft-links/join`). \
+                           Present only while working inside somebody else's \
+                           draft: it routes the save into that person's draft \
+                           and changes the reply to the accepted-draft body. \
+                           A key naming no live join of this account's is \
+                           refused 403 and nothing is written.",
+        ),
     ),
     request_body = SaveEngramBody,
     responses(
         (
             status = 200,
-            description = "The engine's own read payload for the saved engram.",
+            description = "The engine's own read payload for the saved engram, \
+                           plus - when the `capture.similar` advisory found \
+                           neighbours - a `similar` list of up to three \
+                           engrams {domain, permalink, title, status, type} \
+                           and a `guidance` string. A save routed by \
+                           `X-Crystalline-Join` answers the accepted-draft \
+                           body instead, with `joined` carrying the sentence \
+                           naming whose draft it landed in.",
             body = Object,
             headers(("etag" = String, description = "The quoted checksum of the \
                      engram as saved, the token the next save carries.")),
@@ -838,7 +938,12 @@ pub async fn create(
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled \
                            account. A read-only instance answers this ahead of \
-                           the precondition check, so it is never 428.",
+                           the precondition check, so it is never 428. A \
+                           presented `X-Crystalline-Join` that names no live \
+                           join of this account's is answered here too: the \
+                           draft was left, the link ran out or was taken back, \
+                           or the draft was folded, discarded or renamed, and \
+                           nothing of the caller's was written.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -874,7 +979,13 @@ pub async fn create(
             description = "The document is not an engram (unparseable, or no \
                            frontmatter block), the `If-Match` is a wildcard or \
                            a weak validator, or the target is one of the \
-                           reserved OKF names (`index.md`, `log.md`).",
+                           reserved OKF names (`index.md`, `log.md`). Also the \
+                           teaching refusals a domain that reviews changes \
+                           gives: a save at a path where a share-link shows \
+                           somebody else's draft, which says to join that \
+                           draft or to draft your own copy, and a caller with \
+                           no account of their own, which has no draft to \
+                           write into.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -894,7 +1005,7 @@ pub async fn save(
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<SaveEngramBody>,
 ) -> Result<Response, ApiError> {
-    identity.require_editor()?;
+    require_domain_write(&state, &identity, &domain).await?;
     // Before the If-Match parse, not after: an instance that refuses writes
     // refuses them whatever headers arrive, so this answers 403 rather than
     // sending a client off to fetch a token for a write that can never land.
@@ -916,29 +1027,94 @@ pub async fn save(
         )));
     }
     let token = if_match(&headers)?;
+    // Bound rather than passed inline: the neighbours probe below is over the
+    // document that landed, and it borrows that text rather than copying it, so
+    // the params have to outlive the save.
+    let params = SaveParams {
+        domain: domain.clone(),
+        identifier: permalink.clone(),
+        content: body.content,
+        expected_checksum: token,
+    };
+    let scope = identity.scope();
+    // The join this session may be holding, which is what routes the save into
+    // somebody else's draft rather than into this caller's own. `None` for
+    // every ordinary save, which is nearly all of them; see
+    // `super::draft_links::join_of` and `crate::join`.
+    let join = super::draft_links::join_of(&state, &identity, &headers)?;
     match state
         .engine
-        .save_engram(&SaveParams {
-            domain: domain.clone(),
-            identifier: permalink.clone(),
-            content: body.content,
-            expected_checksum: token,
-        })
+        .save_engram_joined(&params, &scope, join.as_ref())
         .await
     {
         // Read back from the receipt rather than reusing the URL's permalink:
         // the text landed verbatim, so an author who edited the `permalink`
         // line has moved the address, and the detail read has to follow it or
         // answer 404 for a write that succeeded.
-        Ok(receipt) => {
+        Ok(mut receipt) => {
             crate::maintenance::record_pending(&domain);
+            // A save made INSIDE somebody else's draft answers the draft
+            // itself rather than a detail read, and it has to: the read-back
+            // below is made as the CALLER, whose ordinary view deliberately
+            // does not carry the owner's draft, so it would answer 404 for a
+            // write that landed. The shape is the one
+            // `POST /draft-links/accept` answers, which is what the screen
+            // that opened the granted draft already speaks - and `body =
+            // Object` on this route is what lets it, rather than a second
+            // response type nobody asked for.
+            //
+            // The neighbours advisory is skipped here for the same reason it
+            // is not on the accept route: it is a search made as the caller,
+            // and a caller who was handed one page to edit is not asking what
+            // else in the domain is near it.
+            if let Some(join) = join.as_ref().filter(|_| receipt.get("joined").is_some()) {
+                let checksum = receipt["checksum"].as_str().unwrap_or_default().to_string();
+                let body = serde_json::json!({
+                    "domain": domain,
+                    "path": join.path,
+                    "owner": join.owner,
+                    "permalink": receipt["permalink"],
+                    "editable": true,
+                    "reason": Value::Null,
+                    "content": params.content,
+                    "checksum": checksum,
+                    "join_key": Value::Null,
+                    "joined": receipt["joined"],
+                });
+                let mut resp = (StatusCode::OK, Json(body)).into_response();
+                if let Ok(tag) = axum::http::HeaderValue::from_str(&format!("\"{checksum}\"")) {
+                    resp.headers_mut().insert(ETAG, tag);
+                }
+                return Ok(resp);
+            }
+            // Same contract as the create above: asked after the write, off the
+            // saved document (the frontmatter is stripped before it is probed),
+            // bounded, and silent when it finds nothing.
+            state
+                .engine
+                .attach_similar(
+                    &mut receipt,
+                    SimilarProbe::Markdown {
+                        text: &params.content,
+                    },
+                    &scope,
+                )
+                .await;
             let moved = receipt["permalink"]
                 .as_str()
                 .ok_or_else(|| {
                     ApiError::internal("the save did not report a permalink to read back")
                 })?
                 .to_string();
-            detail_response(&state, &domain, &moved, StatusCode::OK).await
+            detail_response(
+                &state,
+                &domain,
+                &moved,
+                StatusCode::OK,
+                &scope,
+                Some(&receipt),
+            )
+            .await
         }
         // The one conflict this route translates rather than propagates. Keyed
         // on the prefix `stale_edit_message` owns, which is the seam both
@@ -949,10 +1125,20 @@ pub async fn save(
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state
                 .engine
-                .read_engram(&ReadParams {
-                    identifier: permalink,
-                    domain: Some(domain),
-                })
+                .read_engram_stored(
+                    &ReadParams {
+                        identifier: permalink,
+                        domain: Some(domain),
+                        // The draft-link routes are this surface's way into a
+                        // granted draft: they redeem and join through the
+                        // session cookie, so a share-link never rides a REST
+                        // read. The stored read for the same reason its
+                        // checksum is an ETag: see
+                        // `Engine::read_engram_stored`.
+                        share_link: None,
+                    },
+                    &scope,
+                )
                 .await?;
             let checksum = current["checksum"].as_str().ok_or_else(|| {
                 ApiError::internal("the engram read carried no checksum to version it by")
@@ -1057,7 +1243,12 @@ pub async fn retire(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<RetireBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_editor()?;
+    // This domain is the only one a retirement can touch: the successor it
+    // wires is held to it by `Engine::resolve_in`, which refuses an absolute
+    // identifier naming another domain. Without that rule the domain here
+    // would be a hint the body could override, and the gate would be gating
+    // the wrong name.
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     let value = state
         .engine
         .retire_engram_as(
@@ -1069,6 +1260,7 @@ pub async fn retire(
                 valid_to: body.valid_to,
             },
             Some(&format!("human:{}", caller.name())),
+            &identity.scope(),
         )
         .await
         // Classified 409 like `create`'s collision, for parity across this
@@ -1178,16 +1370,38 @@ pub async fn move_action(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<MoveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_editor()?;
+    require_domain_write(&state, &identity, &domain).await?;
+    // Both ends, because a move writes at both: it takes an engram out of the
+    // source and puts it into the destination, and a caller who may write only
+    // one of the two could otherwise carry knowledge out of a private domain
+    // into a shared one, or into a domain they were never invited to. A
+    // destination the caller may not see answers the same 404 the source
+    // would - the destination is named in the body rather than the path, but
+    // it is a domain name either way, and naming one is not a way to learn
+    // that it exists.
+    //
+    // Read exactly as the engine reads it, untrimmed: a gate that trimmed
+    // what the verb does not would be gating a different string from the one
+    // that gets written to.
+    if let Some(destination) = body
+        .destination_domain
+        .as_deref()
+        .filter(|d| !d.is_empty() && *d != domain)
+    {
+        require_domain_write(&state, &identity, destination).await?;
+    }
     let value = state
         .engine
-        .move_engram(&MoveParams {
-            identifier: body.permalink,
-            domain,
-            destination: body.destination,
-            destination_domain: body.destination_domain,
-            update_links: None,
-        })
+        .move_engram(
+            &MoveParams {
+                identifier: body.permalink,
+                domain,
+                destination: body.destination,
+                destination_domain: body.destination_domain,
+                update_links: None,
+            },
+            &identity.scope(),
+        )
         .await
         // The one collision this verb can hit: a destination already taken.
         // Answered 409 rather than the generic 422 caller-error class, same
@@ -1485,7 +1699,7 @@ pub async fn remove(
     headers: HeaderMap,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
-    identity.require_editor()?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     // Before the If-Match parse, not after: the same reasoning as `save`'s
     // own read-only check, repeated here rather than shared, since the two
     // handlers are not yet worth abstracting over.
@@ -1497,11 +1711,18 @@ pub async fn remove(
     let token = if_match(&headers)?;
     match state
         .engine
-        .delete_engram(&DeleteParams {
-            identifier: permalink.clone(),
-            domain: domain.clone(),
-            expected_checksum: Some(token),
-        })
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: permalink.clone(),
+                domain: domain.clone(),
+                expected_checksum: Some(token),
+            },
+            // The same `human:` provenance the create and the retire stamp,
+            // for the same reason: whose removal this is, in the spelling
+            // those two write into `generated.by`.
+            Some(&format!("human:{}", caller.name())),
+            &identity.scope(),
+        )
         .await
     {
         Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
@@ -1510,10 +1731,20 @@ pub async fn remove(
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state
                 .engine
-                .read_engram(&ReadParams {
-                    identifier: permalink,
-                    domain: Some(domain),
-                })
+                .read_engram_stored(
+                    &ReadParams {
+                        identifier: permalink,
+                        domain: Some(domain),
+                        // The draft-link routes are this surface's way into a
+                        // granted draft: they redeem and join through the
+                        // session cookie, so a share-link never rides a REST
+                        // read. The stored read for the same reason its
+                        // checksum is an ETag: see
+                        // `Engine::read_engram_stored`.
+                        share_link: None,
+                    },
+                    &identity.scope(),
+                )
                 .await?;
             let checksum = current["checksum"].as_str().ok_or_else(|| {
                 ApiError::internal("the engram read carried no checksum to version it by")
@@ -1537,23 +1768,67 @@ const STALE_EDIT: &str = "stale edit";
 /// there is exactly one payload shape for an engram on this surface and a
 /// client that has just written one holds what the detail route would have
 /// given it.
+///
+/// `advisory` is the write receipt the engine handed back, when the caller has
+/// one: everything it carries beyond the detail read - today the neighbours
+/// advisory - is copied across by [`carry_advisory`]. A plain read passes
+/// `None`.
 async fn detail_response(
     state: &RestState,
     domain: &str,
     permalink: &str,
     status: StatusCode,
+    scope: &crate::scope::Scope,
+    advisory: Option<&Value>,
 ) -> Result<Response, ApiError> {
-    let value = state
+    let mut value = state
         .engine
-        .read_engram(&ReadParams {
-            identifier: permalink.to_string(),
-            domain: Some(domain.to_string()),
-        })
+        .read_engram_stored(
+            &ReadParams {
+                identifier: permalink.to_string(),
+                domain: Some(domain.to_string()),
+                // The draft-link routes are this surface's way into a granted
+                // draft: they redeem and join through the session cookie, so a
+                // share-link never rides a REST read. The stored read for the
+                // same reason its checksum is an ETag: see
+                // `Engine::read_engram_stored`.
+                share_link: None,
+            },
+            scope,
+        )
         .await?;
+    if let Some(receipt) = advisory {
+        carry_advisory(&mut value, receipt);
+    }
     let etag = etag(&value)?;
     let mut resp = (status, Json(value)).into_response();
     resp.headers_mut().insert(ETAG, etag);
     Ok(resp)
+}
+
+/// Copy what a write receipt carries beyond the detail read onto the detail the
+/// route answers with. The detail is what the editor renders; these ride beside
+/// it under the same keys the MCP receipt uses, so one reader learns one shape.
+///
+/// Two independent things travel here. The neighbours advisory is a pair -
+/// `similar` and `guidance` - and travels as a pair or not at all. The title
+/// notices are their own: a write can produce a surprising permalink with no
+/// neighbour in sight.
+///
+/// Safe to do before [`etag`] runs: the tag is taken from the payload's own
+/// `checksum`, which is the version of the engram on disk, rather than hashed
+/// over the body being served, so extra keys cannot move it.
+fn carry_advisory(detail: &mut Value, receipt: &Value) {
+    let Value::Object(detail) = detail else {
+        return;
+    };
+    if let (Some(similar), Some(guidance)) = (receipt.get("similar"), receipt.get("guidance")) {
+        detail.insert("similar".to_string(), similar.clone());
+        detail.insert("guidance".to_string(), guidance.clone());
+    }
+    if let Some(notices) = receipt.get("notices") {
+        detail.insert("notices".to_string(), notices.clone());
+    }
 }
 
 /// The strong validator for the engram this read returned: the checksum the

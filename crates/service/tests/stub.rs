@@ -6,8 +6,9 @@
 //! are public, so the status is built directly with no lock, socket or
 //! environment involved; the same duplex pattern as `tests/mcp_instructions.rs`.
 
+use crystalline_service::mcp::newest_legacy_handshake_version;
 use crystalline_service::{DegradedServer, StubStatus};
-use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, RoleServer};
 use serde_json::Value;
@@ -16,7 +17,7 @@ use serde_json::Value;
 /// the releases page, so a single fixture exercises the interesting path.
 fn mcpb_skew_status() -> StubStatus {
     StubStatus {
-        reason: "cannot run an embedded MCP server: another Crystalline instance owns the index (pid 4242)".to_string(),
+        reason: "cannot run an embedded MCP server: this process asked for the index, but another Crystalline instance already owns it: pid 4242, v99.0.0, started by serve, and its record says it bound 127.0.0.1:7411".to_string(),
         binary_version: crystalline_core::VERSION.to_string(),
         daemon_version: Some("99.0.0".to_string()),
         daemon_pid: Some(4242),
@@ -109,7 +110,7 @@ async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours(
     let server_task = tokio::spawn(async move {
         rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
     });
-    let mut info = ClientInfo::default();
+    let mut info = ClientConfig::default();
     info.protocol_version =
         serde_json::from_value(serde_json::Value::String("2027-01-01".to_string())).unwrap();
     let client = rmcp::serve_client(info, client_io).await.unwrap();
@@ -120,22 +121,24 @@ async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours(
         .as_ref()
         .map(|i| i.protocol_version.clone())
         .expect("the server answered initialize");
-    assert_eq!(answered, ProtocolVersion::V_2025_11_25);
+    assert_eq!(answered, newest_legacy_handshake_version());
     drop(client);
     drop(server);
 }
 
-/// The degraded server echoes 2026-07-28 to a client that asks for it, exactly
-/// as the healthy one does: a client cannot learn a different answer from a
-/// failed start than it would have got from a healthy one, which is the whole
-/// reason `supported_protocol_versions` is shared rather than duplicated.
+/// The degraded server answers a handshake naming 2026-07-28 exactly as the
+/// healthy one does - with the newest revision that still has a handshake,
+/// rmcp 3.2.0's `negotiate_protocol_version` rule. A client cannot learn a
+/// different answer from a failed start than it would have got from a healthy
+/// one, which is the whole reason `supported_protocol_versions` is shared
+/// rather than duplicated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_degraded_server_serves_the_era_too() {
+async fn the_degraded_server_answers_an_era_handshake_like_the_healthy_one() {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let server_task = tokio::spawn(async move {
         rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
     });
-    let mut info = ClientInfo::default();
+    let mut info = ClientConfig::default();
     info.protocol_version = ProtocolVersion::V_2026_07_28;
     let client = rmcp::serve_client(info, client_io).await.unwrap();
     let server = server_task.await.unwrap().unwrap();
@@ -145,7 +148,7 @@ async fn the_degraded_server_serves_the_era_too() {
         .as_ref()
         .map(|i| i.protocol_version.clone())
         .expect("the server answered initialize");
-    assert_eq!(answered, ProtocolVersion::V_2026_07_28);
+    assert_eq!(answered, newest_legacy_handshake_version());
     drop(client);
     drop(server);
 }

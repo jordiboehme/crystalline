@@ -16,7 +16,8 @@ use crystalline_core::config::{DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
 use crystalline_service::Engine;
-use crystalline_service::params::EvolveParams;
+use crystalline_service::Scope;
+use crystalline_service::params::{EditParams, EvolveParams};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -219,10 +220,13 @@ fn files() -> Vec<(String, String)> {
 /// wrapper has its own tests at the end of this file.
 async fn sweep(engine: &Engine, today: &str, p: EvolveParams) -> Value {
     engine
-        .evolve_detect(&EvolveParams {
-            today: Some(today.to_string()),
-            ..p
-        })
+        .evolve_detect(
+            &EvolveParams {
+                today: Some(today.to_string()),
+                ..p
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap()
 }
@@ -264,6 +268,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V004", // 65
             "V105", // 60
             "V006", // 58, base 50 plus the human-authored boost
+            "V010", // 55
             "V101", // 55
             "V202", // 55
             "V102", // 50
@@ -274,8 +279,8 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V003", // 25
         ]
     );
-    assert_eq!(v["total"], 15);
-    assert_eq!(v["count"], 15);
+    assert_eq!(v["total"], 16);
+    assert_eq!(v["count"], 16);
     assert_eq!(v["engrams_scanned"], 19);
     assert_eq!(v["unparsed"], 0);
     assert_eq!(v["scope"]["today"], TODAY);
@@ -292,7 +297,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(
         v["families"],
         serde_json::json!([
-            { "family": "temporal", "findings": 6 },
+            { "family": "temporal", "findings": 7 },
             { "family": "structure", "findings": 6 },
             { "family": "redundancy", "findings": 3 },
         ])
@@ -300,7 +305,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
 
     // The prose instruction rides the legend once per rule, never a row.
     let actions = v["actions"].as_array().unwrap();
-    assert_eq!(actions.len(), 15);
+    assert_eq!(actions.len(), 16);
     assert_eq!(actions[0]["rule"], "V001");
     assert!(
         actions
@@ -330,6 +335,10 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(by_rule("V201")["permalink"], "dup-a");
     assert_eq!(by_rule("V202")["permalink"], "deploy-checklist");
     assert_eq!(by_rule("V105")["permalink"], "huge-doc");
+    // The retired engram whose one observation turns up in no live engram of
+    // the domain: `- [context] the successor was never captured`.
+    assert_eq!(by_rule("V010")["permalink"], "retired-thing");
+    assert_eq!(by_rule("V010")["class"], "judgment");
 
     // V006 reads the `generated.by` actor the engine put on the facts, so this
     // is what catches the fact assembly dropping write provenance: the rule
@@ -369,7 +378,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
 async fn paging_walks_the_same_ranked_queue() {
     let (_tmp, engine) = fixture().await;
     let mut walked: Vec<String> = Vec::new();
-    for page in 1..=3 {
+    for page in 1..=4 {
         let v = sweep(
             &engine,
             TODAY,
@@ -380,10 +389,14 @@ async fn paging_walks_the_same_ranked_queue() {
             },
         )
         .await;
-        assert_eq!(v["total"], 15);
+        assert_eq!(v["total"], 16);
         assert_eq!(v["limit"], 5);
         assert_eq!(v["page"], page);
-        assert_eq!(v["count"], 5, "fifteen findings fill three whole pages");
+        assert_eq!(
+            v["count"],
+            if page == 4 { 1 } else { 5 },
+            "sixteen findings fill three whole pages and one more row"
+        );
         for (i, row) in v["queue"].as_array().unwrap().iter().enumerate() {
             assert_eq!(row["n"].as_u64().unwrap() as usize, (page - 1) * 5 + i + 1);
         }
@@ -413,7 +426,7 @@ async fn paging_walks_the_same_ranked_queue() {
         },
     )
     .await;
-    assert_eq!(past["total"], 15);
+    assert_eq!(past["total"], 16);
     assert_eq!(past["count"], 0);
     assert!(past["queue"].as_array().unwrap().is_empty());
 }
@@ -421,7 +434,8 @@ async fn paging_walks_the_same_ranked_queue() {
 /// The `today` override moves the temporal comparisons and nothing else, which
 /// is what makes a run reproducible. Evaluated before every planted date, the
 /// age and window rules go silent while the structural and redundancy rules are
-/// unchanged.
+/// unchanged - and so are the three temporal rules that compare no date at all
+/// (`V004`, `V005` and `V010`, which read the graph and the text).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_today_override_moves_only_the_temporal_rules() {
     let (_tmp, engine) = fixture().await;
@@ -440,7 +454,7 @@ async fn the_today_override_moves_only_the_temporal_rules() {
     assert_eq!(
         fired,
         vec![
-            "V004", "V005", "V101", "V102", "V103", "V105", "V106", "V201", "V202", "V203"
+            "V004", "V005", "V010", "V101", "V102", "V103", "V105", "V106", "V201", "V202", "V203"
         ]
     );
     assert_eq!(v["scope"]["today"], BEFORE_EVERYTHING);
@@ -478,9 +492,9 @@ async fn family_and_rule_filters_narrow_the_queue() {
     .await;
     assert_eq!(
         rules(&temporal),
-        vec!["V005", "V001", "V002", "V004", "V006", "V003"]
+        vec!["V005", "V001", "V002", "V004", "V006", "V010", "V003"]
     );
-    assert_eq!(temporal["total"], 6);
+    assert_eq!(temporal["total"], 7);
     assert_eq!(
         temporal["scope"]["families"],
         serde_json::json!(["temporal"])
@@ -547,17 +561,20 @@ async fn min_priority_drops_the_low_scoring_tail() {
 }
 
 /// An unknown domain, family or rule errors naming the valid set, so a caller
-/// recovers in one step. The reserved `V3xx` range is not in the catalog, so
-/// asking for it errors rather than returning silence.
+/// recovers in one step. An id outside the catalog errors rather than
+/// returning silence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     let (_tmp, engine) = fixture().await;
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            domains: vec!["nope".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["nope".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -565,10 +582,13 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     assert!(e.contains("eng"), "{e}");
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            families: vec!["lifecycle".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                families: vec!["lifecycle".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -578,24 +598,31 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     );
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            rules: vec!["V301".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                rules: vec!["V999".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        e.starts_with("unknown rule 'V301'; valid rules: V001, V002"),
+        e.starts_with("unknown rule 'V999'; valid rules: V001, V002"),
         "{e}"
     );
-    assert!(e.ends_with("V203"), "{e}");
+    // The catalog's last id, so the error names the whole of it.
+    assert!(e.ends_with("V301"), "{e}");
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            today: Some("last tuesday".to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                today: Some("last tuesday".to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -622,7 +649,7 @@ async fn an_unreadable_engram_is_counted_rather_than_aborting_the_sweep() {
     .await;
     assert_eq!(v["unparsed"], 1);
     assert_eq!(v["engrams_scanned"], 18);
-    assert_eq!(v["total"], 14);
+    assert_eq!(v["total"], 15);
     assert!(!rules(&v).contains(&"V106".to_string()));
 }
 
@@ -715,11 +742,14 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
     // Detection changes nothing at all, which is what lets a queue view show
     // this page without claiming anybody worked it.
     engine
-        .evolve_detect(&EvolveParams {
-            domains: vec!["eng".to_string()],
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["eng".to_string()],
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -729,11 +759,14 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
     );
 
     let v = engine
-        .evolve_engrams(&EvolveParams {
-            domains: vec!["eng".to_string()],
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["eng".to_string()],
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(v["scope"]["domains"], serde_json::json!(["eng"]));
@@ -776,10 +809,13 @@ async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
     crystalline_service::maintenance::record_pending("ghost");
 
     let v = engine
-        .evolve_engrams(&EvolveParams {
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -981,6 +1017,7 @@ async fn ack_edit(engine: &Engine, permalink: &str, value: &str) -> Result<Value
                 ..Default::default()
             },
             Some("agent:test"),
+            &Scope::Unrestricted,
         )
         .await
         .map_err(|e| e.to_string())
@@ -1096,6 +1133,7 @@ async fn an_unknown_rule_is_refused() {
                 ..Default::default()
             },
             None,
+            &Scope::Unrestricted,
         )
         .await
         .unwrap_err()
@@ -1186,6 +1224,84 @@ async fn an_ack_whose_evidence_changed_comes_back_stale() {
     assert_eq!(after["acknowledged"]["total"], 1);
 }
 
+/// A single-scope rule keeps exactly one acknowledgment however often its
+/// evidence moves, so the drift row survives a re-acknowledgment: acknowledge,
+/// drift, re-acknowledge, drift again, and the finding is still stale and still
+/// carries the note somebody wrote for it.
+///
+/// The pair-scoped `V301` is the one rule that stores a second entry, and it
+/// stores it per pair. Every other rule replacing its entry is what keeps this
+/// path working: two entries for one rule would leave the second drift with no
+/// entry to point at and downgrade it to a fresh finding, losing "somebody
+/// ruled this intentional and the evidence has since changed" for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_acknowledged_rule_keeps_one_entry_and_stays_stale_on_the_next_drift() {
+    let (tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+
+    // First drift: a second retired target.
+    let path = tmp.path().join("eng/live-doc.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "- relates_to [[Retired thing]]",
+            "- relates_to [[Retired thing]]\n- relates_to [[Old deploy pipeline]]",
+        ),
+    )
+    .unwrap();
+    let old = tmp.path().join("eng/deploy/old-pipeline.md");
+    let source = std::fs::read_to_string(&old).unwrap();
+    std::fs::write(&old, source.replace("status: stable", "status: deprecated")).unwrap();
+    engine.sync(None).await.unwrap();
+
+    // Re-acknowledged on the new evidence: one entry in the file, the fresh one.
+    acknowledge(&engine, "live-doc", "V101 both are deliberate").await;
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        on_disk.matches("rule: V101").count(),
+        1,
+        "one entry per single-scope rule: {on_disk}"
+    );
+
+    // Second drift: a third retired target.
+    std::fs::write(
+        tmp.path().join("eng/legacy-note.md"),
+        "---\ntype: engram\ntitle: Legacy note\npermalink: legacy-note\ntags:\n  - legacy-notes\nstatus: superseded\nrecorded_at: 2026-07-25\n---\n\nKept only for the record.\n\n- [context] nothing points here any more\n",
+    )
+    .unwrap();
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "- relates_to [[Old deploy pipeline]]",
+            "- relates_to [[Old deploy pipeline]]\n- relates_to [[Legacy note]]",
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    let row = rows_on(&v, "live-doc")[0];
+    assert_eq!(row["ack_stale"], true, "{row}");
+    assert_eq!(row["ack_note"], "both are deliberate");
+    assert_eq!(
+        row["ack_scope"], "eng/deploy/old-pipeline, eng/retired-thing",
+        "the row says what was acknowledged, not what it fires on now"
+    );
+    assert_eq!(v["acknowledged"]["total"], 0, "nothing was suppressed");
+}
+
 /// A hand-written entry with no scope suppresses whatever the rule finds, and
 /// withdrawing it brings the finding straight back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1217,7 +1333,14 @@ async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
     assert_eq!(v["acknowledged"]["total"], 1);
 
     let removed = engine
-        .unacknowledge_finding_as("eng", "live-doc", "v101", Some("human:jordi"))
+        .unacknowledge_finding_as(
+            "eng",
+            "live-doc",
+            "v101",
+            None,
+            Some("human:jordi"),
+            &crystalline_service::Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(removed);
@@ -1241,7 +1364,14 @@ async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
     // rewrite that changed nothing.
     assert!(
         !engine
-            .unacknowledge_finding_as("eng", "live-doc", "V101", None)
+            .unacknowledge_finding_as(
+                "eng",
+                "live-doc",
+                "V101",
+                None,
+                None,
+                &crystalline_service::Scope::Unrestricted,
+            )
             .await
             .unwrap()
     );
@@ -1318,6 +1448,7 @@ async fn an_ack_refuses_an_engram_that_no_longer_parses() {
                 ..Default::default()
             },
             Some("agent:test"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap_err()
@@ -1365,6 +1496,7 @@ async fn an_edit_and_an_ack_both_survive_a_block_form_generated_mapping() {
                 ..Default::default()
             },
             Some("agent:test"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1444,7 +1576,14 @@ async fn a_lowercase_hand_written_rule_id_can_still_be_withdrawn() {
 
     assert!(
         engine
-            .unacknowledge_finding_as("eng", "live-doc", "V101", Some("human:jordi"))
+            .unacknowledge_finding_as(
+                "eng",
+                "live-doc",
+                "V101",
+                None,
+                Some("human:jordi"),
+                &crystalline_service::Scope::Unrestricted,
+            )
             .await
             .unwrap()
     );
@@ -1721,5 +1860,950 @@ async fn v009_comes_out_of_a_real_team_domains_unshared_work() {
     assert!(
         !rules(&fresh).contains(&"V009".to_string()),
         "a day-old delta is not stale: {fresh}"
+    );
+}
+
+// --- Task 9: the sweep runs in the invoking actor's dimension ---------------
+
+/// One engram of a reviewed domain, as the team's own files hold it.
+fn reviewed(title: &str, permalink: &str, body: &str) -> String {
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\n{body}\n"
+    )
+}
+
+/// A file domain `team` in review mode, with a state directory of its own so a
+/// draft can be mirrored.
+///
+/// Two engrams the team reviewed: `charter` carries a prose link that answers
+/// to no permalink and no title anywhere (ledger L308 - a fixture target has to
+/// fail both readings or the index resolves it), so it is a `V102` finding for
+/// everybody; `runbook` is whole, so it is a finding for nobody until somebody
+/// drafts one into it.
+async fn review_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("charter.md"),
+        reviewed(
+            "Charter",
+            "charter",
+            "How the team works, and what [[Nobody Ever Wrote This Down]] would have said.",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("runbook.md"),
+        reviewed("Runbook", "runbook", "How the team restarts the importer."),
+    )
+    .unwrap();
+    // One attachment the team's own text shows a reader, and one nothing
+    // references at all, so `V108` has something to say either way.
+    std::fs::write(
+        dir.join("deck.md"),
+        reviewed(
+            "Deck",
+            "deck",
+            "The quarter's numbers are in the deck below.\n\n![Deck](assets/deck.png)",
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    for name in ["deck.png", "stray.png"] {
+        std::fs::write(
+            dir.join("assets").join(name),
+            format!("PNG bytes of {name}"),
+        )
+        .unwrap();
+    }
+
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(tmp.path().join("state")),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
+/// One account, as an authenticated surface resolves it.
+fn account(name: &str) -> Scope {
+    Scope::User {
+        account: name.to_string(),
+        admin: false,
+    }
+}
+
+/// The permalinks `V102` fires on for one actor, sorted so the assertion is
+/// about which engrams carry a dangling reference rather than about rank.
+async fn dangling_for(engine: &Engine, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec!["V102".to_string()],
+                limit: Some(50),
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    let mut out: Vec<String> = v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["permalink"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Append one line to an engram as somebody, which in a reviewed domain lands
+/// as that person's own draft.
+async fn append_as(engine: &Engine, permalink: &str, line: &str, scope: &Scope) {
+    let value = engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: permalink.to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some(line.to_string()),
+                ..EditParams::default()
+            },
+            None,
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["draft"], Value::Bool(true), "{value}");
+}
+
+/// A reference that dangles in a draft is a finding for the person drafting it
+/// and for nobody else: the sweep reads the domain the way its caller reads it,
+/// so the text under review is the author's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drafts_unresolved_link_is_its_authors_finding_only() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "the reviewed files carry exactly one dangling reference"
+    );
+
+    // Alice writes a link nothing answers to into her own draft of the runbook.
+    append_as(
+        &engine,
+        "runbook",
+        "See [[How Alice Would Restart It]] for the rewrite.",
+        &alice,
+    )
+    .await;
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string(), "runbook".to_string()],
+        "her own draft's broken reference is hers to fix"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and nobody else is told about a reference in text they cannot read"
+    );
+
+    // An acknowledgment is resolved and recorded in the acknowledger's own
+    // dimension, so ruling her draft's reference intentional silences it for
+    // her and says nothing to anybody else.
+    engine
+        .acknowledge_finding_as(
+            "team",
+            "runbook",
+            "V102",
+            Some("the rewrite lands with the target"),
+            None,
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "her own ruling silences her own finding"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and the team's sweep never saw it either way"
+    );
+}
+
+/// A finding about the text the team reviewed is everybody's, whatever anybody
+/// is drafting elsewhere - and one actor's acknowledgment of it is their own,
+/// because the ack is written into their draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_finding_shows_for_every_actor() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    let charter = vec!["charter".to_string()];
+    assert_eq!(dangling_for(&engine, &alice).await, charter);
+    assert_eq!(dangling_for(&engine, &bob).await, charter);
+    assert_eq!(
+        dangling_for(&engine, &Scope::Unrestricted).await,
+        charter,
+        "and so does the machine owner, who is drafting nothing"
+    );
+
+    // A draft somewhere else changes nothing about a finding on the file.
+    append_as(&engine, "runbook", "The importer restarts cleanly.", &alice).await;
+    assert_eq!(dangling_for(&engine, &alice).await, charter);
+    assert_eq!(dangling_for(&engine, &bob).await, charter);
+
+    // Alice rules the dangling reference intentional. In a reviewed domain that
+    // ruling lands in her draft of the charter, so it speaks for her alone.
+    engine
+        .acknowledge_finding_as(
+            "team",
+            "charter",
+            "V102",
+            Some("the target lives outside the archive"),
+            None,
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(
+        dangling_for(&engine, &alice).await.is_empty(),
+        "her own ruling silences the finding for her"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        charter,
+        "and never for somebody who has not read it"
+    );
+}
+
+/// A date past every attachment's modified stamp, which is what lets the
+/// attachment rules speak: a file is left alone on the day it arrives, so the
+/// fixture's freshly written assets need a sweep dated after them.
+const AFTER_THE_UPLOAD: &str = "2027-01-01";
+
+/// The attachment paths `V108` calls orphaned for one actor, sorted. An
+/// attachment finding carries its path as the title, since no engram owns it.
+async fn orphans_for(engine: &Engine, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec!["V108".to_string()],
+                limit: Some(50),
+                today: Some(AFTER_THE_UPLOAD.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    let mut out: Vec<String> = v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["title"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Delete an engram as somebody, which in a reviewed domain lands as that
+/// person's own tombstone: the file stays and the path reads as absent for
+/// them alone.
+async fn delete_as(engine: &Engine, permalink: &str, scope: &Scope) {
+    let value = engine
+        .delete_engram_as(
+            &crystalline_service::params::DeleteParams {
+                identifier: permalink.to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["draft"], Value::Bool(true), "{value}");
+}
+
+/// An attachment is shared state and deleting one is a shared act, so the
+/// question `V108` asks - does anything in this domain reference this file -
+/// is asked of the union: what this reader sees plus what the domain still
+/// holds. An author who drops a reference in a draft is never told the file is
+/// now unused, and a reference only their draft carries counts for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_dropping_a_reference_never_orphans_a_shared_attachment() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    let stray = vec!["assets/stray.png".to_string()];
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        stray,
+        "the file nothing points at is the orphan, and the deck is not"
+    );
+
+    // Alice drafts the deck reference out of her copy.
+    engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "deck".to_string(),
+                domain: "team".to_string(),
+                operation: "find_replace".to_string(),
+                find_text: Some("![Deck](assets/deck.png)".to_string()),
+                content: Some("The deck moved to the shared drive.".to_string()),
+                ..EditParams::default()
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        stray,
+        "her unreviewed edit is no argument for deleting a file the team's own \
+         text still shows"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        stray,
+        "and it says nothing to anybody else either"
+    );
+
+    // The other direction: a reference only her draft carries answers for her.
+    append_as(
+        &engine,
+        "runbook",
+        "The stray shot is worth keeping: ![Stray](assets/stray.png)",
+        &alice,
+    )
+    .await;
+    assert!(
+        orphans_for(&engine, &alice).await.is_empty(),
+        "she is reading text that references it, so it is not unused for her"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        stray,
+        "and nothing she has not shared reaches his queue"
+    );
+}
+
+/// A reference is dangling when it answers to nothing the reader sees. For an
+/// author that is base plus their own drafts, so two drafts of theirs answer
+/// each other, and a path they have drafted a deletion of answers nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authors_own_drafts_resolve_each_others_links() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    // A draft-only engram of her own, linked from another of her drafts.
+    engine
+        .write_engram_as(
+            &crystalline_service::params::WriteParams {
+                domain: "team".to_string(),
+                title: "Restart Ladder".to_string(),
+                content: "The ladder the importer restart climbs.".to_string(),
+                tags: vec!["team".to_string()],
+                folder: None,
+                engram_type: None,
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    append_as(
+        &engine,
+        "runbook",
+        "The ladder is in [[Restart Ladder]].",
+        &alice,
+    )
+    .await;
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "her link answers to an engram she is reading, so only the reviewed \
+         file's own broken reference is left"
+    );
+
+    // And the other way: a path she has drafted a deletion of answers nothing,
+    // however well the reviewed folder still answers it for everybody else.
+    delete_as(&engine, "charter", &alice).await;
+    append_as(&engine, "runbook", "History lives in [[Charter]].", &alice).await;
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["runbook".to_string()],
+        "the charter is gone from her view, so her link to it is the dangling one"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and the team still reads the charter, with its own broken reference"
+    );
+}
+
+/// A path an author has drafted a deletion of is absent from their sweep
+/// entirely: no engram, and so no finding about it. For everybody else the
+/// reviewed file stands, and so does what it is doing wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_an_author_deleted_carries_no_finding_for_them() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "the reviewed charter carries a broken reference for everybody"
+    );
+
+    delete_as(&engine, "charter", &alice).await;
+
+    assert!(
+        dangling_for(&engine, &alice).await.is_empty(),
+        "she has deleted the engram the finding was about, so there is nothing \
+         left to tell her"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and the deletion is hers alone until it is reviewed"
+    );
+}
+
+// --- Task 11c: the sweep reads references in the caller's own view ----------
+
+/// Write one engram as somebody, which in a reviewed domain lands as that
+/// person's own draft.
+async fn write_as(engine: &Engine, title: &str, body: &str, scope: &Scope) {
+    let value = engine
+        .write_engram_as(
+            &crystalline_service::params::WriteParams {
+                domain: "team".to_string(),
+                title: title.to_string(),
+                content: body.to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec!["team".to_string()],
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            },
+            None,
+            scope,
+        )
+        .await
+        .unwrap();
+    assert_eq!(value["draft"], Value::Bool(true), "{value}");
+}
+
+/// Add one file to the folder the team shares, and index it.
+async fn reviewed_file(engine: &Engine, dir: &std::path::Path, name: &str, text: &str) {
+    std::fs::write(dir.join(name), text).unwrap();
+    engine.sync(None).await.unwrap();
+}
+
+/// The rules one actor's sweep fires, for the finding shapes that carry no
+/// engram of their own.
+async fn rules_for(engine: &Engine, rule: &str, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec![rule.to_string()],
+                limit: Some(50),
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["rule"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A finding about a team link that one reader's own draft answers is not
+/// raised for that reader.
+///
+/// The sweep is what an author runs before sharing, so it has to speak about
+/// the archive they are actually reading. Told that the charter's link is
+/// broken when the page it names is open in front of them, they would go and
+/// write it twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_links_finding_that_only_the_readers_draft_resolves_is_not_raised_for_them() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "before she writes it, the charter's link is hers to fix like everybody's"
+    );
+
+    write_as(
+        &engine,
+        "Nobody Ever Wrote This Down",
+        "- [decision] somebody did after all #team",
+        &alice,
+    )
+    .await;
+
+    assert!(
+        dangling_for(&engine, &alice).await.is_empty(),
+        "she has answered the team's link, so it is no longer her finding"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        vec!["charter".to_string()],
+        "and it is still everybody else's, because her page is hers alone"
+    );
+}
+
+/// A finding about a team link into a page one reader has deleted is raised for
+/// that reader and for nobody else.
+///
+/// The other end of the same sentence. The file is whole and the link lands for
+/// the team; for her the page it names is gone, and a sweep that said otherwise
+/// would be reading somebody else's archive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_base_link_into_a_path_the_reader_deleted_is_raised_for_them_alone() {
+    let (tmp, engine) = review_fixture().await;
+    let dir = tmp.path().join("team");
+    let alice = account("alice");
+    let bob = account("bob");
+    reviewed_file(
+        &engine,
+        &dir,
+        "guide.md",
+        &reviewed(
+            "Guide",
+            "guide",
+            "Start at the runbook.\n\n- relates_to [[Runbook]]",
+        ),
+    )
+    .await;
+
+    let charter = vec!["charter".to_string()];
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        charter,
+        "the guide's link lands for everybody while the runbook is there"
+    );
+
+    engine
+        .delete_engram_as(
+            &crystalline_service::params::DeleteParams {
+                identifier: "runbook".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string(), "guide".to_string()],
+        "her deletion is what broke the guide's link, and only for her"
+    );
+    assert_eq!(
+        dangling_for(&engine, &bob).await,
+        charter,
+        "the team's own guide still points at the team's own runbook"
+    );
+}
+
+/// A draft titled with a colon answers its author's own link, in the sweep.
+///
+/// `[[Log: Weekly]]` splits like `[[domain:Target]]` and only the registry
+/// settles it, which is the reading the sweep's own draft pass never had: it
+/// re-implemented the permalink and title forms in Rust and stopped there. It
+/// is one resolver now, so the form the index has always understood is the form
+/// the finding understands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_colon_titled_draft_answers_a_drafts_link_in_the_sweep() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+
+    append_as(
+        &engine,
+        "runbook",
+        "The week's numbers are in [[Log: Weekly]].",
+        &alice,
+    )
+    .await;
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string(), "runbook".to_string()],
+        "her draft names a page nobody has written"
+    );
+
+    write_as(
+        &engine,
+        "Log: Weekly",
+        "- [fact] what the week did #team",
+        &alice,
+    )
+    .await;
+
+    assert_eq!(
+        dangling_for(&engine, &alice).await,
+        vec!["charter".to_string()],
+        "and now she has written it, under the title she linked to"
+    );
+}
+
+/// The tag drift rule reads the tags its reader sees; the `vocabulary` tool
+/// goes on answering the team's own list.
+///
+/// The two halves of the Task 9 ruling, and only one of them held. What a
+/// person is SHOWN is the domain's agreement, because a word one author is
+/// trying out in a draft is not the team's vocabulary. But a drift FINDING is
+/// about what that author wrote, and read off the team's list it could only
+/// ever say nothing about the spelling they had just invented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v203_reads_the_tags_the_author_sees() {
+    let (tmp, engine) = review_fixture().await;
+    let dir = tmp.path().join("team");
+    let alice = account("alice");
+    let bob = account("bob");
+    std::fs::write(
+        dir.join("schema.md"),
+        "---\ntype: engram\ntitle: Schema\npermalink: schema\ntags:\n  - database\nstatus: stable\nrecorded_at: 2026-07-25\n---\n\nHow the tables are laid out.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    assert!(
+        rules_for(&engine, "V203", &alice).await.is_empty(),
+        "the team spells it one way and nothing has drifted"
+    );
+
+    append_as(
+        &engine,
+        "runbook",
+        "- [decision] the importer writes straight to the store #data-base",
+        &alice,
+    )
+    .await;
+
+    assert_eq!(
+        rules_for(&engine, "V203", &alice).await,
+        vec!["V203".to_string()],
+        "her own draft is where the second spelling is, so the drift is hers"
+    );
+    assert!(
+        rules_for(&engine, "V203", &bob).await.is_empty(),
+        "and nobody else is told about a word they cannot read"
+    );
+
+    let listed = async |scope: &Scope| {
+        engine
+            .vocabulary(
+                &crystalline_service::params::VocabularyParams {
+                    domain: Some("team".to_string()),
+                },
+                scope,
+            )
+            .await
+            .unwrap()["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    for scope in [&alice, &bob] {
+        assert!(
+            listed(scope).await.contains(&"database".to_string()),
+            "the tool answers the team's own vocabulary"
+        );
+        assert!(
+            !listed(scope).await.contains(&"data-base".to_string()),
+            "and never a word one person is trying out in a draft"
+        );
+    }
+}
+
+/// The attachment paths `V107` calls dangling for one actor, sorted. The
+/// finding carries the path it could not find as its `fix`.
+async fn dangling_attachments_for(engine: &Engine, scope: &Scope) -> Vec<String> {
+    let v = engine
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["team".to_string()],
+                rules: vec!["V107".to_string()],
+                limit: Some(50),
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            scope,
+        )
+        .await
+        .unwrap();
+    let mut out: Vec<String> = v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["fix"].as_str().unwrap().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// **A file only one actor holds is theirs to be orphaned**, and nobody
+/// else's to hear about.
+///
+/// The orphan rule reads the actor view, so a file somebody drafted and
+/// referenced nowhere is reported to its author - which is the only person who
+/// could do anything about it - and is not in the team's list at all, because
+/// the team does not have it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v108_orphans_an_overlay_only_file_for_its_actor_alone() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    let team_only = vec!["assets/stray.png".to_string()];
+    assert_eq!(orphans_for(&engine, &alice).await, team_only);
+    assert_eq!(orphans_for(&engine, &bob).await, team_only);
+
+    let written = engine
+        .attachment_write_as(
+            "team",
+            "assets/mine.png",
+            b"PNG bytes of mine".to_vec(),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(written.draft, "the upload landed as alice's draft");
+
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        vec![
+            "assets/mine.png".to_string(),
+            "assets/stray.png".to_string()
+        ],
+        "her own unreferenced file is hers to answer for, beside the team's"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        team_only,
+        "and the team is told nothing about a file the team does not have"
+    );
+}
+
+/// **A file an actor deleted in review mode reads as absent for them**, and
+/// that absence speaks only about the text they are reading.
+///
+/// Her deletion is a draft like any other: the file is still the team's until
+/// the deletion is reviewed. So `V107` tells HER that the reviewed page still
+/// showing the deck points at a file she no longer has - which is the finding
+/// that would make her fix the page before she shares the deletion - and says
+/// nothing of the sort to anybody else. And `V108` never calls the deck an
+/// orphan for anybody: for her it is not a file she holds at all, and for the
+/// team it is referenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tombstoned_base_attachment_is_absent_for_the_actor_and_v107_says_so_for_their_text_only()
+{
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+    let bob = account("bob");
+
+    assert!(dangling_attachments_for(&engine, &alice).await.is_empty());
+    let team_only = vec!["assets/stray.png".to_string()];
+    assert_eq!(orphans_for(&engine, &bob).await, team_only);
+
+    let draft = engine
+        .attachment_delete_as("team", "assets/deck.png", &alice)
+        .await
+        .unwrap();
+    assert!(draft, "the deletion landed as alice's draft");
+
+    assert_eq!(
+        dangling_attachments_for(&engine, &alice).await,
+        vec!["assets/deck.png".to_string()],
+        "the page she reads shows a file she has taken away"
+    );
+    assert!(
+        dangling_attachments_for(&engine, &bob).await.is_empty(),
+        "and nobody else's reading of the same page changed"
+    );
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        team_only,
+        "a file she is not holding is not a file of hers to be orphaned"
+    );
+    assert_eq!(
+        orphans_for(&engine, &bob).await,
+        team_only,
+        "and the team's sweep is what it was"
+    );
+}
+
+/// **The union rule survived the listing change.**
+///
+/// Task 9 pinned it against the base attachment listing: an author who drafts a
+/// reference away is never told the shared file is now unused. `V108` reads the
+/// actor view now, so the same claim has to be pinned again with an overlay
+/// file standing beside the shared one - the half that reads the actor's own
+/// dimension is the LISTING, and the half that asks "does anything reference
+/// this" is still the union of what this reader sees and what the domain's own
+/// text says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reference_dropped_only_in_a_draft_still_never_orphans_a_shared_file() {
+    let (_tmp, engine) = review_fixture().await;
+    let alice = account("alice");
+
+    // An overlay file of her own, so the listing this rule reads is genuinely
+    // her dimension's rather than the base one.
+    engine
+        .attachment_write_as(
+            "team",
+            "assets/mine.png",
+            b"PNG bytes of mine".to_vec(),
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "deck".to_string(),
+                domain: "team".to_string(),
+                operation: "find_replace".to_string(),
+                find_text: Some("![Deck](assets/deck.png)".to_string()),
+                content: Some("the deck is elsewhere now".to_string()),
+                key: None,
+                value: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+                share_link: None,
+                model: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        orphans_for(&engine, &alice).await,
+        vec![
+            "assets/mine.png".to_string(),
+            "assets/stray.png".to_string()
+        ],
+        "the deck is still referenced by the text the team has, so dropping the \
+         reference in a draft never orphans it: {:?}",
+        orphans_for(&engine, &alice).await
+    );
+}
+
+/// **A file somebody has drafted answers their own reference to it.**
+///
+/// The sweep reads every other input in the caller's own dimension; its
+/// attachment set has to be read there too, or review mode's whole reason for
+/// existing - work on something privately before the team sees it - hands the
+/// author a finding about a file they are looking at. The stranger's sweep is
+/// the other half of the sentence: the team really does not have this file, so
+/// the team's own reference to it really is dangling, and nothing about alice's
+/// overlay may quiet that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_only_attachment_answers_its_authors_reference_in_the_sweep() {
+    let (tmp, engine) = review_fixture().await;
+    let dir = tmp.path().join("team");
+    let alice = account("alice");
+    let bob = account("bob");
+
+    // A reviewed engram pointing at a file nobody has uploaded: dangling for
+    // everybody, which is what the team's own sweep should go on saying.
+    reviewed_file(
+        &engine,
+        &dir,
+        "shot.md",
+        &reviewed(
+            "Shot",
+            "shot",
+            "The dashboard as it looked:\n\n![Shot](assets/shot.png)",
+        ),
+    )
+    .await;
+
+    let missing = vec!["assets/shot.png".to_string()];
+    assert_eq!(dangling_attachments_for(&engine, &alice).await, missing);
+    assert_eq!(dangling_attachments_for(&engine, &bob).await, missing);
+
+    // Alice drafts the file. It is hers alone until the change is shared.
+    let written = engine
+        .attachment_write_as(
+            "team",
+            "assets/shot.png",
+            b"PNG bytes of shot".to_vec(),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert!(written.draft, "the upload landed as alice's draft");
+
+    assert!(
+        dangling_attachments_for(&engine, &alice).await.is_empty(),
+        "the reference she can follow is not a dangling one for her"
+    );
+    assert_eq!(
+        dangling_attachments_for(&engine, &bob).await,
+        missing,
+        "and the team's reference goes on dangling, because the team has no such file"
     );
 }

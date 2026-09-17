@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
+use crystalline_service::Scope;
 use crystalline_service::engine::{Engine, EngineError};
 use crystalline_service::params::WriteParams;
 use tokio::sync::Mutex;
@@ -43,6 +44,8 @@ async fn write(engine: &Engine, title: &str, status: &str, body: &str) {
             status: Some(status.to_string()),
             metadata: None,
             overwrite: false,
+            share_link: None,
+            model: None,
         })
         .await
         .unwrap();
@@ -101,7 +104,7 @@ async fn depth_one_returns_the_anchor_its_neighbors_and_the_typed_edges() {
     let engine = chain().await;
 
     let graph = engine
-        .graph_neighborhood("crystalline://notes/beta", 1, 100)
+        .graph_neighborhood("crystalline://notes/beta", 1, 100, &Scope::Unrestricted)
         .await
         .unwrap();
 
@@ -164,7 +167,7 @@ async fn the_depth_is_clamped_to_one_hop_or_two() {
 
     let count = async |depth: u8| -> usize {
         engine
-            .graph_neighborhood("crystalline://notes/beta", depth, 100)
+            .graph_neighborhood("crystalline://notes/beta", depth, 100, &Scope::Unrestricted)
             .await
             .unwrap()["nodes"]
             .as_array()
@@ -185,7 +188,7 @@ async fn the_node_cap_cuts_and_reports_it() {
     let engine = chain().await;
 
     let capped = engine
-        .graph_neighborhood("crystalline://notes/beta", 2, 1)
+        .graph_neighborhood("crystalline://notes/beta", 2, 1, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -203,7 +206,7 @@ async fn the_node_cap_cuts_and_reports_it() {
     );
 
     let whole = engine
-        .graph_neighborhood("crystalline://notes/beta", 2, 100)
+        .graph_neighborhood("crystalline://notes/beta", 2, 100, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -229,7 +232,7 @@ async fn the_cap_has_a_server_side_ceiling() {
     }
 
     let graph = engine
-        .graph_neighborhood("crystalline://notes/hub", 1, 100_000)
+        .graph_neighborhood("crystalline://notes/hub", 1, 100_000, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -248,7 +251,7 @@ async fn a_retired_neighbor_is_included_with_its_status() {
     let engine = chain().await;
 
     let graph = engine
-        .graph_neighborhood("crystalline://notes/beta", 1, 100)
+        .graph_neighborhood("crystalline://notes/beta", 1, 100, &Scope::Unrestricted)
         .await
         .unwrap();
     let alpha = graph["nodes"]
@@ -279,7 +282,7 @@ async fn a_relation_and_its_prose_link_are_one_edge() {
     .await;
 
     let graph = engine
-        .graph_neighborhood("crystalline://notes/target", 1, 100)
+        .graph_neighborhood("crystalline://notes/target", 1, 100, &Scope::Unrestricted)
         .await
         .unwrap();
     let edges = graph["edges"].as_array().unwrap();
@@ -313,7 +316,7 @@ async fn the_cap_prunes_retired_nodes_first_and_counts_them() {
     // (the anchor plus one). The survivor must be the live one.
     let (_tmp, engine) = fixture_with_retired_neighbor().await;
     let value = engine
-        .graph_neighborhood("crystalline://notes/beta", 1, 2)
+        .graph_neighborhood("crystalline://notes/beta", 1, 2, &Scope::Unrestricted)
         .await
         .unwrap();
     let nodes = value["nodes"].as_array().unwrap();
@@ -333,7 +336,7 @@ async fn the_cap_prunes_retired_nodes_first_and_counts_them() {
 async fn an_uncapped_neighborhood_hides_nothing() {
     let (_tmp, engine) = fixture_with_retired_neighbor().await;
     let value = engine
-        .graph_neighborhood("crystalline://notes/beta", 1, 100)
+        .graph_neighborhood("crystalline://notes/beta", 1, 100, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(value["hidden"], 0);
@@ -347,7 +350,7 @@ async fn a_bad_anchor_is_refused_by_kind() {
     let engine = chain().await;
 
     let malformed = engine
-        .graph_neighborhood("beta", 1, 100)
+        .graph_neighborhood("beta", 1, 100, &Scope::Unrestricted)
         .await
         .expect_err("an anchor that is not a URL is refused");
     assert!(
@@ -356,11 +359,76 @@ async fn a_bad_anchor_is_refused_by_kind() {
     );
 
     let unknown = engine
-        .graph_neighborhood("crystalline://notes/ghost", 1, 100)
+        .graph_neighborhood("crystalline://notes/ghost", 1, 100, &Scope::Unrestricted)
         .await
         .expect_err("an anchor pointing at nothing is refused");
     assert!(
         matches!(unknown, EngineError::NotFound(ref m) if m.contains("ghost")),
         "{unknown:?}"
     );
+}
+
+/// A domain that takes changes directly answers every reader the same bytes.
+///
+/// The `None` arm of every actor-aware statement, pinned where it is visible:
+/// an identified caller carries an actor into the traversal, a domain that
+/// reviews nothing has no draft for it to mean, and the two payloads have to be
+/// the same payload - key for key, so the draft marker is absent rather than
+/// false, and node for node, so no statement quietly answers a different set of
+/// rows to somebody who happens to be signed in.
+#[tokio::test]
+async fn a_direct_domains_graph_is_byte_identical_whoever_asks() {
+    let engine = chain().await;
+
+    for anchor in ["crystalline://notes/beta", "crystalline://notes/*"] {
+        let owner = engine
+            .graph_neighborhood(anchor, 2, 100, &Scope::Unrestricted)
+            .await
+            .unwrap();
+        let nobody = engine
+            .graph_neighborhood(anchor, 2, 100, &Scope::Anonymous)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&owner).unwrap(),
+            serde_json::to_string(&nobody).unwrap(),
+            "the graph of {anchor} is one graph"
+        );
+
+        let owner = engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(2),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let nobody = engine
+            .build_context(
+                &crystalline_service::params::ContextParams {
+                    anchor: anchor.to_string(),
+                    depth: Some(2),
+                    domains: Vec::new(),
+                    timeframe: None,
+                    max_related: None,
+                },
+                &Scope::Anonymous,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&owner).unwrap(),
+            serde_json::to_string(&nobody).unwrap(),
+            "and the context around {anchor} is one context"
+        );
+        assert!(
+            !serde_json::to_string(&owner).unwrap().contains("draft"),
+            "with no word about drafts in it: {owner}"
+        );
+    }
 }

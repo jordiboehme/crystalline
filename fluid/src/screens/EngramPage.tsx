@@ -56,9 +56,10 @@ import { useAuth } from "../auth/AuthContext";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { AgentsEye } from "../components/AgentsEye";
+import { AttachmentsSection } from "../components/AttachmentsSection";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
-import { DetailsPanel } from "../components/DetailsPanel";
+import { CopyAddress, DetailsPanel } from "../components/DetailsPanel";
 import { EngramActions } from "../components/EngramActions";
 import type { EngramActionHandlers } from "../components/EngramActions";
 import { LifecycleBanner } from "../components/LifecycleBanner";
@@ -71,6 +72,7 @@ import { BUTTON, IconButton } from "../components/primitives";
 import { RetireDialog } from "../components/RetireDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
+import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import { prefetchEngramEditor } from "../prefetch";
 import type { WikilinkResolver } from "../wikilinks";
@@ -85,6 +87,7 @@ export default function EngramPage() {
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
   const { capabilities } = useAuth();
+  const { fullWidth } = useFullWidth();
   const navigate = useNavigate();
   const [retiring, setRetiring] = useState(false);
   const [moving, setMoving] = useState(false);
@@ -111,10 +114,21 @@ export default function EngramPage() {
     enabled: detail.isSuccess,
   });
 
+  // The names alone, and only once the listing has landed: the resolver reads
+  // a missing list as "this caller cannot tell whether a prefix is a domain"
+  // and an empty one as "none of them is", so handing it an empty array while
+  // the request is in flight would answer a question nobody can answer yet.
+  const domainNames = useMemo(
+    () => domains.data?.domains.map((entry) => entry.name),
+    [domains.data],
+  );
+
   const wikilinks = useMemo(
     () =>
-      detail.data ? buildWikilinkResolver(detail.data, graph.data) : undefined,
-    [detail.data, graph.data],
+      detail.data
+        ? buildWikilinkResolver(detail.data, graph.data, domainNames)
+        : undefined,
+    [detail.data, graph.data, domainNames],
   );
 
   /*
@@ -234,6 +248,14 @@ export default function EngramPage() {
             ref; it draws nothing here but the region that announces a copy.
           */}
           <div className="flex flex-wrap items-center gap-2 print:hidden">
+            {/*
+              At full width there is no details column to hold it, and this
+              is the only control on the screen that copies the engram's
+              `crystalline://` name - "Share link" beside it copies the
+              browser's URL, which is a different string for a different
+              purpose. So it stands here instead of going with the column.
+            */}
+            {fullWidth && <CopyAddress address={engram.url} />}
             <IconButton
               label="Share link"
               icon={Link2}
@@ -310,6 +332,28 @@ export default function EngramPage() {
         </h1>
       </header>
 
+      {/*
+        What this text is, when it is not the page the team holds.
+
+        A draft stands at the same address the shared page stands at, and this
+        screen is where most readers land - a grantee with no write right can
+        reach nothing else. So the marker the editor renders is rendered here
+        too, and it says both halves: whose work this is, and that the shared
+        tree does not hold it. Absent on everything else, which is nearly
+        every page.
+      */}
+      {engram.draft && (
+        <p
+          role="status"
+          aria-label="Draft"
+          className="rounded bg-amber-100 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"
+        >
+          {engram.draftOwner
+            ? `${engram.draftOwner}'s draft, shared with you. The shared tree does not hold this text and it has not been reviewed.`
+            : "Your private draft. The shared tree has not moved; share it for review when it is ready."}
+        </p>
+      )}
+
       <LifecycleBanner
         status={engram.frontmatter.status}
         staleAfter={engram.frontmatter.staleAfter}
@@ -333,8 +377,18 @@ export default function EngramPage() {
         The body leads and the panels follow it: one column on a narrow screen,
         with the panels under what they describe, and a column beside it once
         there is room for one.
+
+        Unless the reader asked for the whole window, which is what full width
+        is: the column is metadata about the engram, and somebody who asked for
+        the prose asked for it instead of that. What the column held that is
+        not metadata comes with it - the address control into the header above,
+        the files into this column under the body.
       */}
-      <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_18rem]">
+      <div
+        className={`grid gap-8 ${
+          fullWidth ? "" : "lg:grid-cols-[minmax(0,1fr)_18rem]"
+        }`}
+      >
         <div className="flex min-w-0 flex-col gap-8">
           <article aria-labelledby="engram-title">
             {/*
@@ -351,6 +405,21 @@ export default function EngramPage() {
               domain={engram.domain}
             />
           </article>
+          {/*
+            The files this engram carries, which the details panel lists at
+            the reading measure. They are not metadata - they are things a
+            reader opens, and the only place a writer removes one - so at full
+            width they stand under the body with the graph and the eye.
+          */}
+          {fullWidth && (
+            <div className="print:hidden">
+              <AttachmentsSection
+                domain={engram.domain}
+                body={engram.content}
+                canDelete={capabilities.canWrite}
+              />
+            </div>
+          )}
           <div className="print:hidden">
             <GraphSection domain={engram.domain} permalink={engram.permalink} />
           </div>
@@ -362,22 +431,24 @@ export default function EngramPage() {
             />
           </div>
         </div>
-        <aside className="flex flex-col gap-6 print:hidden">
-          <DetailsPanel
-            frontmatter={engram.frontmatter}
-            address={engram.url}
-            domain={engram.domain}
-            // The body decides which of the domain's files this engram
-            // carries: the panel lists what the prose actually references.
-            body={engram.content}
-            canDelete={capabilities.canWrite}
-          />
-          <BacklinksPanel
-            domain={engram.domain}
-            permalink={engram.permalink}
-            inboundCount={engram.inboundCount}
-          />
-        </aside>
+        {!fullWidth && (
+          <aside className="flex flex-col gap-6 print:hidden">
+            <DetailsPanel
+              frontmatter={engram.frontmatter}
+              address={engram.url}
+              domain={engram.domain}
+              // The body decides which of the domain's files this engram
+              // carries: the panel lists what the prose actually references.
+              body={engram.content}
+              canDelete={capabilities.canWrite}
+            />
+            <BacklinksPanel
+              domain={engram.domain}
+              permalink={engram.permalink}
+              inboundCount={engram.inboundCount}
+            />
+          </aside>
+        )}
       </div>
       {retiring && (
         <RetireDialog
@@ -405,11 +476,17 @@ export default function EngramPage() {
  * One direction of the supersedes chain.
  *
  * Both halves of it, because either end may be the one that wrote the relation
- * down: this engram saying `- superseded_by [[Beta]]`, or Beta saying
- * `- supersedes [[Alpha]]` from its own side. Only the first is in this
+ * down: this engram saying `- superseded_by [[beta]]`, or Beta saying
+ * `- supersedes [[alpha]]` from its own side. Only the first is in this
  * engram's payload, so the second is read off the inbound edges of the graph,
  * where the direction is inverted: an inbound `supersedes` means the other
  * engram replaced this one, which is this engram's `superseded_by`.
+ *
+ * Both halves are labelled with the successor's title. The engine writes these
+ * bullets by permalink - the stable identity, and the one spelling that cannot
+ * be misread as a cross-domain prefix - so the outbound half takes its label
+ * from the resolution rather than from the bracket text, which is where the
+ * inbound half has always taken it from.
  *
  * An engram whose successor states it from both sides appears once, because
  * both halves key by the same address.
@@ -426,7 +503,12 @@ function chain(
     .map((relation) => {
       const resolution = resolve(innerOf(relation.target));
       return {
-        label: relation.target.target,
+        // The bracket text only until the graph places it: a permalink is a
+        // worse name than a title and a better one than nothing.
+        label:
+          resolution?.kind === "resolved"
+            ? resolution.label
+            : relation.target.target,
         href: resolution?.kind === "resolved" ? resolution.href : null,
         state: referenceState(resolution, relation.resolved),
       };

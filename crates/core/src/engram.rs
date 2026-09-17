@@ -137,6 +137,17 @@ pub struct Frontmatter {
 pub struct Generated {
     /// The actor that wrote this revision.
     pub by: String,
+    /// The model that produced the words, as the agent reports it, or `None`
+    /// when none was reported.
+    ///
+    /// A sibling key rather than a third slash segment of `by`, because `by` is
+    /// `<producer>/<version>` and a reader that splits on the first slash would
+    /// otherwise read the version as `2.1.271/claude-opus-5`. Absent means
+    /// absent: a write that reports no model emits the two-key form exactly as
+    /// it always did, and the key is left out of the serialized form too rather
+    /// than sent as a null nobody can read anything out of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// When it was written, RFC 3339 with offset.
     pub at: Option<DateTime<FixedOffset>>,
 }
@@ -152,8 +163,24 @@ pub struct Generated {
 pub struct Verified {
     /// The actor that verified the knowledge.
     pub by: String,
+    /// The model the verifying agent reported, or `None` when it reported
+    /// none. Read, written and serialized exactly like [`Generated::model`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// When it was verified, RFC 3339 with offset.
     pub at: Option<DateTime<FixedOffset>>,
+}
+
+/// The model reported inside a provenance mapping: a non-empty string, or
+/// `None`.
+///
+/// An empty, all-blank or non-string value reads as absence rather than as a
+/// model nobody can name, which is how the write path treats one too and how
+/// `generated` reads the same key (`crate::parse`), so one value means one
+/// thing wherever it is written.
+pub(crate) fn reported_model(value: Option<&YamlValue>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 impl Verified {
@@ -185,6 +212,7 @@ impl Verified {
         };
         Some(Verified {
             by: by.to_string(),
+            model: reported_model(map.get("model")),
             at,
         })
     }
@@ -325,6 +353,19 @@ pub struct LinkTarget {
     pub domain: Option<String>,
     /// The target title or permalink.
     pub target: String,
+    /// The bracket text exactly as it was written, trimmed at the ends and
+    /// nothing else.
+    ///
+    /// The parse below is domain-agnostic: it cannot know whether the segment
+    /// before a colon names a real domain, so a title whose own first word ends
+    /// in a colon (`Log: Weekly Garden Notes`) splits like a cross-domain
+    /// prefix. Only a resolver holding the registry can tell the two apart, and
+    /// telling them apart means looking the whole original string up as a
+    /// title, which the split has by then thrown away. So it is kept here.
+    /// Not part of the serialized shape: it is what the parse consumed, not a
+    /// second field a client should read.
+    #[serde(skip)]
+    pub raw: String,
 }
 
 impl LinkTarget {
@@ -342,12 +383,14 @@ impl LinkTarget {
                 return LinkTarget {
                     domain: Some(domain.to_string()),
                     target: rest.to_string(),
+                    raw: inner.to_string(),
                 };
             }
         }
         LinkTarget {
             domain: None,
             target: inner.to_string(),
+            raw: inner.to_string(),
         }
     }
 }

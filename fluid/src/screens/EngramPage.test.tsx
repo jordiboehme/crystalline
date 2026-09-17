@@ -260,7 +260,7 @@ describe("the engram page", () => {
     );
     expect(screen.getByText("7")).toBeVisible();
     expect(screen.getByText(/2026-01-02/)).toBeVisible();
-    expect(screen.getByText(/human:jordi/)).toBeVisible();
+    expect(screen.getByText(/jordi \(human\)/)).toBeVisible();
   });
 
   it("shows nothing at all for the temporal fields an engram leaves out", async () => {
@@ -325,6 +325,38 @@ describe("the engram page", () => {
     const successor = within(banner).getByText("Beta");
     expect(successor).not.toHaveAttribute("title");
     expect(within(banner).queryByRole("link")).toBeNull();
+  });
+
+  it("labels a successor written by permalink with its title", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: BODY.replace(
+            "- superseded_by [[Beta]]",
+            "- superseded_by [[notes/beta]]",
+          ),
+          relations: [
+            {
+              line: 10,
+              rel_type: "superseded_by",
+              resolved: true,
+              target: { domain: null, target: "notes/beta" },
+            },
+          ],
+        }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const banner = await screen.findByRole("note");
+    await waitFor(() => {
+      expect(
+        within(banner).getByRole("link", { name: "Beta" }),
+      ).toHaveAttribute("href", "/d/eng/e/notes/beta");
+    });
+    // The engine writes the permalink because it is the stable identity and
+    // cannot be misread as a domain prefix. What a reader sees is the name.
+    expect(banner).not.toHaveTextContent("notes/beta");
   });
 
   it("shows a successor that declared the relation from its own side", async () => {
@@ -502,7 +534,9 @@ describe("the engram page", () => {
 
     renderApp("/d/eng/e/alpha");
 
-    const button = await screen.findByRole("button", { name: "Copy address" });
+    const button = await screen.findByRole("button", {
+      name: "Copy crystalline:// address",
+    });
     await userEvent.click(button);
 
     expect(writeText).toHaveBeenCalledWith("crystalline://eng/alpha");
@@ -514,7 +548,7 @@ describe("the engram page", () => {
     });
     // And the control keeps its name, so it is not silently renamed under a
     // reader navigating by control.
-    expect(button).toHaveAccessibleName("Copy address");
+    expect(button).toHaveAccessibleName("Copy crystalline:// address");
   });
 
   it("says so when the browser refuses the clipboard", async () => {
@@ -529,7 +563,9 @@ describe("the engram page", () => {
     renderApp("/d/eng/e/alpha");
 
     await userEvent.click(
-      await screen.findByRole("button", { name: "Copy address" }),
+      await screen.findByRole("button", {
+        name: "Copy crystalline:// address",
+      }),
     );
 
     const outcome = screen.getByRole("status", { name: "Copy address result" });
@@ -799,5 +835,121 @@ describe("the engram page", () => {
     expect(
       await screen.findByRole("heading", { name: "Engram not found" }),
     ).toBeVisible();
+  });
+});
+
+/**
+ * The same screen with the frame's full width turned on.
+ *
+ * What the details column holds is metadata, and a reader who asked for the
+ * whole window asked for the prose instead of it. Two things in there are not
+ * metadata though - the crystalline address, which nothing else on this screen
+ * copies, and the files the engram carries, which a writer removes from that
+ * list and nowhere else - so those two come with, and that is what is pinned
+ * here beside the column's absence.
+ */
+describe("the engram page at full width", () => {
+  /** The body, plus a file, so the attachments list has something to draw. */
+  const WITH_FILE = BODY.replace(
+    "Body prose",
+    "The [deck](assets/deck.pdf) says more. Body prose",
+  );
+
+  function serveWithFile() {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ content: WITH_FILE }),
+      "/domains/eng/attachments": () => ({
+        attachments: [
+          {
+            path: "assets/deck.pdf",
+            mime: "application/pdf",
+            size: 2048,
+            modified: "2026-08-18T10:00:00Z",
+            sha256: "abc",
+          },
+        ],
+      }),
+    });
+  }
+
+  it("drops the column and keeps what only the column carried", async () => {
+    localStorage.setItem("fluid.layout.width", "full");
+    serveWithFile();
+
+    renderApp("/d/eng/e/alpha");
+    const main = await screen.findByRole("main");
+    await screen.findByRole("heading", { name: "Alpha" });
+
+    expect(screen.queryByRole("region", { name: "Details" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Backlinks" })).toBeNull();
+    // One column at every width, so the body has the whole of it.
+    expect(main.querySelector('[class*="lg:grid-cols-"]')).toBeNull();
+
+    // The address control moves into the header strip beside the other
+    // utilities rather than disappearing with the panel that held it: "Share
+    // link" beside it copies the browser's URL, which is a different string.
+    const copy = screen.getByRole("button", {
+      name: "Copy crystalline:// address",
+    });
+    expect(copy.closest("header")).not.toBeNull();
+    // And the files the engram carries stand under the body, where the graph
+    // and the agent's eye already stand.
+    expect(
+      await screen.findByRole("region", { name: "Attachments" }),
+    ).toBeVisible();
+  });
+
+  // A draft standing where the team's page stands must never be read as that
+  // page: this screen is where most readers land, and the only one a grantee
+  // with no write right can reach at all.
+  it("says whose draft a granted one is", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const marker = await screen.findByRole("status", { name: /draft/i });
+    expect(marker).toHaveTextContent("alice's draft, shared with you");
+    expect(marker).toHaveTextContent(/not been reviewed/i);
+  });
+
+  it("says that your own draft has not moved the shared tree", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () => detailResponse({ draft: true }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const marker = await screen.findByRole("status", { name: /draft/i });
+    expect(marker).toHaveTextContent("Your private draft");
+    expect(marker).toHaveTextContent(/share it for review/i);
+  });
+
+  it("marks nothing on a page the team already holds", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+    await screen.findByRole("heading", { name: "Alpha" });
+
+    expect(screen.queryByRole("status", { name: /draft/i })).toBeNull();
+  });
+
+  it("keeps the column at the reading measure", async () => {
+    serveWithFile();
+
+    renderApp("/d/eng/e/alpha");
+    const main = await screen.findByRole("main");
+
+    expect(
+      await screen.findByRole("region", { name: "Backlinks" }),
+    ).toBeVisible();
+    expect(main.querySelector('[class*="lg:grid-cols-"]')).not.toBeNull();
+    // Exactly one of it either way: the panel's copy is the only copy here.
+    expect(
+      screen.getAllByRole("button", { name: "Copy crystalline:// address" }),
+    ).toHaveLength(1);
   });
 });

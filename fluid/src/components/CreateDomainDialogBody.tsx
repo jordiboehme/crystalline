@@ -73,7 +73,9 @@ export default function CreateDomainDialogBody({
   const [repo, setRepo] = useState("");
   const [branch, setBranch] = useState("");
   const [path, setPath] = useState("");
+  const [private_, setPrivate] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const privateField = useId();
 
   // Asked only once team mode is on the screen, and cached under the settings
   // screen's own key: an admin who came from there pays nothing for it here.
@@ -119,7 +121,14 @@ export default function CreateDomainDialogBody({
     },
   });
 
-  /** What goes on the wire: the mode, and only what that mode was told. */
+  /**
+   * What goes on the wire: the mode, and only what that mode was told, plus
+   * `private` - which applies to every mode alike, so it rides on both
+   * branches rather than only the one somebody happened to be looking at
+   * when they checked it. Left out entirely when unchecked, the way every
+   * other field nobody filled in is: `false` is the server's own default,
+   * and an explicit `false` here would be this app answering for it.
+   */
   function requestBody(): CreateDomainBody {
     const named = name.trim();
     if (mode === "github") {
@@ -129,9 +138,10 @@ export default function CreateDomainDialogBody({
         ...(branch.trim() === "" ? {} : { branch: branch.trim() }),
         ...(path.trim() === "" ? {} : { path: path.trim() }),
         ...(named === "" ? {} : { name: named }),
+        ...(private_ ? { private: true } : {}),
       };
     }
-    return { mode, name: named };
+    return { mode, name: named, ...(private_ ? { private: true } : {}) };
   }
 
   /** Whether the one field this mode cannot do without has been filled in. */
@@ -296,6 +306,33 @@ export default function CreateDomainDialogBody({
                 </Field>
               </>
             )}
+
+            {/*
+              Every mode alike, so it sits below the mode-specific fields
+              rather than inside any one of them: a domain is private or it is
+              not, whatever backs it.
+            */}
+            <div className="flex flex-col gap-1 text-sm">
+              <label className="flex items-center gap-2">
+                <input
+                  id={privateField}
+                  type="checkbox"
+                  checked={private_}
+                  aria-describedby={`${privateField}-help`}
+                  onChange={(event) => {
+                    setPrivate(event.target.checked);
+                  }}
+                />
+                <span>Private</span>
+              </label>
+              <p
+                id={`${privateField}-help`}
+                className="text-caption pl-6 text-slate-500 dark:text-slate-400"
+              >
+                Only you and this instance's admins can reach it until you
+                invite somebody else in.
+              </p>
+            </div>
 
             <div className="flex justify-end gap-2">
               <button

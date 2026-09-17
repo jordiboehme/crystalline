@@ -8,6 +8,13 @@
 //! genuinely changed files, applies everything in one transaction and resolves
 //! forward references in a single batch at the end.
 //!
+//! A domain's own batch can only resolve references into domains that are
+//! already indexed, so a run over several domains ends with one more pass:
+//! [`resolve_forward_refs`] re-runs the same two store methods over every
+//! domain the run applied, once all of them are in, and a reference pointing
+//! forward into a domain registered later no longer has to wait for the next
+//! sync to stop reading as unresolved.
+//!
 //! Hashing and parsing run off-thread with bounded concurrency; all database
 //! writes stay on the calling task and commit together.
 //!
@@ -88,7 +95,9 @@ use crystalline_core::{MAX_ATTACHMENT_BYTES, attachment_mime, validate_asset_pat
 
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
-use crate::store::{AttachmentRow, DomainId, EngramRecord, FileStamp, NewChunk, Store};
+use crate::store::{
+    AttachmentRow, DomainId, DomainKind, EngramRecord, FileStamp, NewChunk, RebuildKind, Store,
+};
 
 /// Maximum concurrent hashing or parsing tasks.
 const CONCURRENCY: usize = 8;
@@ -125,6 +134,17 @@ pub struct SyncReport {
     /// Prose wikilinks resolved at the end of this sync.
     #[serde(default)]
     pub links_resolved: u64,
+    /// Forward references this domain only resolved in the final cross-domain
+    /// pass of a multi-domain run, once every other domain was indexed - see
+    /// [`resolve_forward_refs`]. Kept apart from `relations_resolved` rather
+    /// than added into it, so a reader can tell a reference that resolved
+    /// against an already-indexed target from one that had to wait for a
+    /// domain later in the run.
+    #[serde(default)]
+    pub relations_resolved_late: u64,
+    /// Prose wikilinks resolved in the same final cross-domain pass.
+    #[serde(default)]
+    pub links_resolved_late: u64,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
 }
@@ -189,7 +209,7 @@ pub async fn sync_domain_with<S: Store + ?Sized>(
         )
         .await?;
     let stamps = store.file_stamps(domain).await?;
-    let scan = scan_domain(name, root, stamps, chunk_params).await?;
+    let scan = scan_domain(name, root, stamps, chunk_params, false).await?;
     apply_scan(store, domain, scan).await
 }
 
@@ -228,6 +248,11 @@ pub struct DomainScan {
     /// Whether `assets` is every attachable file in the domain (a full walk),
     /// so the apply may delete every row it did not see.
     assets_complete: bool,
+    /// Whether this scan is the disk half of a forced rebuild, so the apply's
+    /// transaction also clears the domain's rebuild marker. Only a forced
+    /// [`scan_domain`] sets it: a targeted watcher pass landing during someone
+    /// else's rebuild must not clear a marker whose rebuild never finished.
+    ends_rebuild: bool,
     /// `unchanged` and `failed` from the scan; the apply fills in the rest.
     report: SyncReport,
     /// When the scan began, so the apply can report the total duration.
@@ -242,11 +267,21 @@ pub struct DomainScan {
 /// it and hands it back inside the [`DomainScan`] so the apply can re-check it.
 /// The walk and hash phases run off-thread and never fail fatally: a file that
 /// cannot be read lands in `report.failed`, not an error.
+///
+/// `force` is `reindex --full`: the modification-time and size prefilter is
+/// skipped, so every file on disk is hashed, and a file whose content is
+/// identical to the recorded one is classified as changed rather than
+/// unchanged. Everything else is untouched - a new file is still new, a
+/// vanished path is still a delete, and a rename is still detected and applied
+/// in place rather than re-parsed and re-embedded. The scan also records that
+/// it is the disk half of a rebuild, so the apply's transaction clears the
+/// domain's rebuild marker as it commits.
 pub async fn scan_domain(
     name: &str,
     root: &Path,
     stamps: HashMap<String, FileStamp>,
     chunk_params: &ChunkParams,
+    force: bool,
 ) -> Result<DomainScan> {
     let started = Instant::now();
 
@@ -350,12 +385,14 @@ pub async fn scan_domain(
         Vec::new(),
         chunk_params,
         started,
+        force,
     )
     .await;
     // A full walk saw every file under `assets/`, so the apply may delete any
     // attachment row it did not see.
     scan.assets = assets;
     scan.assets_complete = true;
+    scan.ends_rebuild = force;
     Ok(scan)
 }
 
@@ -509,6 +546,7 @@ pub async fn scan_paths(
         unreadable,
         chunk_params,
         started,
+        false,
     )
     .await;
     // A targeted pass saw only the given paths, so the apply reconciles exactly
@@ -544,6 +582,7 @@ async fn classify_changes(
     unreadable: Vec<(String, String)>,
     chunk_params: &ChunkParams,
     started: Instant,
+    force: bool,
 ) -> DomainScan {
     // Prefilter: unchanged files (same mtime and size) are skipped entirely.
     let mut report = SyncReport {
@@ -558,7 +597,9 @@ async fn classify_changes(
     let mut to_hash: Vec<Scanned> = Vec::new();
     for (rel, scanned) in &current {
         match stamps.get(rel) {
-            Some(stamp) if stamp.mtime == scanned.mtime && stamp.size == scanned.size => {
+            // A forced pass skips the prefilter entirely: the whole point is to
+            // catch a file whose content moved without its stamp moving with it.
+            Some(stamp) if !force && stamp.mtime == scanned.mtime && stamp.size == scanned.size => {
                 report.unchanged += 1;
             }
             _ => to_hash.push(Scanned {
@@ -612,8 +653,11 @@ async fn classify_changes(
         } else {
             let stamp = stamps.get(&scanned.rel);
             let same = stamp.map(|s| s.sha256 == sha256).unwrap_or(false);
-            if same {
-                // Touched but identical content: nothing to reindex.
+            if same && !force {
+                // Touched but identical content: nothing to reindex. A forced
+                // pass re-upserts it anyway, which is what backfills a column a
+                // migration added, and costs no embedding work: the chunk text
+                // is unchanged, so `replace_chunks` carries every vector over.
                 report.unchanged += 1;
             } else {
                 changed.push(PendingChange {
@@ -636,6 +680,8 @@ async fn classify_changes(
         assets: Vec::new(),
         asset_deletes: Vec::new(),
         assets_complete: false,
+        // The caller decides: only a forced full scan ends a rebuild.
+        ends_rebuild: false,
         report,
         started,
     }
@@ -684,6 +730,7 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         assets,
         asset_deletes,
         assets_complete,
+        ends_rebuild,
         mut report,
         started,
     } = scan;
@@ -748,6 +795,15 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         return Err(e);
     }
 
+    // The rebuild this scan was the disk half of is complete: clear its marker
+    // in the same transaction that commits its rows, so the marker is set
+    // exactly while the rebuild is unfinished and a run that died before this
+    // point leaves it standing.
+    if ends_rebuild && let Err(e) = store.end_rebuild(domain).await {
+        let _ = store.rollback().await;
+        return Err(e);
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(e) = store.record_sync(domain, &now).await {
         let _ = store.rollback().await;
@@ -757,6 +813,280 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
 
     report.duration_ms = duration_ms(started.elapsed());
     Ok(report)
+}
+
+/// Per-domain callbacks a multi-domain driver runs for its caller.
+///
+/// [`reindex_domains`] owns the loop, and the two callers of it need different
+/// things around each domain: the daemon claims the file-host lock before it
+/// touches a domain in collaboration mode and refreshes the generated index
+/// files after a domain changed, while the daemonless CLI does neither. Both
+/// hooks default to doing nothing, so a caller with no per-domain business
+/// passes [`NoReindexHooks`] and reads the driver as a plain loop.
+///
+/// The `before_domain` hook runs with the store lock held and is handed the
+/// locked store, because the claim it exists for is itself a store write that
+/// belongs in the same window as the domain's upsert; the tokio mutex is not
+/// reentrant, so a hook must never try to take the lock itself. `after_apply`
+/// runs with no lock held, after the domain's transaction has committed.
+#[async_trait::async_trait]
+pub trait ReindexHooks: Send + Sync {
+    /// Called in the first lock window of each domain, before its row is
+    /// resolved. Returning `false` skips the domain entirely: it is neither
+    /// scanned nor applied, and it is not handed to the final cross-domain
+    /// resolution pass.
+    async fn before_domain(&self, _store: &dyn Store, _name: &str, _root: &Path) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Called after a domain's apply committed, with no store lock held.
+    async fn after_apply(&self, _name: &str, _report: &SyncReport) {}
+}
+
+/// The do-nothing [`ReindexHooks`]: every domain is claimed by nobody and
+/// nothing follows an apply. What a daemonless reindex passes.
+pub struct NoReindexHooks;
+
+#[async_trait::async_trait]
+impl ReindexHooks for NoReindexHooks {}
+
+/// Reindex a list of file domains through one loop, the shared driver behind
+/// both `crystalline reindex` and the daemon's `ctl reindex`.
+///
+/// `force` is `reindex --full`: every file is re-read, re-parsed and
+/// re-upserted rather than prefiltered against its recorded stamp, so a file
+/// whose content changed without its modification time or size moving is
+/// rewritten too, and a column a migration added is backfilled on every row.
+/// Nothing is cleared first, on either path. A domain keeps its previous
+/// complete rows until its own rebuild commits, so an interruption anywhere
+/// leaves a valid index rather than an empty one, stale rows are pruned by the
+/// scan's own delete detection exactly as a plain sync prunes them, and every
+/// chunk whose text is unchanged keeps the embedding it already had instead of
+/// being re-embedded from scratch.
+///
+/// The shape per domain is the two-lock-window one the rest of the sync engine
+/// uses - resolve the domain and snapshot its stamps under the lock, walk and
+/// hash with no lock held, apply transactionally in a second window - so a
+/// large domain's rebuild never blocks concurrent readers behind the mutex.
+/// `rebuild` says which verb is running and whether this is a forced run at
+/// all: `None` is an ordinary incremental pass, `Some` forces every file to be
+/// re-read and also stamps each domain's rebuild marker in the first window,
+/// which the apply's own transaction clears, so a rebuild that never finished
+/// says so afterwards instead of reporting its rows as freshly rebuilt ones.
+/// The marker carries the verb with it, because an interrupted
+/// [`RebuildKind::Full`] left the complete rows from before it while an
+/// interrupted [`RebuildKind::Wipe`] destroyed them and every embedding before
+/// it began, and a reader must not describe one as the other.
+///
+/// The run ends with [`resolve_forward_refs`] over the domains it applied and
+/// one [`Store::checkpoint_wal`], for both callers: a reindex is a
+/// snapshot-preparation verb whichever process runs it.
+pub async fn reindex_domains(
+    store: &tokio::sync::Mutex<dyn Store>,
+    targets: &[(String, PathBuf)],
+    chunk_params: &ChunkParams,
+    rebuild: Option<RebuildKind>,
+    hooks: &dyn ReindexHooks,
+) -> Result<Vec<SyncReport>> {
+    let force = rebuild.is_some();
+    // Each domain this run applied, paired with the report its apply produced,
+    // for the final cross-domain resolution pass. A domain a hook skipped wrote
+    // nothing and is not in the list at all.
+    let mut applied: Vec<(DomainId, SyncReport)> = Vec::new();
+
+    for (name, root) in targets {
+        let Some((domain, snapshot)) = ({
+            let store = store.lock().await;
+            let claimed = hooks
+                .before_domain(&*store, name, root)
+                .await
+                .map_err(|e| in_domain("reindex", name, e))?;
+            if claimed {
+                let domain = store
+                    .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                    .await
+                    .map_err(|e| in_domain("reindex", name, e))?;
+                if let Some(kind) = rebuild {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    store
+                        .begin_rebuild(domain, &now, kind)
+                        .await
+                        .map_err(|e| in_domain("reindex", name, e))?;
+                }
+                // The real stamps, not an empty map: delete detection is the
+                // recorded paths absent from the walk, so a forced run that
+                // cleared first could not prune anything at all - it would see
+                // nothing recorded and call every file on disk new.
+                let snapshot = store
+                    .file_stamps(domain)
+                    .await
+                    .map_err(|e| in_domain("reindex", name, e))?;
+                Some((domain, snapshot))
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+        // The marker is stamped and the lock is released: this is the state a
+        // reader sees for most of a rebuild, and the only state in which the
+        // marker is observable at all. Held open on request so a test can
+        // observe it instead of racing it - see `rebuild_hold`.
+        if force && let Some(hold) = rebuild_hold() {
+            tokio::time::sleep(hold).await;
+        }
+        let scan = scan_domain(name, root, snapshot, chunk_params, force)
+            .await
+            .map_err(|e| in_domain("reindex", name, e))?;
+        let report = {
+            let store = store.lock().await;
+            apply_scan(&*store, domain, scan)
+                .await
+                .map_err(|e| in_domain("reindex", name, e))?
+        };
+        hooks.after_apply(name, &report).await;
+        applied.push((domain, report));
+    }
+
+    // A reindex rebuilds every domain in one run, so it has exactly the
+    // forward-reference problem a full sweep has: the first domain is applied
+    // while the last one holds none of its targets yet.
+    let store = store.lock().await;
+    resolve_forward_refs(&*store, &mut applied)
+        .await
+        .map_err(|e| IndexError::Db(format!("resolving forward references failed: {e}")))?;
+    // Any reindex, full or incremental, is a snapshot-preparation verb: a
+    // downstream pipeline may ship index.db as a single file (sidecars
+    // deleted), so whatever this run just wrote must not sit stranded in the
+    // WAL. Merge and shrink it now rather than leaving it to grow until the
+    // next natural checkpoint. A no-op on Postgres (no local WAL file).
+    //
+    // Best effort, as the trait documents it: every domain has committed by
+    // now, so a checkpoint that could not truncate is a housekeeping miss and
+    // not a reason to report a completed rebuild as failed. It is also new work
+    // for the daemon, which never checkpointed here at all, and a new failure
+    // mode is not what moving it into the shared driver was for.
+    if let Err(e) = store.checkpoint_wal().await {
+        tracing::debug!("reindex: the tail WAL checkpoint did not run: {e}");
+    }
+    Ok(applied.into_iter().map(|(_, report)| report).collect())
+}
+
+/// How long a forced rebuild holds between stamping a domain's marker and
+/// walking its files, from `CRYSTALLINE_TEST_REBUILD_HOLD_MS`, or `None`.
+///
+/// A test-only seam, named `TEST` for the same reason
+/// `CRYSTALLINE_TEST_POSTGRES_URL` is: it is not a knob an install is meant to
+/// set and nothing documents it as one. It exists because the window this
+/// opens - the marker stamped, the store lock released, the walk not yet
+/// finished - is the whole point of the design and is invisible from outside
+/// the process that is rebuilding. The test that proves a daemon keeps
+/// answering during a rebuild, and that `ctl status` shows the marker while it
+/// does, has to observe that window from a third process; without a hold it
+/// samples a window that a small corpus can close inside one polling lap, and
+/// a test that observes a race is a test that flakes.
+///
+/// Read once per process and cached, so the ordinary path pays one relaxed
+/// load and no environment lookup per domain. An unset, empty or unparsable
+/// value is `None`, so a malformed knob holds nothing rather than failing a
+/// rebuild, and a hold only ever happens under `force`, where a marker exists
+/// to be observed.
+fn rebuild_hold() -> Option<Duration> {
+    static HOLD: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| {
+        std::env::var("CRYSTALLINE_TEST_REBUILD_HOLD_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
+/// Name the domain a multi-domain run failed in, keeping the failure itself as
+/// the source.
+fn in_domain(operation: &str, domain: &str, source: IndexError) -> IndexError {
+    IndexError::InDomain {
+        operation: operation.to_string(),
+        domain: domain.to_string(),
+        source: Box::new(source),
+    }
+}
+
+/// The final cross-domain resolution pass of a multi-domain run: resolve every
+/// forward reference that was still pending when its own domain finished,
+/// because the domain it points into had not been indexed yet.
+///
+/// [`apply_scan`] resolves a domain's references as that domain commits, so a
+/// reference into a domain later in the run cannot resolve there: the target
+/// does not exist, and the target domain may have no row at all. Without this
+/// pass such a reference stays unresolved until some later sync happens to
+/// re-run the per-domain resolution, and until then a reader sees
+/// `"resolved": false` on a link that is not broken. Running the same two store
+/// methods once more, after every domain in the run is indexed, settles them in
+/// the run that created them; order of registration stops mattering.
+///
+/// `applied` pairs each domain with the report its own apply produced: the
+/// counts land in [`SyncReport::relations_resolved_late`] and
+/// [`SyncReport::links_resolved_late`] of the report beside the domain they were
+/// counted for, kept apart from the per-domain counters so the late pass is
+/// visible rather than folded away. One structure rather than two parallel
+/// slices, so a caller cannot drift the two apart and silently mis-attribute or
+/// drop counts. Returns the run totals `(relations, links)`.
+///
+/// A run of fewer than two domains is a no-op: a single domain has already had
+/// its references resolved against everything this run indexed, so a second
+/// pass could only re-run the same statement over the same rows.
+///
+/// Callers are the multi-domain drivers - the daemon's sweep, `crystalline sync`
+/// and `crystalline reindex` - and all of them pass only the domains they
+/// actually applied, never one that was skipped or failed.
+pub async fn resolve_forward_refs<S: Store + ?Sized>(
+    store: &S,
+    applied: &mut [(DomainId, SyncReport)],
+) -> Result<(u64, u64)> {
+    if applied.len() < 2 {
+        return Ok((0, 0));
+    }
+
+    store.begin().await?;
+    let pass = async {
+        let mut counts = Vec::with_capacity(applied.len());
+        for (domain, _) in applied.iter() {
+            let relations = store.resolve_pending_relations(*domain).await?;
+            let links = store.resolve_pending_links(*domain).await?;
+            counts.push((relations, links));
+        }
+        Ok::<Vec<(u64, u64)>, IndexError>(counts)
+    }
+    .await;
+    let counts = match pass {
+        Ok(counts) => {
+            store.commit().await?;
+            counts
+        }
+        Err(e) => {
+            let _ = store.rollback().await;
+            return Err(e);
+        }
+    };
+
+    let mut total_relations = 0;
+    let mut total_links = 0;
+    for ((_, report), (relations, links)) in applied.iter_mut().zip(counts) {
+        report.relations_resolved_late = relations;
+        report.links_resolved_late = links;
+        total_relations += relations;
+        total_links += links;
+    }
+    if total_relations > 0 || total_links > 0 {
+        tracing::info!(
+            relations = total_relations,
+            links = total_links,
+            domains = applied.len(),
+            "sync: resolved forward references across domains after the last domain was indexed"
+        );
+    }
+    Ok((total_relations, total_links))
 }
 
 /// Reconcile a domain's attachment rows with the assets the scan found.

@@ -18,6 +18,17 @@ const WHEN_TO_USE: &str = "when to use";
 const PROVISIONING: &str = "provisioning";
 const TAG_ALIASES: &str = "tag aliases";
 
+/// The MANIFEST frontmatter key a domain declares its generated-index policy
+/// under. A switch rather than a list, which is why it lives in the
+/// frontmatter instead of beside the four H2 sections.
+pub const GENERATED_INDEXES_KEY: &str = "generated_indexes";
+
+/// The `generated_indexes` value that keeps the listings at home.
+const GENERATED_INDEXES_LOCAL: &str = "local";
+
+/// The `generated_indexes` value that lets the listings travel.
+const GENERATED_INDEXES_SHARED: &str = "shared";
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
@@ -45,13 +56,21 @@ recorded_at: {today}\n\
     )
 }
 
-/// A parsed Manifest: the H2 sections and their top-level bullets.
+/// A parsed Manifest: the H2 sections and their top-level bullets, plus the
+/// frontmatter switches a domain declares.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     /// Canonical H2 section key (lowercased, whitespace-collapsed) to its
     /// zero-indent bullets, in document order. The first of any duplicate H2
     /// wins.
     pub sections: IndexMap<String, Vec<String>>,
+    /// The [`GENERATED_INDEXES_KEY`] frontmatter value as written, rendered
+    /// to text, or `None` when the key is absent. Private because reading it
+    /// raw is almost never what a caller wants: go through
+    /// [`Manifest::generated_indexes`] for the effective policy, and through
+    /// [`Manifest::declared_generated_indexes`] only to report on what the
+    /// MANIFEST literally says.
+    generated_indexes: Option<String>,
 }
 
 impl Manifest {
@@ -60,7 +79,14 @@ impl Manifest {
         let (_, _, body_start) = locate(source);
         let body = &source[body_start..];
         let body_line_start = source[..body_start].bytes().filter(|b| *b == b'\n').count() + 1;
-        let _ = &engram.frontmatter; // frontmatter validation belongs to verify.
+        // Frontmatter VALIDATION belongs to verify; the switches a domain
+        // declares there are read here, verbatim, and interpreted by the
+        // accessors below.
+        let generated_indexes = engram
+            .frontmatter
+            .extra
+            .get(GENERATED_INDEXES_KEY)
+            .map(scalar_text);
 
         let mut sections: IndexMap<String, Vec<String>> = IndexMap::new();
         let mut current: Option<String> = None;
@@ -93,7 +119,10 @@ impl Manifest {
             }
         }
 
-        Manifest { sections }
+        Manifest {
+            sections,
+            generated_indexes,
+        }
     }
 
     /// The `Scope` bullets, if the section is present.
@@ -260,6 +289,111 @@ impl Manifest {
         }
 
         Some(TagAliasSection { decls, problems })
+    }
+
+    /// The `generated_indexes` declaration exactly as the frontmatter writes
+    /// it, or `None` when the key is absent. For reporting on the MANIFEST -
+    /// a verify finding naming a value nobody recognizes - never for deciding
+    /// behaviour: [`Manifest::generated_indexes`] is what decides.
+    pub fn declared_generated_indexes(&self) -> Option<&str> {
+        self.generated_indexes.as_deref()
+    }
+
+    /// Whether this domain's generated directory indexes travel with a share.
+    ///
+    /// [`GeneratedIndexes::Local`] unless the frontmatter says `shared` in
+    /// exactly that spelling. An absent key is `local`, and so is a value
+    /// nobody recognizes: a typo must never quietly publish files the domain
+    /// did not ask to publish, so the unrecognized case lands on the safe
+    /// side and is reported by verify rule `M006` instead of being obeyed.
+    pub fn generated_indexes(&self) -> GeneratedIndexes {
+        match self.generated_indexes.as_deref() {
+            Some(GENERATED_INDEXES_SHARED) => GeneratedIndexes::Shared,
+            _ => GeneratedIndexes::Local,
+        }
+    }
+}
+
+/// Whether a domain's generated directory indexes (`index.md`, at the root and
+/// at every level below it) travel with the domain when it is shared.
+///
+/// The index file is DERIVED, which is what makes keeping it at home safe:
+/// every side that holds the files can rebuild it from them, the same family
+/// of reason the OKF activity log never travels at all. What a domain gives up
+/// by keeping them local is browsability - a folder in the team repository
+/// carries no listing to click through on the forge - and OKF compatibility,
+/// since an OKF bundle is expected to carry its index files. What it gains is
+/// the end of a merge conflict on every second pull request: two proposals
+/// touching one folder both regenerate that folder's listing, and the second
+/// conflicts the moment the first lands.
+///
+/// So [`GeneratedIndexes::Local`] is the default, and
+/// [`GeneratedIndexes::Shared`] is the deliberate choice of a domain whose
+/// repository is read by something other than Crystalline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeneratedIndexes {
+    /// Generated indexes stay on the machine that generated them: they are
+    /// never shared, and never reported as a change in either direction. The
+    /// default, including for every MANIFEST that declares nothing.
+    #[default]
+    Local,
+    /// Generated indexes travel with the domain as ordinary entries in
+    /// snapshots, share trees and layer records.
+    Shared,
+}
+
+impl GeneratedIndexes {
+    /// The value's spelling in the MANIFEST frontmatter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeneratedIndexes::Local => GENERATED_INDEXES_LOCAL,
+            GeneratedIndexes::Shared => GENERATED_INDEXES_SHARED,
+        }
+    }
+
+    /// Parse a declared value, `None` when it spells neither policy. Exact and
+    /// case-sensitive, like every other declaration a MANIFEST carries.
+    pub fn parse(value: &str) -> Option<GeneratedIndexes> {
+        match value {
+            GENERATED_INDEXES_LOCAL => Some(GeneratedIndexes::Local),
+            GENERATED_INDEXES_SHARED => Some(GeneratedIndexes::Shared),
+            _ => None,
+        }
+    }
+}
+
+/// The [`GeneratedIndexes`] policy the domain rooted at `root` declares, read
+/// from its `MANIFEST.md`.
+///
+/// [`GeneratedIndexes::Local`] whenever the MANIFEST is missing, unreadable,
+/// unparseable or declares nothing, so a caller can ask unconditionally and
+/// never has to handle an error. Same shape as [`in_root_artifact_dirs`], and
+/// same reason: the answer is a property of the domain on disk, and a domain
+/// that cannot say publishes nothing extra.
+pub fn generated_indexes_at(root: &Path) -> GeneratedIndexes {
+    let Ok(source) = std::fs::read_to_string(root.join("MANIFEST.md")) else {
+        return GeneratedIndexes::Local;
+    };
+    let Ok(engram) = parse_engram(&source) else {
+        return GeneratedIndexes::Local;
+    };
+    Manifest::from_engram(&engram, &source).generated_indexes()
+}
+
+/// A frontmatter scalar rendered as the text a reader wrote, so a declaration
+/// nobody recognizes can be quoted back in a finding. A list or a mapping has
+/// no such text and is named by its shape instead; either way the value is not
+/// one of the two words, so it is not obeyed.
+fn scalar_text(value: &crate::yaml::YamlValue) -> String {
+    use crate::yaml::YamlValue;
+    match value {
+        YamlValue::Null => "null".to_string(),
+        YamlValue::Bool(b) => b.to_string(),
+        YamlValue::Int(i) => i.to_string(),
+        YamlValue::Float(f) => f.to_string(),
+        YamlValue::String(s) => s.clone(),
+        YamlValue::Sequence(_) => "a list".to_string(),
+        YamlValue::Mapping(_) => "a mapping".to_string(),
     }
 }
 

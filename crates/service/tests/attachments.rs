@@ -10,9 +10,12 @@ mod support;
 
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
+use crystalline_core::config::{
+    DomainEntry, GlobalConfig, ResponseFormat, ReviewMode, ServiceConfig,
+};
 use crystalline_index::TursoStore;
-use crystalline_service::params::WriteParams;
+use crystalline_service::Scope;
+use crystalline_service::params::{DeleteParams, WriteParams};
 use crystalline_service::{Engine, EngineError};
 use tokio::sync::Mutex;
 
@@ -35,6 +38,8 @@ fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
         status: None,
         metadata: None,
         overwrite: false,
+        share_link: None,
+        model: None,
     }
 }
 
@@ -488,13 +493,16 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
     let (_tmp, engine, _root, _scratch) = engine_fixture().await;
 
     let err = engine
-        .move_engram(&crystalline_service::params::MoveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            destination: "assets/alpha.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                destination: "assets/alpha.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -506,13 +514,16 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
     // Same for the spellings that only look like something else.
     for destination in ["Assets/alpha.md", "a/../assets/alpha.md"] {
         let err = engine
-            .move_engram(&crystalline_service::params::MoveParams {
-                domain: "eng".to_string(),
-                identifier: "alpha".to_string(),
-                destination: destination.to_string(),
-                destination_domain: None,
-                update_links: None,
-            })
+            .move_engram(
+                &crystalline_service::params::MoveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    destination: destination.to_string(),
+                    destination_domain: None,
+                    update_links: None,
+                },
+                &Scope::Unrestricted,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -522,7 +533,7 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
     }
 
     let err = engine
-        .restore_engram("eng", "assets/alpha.md", ALPHA)
+        .restore_engram("eng", "assets/alpha.md", ALPHA, &Scope::Unrestricted)
         .await
         .unwrap_err();
     assert!(
@@ -531,7 +542,7 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
         "a restore into assets/ must be refused, got: {err}"
     );
     let err = engine
-        .restore_engram("eng", "a/../assets/alpha.md", ALPHA)
+        .restore_engram("eng", "a/../assets/alpha.md", ALPHA, &Scope::Unrestricted)
         .await
         .unwrap_err();
     assert!(
@@ -556,19 +567,22 @@ async fn an_engram_path_with_a_colon_still_moves_and_restores() {
         .replace("title: Alpha", "title: Plan v2")
         .replace("permalink: alpha", "permalink: plan-v2");
     engine
-        .restore_engram("eng", "notes/plan: v2.md", &plan)
+        .restore_engram("eng", "notes/plan: v2.md", &plan, &Scope::Unrestricted)
         .await
         .unwrap();
     assert!(root.join("notes").join("plan: v2.md").exists());
 
     engine
-        .move_engram(&crystalline_service::params::MoveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            destination: "notes/rule: two.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                destination: "notes/rule: two.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(root.join("notes").join("rule: two.md").exists());
@@ -700,6 +714,7 @@ async fn a_cross_domain_move_carries_a_sole_referent_attachment() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -709,7 +724,10 @@ async fn a_cross_domain_move_carries_a_sole_referent_attachment() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -743,6 +761,7 @@ async fn a_same_domain_move_leaves_the_attachments_where_they_are() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -752,7 +771,10 @@ async fn a_same_domain_move_leaves_the_attachments_where_they_are() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "notes/note.md", None))
+        .move_engram(
+            &move_params("from", "note", "notes/note.md", None),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -776,6 +798,7 @@ async fn an_attachment_another_source_engram_references_is_copied_not_moved() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -784,6 +807,7 @@ async fn an_attachment_another_source_engram_references_is_copied_not_moved() {
             "from",
             "keeper.md",
             &engram_source("Keeper", "keeper", "", "See [the shot](assets/shot.png)."),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -793,7 +817,10 @@ async fn an_attachment_another_source_engram_references_is_copied_not_moved() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -821,6 +848,7 @@ async fn a_retired_referent_in_the_source_forces_a_copy() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -830,6 +858,7 @@ async fn a_retired_referent_in_the_source_forces_a_copy() {
             "old.md",
             &engram_source("Old", "old", "", "![shot](assets/shot.png)")
                 .replace("status: stable", "status: archived"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -839,7 +868,10 @@ async fn a_retired_referent_in_the_source_forces_a_copy() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -865,6 +897,7 @@ async fn a_claimed_attachment_travels_with_no_body_reference_at_all() {
                 "analyzes: assets/deck.pptx\nanalyzed_hash: nope\n",
                 "What the deck said.",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -874,7 +907,10 @@ async fn a_claimed_attachment_travels_with_no_body_reference_at_all() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -897,6 +933,7 @@ async fn a_destination_holding_the_identical_file_reuses_it() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -910,7 +947,10 @@ async fn a_destination_holding_the_identical_file_reuses_it() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -947,6 +987,7 @@ async fn a_destination_collision_with_other_bytes_suffixes_and_rewrites_the_engr
                 "analyzes: assets/shot.png\n",
                 "![shot](assets/shot.png#right) and again [here](./assets/shot.png).",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -960,7 +1001,10 @@ async fn a_destination_collision_with_other_bytes_suffixes_and_rewrites_the_engr
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1006,12 +1050,16 @@ async fn a_reference_to_a_missing_file_never_fails_the_move() {
                 "analyzes: assets/also-gone.pdf\n",
                 "![gone](assets/gone.png)",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1032,12 +1080,16 @@ async fn a_carry_that_cannot_land_surfaces_a_warning_in_the_move_result() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![ghost](assets/ghost.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
 
     let result = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1064,6 +1116,7 @@ async fn an_exhausted_rename_warns_and_leaves_the_file_in_the_source() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1084,7 +1137,10 @@ async fn an_exhausted_rename_warns_and_leaves_the_file_in_the_source() {
     }
 
     let result = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1133,6 +1189,7 @@ async fn a_move_accumulates_every_carry_warning() {
                 "",
                 "![clean](assets/clean.png) ![ghost](assets/ghost.png) ![shot](assets/shot.png)",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1159,7 +1216,10 @@ async fn a_move_accumulates_every_carry_warning() {
     }
 
     let result = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1219,6 +1279,7 @@ async fn a_clean_move_reports_an_empty_warnings_array() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1228,13 +1289,19 @@ async fn a_clean_move_reports_an_empty_warnings_array() {
         .unwrap();
 
     let crossed = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(crossed["attachment_warnings"], serde_json::json!([]));
 
     let renamed = engine
-        .move_engram(&move_params("into", "note", "notes/note.md", None))
+        .move_engram(
+            &move_params("into", "note", "notes/note.md", None),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1252,6 +1319,7 @@ async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1262,7 +1330,10 @@ async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
 
     // File domain to virtual domain: the bytes land in the blob table.
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("vault")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("vault")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(engine.attachment_list("from").await.unwrap().is_empty());
@@ -1276,7 +1347,10 @@ async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
 
     // And back the other way: the file materializes on disk.
     engine
-        .move_engram(&move_params("vault", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("vault", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -1297,6 +1371,7 @@ async fn a_case_variant_claim_in_the_source_still_forces_a_copy() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1314,6 +1389,7 @@ async fn a_case_variant_claim_in_the_source_still_forces_a_copy() {
                 "analyzes: Assets/shot.png\n",
                 "What the shot showed.",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1323,7 +1399,10 @@ async fn a_case_variant_claim_in_the_source_still_forces_a_copy() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1359,6 +1438,7 @@ async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", &format!("![shot]({long_path})")),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1372,7 +1452,10 @@ async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1410,6 +1493,7 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
             "from",
             "note.md",
             &engram_source("Note", "note", "", "A rule about note."),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1419,7 +1503,10 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
     std::fs::remove_file(from.join("note.md")).unwrap();
 
     let err = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1438,10 +1525,14 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
     );
     assert!(
         engine
-            .read_engram(&crystalline_service::params::ReadParams {
-                identifier: "note".to_string(),
-                domain: Some("into".to_string()),
-            })
+            .read_engram(
+                &crystalline_service::params::ReadParams {
+                    identifier: "note".to_string(),
+                    domain: Some("into".to_string()),
+                    share_link: None,
+                },
+                &Scope::Unrestricted
+            )
             .await
             .is_err(),
         "and nothing was indexed there either"
@@ -1568,6 +1659,7 @@ async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_ref
                 "",
                 "![solo](assets/solo.png) ![both](assets/both.png) ![gone](assets/gone.png)",
             ),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1576,6 +1668,7 @@ async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_ref
             "preview-eng",
             "peer.md",
             &engram_source("Peer", "peer", "", "![both](assets/both.png)"),
+            &Scope::Unrestricted,
         )
         .await
         .unwrap();
@@ -1734,4 +1827,817 @@ async fn a_delete_preview_is_never_stricter_than_the_delete_it_previews() {
             .is_empty(),
         "the row went with it"
     );
+}
+
+// --- the attachment seam, in review mode ------------------------------------
+
+/// A domain that reviews changes answers every actor with the attachments the
+/// team's folder holds, and this pins no change rather than a new one.
+///
+/// The attachment table carries no actor dimension, so one actor's view of a
+/// domain's attachments IS its base attachments: "the actor's view" is
+/// satisfied by construction here rather than by a projection. The test exists
+/// so that answer has one place to be read out of, and so a later attachment
+/// overlay has one seam to land in rather than five call sites to find.
+#[tokio::test]
+async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every_actor() {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "team");
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    let mut entry = DomainEntry::file(dir.clone());
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state")),
+    );
+    engine.sync(None).await.unwrap();
+
+    engine
+        .attachment_write("team", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    // One actor holding a draft over the domain's only engram, so the domain is
+    // genuinely being drafted in while the attachment question is asked.
+    engine
+        .write_engram_as(
+            &WriteParams {
+                domain: "team".to_string(),
+                title: "Fresh".to_string(),
+                content: "- [idea] a page only alice has #team".to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec!["team".to_string()],
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            },
+            Some("claude-code/2.0-for-alice"),
+            &Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let listed = engine.attachment_list("team").await.unwrap();
+    assert_eq!(
+        listed.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        vec!["assets/shot.png"],
+        "the listing is the folder the team reviewed"
+    );
+    let (bytes, row) = engine
+        .attachment_read("team", "assets/shot.png")
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "and so are the bytes");
+    assert_eq!(row.path, "assets/shot.png");
+    assert_eq!(
+        std::fs::read(dir.join("assets/shot.png")).unwrap(),
+        PNG,
+        "which is where they are: an attachment is shared state, not a draft"
+    );
+    drop(scratch);
+}
+
+// --- review mode: the files overlay -----------------------------------------
+//
+// A domain that reviews changes has one rule the whole mode rests on: the
+// folder on disk changes only by a pull. An engram write keeps it by landing as
+// a row in the writer's own dimension; an attachment has nowhere to be a row,
+// so it lands in that actor's files overlay under the state directory instead.
+// These tests are what say it does - and that a direct domain is byte for byte
+// what it was before the overlay existed.
+
+/// Alice, as a signed-in account drafts.
+fn alice() -> Scope {
+    Scope::User {
+        account: "alice".to_string(),
+        admin: false,
+    }
+}
+
+/// Bob, the stranger every one of these tests needs: somebody who may read the
+/// domain and may not see alice's drafts.
+fn bob() -> Scope {
+    Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    }
+}
+
+/// A reviewing file domain and a direct one on a single engine, with the state
+/// directory inside the temp tree so no files overlay can reach the real one.
+///
+/// The direct twin is not decoration: it is how a test says what a row from the
+/// overlay MEANS, by writing the same bytes where nothing is projected and
+/// comparing the two rows.
+async fn review_fixture(
+    reviewing: &str,
+    direct: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    support::ScratchStateDir,
+) {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+
+    let review_dir = root.join(reviewing);
+    std::fs::create_dir_all(review_dir.join("assets")).unwrap();
+    write_manifest(&review_dir, reviewing);
+    std::fs::write(review_dir.join("alpha.md"), ALPHA).unwrap();
+    std::fs::write(review_dir.join("assets/deck.png"), PNG).unwrap();
+    let mut entry = DomainEntry::file(review_dir.clone());
+    entry.review = Some(ReviewMode::Overlay);
+    cfg.domains.insert(reviewing.to_string(), entry);
+
+    let direct_dir = root.join(direct);
+    std::fs::create_dir_all(&direct_dir).unwrap();
+    write_manifest(&direct_dir, direct);
+    cfg.domains
+        .insert(direct.to_string(), DomainEntry::file(direct_dir.clone()));
+    cfg.domains
+        .insert(format!("{direct}-virtual"), DomainEntry::virtual_domain());
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let state = root.join("state");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(state.clone()),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine, review_dir, direct_dir, state, scratch)
+}
+
+/// **An upload in review mode never reaches the folder, and only its own
+/// account can read it back.**
+#[tokio::test]
+async fn an_attachment_written_in_review_mode_is_absent_from_the_folder_and_readable_by_its_actor_only()
+ {
+    let (_tmp, engine, review_dir, direct_dir, state, _scratch) =
+        review_fixture("rev-alone", "plain-alone").await;
+
+    let written = engine
+        .attachment_write_as("rev-alone", "assets/fresh.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    assert!(
+        written.draft,
+        "the receipt says the bytes landed as a draft"
+    );
+
+    assert!(
+        !review_dir.join("assets/fresh.png").exists(),
+        "the folder the team reviewed is untouched"
+    );
+    assert!(
+        !engine
+            .attachment_list("rev-alone")
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.path == "assets/fresh.png"),
+        "and no base row describes it either"
+    );
+    assert!(
+        state
+            .join("overlays/rev-alone/alice/files/assets/fresh.png")
+            .is_file(),
+        "the bytes stand in alice's own files overlay"
+    );
+
+    // The row means what a base row means. The proof is the direct twin: the
+    // same bytes written where nothing is projected carry the same checksum.
+    let twin = engine
+        .attachment_write("plain-alone", "assets/fresh.png", PNG.to_vec())
+        .await
+        .unwrap();
+    assert!(direct_dir.join("assets/fresh.png").is_file());
+
+    let (bytes, row) = engine
+        .attachment_read_as("rev-alone", "assets/fresh.png", &alice())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "alice reads her own bytes back");
+    assert_eq!(row.sha256, twin.sha256, "hashed like any other row");
+    assert_eq!(row.size, PNG.len() as u64);
+    assert_eq!(row.mime, "image/png");
+
+    for (who, scope) in [("bob", bob()), ("nobody", Scope::Anonymous)] {
+        let miss = engine
+            .attachment_read_as("rev-alone", "assets/fresh.png", &scope)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(miss, EngineError::NotFound(_)),
+            "{who} is answered the miss an absent file gets, not the bytes: {miss:?}"
+        );
+    }
+
+    let listed: Vec<String> = engine
+        .attachment_list_as("rev-alone", &alice())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    assert_eq!(listed, vec!["assets/deck.png", "assets/fresh.png"]);
+    let listed: Vec<String> = engine
+        .attachment_list_as("rev-alone", &bob())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["assets/deck.png"],
+        "bob sees the reviewed file and nothing of alice's"
+    );
+}
+
+/// **A replacement is a draft of the file, not the file.**
+#[tokio::test]
+async fn a_stranger_reads_the_reviewed_file_while_the_actor_reads_their_draft_of_it() {
+    let (_tmp, engine, review_dir, _direct, _state, _scratch) =
+        review_fixture("rev-over", "plain-over").await;
+
+    const REDRAWN: &[u8] = b"\x89PNG\r\n\x1a\n\x00redrawn\x00bytes";
+    let written = engine
+        .attachment_write_as("rev-over", "assets/deck.png", REDRAWN.to_vec(), &alice())
+        .await
+        .unwrap();
+    assert!(written.draft);
+
+    assert_eq!(
+        std::fs::read(review_dir.join("assets/deck.png")).unwrap(),
+        PNG,
+        "the reviewed file on disk is exactly as it was"
+    );
+    let (bytes, _) = engine
+        .attachment_read_as("rev-over", "assets/deck.png", &bob())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "bob reads the file the team reviewed");
+    let (bytes, row) = engine
+        .attachment_read_as("rev-over", "assets/deck.png", &alice())
+        .await
+        .unwrap();
+    assert_eq!(bytes, REDRAWN, "alice reads hers");
+    assert_eq!(row.size, REDRAWN.len() as u64);
+
+    let listed = engine
+        .attachment_list_as("rev-over", &alice())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "one row at the path, not two: a draft replaces its base"
+    );
+    assert_eq!(listed[0].size, REDRAWN.len() as u64);
+}
+
+/// **A deletion in review mode hides the file from its deleter and from
+/// nobody else.**
+#[tokio::test]
+async fn a_tombstoned_base_attachment_reads_absent_for_the_actor_and_present_for_a_stranger() {
+    let (_tmp, engine, review_dir, _direct, state, _scratch) =
+        review_fixture("rev-gone", "plain-gone").await;
+
+    let draft = engine
+        .attachment_delete_as("rev-gone", "assets/deck.png", &alice())
+        .await
+        .unwrap();
+    assert!(draft, "the delete landed as a draft");
+
+    assert_eq!(
+        std::fs::read(review_dir.join("assets/deck.png")).unwrap(),
+        PNG,
+        "the reviewed file is untouched"
+    );
+    assert_eq!(
+        engine.attachment_list("rev-gone").await.unwrap().len(),
+        1,
+        "and its base row stands"
+    );
+    assert!(
+        state
+            .join("overlays/rev-gone/alice/files/assets/deck.png.tombstone")
+            .is_file(),
+        "the deletion is a sidecar in alice's own overlay"
+    );
+
+    let miss = engine
+        .attachment_read_as("rev-gone", "assets/deck.png", &alice())
+        .await
+        .unwrap_err();
+    assert!(matches!(miss, EngineError::NotFound(_)), "{miss:?}");
+    assert!(
+        engine
+            .attachment_list_as("rev-gone", &alice())
+            .await
+            .unwrap()
+            .is_empty(),
+        "her listing omits what she deleted"
+    );
+    let (bytes, _) = engine
+        .attachment_read_as("rev-gone", "assets/deck.png", &bob())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "bob still reads it");
+
+    // And the preview of a delete answers the same three ways, which is what
+    // keeps it from being stricter - or laxer - than the act it previews.
+    let p = DeleteParams {
+        identifier: "assets/deck.png".to_string(),
+        domain: "rev-gone".to_string(),
+        expected_checksum: None,
+    };
+    let preview = engine.delete_preview_as(&p, &bob()).await.unwrap();
+    assert_eq!(preview["size"], serde_json::json!(PNG.len()));
+    let miss = engine.delete_preview_as(&p, &alice()).await.unwrap_err();
+    assert!(
+        matches!(miss, EngineError::NotFound(_)),
+        "alice has nothing left to delete there: {miss:?}"
+    );
+
+    // And the delete agrees with the read and the size it stands beside: a
+    // second one is a miss, not a second deletion, exactly as it is on a
+    // domain that takes changes directly.
+    let miss = engine
+        .attachment_delete_as("rev-gone", "assets/deck.png", &alice())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(miss, EngineError::NotFound(_)),
+        "deleting what she has already deleted is a miss: {miss:?}"
+    );
+    let (bytes, _) = engine
+        .attachment_read_as("rev-gone", "assets/deck.png", &bob())
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG, "and bob's file was never in question");
+}
+
+/// **A file only its own actor ever held leaves no marker behind.**
+///
+/// A marker over a base nothing holds is exactly what convergence would clear
+/// again, so there is nothing to mark - the same rule a draft-only engram's
+/// delete follows when it drops the row instead of tombstoning it.
+#[tokio::test]
+async fn a_delete_of_an_overlay_only_file_removes_the_bytes_and_writes_no_sidecar() {
+    let (_tmp, engine, _review_dir, _direct, state, _scratch) =
+        review_fixture("rev-only", "plain-only").await;
+
+    engine
+        .attachment_write_as("rev-only", "assets/only.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    let draft = engine
+        .attachment_delete_as("rev-only", "assets/only.png", &alice())
+        .await
+        .unwrap();
+    assert!(draft);
+
+    assert!(
+        !state
+            .join("overlays/rev-only/alice/files/assets/only.png")
+            .exists(),
+        "the bytes went"
+    );
+    assert!(
+        !state
+            .join("overlays/rev-only/alice/files/assets/only.png.tombstone")
+            .exists(),
+        "and nothing was marked"
+    );
+    assert!(
+        !state.join("overlays/rev-only/alice/files").exists(),
+        "the files folder goes with the last entry under it"
+    );
+
+    let miss = engine
+        .attachment_delete_as("rev-only", "assets/only.png", &alice())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(miss, EngineError::NotFound(_)),
+        "deleting it again is a miss: {miss:?}"
+    );
+}
+
+/// **An upload with no identity is refused in the words an engram write is
+/// refused in.**
+#[tokio::test]
+async fn an_attachment_write_with_no_identity_refuses_with_the_same_sentence_an_engram_write_does()
+{
+    let (_tmp, engine, review_dir, _direct, state, _scratch) =
+        review_fixture("rev-anon", "plain-anon").await;
+
+    let refused = engine
+        .attachment_write_as(
+            "rev-anon",
+            "assets/fresh.png",
+            PNG.to_vec(),
+            &Scope::Anonymous,
+        )
+        .await
+        .unwrap_err();
+    match &refused {
+        EngineError::Refused(message) => assert_eq!(
+            message,
+            crystalline_service::engine::OVERLAY_NEEDS_IDENTITY,
+            "the same sentence, so a caller learns the same thing whatever they were writing"
+        ),
+        other => panic!("a write with no identity is refused: {other:?}"),
+    }
+    assert!(!review_dir.join("assets/fresh.png").exists());
+    assert!(!state.join("overlays").exists(), "and nothing was drafted");
+
+    let refused = engine
+        .attachment_delete_as("rev-anon", "assets/deck.png", &Scope::Anonymous)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, EngineError::Refused(m) if m == crystalline_service::engine::OVERLAY_NEEDS_IDENTITY),
+        "and so is a delete: {refused:?}"
+    );
+    assert!(
+        review_dir.join("assets/deck.png").is_file(),
+        "the reviewed file is where it was"
+    );
+}
+
+/// **A domain that takes changes directly is byte for byte what it was.**
+///
+/// Both entry points, the name-addressed substrate verb and the scope-addressed
+/// projection, and both kinds of domain: the same rows, the same bytes on disk,
+/// no `draft` anywhere and no overlay folder brought into existence.
+#[tokio::test]
+async fn a_direct_domains_attachment_verbs_are_byte_identical_through_the_view() {
+    let (_tmp, engine, _review_dir, direct_dir, state, _scratch) =
+        review_fixture("rev-direct", "plain-direct").await;
+
+    let named = engine
+        .attachment_write("plain-direct", "assets/one.png", PNG.to_vec())
+        .await
+        .unwrap();
+    let viewed = engine
+        .attachment_write_as(
+            "plain-direct",
+            "assets/two.png",
+            PNG.to_vec(),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(!viewed.draft, "a direct domain's upload is never a draft");
+    assert_eq!(viewed.row.sha256, named.sha256);
+    assert_eq!(viewed.row.mime, named.mime);
+    assert_eq!(
+        std::fs::read(direct_dir.join("assets/two.png")).unwrap(),
+        PNG,
+        "the bytes are in the folder, where a direct domain's bytes live"
+    );
+
+    assert_eq!(
+        engine.attachment_list("plain-direct").await.unwrap(),
+        engine
+            .attachment_list_as("plain-direct", &Scope::Unrestricted)
+            .await
+            .unwrap(),
+        "the two listings are one listing"
+    );
+    assert_eq!(
+        engine
+            .attachment_read("plain-direct", "assets/two.png")
+            .await
+            .unwrap(),
+        engine
+            .attachment_read_as("plain-direct", "assets/two.png", &Scope::Unrestricted)
+            .await
+            .unwrap(),
+        "and the two reads are one read"
+    );
+    let p = DeleteParams {
+        identifier: "assets/two.png".to_string(),
+        domain: "plain-direct".to_string(),
+        expected_checksum: None,
+    };
+    assert_eq!(
+        engine.delete_preview(&p).await.unwrap(),
+        engine
+            .delete_preview_as(&p, &Scope::Unrestricted)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .attachment_delete_as("plain-direct", "assets/two.png", &Scope::Unrestricted)
+            .await
+            .unwrap(),
+        "and the delete is not a draft either"
+    );
+    assert!(!direct_dir.join("assets/two.png").exists());
+
+    // A virtual domain has no folder and today no attachments, so nothing about
+    // it changes: its blob table answers both entry points the same way.
+    let written = engine
+        .attachment_write_as(
+            "plain-direct-virtual",
+            "assets/data.json",
+            b"{\"a\":1}".to_vec(),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(!written.draft);
+    assert_eq!(
+        engine
+            .attachment_read("plain-direct-virtual", "assets/data.json")
+            .await
+            .unwrap()
+            .0,
+        b"{\"a\":1}".to_vec()
+    );
+
+    assert!(
+        !state.join("overlays").exists(),
+        "and no overlay folder was ever brought into existence"
+    );
+}
+
+/// **The MCP-facing delete verb routes an `assets/` identifier the way it
+/// routes an engram.**
+#[tokio::test]
+async fn delete_engram_on_an_assets_path_in_review_mode_lands_as_a_draft_deletion() {
+    let (_tmp, engine, review_dir, _direct, _state, _scratch) =
+        review_fixture("rev-verb", "plain-verb").await;
+
+    // Round one first: a preview must never be stricter than the act it
+    // previews, and a file only alice holds is one the delete would really
+    // remove.
+    engine
+        .attachment_write_as("rev-verb", "assets/mine.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    let mine = DeleteParams {
+        identifier: "assets/mine.png".to_string(),
+        domain: "rev-verb".to_string(),
+        expected_checksum: None,
+    };
+    let preview = engine.delete_preview_as(&mine, &alice()).await.unwrap();
+    assert_eq!(preview["size"], serde_json::json!(PNG.len()));
+    assert!(
+        engine.delete_preview_as(&mine, &bob()).await.is_err(),
+        "and bob is previewing nothing, because he holds nothing there"
+    );
+
+    let receipt = engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "assets/deck.png".to_string(),
+                domain: "rev-verb".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["attachment"], serde_json::json!(true));
+    assert_eq!(receipt["deleted"], serde_json::json!(true));
+    assert_eq!(
+        receipt["draft"],
+        serde_json::json!(true),
+        "the receipt says the deletion is alice's draft of one"
+    );
+    assert!(
+        review_dir.join("assets/deck.png").is_file(),
+        "and the folder keeps the file"
+    );
+}
+
+/// **An engine that was never told where its state directory is reaches no
+/// files overlay at all.**
+///
+/// Pinned by the refusal rather than by looking for an `overlays/` folder under
+/// the developer's own state directory: the refusal is what makes reaching it
+/// impossible, where an absent folder would only mean nobody noticed.
+#[tokio::test]
+async fn an_engine_with_no_state_dir_reaches_no_files_overlay_in_a_test_build() {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("rev-unpinned");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "rev-unpinned");
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(ReviewMode::Overlay);
+    cfg.domains.insert("rev-unpinned".to_string(), entry);
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+
+    let refused = engine
+        .attachment_write_as("rev-unpinned", "assets/fresh.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap_err();
+    match &refused {
+        EngineError::Internal(message) => assert!(
+            message.contains("with_state_dir"),
+            "the refusal names what the fixture forgot: {message}"
+        ),
+        other => panic!("an engine with no state directory refuses: {other:?}"),
+    }
+    drop(scratch);
+}
+
+/// **A move INTO a reviewing domain is refused too, and the refusal teaches
+/// the rule rather than the mechanism.**
+///
+/// A draft belongs to one domain's overlay, and the folder the team shares
+/// changes only by a pull. A cross-domain move builds its view from the SOURCE
+/// domain, so a move out of a domain that takes changes directly into one that
+/// reviews them would take the non-overlay branch and write the destination's
+/// folder - the engram and the attachments it carries alike, going round the
+/// review the destination exists to require.
+#[tokio::test]
+async fn a_move_into_a_reviewing_domain_is_refused_with_the_folder_rule() {
+    let (_tmp, engine, review_dir, direct_dir, _state, _scratch) =
+        review_fixture("rev-into", "plain-into").await;
+    std::fs::write(
+        direct_dir.join("beta.md"),
+        ALPHA.replace("Alpha", "Beta").replace("alpha", "beta"),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let refused = engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "beta".to_string(),
+                domain: "plain-into".to_string(),
+                destination: "beta.md".to_string(),
+                destination_domain: Some("rev-into".to_string()),
+                update_links: None,
+            },
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    let text = refused.to_string();
+    assert!(
+        matches!(&refused, EngineError::Refused(_)),
+        "it is a refusal, not an invalid request: {refused:?}"
+    );
+    assert!(
+        text.contains("rev-into") && text.contains("reviews changes"),
+        "the refusal names the domain and why: {text}"
+    );
+    assert!(
+        text.contains("Write it there"),
+        "and says what to do instead: {text}"
+    );
+    assert!(
+        !review_dir.join("beta.md").exists(),
+        "nothing was written into the folder the team reviewed"
+    );
+    assert!(
+        direct_dir.join("beta.md").is_file(),
+        "and the engram is still where it was"
+    );
+}
+
+/// **A move out of a reviewing domain is refused before anything is carried.**
+///
+/// Which is why the cross-domain carry goes on reading and writing the
+/// substrate: the one path that could take a draft file across a domain
+/// boundary never runs.
+#[tokio::test]
+async fn a_move_out_of_a_reviewing_domain_is_refused_before_any_attachment_is_carried() {
+    let (_tmp, engine, review_dir, direct_dir, _state, _scratch) =
+        review_fixture("rev-move", "plain-move").await;
+
+    let refused = engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "alpha".to_string(),
+                domain: "rev-move".to_string(),
+                destination: "alpha.md".to_string(),
+                destination_domain: Some("plain-move".to_string()),
+                update_links: None,
+            },
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, EngineError::Refused(m) if m.contains("share the change first")),
+        "a draft moves only inside the domain it is drafted in: {refused:?}"
+    );
+    assert!(review_dir.join("alpha.md").is_file());
+    assert!(!direct_dir.join("alpha.md").exists());
+}
+
+/// **What a delete of a draft file would take away is read off the file's
+/// metadata, never out of its bytes.**
+///
+/// The size question is a stat question, and asking it by reading the whole
+/// file is both a wasted read and a stricter answer than the act it previews:
+/// a file whose bytes this process cannot read still has a size, and deleting
+/// it would still take that many bytes away. Pinned by taking the read
+/// permission away and leaving the metadata: the preview answers and the read
+/// does not.
+///
+/// Unix only - the permission bits are the discriminator, and Windows has no
+/// equivalent that leaves `metadata` working. Skipped in the one environment
+/// where the bits do not bind (a run as root), with a note rather than a
+/// silent pass.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_size_of_a_draft_file_is_read_from_its_metadata_and_never_from_its_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_tmp, engine, _review_dir, _direct, state, _scratch) =
+        review_fixture("rev-stat", "plain-stat").await;
+
+    engine
+        .attachment_write_as("rev-stat", "assets/locked.png", PNG.to_vec(), &alice())
+        .await
+        .unwrap();
+    let file = state.join("overlays/rev-stat/alice/files/assets/locked.png");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&file).is_ok() {
+        eprintln!(
+            "skipped: this process reads a mode-000 file, so the permission bits cannot \
+             discriminate here (a run as root)"
+        );
+        return;
+    }
+
+    let preview = engine
+        .delete_preview_as(
+            &DeleteParams {
+                identifier: "assets/locked.png".to_string(),
+                domain: "rev-stat".to_string(),
+                expected_checksum: None,
+            },
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["size"],
+        serde_json::json!(PNG.len()),
+        "the preview answers from the file's own metadata: {preview}"
+    );
+
+    // The read is the one that needs the bytes, and it is the one that fails.
+    assert!(
+        engine
+            .attachment_read_as("rev-stat", "assets/locked.png", &alice())
+            .await
+            .is_err(),
+        "the bytes really are unreadable, so the preview above read none"
+    );
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
 }

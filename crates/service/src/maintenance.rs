@@ -51,9 +51,10 @@
 //! never be reported as failed because a throttle record could not be
 //! updated.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use crystalline_core::config::{self, ConfigError};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,70 @@ const HOOKS_DIR: &str = "hooks";
 /// reading a file a newer install wrote; every field is optional, so the
 /// worst case is a nudge decided on fewer facts than the writer had.
 const STATE_VERSION: u32 = 1;
+
+/// How long one kind of MCP nudge stays quiet for one identity after it was
+/// carried on a write receipt: four hours.
+///
+/// Shorter than the Stop hook's day ([`crate::maintenance`] is shared with it)
+/// because the surfaces differ. The hook speaks once at the end of a person's
+/// session; a write receipt speaks to an agent mid-task, and an agent that
+/// works through a morning, shares, and then works through an afternoon should
+/// meet the ask again in the afternoon rather than once a day.
+pub const MCP_NUDGE_COOLDOWN_HOURS: i64 = 4;
+
+/// Which ride-along a write receipt carried. One throttle record per kind per
+/// identity, so an agent that was asked to share is still asked to sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NudgeKind {
+    /// "This work is not shared yet."
+    Share,
+    /// "Knowledge maintenance is due."
+    Evolve,
+}
+
+impl NudgeKind {
+    /// The word this kind is keyed by in [`MaintenanceState::mcp_nudges`].
+    /// Stable, because it is written to a file an older install reads.
+    fn word(self) -> &'static str {
+        match self {
+            NudgeKind::Share => "share",
+            NudgeKind::Evolve => "evolve",
+        }
+    }
+}
+
+/// The key one kind-and-identity pair is recorded under: `<kind>:<identity>`.
+///
+/// The identity half is the account an HTTP call authenticated as, or the
+/// instance key a stdio session stands in with (see
+/// [`crate::nudge::identity_key`]). A colon cannot appear in the kind, so the
+/// first one splits the key and an identity carrying colons of its own is
+/// still one key.
+fn nudge_key(kind: NudgeKind, identity: &str) -> String {
+    format!("{}:{identity}", kind.word())
+}
+
+/// Whether `kind` is due for `identity` at `now`.
+///
+/// Due when nothing was ever recorded for that pair, and again once
+/// [`MCP_NUDGE_COOLDOWN_HOURS`] have passed since the last one. A stamp in the
+/// future suppresses the ask until the clock passes it, deliberately unclamped
+/// for the reason the Stop hook's own throttle gives: a record that reads as
+/// nonsense costs delayed asks rather than an ask decided on a stamp nobody
+/// wrote.
+pub fn mcp_nudge_due(
+    state: &MaintenanceState,
+    kind: NudgeKind,
+    identity: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    match state.mcp_nudges.get(&nudge_key(kind, identity)) {
+        Some(last) => {
+            now.signed_duration_since(*last) >= TimeDelta::hours(MCP_NUDGE_COOLDOWN_HOURS)
+        }
+        None => true,
+    }
+}
 
 /// What this machine owes the human, and when it last said so.
 ///
@@ -103,6 +168,17 @@ pub struct MaintenanceState {
     /// the clock.
     #[serde(default)]
     pub first_seen: Option<DateTime<Utc>>,
+    /// When each MCP nudge was last carried on a write receipt, keyed
+    /// `<kind>:<identity>` (see `nudge_key`). Written by
+    /// [`record_mcp_nudge`], read by [`mcp_nudge_due`], and untouched by every
+    /// other recorder here.
+    ///
+    /// A map rather than two stamps because the cadence is per person: two
+    /// agents writing through one daemon each meet the ask once, and neither
+    /// spends the other's quiet hours. Ordered, so the file's bytes do not
+    /// depend on hashing.
+    #[serde(default)]
+    pub mcp_nudges: BTreeMap<String, DateTime<Utc>>,
 }
 
 /// The maintenance state path, `<state_dir>/hooks/maintenance.json`.
@@ -207,6 +283,28 @@ pub fn record_nudge(now: DateTime<Utc>) {
 pub fn record_first_seen(now: DateTime<Utc>) {
     if let Err(e) = path().and_then(|p| record_first_seen_at(&p, now)) {
         tracing::debug!("maintenance state clock not started: {e}");
+    }
+}
+
+/// Record that `kind` was carried on a write receipt for `identity` at the
+/// current instant.
+///
+/// The MCP half of this file, stamped through a recorder for exactly the
+/// reason [`record_nudge`] is: the trailer decides between its read and its
+/// write, and a `record_pending` from a human's Fluid write landing inside
+/// that gap has to survive.
+///
+/// Resolves the machine's own state directory, like every public recorder
+/// here - and that is the whole of what it adds. **Nothing in this workspace
+/// calls it today**: the one writer, the receipt trailer, records against the
+/// engine's state directory instead (`crate::nudge`), which is the same file in
+/// production and a test's own temporary one under test. It stands as the entry
+/// point for a caller that has no engine to ask - another process on this
+/// machine, the way the Stop hook reaches [`record_nudge`] - and a reader
+/// looking for what writes this field should read `record_mcp_nudge_at`.
+pub fn record_mcp_nudge(kind: NudgeKind, identity: &str) {
+    if let Err(e) = path().and_then(|p| record_mcp_nudge_at(&p, kind, identity, Utc::now())) {
+        tracing::debug!("maintenance state not stamped with the mcp nudge: {e}");
     }
 }
 
@@ -324,6 +422,34 @@ fn record_first_seen_at(path: &Path, now: DateTime<Utc>) -> Result<(), ConfigErr
         return Ok(());
     }
     state.first_seen = Some(now);
+    write_locked(path, &state)
+}
+
+/// The maintenance file under an explicit state directory, which is how the
+/// daemon reaches the same file [`path`] resolves without reading the process
+/// environment a second time.
+pub(crate) fn path_under(state_dir: &Path) -> PathBuf {
+    state_dir.join(HOOKS_DIR).join(MAINTENANCE_FILE)
+}
+
+/// [`load`] against an explicit state directory, with the same infallible
+/// degrade-to-fresh contract.
+pub(crate) fn load_under(state_dir: &Path) -> MaintenanceState {
+    load_from(&path_under(state_dir))
+}
+
+/// [`record_mcp_nudge`] against an explicit file, one critical section like the
+/// recorders above. `now` comes from the caller because the trailer decided at
+/// a particular instant and stamps that same one.
+pub(crate) fn record_mcp_nudge_at(
+    path: &Path,
+    kind: NudgeKind,
+    identity: &str,
+    now: DateTime<Utc>,
+) -> Result<(), ConfigError> {
+    let _write = write_lock();
+    let mut state = load_from(path);
+    state.mcp_nudges.insert(nudge_key(kind, identity), now);
     write_locked(path, &state)
 }
 
@@ -554,6 +680,41 @@ mod tests {
         assert_eq!(landed, expected, "every writer's domain survived");
     }
 
+    /// The MCP throttle is per kind AND per identity, and it opens again once
+    /// the cooldown has passed.
+    #[test]
+    fn a_nudge_is_due_once_per_cooldown_per_identity() {
+        let (_dir, path) = scratch();
+        let now: DateTime<Utc> = "2026-09-16T09:00:00Z".parse().unwrap();
+
+        let fresh = load_from(&path);
+        assert!(mcp_nudge_due(&fresh, NudgeKind::Share, "ada", now));
+        assert!(mcp_nudge_due(&fresh, NudgeKind::Evolve, "ada", now));
+
+        record_mcp_nudge_at(&path, NudgeKind::Share, "ada", now).unwrap();
+        let after = load_from(&path);
+        assert!(
+            !mcp_nudge_due(&after, NudgeKind::Share, "ada", now),
+            "the same ask to the same person is throttled"
+        );
+        assert!(
+            mcp_nudge_due(&after, NudgeKind::Evolve, "ada", now),
+            "the other ask keeps its own cadence"
+        );
+        assert!(
+            mcp_nudge_due(&after, NudgeKind::Share, "bob", now),
+            "another person keeps their own cadence"
+        );
+
+        let inside = now + TimeDelta::hours(MCP_NUDGE_COOLDOWN_HOURS) - TimeDelta::minutes(1);
+        assert!(!mcp_nudge_due(&after, NudgeKind::Share, "ada", inside));
+        let past = now + TimeDelta::hours(MCP_NUDGE_COOLDOWN_HOURS);
+        assert!(
+            mcp_nudge_due(&after, NudgeKind::Share, "ada", past),
+            "once the cooldown has passed the ask is due again"
+        );
+    }
+
     #[test]
     fn save_round_trips_every_field() {
         let (_dir, path) = scratch();
@@ -567,6 +728,10 @@ mod tests {
             last_run_at: Some("2026-08-02T11:30:00Z".parse().unwrap()),
             last_nudge_at: Some("2026-08-03T12:45:00Z".parse().unwrap()),
             first_seen: Some("2026-07-01T09:15:00Z".parse().unwrap()),
+            mcp_nudges: BTreeMap::from([(
+                "share:ada".to_string(),
+                "2026-08-03T13:00:00Z".parse().unwrap(),
+            )]),
         };
 
         save_to(&path, &state).unwrap();

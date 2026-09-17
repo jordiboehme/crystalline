@@ -1,7 +1,8 @@
 //! M-family rules: the MANIFEST and configurable required-file structure.
 //!
 //! `MANIFEST.md` is checked with a hardcoded shape (`## Scope` and
-//! `## When to Use`, `M001`-`M004`, `M101`-`M103`). Every entry under a
+//! `## When to Use`, `M001`-`M004`, `M101`-`M103`), plus the frontmatter
+//! switches it declares (`M006`). Every entry under a
 //! domain's `.crystalline.yaml` `verify.required_files` is checked with the
 //! same rule ids against its own configured sections, so a domain can apply
 //! the identical structural checks to any other file it wants enforced (a
@@ -11,7 +12,8 @@ use indexmap::IndexMap;
 
 use crate::engram::Heading;
 use crate::manifest::{
-    Manifest, ProblemKind, ProvisioningSection, TagAliasSection, in_root_artifact_dirs,
+    GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, ProblemKind, ProvisioningSection,
+    TagAliasSection, in_root_artifact_dirs,
 };
 
 use super::scanner::Domain;
@@ -121,6 +123,32 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
 
     if let Some(section) = manifest.tag_aliases() {
         check_tag_aliases(&section, &file.path, sink);
+    }
+
+    // `M006`: a `generated_indexes` value that spells neither policy. It is an
+    // error rather than a warning because the domain is not doing what its
+    // MANIFEST says: an unrecognized value is read as `local`, the safe side,
+    // so a typo silently stops the listings travelling rather than silently
+    // starting to publish them. Saying so is the only way the owner finds out.
+    if let Some(declared) = manifest.declared_generated_indexes()
+        && GeneratedIndexes::parse(declared).is_none()
+    {
+        sink.emit(
+            &file.path,
+            None,
+            "M006",
+            Severity::Error,
+            format!(
+                "`{GENERATED_INDEXES_KEY}: {declared}` is neither `{}` nor `{}`",
+                GeneratedIndexes::Local.as_str(),
+                GeneratedIndexes::Shared.as_str()
+            ),
+            Some(format!(
+                "read as `{}`, so the generated index files stay on this machine; write `{}` to let them travel with the domain",
+                GeneratedIndexes::Local.as_str(),
+                GeneratedIndexes::Shared.as_str()
+            )),
+        );
     }
 
     check_duplicate_h2(&engram.headings, &file.path, sink);

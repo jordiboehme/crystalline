@@ -36,6 +36,31 @@ pub enum RemoteError {
     #[error("The GitHub connection has expired or was revoked. Use configure to sign in again.")]
     AuthExpired,
 
+    /// A SAML-enforced organization refused the token until the OAuth app is
+    /// authorized for it (GitHub 403 with an `X-GitHub-SSO: required` header).
+    #[error(
+        "GitHub requires single sign-on for the {org} organization before this token can reach it. Authorize the Crystalline app for {org}: open {url}, sign in through your identity provider, then retry. No collaborator change and no reconnect is needed."
+    )]
+    SsoAuthorizationRequired {
+        /// The organization that enforces single sign-on, or `this` when
+        /// neither the SSO url nor the repository named one.
+        org: String,
+        /// Where the person authorizes the app: GitHub's own `X-GitHub-SSO`
+        /// url when it sent one, else the authorized-apps page.
+        url: String,
+    },
+
+    /// An organization with OAuth App access restrictions has not approved
+    /// the app (GitHub 403 whose message names the restriction).
+    #[error(
+        "The {org} organization restricts third-party OAuth apps and has not approved Crystalline yet. Ask an organization owner to approve it under the organization's Settings > Third-party access > OAuth app policy, or request it yourself under GitHub > Settings > Applications > Authorized OAuth Apps > Crystalline (Request next to {org}); then retry."
+    )]
+    OauthAppRestricted {
+        /// The organization that restricts third-party apps, or `this` when
+        /// the request named no repository owner.
+        org: String,
+    },
+
     /// GitHub is rate limiting requests from this machine.
     #[error("GitHub is rate limiting this machine; trying again later. Nothing is lost.")]
     RateLimited {
@@ -54,10 +79,14 @@ pub enum RemoteError {
     },
 
     /// The repository, or the given subpath within it, has no MANIFEST.md, so
-    /// it does not look like a domain Crystalline can subscribe to.
+    /// it does not look like a domain Crystalline can subscribe to. When the
+    /// download the refusal is built from held a MANIFEST.md somewhere else,
+    /// `candidates` names it so the caller can copy the path rather than
+    /// guess it and re-learn it as folklore.
     #[error(
-        "{repo} does not look like a knowledge domain: no MANIFEST.md was found {}",
-        manifest_location(.path)
+        "{repo} does not look like a knowledge domain: no MANIFEST.md was found {}{}",
+        manifest_location(.path),
+        manifest_candidates_clause(candidates, *more_candidates)
     )]
     NotADomain {
         /// The repository, `owner/name`.
@@ -65,6 +94,15 @@ pub enum RemoteError {
         /// The subpath checked within the repository, or `None` for the
         /// repository root.
         path: Option<String>,
+        /// Every other MANIFEST.md this download actually holds, rendered as
+        /// the subpath value a retry passes: repository-relative, shallowest
+        /// first then lexical, capped at a handful. Empty when none were
+        /// found, which keeps the message identical to a repository that
+        /// truly has no domain in it anywhere.
+        candidates: Vec<String>,
+        /// How many further candidates the cap left out, `0` when the list
+        /// above is everything that was found.
+        more_candidates: usize,
     },
 
     /// GitHub could not be reached at all: DNS failure, connection refused or
@@ -194,6 +232,44 @@ fn manifest_location(path: &Option<String>) -> String {
     }
 }
 
+/// Renders the `NotADomain` suggestion clause: empty when nothing else was
+/// found, so the message reads exactly as it always did for a repository with
+/// no domain in it anywhere. Otherwise names every MANIFEST.md the download
+/// actually held and the subpath value a retry passes for each, so the
+/// caller copies a fact instead of guessing one.
+fn manifest_candidates_clause(candidates: &[String], more: usize) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let manifests: Vec<String> = candidates
+        .iter()
+        .map(|c| format!("{c}/MANIFEST.md"))
+        .collect();
+    let found = if more > 0 {
+        format!("{}, and {more} more", manifests.join(", "))
+    } else {
+        join_with(&manifests, "and")
+    };
+    let pass = join_with(candidates, "or");
+    // The value has to be named as what it is passed as. "pass memory" reads
+    // like an instruction to pass something called memory somewhere; the
+    // subpath is the `path` parameter, and saying so is the difference between
+    // a fact to copy and a guess to make.
+    format!(". Found MANIFEST.md at {found}; pass {pass} as the path.")
+}
+
+/// Joins a list in natural language with `conj` ("and" or "or") before the
+/// last item: one item alone, `"a {conj} b"` for two, `"a, b, {conj} c"` for
+/// three or more.
+fn join_with(items: &[String], conj: &str) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} {conj} {second}"),
+        [init @ .., last] => format!("{}, {conj} {last}", init.join(", ")),
+    }
+}
+
 /// Renders a proposal-number list for the `NoWithdrawTarget` message:
 /// `"none"` for an empty list, `"#3, #7"` otherwise.
 fn join_numbers(numbers: &[u64]) -> String {
@@ -293,6 +369,35 @@ mod tests {
         }
     }
 
+    /// The single sign-on refusal is the one 403 the person can clear alone,
+    /// so its message has to carry the org, the exact url and the two things
+    /// that are NOT the fix: no collaborator change, no reconnect.
+    #[test]
+    fn sso_authorization_required_names_the_org_the_url_and_what_is_not_needed() {
+        let err = RemoteError::SsoAuthorizationRequired {
+            org: "acme".to_string(),
+            url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "GitHub requires single sign-on for the acme organization before this token can reach it. Authorize the Crystalline app for acme: open https://github.com/orgs/acme/sso?authorization_request=abc, sign in through your identity provider, then retry. No collaborator change and no reconnect is needed."
+        );
+    }
+
+    /// The OAuth App restriction is the one 403 somebody ELSE has to clear,
+    /// so the message names the owner's page and the person's own request
+    /// path rather than any retry-and-hope instruction.
+    #[test]
+    fn oauth_app_restricted_names_both_the_owner_page_and_the_request_path() {
+        let err = RemoteError::OauthAppRestricted {
+            org: "acme".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "The acme organization restricts third-party OAuth apps and has not approved Crystalline yet. Ask an organization owner to approve it under the organization's Settings > Third-party access > OAuth app policy, or request it yourself under GitHub > Settings > Applications > Authorized OAuth Apps > Crystalline (Request next to acme); then retry."
+        );
+    }
+
     #[test]
     fn repo_not_found_names_the_repo_and_hints_at_access() {
         let err = RemoteError::RepoNotFound {
@@ -308,6 +413,8 @@ mod tests {
         let err = RemoteError::NotADomain {
             repo: "acme/brand-knowledge".to_string(),
             path: Some("knowledge".to_string()),
+            candidates: vec![],
+            more_candidates: 0,
         };
         let msg = err.to_string();
         assert!(msg.contains("acme/brand-knowledge"), "{msg}");
@@ -320,8 +427,104 @@ mod tests {
         let err = RemoteError::NotADomain {
             repo: "acme/brand-knowledge".to_string(),
             path: None,
+            candidates: vec![],
+            more_candidates: 0,
         };
         assert!(err.to_string().contains("at the repository root"));
+    }
+
+    /// A repository whose only manifest sits one folder down: the refusal
+    /// names it, and the value it names is exactly what a retry passes as
+    /// the subpath - copied, not translated.
+    #[test]
+    fn not_a_domain_names_a_manifest_found_one_folder_down() {
+        let err = RemoteError::NotADomain {
+            repo: "planview-dev/scotty-knowledge".to_string(),
+            path: None,
+            candidates: vec!["memory".to_string()],
+            more_candidates: 0,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no MANIFEST.md was found at the repository root"),
+            "{msg}"
+        );
+        assert!(msg.contains("memory/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("pass memory"), "{msg}");
+    }
+
+    /// Two depths: both are listed, shallowest first, so the caller sees the
+    /// more likely one named first without having to compare depths itself.
+    #[test]
+    fn not_a_domain_lists_manifests_at_two_depths_shallowest_first() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec!["memory".to_string(), "archive/notes".to_string()],
+            more_candidates: 0,
+        };
+        let msg = err.to_string();
+        let memory_at = msg.find("memory/MANIFEST.md").expect(&msg);
+        let archive_at = msg.find("archive/notes/MANIFEST.md").expect(&msg);
+        assert!(memory_at < archive_at, "{msg}");
+        assert!(msg.contains("pass memory or archive/notes"), "{msg}");
+    }
+
+    /// No MANIFEST.md anywhere in what was downloaded: the message is
+    /// unchanged from before this feature existed, which is now true and
+    /// complete rather than a guess about what else might be there.
+    #[test]
+    fn not_a_domain_keeps_todays_wording_when_nothing_else_was_found() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec![],
+            more_candidates: 0,
+        };
+        assert_eq!(
+            err.to_string(),
+            "acme/brand-knowledge does not look like a knowledge domain: no MANIFEST.md was found at the repository root"
+        );
+    }
+
+    /// Asked for at a subpath that itself has no manifest, while one exists
+    /// nested under that same subpath: the candidate names the OTHER path,
+    /// composed with the requested subpath folded back in, since that is
+    /// what a retry must pass from the repository root.
+    #[test]
+    fn not_a_domain_names_a_manifest_found_elsewhere_under_the_requested_subpath() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: Some("wrong".to_string()),
+            candidates: vec!["wrong/memory".to_string()],
+            more_candidates: 0,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("no MANIFEST.md was found at wrong"), "{msg}");
+        assert!(msg.contains("wrong/memory/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("pass wrong/memory"), "{msg}");
+    }
+
+    /// The cap: more candidates exist than the message lists, and it says
+    /// so rather than pretending the list is exhaustive.
+    #[test]
+    fn not_a_domain_says_how_many_more_candidates_the_cap_left_out() {
+        let err = RemoteError::NotADomain {
+            repo: "acme/brand-knowledge".to_string(),
+            path: None,
+            candidates: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+            ],
+            more_candidates: 3,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("a/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("e/MANIFEST.md"), "{msg}");
+        assert!(msg.contains("3 more"), "{msg}");
     }
 
     #[test]
@@ -465,6 +668,15 @@ mod tests {
             RemoteError::AuthExpired.to_string(),
             RemoteError::Offline.to_string(),
             RemoteError::RateLimited { reset: None }.to_string(),
+            RemoteError::SsoAuthorizationRequired {
+                org: "acme".to_string(),
+                url: "https://github.com/orgs/acme/sso".to_string(),
+            }
+            .to_string(),
+            RemoteError::OauthAppRestricted {
+                org: "acme".to_string(),
+            }
+            .to_string(),
             RemoteError::RepoNotFound {
                 repo: "acme/brand-knowledge".to_string(),
             }
@@ -472,6 +684,8 @@ mod tests {
             RemoteError::NotADomain {
                 repo: "acme/brand-knowledge".to_string(),
                 path: Some("knowledge".to_string()),
+                candidates: vec!["knowledge/memory".to_string(), "archive/notes".to_string()],
+                more_candidates: 2,
             }
             .to_string(),
             RemoteError::ConflictsPending { count: 1 }.to_string(),

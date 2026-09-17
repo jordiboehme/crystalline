@@ -17,10 +17,12 @@
 //! are pure functions of their inputs (the config file and the MANIFESTs on
 //! disk). No timestamps, process IDs, environment variables or other
 //! environment-dependent values ever enter the output, and no unordered
-//! iteration (a hash map, a hash set) drives ordering. Domain order comes
-//! from the config's own registered order: `generate_prompt` filters it
-//! through a sorted inclusion set and reorders preferred-first, while
-//! `generate_prompt_unscoped` emits that registered order verbatim.
+//! iteration (a hash map, a hash set) drives ordering. `generate_prompt`
+//! filters the config's registered order through a sorted inclusion set and
+//! reorders preferred-first, while `generate_prompt_unscoped` sorts by name,
+//! case-insensitively - the same comparison the domain listing applies, so the
+//! onboarding block served at session start and the same index re-fetched
+//! mid-session present the domains in one order.
 //! `render_json` relies on `serde_json`'s stable field order. Identical
 //! config plus identical on-disk MANIFESTs must render byte-identical output
 //! every time, whether rendered twice in one process or by two separate
@@ -148,6 +150,26 @@ pub fn generate_prompt(
     }
 }
 
+/// Keep only the named domains in a built prompt, in the order they are already
+/// in.
+///
+/// Separate from [`generate_prompt`] rather than a parameter of it because the
+/// order is the thing being preserved: the preference reorder and the registry
+/// order have already been applied, and a filter that rebuilt the list could
+/// only get that order wrong. An empty `names` changes nothing, so a caller
+/// with no flag passes its empty vector straight through.
+///
+/// Validation belongs to the caller: this crate knows nothing about how to
+/// tell somebody which domains their machine has registered.
+pub fn restrict_to_domains(output: &mut PromptOutput, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    output
+        .domains
+        .retain(|d| names.iter().any(|n| n == &d.name));
+}
+
 /// Build the routing prompt with no workspace context: every registered
 /// domain in config order, unfiltered. This is the shape the MCP
 /// `instructions` channel wants, where a server serves one index to every
@@ -167,7 +189,15 @@ pub fn generate_prompt_unscoped(
 ) -> PromptOutput {
     let mut domains = Vec::with_capacity(global.domains.len());
     let mut warnings = Vec::new();
-    for (name, entry) in &global.domains {
+    // Sorted by name, case-insensitively, the same comparison the domain
+    // listing applies. The config map preserves registration order, which is
+    // meaningless to a reader; more to the point, the onboarding block served
+    // at session start and the same index re-fetched mid-session through
+    // `list_domains` are two views of one thing and must not disagree about
+    // the order they present it in.
+    let mut registered: Vec<_> = global.domains.iter().collect();
+    registered.sort_by_cached_key(|(name, _)| (name.to_lowercase(), (*name).clone()));
+    for (name, entry) in registered {
         let (bullets, warning) = if entry.is_virtual() {
             virtual_routing_bullets(name, virtual_bullets.get(name))
         } else {
@@ -390,8 +420,18 @@ fn render_behavior_block(output: &PromptOutput, out: &mut String) {
 
 /// The behavior rules an agent follows when working with this server's tools,
 /// one string per rule, without the leading `- ` and without a trailing
-/// newline. The read-only set drops the four content-mutating tools and the
-/// capture language; the read-write set names them.
+/// newline. The read-only set drops the four content-mutating tools this block
+/// names and the capture language; the read-write set names them. Four rather
+/// than every write verb on the surface: `split_engram` is taught by the skills
+/// rather than here, so the routing block stays inside its truncation budget.
+///
+/// The first two rules say *when* to search and everything under them says
+/// *how*, which is why they open the block in both variants: a block that only
+/// routed a search left the agent to decide on its own whether a question was
+/// worth one, and the answer in practice was too rarely. They are the two
+/// lines that must survive a truncating client, so they come first and are
+/// never trimmed; the rules below them absorbed the budget instead, which is
+/// why the narrow and broad routing rule is one line rather than two.
 ///
 /// This is the single source of the rule set: [`render_routing_body`] renders
 /// it as the Behavior block of both onboarding renderers, and the MCP
@@ -400,8 +440,12 @@ fn render_behavior_block(output: &PromptOutput, out: &mut String) {
 /// same rules and the set can never drift between them.
 pub fn behavior_bullets(read_only: bool) -> Vec<String> {
     let mut bullets = vec![
-        "Narrow question, one domain fits: search_engrams with domains=[that domain].".to_string(),
-        "Broad or unclear question: search_engrams with no domains sweeps them all.".to_string(),
+        "Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess."
+            .to_string(),
+        "Search before you start: a task begins with search_engrams on its subject, so what an earlier session learned shapes the work instead of being rediscovered after the fact."
+            .to_string(),
+        "Narrow question: search_engrams with domains=[that domain]; broad or unclear: no domains sweeps them all."
+            .to_string(),
     ];
     if read_only {
         // Read-only variant: no write-tools line and no capture language; the
@@ -416,14 +460,14 @@ pub fn behavior_bullets(read_only: bool) -> Vec<String> {
                 .to_string(),
         );
         bullets.push(
-            "Pass write_engram a folder matching the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons."
+            "Pass write_engram a folder from the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons."
                 .to_string(),
         );
         bullets.push(
             "Check vocabulary for tags and categories in use before inventing one.".to_string(),
         );
         bullets.push(
-            "Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge and raise it when one proves key to a task."
+            "Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge, raise it when one proves key."
                 .to_string(),
         );
     }
@@ -431,7 +475,7 @@ pub fn behavior_bullets(read_only: bool) -> Vec<String> {
         "build_context on a crystalline:// anchor gathers knowledge around a task.".to_string(),
     );
     bullets.push(
-        "Read a MANIFEST with read_engram only when the domain's routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session."
+        "Read a MANIFEST with read_engram only when the routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session."
             .to_string(),
     );
     bullets
@@ -480,20 +524,7 @@ pub const INSTRUCTIONS_BUDGET: usize = 1900;
 /// function of the rendered sizes, so the determinism contract holds and the
 /// cost is at most three renders of the same small strings.
 pub fn render_instructions(output: &PromptOutput) -> String {
-    let mut head = String::new();
-    head.push_str(ROUTING_HEADER);
-    if output.read_only {
-        head.push_str(
-            "Crystalline is your crystallized intelligence across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
-        );
-    } else {
-        head.push_str(
-            "Crystalline is your crystallized intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
-        );
-    }
-    render_behavior_block(output, &mut head);
-    head.push('\n');
-    head.push_str("Domains:\n");
+    let head = instructions_head(output);
 
     // Tier 1: every routing line, up to three bullets each.
     let mut full = head.clone();
@@ -511,12 +542,65 @@ pub fn render_instructions(output: &PromptOutput) -> String {
 
     // Tier 3: a single count line; the index itself is one tool call away.
     let mut counted = head;
+    push_count_line(output, &mut counted);
+    counted
+}
+
+/// The fixed half of [`render_instructions`]: header, intro, the Behavior
+/// block and the `Domains:` label the variable half hangs under. Shared so the
+/// two renderers below cannot grow an intro or a rule the other lacks.
+fn instructions_head(output: &PromptOutput) -> String {
+    let mut head = String::new();
+    head.push_str(ROUTING_HEADER);
+    if output.read_only {
+        head.push_str(
+            "Crystalline is your crystallized intelligence across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+        );
+    } else {
+        head.push_str(
+            "Crystalline is your crystallized intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+        );
+    }
+    render_behavior_block(output, &mut head);
+    head.push('\n');
+    head.push_str("Domains:\n");
+    head
+}
+
+/// The single line that stands in for the domain list: how many are
+/// registered, and the one call that returns them. One writer, so
+/// [`render_instructions`]'s last tier and [`render_counted_instructions`]
+/// cannot word it differently.
+fn push_count_line(output: &PromptOutput, out: &mut String) {
     let n = output.domains.len();
     let noun = if n == 1 { "domain" } else { "domains" };
     let _ = writeln!(
-        counted,
+        out,
         "{n} {noun} registered; list_domains with include_routing=true returns the full index and its behavior rules."
     );
+}
+
+/// [`render_instructions`] with the domain lines always replaced by the count
+/// line: the whole of the behavior rules, none of the names.
+///
+/// **For the one onboarding channel that cannot know who is asking.** The
+/// legacy `initialize` handshake is answered from `get_info`, which rmcp calls
+/// with no request context at all, so an HTTP server has no caller to scope the
+/// block to and cannot leave a private domain's name out of it. Naming every
+/// registered domain to every anonymous peer that opens a session is exactly
+/// what a private domain is not, so that channel renders this instead and
+/// points at `list_domains`, which does resolve a caller and does filter.
+///
+/// Stdio is unaffected and keeps the full block: a local session is the machine
+/// owner, which already has the files on disk.
+///
+/// The count itself is deliberately the count of *registered* domains rather
+/// than of visible ones - there is nobody here to make it visible to - so this
+/// channel still says how many exist. That is the residue of the split, and it
+/// is one integer against the full index this used to hand out.
+pub fn render_counted_instructions(output: &PromptOutput) -> String {
+    let mut counted = instructions_head(output);
+    push_count_line(output, &mut counted);
     counted
 }
 
@@ -716,7 +800,8 @@ mod tests {
             text.contains("read-only and curated externally"),
             "read-only line expected:\n{text}"
         );
-        // None of the four content-mutating tool names appear anywhere.
+        // None of the four content-mutating tool names this block writes
+        // appear anywhere.
         for tool in [
             "write_engram",
             "edit_engram",
@@ -780,12 +865,68 @@ mod tests {
     fn unscoped_ignores_prompt_rules_and_marks_nothing_preferred() {
         let (_tmp, global) = fixture_with_prompt_rules();
         let output = generate_prompt_unscoped(&global, &BTreeMap::new());
-        // Every registered domain is present in config order, `beta` included
-        // despite the include-only rule that would drop it in the scoped path.
+        // Every registered domain is present, `beta` included despite the
+        // include-only rule that would drop it in the scoped path.
         let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "beta"]);
         // No workspace means no preferred reorder: nothing is ever preferred.
         assert!(output.domains.iter().all(|d| !d.preferred));
+    }
+
+    /// `restrict_to_domains` cannot resurrect a domain `prompt.rules` already
+    /// dropped for this workspace: naming the excluded domain alongside an
+    /// included one still renders only the included one. The scoped
+    /// `generate_prompt` (not the unscoped generator) is what makes this
+    /// true - it never hands the excluded domain to the filter in the first
+    /// place, and a filter that only ever removes can't add it back.
+    #[test]
+    fn restrict_to_domains_cannot_undo_a_workspace_exclusion() {
+        let (tmp, global) = fixture_with_prompt_rules();
+        let mut output = generate_prompt(&global, tmp.path(), &BTreeMap::new());
+        // The workspace scoping already dropped `beta` for this workspace,
+        // same as `unscoped_ignores_prompt_rules_and_marks_nothing_preferred`
+        // proves the unscoped path does not.
+        assert!(
+            output.domains.iter().all(|d| d.name != "beta"),
+            "prompt.rules should have already excluded beta: {output:?}"
+        );
+
+        restrict_to_domains(&mut output, &["alpha".to_string(), "beta".to_string()]);
+        let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha"],
+            "naming an excluded domain must not add it back: {names:?}"
+        );
+    }
+
+    /// The onboarding block is in the same order the domain listing is.
+    ///
+    /// Registration order is what the config map preserves and it means
+    /// nothing to a reader; worse, the block served at session start and the
+    /// index an agent re-fetches mid-session through `list_domains` are two
+    /// views of one thing, and two orders would read as two answers.
+    #[test]
+    fn unscoped_sorts_the_domains_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut domains = indexmap::IndexMap::new();
+        // Registered in the order somebody happened to add them. `Falcon` and
+        // `falconry` are the pair that pins the comparison as case-insensitive
+        // rather than byte-wise.
+        for name in ["zebra", "mercury", "Falcon", "falconry"] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("MANIFEST.md"), manifest_source(&["when routing"])).unwrap();
+            domains.insert(name.to_string(), DomainEntry::file(root));
+        }
+        let global = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+
+        let output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["Falcon", "falconry", "mercury", "zebra"]);
     }
 
     #[test]
@@ -892,6 +1033,52 @@ mod tests {
         );
     }
 
+    /// The two search-first rules open the Behavior block, in both variants,
+    /// in every rendering of it: the session-hook block [`render_text`]
+    /// writes, the MCP `instructions` [`render_instructions`] writes and the
+    /// [`behavior_bullets`] list the `list_domains` tool returns verbatim.
+    /// They say *when* to search, which the rest of the block never did, so
+    /// they come before the routing rules that say how.
+    #[test]
+    fn the_search_first_rules_open_the_behavior_block_in_every_rendering() {
+        const ANSWER: &str = "Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess.";
+        const START: &str = "Search before you start: a task begins with search_engrams on its subject, so what an earlier session learned shapes the work instead of being rediscovered after the fact.";
+
+        let (_tmp, global) = fixture();
+        for read_only in [false, true] {
+            // The list `list_domains` hands a remote client.
+            let bullets = behavior_bullets(read_only);
+            assert_eq!(bullets[0], ANSWER, "read_only={read_only}: first rule");
+            assert_eq!(bullets[1], START, "read_only={read_only}: second rule");
+
+            // Both onboarding renderers open their Behavior block with the
+            // same two lines, in the same order.
+            let opening = format!("Behavior:\n- {ANSWER}\n- {START}\n");
+            let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+            output.read_only = read_only;
+            for (channel, text) in [
+                ("render_text", render_text(&output)),
+                ("render_instructions", render_instructions(&output)),
+            ] {
+                let block = text.find("Behavior:\n").expect("a behavior block");
+                assert!(
+                    text[block..].starts_with(&opening),
+                    "read_only={read_only} {channel}: the two search-first rules open the block:\n{text}"
+                );
+            }
+        }
+
+        // Read-only keeps its curated-externally sentence, after the two.
+        let read_only = behavior_bullets(true);
+        assert!(
+            read_only
+                .iter()
+                .skip(2)
+                .any(|b| b.contains("read-only and curated externally")),
+            "the curated sentence follows the two rules: {read_only:?}"
+        );
+    }
+
     /// Scaffold `count` file domains, each with `bullets_per_domain` routing
     /// bullets, the way the CLI latency test scaffolds a large registry.
     fn many_domains(count: usize, bullets_per_domain: usize) -> (tempfile::TempDir, GlobalConfig) {
@@ -959,11 +1146,14 @@ mod tests {
         );
 
         // Tier 2: enough domains to blow the budget at three bullets each, but
-        // not at one - one routing line per domain survives, trimmed.
-        let (_t2, mid) = many_domains(12, 5);
+        // not at one - one routing line per domain survives, trimmed. The
+        // count tracks the size of the fixed head: every byte the Behavior
+        // block gains is a byte the domain lines lose, so a head that grows
+        // pulls this number down and a head that shrinks lets it rise.
+        let (_t2, mid) = many_domains(5, 5);
         let tier2 = render_instructions(&generate_prompt_unscoped(&mid, &BTreeMap::new()));
         assert!(
-            tier2.contains("- domain11: When a task touches domain11 aspect 0\n"),
+            tier2.contains("- domain04: When a task touches domain04 aspect 0\n"),
             "one bullet per domain:\n{tier2}"
         );
         assert!(

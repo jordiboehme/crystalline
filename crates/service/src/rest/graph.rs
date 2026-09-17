@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use utoipa::IntoParams;
 
+use super::auth::Identity;
 use super::{ApiError, ApiQuery, ProblemDetail, RestState};
 
 /// The query string `GET /graph` takes. `anchor` has no default: a traversal
@@ -135,6 +136,7 @@ const DEFAULT_MAX_NODES: usize = 100;
 )]
 pub async fn graph(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<GraphQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
@@ -143,6 +145,7 @@ pub async fn graph(
             &query.anchor,
             query.depth.unwrap_or(DEFAULT_DEPTH),
             query.max_nodes.unwrap_or(DEFAULT_MAX_NODES),
+            &identity.scope(),
         )
         .await?;
     Ok(Json(value))

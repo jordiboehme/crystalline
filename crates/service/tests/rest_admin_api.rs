@@ -85,8 +85,12 @@ async fn serve(opts: Options) -> Fixture {
         domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             trusted_header: None,
+            proxy_headers: None,
             anonymous: Some(false),
+            mcp: None,
+            oauth: None,
             max_users: None,
+            oidc: None,
         }),
         github: opts.github.then(|| GitHubConfig {
             enabled: Some(true),
@@ -638,7 +642,7 @@ async fn the_share_routes_walk_the_loop() {
     assert_eq!(changes.status(), 200, "{}", changes.text().await.unwrap());
     let changes: serde_json::Value = changes.json().await.unwrap();
     assert_eq!(changes["action"], "create");
-    assert_eq!(changes["changes"][1]["path"], "shared.md", "{changes}");
+    assert_eq!(changes["changes"][0]["path"], "shared.md", "{changes}");
     assert!(changes["effective_title"].as_str().is_some());
 
     // Share it.
@@ -870,15 +874,10 @@ async fn a_share_carries_only_the_chosen_files_and_the_plan_names_their_authors(
     assert_eq!(shared.status(), 200, "{}", shared.text().await.unwrap());
     let shared: serde_json::Value = shared.json().await.unwrap();
     assert_eq!(shared["outcome"], "proposed", "{shared}");
-    // The chosen file and the generated listing of the folder it lives in -
-    // here the domain root - and nothing else: the listing is derived from
-    // the engrams beside it, so it travels with them rather than being left
-    // to disagree with the folder it describes.
-    assert_eq!(
-        shared["added"],
-        serde_json::json!(["index.md", "mine.md"]),
-        "{shared}"
-    );
+    // Exactly the chosen file. The generated listing of its folder would ride
+    // along with it in a domain that declares `generated_indexes: shared`;
+    // this one declares nothing, so the listing stays on this machine.
+    assert_eq!(shared["added"], serde_json::json!(["mine.md"]), "{shared}");
     assert_eq!(
         shared["updated"],
         serde_json::json!([]),
@@ -1707,10 +1706,29 @@ async fn unregister_answers_with_files_kept_and_the_domain_vanishes() {
         .await
         .unwrap();
     assert_eq!(made.status(), 201);
-    let gone = as_session(
+    // And because those rows are the knowledge, the route refuses to delete
+    // them on a request that did not say so. A freshly registered virtual
+    // domain already holds its scaffolded MANIFEST, which is why even this one
+    // is refused: "holds engrams" is the test, and a virtual domain always
+    // does.
+    let unconfirmed = as_session(
         fx.addr,
         reqwest::Method::DELETE,
         "/api/v1/domains/ephemeral",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(unconfirmed.status(), 409);
+    assert!(
+        unconfirmed.text().await.unwrap().contains("purge"),
+        "the refusal names the flag that would let it through"
+    );
+    let gone = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/ephemeral?purge=true",
         &admin,
     )
     .send()

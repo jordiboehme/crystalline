@@ -137,6 +137,28 @@ export interface EvolveFinding {
   ackStale: boolean;
   /** The note the matching or stale acknowledgment carries, when it has one. */
   ackNote: string | null;
+  /**
+   * The evidence this row fired on, which the sweep sends for `V301` alone.
+   *
+   * It is the one rule that fires more than once on an engram - an engram can
+   * be the semantic twin of several others - so the engram and the rule do not
+   * name the finding and this is what tells two rows apart. Send it back to
+   * acknowledge the pair that was read rather than whichever one the server
+   * would have picked. Null for every other rule, which answers for its engram
+   * and has nothing to choose between.
+   */
+  scope: string | null;
+  /**
+   * The evidence the matching or stale acknowledgment was **given for**, which
+   * is a different thing from {@link scope}: on a stale row the two disagree,
+   * and that disagreement is why the acknowledgment stopped matching.
+   *
+   * It is the entry the engram holds, so it is what a withdrawal names: taking
+   * one twin pair back leaves the engram's other pairs silenced. Null when no
+   * acknowledgment spoke to this row, or when the one that did was given for
+   * nothing in particular.
+   */
+  ackScope: string | null;
 }
 
 /** What acknowledgments kept out of the queue. */
@@ -198,6 +220,22 @@ export interface EvolveQueue {
 }
 
 /**
+ * Which family each rule series files under, as the sweep's own catalog files
+ * it.
+ *
+ * A table rather than the series number used as an index, because the two
+ * stopped agreeing: `V3xx` finds redundancy by meaning where `V2xx` finds it
+ * by wording, and the catalog puts both under the one heading. Two engrams
+ * that say the same thing are one kind of work whichever pass noticed it.
+ */
+const EVOLVE_FAMILY_OF_SERIES: Record<string, EvolveFamily> = {
+  "0": "temporal",
+  "1": "structure",
+  "2": "redundancy",
+  "3": "redundancy",
+};
+
+/**
  * The family a rule belongs to, read off its id.
  *
  * Null for anything this client does not recognize, which includes a rule from
@@ -205,9 +243,10 @@ export interface EvolveQueue {
  * as a claim about what kind of work it is.
  */
 export function evolveFamily(rule: string): EvolveFamily | null {
-  const match = /^V(\d)\d\d$/.exec(rule);
-  const index = Number(match?.[1] ?? NaN);
-  return EVOLVE_FAMILIES[index] ?? null;
+  const series = /^V(\d)\d\d$/.exec(rule)?.[1];
+  return (
+    (series === undefined ? undefined : EVOLVE_FAMILY_OF_SERIES[series]) ?? null
+  );
 }
 
 /** Read one class, falling back to the one that asks before acting. */
@@ -257,6 +296,8 @@ function readFinding(value: unknown): EvolveFinding | null {
     acknowledged: record?.acknowledged === true,
     ackStale: record?.ack_stale === true,
     ackNote: asString(record?.ack_note),
+    scope: asString(record?.scope),
+    ackScope: asString(record?.ack_scope),
   };
 }
 
@@ -331,15 +372,20 @@ export const EVOLVE_KEY_ROOT = ["evolve"] as const;
 /**
  * The cache key of one sweep, which is every parameter it carries.
  *
- * Whether the silenced findings were asked for is one of them: it is a
- * different question with a different answer, and reading one back for the
- * other would draw a queue that does not match the toggle above it.
+ * Every one of them, because each narrows the sweep on the server and so
+ * changes the answer rather than the view of it. Whether the silenced findings
+ * were asked for is the plainest case - it is a different question, and reading
+ * one back for the other would draw a queue that does not match the toggle
+ * above it - but the domains and the families are no different: a page ranks
+ * and caps the whole result, so a scoped sweep can hold findings an unscoped
+ * one had no room for.
  */
 export function evolveKey(
   domains: string[] = [],
   includeAcknowledged = false,
+  families: string[] = [],
 ): readonly unknown[] {
-  return [...EVOLVE_KEY_ROOT, domains, includeAcknowledged];
+  return [...EVOLVE_KEY_ROOT, domains, includeAcknowledged, families];
 }
 
 /**
@@ -353,6 +399,13 @@ export function evolveKey(
 export async function fetchEvolveQueue(
   opts: {
     domains?: string[];
+    /**
+     * Restrict the sweep to these detector families. Empty is all three, and
+     * it is a server-side narrowing rather than a filter over what came back:
+     * the page is ranked and capped across the whole result, so a family that
+     * ranks low can be missing from an unfiltered page entirely.
+     */
+    families?: string[];
     limit?: number;
     /** Ask for the silenced findings too, each marked acknowledged. */
     includeAcknowledged?: boolean;
@@ -362,6 +415,10 @@ export async function fetchEvolveQueue(
   const domains = opts.domains ?? [];
   if (domains.length > 0) {
     query.set("domains", domains.join(","));
+  }
+  const families = opts.families ?? [];
+  if (families.length > 0) {
+    query.set("families", families.join(","));
   }
   query.set("limit", String(opts.limit ?? EVOLVE_LIMIT));
   // Sent only when it is asked for, so an ordinary sweep goes out as the
@@ -384,39 +441,64 @@ function ackPath(domain: string): string {
  * stored in the engram's frontmatter, where a blank string is a line of noise
  * that reads as a reason somebody gave and did not.
  */
-function ackBody(permalink: string, rule: string, note?: string): AckBody {
+function ackBody(
+  permalink: string,
+  rule: string,
+  note?: string,
+  scope?: string | null,
+): AckBody {
   const said = note?.trim() ?? "";
-  return said === "" ? { permalink, rule } : { permalink, rule, note: said };
+  const named = scope?.trim() ?? "";
+  return {
+    permalink,
+    rule,
+    ...(said === "" ? {} : { note: said }),
+    ...(named === "" ? {} : { scope: named }),
+  };
 }
 
 /**
  * Rule one finding intentional, so future sweeps stop raising it.
  *
- * The scope it holds for is never sent: the server runs detection for the
- * engram and takes the firing finding's own evidence, so neither a person nor
- * an agent ever handles a fingerprint. Acknowledging the same rule again
- * replaces the entry, which is what makes this the re-acknowledge call too.
+ * Nobody composes a fingerprint: the evidence is the server's, taken from
+ * detection it runs for the engram. Pass the row's own {@link
+ * EvolveFinding.scope} and detection checks that pair instead of choosing one,
+ * which is how the finding a person clicked is the finding that gets silenced
+ * on an engram raising two of them; a scope no sweep sees is refused. Omit it
+ * and the server picks, which is right for every rule that fires once.
+ *
+ * The same call re-acknowledges: an entry given for the same evidence is
+ * replaced, so a corrected note lands on the acknowledgment it belongs to.
  */
 export async function acknowledgeFinding(
   domain: string,
   permalink: string,
   rule: string,
   note?: string,
+  scope?: string | null,
 ): Promise<void> {
   await api(ackPath(domain), {
     method: "POST",
-    body: JSON.stringify(ackBody(permalink, rule, note)),
+    body: JSON.stringify(ackBody(permalink, rule, note, scope)),
   });
 }
 
-/** Take an acknowledgment back, leaving the engram's others alone. */
+/**
+ * Take an acknowledgment back, leaving the engram's other rules alone.
+ *
+ * A rule has one acknowledgment, so this takes back one - except `V301`, which
+ * has one per twin pair. Pass the row's own {@link EvolveFinding.ackScope},
+ * the entry the engram actually holds, and the engram's other pairs stay
+ * silenced; omit it and every pair goes at once.
+ */
 export async function unacknowledgeFinding(
   domain: string,
   permalink: string,
   rule: string,
+  scope?: string | null,
 ): Promise<void> {
   await api(ackPath(domain), {
     method: "DELETE",
-    body: JSON.stringify(ackBody(permalink, rule)),
+    body: JSON.stringify(ackBody(permalink, rule, undefined, scope)),
   });
 }

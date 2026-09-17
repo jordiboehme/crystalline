@@ -629,10 +629,13 @@ fn bump_install_receipt_current(home: &Path) {
     .unwrap();
 }
 
-/// Run `crystalline prompt system` in the isolated env and return its stdout,
-/// asserting a clean exit - the session provisioning path must never break the
-/// routing prompt.
-fn prompt_stdout(home: &Path, bin_dir: &Path) -> String {
+/// Run `crystalline prompt system` in the isolated env and return its stdout
+/// and stderr separately, asserting a clean exit - the session provisioning
+/// path must never break the routing prompt. Session provisioning notices
+/// (pending decisions, reconcile summaries, deferred-mcp lines) land on
+/// stderr only; stdout carries the routing payload alone, byte for byte
+/// what an agent's context receives.
+fn prompt_output(home: &Path, bin_dir: &Path) -> (String, String) {
     let out = provision_cmd(home, bin_dir)
         .args(["prompt", "system"])
         .output()
@@ -642,7 +645,15 @@ fn prompt_stdout(home: &Path, bin_dir: &Path) -> String {
         "prompt system must succeed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Convenience wrapper for call sites that only need the routing payload.
+fn prompt_stdout(home: &Path, bin_dir: &Path) -> String {
+    prompt_output(home, bin_dir).0
 }
 
 /// The parsed `provisions.json` receipt at the isolated home.
@@ -659,19 +670,24 @@ fn prompt_appends_pending_decision_block() {
     register_harbor(&home, &bin_dir, &harbor_dir);
     bump_install_receipt_current(&home);
 
-    // Undecided: the routing body plus a pending-decision block naming harbor
-    // with its per-type counts and how to decide.
-    let undecided = prompt_stdout(&home, &bin_dir);
+    // Undecided: a pending-decision notice naming harbor with its per-type
+    // counts and how to decide, on stderr - never mixed into the routing
+    // payload on stdout.
+    let (undecided_out, undecided_notices) = prompt_output(&home, &bin_dir);
     assert!(
-        undecided.contains("provision allow harbor"),
-        "the pending block hints at the decision: {undecided}"
+        undecided_notices.contains("provision allow harbor"),
+        "the pending block hints at the decision: {undecided_notices}"
     );
     assert!(
-        undecided.contains("skills: 1")
-            && undecided.contains("commands: 1")
-            && undecided.contains("agents: 1")
-            && undecided.contains("mcps: 1"),
-        "the counts are correct: {undecided}"
+        undecided_notices.contains("skills: 1")
+            && undecided_notices.contains("commands: 1")
+            && undecided_notices.contains("agents: 1")
+            && undecided_notices.contains("mcps: 1"),
+        "the counts are correct: {undecided_notices}"
+    );
+    assert!(
+        !undecided_out.contains("provision allow harbor"),
+        "the pending block never rides on stdout, which an agent reads verbatim: {undecided_out}"
     );
 
     // Once decided, nothing is pending and the block is gone.
@@ -679,22 +695,17 @@ fn prompt_appends_pending_decision_block() {
         .args(["provision", "deny", "harbor"])
         .assert()
         .success();
-    let denied = prompt_stdout(&home, &bin_dir);
+    let (denied_out, denied_notices) = prompt_output(&home, &bin_dir);
     assert!(
-        !denied.contains("provision allow harbor"),
-        "no block once the domain is decided: {denied}"
+        !denied_notices.contains("provision allow harbor"),
+        "no block once the domain is decided: {denied_notices}"
     );
 
-    // The routing body is byte-identical; the undecided run only appended the
-    // pending block after it.
-    assert!(
-        undecided.starts_with(&denied),
-        "the routing body must be byte-identical, the block only appended\n--- undecided ---\n{undecided}\n--- denied ---\n{denied}"
-    );
-    let appended = &undecided[denied.len()..];
-    assert!(
-        appended.contains("provision allow harbor"),
-        "the appended tail is exactly the pending block: {appended:?}"
+    // The routing payload on stdout is byte-identical regardless of pending
+    // decisions - only stderr differs between the two runs.
+    assert_eq!(
+        undecided_out, denied_out,
+        "the routing payload on stdout must be byte-identical\n--- undecided ---\n{undecided_out}\n--- denied ---\n{denied_out}"
     );
 }
 
@@ -712,7 +723,7 @@ fn prompt_reconciles_after_source_change() {
         "# Quartermaster\n\nA thoroughly rewritten and noticeably longer stores manifest.\n";
     write(&harbor_dir, "agents/quartermaster.md", new_agent);
 
-    let out = prompt_stdout(&home, &bin_dir);
+    let (out, notices) = prompt_output(&home, &bin_dir);
 
     let target = home.join(".claude/agents/quartermaster.md");
     assert_eq!(
@@ -721,12 +732,16 @@ fn prompt_reconciles_after_source_change() {
         "the target is reconciled to the new source"
     );
     assert!(
-        out.contains("Refreshed") && out.contains("provisioned artifact"),
-        "a change notice is present: {out}"
+        notices.contains("Refreshed") && notices.contains("provisioned artifact"),
+        "a change notice is present on stderr: {notices}"
     );
     assert!(
-        !out.contains("MCP server changes are waiting"),
-        "the unchanged mcp is not deferred: {out}"
+        !notices.contains("MCP server changes are waiting"),
+        "the unchanged mcp is not deferred: {notices}"
+    );
+    assert!(
+        !out.contains("Refreshed"),
+        "the change notice never rides on stdout: {out}"
     );
 }
 
@@ -783,15 +798,22 @@ fn prompt_defers_mcp_changes_with_one_line() {
         r#"{"name": "lighthouse", "server": {"type": "http", "url": "https://example.test/mcp/v2"}}"#,
     );
 
-    let out = prompt_stdout(&home, &bin_dir);
+    let (out, notices) = prompt_output(&home, &bin_dir);
 
-    // Exactly one deferred-MCP line, and the hook path never spawned the
-    // harness CLI (the shim log did not grow).
-    let deferred_lines = out
+    // Exactly one deferred-MCP line on stderr, and the hook path never
+    // spawned the harness CLI (the shim log did not grow).
+    let deferred_lines = notices
         .lines()
         .filter(|l| l.contains("MCP server changes are waiting"))
         .count();
-    assert_eq!(deferred_lines, 1, "exactly one deferred-MCP line: {out}");
+    assert_eq!(
+        deferred_lines, 1,
+        "exactly one deferred-MCP line: {notices}"
+    );
+    assert!(
+        !out.contains("MCP server changes are waiting"),
+        "the deferred-MCP line never rides on stdout: {out}"
+    );
     assert_eq!(
         read_log(&log),
         log_before,
@@ -826,7 +848,7 @@ fn prompt_defers_mcp_changes_with_one_line() {
         read_log(&log)
     );
 
-    let quiet = prompt_stdout(&home, &bin_dir);
+    let quiet = prompt_output(&home, &bin_dir).1;
     assert!(
         !quiet.contains("MCP server changes are waiting"),
         "the next session is quiet once the mcp is applied: {quiet}"
@@ -844,13 +866,20 @@ fn prompt_survives_corrupt_receipt_with_one_advisory() {
     let receipt_path = home.join("state/crystalline/provisions.json");
     std::fs::write(&receipt_path, "{ not json").unwrap();
 
-    let out = prompt_stdout(&home, &bin_dir);
+    let (out, notices) = prompt_output(&home, &bin_dir);
 
-    let advisory_lines = out
+    let advisory_lines = notices
         .lines()
         .filter(|l| l.contains("provisioning memory could not be read"))
         .count();
-    assert_eq!(advisory_lines, 1, "exactly one advisory line: {out}");
+    assert_eq!(
+        advisory_lines, 1,
+        "exactly one advisory line on stderr: {notices}"
+    );
+    assert!(
+        !out.contains("provisioning memory could not be read"),
+        "the advisory never rides on stdout: {out}"
+    );
     assert_eq!(
         std::fs::read_to_string(&receipt_path).unwrap(),
         "{ not json",
@@ -893,6 +922,7 @@ fn prompt_json_format_stays_notice_free() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     let _: Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("the json prompt must parse: {e}\n{stdout}"));
     assert!(
@@ -906,5 +936,82 @@ fn prompt_json_format_stays_notice_free() {
     assert!(
         !stdout.contains("Refreshed"),
         "no reconcile summary leaks into json: {stdout}"
+    );
+    // Not in the payload, and not lost either: a person running the hook by
+    // hand is the only reader who can act on a pending decision, and stderr is
+    // where they read it.
+    assert!(
+        stderr.contains("provision allow cove"),
+        "the pending decision reaches stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refreshed"),
+        "and so does the reconcile summary: {stderr}"
+    );
+}
+
+/// The same rule for the copilot envelope, which is the format an agent reads
+/// most literally: `additionalContext` is the agent's context, so a notice
+/// asking a human for a decision must not be inside it. The envelope still
+/// has to be the only thing on stdout, so the notices go to stderr rather than
+/// beside it.
+#[test]
+fn prompt_copilot_format_keeps_notices_out_of_the_context() {
+    let (work, home, bin_dir, harbor_dir) = setup("prompt-copilot-notice");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    bump_install_receipt_current(&home);
+
+    // The same two notice sources the json case uses: an undecided domain and
+    // a changed artifact source.
+    let cove_dir = work.path().join("kb-cove");
+    write_harbor(&cove_dir);
+    provision_cmd(&home, &bin_dir)
+        .args(["domain", "add", "cove"])
+        .arg(&cove_dir)
+        .arg("--no-sync")
+        .assert()
+        .success();
+    write(
+        &harbor_dir,
+        "agents/quartermaster.md",
+        "# Quartermaster\n\nChanged for this session with a longer body than before.\n",
+    );
+
+    let out = provision_cmd(&home, &bin_dir)
+        .args(["prompt", "system", "--format", "copilot"])
+        .write_stdin(r#"{"source":"startup"}"#)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the copilot envelope must parse: {e}\n{stdout}"));
+    let context = parsed["additionalContext"].as_str().unwrap();
+    assert!(
+        context.contains("CRYSTALLINE KNOWLEDGE ROUTING"),
+        "the routing block is still carried: {context}"
+    );
+    assert!(
+        !context.contains("ships artifacts to provision"),
+        "no pending block rides in the agent's context: {context}"
+    );
+    assert!(
+        !context.contains("Refreshed"),
+        "no reconcile summary rides in the agent's context: {context}"
+    );
+    assert!(
+        stderr.contains("provision allow cove"),
+        "the pending decision reaches stderr instead: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refreshed"),
+        "and so does the reconcile summary: {stderr}"
     );
 }

@@ -47,6 +47,18 @@ export interface Capabilities {
    * and the login screen asks for a first admin instead of credentials.
    */
   needsSetup: boolean;
+  /**
+   * Whether this instance serves OAuth for MCP clients, from the effective
+   * `auth.oauth` setting.
+   *
+   * A rendering signal for the profile's connected-clients card
+   * (`OauthGrantsCard`), the same role `canShare` plays for the share
+   * surfaces: an instance that never turned OAuth on draws no card offering
+   * to manage clients that can never exist. It is not the gate - the
+   * server refuses `/me/oauth-grants` and `/oauth/*` on its own, off
+   * `auth.oauth` itself, regardless of what this probe says.
+   */
+  oauth: boolean;
   /** The version of the server that answered the probe. */
   serverVersion: string;
 }

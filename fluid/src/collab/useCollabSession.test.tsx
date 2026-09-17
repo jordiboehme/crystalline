@@ -68,12 +68,17 @@ function detailOf(content: string): EngramDetail {
       staleAfter: null,
       verified: [],
       generatedBy: null,
+      generatedModel: null,
     },
     observations: [],
     relations: [],
     links: [],
     inboundCount: 0,
     inboundRefs: [],
+    similar: [],
+    guidance: null,
+    draft: false,
+    draftOwner: null,
   };
 }
 
@@ -82,7 +87,7 @@ const SESSION_TEXT = "---\ntitle: A\n---\n\nbody\n";
 /** The mounted hook, so the assertions can read what it last returned. */
 let mounted: { result: { current: CollabSession } } | null = null;
 
-function mount(enabled = true) {
+function mount(enabled = true, overlay?: string) {
   mounted = renderHook(() =>
     useCollabSession({
       domain: "eng",
@@ -90,6 +95,7 @@ function mount(enabled = true) {
       account: "ada",
       displayName: "Ada Lovelace",
       enabled,
+      overlay,
       socketFactory: fakeSocketFactory,
     }),
   );
@@ -128,13 +134,26 @@ function joinRoom(hello: Partial<CollabHello> = {}) {
 
 /** An awareness frame from somebody else in the room. */
 function presenceFrame(name: string): Uint8Array {
-  const otherDoc = new Y.Doc();
-  const other = new Awareness(otherDoc);
-  other.setLocalStateField("user", {
+  return awarenessFrame({
     name,
     color: "#f59e0b",
     colorLight: "#f59e0b33",
   });
+}
+
+/**
+ * The awareness frame the SERVER publishes for an agent working in this
+ * document: a name, the agent flag, and deliberately no color of its own.
+ */
+function agentFrame(label: string): Uint8Array {
+  return awarenessFrame({ name: label, agent: true });
+}
+
+/** One awareness state, framed the way the wire carries it. */
+function awarenessFrame(user: Record<string, unknown>): Uint8Array {
+  const otherDoc = new Y.Doc();
+  const other = new Awareness(otherDoc);
+  other.setLocalStateField("user", user);
   const encoder = encoding.createEncoder();
   encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
   encoding.writeVarUint8Array(
@@ -164,6 +183,20 @@ describe("fileSpace", () => {
 });
 
 describe("useCollabSession", () => {
+  // The room a grantee opens is the room over the OWNER's draft, and the only
+  // place that is said is the socket's own URL: a session opened without it
+  // would be a room over this account's own document under a header naming
+  // somebody else's.
+  it("opens the owner's document when a granted draft is named", () => {
+    mount(true, "alice");
+    expect(socketAt(0).url).toBe("/api/v1/collab/eng/alpha?overlay=alice");
+  });
+
+  it("opens this account's own document when no owner is named", () => {
+    mount();
+    expect(socketAt(0).url).toBe("/api/v1/collab/eng/alpha");
+  });
+
   it("falls back to solo when the first connect never lands", () => {
     mount();
     expect(session().mode).toBe("connecting");
@@ -244,6 +277,22 @@ describe("useCollabSession", () => {
     expect(grace?.color).toMatch(/^#[0-9a-f]{6}$/);
     expect(grace?.self).toBe(false);
     expect(me?.self).toBe(true);
+  });
+
+  it("tells an agent peer apart from a person, and colors it anyway", () => {
+    const { socket } = joinRoom();
+    act(() => {
+      socket.receive(presenceFrame("Grace"));
+      socket.receive(agentFrame("ada (agent: claude-code/2.0)"));
+    });
+    const participants = session().participants;
+    const agent = participants.find((one) => one.agent);
+    expect(agent?.name).toBe("ada (agent: claude-code/2.0)");
+    // No color on the wire: the room's own palette, keyed by the label, is
+    // what gives an agent a chip like everybody else's.
+    expect(agent?.color).toMatch(/^#[0-9a-f]{6}$/);
+    expect(agent?.self).toBe(false);
+    expect(participants.find((one) => one.name === "Grace")?.agent).toBe(false);
   });
 
   it("carries a conflict and an accepted deletion", () => {

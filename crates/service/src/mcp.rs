@@ -53,6 +53,17 @@
 //! required. It re-fetches mid-session through `list_domains` with
 //! `include_routing=true`, the same index the instructions carry.
 //!
+//! **Over HTTP that block names no domain.** `get_info` is synchronous and rmcp
+//! calls it with no request context, so the legacy handshake cannot know who is
+//! connecting and cannot leave a private domain out of a per-caller block;
+//! there it renders [`crate::engine::Engine::routing_text_counted`] instead -
+//! every behavior rule, the count of registered domains, and the pointer at
+//! `list_domains`, which does resolve a caller and does filter. Stdio keeps the
+//! whole block, because a local session is the machine owner. Every channel
+//! that *does* carry a request context is scoped per caller instead:
+//! `server/discover` through [`McpServer::arrival_info_scoped`], the
+//! `onboarding` prompt, and `list_domains` itself.
+//!
 //! In read-only mode (the engine's `read_only` flag) the write-gated tools are
 //! filtered out of `list_tools` and `get_tool`; the routes stay registered so
 //! a client that calls a hidden tool by name reaches the engine's read-only
@@ -253,7 +264,7 @@ use rmcp::model::{
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
     PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
-    ServerInfo, SubscriptionFilter, Tool,
+    ServerConfig, SubscriptionFilter, Tool,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
@@ -262,18 +273,20 @@ use serde_json::{Value, json};
 use crystalline_core::{CrystallineUrl, SKILL_ASSETS};
 use crystalline_remote::RemoteError;
 
-/// The tools hidden in read-only mode: the four content-mutating engram tools
-/// plus `add_domain`, which creates a domain (writing config, and files for a
-/// local domain). In read-only mode they are hidden from `list_tools` and
-/// `get_tool`, while their routes stay registered so a client that calls one by
-/// name still reaches the engine guard and gets the read-only error rather than
-/// a bare "tool not found".
-const WRITE_TOOLS: [&str; 5] = [
+/// The tools hidden in read-only mode: the five content-mutating engram tools
+/// plus `add_domain` and `remove_domain`, which create and unregister domains
+/// (writing config, and files for a local domain). In read-only mode they are
+/// hidden from `list_tools` and `get_tool`, while their routes stay registered
+/// so a client that calls one by name still reaches the engine guard and gets
+/// the read-only error rather than a bare "tool not found".
+const WRITE_TOOLS: [&str; 7] = [
     "write_engram",
     "edit_engram",
     "move_engram",
+    "split_engram",
     "delete_engram",
     "add_domain",
+    "remove_domain",
 ];
 
 /// Whether a tool name is one of the write-gated tools (hidden in read-only
@@ -298,9 +311,9 @@ fn is_write_tool(name: &str) -> bool {
 /// `instructions` to `server/discover`, restricts `tools/list_changed` to
 /// subscribers and requires caching hints on six operations; all four are
 /// implemented here - see [`McpServer::list_tools`], [`McpServer::discover`],
-/// [`McpServer::listen`] and [`CacheHinted`] - and so is the stdio bridge's
-/// half, where a bare `server/discover` probe is normalized and forwarded
-/// rather than answered `-32601` (`crate::client`). A fifth obligation,
+/// [`McpServer::listen`] and [`CacheHinted`]. The stdio path has no probe
+/// handling of its own - every client line is forwarded verbatim
+/// (`crate::client`) and rmcp classifies and answers it. A fifth obligation,
 /// `ping`'s removal, is rmcp's: it answers `method_not_found` to any peer that
 /// is not on the legacy lifecycle (`handler/server.rs:112-118`), and we
 /// implement no `ping`. `tests/mcp_modern_era.rs` is what a client at this
@@ -308,7 +321,7 @@ fn is_write_tool(name: &str) -> bool {
 ///
 /// **The bottom is deliberately NOT a decision.** `V_2024_11_05` is served today
 /// and stays served: rmcp branches nowhere between it and `V_2025_11_25`
-/// (`uses_legacy_lifecycle`, rmcp 3.1.2 `service.rs:196-202`, one `<` comparison
+/// (`uses_legacy_lifecycle`, rmcp 3.4.0 `service.rs:204-215`, one `<` comparison
 /// against 2026-07-28), so keeping the oldest costs one array element, and
 /// dropping a revision is a deprecation with a release note rather than a
 /// side effect of an upgrade.
@@ -320,11 +333,12 @@ pub const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2026_07_28,
 ];
 
-/// The newest revision we serve: what a client asking for one we do not serve
-/// is answered with over stdio, and the version the stdio bridge injects into a
-/// bare `server/discover` probe (`crate::client`). Reads the last element, so
-/// the ordering of [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than
-/// cosmetic.
+/// The newest revision we serve. Reads the last element, so the ordering of
+/// [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than cosmetic.
+///
+/// **Not the downgrade target.** A client asking over stdio for a revision we
+/// do not serve is answered [`newest_legacy_handshake_version`], which is a
+/// different value and for a reason spelled out there.
 pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
     SERVED_PROTOCOL_VERSIONS
         .last()
@@ -344,12 +358,20 @@ pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
 /// SHOULD disconnect rather than proceed. It also has a concrete cost: rmcp
 /// keys `ping`'s removal, the `resultType` discriminator and the subscription
 /// dispatch on the peer's **negotiated** version (`handler/server.rs:112-118`,
-/// `:246-260`, `uses_legacy_lifecycle` at `service.rs:196-202`), so a client
+/// `:246-260`, `uses_legacy_lifecycle` at `service.rs:210-215`), so a client
 /// downgraded onto the era would lose `ping` without ever having asked for the
-/// era. Capping the downgrade means a peer reaches the modern lifecycle only
-/// by asking for it - by opening with `server/discover`, or by naming
-/// 2026-07-28 in its own handshake, both of which are still echoed verbatim.
-pub(crate) fn newest_legacy_handshake_version() -> ProtocolVersion {
+/// era.
+///
+/// **Since rmcp 3.2.0 this cap is upstream's rule too, and it binds every
+/// handshake rather than only an unserved one.** `negotiate_protocol_version`
+/// (`service/server.rs:479`) echoes a requested revision only when it is a
+/// legacy one the server supports, and otherwise answers with the newest
+/// legacy revision - so an `initialize` naming 2026-07-28 is answered this
+/// value however the handler replies. A peer therefore reaches the modern
+/// lifecycle only the way the specification provides for: by opening with
+/// `server/discover`, or by carrying the SEP-2575 `_meta` on an inline
+/// request. Naming the era in a handshake is not one of the routes.
+pub fn newest_legacy_handshake_version() -> ProtocolVersion {
     SERVED_PROTOCOL_VERSIONS
         .iter()
         .rfind(|version| **version < ProtocolVersion::V_2026_07_28)
@@ -373,12 +395,26 @@ const CACHE_TTL_MS: u64 = 0;
 ///
 /// [`CacheScope::Public`] is truthful rather than convenient, and it became
 /// truthful only once the list endpoints stopped varying per connection: every
-/// list this server answers is decided before the first request from
-/// deployment configuration and machine state, never from who is asking, and
-/// none of it varies by the authorization presented on the request - which is
-/// the one variation SEP-2567 explicitly permits and the one that would force
-/// `private`. The shipped skills a `resources/read` returns are static copy
-/// compiled into this binary.
+/// **protocol** list this server answers - `tools/list`, `prompts/list`,
+/// `resources/list`, `resources/templates/list`, the five results this constant
+/// governs - is decided before the first request from deployment configuration
+/// and machine state, never from who is asking, and none of it varies by the
+/// authorization presented on the request, which is the one variation SEP-2567
+/// explicitly permits and the one that would force `private`. The shipped
+/// skills a `resources/read` returns are static copy compiled into this binary.
+///
+/// It is a claim about those results and not about the server: a *tool* result
+/// may vary by caller and several now do (`list_domains` answers each account
+/// its own index). Tool results carry no caching hints at all, so nothing about
+/// them is promised here.
+///
+/// **One result on this server is not that, and it says so itself.** An
+/// attachment read through the same `resources/read` endpoint *does* vary by
+/// the authorization on the request: a file inside a private domain is served
+/// to its members and refused to everybody else. A shared cache holding that
+/// answer under a public scope would hand one caller's attachment to the next
+/// one, so that branch passes [`CacheScope::Private`] to
+/// [`CacheHinted::with_cache_hints_as`] instead of taking this default.
 const CACHE_SCOPE: CacheScope = CacheScope::Public;
 
 /// Whether the peer this request belongs to gets SEP-2549 caching hints.
@@ -648,16 +684,27 @@ fn chosen_resolution(
 /// regardless of the capabilities `get_info` advertises. An un-advertised
 /// capability is therefore not a defence against this MUST; an override is.
 pub(crate) trait CacheHinted: Sized {
-    /// Set both hints, or neither.
-    fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self;
+    /// Set both hints, or neither, at the default [`CACHE_SCOPE`].
+    fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self {
+        self.with_cache_hints_as(context, CACHE_SCOPE)
+    }
+
+    /// Set both hints, or neither, at a scope this result chose for itself.
+    /// The one caller that does is the attachment branch of
+    /// [`McpServer::read_resource`], whose answer varies by who asked.
+    fn with_cache_hints_as(self, context: &RequestContext<RoleServer>, scope: CacheScope) -> Self;
 }
 
 macro_rules! impl_cache_hinted {
     ($($t:ty),+ $(,)?) => {
         $(impl CacheHinted for $t {
-            fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self {
+            fn with_cache_hints_as(
+                self,
+                context: &RequestContext<RoleServer>,
+                scope: CacheScope,
+            ) -> Self {
                 if peer_gets_cache_hints(context) {
-                    self.with_ttl_ms(CACHE_TTL_MS).with_cache_scope(CACHE_SCOPE)
+                    self.with_ttl_ms(CACHE_TTL_MS).with_cache_scope(scope)
                 } else {
                     self
                 }
@@ -917,10 +964,16 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
+use crate::collab::session::AgentPeer;
+use crate::domain_view::DomainView;
 use crate::engine::{
-    AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential, ProvisionAction, ShareActor,
+    ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, LiveWriteTarget,
+    OVERLAY_NEEDS_IDENTITY, PreviewCredential, ProvisionAction, ShareActor, sanitize_actor,
 };
 use crate::params::*;
+use crate::rest::member_level_word;
+use crate::scope::{DomainRight, Scope};
+use crate::similar::SimilarProbe;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
 /// from the initialize handshake rmcp keeps on the peer.
@@ -958,6 +1011,284 @@ fn client_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
     Some(format!("{name}/{version}"))
 }
 
+/// The account this call authenticated as, or `None` when nobody did.
+///
+/// The door does the resolving: with `auth.mcp` on, [`crate::mcp_gate::McpGate`]
+/// turns the `Authorization` header into an account before the transport sees
+/// the request and leaves it in the request's extensions. rmcp copies the
+/// remaining `http::request::Parts` into every tool call's `ctx.extensions`
+/// (3.2.0 `transport/streamable_http_server/tower.rs`, four injection sites:
+/// `:1219` stateless negotiated, `:1775` session POST, `:1855` session
+/// creation, `:1974` stateless POST), so the identity is readable here with no
+/// second lookup, no per-connection state of our own and no second channel that
+/// could disagree with the gate.
+///
+/// **What makes it trustworthy is the gate, not this read.** A request bearing
+/// a session id is checked against the identity that opened that session before
+/// it is routed, so an account cannot arrive on somebody else's session state;
+/// a session-less request carries its own credential and is resolved on its
+/// own. Nothing a client sends is read here - the extension is inserted
+/// server-side or not at all - so an identity cannot be forged by a caller.
+///
+/// `None` in exactly two cases, both of which keep their legacy actor: stdio,
+/// where there are no HTTP parts at all, and auth-off HTTP, where the gate is a
+/// pass-through and inserts nothing.
+pub(crate) fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    mcp_identity(ctx).map(|identity| identity.name)
+}
+
+/// The whole identity the gate resolved, name and instance role together.
+///
+/// [`mcp_account`] wants only the name; an authorization decision wants the
+/// role beside it, and the gate already read both out of the same row (see
+/// [`crate::mcp_gate::McpIdentity`]), so taking them from one place is what
+/// keeps the two from ever disagreeing.
+fn mcp_identity(ctx: &RequestContext<RoleServer>) -> Option<crate::mcp_gate::McpIdentity> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    parts
+        .extensions
+        .get::<crate::mcp_gate::McpIdentity>()
+        .cloned()
+}
+
+/// What stands in for the client half when a client declared no usable name.
+///
+/// The composed actor is always two halves, so a bare account name never
+/// reaches `generated.by`: `ada` alone reads as "a client calling itself ada",
+/// and drops the one fact this composition exists to record - that an agent,
+/// not the person, did the writing.
+const UNKNOWN_CLIENT: &str = "agent";
+
+/// The join, and the cost of it in kept characters once the engine has folded
+/// its spaces into hyphens: `-for-`. [`ACTOR_JOIN_WORD`] is the same word as
+/// [`without_the_join`] has to recognize it, once the fold has made it a
+/// hyphen-separated segment of its own.
+const ACTOR_JOIN: &str = " for ";
+const ACTOR_JOIN_CHARS: usize = 5;
+const ACTOR_JOIN_WORD: &str = "for";
+
+/// The client half with any join in it taken out, so the composed shape is
+/// something only this server can produce.
+///
+/// [`sanitize_actor`] has already folded whitespace into hyphens by the time
+/// this runs, so a client naming itself `x for ada` arrives here as
+/// `x-for-ada` - byte-identical to what an authenticated ada session composes,
+/// on an instance where nobody authenticated at all. An account name cannot
+/// contain whitespace (the auth store's `normalize_account_name` refuses it), so the
+/// join is the only way that shape arises honestly, and this is what keeps it
+/// that way. A client that genuinely has `for` as a hyphen-separated word in
+/// its name loses that word and keeps the rest.
+///
+/// **Structural rather than textual, because a text substitution can be
+/// layered around.** Deleting the `-for-` runs one pass at a time leaves the
+/// runs that pass created: `x-for-for-ada` has two overlapping joins, a single
+/// non-overlapping left-to-right pass consumes the first and re-joins its
+/// neighbours, and `x-for-ada` comes out the other side - the very bytes the
+/// deletion exists to prevent. So the half is taken apart on its separator
+/// instead: every segment that is the join word is dropped, empty runs
+/// collapse with them, and what is rejoined cannot contain `-for-` at any
+/// position or multiplicity, because a `-` in the result is only ever a
+/// separator this function put there between two segments that are not the
+/// word.
+///
+/// The comparison is ASCII case-insensitive even though `sanitize_actor` does
+/// not lowercase and the server's own join is always lowercase, so `x-FOR-ada`
+/// is not literally the composed bytes. Provenance gets read by people, and a
+/// reader scanning for who a write was made for does not spell-check the case;
+/// dropping it costs a client the word `for` in some capitalization and buys
+/// the field a rule with no near misses in it.
+fn without_the_join(sanitized_client: &str) -> String {
+    sanitized_client
+        .split('-')
+        .filter(|segment| !segment.is_empty() && !segment.eq_ignore_ascii_case(ACTOR_JOIN_WORD))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// The longest client half a presence label carries, in characters.
+///
+/// `clientInfo.name` is client-supplied and unbounded, and this label is
+/// broadcast to every browser in the room and read back in every agent's
+/// `present`. A chip is a chip: a name past this is a client saying more about
+/// itself than a participant strip is for.
+const AGENT_LABEL_CLIENT_CHARS: usize = 60;
+
+/// The client half as a person reads it, rather than as provenance spells it.
+///
+/// [`sanitize_actor`] folds whitespace into hyphens because `generated.by` is
+/// a token; a chip in a strip is a name, so the spaces stay and only what
+/// cannot be drawn goes. `None` when nothing legible is left.
+///
+/// A cut at [`AGENT_LABEL_CLIENT_CHARS`] carries a trailing `...`, so a
+/// truncated name reads as truncated rather than as the whole of what the
+/// client reported.
+fn display_client(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut gap = false;
+    let mut truncated = false;
+    for c in raw.trim().chars() {
+        if out.chars().count() >= AGENT_LABEL_CLIENT_CHARS {
+            truncated = true;
+            break;
+        }
+        if c.is_whitespace() {
+            gap = !out.is_empty();
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if gap {
+            out.push(' ');
+            gap = false;
+        }
+        out.push(c);
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// How this call shows up in the participant strip of a room it works in.
+///
+/// **Display, and display only.** What a write RECORDS is
+/// [`acting_actor`]'s hyphenated OKF token and is untouched by this; what a
+/// person SEES beside their own name while an agent is in their document is
+/// this, and the two are built from the same two halves so they can never
+/// name different agents. The name leads because that is who the work is
+/// being done for, and the harness follows it in the parenthesis because a
+/// person watching two agents work needs to tell them apart.
+///
+/// `None` when no ACCOUNT is known, whatever the client calls itself: see
+/// [`presence_label`].
+fn agent_peer(ctx: &RequestContext<RoleServer>, scope: &crate::scope::Scope) -> Option<AgentPeer> {
+    presence_label(
+        presence_identity(mcp_account(ctx), scope),
+        client_actor(ctx).and_then(|client| display_client(&client)),
+    )
+}
+
+/// The word a local agent is drawn under, where the only person who can be
+/// reading the strip is the person it is working for.
+const PRESENCE_SELF: &str = "you";
+
+/// Who a chip is for and what it is called: the account presence is KEYED by,
+/// and the name a person READS.
+///
+/// The two are one string almost always, and the case where they part is the
+/// machine owner's own session. A local stdio agent has no gate to resolve an
+/// account, so the identity it acts with is
+/// [`crate::engine::OWNER_IDENTITY_NAME`] - the name that session's drafts are
+/// filed under, which is the right key and the wrong word. Drawn as it stands
+/// it tells the owner that somebody called `owner` is in their document, and
+/// that somebody is themselves; [`PRESENCE_SELF`] is what it is instead, with
+/// the harness still following so two agents of one person are told apart.
+///
+/// **Decided here, where the two sources are still apart.** An account the
+/// gate resolved that happens to be named `owner` is a remote person like any
+/// other and keeps their own name in everybody's strip: only the absence of a
+/// gate, on a session acting unrestricted, is you. Keying presence by the
+/// account either way is what keeps a slot stable across the substitution -
+/// the strip's key is who the work is filed under, never what it is captioned.
+fn presence_identity(
+    gate_account: Option<String>,
+    scope: &crate::scope::Scope,
+) -> Option<(String, String)> {
+    match gate_account {
+        Some(account) => Some((account.clone(), account)),
+        None => match scope {
+            crate::scope::Scope::Unrestricted => Some((
+                crate::engine::OWNER_IDENTITY_NAME.to_string(),
+                PRESENCE_SELF.to_string(),
+            )),
+            other => crate::scope::overlay_actor(other).map(|actor| (actor.clone(), actor)),
+        },
+    }
+}
+
+/// The two halves composed, and the rule about which of them may lead.
+///
+/// **The identity is what makes a chip worth drawing, so without one there is
+/// no chip.** A name in somebody's participant strip says "this is who is in
+/// your document", and on an instance with MCP authentication off the client
+/// half is whatever an unauthenticated caller typed into its handshake - so a
+/// label led by it would let anybody put any name beside a person's own. The
+/// harness may only ever follow a name the server resolved
+/// ([`presence_identity`]).
+///
+/// That name alone is a complete answer: an agent whose client sent no usable
+/// name is "<name> (agent)", which says the true thing and says who it is for.
+fn presence_label(identity: Option<(String, String)>, client: Option<String>) -> Option<AgentPeer> {
+    let (account, shown) = identity?;
+    let label = match client {
+        Some(client) => format!("{shown} (agent: {client})"),
+        None => format!("{shown} (agent)"),
+    };
+    Some(AgentPeer { account, label })
+}
+
+/// The actor a write records: the client that asked, and - when the call
+/// authenticated - the account it asked on behalf of, as `"<client> for
+/// <account>"`.
+///
+/// An agent is not a person, and with the gate on both halves are known: the
+/// harness that made the call ([`client_actor`]) and the human whose token
+/// opened the session ([`mcp_account`]). Recording only the first would leave
+/// an audit of who taught this instance what stopping at "some agent";
+/// recording only the second would lose which tool did the writing. So both are
+/// kept, in one line, in the one field OKF has for it.
+///
+/// **Each half is sanitized on its own and the composition happens after**,
+/// which is the whole of the integrity here. [`Engine::actor`] sanitizes
+/// whatever it is handed and stops at [`ACTOR_MAX_CHARS`] kept characters;
+/// `clientInfo.name` and `.version` are client-supplied and unbounded, so
+/// composing first and sanitizing once would let a long enough client name
+/// spend the entire budget and truncate the half the server asserts off the
+/// end - silently, with the write still succeeding. Here the account is
+/// measured first and the client half is budgeted against what is left, so the
+/// account always lands whole; the second pass the engine makes over the
+/// composition is then idempotent apart from folding the join's spaces into
+/// hyphens.
+///
+/// So on disk: `claude-code/2.0-for-ada`. The word `for` is what survives the
+/// fold as the join, which is why the composition reads as a phrase rather
+/// than as punctuation, and [`without_the_join`] is what keeps a client from
+/// writing that phrase itself.
+///
+/// `None` only when neither half is known, which is [`Engine::actor`]'s
+/// fallback case and behaves exactly as it did before.
+fn acting_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    let account = mcp_account(ctx)
+        .map(|account| sanitize_actor(&account))
+        .filter(|account| !account.is_empty());
+    let client = client_actor(ctx)
+        .map(|client| without_the_join(&sanitize_actor(&client)))
+        .filter(|client| !client.is_empty());
+    let Some(account) = account else {
+        // Nobody authenticated: the client alone, exactly as before, minus a
+        // join it was never entitled to write.
+        return client;
+    };
+    // What is left for the client half once the account and the join are
+    // spoken for. A pathological account name can leave nothing, and then the
+    // account is the whole of it: the half a caller cannot choose is the half
+    // that survives.
+    let budget = ACTOR_MAX_CHARS.saturating_sub(account.chars().count() + ACTOR_JOIN_CHARS);
+    if budget == 0 {
+        return Some(account);
+    }
+    let client = client.unwrap_or_else(|| UNKNOWN_CLIENT.to_string());
+    let client: String = client.chars().take(budget).collect();
+    let client = client.trim_end_matches('-');
+    if client.is_empty() {
+        // A budget too small to hold anything of the client at all. The
+        // account alone rather than a bare `for-ada`, which is neither half.
+        return Some(account);
+    }
+    Some(format!("{client}{ACTOR_JOIN}{account}"))
+}
+
 /// Which transport a server instance serves, the one distinction the `auto`
 /// value of `skills.serve` turns on.
 ///
@@ -974,6 +1305,106 @@ pub enum Transport {
     /// Served over the streamable HTTP transport.
     Http,
 }
+
+/// The MCP server for one connection: one tool router over one shared engine.
+/// Cheap to clone; every serving path builds one per connection (the daemon
+/// per accepted `mcp` socket, the HTTP transport per session, the stdio bridge
+/// once for its single session).
+///
+/// **Nothing about the connecting client is read any more.** The
+/// install-receipt match used to live here as an `AtomicBool` set from the
+/// client's own `initialize` name, which is the per-connection variation
+/// SEP-2567 forbids. What is here instead was decided before the connection
+/// existed: see `harness_onboarded`.
+/// The draft joins one MCP server object opened, and the thing that ends them.
+///
+/// **A join belongs to a HOLDER, never to an account** (see [`crate::join`]),
+/// and this object is the ending of one KIND of holder: a stdio process, one
+/// connection on the daemon's own socket, or one legacy `Mcp-Session-Id`
+/// session. Each of those is one `McpServer` for its whole life, so its last
+/// clone going away is that holder ending and `Drop` ends its joins.
+///
+/// **A modern-era peer on streamable HTTP is not one of them**, and that is
+/// the case this type has to get right rather than the cases it serves. Those
+/// requests route statelessly: rmcp builds a fresh service per POST
+/// (`daemon.rs`'s table of the five `get_service()` sites), so this object
+/// would live for one call and its `Drop` would run at the end of the very
+/// request that opened the join. So only keys whose holder
+/// [`crate::join::Holder::ends_with_its_holder`] are remembered here at all;
+/// a token identity's join is ended by idleness in the registry instead, and
+/// nothing on the request path ends it.
+///
+/// What is NOT kept here is the set of joins the caller is inside. That is
+/// read from the registry per call ([`crate::join::Joins::held_by`]), for the
+/// same reason: a stateless peer's second request is a different object, and
+/// anything remembered in this one it would have forgotten.
+struct SessionJoins {
+    registry: Arc<crate::join::Joins>,
+    /// `(key, account, holder)` for every join this object opened whose
+    /// holder ends when this object does. The holder rides along with each
+    /// entry, rather than being assumed constant for the object, so `close`
+    /// is always asked to end the exact join this object opened - not just
+    /// one that happens to name the same account.
+    keys: std::sync::Mutex<Vec<(String, String, crate::join::Holder)>>,
+}
+
+impl SessionJoins {
+    fn new(registry: Arc<crate::join::Joins>) -> SessionJoins {
+        SessionJoins {
+            registry,
+            keys: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record a key this object was just handed, when this object is what ends
+    /// it. De-duplicated, because joining a draft this holder is already
+    /// inside answers the key it already holds.
+    fn remember(&self, join: &crate::join::Join, key: String) {
+        if !join.holder.ends_with_its_holder() {
+            return;
+        }
+        let mut keys = self.lock();
+        if !keys.iter().any(|(held, ..)| held == &key) {
+            keys.push((key, join.account.clone(), join.holder.clone()));
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, String, crate::join::Holder)>> {
+        self.keys.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// This holder has ended, so the drafts it was working inside are drafts it is
+/// no longer inside. Empty for a stateless peer, by construction: nothing was
+/// remembered for it.
+impl Drop for SessionJoins {
+    fn drop(&mut self) {
+        for (key, account, holder) in self.lock().iter() {
+            self.registry.close(key, account, holder);
+        }
+    }
+}
+
+/// The `Mcp-Session-Id` a request carried, if any.
+///
+/// Read off the HTTP parts rmcp injects into the request extensions, the same
+/// place [`mcp_identity`] reads the gate's answer from. Carrying a session id
+/// is not on its own what makes a request a session - see
+/// [`McpServer::holder_of`], which is this function's only caller.
+fn session_header(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.headers.get("mcp-session-id"))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Numbers one `McpServer` apart from another on the transports where the
+/// server object IS the holder. A daemon serves many stdio-shaped connections
+/// at once, so the process id alone would make them one holder and any one of
+/// them closing would put the others out of their drafts.
+static NEXT_SERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The MCP server for one connection: one tool router over one shared engine.
 /// Cheap to clone; every serving path builds one per connection (the daemon
@@ -1003,6 +1434,19 @@ pub struct McpServer {
     /// the safe direction (an over-served client pays duplicated context, an
     /// under-served one loses onboarding it cannot rediscover).
     harness_onboarded: bool,
+    /// The drafts this server object joined by presenting a share-link, and
+    /// the handle whose last clone ends them. See [`SessionJoins`].
+    joins: Arc<SessionJoins>,
+    /// This server object's number, which is the holder id on the transports
+    /// where the object is the holder. See [`SessionJoins`].
+    server: u64,
+    /// The legacy sessions this process has minted and not yet ended, so
+    /// [`McpServer::holder_of`] can tell a session id this server is actually
+    /// serving from one a client simply sent. `None` on every construction
+    /// that has no session manager behind it - stdio, the daemon's socket, a
+    /// test building a server directly - where no request is a legacy session
+    /// anyway.
+    sessions: Option<Arc<crate::mcp_gate::SessionOwners>>,
 }
 
 impl McpServer {
@@ -1017,11 +1461,226 @@ impl McpServer {
     }
 
     fn with_transport(engine: Arc<Engine>, transport: Transport) -> McpServer {
+        let joins = Arc::new(SessionJoins::new(engine.joins().clone()));
         McpServer {
             engine,
             transport,
             harness_onboarded: false,
+            joins,
+            server: NEXT_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            sessions: None,
         }
+    }
+
+    /// Hand this server the map of live legacy sessions, so it can tell one it
+    /// is serving from an id a client sent. Called by the streamable-HTTP
+    /// service factory, which is the one construction that has a session
+    /// manager behind it.
+    pub fn with_session_owners(
+        mut self,
+        sessions: Arc<crate::mcp_gate::SessionOwners>,
+    ) -> McpServer {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Which holder this call's joins belong to, and so what ends them.
+    ///
+    /// Resolved PER CALL rather than stored, because on the streamable-HTTP
+    /// transport the server object is not the holder: rmcp builds a fresh one
+    /// per stateless POST, and the thing that persists between two of a modern
+    /// peer's requests is the identity its token resolved to. Three answers,
+    /// one per way of being a caller here:
+    ///
+    /// * **stdio, and the daemon's own socket, are a process**, numbered per
+    ///   server object so a daemon serving several at once keeps them apart.
+    ///   Its joins end when the object does, which is when the connection does.
+    /// * **a legacy-shaped HTTP request on a session this process minted is
+    ///   that session.** The legacy lifecycle: the transport owns the
+    ///   session's ending, and the server object built for it goes with it.
+    /// * **every other HTTP request is a token identity**, which is what the
+    ///   2026-07-28 era has instead of a session. Nothing on that path is an
+    ///   ending, so the registry ends those by idleness.
+    ///
+    /// **Both halves of the session test are load bearing, and the first is
+    /// the one that is easy to get wrong.** rmcp decides whether a request is
+    /// served by a per-session object from the BODY and never from the session
+    /// header, so an era-shaped `tools/call` carrying a session id is routed
+    /// statelessly and its server object lives for that one request. Naming it
+    /// a session here would put its join on an object that is about to be
+    /// dropped, which is exactly the failure the holder exists to close,
+    /// reached through a dual-era client or a proxy that echoes the header.
+    ///
+    /// So the shape is decided by rmcp's own rule, `uses_legacy_lifecycle`
+    /// (rmcp 3.4.0 `service.rs:210-215`, reached from
+    /// `tower.rs`'s `is_legacy_request`), which this mirrors clause for clause.
+    /// It reads TWO things from the request and they are not the same thing:
+    ///
+    /// 1. **whether the era's required `_meta` keys are present at all** -
+    ///    `protocolVersion` and `clientCapabilities`, tested by
+    ///    `RequestMetaObject::missing_required_keys`, which checks presence and
+    ///    never what revision the first of them names. A request carrying both
+    ///    is stateless for rmcp EVEN WHEN it names a pre-era revision, and that
+    ///    clause overrules the version.
+    /// 2. **the version**, this request's own: from its `_meta` if it has one,
+    ///    otherwise the negotiated one. Only consulted when the first clause
+    ///    did not already answer.
+    ///
+    /// Reading the version alone was the bug of the round before this one: a
+    /// dual-era harness that holds a legacy session and still attaches its
+    /// SEP-2575 client context to later requests sends exactly the request the
+    /// two clauses disagree about.
+    /// `an_era_meta_call_naming_a_legacy_revision_is_stateless_on_a_minted_session`
+    /// is that request on the wire.
+    ///
+    /// rmcp's third input, an `initialize` body, needs no clause here: a
+    /// handshake reaches no tool and so never asks who holds a join.
+    ///
+    /// The second half of the session test is that the id has to be one this
+    /// process is actually serving. An id nothing minted has no session behind
+    /// it and no ending to wait for; the gate refuses a claim belonging to
+    /// somebody ELSE with a 403, and an unclaimed one it lets through, so this
+    /// is where an unclaimed one stops being a holder.
+    ///
+    /// `None` when the request carries no account at all, which is the
+    /// anonymous open tier: a share-link binds to an account, so there is no
+    /// join for that caller to hold and the verb refuses in those words. With
+    /// MCP authentication off that is EVERY request, so the claim test below is
+    /// never reached and no join is ever opened - an instance with no accounts
+    /// has no drafts to join either, and the answer falls out of the first line
+    /// rather than out of the session rule.
+    ///
+    /// **rmcp version-bump checklist.** Because this mirrors `uses_legacy_lifecycle`
+    /// clause for clause rather than calling into it, an rmcp upgrade never
+    /// fails the build over a drift here - it has to be re-checked by hand
+    /// every time: re-read both of rmcp's clauses (the `_meta` presence test
+    /// and the version comparison) against this function's two branches and
+    /// adjust the branches, and the doc comment above, wherever rmcp's shape moved. See the
+    /// `SERVED_PROTOCOL_VERSIONS` and `newest_legacy_handshake_version` doc
+    /// comments near the top of this file for the sibling places an rmcp bump
+    /// touches.
+    ///
+    /// Last walked at the 3.2.0 -> 3.4.0 bump (2026-09-17): both clauses are
+    /// unchanged (`uses_legacy_lifecycle` and `is_legacy_version` are
+    /// byte-identical, and so is `is_legacy_request`, which only moved to a
+    /// let-chain and a new error alias), `negotiate_protocol_version` is
+    /// byte-identical too, and 3.3.0's new `ServerHandler::negotiate_initialize`
+    /// is an opt-in helper that restates the default `initialize` body - this
+    /// server overrides `initialize` to supply its own downgrade target and does
+    /// not call it.
+    fn holder_of(&self, ctx: &RequestContext<RoleServer>) -> Option<crate::join::Holder> {
+        match self.transport {
+            Transport::Stdio => Some(crate::join::Holder::Process(self.server)),
+            Transport::Http => {
+                let account = mcp_account(ctx)?;
+                let era_meta = ctx
+                    .meta
+                    .missing_required_keys(&ProtocolVersion::V_2026_07_28)
+                    .is_empty();
+                let legacy_shaped = !era_meta
+                    && ctx
+                        .protocol_version()
+                        .is_none_or(|version| version < ProtocolVersion::V_2026_07_28);
+                if legacy_shaped
+                    && let Some(session) = session_header(ctx)
+                    && let Some(owners) = &self.sessions
+                    && owners.owner(&session).as_deref() == Some(account.as_str())
+                {
+                    return Some(crate::join::Holder::McpSession(session));
+                }
+                Some(crate::join::Holder::Token(account))
+            }
+        }
+    }
+
+    /// Present a share-link: bind it to this account, open the draft it names
+    /// for THIS session, and answer the join the verb routes through.
+    ///
+    /// Both of the browser's two steps at once (see
+    /// [`Engine::open_share_link`]), because an agent that was handed a link
+    /// and passed it to a verb has decided both: it means to see the draft and
+    /// it means to work in it.
+    async fn enter_draft(
+        &self,
+        scope: &Scope,
+        ctx: &RequestContext<RoleServer>,
+        token: &str,
+    ) -> std::result::Result<crate::engine::OpenedLink, crate::engine::EngineError> {
+        let Some(holder) = self.holder_of(ctx) else {
+            return Err(crate::engine::EngineError::Refused(
+                "a draft share-link binds to an account, and this session has none: authenticate \
+                 before presenting one"
+                    .to_string(),
+            ));
+        };
+        let opened = self.engine.open_share_link(token, scope, &holder).await?;
+        if let crate::engine::OpenedLink::Joined { key, join } = &opened {
+            self.joins.remember(join, key.clone());
+        }
+        Ok(opened)
+    }
+
+    /// Present a link on a WRITE: the join it opened, or the refusal that says
+    /// why this caller may read the draft and not write in it.
+    ///
+    /// The other half of [`crate::engine::OpenedLink`]'s two answers. A read
+    /// takes `ReadOnly` as an answer; a write asked to land inside the draft
+    /// and cannot, so for it the sentence is the refusal it always was.
+    async fn joined_by(
+        &self,
+        scope: &Scope,
+        ctx: &RequestContext<RoleServer>,
+        token: &str,
+    ) -> Result<crate::join::Join, ErrorData> {
+        match self.enter_draft(scope, ctx, token).await {
+            Ok(crate::engine::OpenedLink::Joined { join, .. }) => Ok(join),
+            Ok(crate::engine::OpenedLink::ReadOnly(reason)) => {
+                Err(to_error(crate::engine::EngineError::Refused(reason)))
+            }
+            Err(err) => Err(to_error(err)),
+        }
+    }
+
+    /// The join this session holds that `identifier` names, or `None`.
+    ///
+    /// **By the page, never by the domain**, and that is the whole of it. A
+    /// session that joined one draft of a domain goes on editing its own
+    /// engrams in that domain exactly as before; only a call that named the
+    /// shared page is routed into its author's copy. Matching by the domain
+    /// instead would bind every write the session made anywhere in that domain
+    /// to the one page it was invited into.
+    ///
+    /// The name is checked against what the GRANT opens
+    /// ([`Engine::granted_draft_named`]), which is the draft's own address,
+    /// its path and the path with the suffix off - the three spellings an
+    /// engram is addressed by - and against the path the join was opened for,
+    /// so one of the owner's other drafts answering the same name routes
+    /// nothing.
+    async fn joined_for(
+        &self,
+        scope: &Scope,
+        ctx: &RequestContext<RoleServer>,
+        domain: &str,
+        identifier: &str,
+    ) -> Option<crate::join::Join> {
+        let account = crate::scope::overlay_actor(scope)?;
+        let holder = self.holder_of(ctx)?;
+        // The registry, not a list kept on this object: a stateless peer's
+        // second request is a different object, so anything this one
+        // remembered it would have forgotten. See [`SessionJoins`].
+        let held = self.engine.joins().held_by(&account, &holder, domain);
+        for join in held {
+            let named = self
+                .engine
+                .granted_draft_named(domain, identifier, Some(&join.owner), scope)
+                .await
+                .ok()
+                .flatten();
+            if named.is_some_and(|(_, path)| path == join.path) {
+                return Some(join);
+            }
+        }
+        None
     }
 
     /// Record that the harness this process serves is already onboarded (see
@@ -1034,28 +1693,244 @@ impl McpServer {
         self
     }
 
+    /// Who this call is acting as, as the one value every scoped verb on this
+    /// server is threaded with.
+    ///
+    /// Resolved per call rather than stored, for the same reason
+    /// [`McpServer::share_actor`] is: the account comes off the request the
+    /// gate authenticated, and a copy kept on the server would be one more
+    /// thing that could disagree with the door.
+    ///
+    /// Three answers, one per way of reaching this server:
+    ///
+    /// * **stdio is [`Scope::Unrestricted`]**, and not as a shortcut. A stdio
+    ///   session is a process this machine's harness started, so its caller
+    ///   already has every domain's files on disk; there is nothing here for a
+    ///   check to protect, and the CLI and control socket pass the same value
+    ///   for the same reason.
+    /// * **an authenticated HTTP session is [`Scope::User`]**, carrying the
+    ///   name and the instance role [`crate::mcp_gate::McpGate`] resolved once,
+    ///   before the transport saw the request. Nothing a client sends is read
+    ///   here: the extension is inserted server-side or not at all.
+    /// * **an HTTP session with no identity is [`Scope::Anonymous`]**, which
+    ///   exists only where `auth.mcp` is off - the legacy open tier, where the
+    ///   gate is a pass-through. It reads what is shared and sees no private
+    ///   domain, which is exactly the tier's promise: an instance that never
+    ///   made anything private is byte-identical to its old self, and one that
+    ///   did keeps it out of an unauthenticated agent's reach.
+    fn scope_of(&self, ctx: &RequestContext<RoleServer>) -> Scope {
+        match self.transport {
+            Transport::Stdio => Scope::Unrestricted,
+            Transport::Http => match mcp_identity(ctx) {
+                Some(identity) => Scope::User {
+                    account: identity.name,
+                    admin: identity.admin,
+                },
+                None => Scope::Anonymous,
+            },
+        }
+    }
+
+    /// The gate every write verb passes before it touches a domain, answering
+    /// the same two refusals the REST write routes answer and in the same
+    /// order.
+    ///
+    /// 1. **A domain this caller may not see is the not-found**, decided first,
+    ///    so a stranger writing into a private domain learns exactly what a
+    ///    stranger writing into a domain nobody registered learns.
+    /// 2. **Then the right**, which is what a private domain adds and what the
+    ///    instance role decides on a shared one. The refusal names the level
+    ///    the caller holds, because "forbidden" on a domain they can see and
+    ///    read is otherwise indistinguishable from a bug.
+    ///
+    /// The right read here is [`Engine::write_right`], the domain answer capped
+    /// by the instance role, and it is the same call the JSON API's write gate
+    /// makes. An instance viewer invited into a private domain as an editor is
+    /// therefore refused here exactly as their browser is refused there: an
+    /// invitation widens what an account may reach, never what its instance
+    /// role lets it do. Reading the uncapped `domain_right` here instead is
+    /// what let one person's agent write what that same person could not.
+    ///
+    /// **The domain gated is the one the call named, and that is the whole of
+    /// it.** An identifier cannot move a write to another domain: the absolute
+    /// `crystalline://` form is refused outright when its domain is not the
+    /// `domain` argument (`Engine::resolve_in`, which every write verb resolves
+    /// through), so the named domain is the only domain a write can
+    /// reach. An earlier draft of this gate resolved the identifier and checked
+    /// *its* domain instead, which left the named one unchecked and let a call
+    /// whose two halves disagree reach the unscoped `content_source` behind
+    /// them - an error naming every registered domain, private ones included.
+    /// The gate and the engine now read the same field.
+    ///
+    /// `Ok(None)` is the allowed case. `Ok(Some(text))` is a refusal to hand
+    /// back through [`refuse`], so the model reads why rather than a bare
+    /// error. `Err` is step one's not-found, which is an engine error because
+    /// it has to be the engine's own bytes.
+    ///
+    /// **The legacy open tier is never refused by step two**, and that is the
+    /// tier rather than an oversight: an instance with `auth.mcp` off has no
+    /// accounts to hold a level, and every agent reaching it writes exactly
+    /// what it always wrote. Step one still runs for it, and a private domain
+    /// is invisible to it, so there is nothing there for step two to protect.
+    ///
+    /// That carve-out is read from the setting that creates the tier rather
+    /// than from the absence of an identity, which are not the same statement.
+    /// With `auth.mcp` on, an unauthenticated request is refused at the door
+    /// and never reaches a tool at all; if a gate regression ever let one
+    /// through it would arrive here as [`Scope::Anonymous`] too, and it must
+    /// not inherit the open tier's writes. So the condition is "the door is
+    /// open", not "nobody is there". [`Scope::Unrestricted`] needs no arm at
+    /// all - it resolves to [`DomainRight::Own`] on every domain.
+    async fn refuse_unwritable(
+        &self,
+        domain: &str,
+        scope: &Scope,
+    ) -> Result<Option<String>, ErrorData> {
+        self.engine
+            .require_domain(domain, scope)
+            .await
+            .map_err(to_error)?;
+        if matches!(scope, Scope::Anonymous) && !self.engine.auth_mcp() {
+            return Ok(None);
+        }
+        let right = self
+            .engine
+            .write_right(scope, domain)
+            .await
+            .map_err(to_error)?;
+        if right < DomainRight::Write {
+            return Ok(Some(format!(
+                "your access to '{domain}' is {}, and editor access is required to change it",
+                member_level_word(right)
+            )));
+        }
+        Ok(None)
+    }
+
+    /// The gate on changing what this instance IS: which domains are
+    /// registered on it, how it is configured, and which of the artifacts its
+    /// domains ship are installed into the harnesses on the machine it runs
+    /// on.
+    ///
+    /// Three verbs pass through here: [`McpServer::add_domain`], a `configure`
+    /// that sets, unsets or connects, and `provision` in its `allow`, `deny`
+    /// and `apply` actions - the last because a decision is written into the
+    /// same `config.yaml` a `configure set` writes and `apply` then runs the
+    /// harness CLIs on the server. A `provision` `status` is a read and is
+    /// scoped rather than gated.
+    ///
+    /// Three answers, and each is a rule rather than a consequence:
+    ///
+    /// * **a local stdio session is the machine owner.** Whoever runs it
+    ///   already has the config file and the domains on disk, so there is
+    ///   nothing here for a check to protect;
+    /// * **the legacy open tier keeps exactly what it had.** With `auth.mcp`
+    ///   off there are no accounts to hold a role, and refusing here would take
+    ///   away what every single-user install does on every session. The
+    ///   condition is spelled the same way [`McpServer::refuse_unwritable`]
+    ///   spells it - the door is open, not merely that nobody is there - so an
+    ///   unauthenticated request that somehow got past a gate that is ON cannot
+    ///   inherit the open tier's powers;
+    /// * **an authenticated agent needs the instance admin role**, which is
+    ///   what the JSON API has always required of the same actions. Anything
+    ///   else is refused with [`INSTANCE_ADMIN_ONLY`].
+    ///
+    /// `remove_domain` deliberately does NOT go through here: ending a domain
+    /// is gated in the engine, where REST reads the same rule, and that rule is
+    /// narrower in one direction (a private domain's owner may end it without
+    /// being an admin) and wider in none.
+    fn refuse_instance_change(&self, scope: &Scope) -> Option<&'static str> {
+        match scope {
+            Scope::Unrestricted => None,
+            Scope::Anonymous if !self.engine.auth_mcp() => None,
+            Scope::User { admin: true, .. } => None,
+            _ => Some(INSTANCE_ADMIN_ONLY),
+        }
+    }
+
     /// Who a write verb over this connection acts as, when this instance
     /// shares with personal GitHub identities (`github.share_identity =
     /// personal`). Inert in the default `instance` mode, where one credential
     /// does everything.
     ///
-    /// **The transport is the identity here, because it is the only thing
-    /// there is.** A stdio session is a process this machine's harness
-    /// started, so it is the machine owner in exactly the sense the CLI is -
-    /// the same local `owner` credential, connected once with `crystalline
-    /// connect github --personal`. An HTTP session carries no user auth at all
-    /// (there is nobody to be), so it acts as the account
-    /// `github.agent_identity` names, and refuses with a text naming that
-    /// setting when an admin has named none.
+    /// **An authenticated session IS its account.** A stdio session is a
+    /// process this machine's harness started, so it is the machine owner in
+    /// exactly the sense the CLI is - the same local `owner` credential,
+    /// connected once with `crystalline connect github --personal`. An HTTP
+    /// session that authenticated at the door acts as the account it
+    /// authenticated as, so a share goes out on that person's own connected
+    /// GitHub identity and their name is on the proposal: the agent acts as the
+    /// user rather than as one shared bot everybody's work is filed under.
     ///
-    /// Read per call rather than stored: the two constructors already record
-    /// the transport, and one more copy of it would be one more thing that can
-    /// disagree with them.
-    fn share_actor(&self) -> ShareActor {
+    /// **The transport-only answer survives where there is nothing else.** An
+    /// HTTP session on an instance that does not make agents authenticate
+    /// carries no user auth at all - there is nobody to be - so it stays
+    /// [`ShareActor::HttpAgent`] and resolves through `github.agent_identity`,
+    /// refusing with a text naming that setting when an admin has named none.
+    /// That is the legacy tier unchanged, which is what keeps a default install
+    /// behaving as it did.
+    ///
+    /// Read per call rather than stored: the account comes off the request
+    /// (see [`mcp_account`]), and a copy of it kept on the server would be one
+    /// more thing that could disagree with the door.
+    fn share_actor(&self, ctx: &RequestContext<RoleServer>) -> ShareActor {
         match self.transport {
             Transport::Stdio => ShareActor::Owner,
-            Transport::Http => ShareActor::HttpAgent,
+            Transport::Http => match mcp_account(ctx) {
+                Some(account) => ShareActor::Account(account),
+                None => ShareActor::HttpAgent,
+            },
         }
+    }
+
+    /// A write receipt with the neighbours advisory attached, for the two
+    /// verbs whose caller is an agent in the loop. Scoped by the caller, so a
+    /// private domain's engram is a neighbour only to someone who may see it.
+    ///
+    /// Called from here rather than from inside the engine verb on purpose:
+    /// the probe takes the store lock, which is not reentrant, so it may only
+    /// run once the write has returned and released it.
+    async fn with_similar(
+        &self,
+        mut receipt: Value,
+        probe: SimilarProbe<'_>,
+        scope: &Scope,
+    ) -> Value {
+        self.engine.attach_similar(&mut receipt, probe, scope).await;
+        receipt
+    }
+
+    /// A finished write result with the ride-along ask appended to it, when one
+    /// is due for the caller ([`crate::nudge::write_verb_trailer`]).
+    ///
+    /// **Last, on every write verb.** It runs after the receipt is whole -
+    /// after the neighbours advisory, after the live-document keys, after the
+    /// link the verb attaches - because it is addressed to the agent rather
+    /// than to the receipt: nothing downstream reads it, and a trailer that
+    /// moved earlier would sit inside a shape somebody parses.
+    ///
+    /// Only the first content block is touched, and only when it is text: that
+    /// block is the receipt, and the blocks after it are the resource links a
+    /// client follows. A result whose first block is not text (none today) is
+    /// handed back unchanged rather than grown a block of its own, since a
+    /// second text block would read as a second receipt.
+    ///
+    /// Never on a refusal and never on a question: both are answered before a
+    /// write happens, so neither reaches this.
+    async fn nudged(
+        &self,
+        mut result: CallToolResult,
+        ctx: &RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        let Some(trailer) =
+            crate::nudge::write_verb_trailer(&self.engine, mcp_account(ctx).as_deref()).await
+        else {
+            return result;
+        };
+        if let Some(ContentBlock::Text(text)) = result.content.first_mut() {
+            text.text.push_str(&format!("\n\n---\n{trailer}"));
+        }
+        result
     }
 }
 
@@ -1064,7 +1939,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document asks them first, by name, and on a yes it lands in their document (receipt: landed live) rather than over it, so use edit_engram when the change is a targeted one. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1074,11 +1949,36 @@ impl McpServer {
     )]
     async fn write_engram(
         &self,
-        Parameters(p): Parameters<WriteParams>,
+        Parameters(mut p): Parameters<WriteParams>,
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let actor = client_actor(&ctx);
+        // The model an agent reports is client-supplied text exactly as the
+        // client identity is, so it is sanitized the same way and an id that
+        // sanitizes away counts as none reported. Belt and braces rather than
+        // the load-bearing pass: `Engine::stamped_model` sanitizes whatever
+        // reaches it, which is what covers the surfaces that never come through
+        // here (the CLI and the control socket decode these params themselves).
+        // Whether the model is recorded at all is the engine's call rather than
+        // this one either: it resolves the actor the write lands under, and a
+        // person's write never carries a model.
+        p.model = p
+            .model
+            .as_deref()
+            .map(sanitize_actor)
+            .filter(|m| !m.is_empty());
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
+            return refuse(refusal).map(CallToolResponse::from);
+        }
+        let actor = acting_actor(&ctx);
+        // A capture inside somebody's draft names that draft on the call: this
+        // verb derives its destination from the title rather than resolving a
+        // page, so there is no identifier to work out which draft was meant.
+        let join = match p.share_link.as_deref() {
+            Some(token) => Some(self.joined_by(&scope, &ctx, token).await?),
+            None => None,
+        };
 
         // **A refusal is read before the engine runs, never after it.** A
         // collision is discovered by attempting the write, so the shape that
@@ -1100,7 +2000,103 @@ impl McpServer {
             return refuse(COLLISION_REFUSAL).map(CallToolResponse::from);
         }
 
-        let written = self.engine.write_engram_as(&p, actor.as_deref()).await;
+        let peer = agent_peer(&ctx, &scope);
+
+        // **A wholesale replacement of a document somebody has open is asked
+        // about before it happens.** An `edit_engram` composes into that
+        // document; this verb with `overwrite` replaces it, and the work it
+        // would replace is on somebody's screen and not saved anywhere yet. So
+        // the person is asked, by name, and the write waits for their answer.
+        //
+        // **When both questions would apply, this is the one that is asked**,
+        // and it is asked FIRST - before the write that would raise the
+        // collision. It subsumes the collision, because a yes here is a yes to
+        // replacing what is at that permalink and it also says who is in
+        // there, which the collision question cannot. Asking the collision
+        // first and this one second would put two differently worded questions
+        // about one act to the same person, and on a client that does not
+        // carry the first answer into the second round the two would alternate
+        // for ever.
+        //
+        // **Which key carries the answer depends on how the caller arrived**,
+        // and that is what makes the round terminate. A caller that passed
+        // `overwrite` has already decided to replace what is there and is
+        // being asked the live question alone, so it answers on the confirm
+        // key. A caller that did not pass it is being asked ONE question that
+        // is both, so it answers on the resolution key - the same key the
+        // collision round has always used, which is why round two carries
+        // `resolution: overwrite` and lands rather than asking again. Reading
+        // `confirm` there instead would let a yes carried over from some other
+        // verb's round turn a plain capture into an overwrite, which is worse
+        // than the second question it would save.
+        //
+        // Nothing changes for a capture whose destination no room is open
+        // over: that is the collision round, exactly as it was.
+        //
+        // **A client that cannot be asked is refused rather than served the
+        // replacement**, which is this round's one departure from the others
+        // in this file. A delete or an acknowledgment nobody can be asked
+        // about is the verb the human already typed, so it runs; an overwrite
+        // of somebody ELSE's open document is their unsaved work gone with
+        // nothing left to say where it went, and no other surface would ever
+        // show them what happened.
+        if let Some(target) = self
+            .engine
+            .live_write_target(&p, &scope, join.as_ref(), peer.as_ref())
+            .await
+        {
+            if !confirmation_supported(&ctx) {
+                return refuse(live_overwrite_refusal(&target)).map(CallToolResponse::from);
+            }
+            let answered = match p.overwrite {
+                true => confirmed(&responses.0),
+                false => resolved_overwrite(&responses.0),
+            };
+            match answered {
+                None if p.overwrite => {
+                    return Ok(confirm_question(live_overwrite_question_text(&p, &target)).into());
+                }
+                None => {
+                    return Ok(
+                        collision_question(live_collision_question_text(&p, &target)).into(),
+                    );
+                }
+                Some(false) => return refuse(LIVE_OVERWRITE_REFUSAL).map(CallToolResponse::from),
+                // The answered call runs here rather than falling through to
+                // the collision round below: the yes was given about replacing
+                // the page at that permalink, so routing it through the error
+                // the engine would raise for the missing `overwrite` would
+                // make the landing depend on that interception. One call, with
+                // the argument the answer amounts to.
+                Some(true) => {
+                    let mut confirmed_write = p.clone();
+                    confirmed_write.overwrite = true;
+                    let receipt = match self
+                        .engine
+                        .write_engram_present(
+                            &confirmed_write,
+                            actor.as_deref(),
+                            &scope,
+                            join.as_ref(),
+                            peer.as_ref(),
+                        )
+                        .await
+                    {
+                        Ok(receipt) => receipt,
+                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                    };
+                    let receipt = self
+                        .with_similar(receipt, SimilarProbe::for_write(&confirmed_write), &scope)
+                        .await;
+                    return Ok(self.nudged(ok_written(receipt)?, &ctx).await.into());
+                }
+            }
+        }
+
+        let written = self
+            .engine
+            .write_engram_present(&p, actor.as_deref(), &scope, join.as_ref(), peer.as_ref())
+            .await;
 
         // A permalink collision is the one failure here with a real choice
         // behind it, so a peer that can put that choice to its user is offered
@@ -1120,10 +2116,14 @@ impl McpServer {
             _ => None,
         };
         let Some(permalink) = collision else {
-            return written
-                .map_err(to_error)
-                .and_then(ok_written)
-                .map(CallToolResponse::from);
+            let receipt = match written {
+                Ok(receipt) => receipt,
+                Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+            };
+            let receipt = self
+                .with_similar(receipt, SimilarProbe::for_write(&p), &scope)
+                .await;
+            return Ok(self.nudged(ok_written(receipt)?, &ctx).await.into());
         };
 
         match resolved_overwrite(&responses.0) {
@@ -1142,12 +2142,24 @@ impl McpServer {
             Some(true) => {
                 let mut retry = p.clone();
                 retry.overwrite = true;
-                self.engine
-                    .write_engram_as(&retry, actor.as_deref())
+                let receipt = match self
+                    .engine
+                    .write_engram_present(
+                        &retry,
+                        actor.as_deref(),
+                        &scope,
+                        join.as_ref(),
+                        peer.as_ref(),
+                    )
                     .await
-                    .map_err(to_error)
-                    .and_then(ok_written)
-                    .map(CallToolResponse::from)
+                {
+                    Ok(receipt) => receipt,
+                    Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                };
+                let receipt = self
+                    .with_similar(receipt, SimilarProbe::for_write(&retry), &scope)
+                    .await;
+                Ok(self.nudged(ok_written(receipt)?, &ctx).await.into())
             }
         }
     }
@@ -1155,15 +2167,47 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
         &self,
         Parameters(p): Parameters<ReadParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let value = self.engine.read_engram(&p).await.map_err(to_error)?;
-        let links = self.attachment_links(&value).await;
+        let scope = self.scope_of(&ctx);
+        // A link presented here binds it to this account and opens the draft
+        // for this holder, so the read below answers the draft it names and a
+        // later edit of that page lands in its author's copy. The read itself
+        // needs no join - a grant is what a read crosses on - but an agent
+        // that was handed a link and is reading with it has decided both, the
+        // same way a person pressing the button in a browser has.
+        //
+        // **A refused JOIN is not a failed READ, and the type is what says so.**
+        // A grantee who may read the draft and not edit it, and one already
+        // working in as many drafts as this instance keeps open for one
+        // account, are [`crate::engine::OpenedLink::ReadOnly`] rather than
+        // errors: each redeemed the link and asked for exactly what their
+        // grant is for. Every way the link itself opens NOTHING is still an
+        // error and is raised here - a dead link, a draft that has gone, a
+        // caller with no account at all - because that caller is reading a
+        // page they were told they had been given, and answering them the
+        // domain's own page in silence would let them report it as somebody's
+        // draft.
+        if let Some(token) = p.share_link.as_deref() {
+            self.enter_draft(&scope, &ctx, token)
+                .await
+                .map_err(to_error)?;
+        }
+        // Reading somebody's open document is being in the room with them,
+        // for as long as the claim stands: the strip names this agent while
+        // it works, exactly as it names a person who has the page open.
+        let value = self
+            .engine
+            .read_engram_present(&p, &scope, agent_peer(&ctx, &scope).as_ref())
+            .await
+            .map_err(to_error)?;
+        let links = self.attachment_links(&value, &scope).await;
         let mut result = ok(value)?;
         result.content.extend(links);
         Ok(result)
@@ -1172,7 +2216,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it errors when the engram carries no entry for that rule and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same finding again replaces its entry, and V301 is the one rule that keeps more than one, an entry per twin pair, so acknowledging a second pair on the same engram records it beside the first and each pair is silenced on its own. Every other rule keeps exactly one entry however often it fires on that engram, so a second acknowledgment of it replaces what the first said and the finding it was not given for comes back marked stale. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it takes back every entry for that rule, which for V301 means every twin pair you acknowledged on that engram, it errors when the engram carries no entry for that rule, and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. An edit of an engram somebody has open in the web editor composes into their live document instead of the file - it arrives under their cursor, keeps what they have typed, and the receipt says landed: live with present naming who is in there; their session saves it. You are usually named in their participant strip while you work there, for a minute after each call, so they can tell which agent a change came from. To edit somebody's shared draft rather than your own copy of the page, pass the draft share-link they handed you (dl_...) as share_link: it opens that draft for this connection and the edit lands in its author's copy, with the receipt saying whose. A draft reached that way is read from its author's last saved text rather than from their open document, so send an edit inside one without expected_checksum: the text composes correctly either way, and a checksum taken from a granted read is refused as stale for as long as its author keeps typing. That stays open until your session ends, or - on a sessionless HTTP connection - for 30 minutes after your last call about the draft, so present the link again whenever an edit is refused as unjoined. Without it, an edit at a path somebody shared with you is refused and told the two ways forward. The generated provenance block is refreshed with who edited it, with which model, and when: pass model with your own model id (for example claude-opus-5) on every edit, and a verification you record carries it too. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1182,10 +2226,32 @@ impl McpServer {
     )]
     async fn edit_engram(
         &self,
-        Parameters(p): Parameters<EditParams>,
+        Parameters(mut p): Parameters<EditParams>,
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // The model an agent reports is client-supplied text exactly as the
+        // client identity is, so it is sanitized the same way and an id that
+        // sanitizes away counts as none reported. Belt and braces rather than
+        // the load-bearing pass: `Engine::stamped_model` sanitizes whatever
+        // reaches it, which is what covers the surfaces that never come through
+        // here (the CLI and the control socket decode these params themselves).
+        // Whether the model is recorded at all is the engine's call rather than
+        // this one either: it resolves the actor the write lands under, and a
+        // person's write never carries a model.
+        p.model = p
+            .model
+            .as_deref()
+            .map(sanitize_actor)
+            .filter(|m| !m.is_empty());
+        // Before the confirmation round, not after it: a question naming an
+        // engram in a domain the caller may not see is the leak this gate
+        // exists to prevent, and a question about a write that would be
+        // refused is a question nobody should be asked.
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
+            return refuse(refusal).map(CallToolResponse::from);
+        }
         // One key arms the round and every other edit runs untouched. The
         // parse failure is swallowed rather than reported here on purpose: the
         // engine is the one place that words it, and asking a user about an
@@ -1205,18 +2271,44 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
-            .edit_engram_as(&p, client_actor(&ctx).as_deref())
+        // Which draft this edit is inside, if any: the link presented on this
+        // call, or - for a session already inside one - the join whose draft
+        // the identifier names. An edit of anything else in that domain is the
+        // session's own, exactly as it was before it joined anything.
+        let join = match p.share_link.as_deref() {
+            Some(token) => Some(self.joined_by(&scope, &ctx, token).await?),
+            None => {
+                self.joined_for(&scope, &ctx, &p.domain, &p.identifier)
+                    .await
+            }
+        };
+        let receipt = match self
+            .engine
+            .edit_engram_present(
+                &p,
+                acting_actor(&ctx).as_deref(),
+                &scope,
+                join.as_ref(),
+                agent_peer(&ctx, &scope).as_ref(),
+            )
             .await
-            .map_err(to_error)
-            .and_then(ok_written)
-            .map(CallToolResponse::from)
+        {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+        };
+        // `for_edit` is `None` for `set_frontmatter` and for any operation that
+        // carried no content, which is what keeps a lifecycle flip silent.
+        let receipt = match SimilarProbe::for_edit(&p) {
+            Some(probe) => self.with_similar(receipt, probe, &scope).await,
+            None => receipt,
+        };
+        Ok(self.nudged(ok_written(receipt)?, &ctx).await.into())
     }
 
     #[tool(
         name = "move_engram",
         title = "Move engram",
-        description = "Re-home an engram to a new path or domain as the knowledge base is reorganized. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. On a cross-domain move, inbound bare links from other domains are rewritten to the domain-prefixed [[domain:Target]] form so nothing dangles. Set update_links to false to skip that. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log.",
+        description = "Re-home an engram to a new path or domain as the knowledge base is reorganized. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. On a cross-domain move, inbound bare links from other domains are rewritten to the domain-prefixed [[domain:Target]] form so nothing dangles. Set update_links to false to skip that. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1227,18 +2319,76 @@ impl McpServer {
     async fn move_engram(
         &self,
         Parameters(p): Parameters<MoveParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.engine
-            .move_engram(&p)
+        let scope = self.scope_of(&ctx);
+        // Both ends, because a move writes at both: a caller who may write only
+        // one of the two could otherwise carry knowledge out of a private
+        // domain into a shared one, or into a domain it was never invited to.
+        // A destination it may not see answers the same not-found the source
+        // would - naming a domain is not a way to learn that it exists.
+        //
+        // The destination is gated whether or not it repeats the source's
+        // spelling: an omitted or equal `destination_domain` means the source
+        // domain, which the first gate already passed, so the second call is a
+        // no-op there rather than a case to skip - and a skip is how a check
+        // goes missing when the two spellings stop coinciding.
+        //
+        // Read exactly as `Engine::move_engram` reads it, untrimmed and
+        // unfiltered, the way the REST move route reads it too: a gate that
+        // normalizes what the verb does not is gating a different string from
+        // the one that gets written to, which is the same disagreement between
+        // the gate and the engine that this gate exists to end.
+        let destination = p.destination_domain.as_deref().unwrap_or(&p.domain);
+        for end in [p.domain.as_str(), destination] {
+            if let Some(refusal) = self.refuse_unwritable(end, &scope).await? {
+                return refuse(refusal);
+            }
+        }
+        let receipt = match self.engine.move_engram(&p, &scope).await {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_write_error(e),
+        };
+        Ok(self.nudged(ok_moved(receipt)?, &ctx).await)
+    }
+
+    #[tool(
+        name = "split_engram",
+        title = "Split engram",
+        description = "Split an engram: move part of it into a new engram of its own, in one step, when a bundle mixes lifecycles. Split before you retire. Validity is set per engram rather than per bullet, so when one fact in an engram stops holding while the rest still does, move the facts that still hold out with this tool and retire only what remains - never retire the bundle whole and re-type its surviving facts into the successor, which loses their history and repeats the copy on every later expiry. Use it too when an engram grew a second topic that deserves its own engram, and whenever an evolve_engrams V010 carry-forward-gap finding names it. Select what moves with observations (the one-based line numbers read_engram reports for each observation bullet) or with sections (heading paths such as '## Notes' or '## API > ### Auth', which move with every deeper subsection under them), or both; at least one is required. The new engram is written with the moved content, the source's tags and type, status stable and no validity window - the facts moving out are the ones that still hold - plus a '- derived_from [[Source]]' relation, and the source gets '- split_into [[New]]' back so the pair resolves from both ends and stays out of the one-sided-relation finding. Pass folder to file the new engram under a topic prefix, as write_engram does. Both writes are guarded by expected_checksum (from read_engram): a source that changed since your read refuses the split and nothing is created, and any refusal before the source is rewritten takes the new engram back out again. Once the source has been rewritten nothing is undone - a failure after that point keeps both engrams and says so, since the moved bullets then live only in the new one - so re-read both before splitting again. Refused when the selection would leave the source under the verify minimum of three content lines, which is the case where the answer is to retire the whole engram rather than split it. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn split_engram(
+        &self,
+        Parameters(p): Parameters<SplitParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // One domain, because a split writes twice inside it: the new engram
+        // lands in the source's domain, so the source's gate is the whole gate.
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
+            return refuse(refusal);
+        }
+        let receipt = match self
+            .engine
+            .split_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
             .await
-            .map_err(to_error)
-            .and_then(ok_moved)
+        {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_write_error(e),
+        };
+        Ok(self.nudged(ok_split(receipt)?, &ctx).await)
     }
 
     #[tool(
         name = "delete_engram",
         title = "Delete engram",
-        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment. On a 2026-07-28 peer that declared an elicitation capability the first call deletes nothing and answers input_required instead: a confirmation question naming the engram, its domain and permalink and the attachments only it references, which the client puts to the user and answers by re-sending the same call with the confirmation; anything but a yes deletes nothing.",
+        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment. On a 2026-07-28 peer that declared an elicitation capability the first call deletes nothing and answers input_required instead: a confirmation question naming the engram, its domain and permalink and the attachments only it references, which the client puts to the user and answers by re-sending the same call with the confirmation; anything but a yes deletes nothing. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1252,13 +2402,22 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // Before the confirmation round, for the reason `edit_engram` states.
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
+            return refuse(refusal).map(CallToolResponse::from);
+        }
         // The whole confirmation flow lives inside this gate, so a peer that
         // cannot be asked is served exactly what it was served before the flow
         // existed: one call, one delete, one `CallToolResult`.
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
                 None => {
-                    let preview = self.engine.delete_preview(&p).await.map_err(to_error)?;
+                    let preview = self
+                        .engine
+                        .delete_preview_as(&p, &scope)
+                        .await
+                        .map_err(to_error)?;
                     return Ok(confirm_question(delete_question(&preview)).into());
                 }
                 Some(false) => {
@@ -1270,12 +2429,15 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
-            .delete_engram(&p)
+        let receipt = match self
+            .engine
+            .delete_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+        };
+        Ok(self.nudged(ok(receipt)?, &ctx).await.into())
     }
 
     #[tool(
@@ -1287,9 +2449,10 @@ impl McpServer {
     async fn search_engrams(
         &self,
         Parameters(p): Parameters<SearchParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .search_engrams(&p)
+            .search_engrams(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_found(v))
@@ -1304,9 +2467,10 @@ impl McpServer {
     async fn build_context(
         &self,
         Parameters(p): Parameters<ContextParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .build_context(&p)
+            .build_context(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1321,9 +2485,10 @@ impl McpServer {
     async fn recent_activity(
         &self,
         Parameters(p): Parameters<RecentParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .recent_activity(&p)
+            .recent_activity(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1332,15 +2497,16 @@ impl McpServer {
     #[tool(
         name = "list_domains",
         title = "List domains",
-        description = "List the registered domains with their engram counts to see what the agent has been taught. If no CRYSTALLINE KNOWLEDGE ROUTING block reached you this session, call this at session start with include_routing=true: it returns each domain's When to Use routing bullets plus the behavior rules for this server's tools; follow them and route searches through those domains before answering from memory. The same call re-fetches the index mid-session.",
+        description = "List the registered domains with their engram counts to see what the agent has been taught. If no CRYSTALLINE KNOWLEDGE ROUTING block reached you this session, call this at session start with include_routing=true: it returns each domain's When to Use routing bullets plus the behavior rules for this server's tools; follow them and route searches through those domains before answering from memory. The same call re-fetches the index mid-session. Every domain in the answer says whether it is private - visible only to its owner, the accounts invited into it and instance admins - so which domains are private is answered from this one call rather than domain by domain.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_domains(
         &self,
         Parameters(p): Parameters<ListDomainsParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .list_domains(&p)
+            .list_domains(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1355,9 +2521,10 @@ impl McpServer {
     async fn browse_domain(
         &self,
         Parameters(p): Parameters<BrowseParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .browse_domain(&p)
+            .browse_domain(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1372,9 +2539,10 @@ impl McpServer {
     async fn validate_engrams(
         &self,
         Parameters(p): Parameters<ValidateParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .validate_engrams(&p)
+            .validate_engrams(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1389,9 +2557,10 @@ impl McpServer {
     async fn infer_schema(
         &self,
         Parameters(p): Parameters<InferParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .infer_schema(&p)
+            .infer_schema(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1406,9 +2575,10 @@ impl McpServer {
     async fn vocabulary(
         &self,
         Parameters(p): Parameters<VocabularyParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .vocabulary(&p)
+            .vocabulary(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1417,15 +2587,16 @@ impl McpServer {
     #[tool(
         name = "evolve_engrams",
         title = "Evolve engrams",
-        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones, and a team domain holding substantive work nobody has shared for over a week), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
+        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones, and a team domain holding substantive work nobody has shared for over a week), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, semantic twins, drifted tags). It detects by dates, links, graph shape and embedding similarity - V301 semantic twins names two current engrams that say the same thing in different words - and it still cannot find or confirm a contradiction between what two engrams say: similarity is agreement about a topic, not about a fact. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. In a review-mode domain the sweep covers your own drafts too. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn evolve_engrams(
         &self,
         Parameters(p): Parameters<EvolveParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .evolve_engrams(&p)
+            .evolve_engrams(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1445,9 +2616,23 @@ impl McpServer {
     async fn configure(
         &self,
         Parameters(p): Parameters<ConfigureParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
+        }
+
+        // A bare `configure` is the settings page, which is a read and stays
+        // open to every caller. Everything that CHANGES this instance - a set,
+        // an unset, and the three connect fields that decide which GitHub
+        // identity it acts as - is an instance change and is gated as one.
+        let changes = !p.set.is_empty()
+            || !p.unset.is_empty()
+            || p.connect.is_some()
+            || p.token.is_some()
+            || p.host.is_some();
+        if changes && let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
+            return refuse(refusal);
         }
 
         if p.token.is_some() || p.connect.is_some() {
@@ -1457,7 +2642,11 @@ impl McpServer {
                         .connect_with_token(token, p.host.as_deref())
                         .await
                 }
-                (None, Some("github")) => self.engine.start_device_connect(p.host.as_deref()).await,
+                (None, Some("github")) => {
+                    self.engine
+                        .start_device_connect(p.host.as_deref(), p.restart)
+                        .await
+                }
                 (None, Some(other)) => Err(EngineError::Invalid(format!(
                     "configure connect must be 'github', got '{other}'"
                 ))),
@@ -1503,6 +2692,19 @@ impl McpServer {
         Parameters(p): Parameters<AddDomainParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Read-only first, matching `configure` and `remove_domain`: on an
+        // instance where nobody may register a domain, "this instance is
+        // read-only" is the more useful of the two true answers, and it is the
+        // one that does not depend on who is asking.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        // Then the role: registering a domain changes what this instance is, so
+        // it is gated before anything is validated - an agent that may not
+        // create one is told so rather than told its arguments were wrong.
+        if let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
+            return refuse(refusal);
+        }
         if p.repo.is_some() && p.is_virtual {
             return Err(to_error(EngineError::Invalid(
                 "add_domain: repo and virtual are mutually exclusive; a team domain is file-backed"
@@ -1571,9 +2773,74 @@ impl McpServer {
     }
 
     #[tool(
+        name = "remove_domain",
+        title = "Remove domain",
+        description = "Unregister a domain when its knowledge no longer belongs on this instance - the counterpart to add_domain, and the way to remove, unregister, drop or disconnect a domain the agent should stop learning from and searching. What goes is the registration and the search index rows, not the knowledge: a local folder domain is unregistered and its markdown files stay exactly where they are on disk, so pointing add_domain at that folder again re-adopts them; a team domain is unregistered with its local folder left in place and its GitHub repository never touched, so nothing is removed for the rest of the team. A virtual domain is the exception, because its engrams live in the database and ARE its knowledge: it refuses unless you pass purge: true, and there is no folder left to re-adopt afterwards, so export or share what is worth keeping first. Any open co-editing rooms in the domain are saved and closed before it goes; rooms_closed counts them. Private drafts go too: an overlay draft of a path lives in this instance's index and its journal alone, so unregistering the domain ends every actor's unshared drafts in it and nothing brings them back. Drafts that are not yours are named rather than assumed: a domain where somebody else is drafting refuses until end_drafts lists each of them, and the refusal says who and how many drafts each holds (never what is in them). Your own drafts need no naming, and naming yourself as well is accepted and changes nothing, so the actor list a refusal or the confirmation question reports can be sent straight back. On a 2026-07-28 peer that declared an elicitation capability the first call removes nothing and answers input_required instead: a confirmation question naming the domain, its kind, how many engrams it holds and how many private drafts each actor would lose, which the client puts to the user and answers by re-sending the same call with the confirmation; anything but a yes removes nothing. A local session is the machine owner and may remove any domain; over HTTP this is for an instance admin, or for the owner of a private domain, and a caller who may not see a domain is answered exactly as if nobody had registered it. A domain defined by an environment variable belongs to that variable: unset it instead. Refuses on a read-only instance, like every mutating tool.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn remove_domain(
+        &self,
+        Parameters(p): Parameters<RemoveDomainParams>,
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        let scope = self.scope_of(&ctx);
+        // The preview raises every refusal the removal itself would raise, in
+        // the same order: a domain this caller may not see is refused as an
+        // unregistered one, a caller who may see it and may not end it is told
+        // who can, an environment-defined domain raises its conflict, and a
+        // virtual domain holding engrams is refused until `purge` says the loss
+        // was intended. All of them come before the question, for the reason
+        // `delete_engram` states: never ask about an action that would refuse
+        // anyway. `Engine::unregister_domain` decides all four again inside the
+        // domain-admin lock, which is where they actually have to hold, so this
+        // round is advisory and the engine is the authority.
+        let preview = match self
+            .engine
+            .domain_remove_preview(&p.domain, &scope, p.purge, &p.end_drafts)
+            .await
+        {
+            Ok(preview) => preview,
+            Err(e) => return refusal_or_error(e),
+        };
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    return Ok(confirm_question(remove_domain_question(&preview)).into());
+                }
+                Some(false) => {
+                    return refuse(format!(
+                        "The removal was not confirmed, so domain '{}' is still registered and \
+                         nothing was touched. Call remove_domain again if the user asks for it.",
+                        p.domain
+                    ))
+                    .map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
+        }
+        match self
+            .engine
+            .unregister_domain(&p.domain, &scope, p.purge, &p.end_drafts)
+            .await
+        {
+            Ok(report) => ok(report).map(CallToolResponse::from),
+            Err(e) => refusal_or_error(e),
+        }
+    }
+
+    #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1590,10 +2857,19 @@ impl McpServer {
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // A named domain this caller may not see is refused as an unregistered
+        // one, before the preview names a single file of it. A read gate rather
+        // than a write one: what may be shared is `github.share_identity`'s
+        // question and answered further in, and the narrow form so a domain
+        // that is merely unregistered keeps the answer it always had.
+        self.engine
+            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
                 None => {
-                    let preview = self
+                    let preview = match self
                         .engine
                         .origin_share_preview(
                             &p.domain,
@@ -1609,11 +2885,19 @@ impl McpServer {
                             // call would, so an instance that would refuse the
                             // share refuses here instead of asking a question
                             // it could not honour.
-                            self.share_actor(),
+                            self.share_actor(&ctx),
                             PreviewCredential::ActingIdentity,
                         )
                         .await
-                        .map_err(to_error)?;
+                    {
+                        Ok(preview) => preview,
+                        // A caller with no identity holds no draft, and the
+                        // preview resolves that first: the question it could
+                        // not ask is answered with the teaching text rather
+                        // than with a protocol error, exactly as the confirmed
+                        // call below answers it.
+                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                    };
                     if share_plan_needs_confirmation(preview["action"].as_str()) {
                         return Ok(confirm_question(share_question(&preview)).into());
                     }
@@ -1624,19 +2908,27 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
+        // The refusal an agent with no identity meets here is teaching text -
+        // "connect with your MCP token and try again" - and it is the same
+        // sentence a write of that domain answers, so it goes back the same
+        // way: `isError` with the words in it, never a protocol error the
+        // client renders opaquely. Every other engine error keeps the shape it
+        // had.
+        match self
+            .engine
             .origin_share(
                 &p.domain,
                 p.title.as_deref(),
                 p.description.as_deref(),
                 p.proposal,
                 p.files.as_deref(),
-                self.share_actor(),
+                self.share_actor(&ctx),
             )
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        {
+            Ok(shared) => ok(shared).map(CallToolResponse::from),
+            Err(e) => overlay_write_error(e).map(CallToolResponse::from),
+        }
     }
 
     #[tool(
@@ -1653,32 +2945,49 @@ impl McpServer {
     async fn update_domain(
         &self,
         Parameters(p): Parameters<UpdateDomainParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if refused_collab_tool("update_domain", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
         }
+        if let Some(domain) = p.domain.as_deref() {
+            self.engine
+                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .await
+                .map_err(to_error)?;
+        }
         // A pull can rewrite a domain's MANIFEST, so `provisioning_declared`
         // can flip here too, and like `add_domain` that announces nothing: the
         // gate it feeds refuses at call time instead of shaping a list.
-        let result = self.engine.origin_update(p.domain.as_deref()).await;
+        let result = self
+            .engine
+            .origin_update(p.domain.as_deref(), &self.scope_of(&ctx))
+            .await;
         result.map_err(to_error).and_then(|v| self.ok_list(v))
     }
 
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP use the account github.agent_identity names; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
         &self,
         Parameters(p): Parameters<OriginStatusParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if refused_collab_tool("origin_status", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
         }
+        if let Some(domain) = p.domain.as_deref() {
+            self.engine
+                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .await
+                .map_err(to_error)?;
+        }
         self.engine
-            .origin_status(p.domain.as_deref())
+            .origin_status(p.domain.as_deref(), p.detail, &self.scope_of(&ctx))
             .await
             .map(lean_origin_status)
             .map_err(to_error)
@@ -1688,7 +2997,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that sets github.share_identity to personal needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP use the account github.agent_identity names). resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that sets github.share_identity to personal needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1705,6 +3014,12 @@ impl McpServer {
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Before the question, so a conflict preview never shows both sides of
+        // an engram in a domain this caller may not see.
+        self.engine
+            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
         // Three ways to arrive at a resolution, and the arm order is the
         // behaviour: an explicit one is honoured for every peer and never
         // asked about, an eliciting peer that named none is asked, and any
@@ -1750,18 +3065,23 @@ impl McpServer {
                 ));
             }
         };
-        self.engine
-            .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor())
+        // The same teaching refusal a share answers: settling a conflict in a
+        // reviewing domain settles it in somebody's draft, so an agent with no
+        // identity is told how to get one rather than handed a protocol error.
+        match self
+            .engine
+            .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor(&ctx))
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        {
+            Ok(settled) => ok(settled).map(CallToolResponse::from),
+            Err(e) => overlay_write_error(e).map(CallToolResponse::from),
+        }
     }
 
     #[tool(
         name = "withdraw_proposal",
         title = "Withdraw proposal",
-        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1778,6 +3098,11 @@ impl McpServer {
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Before the preview, for the reason `resolve_conflict` states.
+        self.engine
+            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
         let revert = p.revert.unwrap_or(false);
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
@@ -1787,11 +3112,23 @@ impl McpServer {
                     // call, so a target that cannot be named is reported here
                     // as the error it is rather than turned into a question
                     // about a proposal that does not exist.
-                    let preview = self
+                    let preview = match self
                         .engine
-                        .origin_withdraw_preview(&p.domain, p.proposal, revert, self.share_actor())
+                        .origin_withdraw_preview(
+                            &p.domain,
+                            p.proposal,
+                            revert,
+                            self.share_actor(&ctx),
+                        )
                         .await
-                        .map_err(to_error)?;
+                    {
+                        Ok(preview) => preview,
+                        // A caller with no identity holds no draft, and the
+                        // preview resolves that first, so the question it could
+                        // not ask is answered with the teaching text the
+                        // withdrawal itself would answer.
+                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                    };
                     return Ok(confirm_question(withdraw_question(&preview)).into());
                 }
                 Some(false) => {
@@ -1800,12 +3137,17 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
-            .origin_withdraw(&p.domain, p.proposal, revert, self.share_actor())
+        // Teaching text rather than a protocol error, for the reason
+        // `share_changes` answers it that way: a withdrawal in a reviewing
+        // domain is a withdrawal of somebody's proposal of their draft.
+        match self
+            .engine
+            .origin_withdraw(&p.domain, p.proposal, revert, self.share_actor(&ctx))
             .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        {
+            Ok(withdrawn) => ok(withdrawn).map(CallToolResponse::from),
+            Err(e) => overlay_write_error(e).map(CallToolResponse::from),
+        }
     }
 
     #[tool(
@@ -1822,6 +3164,7 @@ impl McpServer {
     async fn provision(
         &self,
         Parameters(p): Parameters<ProvisionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let action = match p.action.as_str() {
             "status" => ProvisionAction::Status,
@@ -1833,6 +3176,13 @@ impl McpServer {
                         None,
                     ));
                 };
+                // Deciding about a domain is a way of asking whether it
+                // exists, so a domain this caller may not see is refused as an
+                // unregistered one first.
+                self.engine
+                    .refuse_hidden_domain(&domain, &self.scope_of(&ctx))
+                    .await
+                    .map_err(to_error)?;
                 if p.action == "allow" {
                     ProvisionAction::Allow { domain }
                 } else {
@@ -1846,6 +3196,28 @@ impl McpServer {
                 ));
             }
         };
+        // Read-only first, matching `configure`, `add_domain` and
+        // `remove_domain`: on an instance where nothing may be provisioned at
+        // all, "this instance is read-only" is the more useful of the two true
+        // answers, and it is the one that does not depend on who is asking.
+        // The engine refuses these three arms for the same reason; asking here
+        // is what keeps the ORDER the same as the sibling verbs'.
+        if !matches!(action, ProvisionAction::Status) && self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        // Then the role, because allow, deny and apply change what this
+        // instance IS: each writes a provisioning decision into the same
+        // `config.yaml` that `configure set` edits, and `apply` reconciles
+        // artifacts into the harnesses on the machine the daemon runs on. That
+        // is the class [`McpServer::refuse_instance_change`] gates, so it is
+        // gated here too rather than merely being absent from the list of
+        // verbs somebody remembered. `status` is a read and stays open, scoped
+        // to the domains this caller may see like every other listing.
+        if !matches!(action, ProvisionAction::Status)
+            && let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx))
+        {
+            return refuse(refusal);
+        }
         // The declaration gate, which used to hide this tool from the listing
         // and now refuses the actions it would make pointless. `status` is
         // deliberately not one of them: it answers an empty report, which is
@@ -1854,7 +3226,7 @@ impl McpServer {
             return refuse(PROVISION_NOT_DECLARED);
         }
         self.engine
-            .provision(&action)
+            .provision(&action, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1907,20 +3279,34 @@ impl McpServer {
 /// docs.
 #[prompt_router]
 impl McpServer {
-    /// The routing block the initialize `instructions` also carry, re-rendered
-    /// per call: the cache refresh first is what makes a virtual domain's
-    /// bullets current, exactly as the daemon does before `get_info`.
+    /// The routing block, re-rendered per call and scoped to whoever asked:
+    /// the cache refresh first is what makes a virtual domain's bullets
+    /// current, exactly as the daemon does before `get_info`.
+    ///
+    /// This is the pull-shaped mitigation for a client that never received the
+    /// block on arrival, and unlike the legacy handshake it carries a request
+    /// context - so it hands out that caller's own index rather than either
+    /// everybody's or nobody's.
     #[prompt(
         name = "onboarding",
         title = "Knowledge routing",
         description = "The live knowledge routing block for this server: one routing line per domain plus the behavior rules. Insert at session start."
     )]
-    async fn onboarding_prompt(&self) -> Vec<PromptMessage> {
+    async fn onboarding_prompt(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
         self.engine.refresh_routing_cache().await;
-        vec![PromptMessage::new_text(
-            Role::User,
-            self.engine.routing_text(),
-        )]
+        // Scoped, unlike the legacy handshake block: a prompt request carries a
+        // context, so this channel knows who is asking and hands out that
+        // caller's own index. On stdio the scope is unrestricted and the bytes
+        // are the whole block, exactly as before.
+        let text = self
+            .engine
+            .routing_text_scoped(&self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
+        Ok(vec![PromptMessage::new_text(Role::User, text)])
     }
 
     /// The static bootstrap snippet, identical to what `crystalline prompt
@@ -1956,7 +3342,7 @@ impl McpServer {
     /// no hook carries it, it describes this connection's wire format rather
     /// than the knowledge, and a client that cannot read a tool result is
     /// worse off than one that read the routing block twice.
-    fn arrival_info(&self) -> ServerInfo {
+    fn arrival_info(&self) -> ServerConfig {
         let mut info = self.get_info();
         if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
             let mut instructions = crystalline_core::render_minimal_instructions();
@@ -1966,6 +3352,36 @@ impl McpServer {
             info.instructions = Some(instructions);
         }
         info
+    }
+
+    /// [`McpServer::arrival_info`] for the one arrival path that knows who is
+    /// asking: the 2026-07-28 era's `server/discover`, which carries a request
+    /// context where `initialize` carries none.
+    ///
+    /// Only the routing block is substituted, and only when the deployment's
+    /// onboarding decision left one there. Everything else - the minimal-block
+    /// decision, the TOON note, the server info, the capabilities - comes from
+    /// the shared builder, so the two arrival paths cannot grow a variant the
+    /// other lacks.
+    ///
+    /// A scope that cannot be resolved is an error rather than the unfiltered
+    /// block: onboarding that names a domain the caller may not see is exactly
+    /// what this exists to prevent, and a client that gets an error re-asks.
+    async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerConfig, ErrorData> {
+        let mut info = self.arrival_info();
+        if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
+            return Ok(info);
+        }
+        let mut instructions = self
+            .engine
+            .routing_text_scoped(scope)
+            .await
+            .map_err(to_error)?;
+        if self.engine.response_format() == ResponseFormat::Toon {
+            instructions.push_str(TOON_INSTRUCTIONS_NOTE);
+        }
+        info.instructions = Some(instructions);
+        Ok(info)
     }
 
     /// The resource links a `read_engram` result carries: one per distinct
@@ -1980,7 +3396,15 @@ impl McpServer {
     /// a dangling attachment reference is knowledge debt, and `evolve_engrams`
     /// is where debt is reported. A listing that cannot be read (a domain
     /// dropped between the read and this call) costs the links, never the read.
-    async fn attachment_links(&self, value: &Value) -> Vec<ContentBlock> {
+    ///
+    /// `scope` is the caller's, and the domain is re-checked against it before
+    /// the listing is read. Belt and braces: the value handed in came out of a
+    /// scoped `read_engram`, so its domain is one this caller may already see.
+    /// The engine's attachment listing takes a domain by name and no scope of
+    /// its own, though, so the check is made where the name is used rather than
+    /// assumed from where it came - and a resolver that cannot answer costs the
+    /// links rather than widening them.
+    async fn attachment_links(&self, value: &Value, scope: &Scope) -> Vec<ContentBlock> {
         let (Some(domain), Some(content)) = (
             value.get("domain").and_then(Value::as_str),
             value.get("content").and_then(Value::as_str),
@@ -1991,7 +3415,20 @@ impl McpServer {
         if refs.is_empty() {
             return Vec::new();
         }
-        let Ok(rows) = self.engine.attachment_list(domain).await else {
+        if self.engine.require_domain(domain, scope).await.is_err() {
+            return Vec::new();
+        }
+        // This reader's own view, so a draft-only attachment a draft
+        // references is a resource link for its author and nothing at all for
+        // anybody else. A screen that cannot be computed costs the links rather
+        // than widening them, exactly as an unresolvable view does.
+        let Ok(hidden) = self.engine.hidden_for(scope).await else {
+            return Vec::new();
+        };
+        let Ok(view) = DomainView::for_read(&self.engine, domain, &hidden, scope) else {
+            return Vec::new();
+        };
+        let Ok(rows) = view.attachments().await else {
             return Vec::new();
         };
         refs.iter()
@@ -2133,21 +3570,37 @@ impl ServerHandler for McpServer {
     /// alike. The daemon and the embedded stdio stack refresh the
     /// virtual-domain routing cache just before this runs, so the sync render
     /// reads a current cache and never blocks on the store. `server_info` is
-    /// also set explicitly: `ServerInfo::default()` leaves
+    /// also set explicitly: `ServerConfig::default()` leaves
     /// `Implementation::from_build_env()`, which would report the rmcp crate's
     /// own name and version to harness logs rather than crystalline's.
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
         // This field is the default `initialize` answer, and `initialize`
         // belongs to the legacy lifecycle, so it names the newest revision that
         // still has a handshake rather than the newest we serve. What we serve
         // is advertised through `supported_protocol_versions` and echoed by
         // `initialize` when a client asks for it. Set explicitly because
-        // `ServerInfo::default()` would leave rmcp's own `ProtocolVersion::
+        // `ServerConfig::default()` would leave rmcp's own `ProtocolVersion::
         // LATEST` here, which moves when the crate does.
         info.protocol_version = newest_legacy_handshake_version();
-        let mut instructions = self.engine.routing_text();
+        // **Which block, and why the transport decides it.** This method is
+        // synchronous and rmcp hands it no request context, so an HTTP server
+        // answering `initialize` has no caller to resolve and no way to leave a
+        // private domain's bullets out of a per-caller block. Naming every
+        // registered domain to whoever opened a session is what a private
+        // domain is not, so HTTP gets the countable half - every behavior rule,
+        // the number of domains, and the pointer at `list_domains`, which does
+        // resolve a caller and does filter. Stdio keeps the full block: that
+        // caller is the machine owner and has the files already.
+        //
+        // The era's own instructions channel does not go through here at all
+        // ([`McpServer::discover`] carries a request context and is scoped);
+        // this is the legacy lifecycle only.
+        let mut instructions = match self.transport {
+            Transport::Stdio => self.engine.routing_text(),
+            Transport::Http => self.engine.routing_text_counted(),
+        };
         if self.engine.response_format() == ResponseFormat::Toon {
             instructions.push_str(TOON_INSTRUCTIONS_NOTE);
         }
@@ -2192,7 +3645,7 @@ impl ServerHandler for McpServer {
     /// per-connection prohibition forbids, and the decision moved to the
     /// spawned process (see `McpServer::harness_onboarded`). What survives is
     /// what rmcp's own default does: publishing the peer info, which is what
-    /// `client_actor` and every `generated.by` write read afterwards, and the
+    /// `acting_actor` and every `generated.by` write read afterwards, and the
     /// version echo.
     ///
     /// # A version we do not serve is refused here, but only over HTTP
@@ -2279,19 +3732,22 @@ impl ServerHandler for McpServer {
         context.peer.set_peer_info(request);
 
         let mut info = self.arrival_info();
-        // Echo what the client asked for when we serve it - 2026-07-28
-        // included, which is how a client asks for the modern lifecycle
-        // through a handshake - and downgrade to the newest revision that
-        // still has a handshake otherwise. The fallback is read from our own
-        // list rather than left at `ServerInfo::default()`'s
+        // **We supply the downgrade target; rmcp decides the echo.** Whatever
+        // this handler returns is post-processed by rmcp's
+        // `negotiate_protocol_version` (`service/server.rs:480`) on every
+        // transport - stdio at `service/server.rs:652`, HTTP at
+        // `tower.rs:348` - which echoes the requested revision itself when it
+        // is a legacy one we support and otherwise adopts this value, or the
+        // newest legacy revision we advertise if this value is not legacy. So
+        // an echoing branch here would be inert: it can only ever hand rmcp a
+        // value it discards. What is left is the one thing rmcp reads, and it
+        // has to stay legacy for rmcp to take it.
+        //
+        // Read from our own list rather than left at `ServerConfig::default()`'s
         // `ProtocolVersion::LATEST`, so an rmcp whose LATEST moves cannot make
-        // us answer with a revision we do not serve, and it is capped below
-        // the era for the reasons on [`newest_legacy_handshake_version`].
-        info.protocol_version = if served {
-            requested
-        } else {
-            newest_legacy_handshake_version()
-        };
+        // us offer a revision we do not serve, and capped below the era for
+        // the reasons on [`newest_legacy_handshake_version`].
+        info.protocol_version = newest_legacy_handshake_version();
         Ok(info)
     }
 
@@ -2321,23 +3777,31 @@ impl ServerHandler for McpServer {
     /// (`daemon.rs`), or a discover-first client reads a stale virtual-domain
     /// index. The rest is rmcp's own construction:
     /// `DiscoverResult::from_server_info` carries `instructions` out of
-    /// `ServerInfo` untouched and sets `ttl_ms: 0` with `cache_scope: Private`
+    /// `ServerConfig` untouched and sets `ttl_ms: 0` with `cache_scope: Private`
     /// (rmcp 3.1.2 `model.rs:1246-1268`), which already satisfies the
     /// caching MUST for this operation.
     ///
     /// The client's own `_meta.clientInfo` is deliberately not read here. The
     /// specification says implementations "SHOULD NOT use them to change the
-    /// behavior of the client or server", and keying instructions on it would
-    /// additionally force a private cache scope on a result the spec wants
-    /// cacheable.
+    /// behavior of the client or server", so nothing a client *says* about
+    /// itself shapes this answer.
+    ///
+    /// What does shape it is the authorization on the request, which is the one
+    /// variation the caching rules provide for and which rmcp's own
+    /// construction already accounts for: `DiscoverResult::from_server_info`
+    /// sets `cache_scope: Private`, so a per-caller block is never cached
+    /// across callers. The block is rendered through
+    /// [`McpServer::arrival_info_scoped`], so a domain this caller may not see
+    /// is absent from its onboarding rather than named to it.
     async fn discover(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, ErrorData> {
         self.engine.refresh_routing_cache().await;
+        let info = self.arrival_info_scoped(&self.scope_of(&context)).await?;
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
-            self.arrival_info(),
+            info,
         ))
     }
 
@@ -2609,9 +4073,21 @@ impl ServerHandler for McpServer {
                 ..url
             };
             if let Some(path) = url.asset_path() {
-                let (bytes, row) = self
-                    .engine
-                    .attachment_read(&url.domain, path)
+                // An attachment uri names its domain outright, and nothing had
+                // to be read first to learn the name, so this is the one
+                // attachment path a caller can reach cold. A domain it may not
+                // see is refused exactly as an unregistered one - the same
+                // bytes, from the engine's own line - before the file is
+                // touched.
+                self.engine
+                    .require_domain(&url.domain, &self.scope_of(&context))
+                    .await
+                    .map_err(to_error)?;
+                let scope = self.scope_of(&context);
+                let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
+                let (bytes, row) = DomainView::for_read(&self.engine, &url.domain, &hidden, &scope)
+                    .map_err(to_error)?
+                    .attachment_bytes(path)
                     .await
                     .map_err(to_error)?;
                 return Ok(ReadResourceResult::new(vec![attachment_contents(
@@ -2619,7 +4095,9 @@ impl ServerHandler for McpServer {
                     bytes,
                     &row.mime,
                 )])
-                .with_cache_hints(&context)
+                // Private: this answer depends on who asked, unlike every
+                // other result this server hints (see [`CACHE_SCOPE`]).
+                .with_cache_hints_as(&context, CacheScope::Private)
                 .into());
             }
         }
@@ -2726,6 +4204,15 @@ fn attachment_contents(uri: &str, bytes: Vec<u8>, mime: &str) -> ResourceContent
 
 /// Wrap an engine value as a successful tool result. The compact JSON is the
 /// single text content block; callers that need structured data re-parse it.
+///
+/// **On the five write verbs that text can carry a trailer**, and a caller that
+/// re-parses one has to cut before it: a receipt may end with a horizontal rule
+/// on its own line (`\n\n---\n`) and one ride-along sentence after it
+/// ([`crate::nudge`]). The JSON in front of the rule is compact and therefore
+/// holds no raw newline of its own, so the first occurrence of that sequence is
+/// the cut. Nothing promises the text is JSON at the protocol level - these
+/// tools declare no output schema and set no structured content - so the rule
+/// is the contract.
 fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     let text = serde_json::to_string(&value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -2785,6 +4272,24 @@ fn ok_moved(value: Value) -> Result<CallToolResult, ErrorData> {
     Ok(result)
 }
 
+/// [`ok`] for a `split_engram` result, with the link pointing at the engram the
+/// split created: the one of the two the caller has not read yet.
+fn ok_split(value: Value) -> Result<CallToolResult, ErrorData> {
+    let link = (|| {
+        let domain = value.get("domain").and_then(Value::as_str)?;
+        let new = value.get("new")?;
+        let permalink = new.get("permalink").and_then(Value::as_str)?;
+        let title = new
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(permalink);
+        Some(engram_link(domain, permalink, title))
+    })();
+    let mut result = ok(value)?;
+    result.content.extend(link);
+    Ok(result)
+}
+
 /// The sentence `delete_engram` asks before it acts, rendered from
 /// [`crate::engine::Engine::delete_preview`]'s two shapes.
 ///
@@ -2814,6 +4319,103 @@ fn delete_question(preview: &Value) -> String {
     });
     let clause = preview_attachment_clause(enumerated.as_deref());
     format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
+}
+
+/// What an authenticated non-admin agent is told when it tries to change what
+/// this instance is: which domains are registered, how it is configured, and
+/// what it provisions into the harnesses on the machine it runs on.
+///
+/// The JSON API has always gated those admin-only; over MCP they were open to
+/// any account whose agent held a token, which is the last place the two
+/// surfaces disagreed. It names the role rather than the person, and it names
+/// the way out, because an agent that reads this has to be able to tell its
+/// user what to ask for.
+const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it, its settings and what it provisions into the harnesses on its machine - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
+
+/// The sentence `remove_domain` asks before it acts, rendered from
+/// [`crate::engine::Engine::domain_remove_preview`].
+///
+/// Names the domain, its kind and how much knowledge is in it, because those
+/// are the three things somebody needs in order to answer - and then says what
+/// actually happens to that knowledge, which is the half that differs by kind:
+/// a file domain's markdown stays on disk and is re-adopted by adding the
+/// folder again, while a virtual domain's rows are the knowledge and go with
+/// it.
+fn remove_domain_question(preview: &Value) -> String {
+    let domain = preview["domain"].as_str().unwrap_or_default();
+    let kind = preview["kind"].as_str().unwrap_or("file");
+    let held = match preview["engrams"].as_u64() {
+        Some(1) => " holding 1 engram".to_string(),
+        Some(n) => format!(" holding {n} engrams"),
+        // Two different absences, and a question about deleting somebody's
+        // knowledge owes them the difference. An index that could not be read
+        // is a number that exists and is unavailable, so the question says so
+        // instead of falling silent; a plain absence is a domain nothing has
+        // synced, and saying nothing beats claiming a count of zero.
+        None if preview["engrams_unknown"].as_bool().unwrap_or(false) => {
+            " whose engram count could not be read".to_string()
+        }
+        None => String::new(),
+    };
+    let consequence = match kind {
+        "virtual" => {
+            "Its engrams live in the database, so they are deleted with it and this cannot be \
+             undone."
+        }
+        // Never "add the folder again": that registers a plain local domain and
+        // drops the origin, the base commit and the team connection.
+        "team" => {
+            "Its local folder stays on disk exactly as it is and the GitHub repository is never \
+             touched, so nothing is removed for the rest of the team; reconnecting it is \
+             add_domain with the repository, not with the folder."
+        }
+        _ => {
+            "Its files stay on disk exactly as they are, so adding the folder again re-adopts \
+             them; the registration and the search index rows go."
+        }
+    };
+    format!(
+        "Unregister the {kind} domain '{domain}'{held}? {consequence}{}",
+        removal_drafts_clause(preview)
+    )
+}
+
+/// What the removal question says about the private drafts it would end, or
+/// nothing at all when there are none.
+///
+/// The drafts are the half of a removal that is really lost. A file domain's
+/// markdown stays on disk and a team domain's repository is never touched, but
+/// an actor's draft of a path lives in the index and in its mirror under the
+/// state directory and nowhere else, so ending the domain ends the drafts -
+/// including other people's, which is why the sentence names them per actor
+/// rather than as one number.
+fn removal_drafts_clause(preview: &Value) -> String {
+    if preview["drafts_unknown"].as_bool().unwrap_or(false) {
+        return " Whether anyone holds private drafts here could not be read.".to_string();
+    }
+    let Some(rows) = preview["drafts"].as_array().filter(|r| !r.is_empty()) else {
+        return String::new();
+    };
+    let total: u64 = rows
+        .iter()
+        .map(|r| r["entries"].as_u64().unwrap_or_default())
+        .sum();
+    let per_actor: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{} ({})",
+                r["actor"].as_str().unwrap_or("someone"),
+                r["entries"].as_u64().unwrap_or_default()
+            )
+        })
+        .collect();
+    let plural = if total == 1 { "" } else { "s" };
+    format!(
+        " It also ends {total} private draft{plural} - {} - which live in this index alone \
+         and cannot be brought back.",
+        per_actor.join(", ")
+    )
 }
 
 /// Whether a share plan has to be confirmed before it runs, given the plan's
@@ -2867,10 +4469,11 @@ fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
 /// about the layer they named.
 ///
 /// **Generated folder listings get one line at the end and no place in the
-/// list.** `index.md` files ride along with a share so the team repository
-/// stays browsable on the forge, and they are derived from the engrams beside
+/// list.** `index.md` files ride along with a share in a domain that declares
+/// `generated_indexes: shared`, and they are derived from the engrams beside
 /// them: counted among the changes they would crowd the real work out of the
-/// ten-file cap and say nothing in return. So they are summarized - "Also
+/// ten-file cap and say nothing in return. A domain that keeps its listings
+/// local has none of them here at all, and the line simply never appears. So they are summarized - "Also
 /// refreshes 3 folder indexes." - and a share carrying nothing else says that
 /// plainly instead of reading as a share of nothing.
 ///
@@ -2914,10 +4517,11 @@ fn share_question(preview: &Value) -> String {
     let title = preview["effective_title"].as_str().unwrap_or_default();
     let empty = Vec::new();
     let all = preview["changes"].as_array().unwrap_or(&empty);
-    // The generated folder listings are counted, never listed. They travel with
-    // the share so the team repository stays browsable, and a person deciding
-    // whether to publish is deciding about the engrams: ten paths of derived
-    // churn ahead of them would push the real work off the end of the cap.
+    // The generated folder listings are counted, never listed. A person
+    // deciding whether to publish is deciding about the engrams: ten paths of
+    // derived churn ahead of them would push the real work off the end of the
+    // cap. There are none to count unless the domain shares its listings, in
+    // which case the count is zero and the line is skipped.
     let indexes = all.iter().filter(|c| is_index_change(c)).count();
     let changes: Vec<&Value> = all.iter().filter(|c| !is_index_change(c)).collect();
     let (mut added, mut updated, mut deleted) = (0usize, 0usize, 0usize);
@@ -3245,6 +4849,69 @@ fn collision_question_text(p: &WriteParams, permalink: &str) -> String {
 /// one argument that would have replaced it.
 const COLLISION_REFUSAL: &str = "The overwrite was not confirmed, so the existing engram was left in place; nothing was written. Call write_engram again with overwrite=true if the user asks for it.";
 
+/// The sentence a wholesale overwrite of an open document asks instead of
+/// replacing it.
+///
+/// It names the three things the person deciding needs: which engram, who is
+/// in there, and that the whole document goes rather than a part of it. The
+/// permalink is the one the capture resolved to rather than the title typed at
+/// it, so a yes is given about the page that would actually be replaced.
+fn live_overwrite_question_text(p: &WriteParams, target: &LiveWriteTarget) -> String {
+    format!(
+        "'{}' in '{}' is open in a live editor (present: {}) with work nobody has saved yet, and this write replaces the whole document. Replace it wholesale?",
+        target.permalink,
+        p.domain.trim(),
+        present_names(&target.present)
+    )
+}
+
+/// The one question a capture asks when the permalink it would land on is both
+/// taken and open in a live editor.
+///
+/// Both questions in one sentence, because it is one act: the engram is there,
+/// somebody is in it with work nobody has saved, and a yes replaces the whole
+/// document. It is asked on the resolution key rather than the confirm key -
+/// see the round that returns it - so the answer that comes back is the one
+/// this verb already knows how to carry into a write.
+fn live_collision_question_text(p: &WriteParams, target: &LiveWriteTarget) -> String {
+    format!(
+        "'{}' would land at permalink '{}' which already exists in '{}' and is open in a live editor right now (present: {}), with work nobody has saved yet; this write replaces the whole document. Overwrite it, or cancel?",
+        p.title.trim(),
+        target.permalink,
+        p.domain.trim(),
+        present_names(&target.present)
+    )
+}
+
+/// What an unconfirmed wholesale overwrite tells the model: what is still
+/// standing, and the two ways forward.
+pub const LIVE_OVERWRITE_REFUSAL: &str = "The overwrite was not confirmed, so the live engram was left as its editor holds it; nothing was written. Use edit_engram for a targeted change, or call write_engram again with overwrite=true if the user asks for it.";
+
+/// [`LIVE_OVERWRITE_REFUSAL`] for a client that could not be asked, with the
+/// names it could not put the question to.
+///
+/// The same words plus the fact that makes them true here: nobody was asked,
+/// because this client has no way to ask anybody, and somebody is in the
+/// document all the same.
+fn live_overwrite_refusal(target: &LiveWriteTarget) -> String {
+    format!(
+        "{LIVE_OVERWRITE_REFUSAL} It is open in a live editor right now (present: {}), and this client cannot put the question to them.",
+        present_names(&target.present)
+    )
+}
+
+/// Who is in a room, for a sentence a person reads.
+///
+/// A room with connections but no published name is a real state - a browser
+/// that has not sent its awareness frame yet - and saying so plainly is better
+/// than an empty parenthesis that reads like a bug.
+fn present_names(present: &[String]) -> String {
+    match present.is_empty() {
+        true => "nobody has published a name".to_string(),
+        false => present.join(", "),
+    }
+}
+
 /// The sentence an `evolve_ack` assignment asks before it acts, rendered from
 /// [`crate::engine::Engine::ack_preview`].
 ///
@@ -3304,6 +4971,61 @@ fn refuse(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
     )]))
 }
 
+/// An engine error as the shape its content deserves: a refusal the model must
+/// read, or a protocol error.
+///
+/// The split [`McpServer::refuse_unwritable`] already makes, applied to an
+/// engine error rather than to a right. [`EngineError::Forbidden`] is raised
+/// only about something the caller can already see, and its whole content is
+/// teaching text naming who can - the skills tell an agent to relay exactly
+/// that rather than retry - so it goes back as a tool error the client renders,
+/// for the reason [`refuse`] states. [`EngineError::ConfirmationRequired`] is
+/// there for the same reason and a stronger one: its whole content is the flag
+/// that would let the call through, so a model that cannot read it cannot
+/// complete the task it was given. Everything else keeps [`to_error`]'s
+/// protocol shape, and the not-found in particular must: its bytes are what a
+/// hidden domain is answered with, and the two have to stay identical.
+fn refusal_or_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
+    match e {
+        EngineError::Forbidden(text) | EngineError::ConfirmationRequired(text) => {
+            refuse(text).map(CallToolResponse::from)
+        }
+        other => Err(to_error(other)),
+    }
+}
+
+/// An overlay write's own reading of [`EngineError::Refused`]: when the
+/// message is [`OVERLAY_NEEDS_IDENTITY`], it is teaching text a caller must
+/// see - "connect with your MCP token and try again" - not a mistake to
+/// retry blindly, so it goes back as a tool error the client renders, the
+/// same way [`refusal_or_error`] already reads `Forbidden` and
+/// `ConfirmationRequired`. `refuse_unwritable` already let this caller through
+/// by the time a write reaches this: the legacy open tier has no accounts to
+/// hold a member level, so that gate is not the one a review-mode domain's
+/// missing identity trips. Every other `Refused` message keeps [`to_error`]'s
+/// protocol shape, unchanged.
+///
+/// **Every verb that resolves a sharer's identity reads its errors through
+/// this**, not only the write verbs: a share, a withdrawal and a conflict
+/// resolution in a reviewing domain are all about somebody's draft, so an
+/// agent with no identity has nothing to share, withdraw or settle and is told
+/// how to get one. The tool descriptions teach that sentence, so a caller that
+/// meets this refusal did what it was told, and an opaque protocol error would
+/// leave it nothing to do next.
+///
+/// **One helper, and the shape is the call site's.** A tool function that
+/// answers [`CallToolResponse`] rather than the bare [`CallToolResult`] this
+/// reads adds `.map(CallToolResponse::from)` where it knows which it is; a
+/// second helper that did only that wrapping was one name for no decision.
+fn overlay_write_error(e: EngineError) -> Result<CallToolResult, ErrorData> {
+    match &e {
+        EngineError::Refused(message) if message == OVERLAY_NEEDS_IDENTITY => {
+            refuse(message.clone())
+        }
+        _ => Err(to_error(e)),
+    }
+}
+
 /// Map an engine error to an rmcp tool error with an actionable message.
 fn to_error(e: EngineError) -> ErrorData {
     match e {
@@ -3313,11 +5035,20 @@ fn to_error(e: EngineError) -> ErrorData {
         | EngineError::Conflict(_)
         | EngineError::Invalid(_)
         | EngineError::ReadOnly
+        // The caller asked for something they are not allowed to do, and the
+        // message says who is: input-class guidance, like the read-only
+        // refusal above it.
+        | EngineError::Forbidden(_)
+        | EngineError::ConfirmationRequired(_)
         | EngineError::EnvTokenConnect
         // The caller asked at the wrong moment rather than for the wrong
         // thing, and the message says to try again once the other sign-in is
         // done: actionable input-class guidance, like the two above it.
-        | EngineError::ConnectInProgress => ErrorData::invalid_params(e.to_string(), None),
+        | EngineError::ConnectInProgress
+        // The domain takes changes in a shape this call did not satisfy, and
+        // the message is the way in: input-class guidance again, and an agent
+        // that reads it can retry correctly in one step.
+        | EngineError::Refused(_) => ErrorData::invalid_params(e.to_string(), None),
         EngineError::Remote(remote) => remote_to_error(remote),
         EngineError::Io { .. } | EngineError::Internal(_) => {
             ErrorData::internal_error(e.to_string(), None)
@@ -3342,9 +5073,11 @@ fn to_error(e: EngineError) -> ErrorData {
 /// `invalid_params`-shaped. A refusal in particular must never land in the
 /// server-error class: its whole content is the way out of the situation the
 /// caller put themselves in, and an "internal error" verdict in front of it
-/// tells the caller the opposite of what the message says. This match is
-/// exhaustive over `RemoteError` so a new variant must be classified here
-/// rather than silently defaulting.
+/// tells the caller the opposite of what the message says. The two
+/// organization-policy refusals sit in that same class for the same reason:
+/// nothing is broken here, and the message names the page that clears it.
+/// This match is exhaustive over `RemoteError` so a new variant must be
+/// classified here rather than silently defaulting.
 fn remote_to_error(e: RemoteError) -> ErrorData {
     let message = e.to_string();
     match e {
@@ -3366,6 +5099,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::StacksUnsupported
         | RemoteError::Refused(_)
+        | RemoteError::SsoAuthorizationRequired { .. }
+        | RemoteError::OauthAppRestricted { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }
@@ -3375,6 +5110,297 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// A client name past [`AGENT_LABEL_CLIENT_CHARS`] is cut, and the cut
+    /// carries a trailing `...` so it reads as a cut rather than as the
+    /// whole of what the client reported. A name at or under the cap is
+    /// untouched.
+    #[test]
+    fn display_client_marks_a_cut_name_as_cut() {
+        let long = "x".repeat(AGENT_LABEL_CLIENT_CHARS + 10);
+        let shown = display_client(&long).expect("a name of legible characters");
+        assert!(
+            shown.ends_with("..."),
+            "a truncated name must say so: {shown}"
+        );
+        assert_eq!(
+            shown.chars().count(),
+            AGENT_LABEL_CLIENT_CHARS + 3,
+            "the cap's characters plus the three that mark the cut: {shown}"
+        );
+
+        let exact = "y".repeat(AGENT_LABEL_CLIENT_CHARS);
+        let shown = display_client(&exact).expect("a name of legible characters");
+        assert_eq!(
+            shown, exact,
+            "a name at the cap exactly is not truncated and carries no mark"
+        );
+    }
+
+    /// **Ruling M2.** On the tier where MCP authentication is off, nobody is
+    /// authenticated and nothing is filed under a name - so however the client
+    /// names itself, it gets no chip in anybody's strip.
+    ///
+    /// The half a caller chooses may only ever FOLLOW an account the server
+    /// resolved. Letting it lead would put a name of the caller's choosing
+    /// beside a person's own name in their own document, which is the one
+    /// thing a participant strip must not be able to say.
+    #[test]
+    fn an_unauthenticated_caller_gets_no_chip_however_it_names_itself() {
+        // What `agent_peer` resolves on that tier: no gate identity at all,
+        // and no draft identity either.
+        let nobody = presence_identity(None, &Scope::Anonymous);
+        assert!(nobody.is_none(), "the open tier holds nobody in particular");
+        assert!(
+            presence_label(nobody, display_client("Grace Hopper")).is_none(),
+            "so there is nobody to put in the strip"
+        );
+        // An account is what earns one, and the harness then follows it.
+        let peer = presence_label(
+            presence_identity(Some("ada".to_string()), &Scope::Anonymous),
+            display_client("claude-code/2.0"),
+        )
+        .expect("an authenticated caller is a peer");
+        assert_eq!(peer.account, "ada");
+        assert_eq!(peer.label, "ada (agent: claude-code/2.0)");
+        let bare = presence_label(
+            presence_identity(Some("ada".to_string()), &Scope::Anonymous),
+            None,
+        )
+        .expect("an account is enough");
+        assert_eq!(bare.label, "ada (agent)");
+    }
+
+    /// **A local agent is "you" in the strip, never the owner's filing name.**
+    ///
+    /// A stdio session has no gate to resolve an account, so the identity it
+    /// acts with is the machine owner's - the name that session's drafts are
+    /// filed under. Drawn as it stands, the only person who can be reading
+    /// that strip is told somebody called `owner` is in their document, which
+    /// is themselves. The word for that is "you", and the harness still
+    /// follows it so two agents of one person are told apart.
+    ///
+    /// **The substitution is made where the two sources are still apart.** An
+    /// account the gate resolved that happens to be named `owner` is a remote
+    /// person like anybody else and keeps their own name; only the local
+    /// session with no gate at all is you.
+    #[test]
+    fn a_local_sessions_agent_is_you_in_the_owners_own_strip() {
+        let peer = presence_label(
+            presence_identity(None, &Scope::Unrestricted),
+            display_client("claude-code/2.0"),
+        )
+        .expect("a local session acts as somebody");
+        assert_eq!(peer.label, "you (agent: claude-code/2.0)");
+        assert_eq!(
+            peer.account,
+            crate::engine::OWNER_IDENTITY_NAME,
+            "while presence stays keyed by the identity the work is filed under"
+        );
+        let bare = presence_label(presence_identity(None, &Scope::Unrestricted), None)
+            .expect("an identity is enough");
+        assert_eq!(bare.label, "you (agent)");
+
+        let remote = presence_label(
+            presence_identity(
+                Some(crate::engine::OWNER_IDENTITY_NAME.to_string()),
+                &Scope::Anonymous,
+            ),
+            None,
+        )
+        .expect("an authenticated account is a peer");
+        assert_eq!(
+            remote.label,
+            format!("{} (agent)", crate::engine::OWNER_IDENTITY_NAME),
+            "an account the gate resolved is never you, whatever it is called"
+        );
+    }
+
+    /// A join a server object opened ends when THAT OBJECT ends - and only
+    /// when the object is what holds it.
+    ///
+    /// The pin under ruling I1's first half: a stdio process and a legacy MCP
+    /// session are each one `McpServer` for their whole life, so the object
+    /// going away is the holder ending. Nothing else is ended by it: the same
+    /// account's browser session is a different holder with a key of its own,
+    /// which is what keeps an agent's ending out of a person's window.
+    #[test]
+    fn a_server_objects_joins_end_with_it_when_it_is_the_holder() {
+        let registry = Arc::new(crate::join::Joins::default());
+        let agents = crate::join::Join {
+            account: "bob".to_string(),
+            holder: crate::join::Holder::McpSession("session-1".to_string()),
+            domain: "team".to_string(),
+            path: "fresh.md".to_string(),
+            owner: "alice".to_string(),
+            expires_at: None,
+        };
+        let browsers = crate::join::Join {
+            holder: crate::join::Holder::Browser("csrf-bob".to_string()),
+            ..agents.clone()
+        };
+        let agent_key = registry.open(agents.clone()).unwrap();
+        let browser_key = registry.open(browsers).unwrap();
+        assert_ne!(agent_key, browser_key, "two holders, two keys");
+
+        let session = SessionJoins::new(registry.clone());
+        session.remember(&agents, agent_key.clone());
+        session.remember(&agents, agent_key.clone());
+        assert_eq!(session.lock().len(), 1, "one key, however often remembered");
+
+        drop(session);
+        assert_eq!(
+            registry.get(&agent_key, "bob"),
+            None,
+            "the session ended, so its join did"
+        );
+        assert!(
+            registry.get(&browser_key, "bob").is_some(),
+            "and the person's browser is still inside the draft it joined"
+        );
+        assert!(registry.holds(
+            "bob",
+            &crate::join::Holder::Browser("csrf-bob".to_string()),
+            "team",
+            "alice",
+            "fresh.md"
+        ));
+    }
+
+    /// A stateless peer's join is not ended by the request that opened it.
+    ///
+    /// The pin under ruling I1's second half. On the streamable-HTTP transport
+    /// a modern-era peer gets a fresh server object per POST, so this object's
+    /// `Drop` runs at the end of the very call that presented the link.
+    /// Nothing is remembered for a token identity, so nothing is ended, and
+    /// the registry is where the next request finds the join.
+    #[test]
+    fn a_stateless_peers_join_is_not_ended_by_the_request_that_opened_it() {
+        let registry = Arc::new(crate::join::Joins::default());
+        let join = crate::join::Join {
+            account: "bob".to_string(),
+            holder: crate::join::Holder::Token("bob".to_string()),
+            domain: "team".to_string(),
+            path: "fresh.md".to_string(),
+            owner: "alice".to_string(),
+            expires_at: None,
+        };
+        let key = registry.open(join.clone()).unwrap();
+
+        // The POST that presented the link.
+        let first = SessionJoins::new(registry.clone());
+        first.remember(&join, key.clone());
+        assert!(
+            first.lock().is_empty(),
+            "a token identity's join is not this object's to end"
+        );
+        drop(first);
+        assert!(
+            registry.get(&key, "bob").is_some(),
+            "so the join outlives the request that opened it"
+        );
+
+        // The next POST, a different object, finds it in the registry.
+        let second = SessionJoins::new(registry.clone());
+        assert_eq!(
+            registry.held_by(
+                "bob",
+                &crate::join::Holder::Token("bob".to_string()),
+                "team"
+            ),
+            vec![join],
+            "which is where a stateless peer's second request looks"
+        );
+        drop(second);
+    }
+
+    /// A join another holder is holding is not this object's, whatever account
+    /// it belongs to.
+    ///
+    /// Said from the browser's side: bob's browser is inside alice's draft, so
+    /// the registry holds a join for his account - and bob's agent, which
+    /// authenticates as bob, opened nothing and is therefore inside nothing.
+    #[test]
+    fn another_holders_join_is_not_this_objects() {
+        let registry = Arc::new(crate::join::Joins::default());
+        let browser = crate::join::Holder::Browser("csrf-bob".to_string());
+        let browser_key = registry
+            .open(crate::join::Join {
+                account: "bob".to_string(),
+                holder: browser.clone(),
+                domain: "team".to_string(),
+                path: "fresh.md".to_string(),
+                owner: "alice".to_string(),
+                expires_at: None,
+            })
+            .unwrap();
+        let agent = SessionJoins::new(registry.clone());
+        assert!(
+            registry
+                .held_by(
+                    "bob",
+                    &crate::join::Holder::Token("bob".to_string()),
+                    "team"
+                )
+                .is_empty(),
+            "the agent's holder opened nothing, so it is inside nothing"
+        );
+        assert!(
+            registry.holds("bob", &browser, "team", "alice", "fresh.md"),
+            "while the window that joined it is inside it"
+        );
+        drop(agent);
+        assert!(
+            registry.get(&browser_key, "bob").is_some(),
+            "and an agent ending leaves a join it never opened alone"
+        );
+    }
+
+    /// **The join is the server's word, at any position and any multiplicity.**
+    ///
+    /// The rule this pins is structural: whatever a client calls itself, the
+    /// half that reaches the composition cannot contain `-for-`, so the shape
+    /// `<client>-for-<account>` on disk can only have been written by a server
+    /// that resolved an account. The `x-for-for-ada` case is the one a textual
+    /// deletion gets wrong - one non-overlapping pass consumes the first join
+    /// and re-joins its neighbours into a second one.
+    #[test]
+    fn no_client_name_survives_carrying_the_join() {
+        for (client, expected) in [
+            // The straightforward attempt, and the layered one.
+            ("x-for-ada", "x-ada"),
+            ("x-for-for-ada", "x-ada"),
+            ("x-for-for-for-ada", "x-ada"),
+            // Case is not a hiding place, even though the server's own join is
+            // always lowercase.
+            ("x-FOR-ada", "x-ada"),
+            ("x-For-ada", "x-ada"),
+            // The join at either end is not a join, and goes all the same.
+            ("for-ada", "ada"),
+            ("x-for", "x"),
+            // Empty runs collapse with the words that made them, so a doubled
+            // separator cannot smuggle one back in either.
+            ("x-for--ada", "x-ada"),
+            ("x--for--ada", "x-ada"),
+            // A name that is nothing but the word leaves nothing, which
+            // `acting_actor` reads as no client at all.
+            ("for", ""),
+            ("for-for", ""),
+            // `for` inside a word is a word, not the join, and is untouched.
+            ("waiting-forever/1.0", "waiting-forever/1.0"),
+            ("xfor-ada", "xfor-ada"),
+            ("x-fora-ada", "x-fora-ada"),
+            // The ordinary case pays nothing.
+            ("claude-code/2.0", "claude-code/2.0"),
+        ] {
+            let stripped = without_the_join(client);
+            assert_eq!(stripped, expected, "stripping {client}");
+            assert!(
+                !stripped.contains("-for-"),
+                "no client half may carry the join: {client} -> {stripped}"
+            );
+        }
+    }
 
     /// One `inputResponses` map holding `value` under the `confirm` key.
     fn responses(value: Value) -> Option<rmcp::model::InputResponses> {
@@ -3392,6 +5418,134 @@ mod tests {
     /// key it was asked for. Everything else that is an answer is a no, and
     /// only the genuine absence of an answer is [`None`], because that is what
     /// opens round one.
+    /// The removal question knows three kinds, and the half that differs by
+    /// kind is the RECOVERY rather than the wording.
+    ///
+    /// The team case is the one worth a test of its own: re-adding a team
+    /// domain's folder registers a plain local domain and drops the origin, so
+    /// a question that offered that recovery would be telling somebody the
+    /// wrong thing inside a destructive confirmation. It rendered as "file"
+    /// before, which is exactly the mistake this pins.
+    #[test]
+    fn the_removal_question_speaks_for_all_three_kinds() {
+        let question = |kind: &str, engrams: Value| {
+            remove_domain_question(&json!({
+                "domain": "kb",
+                "kind": kind,
+                "engrams": engrams,
+                "files_kept": kind != "virtual",
+            }))
+        };
+
+        let file = question("file", json!(4));
+        assert!(file.contains("file domain 'kb'"), "{file}");
+        assert!(file.contains("holding 4 engrams"), "{file}");
+        assert!(file.contains("adding the folder again"), "{file}");
+
+        let team = question("team", json!(1));
+        assert!(team.contains("team domain 'kb'"), "{team}");
+        assert!(team.contains("holding 1 engram"), "{team}");
+        assert!(
+            team.contains("repository is never touched"),
+            "the team's copy is safe, and the question says so: {team}"
+        );
+        assert!(
+            team.contains("with the repository, not with the folder"),
+            "and it names the recovery that actually restores a team domain: {team}"
+        );
+        assert!(
+            !team.contains("adding the folder again re-adopts"),
+            "never the local recovery, which would drop the origin: {team}"
+        );
+
+        let virt = question("virtual", json!(2));
+        assert!(virt.contains("virtual domain 'kb'"), "{virt}");
+        assert!(virt.contains("cannot be undone"), "{virt}");
+
+        // A domain the index has no row for says how much is at stake by
+        // saying nothing, rather than claiming a count of zero.
+        let unknown = question("file", Value::Null);
+        assert!(unknown.contains("domain 'kb'?"), "{unknown}");
+        assert!(!unknown.contains("holding"), "{unknown}");
+
+        // A count that could not be read is the other absence, and the
+        // question owes a caller the difference: this one is a number that
+        // exists and is unavailable, not a domain that has synced nothing.
+        let unreadable = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "virtual",
+            "engrams": Value::Null,
+            "engrams_unknown": true,
+            "files_kept": false,
+        }));
+        assert!(
+            unreadable.contains("whose engram count could not be read"),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.contains("cannot be undone"),
+            "and it still spells out what the removal costs: {unreadable}"
+        );
+        assert!(!unreadable.contains("holding"), "{unreadable}");
+    }
+
+    /// Private drafts are the half of a removal nobody can get back: a file
+    /// domain's markdown stays on disk and a team's repository is untouched,
+    /// but an actor's draft lives in the index and its mirror alone, and the
+    /// removal takes both. So the question names them, per actor, before
+    /// anybody answers it.
+    #[test]
+    fn the_removal_question_names_the_private_drafts_it_would_end() {
+        let with = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "file",
+            "engrams": 4,
+            "drafts": [
+                { "actor": "alice", "entries": 2 },
+                { "actor": "bob", "entries": 1 },
+            ],
+            "drafts_unknown": false,
+            "files_kept": true,
+        }));
+        // The whole sentence, byte for byte. This is the text somebody reads
+        // before agreeing to a destructive removal, so it is pinned rather than
+        // probed with substrings: a `contains` on either side of a hole in the
+        // middle of a sentence passes over a sentence with a hole in it.
+        assert_eq!(
+            with,
+            "Unregister the file domain 'kb' holding 4 engrams? Its files stay on disk exactly \
+             as they are, so adding the folder again re-adopts them; the registration and the \
+             search index rows go. It also ends 3 private drafts - alice (2), bob (1) - which \
+             live in this index alone and cannot be brought back."
+        );
+
+        // Nobody drafting here says nothing at all: the question stays the
+        // sentence it was.
+        let without = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "file",
+            "engrams": 4,
+            "drafts": [],
+            "drafts_unknown": false,
+            "files_kept": true,
+        }));
+        assert!(!without.contains("draft"), "{without}");
+
+        // And a journal that could not be read is said, not guessed at.
+        let unknown = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "file",
+            "engrams": 4,
+            "drafts": [],
+            "drafts_unknown": true,
+            "files_kept": true,
+        }));
+        assert!(
+            unknown.contains("could not be read"),
+            "an unreadable journal is not the same answer as nobody drafting: {unknown}"
+        );
+    }
+
     #[test]
     fn confirmed_says_yes_to_one_shape_and_no_to_every_other() {
         let yes = [json!({ "action": "accept", "content": { "confirm": true } })];
@@ -4105,9 +6259,15 @@ mod tests {
             RemoteError::RepoNotFound {
                 repo: "acme/brand-knowledge".to_string(),
             },
+            // Carries a candidate so this loop's `assert_eq!(err.message,
+            // message)` below actually exercises that the suggestion clause
+            // reaches the MCP caller verbatim rather than being trimmed to
+            // the refusal's first line.
             RemoteError::NotADomain {
                 repo: "acme/brand-knowledge".to_string(),
                 path: None,
+                candidates: vec!["memory".to_string()],
+                more_candidates: 0,
             },
             RemoteError::ConflictsPending { count: 2 },
             RemoteError::ProposalNotFound { number: 7 },
@@ -4123,6 +6283,17 @@ mod tests {
             RemoteError::ConflictNotFound {
                 path: "notes/a.md".to_string(),
                 open: vec![],
+            },
+            // An organization policy refusal is nobody's server fault: the
+            // token works, and the message names the GitHub page that clears
+            // it. An internal-error verdict in front of that would tell the
+            // caller to wait out a failure they are meant to go and fix.
+            RemoteError::SsoAuthorizationRequired {
+                org: "acme".to_string(),
+                url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+            },
+            RemoteError::OauthAppRestricted {
+                org: "acme".to_string(),
             },
         ];
         for e in cases {
@@ -4568,6 +6739,26 @@ mod tests {
         assert!(
             PROVISION_NOT_DECLARED.contains("status"),
             "{PROVISION_NOT_DECLARED}"
+        );
+    }
+
+    /// The refusal a non-admin agent reads names every class of change it
+    /// gates, provisioning included: a message that names two of three leaves
+    /// somebody refused on `provision apply` reading a sentence about
+    /// something else.
+    #[test]
+    fn the_instance_admin_refusal_names_provisioning_too() {
+        assert!(
+            INSTANCE_ADMIN_ONLY.contains("domains registered on it"),
+            "{INSTANCE_ADMIN_ONLY}"
+        );
+        assert!(
+            INSTANCE_ADMIN_ONLY.contains("settings"),
+            "{INSTANCE_ADMIN_ONLY}"
+        );
+        assert!(
+            INSTANCE_ADMIN_ONLY.contains("provision"),
+            "the third class is the one the message forgot: {INSTANCE_ADMIN_ONLY}"
         );
     }
 }

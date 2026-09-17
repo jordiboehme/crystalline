@@ -55,9 +55,27 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/auth/logout",
     "GET /api/v1/auth/me",
     "POST /api/v1/auth/setup",
+    "GET /api/v1/auth/oidc/login",
+    "POST /api/v1/auth/oidc/login",
+    "GET /api/v1/auth/oidc/callback",
+    "GET /api/v1/auth/providers",
+    "POST /api/v1/oauth/register",
+    "GET /api/v1/oauth/authorize",
+    "GET /api/v1/oauth/authorizations/{id}",
+    "POST /api/v1/oauth/authorizations/{id}",
+    "POST /api/v1/oauth/token",
+    "GET /api/v1/me/identity-links",
+    "DELETE /api/v1/me/identity-links/{issuer}",
     "GET /api/v1/domains",
     "POST /api/v1/domains",
     "DELETE /api/v1/domains/{domain}",
+    "PUT /api/v1/domains/{domain}/review",
+    "GET /api/v1/domains/{domain}/drafts",
+    "PUT /api/v1/domains/{domain}/visibility",
+    "GET /api/v1/domains/{domain}/members",
+    "PUT /api/v1/domains/{domain}/members/{principal}",
+    "DELETE /api/v1/domains/{domain}/members/{principal}",
+    "PUT /api/v1/domains/{domain}/owner",
     "GET /api/v1/domains/{domain}/sync",
     "POST /api/v1/domains/{domain}/sync",
     "GET /api/v1/domains/{domain}/sync/changes",
@@ -107,6 +125,18 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/me/github-identity",
     "POST /api/v1/me/github-identity/connect",
     "PUT /api/v1/me/github-identity/token",
+    "GET /api/v1/me/mcp-tokens",
+    "POST /api/v1/me/mcp-tokens",
+    "POST /api/v1/me/mcp-tokens/{id}/rotate",
+    "DELETE /api/v1/me/mcp-tokens/{id}",
+    "GET /api/v1/me/oauth-grants",
+    "DELETE /api/v1/me/oauth-grants/{id}",
+    "GET /api/v1/domains/{domain}/draft-links",
+    "POST /api/v1/domains/{domain}/draft-links",
+    "DELETE /api/v1/draft-links/{id}",
+    "POST /api/v1/draft-links/accept",
+    "POST /api/v1/draft-links/join",
+    "POST /api/v1/draft-links/leave",
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.
@@ -167,6 +197,12 @@ struct Inner {
     /// provider call at all (disabled, unauthenticated, or paused for a rate
     /// limit).
     branch_head_calls: usize,
+    /// A branch move armed to happen right AFTER the nth `branch_head` probe
+    /// answers: `(n, branch, commit)`. Set through
+    /// `MockProvider::move_branch_after_head_probes`, and the only way a test
+    /// can put an upstream advance in the middle of one engine call - which is
+    /// the window a share of a reviewing domain has to be safe across.
+    branch_move_after_probe: Option<(usize, String, String)>,
     /// How many times `tarball` has been called, for the connect-race test:
     /// a first connect parks mid-download while an identical retry queues on
     /// the origin lock, so a count of exactly one proves the retry answered
@@ -356,6 +392,20 @@ impl MockProvider {
         self.inner.lock().unwrap().branch_head_calls
     }
 
+    /// Moves `branch` to `commit` right after the `probe`th `branch_head` call
+    /// answers, counting from the first call this provider ever served.
+    ///
+    /// The one way a test can advance the remote in the middle of a single
+    /// engine call: a share of a domain that reviews changes pulls the folder
+    /// and then proposes, and what happens when the team's copy moves between
+    /// those two steps is a behaviour rather than a race to be hoped away. The
+    /// probe that triggers it still answers with the head as it stood, so the
+    /// move is strictly after it.
+    pub fn move_branch_after_head_probes(&self, probe: usize, branch: &str, commit: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.branch_move_after_probe = Some((probe, branch.to_string(), commit.to_string()));
+    }
+
     /// Arms a gate that blocks every `tarball` download until the returned
     /// sender flips it open, and starts counting `tarball` calls. The
     /// connect-race test uses it to park a first connect mid-download while
@@ -387,6 +437,21 @@ impl MockProvider {
     /// request.
     pub fn branch_commit(&self, branch: &str) -> Option<String> {
         self.inner.lock().unwrap().branches.get(branch).cloned()
+    }
+
+    /// One file's bytes as `commit` holds them, or `None` when that commit
+    /// holds nothing at that path.
+    ///
+    /// What a proposal actually carries, read off the tree the share built:
+    /// a receipt naming a path says the share decided to carry it, and this
+    /// says the bytes travelled with the decision.
+    pub fn commit_file(&self, commit: &str, path: &str) -> Option<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .and_then(|c| c.files.get(path).cloned())
     }
 
     /// The provider calls made so far, in order, for asserting the exact
@@ -510,14 +575,26 @@ impl Provider for MockProvider {
             }
         })?;
         let current = inner.etags.get(&origin.branch).cloned();
-        if etag.is_some() && etag == current.as_deref() {
-            Ok(HeadProbe::Unchanged)
+        let answer = if etag.is_some() && etag == current.as_deref() {
+            HeadProbe::Unchanged
         } else {
-            Ok(HeadProbe::Changed {
+            HeadProbe::Changed {
                 head: commit,
                 etag: current,
-            })
+            }
+        };
+        // Armed moves fire after the answer is fixed, so this probe reports the
+        // head as it stood and the next one sees the advance.
+        if let Some((probe, branch, target)) = inner.branch_move_after_probe.clone()
+            && inner.branch_head_calls == probe
+        {
+            inner.branch_move_after_probe = None;
+            inner.etag_counter += 1;
+            let etag = format!("etag{}", inner.etag_counter);
+            inner.branches.insert(branch.clone(), target);
+            inner.etags.insert(branch, etag);
         }
+        Ok(answer)
     }
 
     async fn compare(
@@ -1017,6 +1094,153 @@ impl EmbeddingProvider for CountingEmbedder {
     }
 }
 
+/// The marker words that decide an engram's axis under [`TopicEmbedder`].
+pub const TOPICS: [&[&str]; 3] = [
+    &["retry", "retries", "backoff", "queue", "dead-letter", "ttl"],
+    &["docking", "clamp", "clamps", "thrust", "seats", "bay"],
+    &["token", "login", "session", "auth", "cookie", "csrf"],
+];
+
+/// A deterministic provider that embeds by topic: every marker word adds to
+/// its topic's axis, everything else lands on a fourth "none" axis when no
+/// marker appears at all. Two texts about one topic are identical vectors;
+/// texts about different topics are orthogonal; a manifest or a random note
+/// is orthogonal to every topic. That is what makes "a neighbour appears" and
+/// "the receipt stays quiet" both assertable, where a hash-bucket provider
+/// makes unrelated prose look alike.
+pub struct TopicEmbedder;
+
+impl TopicEmbedder {
+    pub fn embed_one(text: &str) -> Vec<f32> {
+        let mut v = [0f32; 4];
+        for word in text
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|w| !w.is_empty())
+        {
+            let w = word.to_lowercase();
+            for (axis, words) in TOPICS.iter().enumerate() {
+                if words.contains(&w.as_str()) {
+                    v[axis] += 1.0;
+                }
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return vec![0.0, 0.0, 0.0, 1.0];
+        }
+        v.iter().map(|x| x / norm).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for TopicEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| TopicEmbedder::embed_one(t)).collect())
+    }
+
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+/// A provider that answers like [`TopicEmbedder`] after sleeping `delay`, for
+/// the probe timeout path.
+pub struct SleepyEmbedder {
+    pub delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for SleepyEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        tokio::time::sleep(self.delay).await;
+        Ok(texts.iter().map(|t| TopicEmbedder::embed_one(t)).collect())
+    }
+
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+// --- tracing capture --------------------------------------------------------
+
+/// Every `tracing` event emitted while this is the thread's default
+/// subscriber, rendered as `LEVEL message field=value ...` lines.
+///
+/// Held behind an `Arc` so the layer installed in the subscriber and the test
+/// reading the lines are the same buffer. Thread-local rather than global on
+/// purpose: `#[tokio::test]` runs its whole future, spawned tasks included, on
+/// the one thread, so the guard covers a background device flow too, and two
+/// tests in the same binary cannot capture each other's lines.
+#[derive(Clone, Default)]
+pub struct CapturedLogs(Arc<Mutex<Vec<String>>>);
+
+impl CapturedLogs {
+    /// The captured lines so far, oldest first.
+    pub fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Whether some captured line contains `needle`.
+    pub fn any_contains(&self, needle: &str) -> bool {
+        self.lines().iter().any(|l| l.contains(needle))
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use std::fmt::Write as _;
+
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                if field.name() == "message" {
+                    let _ = write!(self.0, " {value:?}");
+                } else {
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+        }
+
+        let mut line = String::new();
+        let _ = write!(line, "{}", event.metadata().level());
+        event.record(&mut Fields(&mut line));
+        self.0.lock().unwrap().push(line);
+    }
+}
+
+/// Installs [`CapturedLogs`] as this thread's default subscriber, returning
+/// the buffer and the guard that keeps it installed. Drop the guard (or let
+/// the test end) to restore the previous default.
+pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::registry().with(logs.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    (logs, guard)
+}
+
 // --- GitHub connect auth: shared test double --------------------------------
 
 /// A fake [`ConnectAuth`] for the `configure` tool's connect actions and the
@@ -1031,7 +1255,11 @@ impl EmbeddingProvider for CountingEmbedder {
 /// narrower convenience constructors for tests that only need a
 /// token-validate acceptor or a device flow that always fails once released.
 pub struct StubConnectAuth {
-    start_result: Mutex<Option<Result<DeviceFlowStart, RemoteError>>>,
+    /// The device-flow starts to hand out, in order, one per call. A queue
+    /// rather than a single one-shot because a restart asks the same double
+    /// for a SECOND code, and the test that proves the code changed needs the
+    /// two to differ (see [`StubConnectAuth::queue_start`]).
+    start_results: Mutex<std::collections::VecDeque<Result<DeviceFlowStart, RemoteError>>>,
     /// Gates `run_device_flow`'s completion; a test releases it with
     /// `auth.run_gate.notify_one()` once it has observed the "still waiting
     /// on the user" state.
@@ -1042,6 +1270,33 @@ pub struct StubConnectAuth {
     /// consuming `validate_result`, so a connect in any test never panics on
     /// a used-up one-shot outcome. Backs [`StubConnectAuth::accepting`].
     accept_any: Option<String>,
+    /// Set when a `run_device_flow` future is dropped before it produced an
+    /// answer - which is exactly what an abandoned flow's aborted task looks
+    /// like from inside the double. Read with
+    /// [`StubConnectAuth::run_was_abandoned`]. A future that runs to
+    /// completion disarms its witness first, so a normal landing never sets
+    /// this.
+    run_abandoned: Arc<std::sync::atomic::AtomicBool>,
+    /// Set the moment a `run_device_flow` future is first polled, so a test
+    /// that wants to abandon a flow can first wait until there is something
+    /// to abandon - a spawned task that has never been polled would be
+    /// aborted before it entered the double at all.
+    run_entered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Set on drop unless disarmed: how [`StubConnectAuth`] notices that the
+/// engine abandoned a device flow instead of letting it finish.
+struct RunWitness {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for RunWitness {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// The general one-shot double (the original `FakeConnectAuth` constructor):
@@ -1053,11 +1308,13 @@ pub fn fake_auth(
     validate: Result<String, RemoteError>,
 ) -> Arc<StubConnectAuth> {
     Arc::new(StubConnectAuth {
-        start_result: Mutex::new(Some(start)),
+        start_results: Mutex::new(std::collections::VecDeque::from([start])),
         run_gate: Arc::new(tokio::sync::Notify::new()),
         run_result: Mutex::new(Some(run)),
         validate_result: Mutex::new(Some(validate)),
         accept_any: None,
+        run_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        run_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -1079,11 +1336,15 @@ impl StubConnectAuth {
     /// device path.
     pub fn accepting(user: &str) -> Self {
         Self {
-            start_result: Mutex::new(Some(Err(RemoteError::NotConnected))),
+            start_results: Mutex::new(std::collections::VecDeque::from([Err(
+                RemoteError::NotConnected,
+            )])),
             run_gate: Arc::new(tokio::sync::Notify::new()),
             run_result: Mutex::new(Some(Err(RemoteError::NotConnected))),
             validate_result: Mutex::new(None),
             accept_any: Some(user.to_string()),
+            run_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            run_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1100,13 +1361,13 @@ impl StubConnectAuth {
     pub fn denying(reason: &str) -> (Self, Arc<tokio::sync::Notify>) {
         let gate = Arc::new(tokio::sync::Notify::new());
         let auth = Self {
-            start_result: Mutex::new(Some(Ok(DeviceFlowStart {
+            start_results: Mutex::new(std::collections::VecDeque::from([Ok(DeviceFlowStart {
                 device_code: "devcode".to_string(),
                 user_code: "ABCD-1234".to_string(),
                 verification_url: "https://github.example/device".to_string(),
                 interval_secs: 0,
                 expires_in_secs: 900,
-            }))),
+            })])),
             run_gate: gate.clone(),
             run_result: Mutex::new(Some(Err(RemoteError::Api {
                 status: 403,
@@ -1114,8 +1375,42 @@ impl StubConnectAuth {
             }))),
             validate_result: Mutex::new(None),
             accept_any: None,
+            run_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            run_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         (auth, gate)
+    }
+
+    /// Queues one more device-flow start, handed out after the ones already
+    /// queued. What a restart test uses to give the second sign-in a code
+    /// that differs from the first.
+    pub fn queue_start(&self, start: Result<DeviceFlowStart, RemoteError>) {
+        self.start_results.lock().unwrap().push_back(start);
+    }
+
+    /// Re-arm the one-shot run and validate outcomes.
+    ///
+    /// The constructors set each once, which is right for a test that drives
+    /// exactly one sign-in. A test whose flow may legitimately run a second
+    /// time - a restart that abandons the first and starts again - would
+    /// otherwise panic inside the double on the used-up outcome, and a panic in
+    /// a double reads as a bug in the code under test. Pairs with
+    /// [`StubConnectAuth::queue_start`], which does the same for the code.
+    pub fn rearm(&self, run: Result<String, RemoteError>, validate: Result<String, RemoteError>) {
+        *self.run_result.lock().unwrap() = Some(run);
+        *self.validate_result.lock().unwrap() = Some(validate);
+    }
+
+    /// Whether a `run_device_flow` future was dropped before it answered -
+    /// the shape an abandoned flow's aborted task has from in here. Polled
+    /// rather than awaited: an abort takes effect at the task's next poll.
+    pub fn run_was_abandoned(&self) -> bool {
+        self.run_abandoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a `run_device_flow` future has been polled at least once.
+    pub fn run_was_entered(&self) -> bool {
+        self.run_entered.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1133,10 +1428,10 @@ impl ConnectAuth for StubConnectAuth {
             // panic on a used-up one-shot.
             return Err(RemoteError::NotConnected);
         }
-        self.start_result
+        self.start_results
             .lock()
             .unwrap()
-            .take()
+            .pop_front()
             .expect("start_device_flow result not set")
     }
 
@@ -1146,12 +1441,21 @@ impl ConnectAuth for StubConnectAuth {
         _client_id: &str,
         _start: &DeviceFlowStart,
     ) -> Result<String, RemoteError> {
+        self.run_entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut witness = RunWitness {
+            flag: self.run_abandoned.clone(),
+            armed: true,
+        };
         self.run_gate.notified().await;
-        self.run_result
+        let answer = self
+            .run_result
             .lock()
             .unwrap()
             .take()
-            .expect("run_device_flow result not set")
+            .expect("run_device_flow result not set");
+        witness.armed = false;
+        answer
     }
 
     async fn validate_token(
@@ -1300,4 +1604,170 @@ impl Drop for ScratchStateDir {
         }
         *slot = None;
     }
+}
+
+// --- one authenticated MCP conversation over the real transport ---------------
+//
+// Shared rather than duplicated: `mcp_auth.rs` drives the gate with it and
+// `overlay_domains.rs` drives an authenticated search through it, and both need
+// the identical handshake. Raw HTTP/1.1 rather than a client library for the
+// reason the session's own doc gives.
+
+/// The same handshake from a client naming itself `client`, which is the whole
+/// of what a client gets to say about its own identity and therefore the input
+/// the provenance composition has to be safe against.
+pub fn initialize_body_as(client: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": client, "version": "0.0.0" },
+        },
+    })
+    .to_string()
+}
+
+/// One authenticated MCP conversation over the real transport: the legacy
+/// handshake, the `notifications/initialized` that follows it, and the
+/// `tools/call` POSTs a test drives afterwards.
+///
+/// Raw HTTP/1.1 over a fresh connection per request, modelled on
+/// `tests/http_stream.rs`: a `tools/call` answer is a chunked SSE stream the
+/// transport leaves open for the session's own use, so there is no
+/// end-of-message a buffering client could wait for. Reading for a bounded
+/// window and asserting on substrings is what that shape allows.
+pub struct McpTestSession {
+    addr: std::net::SocketAddr,
+    session: String,
+    token: Option<String>,
+}
+
+impl McpTestSession {
+    /// Handshake at `addr` presenting `token`, then send the
+    /// `notifications/initialized` a client owes the session before its first
+    /// call.
+    pub async fn open(addr: &std::net::SocketAddr, token: Option<&str>) -> McpTestSession {
+        McpTestSession::open_as(addr, token, "mcp-auth-test").await
+    }
+
+    /// [`McpTestSession::open`] from a client that names itself `client`.
+    pub async fn open_as(
+        addr: &std::net::SocketAddr,
+        token: Option<&str>,
+        client: &str,
+    ) -> McpTestSession {
+        let handshake = raw_post(addr, &initialize_body_as(client), &[], token).await;
+        assert!(
+            handshake.starts_with("HTTP/1.1 200 "),
+            "the handshake must be served:\n{handshake}"
+        );
+        let session = raw_session_id(&handshake);
+        let ready = raw_post(
+            addr,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &[("Mcp-Session-Id", session.as_str())],
+            token,
+        )
+        .await;
+        assert!(
+            ready.starts_with("HTTP/1.1 2"),
+            "the initialized notification must be accepted:\n{ready}"
+        );
+        McpTestSession {
+            addr: *addr,
+            session,
+            token: token.map(str::to_string),
+        }
+    }
+
+    /// Call `tool` on this session, handing back the raw response bytes.
+    pub async fn call_tool(&self, tool: &str, arguments: serde_json::Value) -> String {
+        self.request(
+            "tools/call",
+            serde_json::json!({ "name": tool, "arguments": arguments }),
+        )
+        .await
+    }
+
+    /// Any JSON-RPC request on this session, for the surfaces that are not
+    /// tool calls - `resources/read` among them.
+    pub async fn request(&self, method: &str, params: serde_json::Value) -> String {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+        raw_post(
+            &self.addr,
+            &body,
+            &[("Mcp-Session-Id", self.session.as_str())],
+            self.token.as_deref(),
+        )
+        .await
+    }
+}
+
+/// Send one raw HTTP/1.1 POST and read back whatever arrives within a bounded
+/// window (see [`McpTestSession`] for why the window is bounded rather than a
+/// read to EOF). `headers` carries whatever the shape under test needs beside
+/// the fixed ones - a session id for the legacy path, the era's standard
+/// headers for a stateless one.
+pub async fn raw_post(
+    addr: &std::net::SocketAddr,
+    body: &str,
+    headers: &[(&str, &str)],
+    token: Option<&str>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Connection: close\r\n"
+        .to_string();
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.flush().await;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The `mcp-session-id` header out of a raw response head, case-insensitively.
+pub fn raw_session_id(raw: &str) -> String {
+    for line in raw.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("mcp-session-id")
+        {
+            return value.trim().to_string();
+        }
+    }
+    panic!("no mcp-session-id header in response:\n{raw}");
 }

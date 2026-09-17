@@ -54,6 +54,7 @@ import { useState } from "react";
 
 import type { SyncProposal } from "../api/admin";
 import { fetchSyncStatus, syncStatusKey } from "../api/admin";
+import { isWebAddress } from "../format";
 import { ShareDialog } from "./ShareDialog";
 import { WithdrawProposalDialog } from "./WithdrawProposalDialog";
 import { BUTTON, Chip } from "./primitives";
@@ -291,20 +292,6 @@ function ChainNotices({
       )}
     </div>
   );
-}
-
-/**
- * Whether a proposal's url is an address this card will hand a reader.
- *
- * The url is the forge's own word, and on an enterprise install the forge is a
- * machine somebody else administers. Nothing about a review needs a scheme
- * other than http or https, so anything else - `javascript:` first among them -
- * is drawn as text instead of as a link that runs on press. Defence in depth
- * rather than a known hole: the engine builds these from the API's own fields,
- * and this is the line that holds if one day it does not.
- */
-function isWebAddress(url: string): boolean {
-  return url.startsWith("https://") || url.startsWith("http://");
 }
 
 /**

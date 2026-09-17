@@ -18,6 +18,7 @@ import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { ApiProblem, api } from "../api/client";
+import { JOIN_KEY_STORAGE } from "../api/draftLinks";
 import { TEXT_NAME } from "../collab/provider";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
@@ -25,6 +26,7 @@ import type { Draft } from "../editor/drafts";
 import { readDraft } from "../editor/drafts";
 import { docText } from "../editor/setup";
 import { SAVE_EVENT } from "../editor/useEditorSession";
+import { LAYOUT_WIDTH_KEY } from "../layoutWidth";
 import {
   answersFor,
   domainsResponse,
@@ -196,8 +198,8 @@ function joinedSession(overrides: Partial<CollabSession> = {}) {
     epoch: "e1",
     status: "connected",
     participants: [
-      { name: "Ada Lovelace", color: "#0ea5e9", self: true },
-      { name: "Grace Hopper", color: "#f59e0b", self: false },
+      { name: "Ada Lovelace", color: "#0ea5e9", self: true, agent: false },
+      { name: "Grace Hopper", color: "#f59e0b", self: false, agent: false },
     ],
     flush,
     ...overrides,
@@ -323,6 +325,9 @@ beforeEach(() => {
   // as the screen behaved before there was a session to join.
   collabMock.mockReturnValue(soloCollabSession());
   localStorage.clear();
+  // The join lives in session storage, and a leftover one would put the next
+  // test's editor inside somebody else's draft.
+  sessionStorage.clear();
 });
 
 describe("the engram editor", () => {
@@ -615,6 +620,30 @@ describe("the engram editor", () => {
     expect(putBody(0)).toEqual({ content: linked });
   });
 
+  it("keeps the findings under the buffer at full width, form and all", async () => {
+    // The frame's own preference, read by the screen through the context the
+    // frame provides. The column beside the buffer goes, and what goes with
+    // it is decided by where else a reader could get at the same thing: every
+    // field the form writes is a line of the frontmatter block in the text
+    // right there, and the findings are named by the notice above the buffer
+    // and are the only way to jump to the line one is about.
+    localStorage.setItem("fluid.layout.width", "full");
+    serveEditor();
+
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+
+    // The mode is on: one column, at every viewport.
+    const main = await screen.findByRole("main");
+    expect(main.querySelector('[class*="lg:grid-cols-"]')).toBeNull();
+    expect(
+      await screen.findByRole("region", { name: "Validation findings" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("region", { name: "Frontmatter form" }),
+    ).toBeNull();
+  });
+
   it("assists the frontmatter beside the buffer, writing single lines into it", async () => {
     serveEditor({
       "/domains/eng/engrams/alpha": (_path, init) =>
@@ -689,6 +718,70 @@ describe("the engram editor", () => {
     const call = apiMock.mock.calls.find(([, init]) => init?.method === "PUT");
     expect(call?.[1]?.headers).toEqual({ "If-Match": '"3f8a1c05e2"' });
     expect(await screen.findByText("Saved")).toBeInTheDocument();
+  });
+
+  it("shows the save receipt's neighbours advisory, and dismisses it", async () => {
+    const put = vi.fn(() =>
+      detailResponse({
+        checksum: "next111",
+        similar: [
+          {
+            domain: "eng",
+            permalink: "retry-queue-gotcha",
+            title: "Retry queue gotcha",
+            status: "stable",
+            type: "engram",
+          },
+        ],
+        guidance: "read the one that fits",
+      }),
+    );
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    const panel = await screen.findByRole("status", {
+      name: "Similar engrams",
+    });
+    expect(
+      within(panel).getByRole("link", { name: /Retry queue gotcha/ }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(
+      screen.queryByRole("status", { name: "Similar engrams" }),
+    ).not.toBeInTheDocument();
+    // Dismissing takes the Dismiss button itself out of the document, and
+    // a reader who reached it from the keyboard should land back in the
+    // buffer they were editing rather than at document.body, which would
+    // restart the next Tab from the top of the page.
+    expect(document.body).not.toHaveFocus();
+    expect(screen.getByLabelText("Engram source")).toHaveFocus();
+  });
+
+  it("carries no neighbours advisory when the save answers with none", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    expect(
+      screen.queryByRole("status", { name: "Similar engrams" }),
+    ).not.toBeInTheDocument();
   });
 
   it("saves from inside the buffer, on the keyboard", async () => {
@@ -1867,6 +1960,113 @@ describe("the engram editor", () => {
       expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
     });
   });
+
+  // Sharing is for your own unfolded work, and a granted draft is not that.
+  it("offers Share on an own draft and names the owner on a granted one", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": () => detailResponse({ draft: true }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(
+      await screen.findByRole("button", { name: "Share draft" }),
+    ).toBeVisible();
+  });
+
+  it("names whose draft a granted one is, and offers no Share on it", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    // The editor must say whose work is in the buffer: it is the one screen
+    // that would otherwise show somebody else's text as though it were yours.
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Share draft" }),
+    ).not.toBeInTheDocument();
+  });
+
+  /** The join this window holds, as the `/draft/<token>` screen stores it. */
+  function holdJoin(overrides: Record<string, string> = {}) {
+    sessionStorage.setItem(
+      JOIN_KEY_STORAGE,
+      JSON.stringify({
+        key: "k1",
+        domain: "eng",
+        path: "alpha.md",
+        owner: "alice",
+        permalink: "alpha",
+        ...overrides,
+      }),
+    );
+  }
+
+  /** The options the screen last asked the session hook for. */
+  function askedFor(): Record<string, unknown> {
+    const call = collabMock.mock.calls.at(-1);
+    if (!call) {
+      throw new Error("the screen opened no session");
+    }
+    return call[0] as unknown as Record<string, unknown>;
+  }
+
+  // The header says whose draft this is; the room has to be over the same
+  // document, or every keystroke lands in a draft of this reader's own while
+  // the screen says otherwise.
+  it("opens the owner's room on a granted draft this window joined", async () => {
+    holdJoin();
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(askedFor().overlay).toBe("alice");
+    expect(askedFor().enabled).toBe(true);
+  });
+
+  // Seeing a draft and editing it are two steps: with no join there is no
+  // room to open at all, and the buffer stays the draft the read handed over.
+  it("opens no room on a granted draft this window has not joined", async () => {
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          draft: true,
+          draft_owner: "alice",
+          content: CONTENT.replace("A rule.", "What alice has not shared yet."),
+        }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(askedFor().overlay).toBeUndefined();
+    expect(askedFor().enabled).toBe(false);
+    // And what stands in the buffer is her draft, which is what the read
+    // handed over: the property the room binding exists to keep true.
+    await openBuffer("What alice has not shared yet.");
+  });
+
+  // A join to a different page is not a join to this one.
+  it("opens no room when the held join names another document", async () => {
+    holdJoin({ permalink: "beta", path: "beta.md" });
+    serveEditor({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "alice" }),
+    });
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText("alice's draft")).toBeVisible();
+    expect(askedFor().overlay).toBeUndefined();
+    expect(askedFor().enabled).toBe(false);
+  });
+
+  // Nothing changes for an ordinary page: this account's own document, which
+  // is what a room with no owner named is.
+  it("opens this account's own room on a page nobody granted", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    expect(askedFor().overlay).toBeUndefined();
+    expect(askedFor().enabled).toBe(true);
+  });
 });
 
 describe("the engram editor in a session", () => {
@@ -1897,6 +2097,55 @@ describe("the engram editor in a session", () => {
     expect(chips.textContent).toContain("Grace Hopper");
     // The local author is marked rather than listed as a stranger.
     expect(chips.textContent).toContain("you");
+  });
+
+  /**
+   * An agent working in the room is a peer of the room, not an event that
+   * happens to the text: it gets a chip with its own name, a glyph that says
+   * it is an agent, and a color like anybody else's.
+   *
+   * The glyph is decorative rather than announced: the server already appends
+   * "(agent: ...)" onto the participant's own name, so a screen reader that
+   * also read the glyph's label would hear "agent" twice for the same chip.
+   * The chip's accessible name is the room list's own label plus the name
+   * text, which already carries the word.
+   *
+   * Run at both widths, because the strip lives above the buffer rather than
+   * in the details column: a presence feature that vanished at full width
+   * would vanish for exactly the person who widened the window to work
+   * alongside somebody. Each leg proves it took by the column itself, which
+   * is the difference between the two.
+   */
+  describe.each([
+    { width: "the reading measure", fullWidth: false },
+    { width: "full width", fullWidth: true },
+  ])("with an agent in the room at $width", ({ fullWidth }) => {
+    it("names the agent as its own peer, with a decorative robot glyph", async () => {
+      localStorage.setItem(LAYOUT_WIDTH_KEY, fullWidth ? "full" : "reading");
+      await openRoom({
+        participants: [
+          { name: "Ada Lovelace", color: "#0ea5e9", self: true, agent: false },
+          {
+            name: "ada (agent: claude-code/2.0)",
+            color: "#f59e0b",
+            self: false,
+            agent: true,
+          },
+        ],
+      });
+      if (fullWidth) {
+        expect(screen.queryByLabelText("Status")).not.toBeInTheDocument();
+      } else {
+        expect(screen.getByLabelText("Status")).toBeInTheDocument();
+      }
+      const chips = screen.getByRole("list", { name: /in this session/i });
+      expect(chips.textContent).toContain("ada (agent: claude-code/2.0)");
+      expect(chips).toHaveAccessibleName(/ada \(agent: claude-code\/2.0\)/);
+      // One glyph, on the one peer that is not a person, hidden from
+      // assistive tech since the name already carries the agent word.
+      const glyphs = chips.querySelectorAll('svg[aria-hidden="true"]');
+      expect(glyphs).toHaveLength(1);
+    });
   });
 
   it("the Save button asks the session to flush and never PUTs", async () => {

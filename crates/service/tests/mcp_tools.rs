@@ -5,6 +5,8 @@
 //! engine shares an in-memory store; domains are real temp directories because
 //! files are the source of truth.
 
+mod support;
+
 use std::sync::Arc;
 
 use crystalline_core::config::{
@@ -79,6 +81,10 @@ impl Harness {
         let engine = Arc::new(
             Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
                 .with_token_store_dir(token_store)
+                // `remove_domain` sweeps the overlay journal, and the sweep is a
+                // recursive delete: it belongs inside the temp directory like
+                // everything else this harness writes.
+                .with_state_dir(root.join("state"))
                 .with_read_only(read_only),
         );
         engine.sync(None).await.unwrap();
@@ -103,6 +109,26 @@ impl Harness {
             tokio::spawn(
                 async move { rmcp::serve_server(McpServer::new(engine), server_io).await },
             );
+        let client = rmcp::serve_client((), client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        (client, server)
+    }
+
+    /// [`Harness::connect`] over the HTTP transport, which with no identity
+    /// extension inserted is [`crystalline_service::Scope::Anonymous`] - the
+    /// legacy open tier, the one scope reachable in-process that is narrower
+    /// than the machine owner's.
+    async fn connect_http(
+        &self,
+    ) -> (
+        RunningService<RoleClient, ()>,
+        RunningService<rmcp::RoleServer, McpServer>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let server_task = tokio::spawn(async move {
+            rmcp::serve_server(McpServer::new_http(engine), server_io).await
+        });
         let client = rmcp::serve_client((), client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
         (client, server)
@@ -173,6 +199,70 @@ async fn call_text(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<S
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// A title that will not read back the way it was written reaches the agent
+/// that wrote it, under the DEFAULT response format rather than only in JSON.
+/// The write receipt is a confirmation, so it stays compact JSON while the
+/// list-shaped tools render TOON, and the notices ride inside it - an agent
+/// that only learned about the nested permalink weeks later, through a link
+/// that would not resolve, is the whole case for the key existing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_title_that_will_not_read_back_reaches_the_agent_that_wrote_it() {
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let slashed = call_text(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Q3/Q4 planning", "content": "What the quarter holds." }),
+    )
+    .await
+    .unwrap();
+    let receipt: Value = serde_json::from_str(&slashed).unwrap_or_else(|e| {
+        panic!("the confirmation is JSON under the TOON default: {e}: {slashed}")
+    });
+    assert_eq!(receipt["permalink"], "q3/q4-planning");
+    let notice = receipt["notices"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the notice reached the agent: {slashed}"));
+    assert!(
+        notice.contains("q3/q4-planning") && notice.contains("folder"),
+        "whole, not truncated by the renderer: {notice}"
+    );
+
+    let coloned = call_text(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Murmur: the dispatch pipeline",
+            "content": "How dispatch works."
+        }),
+    )
+    .await
+    .unwrap();
+    let receipt: Value = serde_json::from_str(&coloned).unwrap();
+    let notice = receipt["notices"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("and so does the colon's: {coloned}"));
+    assert!(
+        notice.contains("`[[murmur-the-dispatch-pipeline]]`")
+            && notice.contains("`[[eng:murmur-the-dispatch-pipeline]]`"),
+        "naming the two forms that always resolve, both of them pasteable: {notice}"
+    );
+
+    // A plain title's receipt gains no key at all.
+    let plain = call_text(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Plain title", "content": "Nothing surprising." }),
+    )
+    .await
+    .unwrap();
+    let receipt: Value = serde_json::from_str(&plain).unwrap();
+    assert!(receipt.get("notices").is_none(), "{plain}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,8 +367,10 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
         "provision",
         "read_engram",
         "recent_activity",
+        "remove_domain",
         "search_engrams",
         "skills",
+        "split_engram",
         "validate_engrams",
         "vocabulary",
         "write_engram",
@@ -302,7 +394,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
             "{hidden} must be withheld while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 18, "every tool, exactly once: {names:?}");
+    assert_eq!(names.len(), 20, "every tool, exactly once: {names:?}");
 
     // The deterministic-ordering SHOULD on `/server/tools`, satisfied by
     // rmcp's `ToolRouter::list_all` (3.1.2 `handler/server/router/tool.rs:588`
@@ -310,6 +402,44 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "tools/list is ordered by name");
+}
+
+/// No agent administers a private domain.
+///
+/// The identity plan's own line: agents INHERIT visibility - an MCP session
+/// acts as the account whose token it carries, and every read and write it
+/// makes is already filtered by that account's memberships - and they do not
+/// hand it out. Inviting somebody into a domain, changing a level, handing a
+/// domain on and deciding whether a domain is private at all are decisions a
+/// person makes, over REST or at the `crystalline` CLI.
+///
+/// Pinned as a property of the whole list rather than as five absent names,
+/// because the failure mode is a LATER task adding a membership verb because
+/// it was convenient, not somebody re-adding one of today's names. Both the
+/// default install and the collaboration-enabled list are checked: the gated
+/// surface is where such a tool would most plausibly land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_administers_a_domains_membership() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    call(
+        client.peer(),
+        "configure",
+        json!({"set": {"github.enabled": "true"}}),
+    )
+    .await
+    .unwrap();
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    for tool in &tools.tools {
+        let name = tool.name.to_string();
+        for word in ["member", "invite", "visibility", "private"] {
+            assert!(
+                !name.contains(word),
+                "'{name}' looks like a membership verb: agents inherit what \
+                 they may see and never administer it"
+            );
+        }
+    }
 }
 
 /// Turning collaboration on adds exactly the five tools it enables, and takes
@@ -581,6 +711,215 @@ async fn tool_descriptions_teach_salience() {
     );
 }
 
+/// How often an acknowledgment stacks is a rule-by-rule fact, and `edit_engram`
+/// is where an agent learns it. The stacking clause has to name `V301`: it is
+/// the only rule whose entries are kept per pair. Stated generally it is false
+/// of `V103`, which fires once per reciprocal pair and so can raise several
+/// findings on one engram whose acknowledgments replace one another - an agent
+/// reading the general form would expect a second note to sit beside the first
+/// and find it had overwritten it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_which_rule_acknowledges_per_pair() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    let edit = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "edit_engram")
+        .expect("edit_engram tool present");
+    let text = edit.description.as_deref().unwrap_or("");
+    // Clause by clause rather than as one string, so the check is about which
+    // claim names the rule and not about how the rest of the copy is worded.
+    let stacking: Vec<&str> = text
+        .split(['.', ';'])
+        .filter(|clause| clause.contains("beside the first"))
+        .collect();
+    assert_eq!(
+        stacking.len(),
+        1,
+        "edit_engram teaches stacking exactly once: {text}"
+    );
+    assert!(
+        stacking[0].contains("V301"),
+        "the clause that says a second acknowledgment is kept has to name the \
+         one rule that keeps it: {}",
+        stacking[0]
+    );
+}
+
+/// Working in a document somebody has open is not a private act, and both
+/// verbs that can do it say so.
+///
+/// An agent that reads or edits a live document appears in that person's
+/// participant strip by name for a minute. That is a fact about the agent's
+/// own visibility rather than about the engram, so it belongs where an agent
+/// learns what a verb does - in the description it is handed - and not only in
+/// the code that does it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_that_working_in_an_open_document_is_seen() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    for name in ["read_engram", "edit_engram"] {
+        let text = tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} tool present"))
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase();
+        assert!(
+            text.contains("participant strip"),
+            "{name} teaches where the person sees the agent: {text}"
+        );
+        assert!(
+            text.contains("for a minute"),
+            "{name} teaches how long that name stands: {text}"
+        );
+    }
+}
+
+/// And that replacing one wholesale is not something an agent does quietly:
+/// `write_engram` teaches the confirm, and names the verb to reach for when the
+/// change is a targeted one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_that_a_wholesale_overwrite_asks_first() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    let text = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "write_engram")
+        .expect("write_engram tool present")
+        .description
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        text.contains("asks them first"),
+        "write_engram teaches that an overwrite of an open document is asked about: {text}"
+    );
+    assert!(
+        text.contains("landed live"),
+        "and what the receipt says when it lands in their document: {text}"
+    );
+    assert!(
+        text.contains("edit_engram"),
+        "and names the targeted verb to use instead: {text}"
+    );
+}
+
+/// Review mode is a routing decision every write-facing tool's description
+/// has to teach on its own, since a model reads one tool's copy at a time:
+/// every write verb (`write_engram`, `edit_engram`, `move_engram`,
+/// `delete_engram`, `split_engram`) names where its write lands and what a
+/// `draft` receipt means, `read_engram` names that a live editor is read
+/// through the live document, `share_changes` names what a review-mode share
+/// carries and `evolve_engrams` names that the sweep covers an agent's own
+/// drafts too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_review_mode() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    // share_changes is one of the five collaboration tools withheld from
+    // tools/list while github.enabled is off; turn it on so its description
+    // is there to read, the same way
+    // flipping_github_enabled_moves_the_tool_list_by_exactly_the_five does.
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "github.enabled": "true" } }),
+    )
+    .await
+    .unwrap();
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+
+    let description_of = |name: &str| {
+        tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} tool present"))
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+    };
+
+    for name in [
+        "write_engram",
+        "edit_engram",
+        "move_engram",
+        "delete_engram",
+        "split_engram",
+    ] {
+        let text = description_of(name);
+        assert!(
+            text.contains("review mode") && text.contains("private draft"),
+            "{name} teaches where a write in a review-mode domain lands: {text}"
+        );
+        assert!(
+            text.contains("share_changes proposes exactly your drafts"),
+            "and that share_changes is what proposes it for review: {text}"
+        );
+        assert!(
+            text.contains("receipt marked draft means the tree did not move"),
+            "and what a draft receipt means: {text}"
+        );
+    }
+
+    let read = description_of("read_engram");
+    // "live document" alone does not bite: the description carried it before
+    // this sentence existed ("Reading a live document is not a private
+    // act"), so a reword that dropped "live editor" while keeping that older
+    // sentence would still pass a conjunction of only those two.
+    // "participant strip" does not bite either - it entered `read_engram` in
+    // Task 15 (an ancestor of Task 18, the commit this pin means to bite on)
+    // and is already pinned by
+    // `tool_descriptions_teach_that_working_in_an_open_document_is_seen`. "so
+    // you see what the person sees" is the phrase that came in WITH Task 18's
+    // sentence and nowhere else, so it is what actually strengthens this
+    // conjunction against a reword of that sentence.
+    //
+    // The needle lost its "always" when the sentence did. The claim was not
+    // true on the path a share-link takes: a granted read answers the draft
+    // row its author last saved, never their open document (ruled onto the
+    // backlog, `plans/backlog.md`), so the description says which reads are
+    // live and the second half of this assertion pins the qualification rather
+    // than the promise it replaced.
+    assert!(
+        read.contains("live editor")
+            && read.contains("live document")
+            && read.contains("so you see what the person sees")
+            && read.contains(
+                "a draft you reach with a share_link answers its author's last \
+                              saved text"
+            ),
+        "read_engram teaches that a live editor is read through the live document, \
+         and which read is answered from the row instead: {read}"
+    );
+
+    let share = description_of("share_changes");
+    assert!(
+        share.contains("review-mode domain") && share.contains("exactly your draft entries"),
+        "share_changes teaches what a review-mode share carries: {share}"
+    );
+
+    let evolve = description_of("evolve_engrams");
+    assert!(
+        evolve.contains("review-mode domain") && evolve.contains("your own drafts too"),
+        "evolve_engrams teaches that the sweep covers an agent's own drafts too: {evolve}"
+    );
+}
+
 /// Folder hierarchy inside a domain is invisible to an agent unless the tool
 /// copy teaches it: `write_engram` documents the `folder` argument and the
 /// `build_context` glob it unlocks, and `move_engram` says a destination
@@ -703,14 +1042,17 @@ async fn read_only_hides_the_write_gated_tools() {
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
     let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
 
-    // The five write-gated tools (four content-mutating plus add_domain, which
-    // creates domains) are absent from the surface.
+    // The seven write-gated tools (five content-mutating plus add_domain and
+    // remove_domain, which create and unregister domains) are absent from the
+    // surface.
     for hidden in [
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
         "add_domain",
+        "remove_domain",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -1511,6 +1853,133 @@ async fn move_same_domain_and_cross_domain_link_rewrite() {
         "link rewritten: {linker}"
     );
     assert!(h.root.join("ops/target.md").exists());
+}
+
+/// **The write gate reads the destination domain exactly as the verb does.**
+///
+/// The gate used to trim `destination_domain` before checking it while the
+/// engine read the field as sent. Trimming could only make the gate check a
+/// name at least as restrictive as the one written to, so it was not a hole -
+/// but the argument that says so has to be re-derived by whoever reads the two
+/// lines next, and the day both sides trim, a padded destination silently moves
+/// an engram into the trimmed domain. So the property is pinned instead: a
+/// padded name is not a registered domain, the move is refused, and nothing
+/// lands anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_padded_destination_domain_names_no_domain_at_all() {
+    let h = Harness::new(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Target", "content": "the target" }),
+    )
+    .await
+    .unwrap();
+
+    let refused = call(
+        peer,
+        "move_engram",
+        json!({
+            "identifier": "target",
+            "domain": "eng",
+            "destination": "target.md",
+            "destination_domain": " ops",
+        }),
+    )
+    .await
+    .expect_err("' ops' is not a registered domain");
+    assert!(
+        refused.to_string().contains("' ops' not registered"),
+        "and the refusal names the string as sent: {refused}"
+    );
+    assert!(
+        h.root.join("eng/target.md").exists(),
+        "the engram stayed where it was"
+    );
+    assert!(
+        !h.root.join("ops/target.md").exists(),
+        "and nothing was written into the domain the padded name resembles"
+    );
+}
+
+/// **A cross-domain move rewrites bare links and nothing else.**
+///
+/// A reference written with a prefix in its brackets - `[[open:Thing]]`, or a
+/// colon title like `[[Log: Weekly Garden Notes]]`, which parses the same way
+/// and resolves by title - carries a `to_target` that is only the text after
+/// the colon. The needle the rewrite builds from it is therefore not what the
+/// file holds, and when the same file also holds a genuinely bare link with
+/// exactly that text, the replace is global: the wrong link gets prefixed and
+/// the receipt counts it as a repair.
+///
+/// So the rewrite skips a reference that named a domain. The colon-titled link
+/// dangles after the move, which is what a link the mover cannot rewrite
+/// honestly does, and the bare link pointing somewhere else is left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_domain_move_never_rewrites_a_link_it_did_not_match() {
+    let h = Harness::new(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // The engram that moves, whose title's first word ends in a colon.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Log: Weekly Garden Notes", "content": "what the garden did" }),
+    )
+    .await
+    .unwrap();
+    // One file linking twice: to the colon title, and to a bare `[[Weekly
+    // Garden Notes]]` - an engram nobody has written yet, which is an ordinary
+    // state and the sweep's business, not the mover's. No engram may carry that
+    // exact title here: one would take the colon-titled link's resolution for
+    // itself, which is a different case from the one this test is about.
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Linker",
+            "content": "see [[Log: Weekly Garden Notes]] and also [[Weekly Garden Notes]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "move_engram",
+        json!({
+            "identifier": "log-weekly-garden-notes",
+            "domain": "eng",
+            "destination": "log-weekly-garden-notes.md",
+            "destination_domain": "ops",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["cross_domain"], json!(true));
+    assert_eq!(
+        out["links_rewritten"],
+        json!(0),
+        "no bare link pointed at the moved engram, so nothing was repaired: {out}"
+    );
+
+    let linker = std::fs::read_to_string(h.root.join("eng/linker.md")).unwrap();
+    assert!(
+        linker.contains("[[Weekly Garden Notes]]"),
+        "the bare link to somebody else is untouched: {linker}"
+    );
+    assert!(
+        !linker.contains("[[ops:Weekly Garden Notes]]"),
+        "and was never rewritten in the moved engram's name: {linker}"
+    );
+    assert!(
+        linker.contains("[[Log: Weekly Garden Notes]]"),
+        "the colon-titled link is left as written: {linker}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2488,6 +2957,48 @@ async fn write_engram_rejects_a_timestamp_in_a_date_field() {
     );
 }
 
+/// The collision check runs ahead of `build_markdown`: a create with
+/// unbuildable content at a permalink that is already taken answers
+/// "permalink already exists ... pass overwrite=true to replace", not the
+/// content error `build_markdown` would otherwise raise first. The plainer
+/// message is the more useful of the two, and the one this verb gave before
+/// `build_markdown` was ever hoisted ahead of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_capture_at_a_taken_permalink_answers_the_collision_refusal() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Taken Title",
+            "content": "The engram that already holds this permalink.",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let err = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Taken Title",
+            "content": "A second capture at the same title, with content that could not be built.",
+            "metadata": { "valid_to": "2026-07-15T10:30:00Z" },
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("already exists") && err.contains("pass overwrite=true to replace"),
+        "the collision refusal, not the malformed-content error: {err}"
+    );
+}
+
 /// A sentinel far-future `valid_to` is dropped on write: open-ended validity is
 /// expressed by absence, not by a distant date. The write succeeds and the
 /// field never lands in the file.
@@ -3316,7 +3827,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 22] = [
     (
         "write_engram",
         "Capture engram",
@@ -3344,6 +3855,14 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
     (
         "move_engram",
         "Move engram",
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+    ),
+    (
+        "split_engram",
+        "Split engram",
         Some(false),
         Some(true),
         Some(false),
@@ -3448,6 +3967,18 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
         Some(false),
         Some(true),
     ),
+    // Destructive where `add_domain` is not: this ends a domain rather than
+    // creating one. Idempotent, because a second call on a name that is already
+    // gone is the ordinary unregistered-domain answer and changes nothing.
+    // Closed-world: unregistering a team domain never touches its repository.
+    (
+        "remove_domain",
+        "Remove domain",
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+    ),
     (
         "share_changes",
         "Share changes",
@@ -3536,7 +4067,7 @@ async fn tool_annotations_match_the_locked_table() {
 async fn annotation_hints_line_up_with_the_gating() {
     use rmcp::ServerHandler;
 
-    // The eight write-gated tools (the five WRITE_TOOLS plus the three
+    // The write-gated tools (the WRITE_TOOLS carrying a row here, plus the three
     // collaboration tools hidden in read-only mode) must each disclaim
     // read-only.
     let rw = annotation_server(false).await;
@@ -3544,8 +4075,10 @@ async fn annotation_hints_line_up_with_the_gating() {
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
         "add_domain",
+        "remove_domain",
         "configure",
         "share_changes",
         "resolve_conflict",
@@ -3627,6 +4160,13 @@ async fn provision_is_listed_when_no_domain_declares_and_refuses_the_mutations()
         assert!(
             text.contains("## Provisioning"),
             "provision {action}'s refusal must name what is missing: {text}"
+        );
+        // A stdio session is the machine owner, so the instance-admin gate the
+        // three mutating actions carry over HTTP never fires here: whoever runs
+        // this process already has the config file and the harnesses on disk.
+        assert!(
+            !text.contains("instance admin"),
+            "provision {action} is never role gated over stdio: {text}"
         );
     }
 }
@@ -4151,9 +4691,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 20 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 22 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 20 are visible and on the read-only one where
+/// read-write server where all 22 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.
@@ -4274,7 +4814,7 @@ async fn write_engram_records_the_connected_client_as_generated_by() {
     .unwrap();
 
     let expected = {
-        let info = rmcp::model::ClientInfo::default().client_info;
+        let info = rmcp::model::ClientConfig::default().client_info;
         format!("{}/{}", info.name, info.version)
     };
     let text = std::fs::read_to_string(h.root.join("eng/provenance.md")).unwrap();
@@ -4362,6 +4902,450 @@ async fn edit_engram_migrates_a_legacy_timestamp_to_generated() {
     let engram = crystalline_core::parse_engram(&text).unwrap();
     let generated = engram.frontmatter.generated.unwrap();
     assert!(generated.at.unwrap().to_rfc3339().as_str() > "2026-01-01T00:00:00+00:00");
+}
+
+/// The agent reports the model that produced the words, and it lands beside the
+/// actor in the provenance block: the client says which harness wrote, the
+/// model says with what, and a later reader weighs the page by both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_engram_records_the_reported_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "With a model",
+            "content": "Who wrote this, and with what.",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let expected = {
+        let info = rmcp::model::ClientConfig::default().client_info;
+        format!("{}/{}", info.name, info.version)
+    };
+    let text = std::fs::read_to_string(h.root.join("eng/with-a-model.md")).unwrap();
+    assert!(
+        text.contains(&format!(
+            "generated: {{ by: {expected}, model: claude-opus-5, at: "
+        )),
+        "expected the reported model beside the client: {text}"
+    );
+    let g = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .generated
+        .unwrap();
+    assert_eq!(g.model.as_deref(), Some("claude-opus-5"));
+}
+
+/// An edit refreshes the provenance block, so the model of the agent that made
+/// the change is what the refreshed block records - not the one the capture
+/// was written with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_engram_records_the_model_on_the_generated_block_it_touches() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Refreshed",
+            "content": "A first pass.",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "refreshed",
+            "operation": "append",
+            "content": "A sharper second pass.",
+            "model": "claude-haiku-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/refreshed.md")).unwrap();
+    assert!(
+        text.contains("model: claude-haiku-5"),
+        "the editing agent's model must win: {text}"
+    );
+    assert!(
+        !text.contains("claude-opus-5"),
+        "exactly one provenance block, carrying one model: {text}"
+    );
+}
+
+/// A verification records the model of the agent that checked the knowledge,
+/// the same sibling key the `generated` block carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verification_by_an_agent_records_its_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked", "content": "A fact worth re-checking." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked.md")).unwrap();
+    let entries = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .verified;
+    let [only] = entries.as_slice() else {
+        panic!("one verification: {entries:?}");
+    };
+    assert_eq!(only.model.as_deref(), Some("claude-opus-5"));
+    assert!(
+        text.contains(&format!(
+            "verified: {{ by: {}, model: claude-opus-5, at: ",
+            only.by
+        )),
+        "the model belongs between the verifier and the instant: {text}"
+    );
+}
+
+/// A write and an edit that report no model leave the two-key flow mapping and
+/// put the key nowhere in the frontmatter.
+///
+/// The byte pin proper is the core test
+/// (`a_generated_block_without_a_model_emits_the_two_key_form_unchanged`), which
+/// compares a stamp against a fixture written before the key existed and asserts
+/// every other byte is where it was. This one is the end-to-end half of that:
+/// the whole MCP path, from the parameter nobody passed to the line on disk. The
+/// scan is over the frontmatter block rather than the file, so it reads what it
+/// is about and not the prose an author happened to write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_without_a_model_emits_the_two_key_provenance_block() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Silent", "content": "Nobody said which one wrote it." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "silent",
+            "operation": "append",
+            "content": "And the edit says nothing about it either.",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let expected = {
+        let info = rmcp::model::ClientConfig::default().client_info;
+        format!("{}/{}", info.name, info.version)
+    };
+    let text = std::fs::read_to_string(h.root.join("eng/silent.md")).unwrap();
+    assert!(
+        text.contains(&format!("generated: {{ by: {expected}, at: ")),
+        "the two-key form, unchanged: {text}"
+    );
+    let frontmatter = text
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---"))
+        .map(|(block, _)| block)
+        .unwrap_or_else(|| panic!("the engram carries a frontmatter block: {text}"));
+    assert!(
+        !frontmatter.contains("model"),
+        "no model was reported: {frontmatter}"
+    );
+}
+
+/// A person's write never carries a model, whoever reports one. The `human:`
+/// prefix is what the trust tier and the sweep read as "a person wrote this",
+/// and the actor is resolved inside the engine - an `identity.actor` of that
+/// form is invisible to the caller that passed the parameter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_actor_never_carries_a_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "identity.actor": "human:jordi" } }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "By a person",
+            "content": "Typed by somebody.",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/by-a-person.md")).unwrap();
+    assert!(
+        text.contains("generated: { by: human:jordi, at: "),
+        "a person's provenance block stays as it was: {text}"
+    );
+    assert!(
+        !text.contains("model"),
+        "a person writes with no model: {text}"
+    );
+}
+
+/// A verification a caller attributes to a person never carries a model either.
+/// The entry's own actor is what the rule reads, not the agent that made the
+/// call: a record saying a model produced a check a person made is the shape the
+/// trust tier is there to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_verifier_never_carries_a_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked by a person", "content": "A fact somebody read." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked-by-a-person",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "human:jordi",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked-by-a-person.md")).unwrap();
+    let entries = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .verified;
+    let [only] = entries.as_slice() else {
+        panic!("one verification: {entries:?}");
+    };
+    assert_eq!(only.by, "human:jordi");
+    assert_eq!(only.model, None, "a person checks with no model: {text}");
+    assert!(
+        text.contains("verified: { by: human:jordi, at: "),
+        "the two-key entry form, unchanged: {text}"
+    );
+}
+
+/// A verification attributed to another agent keeps the model, because the rule
+/// is about the `human:` prefix and nothing else: an actor a caller names is
+/// treated exactly as the one the server composes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_agent_verifier_still_carries_the_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Checked by a bot", "content": "A fact a bot read." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "checked-by-a-bot",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "team-bot/1.0",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked-by-a-bot.md")).unwrap();
+    assert!(
+        text.contains("verified: { by: team-bot/1.0, model: claude-opus-5, at: "),
+        "a named agent verifier keeps its model: {text}"
+    );
+}
+
+/// An instance pinned to a person still records an agent verifier's model. The
+/// prefix rule reads the actor a record CLAIMS, and what a `verified` entry
+/// claims is its own `by`: the acting identity decides the `generated` block it
+/// stamps and nothing else, so an operator who pins `identity.actor` to a person
+/// does not thereby strip the model off a check attributed to a bot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_human_instance_still_records_an_agent_verifiers_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "identity.actor": "human:jordi" } }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Pinned instance", "content": "A fact a bot read." }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "pinned-instance",
+            "operation": "set_frontmatter",
+            "key": "verified",
+            "value": "team-bot/1.0",
+            "model": "claude-opus-5",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/pinned-instance.md")).unwrap();
+    assert!(
+        text.contains("verified: { by: team-bot/1.0, model: claude-opus-5, at: "),
+        "the entry's own actor is the only prefix test on this path: {text}"
+    );
+    assert!(
+        text.contains("generated: { by: human:jordi, at: "),
+        "and the block the person's instance stamps carries none: {text}"
+    );
+}
+
+/// A `verified` entry that arrives through `write_engram`'s `metadata`
+/// parameter, rather than through `edit_engram`'s dedicated `verified`
+/// verb path, is held to the very same rule: a `human:` actor never carries a
+/// model, whichever route the entry took in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verified_entry_in_write_engrams_metadata_drops_a_humans_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Checked via metadata",
+            "content": "A fact captured with its check already attached.",
+            "metadata": {
+                "verified": {
+                    "by": "human:jordi",
+                    "model": "claude-opus-5",
+                    "at": "2026-09-16T10:00:00Z",
+                },
+            },
+        }),
+    )
+    .await
+    .unwrap();
+
+    let text = std::fs::read_to_string(h.root.join("eng/checked-via-metadata.md")).unwrap();
+    let entries = crystalline_core::parse_engram(&text)
+        .unwrap()
+        .frontmatter
+        .verified;
+    let [only] = entries.as_slice() else {
+        panic!("one verification: {entries:?}");
+    };
+    assert_eq!(only.by, "human:jordi");
+    assert_eq!(
+        only.model, None,
+        "the metadata path drops a human's model exactly as the verb path does: {text}"
+    );
+    assert!(
+        text.contains("verified: { by: human:jordi, at: "),
+        "the two-key entry form, unchanged: {text}"
+    );
+}
+
+/// The two write verbs teach the parameter, because a parameter nobody is told
+/// to fill is filled about never: an agent reports its own model id only if the
+/// description it reads asks for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_the_reported_model() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    for name in ["write_engram", "edit_engram"] {
+        let tool = tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} tool present"));
+        let text = tool.description.as_deref().unwrap_or("");
+        assert!(
+            text.contains("model"),
+            "{name} must teach the model parameter: {text}"
+        );
+        let schema = serde_json::to_string(&tool.input_schema).unwrap();
+        assert!(
+            schema.contains("\"model\""),
+            "{name} must advertise the model parameter: {schema}"
+        );
+    }
 }
 
 // --- evolve_engrams: name, gating and the encoded queue -----------------------
@@ -4560,4 +5544,330 @@ async fn evolve_engrams_renders_the_queue_as_one_toon_table() {
     // The legend and the guidance ride the same response.
     assert!(text.contains("actions["), "{text}");
     assert!(text.contains("guidance:"), "{text}");
+}
+
+// --- remove_domain ----------------------------------------------------------
+
+/// **A local domain is unregistered and its files stay on disk**, and a stdio
+/// session may do it at all: the machine owner is `Scope::Unrestricted`, so the
+/// removal gate that an HTTP caller meets resolves to `Own` here and never
+/// stands between somebody and the files they already have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_unregisters_a_local_domain_and_keeps_its_files() {
+    let h = Harness::new(&["eng", "keep"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Alpha", "content": "Alpha knowledge" }),
+    )
+    .await
+    .unwrap();
+
+    let report = call(peer, "remove_domain", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert_eq!(report["domain"], json!("eng"), "{report}");
+    assert_eq!(report["unregistered"], json!(true), "{report}");
+    assert_eq!(
+        report["files_kept"],
+        json!(true),
+        "a file domain's files stay on disk: {report}"
+    );
+
+    assert!(
+        h.root.join("eng").join("alpha.md").exists(),
+        "the engram file was left exactly where it was"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        !listed.to_string().contains("\"eng\""),
+        "the domain is gone from the listing: {listed}"
+    );
+    assert!(
+        listed.to_string().contains("keep"),
+        "and the other domain is untouched: {listed}"
+    );
+}
+
+/// **A virtual domain's rows ARE its knowledge**, so the removal refuses until
+/// the caller says `purge: true` - and the refusal is the tool's own text a
+/// model can read, not an opaque protocol error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_refuses_a_virtual_domain_without_purge() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mind", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "mind", "title": "Only Copy", "content": "Nowhere else" }),
+    )
+    .await
+    .unwrap();
+
+    let refused = call_result(peer, "remove_domain", json!({ "domain": "mind" })).await;
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "the refusal is a tool error the model reads: {refused:?}"
+    );
+    let text = result_text(&refused);
+    assert!(
+        text.contains("purge"),
+        "the refusal names the way through: {text}"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        listed.to_string().contains("mind"),
+        "and nothing was removed: {listed}"
+    );
+
+    let report = call(
+        peer,
+        "remove_domain",
+        json!({ "domain": "mind", "purge": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report["unregistered"], json!(true), "{report}");
+    assert_eq!(
+        report["files_kept"],
+        json!(false),
+        "a virtual domain has no files to keep: {report}"
+    );
+
+    // The whole justification for requiring `purge` is that the rows ARE the
+    // knowledge, so the loss has to be a pinned fact rather than a claim the
+    // refusal text makes. Re-registered under the same name, the domain is
+    // empty: nothing survived the removal to be re-adopted, which is exactly
+    // what a file domain would have done.
+    call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mind", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    let found = call(peer, "search_engrams", json!({ "query": "Nowhere else" }))
+        .await
+        .unwrap();
+    assert!(
+        !found.to_string().contains("Only Copy"),
+        "the purged engrams are gone: {found}"
+    );
+}
+
+/// A read-only instance hides `remove_domain` with the rest of the write-gated
+/// tools, and a call by name still reaches the engine guard rather than a bare
+/// "no such tool".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_is_hidden_and_refused_on_a_read_only_instance() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+    let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+    assert!(
+        !names.contains(&"remove_domain".to_string()),
+        "remove_domain is hidden read-only: {names:?}"
+    );
+
+    let refused = call(peer, "remove_domain", json!({ "domain": "eng" }))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("read-only"),
+        "the route stays registered and answers the read-only refusal: {refused}"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        listed.to_string().contains("eng"),
+        "and nothing was unregistered: {listed}"
+    );
+}
+
+// --- the neighbours advisory on a write receipt ------------------------------
+
+const RETRY: &str = "The retry queue doubles its backoff on every failure.\nA dead-letter ttl bounds how long a retry waits.\nRaising the ttl fixed the stuck retries last time.";
+const RETRY_AGAIN: &str = "Retries wait on a backoff that doubles each time.\nThe dead-letter ttl is the bound on a stuck retry.\nWe raised the ttl and the queue drained.";
+
+#[tokio::test]
+async fn write_and_content_edit_receipts_name_their_neighbours() {
+    let h = Harness::new(&["eng"]).await;
+    h.engine.set_provider(Arc::new(support::TopicEmbedder));
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let first = call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry queue gotcha", "content": RETRY, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        first.get("similar").is_none(),
+        "nothing near the first capture: {first}"
+    );
+    h.engine.embed_pending().await.unwrap();
+
+    let second = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Retry backoff lesson",
+            "content": RETRY_AGAIN,
+            "tags": ["t"]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        second["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{second}"
+    );
+    assert_eq!(second["similar"][0]["type"], "engram");
+    assert_eq!(second["similar"][0]["status"], "stable");
+    assert_eq!(second["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+    assert!(second["similar"].as_array().unwrap().len() <= 3);
+
+    let appended = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "retry-backoff-lesson", "domain": "eng", "operation": "append",
+            "content": "- [lesson] a retry storm needs a longer dead-letter ttl and a wider backoff on the queue #retry"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        appended["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{appended}"
+    );
+    assert_eq!(appended["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+
+    let flipped = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "retry-backoff-lesson", "domain": "eng",
+            "operation": "set_frontmatter", "key": "salience", "value": "7"
+        }),
+    )
+    .await
+    .unwrap();
+    // `call` hands back a bare `Value::String` for a tool-level refusal, and
+    // `.get` on a string is always `None`, so the receipt is pinned before the
+    // absence is read: a refused edit must not read as a silent one.
+    assert_eq!(
+        flipped["operation"], "set_frontmatter",
+        "the flip landed: {flipped}"
+    );
+    assert!(
+        flipped.get("similar").is_none(),
+        "set_frontmatter never probes: {flipped}"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it() {
+    // The one property this file can prove that the engine tests cannot: the
+    // handler passes the CALLER's scope rather than a hard-coded
+    // `Scope::Unrestricted`. `lab` is private, so it is a neighbour over stdio
+    // (the machine owner) and invisible over the open HTTP tier.
+    let h = Harness::new(&["eng", "lab"]).await;
+    h.engine.set_provider(Arc::new(support::TopicEmbedder));
+    h.engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "lab".to_string(),
+            title: "Retry secrets".to_string(),
+            content: RETRY.to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["t".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .unwrap();
+    h.engine.embed_pending().await.unwrap();
+
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&h.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "keeper",
+        "keeper",
+        None,
+        crystalline_service::rest::Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    auth.set_domain_visibility("lab", true, "keeper")
+        .await
+        .unwrap();
+    h.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+
+    // The open tier first, while `eng` still holds no retry engram of its own:
+    // an empty advisory here means "nothing visible", not "nothing near".
+    let (anon, _s1) = h.connect_http().await;
+    let stranger = call(
+        anon.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry backoff lesson", "content": RETRY_AGAIN, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    // Same guard as above, and it carries more here: without it a write the
+    // open tier REFUSED would read exactly like one that was scoped.
+    assert_eq!(
+        stranger["permalink"], "retry-backoff-lesson",
+        "the open tier's write landed: {stranger}"
+    );
+    assert!(
+        stranger.get("similar").is_none(),
+        "a private domain's engram never reaches the open tier: {stranger}"
+    );
+    h.engine.embed_pending().await.unwrap();
+
+    let (owner, _s2) = h.connect().await;
+    let machine = call(
+        owner.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry ttl note", "content": RETRY_AGAIN, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    let names: Vec<&str> = machine["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["permalink"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"retry-secrets"),
+        "the machine owner sees the private domain's neighbour: {machine}"
+    );
 }

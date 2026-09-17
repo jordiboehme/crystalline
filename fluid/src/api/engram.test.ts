@@ -37,4 +37,84 @@ describe("the writer a detail payload names", () => {
         .generatedBy,
     ).toBeNull();
   });
+
+  it("carries the model the writer reported, beside the actor", () => {
+    const frontmatter = detail({
+      generated: { by: "claude-code/2.1.271", model: "claude-opus-5" },
+    }).frontmatter;
+    expect(frontmatter.generatedBy).toBe("claude-code/2.1.271");
+    expect(frontmatter.generatedModel).toBe("claude-opus-5");
+  });
+
+  it("reports no model where the block names none", () => {
+    expect(
+      detail({ generated: { by: "human:jordi" } }).frontmatter.generatedModel,
+    ).toBeNull();
+  });
+});
+
+describe("the model a verification records", () => {
+  it("is read beside the verifier", () => {
+    const entries = detail({
+      verified: [
+        {
+          by: "claude-code/2.1.271",
+          model: "claude-opus-5",
+          at: "2026-09-16T10:04:01+00:00",
+        },
+      ],
+    }).frontmatter.verified;
+    expect(entries[0]?.by).toBe("claude-code/2.1.271");
+    expect(entries[0]?.model).toBe("claude-opus-5");
+  });
+
+  it("is nothing where the entry names none", () => {
+    const entries = detail({
+      verified: [{ by: "human:jordi", at: "2026-09-16T10:04:01+00:00" }],
+    }).frontmatter.verified;
+    expect(entries[0]?.model).toBeNull();
+  });
+});
+
+describe("the neighbours advisory a write receipt carries", () => {
+  it("reads the neighbours advisory and defaults to none", () => {
+    const withSimilar = readEngramDetail(
+      {
+        domain: "eng",
+        permalink: "retry-backoff-lesson",
+        content: "",
+        similar: [
+          {
+            domain: "eng",
+            permalink: "retry-queue-gotcha",
+            title: "Retry queue gotcha",
+            status: "stable",
+            type: "engram",
+          },
+          { permalink: "missing-domain" },
+        ],
+        guidance: "read the one that fits",
+      },
+      "eng",
+      "retry-backoff-lesson",
+    );
+    expect(withSimilar.similar).toEqual([
+      {
+        domain: "eng",
+        permalink: "retry-queue-gotcha",
+        title: "Retry queue gotcha",
+        status: "stable",
+        type: "engram",
+      },
+    ]);
+    expect(withSimilar.guidance).toBe("read the one that fits");
+
+    const quiet = readEngramDetail(
+      { domain: "eng", permalink: "alpha", content: "" },
+      "eng",
+      "alpha",
+    );
+    expect(quiet.similar).toEqual([]);
+    expect(quiet.guidance).toBeNull();
+  });
 });

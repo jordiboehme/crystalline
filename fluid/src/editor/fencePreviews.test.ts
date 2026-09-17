@@ -150,8 +150,8 @@ describe("fence previews", () => {
     const config = vi.mocked(mermaid.initialize).mock.calls.at(-1)?.[0];
     expect(config).toMatchObject({ theme: "base" });
     expect(config?.themeVariables).toMatchObject({
-      primaryColor: "#ccfbf1",
-      primaryBorderColor: "#0f766e",
+      primaryColor: "#ece8f9",
+      primaryBorderColor: "#45388c",
       noteBkgColor: "#f1f5f9",
       noteTextColor: "#0f172a",
       titleColor: "#0f172a",

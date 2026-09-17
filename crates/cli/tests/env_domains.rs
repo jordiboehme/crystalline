@@ -171,14 +171,15 @@ fn prompt_system_never_marks_an_env_domain_pending_while_a_regular_domain_still_
         .unwrap();
     assert!(out.status.success(), "{:?}", out);
     let text = String::from_utf8(out.stdout).unwrap();
+    let notices = String::from_utf8(out.stderr).unwrap();
 
     assert!(
-        text.contains("provision allow harbor"),
-        "the regular undecided declaring domain still produces its pending line: {text}"
+        notices.contains("provision allow harbor"),
+        "the regular undecided declaring domain still produces its pending line on stderr: {notices}"
     );
     assert!(
-        !text.contains("provision allow team"),
-        "the env-defined domain never surfaces as awaiting a decision: {text}"
+        !notices.contains("provision allow team"),
+        "the env-defined domain never surfaces as awaiting a decision: {notices}"
     );
     assert!(
         text.contains("team"),

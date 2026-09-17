@@ -143,13 +143,21 @@ function DomainCard({
 }) {
   return (
     <article className="flex h-full flex-col gap-2 rounded border border-slate-200 p-4 dark:border-slate-800">
-      <h3 className="text-base font-semibold">
+      <h3 className="flex flex-wrap items-center gap-2 text-base font-semibold">
         <Link
           to={domainRoute(domain.name)}
           className="hover:underline focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none"
         >
           {domain.name}
         </Link>
+        {/*
+          Beside the link rather than inside it, the same way the domain
+          screen puts it beside its heading: the link's accessible name stays
+          exactly the domain's name, and the badge is a separate piece of
+          content next to it. It rides on the listing this card is already
+          drawn from, so a private domain is badged wherever it is named.
+        */}
+        {domain.private && <Chip variant="accent">private</Chip>}
       </h3>
       {/* The count reads as a number and stays text; what backs the domain is
           a category, so it wears the chip every category in this app wears. */}

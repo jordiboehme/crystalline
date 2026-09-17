@@ -45,7 +45,9 @@ services:
 
   crystalline:
     image: ghcr.io/jordiboehme/crystalline:latest
-    command: ["serve", "--http", "0.0.0.0:7411", "--read-only"]
+    command: ["serve", "--read-only"]
+    environment:
+      CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
     depends_on:
       - git-sync
     ports:

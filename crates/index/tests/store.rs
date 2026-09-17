@@ -9,13 +9,14 @@
 //! assertions (Turso schema version, the query-plan index seek, the on-disk file)
 //! live in `turso_only.rs`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crystalline_index::{
     AttachmentRow, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage,
     EmbeddingRow, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage,
     InboundQuery, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode,
-    SearchQuery, Store, TursoStore, Vocabulary, sync_domain,
+    SearchQuery, Store, TursoStore, Vocabulary, resolve_forward_refs, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -59,6 +60,8 @@ fn record(path: &str, permalink: &str, content: &str, sha: &str) -> EngramRecord
             size: content.len() as u64,
             sha256: sha.to_string(),
         },
+        actor: String::new(),
+        tombstone: false,
     }
 }
 
@@ -84,12 +87,19 @@ fn pg_url() -> Option<String> {
 /// A distinct schema name per test invocation. The pid keeps runs apart, the
 /// counter keeps tests within a run apart; both stay well under Postgres's
 /// 63-byte identifier limit.
+/// A hash salt keeps a recycled pid from adopting a schema a panicking run left behind.
 #[cfg(feature = "postgres")]
 fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("ct_{}_{}", std::process::id(), n)
+    format!(
+        "ct_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
 }
 
 /// Run a parity body against Turso (always) and Postgres (when configured),
@@ -179,7 +189,7 @@ async fn full_sync_counts(store: &dyn Store) {
 
     // The resolved prose wikilink is a `links_to` edge in graph traversal.
     let alpha = store.lookup_id("eng", "alpha").await.unwrap().unwrap();
-    let slice = store.neighbors(&[alpha], 1).await.unwrap();
+    let slice = store.neighbors(&[alpha], 1, None).await.unwrap();
     assert!(
         slice
             .edges
@@ -498,6 +508,106 @@ parity!(
     forward_reference_resolves_by_title
 );
 
+/// `reference_match`'s title-match arm with two candidates: two engrams share
+/// a title, so a `[[Same Title]]` reference has more than one row it could
+/// bind to. `alpha-target.md` (permalink `alpha-target`) is synced alone
+/// first, so it gets the lower id; `Zulu-target.md` (permalink
+/// `zulu-target`) arrives in a later sync alongside the reference itself, so
+/// it gets the higher id.
+///
+/// The fixture is built so the candidate orderings disagree, which is the
+/// point: byte order over the path picks `Zulu-target.md` (`'Z'` is `0x5A`,
+/// `'a'` is `0x61`), a locale collation picks `alpha-target.md`, and the id
+/// order the tie-break is pinned to picks `alpha-target.md` too - but for a
+/// reason a locale cannot supply, since the id is an integer no collation
+/// touches. So this asserts the tie lands on the lower id on BOTH backends,
+/// which is what makes the two answers the same answer whatever the database's
+/// locale is and whatever order the rows physically sit in.
+///
+/// It was written for a path tie-break and rebaselined when that key cost the
+/// title arm its index on turso (a bare `ORDER BY e.path` is satisfiable from
+/// `idx_engram_path_actor`, so the planner abandoned `idx_engram_title_lower`
+/// and scanned the domain once per dangling reference). The property under
+/// test did not change: a tie is decided by the address, not by the layout.
+async fn reference_match_tie_break_prefers_the_lower_id(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    write(
+        root,
+        "alpha-target.md",
+        &engram("Same Title", "alpha-target", "engram", "", "alpha body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    write(
+        root,
+        "Zulu-target.md",
+        &engram("Same Title", "zulu-target", "engram", "", "zulu body\n"),
+    );
+    write(
+        root,
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "- depends_on [[Same Title]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let alpha_target = store.lookup_id("d", "alpha-target").await.unwrap().unwrap();
+    let zulu_target = store.lookup_id("d", "zulu-target").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let alpha_page = store
+        .inbound_page(&InboundQuery {
+            engram_id: alpha_target,
+            domain_id: domain,
+            permalink: "alpha-target",
+            title: "Same Title",
+            q: None,
+            rel: None,
+            exclude_domains: &[],
+            page: 1,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let zulu_page = store
+        .inbound_page(&InboundQuery {
+            engram_id: zulu_target,
+            domain_id: domain,
+            permalink: "zulu-target",
+            title: "Same Title",
+            q: None,
+            rel: None,
+            exclude_domains: &[],
+            page: 1,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        alpha_page.total, 1,
+        "the reference binds to the lower id, alpha-target.md: {alpha_page:?}"
+    );
+    assert_eq!(
+        zulu_page.total, 0,
+        "not to the byte order winner, Zulu-target.md: {zulu_page:?}"
+    );
+}
+parity!(
+    reference_resolves_to_the_same_row_on_both_backends,
+    reference_match_tie_break_prefers_the_lower_id
+);
+
 /// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
 /// mentioned in prose (no relation type) stays unresolved until its target
 /// appears, then resolves on the later sync into a `links_to` graph edge. This
@@ -537,7 +647,7 @@ async fn link_two_pass_resolution(store: &dyn Store) {
 
     // The resolved wikilink is a `links_to` edge from A to Gamma.
     let a = store.lookup_id("d", "a").await.unwrap().unwrap();
-    let slice = store.neighbors(&[a], 1).await.unwrap();
+    let slice = store.neighbors(&[a], 1, None).await.unwrap();
     assert!(
         slice
             .edges
@@ -551,6 +661,146 @@ async fn link_two_pass_resolution(store: &dyn Store) {
 parity!(
     prose_wikilink_resolves_on_later_sync,
     link_two_pass_resolution
+);
+
+/// A run over several domains settles its forward references before it
+/// finishes. Domain `a` is indexed first and carries both a relation and a
+/// prose wikilink into domain `b`, which does not exist yet - not the engram,
+/// not even the domain row - so `a`'s own resolution batch cannot match either
+/// one. Indexing `b` afterwards does not help `a` either: resolution is scoped
+/// to the domain being applied. Until the final pass existed, both references
+/// read as unresolved for the rest of the run, and the fix for an agent seeing
+/// `"resolved": false` on a link that is not broken was to sync a second time.
+///
+/// The references are written in the cross-domain `[[b:...]]` form on purpose.
+/// A bare `[[B Note]]` resolves only inside the writing domain (the match
+/// scopes to `to_domain`'s row and falls back to the source domain when it is
+/// absent), so it could never reach `b` at all and would pin nothing here.
+async fn late_cross_domain_resolution(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let a_root = dir.path().join("a");
+    let b_root = dir.path().join("b");
+    std::fs::create_dir_all(&a_root).unwrap();
+    std::fs::create_dir_all(&b_root).unwrap();
+    write(
+        &a_root,
+        "a.md",
+        &engram(
+            "A",
+            "a",
+            "engram",
+            "",
+            "- depends_on [[b:B Note]]\n\nProse mentions [[b:B Note]] too.\n",
+        ),
+    );
+    write(
+        &b_root,
+        "b.md",
+        &engram("B Note", "b-note", "engram", "", "body b\n"),
+    );
+
+    // The loop of a multi-domain driver: `a` first, while `b` is unknown - a
+    // driver upserts each domain row as it reaches it, so `b` has no row at all
+    // while `a` is being applied, which is exactly the state that defeats the
+    // per-domain batch.
+    let a_report = sync_domain(store, "a", &a_root).await.unwrap();
+    let b_report = sync_domain(store, "b", &b_root).await.unwrap();
+    // Both rows exist now, so these resolve the ids the driver already held.
+    let a_id = store
+        .upsert_domain("a", Some(&a_root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let b_id = store
+        .upsert_domain("b", Some(&b_root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        (a_report.relations_resolved, a_report.links_resolved),
+        (0, 0),
+        "a's own batch cannot see into b"
+    );
+
+    // The tail of the same driver, after every domain of the run is indexed.
+    // The driver carries one structure pairing each applied domain with its own
+    // report, so a count can never land on the wrong report.
+    let mut applied = vec![(a_id, a_report), (b_id, b_report)];
+    let totals = resolve_forward_refs(store, &mut applied).await.unwrap();
+    assert_eq!(totals, (1, 1), "the run totals name the late resolutions");
+    assert_eq!(
+        (
+            applied[0].1.relations_resolved_late,
+            applied[0].1.links_resolved_late
+        ),
+        (1, 1),
+        "and they are reported against the domain that carried them"
+    );
+    assert_eq!(
+        (
+            applied[1].1.relations_resolved_late,
+            applied[1].1.links_resolved_late
+        ),
+        (0, 0),
+        "b had no forward references of its own"
+    );
+
+    let stats = store.domain_stats().await.unwrap();
+    let a_stats = stats.iter().find(|d| d.name == "a").expect("domain a");
+    assert_eq!(
+        (a_stats.unresolved_relations, a_stats.unresolved_links),
+        (0, 0),
+        "nothing is left unresolved when the first sync finishes"
+    );
+
+    // The resolved reference is a real edge, not just a filled column.
+    let a = store.lookup_id("a", "a").await.unwrap().unwrap();
+    let slice = store.neighbors(&[a], 1, None).await.unwrap();
+    let perms: Vec<&str> = slice.nodes.iter().map(|n| n.permalink.as_str()).collect();
+    assert!(perms.contains(&"b-note"), "traversal reaches b's engram");
+
+    // The pass is idempotent: a second run over a settled index resolves
+    // nothing and does not double-count.
+    let again = resolve_forward_refs(store, &mut applied).await.unwrap();
+    assert_eq!(again, (0, 0), "nothing left to resolve");
+}
+parity!(
+    a_multi_domain_run_resolves_forward_references_before_it_finishes,
+    late_cross_domain_resolution
+);
+
+/// A single-domain run needs no final pass: its own batch already resolved
+/// everything this run indexed, so the pass short-circuits, leaves the late
+/// counters at zero and does not re-run the statement.
+async fn single_domain_run_skips_the_late_pass(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- depends_on [[b]]\n"),
+    );
+    write(root, "b.md", &engram("B", "b", "engram", "", "body b\n"));
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.relations_resolved, 1, "resolved in its own batch");
+
+    let mut applied = vec![(domain, report)];
+    let totals = resolve_forward_refs(store, &mut applied).await.unwrap();
+    assert_eq!(totals, (0, 0));
+    assert_eq!(
+        (
+            applied[0].1.relations_resolved_late,
+            applied[0].1.links_resolved_late
+        ),
+        (0, 0),
+        "the late counters stay at zero on a single-domain run"
+    );
+}
+parity!(
+    a_single_domain_run_skips_the_late_pass,
+    single_domain_run_skips_the_late_pass
 );
 
 /// `outbound_refs` reports every relation and prose link leaving an engram, in
@@ -583,7 +833,7 @@ async fn outbound_refs_status(store: &dyn Store) {
     sync_domain(store, "d", root).await.unwrap();
 
     let source = store.lookup_id("d", "source").await.unwrap().unwrap();
-    let refs = store.outbound_refs(source).await.unwrap();
+    let refs = store.outbound_refs(source, None).await.unwrap();
     let shape: Vec<_> = refs
         .iter()
         .map(|r| {
@@ -625,7 +875,7 @@ async fn outbound_refs_status(store: &dyn Store) {
     // The target itself has no outbound references.
     let target = store.lookup_id("d", "target").await.unwrap().unwrap();
     assert!(
-        store.outbound_refs(target).await.unwrap().is_empty(),
+        store.outbound_refs(target, None).await.unwrap().is_empty(),
         "an engram with no relations or links reports none"
     );
 }
@@ -733,6 +983,23 @@ async fn inbound_refs_kinds(store: &dyn Store) {
         EdgeKind::Link,
         "the prose wikilink is a link-kind inbound ref: {refs:?}"
     );
+    // Whether the reference named a domain in its brackets rides along, because
+    // the caller that rewrites bracket text has to tell `[[Hub]]` from
+    // `[[d:Hub]]`: the text on disk differs, and the target text alone is the
+    // same string in both.
+    assert_eq!(
+        refs.iter()
+            .find(|r| r.src_path == "cross.md")
+            .and_then(|r| r.to_domain.clone()),
+        Some("d".to_string()),
+        "a prefixed reference reports the domain it named: {refs:?}"
+    );
+    assert!(
+        refs.iter()
+            .filter(|r| r.src_domain == "d")
+            .all(|r| r.to_domain.is_none()),
+        "and a bare one reports none: {refs:?}"
+    );
 }
 parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
 
@@ -800,6 +1067,7 @@ fn hub_query(hub: EngramId, domain: DomainId) -> InboundQuery<'static> {
         title: "Hub",
         q: None,
         rel: None,
+        exclude_domains: &[],
         page: 1,
         limit: 10,
     }
@@ -1147,6 +1415,75 @@ parity!(
     inbound_page_empty
 );
 
+/// `exclude_domains` takes a domain out of all three answers at once: the page,
+/// the total and the per-relation summary. A reader who may not see `Zed`
+/// learns nothing about it - not the row, and not a count that would only make
+/// sense if the row existed.
+async fn inbound_page_excludes_domains(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+    let hidden = vec!["Zed".to_string()];
+
+    let page = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        !page.hits.iter().any(|h| h.domain == "Zed"),
+        "the hidden domain's referrer is off the page: {page:?}"
+    );
+    assert!(
+        !hit_titles(&page).contains(&"Cross"),
+        "and it is the cross-domain one that went: {page:?}"
+    );
+    assert_eq!(page.total, 6, "the total counts what it showed: {page:?}");
+    assert_eq!(
+        page.types
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect::<Vec<_>>(),
+        vec![("cites", 3), ("part_of", 2), ("links_to", 1)],
+        "the summary drops the hidden reference too: {page:?}"
+    );
+
+    // The exclusion narrows and nothing else: a reader-chosen filter still
+    // applies on top of it, over the same reduced set.
+    let filtered = store
+        .inbound_page(&InboundQuery {
+            rel: Some("cites"),
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 3, "{filtered:?}");
+    assert!(
+        !filtered.hits.iter().any(|h| h.domain == "Zed"),
+        "{filtered:?}"
+    );
+
+    // A name nobody registered excludes nothing, so the unfiltered answer is
+    // the one the empty exclusion gives.
+    let unrelated = vec!["ghost".to_string()];
+    let same = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &unrelated,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    let all = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+    assert_eq!(same.total, all.total, "{same:?}");
+    assert_eq!(hit_titles(&same), hit_titles(&all), "{same:?}");
+}
+parity!(
+    inbound_page_hides_the_domains_it_is_told_to,
+    inbound_page_excludes_domains
+);
+
 /// `unresolved_refs` reports every dangling relation and prose link in a domain,
 /// and nothing else: a relation that resolves never appears, a reference in
 /// another domain never leaks in and a domain with no engrams reports none. Each
@@ -1219,7 +1556,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
     let alpha = store.lookup_id("d", "alpha").await.unwrap().unwrap();
     let beta = store.lookup_id("d", "beta").await.unwrap().unwrap();
     let capital = store.lookup_id("d", "capital").await.unwrap().unwrap();
-    let refs = store.unresolved_refs(d).await.unwrap();
+    let refs = store.unresolved_refs(d, None).await.unwrap();
 
     let name = |id: EngramId| {
         if id == alpha {
@@ -1241,6 +1578,11 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 r.rel_type.as_str(),
                 r.target_domain.as_deref(),
                 r.target.as_str(),
+                // The bracket text as written, read back off `to_raw` rather
+                // than rebuilt: an ordinal drift onto the neighbouring source
+                // path would pass every other assertion in the tree and score
+                // V102's repair against a file name.
+                r.raw.as_str(),
                 r.line,
             )
         })
@@ -1256,6 +1598,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "cites",
                 None,
                 "Absent",
+                "Absent",
                 Some(13)
             ),
             (
@@ -1263,6 +1606,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 EdgeKind::Relation,
                 "blocks",
                 None,
+                "Old  Deploy Pipeline",
                 "Old  Deploy Pipeline",
                 Some(14)
             ),
@@ -1272,6 +1616,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "links_to",
                 None,
                 "Ghost Title",
+                "Ghost Title",
                 Some(16)
             ),
             (
@@ -1280,6 +1625,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "links_to",
                 Some("ghosts"),
                 "Remote Thing",
+                "ghosts:Remote Thing",
                 Some(18)
             ),
             (
@@ -1288,10 +1634,12 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "supersedes",
                 Some("archive"),
                 "Old Note",
+                "archive:Old Note",
                 Some(13)
             ),
         ],
-        "unresolved refs are ordered by (path, line) and carry the target verbatim: {refs:?}"
+        "unresolved refs are ordered by (path, line) and carry the target and the \
+         whole bracket text verbatim: {refs:?}"
     );
     assert!(
         !refs.iter().any(|r| r.target == "Target"),
@@ -1299,7 +1647,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
     );
 
     // Deterministic: the same call over the same corpus returns the same queue.
-    let again = store.unresolved_refs(d).await.unwrap();
+    let again = store.unresolved_refs(d, None).await.unwrap();
     assert_eq!(again, refs, "two calls return the same order");
 
     // Scoped to one domain, and a domain with no engrams reports none.
@@ -1307,7 +1655,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
         .upsert_domain("o", Some(&other.to_string_lossy()), DomainKind::File)
         .await
         .unwrap();
-    let other_refs = store.unresolved_refs(o).await.unwrap();
+    let other_refs = store.unresolved_refs(o, None).await.unwrap();
     assert_eq!(
         other_refs
             .iter()
@@ -1321,7 +1669,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
         .await
         .unwrap();
     assert!(
-        store.unresolved_refs(empty).await.unwrap().is_empty(),
+        store.unresolved_refs(empty, None).await.unwrap().is_empty(),
         "a domain with no engrams has no unresolved references"
     );
 }
@@ -2120,12 +2468,12 @@ async fn vocabulary_reports_its_aliases(store: &dyn Store) {
     };
 
     // Scoped: just d1's alias.
-    let scoped = store.vocabulary(Some("d1")).await.unwrap();
+    let scoped = store.vocabulary(Some("d1"), None).await.unwrap();
     assert_eq!(pairs(&scoped), vec![("old".to_string(), "new".to_string())]);
 
     // All-domain: the union, deduped across the shared `old -> new` and sorted
     // by alias then canonical.
-    let all = store.vocabulary(None).await.unwrap();
+    let all = store.vocabulary(None, None).await.unwrap();
     assert_eq!(
         pairs(&all),
         vec![
@@ -2337,7 +2685,7 @@ async fn neighbors_cross_domain(store: &dyn Store) {
 
     let a = store.lookup_id("domain1", "a").await.unwrap().unwrap();
 
-    let d1_slice = store.neighbors(&[a], 1).await.unwrap();
+    let d1_slice = store.neighbors(&[a], 1, None).await.unwrap();
     let perms1: Vec<&str> = d1_slice
         .nodes
         .iter()
@@ -2347,7 +2695,7 @@ async fn neighbors_cross_domain(store: &dyn Store) {
     assert!(perms1.contains(&"b"), "depth 1 reaches B");
     assert!(!perms1.contains(&"c"), "depth 1 does not reach C");
 
-    let d2_slice = store.neighbors(&[a], 2).await.unwrap();
+    let d2_slice = store.neighbors(&[a], 2, None).await.unwrap();
     let perms2: Vec<&str> = d2_slice
         .nodes
         .iter()
@@ -2412,7 +2760,7 @@ async fn neighbors_carries_salience(store: &dyn Store) {
     assert_eq!(report.relations_resolved, 3, "all three relations resolve");
 
     let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
-    let slice = store.neighbors(&[seed], 1).await.unwrap();
+    let slice = store.neighbors(&[seed], 1, None).await.unwrap();
 
     let numeric = slice
         .nodes
@@ -2476,7 +2824,7 @@ async fn neighbors_carries_status(store: &dyn Store) {
     assert_eq!(report.relations_resolved, 2, "both relations resolve");
 
     let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
-    let slice = store.neighbors(&[seed], 1).await.unwrap();
+    let slice = store.neighbors(&[seed], 1, None).await.unwrap();
 
     let current = slice
         .nodes
@@ -2594,7 +2942,7 @@ async fn vocabulary_counts(store: &dyn Store) {
     // two engrams and two observations; `api` and `deploy` tie and sort by name;
     // `legacy` (1, 0) and `urgent` (0, 1) have unequal counts, so a swapped
     // engram/observation assignment in the backend would fail here.
-    let all = store.vocabulary(None).await.unwrap();
+    let all = store.vocabulary(None, None).await.unwrap();
     assert_eq!(
         tag_shape(&all),
         vec![
@@ -2627,7 +2975,7 @@ async fn vocabulary_counts(store: &dyn Store) {
     // The domain filter narrows every facet to one domain's engrams. The eng
     // domain keeps the unequal-count `legacy` (1, 0) and `urgent` (0, 1) tags and
     // still excludes the ops `deploy` tag.
-    let eng_vocab = store.vocabulary(Some("eng")).await.unwrap();
+    let eng_vocab = store.vocabulary(Some("eng"), None).await.unwrap();
     assert_eq!(
         tag_shape(&eng_vocab),
         vec![
@@ -2646,8 +2994,19 @@ async fn vocabulary_counts(store: &dyn Store) {
         eng_vocab.relation_types
     );
 
+    // Merging every domain's own sweep is the all-domain sweep, name for name
+    // and count for count. That is what a caller who may not read every domain
+    // assembles, and it must not be able to order or count itself differently
+    // from the single query.
+    let ops_vocab = store.vocabulary(Some("ops"), None).await.unwrap();
+    assert_eq!(
+        crystalline_index::merge_vocabularies(vec![eng_vocab.clone(), ops_vocab]),
+        all,
+        "the merge of the per-domain sweeps is the all-domain sweep"
+    );
+
     // An unknown domain yields empty vectors rather than an error.
-    let missing = store.vocabulary(Some("nope")).await.unwrap();
+    let missing = store.vocabulary(Some("nope"), None).await.unwrap();
     assert!(
         missing.tags.is_empty()
             && missing.categories.is_empty()
@@ -2697,7 +3056,7 @@ async fn vocabulary_types_and_statuses(store: &dyn Store) {
     // The all-domain sweep counts every engram row and orders by count
     // descending then name, so the three singletons sort alphabetically behind
     // the pair.
-    let all = store.vocabulary(None).await.unwrap();
+    let all = store.vocabulary(None, None).await.unwrap();
     assert_eq!(
         named_shape(&all.types),
         vec![
@@ -2720,7 +3079,7 @@ async fn vocabulary_types_and_statuses(store: &dyn Store) {
     );
 
     // The domain filter narrows both lists to one domain's engrams.
-    let scoped = store.vocabulary(Some("eng")).await.unwrap();
+    let scoped = store.vocabulary(Some("eng"), None).await.unwrap();
     assert_eq!(
         named_shape(&scoped.types),
         vec![("note".to_string(), 2), ("decision".to_string(), 1)],
@@ -2735,7 +3094,7 @@ async fn vocabulary_types_and_statuses(store: &dyn Store) {
     );
 
     // An unknown domain yields empty vectors here too, matching the other lists.
-    let missing = store.vocabulary(Some("nope")).await.unwrap();
+    let missing = store.vocabulary(Some("nope"), None).await.unwrap();
     assert!(
         missing.types.is_empty() && missing.statuses.is_empty(),
         "an unknown domain is written in no types or statuses: {missing:?}"
@@ -2765,7 +3124,7 @@ async fn tag_identity_folds(store: &dyn Store) {
     sync_domain(store, "d", root).await.unwrap();
 
     // One folded tag row: two engrams (Foo, foo) and one observation (#FOO).
-    let vocab = store.vocabulary(Some("d")).await.unwrap();
+    let vocab = store.vocabulary(Some("d"), None).await.unwrap();
     let shape: Vec<(String, i64, i64)> = vocab
         .tags
         .iter()
@@ -2981,6 +3340,49 @@ async fn descriptor_lookups_order_by_bytes(store: &dyn Store) {
 parity!(
     descriptor_lookups_order_by_byte_value,
     descriptor_lookups_order_by_bytes
+);
+
+/// The name list and the counted stats describe the same set of domains, in the
+/// same byte order.
+///
+/// `domain_names` exists so the serving screen - which asks on every read which
+/// domains the index holds - does not pay for `domain_stats`' six correlated
+/// counting scans per domain to learn a name. Two answers for one question is
+/// how they drift, so this pins them together; the mixed case is here because a
+/// Postgres locale collation would order the two differently without the
+/// explicit `COLLATE "C"`.
+async fn names_and_stats_describe_the_same_domains(store: &dyn Store) {
+    assert!(
+        store.domain_names().await.unwrap().is_empty(),
+        "an empty index holds no domain names"
+    );
+    for name in ["Zed", "eng", "alpha"] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", &engram("A", "a", "engram", "", "b\n"));
+        sync_domain(store, name, dir.path()).await.unwrap();
+    }
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["Zed".to_string(), "alpha".to_string(), "eng".to_string()],
+        "sorted in byte order, so a capitalized name comes first"
+    );
+    let mut counted: Vec<String> = store
+        .domain_stats()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    counted.sort();
+    assert_eq!(
+        counted,
+        store.domain_names().await.unwrap(),
+        "the cheap answer names exactly the domains the counted one does"
+    );
+}
+parity!(
+    domain_names_matches_domain_stats,
+    names_and_stats_describe_the_same_domains
 );
 
 async fn wipe_clears(store: &dyn Store) {
@@ -4774,4 +5176,2736 @@ async fn clear_domain_clears_attachments(store: &dyn Store) {
 parity!(
     clear_domain_takes_attachments_with_it,
     clear_domain_clears_attachments
+);
+
+/// Issue #65 at the index: an engram whose own title's first word ends in a
+/// colon.
+///
+/// `[[Log: Weekly Garden Notes]]` splits like `[[domain:Target]]`, because the
+/// parser is domain-agnostic and nothing inside the brackets says which it is.
+/// Resolution is where the registry can settle it: a prefix no domain answers
+/// to means the whole bracket text is a title at home. A prefix that does name
+/// a domain is untouched, and an unregistered prefix matching nothing at home
+/// stays unresolved rather than being softened into a hit.
+async fn colon_title_resolution(store: &dyn Store) {
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "how to restart\n"),
+    );
+    sync_domain(store, "ops", other).await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // The title is quoted, because a bare `title: Log: Weekly Garden Notes` is
+    // not YAML at all - which is a small reminder of why the colon is a
+    // problem worth solving rather than forbidding.
+    write(
+        root,
+        "log-weekly.md",
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    );
+    write(
+        root,
+        "alpha.md",
+        &engram(
+            "Alpha",
+            "alpha",
+            "engram",
+            "",
+            "- superseded_by [[Log: Weekly Garden Notes]]\n- cites [[ops:Runbook]]\n- blocks [[Ledger: Nobody Wrote This]]\n\nProse about [[Log: Weekly Garden Notes]] here.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let alpha = store.lookup_id("d", "alpha").await.unwrap().unwrap();
+    let refs = store.outbound_refs(alpha, None).await.unwrap();
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| (r.to_domain.as_deref(), r.to_target.as_str(), r.resolved))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Nothing is registered as `Log`, so the whole bracket text is the
+            // title of the engram beside it.
+            (Some("Log"), "Weekly Garden Notes", true),
+            // `ops` is a domain, so the prefix keeps its meaning.
+            (Some("ops"), "Runbook", true),
+            // `Ledger` is no domain either, and no engram here is titled
+            // `Ledger: Nobody Wrote This`. A second reading is a second
+            // question, not a softer answer.
+            (Some("Ledger"), "Nobody Wrote This", false),
+            // The prose wikilink is the same target through the other table.
+            (Some("Log"), "Weekly Garden Notes", true),
+        ]
+    );
+}
+parity!(
+    a_colon_in_a_title_resolves_at_home_on_both_backends,
+    colon_title_resolution
+);
+
+// --- the registration stamp --------------------------------------------------
+
+/// The `last_registered` stamp: a domain the configuration still names is
+/// marked as seen, restamping moves the mark forward, a domain nobody stamped
+/// reads as `None`, and the value travels on `domain_stats`.
+///
+/// `None` is the load-bearing case. It means "never stamped", not "stamped
+/// long ago": a domain row written before the column existed, or one written
+/// by a sync that ran before the first stamping sweep, carries no evidence
+/// about its age at all. A caller that ages the stamp must leave such a row
+/// alone rather than treat it as infinitely old.
+async fn registration_stamp(store: &dyn Store) {
+    let _ = store
+        .upsert_domain("alpha", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("beta", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("gamma", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+
+    // Fresh rows are unstamped: nobody has said they were registered yet.
+    let stamp = |stats: &Vec<crystalline_index::DomainStats>, name: &str| {
+        stats
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} is in domain_stats"))
+            .last_registered
+            .clone()
+    };
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stamp(&stats, "alpha"), None, "a fresh row is unstamped");
+    assert_eq!(stamp(&stats, "beta"), None);
+    assert_eq!(stamp(&stats, "gamma"), None);
+
+    // Stamping names two of the three. Times are fixed-width RFC 3339 strings,
+    // the same convention `last_sync` uses, so they compare lexically.
+    store
+        .stamp_registered(&["alpha", "beta"], "2026-09-01T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "the stamp travels on domain_stats"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z")
+    );
+    assert_eq!(
+        stamp(&stats, "gamma"),
+        None,
+        "a domain nobody stamped stays unstamped: never seen, not seen long ago"
+    );
+
+    // Stamping again moves the mark forward for the named domains only.
+    store
+        .stamp_registered(&["alpha"], "2026-09-08T12:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "restamping moves the mark forward"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "a domain the second call did not name keeps its earlier stamp"
+    );
+
+    // An empty set is a no-op, not a syntax error: a configuration that
+    // registers nothing is a configuration, and the sweep still runs.
+    store
+        .stamp_registered(&[], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "an empty stamp set changes nothing"
+    );
+
+    // A name with no row is a silent no-op: the configuration may register a
+    // domain that has never been synced, and stamping must not invent a row.
+    store
+        .stamp_registered(&["never-synced", "gamma"], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats.len(), 3, "stamping an unknown name creates no row");
+    assert_eq!(
+        stamp(&stats, "gamma").as_deref(),
+        Some("2026-09-09T00:00:00Z"),
+        "the known name beside it was still stamped"
+    );
+}
+parity!(
+    registration_stamp_records_when_a_domain_was_last_seen,
+    registration_stamp
+);
+
+// --- the actor dimension -----------------------------------------------------
+
+/// The body `sync_domain` stores for the fixture engram below: what the parser
+/// keeps of the file, heading and all.
+const BASE_BODY: &str = "\n# A\n\nbase body\n\n";
+
+/// An overlay row is a full engram row belonging to one actor, sitting beside
+/// the base row at the same path, and nothing that reads the base sees it.
+///
+/// This is the whole contract of the actor dimension in one body: a draft
+/// round-trips through the overlay verbs whole, it is addressed by actor so a
+/// second actor asking the same question gets nothing, and every base-facing
+/// read - content, listing, browse, stats, stamps, resolution, export, search -
+/// answers exactly what it answered before the draft existed. The file stamps
+/// are the sharpest of those: the sync driver derives deletes by subtracting
+/// the walk from that snapshot, so a draft leaking into it would be proposed as
+/// a deletion on every single sync.
+async fn overlay_rows_shadow_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "base body\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_id = store
+        .lookup_id("d", "a")
+        .await
+        .unwrap()
+        .expect("a base row");
+
+    // An empty actor is the base row's own name, so it is not an overlay and
+    // the verb refuses it rather than writing over the base.
+    let draft = record("a.md", "a", "draft body\n", "dddd");
+    assert!(
+        store.upsert_overlay(domain, "", &draft).await.is_err(),
+        "the empty actor names the base row, so it is not a draft key"
+    );
+
+    let draft_id = store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    assert_ne!(
+        draft_id, base_id,
+        "a draft is a row of its own, not an edit of the base row"
+    );
+
+    // Nothing that reads the base has changed.
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "the base content is what the files on disk say it is"
+    );
+    assert_eq!(
+        store.list_engrams("d", None, None).await.unwrap().len(),
+        1,
+        "the listing holds the base row alone"
+    );
+    assert_eq!(
+        store.browse_level("d", None, 1, 50).await.unwrap().total,
+        1,
+        "and the browse level counts the same one"
+    );
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stats.iter().find(|s| s.name == "d").unwrap().engrams,
+        1,
+        "a domain holding a draft is not a domain holding two engrams"
+    );
+    let stamps = store.file_stamps(domain).await.unwrap();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "the stamp snapshot names only what is on disk, or every sync would \
+         propose the draft as a deletion"
+    );
+    assert_eq!(
+        store.lookup_id("d", "a").await.unwrap(),
+        Some(base_id),
+        "resolution still lands on the base row"
+    );
+    assert_eq!(
+        store.find_engram("d", "a").await.unwrap().map(|d| d.id),
+        Some(base_id)
+    );
+    assert_eq!(
+        store.find_engram_any("a").await.unwrap().len(),
+        1,
+        "and the cross-domain lookup finds one answer, not two"
+    );
+    let exported = store.all_engram_contents(domain).await.unwrap();
+    assert_eq!(
+        exported
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![BASE_BODY],
+        "an export writes the domain back as its files, drafts excluded"
+    );
+    let hits = store.search(&SearchQuery::text("draft")).await.unwrap();
+    assert_eq!(hits.total, 0, "a draft is not in the base search either");
+
+    // And the draft itself round-trips, for its own actor only.
+    let mine = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .expect("alice sees her own draft");
+    assert_eq!(mine.content, "draft body\n");
+    assert_eq!(mine.path, "a.md");
+    assert_eq!(mine.permalink, "a");
+    assert_eq!(mine.actor, "alice");
+    assert!(!mine.tombstone, "an ordinary draft is not a tombstone");
+    assert!(
+        store
+            .overlay_entry(domain, "bob", "a.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "and nobody else's"
+    );
+    assert_eq!(
+        store.overlay_entries(domain, "alice").await.unwrap().len(),
+        1
+    );
+    assert!(
+        store
+            .overlay_entries(domain, "bob")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1)],
+        "the per-actor count names who holds drafts here and how many"
+    );
+
+    // A second write at the same path replaces the draft rather than adding one.
+    let second = record("a.md", "a", "later draft\n", "eeee");
+    let again = store
+        .upsert_overlay(domain, "alice", &second)
+        .await
+        .unwrap();
+    assert_eq!(again, draft_id, "one row per actor per path");
+    assert_eq!(
+        store
+            .overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "later draft\n"
+    );
+
+    // A second actor holds a draft at the same path without disturbing hers.
+    store
+        .upsert_overlay(domain, "bob", &record("a.md", "a", "bob's\n", "bbbb"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1), ("bob".to_string(), 1)],
+        "two actors, one path, one row each"
+    );
+
+    // Clearing is per actor and idempotent, and the base row is untouched.
+    assert!(
+        store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap(),
+        "clearing a draft that exists reports that it did"
+    );
+    assert!(
+        !store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap(),
+        "and clearing it again reports that there was nothing to clear"
+    );
+    assert!(
+        store
+            .overlay_entry(domain, "bob", "a.md")
+            .await
+            .unwrap()
+            .is_some(),
+        "the other actor's draft is still there"
+    );
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "and the base row never moved"
+    );
+}
+parity!(
+    overlay_rows_shadow_nothing_until_asked_and_round_trip,
+    overlay_rows_shadow_nothing
+);
+
+/// A tombstone is an overlay row like any other, carrying the flag instead of a
+/// replacement body.
+///
+/// It has to be a row rather than an absence for the same reason a draft does:
+/// it belongs to one actor, it survives a forced resync, and the journal that
+/// mirrors it needs something to mirror. What it must never do is reach the
+/// base - the file on disk is still there, so every base read still answers
+/// with it.
+async fn a_tombstone_is_a_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "base body\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let mut stone = record("a.md", "a", "", "");
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let entry = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .expect("the tombstone is a row, so it is found");
+    assert!(entry.tombstone, "and it says what it is");
+    assert_eq!(entry.actor, "alice");
+    assert_eq!(
+        store.overlay_entries(domain, "alice").await.unwrap().len(),
+        1,
+        "a tombstone is one of an actor's overlay entries"
+    );
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1)],
+        "and it counts as one"
+    );
+
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "the file on disk is still there, so the base still answers with it"
+    );
+    assert_eq!(
+        store.list_engrams("d", None, None).await.unwrap().len(),
+        1,
+        "and the base listing is one row, not two and not zero"
+    );
+    assert_eq!(
+        store.file_stamps(domain).await.unwrap().len(),
+        1,
+        "the stamp snapshot is what is on disk, tombstone or no tombstone"
+    );
+
+    // Turning a tombstone back into a draft is one more write at the same key.
+    store
+        .upsert_overlay(domain, "alice", &record("a.md", "a", "back\n", "aaaa"))
+        .await
+        .unwrap();
+    let entry = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !entry.tombstone,
+        "the flag clears with the row that carried it"
+    );
+    assert_eq!(entry.content, "back\n");
+}
+parity!(a_tombstone_is_an_overlay_row_too, a_tombstone_is_a_row);
+
+/// Asking which domain a name is, without registering one on the way.
+///
+/// Every other route to a `DomainId` is `upsert_domain`, which writes. A read
+/// that has to count somebody's drafts - a status call, a removal's question -
+/// cannot spend a write to ask, least of all on a read-only instance, so this
+/// is the read-only form: the id of a domain the index already holds, and
+/// `None` for a name it has never been told about, with the table left exactly
+/// as it was either way.
+async fn domain_id_is_a_read(store: &dyn Store) {
+    let registered = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_id("eng").await.unwrap(),
+        Some(registered),
+        "a registered domain answers with the id every write verb resolved"
+    );
+    assert_eq!(
+        store.domain_id("nobody-registered-this").await.unwrap(),
+        None,
+        "a name the index has never held is absent rather than an error"
+    );
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["eng".to_string()],
+        "and asking after an unregistered name registered nothing"
+    );
+}
+parity!(
+    domain_id_answers_without_registering_anything,
+    domain_id_is_a_read
+);
+
+/// A draft of `path`, parsed from markdown the way a write verb parses what it
+/// was handed, so a draft row carries the observations, tags and chunks-worth
+/// of text a base row carries.
+async fn draft(
+    store: &dyn Store,
+    domain: DomainId,
+    actor: &str,
+    path: &str,
+    markdown: &str,
+) -> EngramId {
+    let parsed = crystalline_core::parse_engram(markdown).unwrap();
+    let record = EngramRecord::from_engram(
+        &parsed,
+        path,
+        FileStamp {
+            mtime: 0,
+            size: markdown.len() as u64,
+            sha256: format!("{actor}-{path}"),
+        },
+    );
+    store.upsert_overlay(domain, actor, &record).await.unwrap()
+}
+
+/// The `(permalink, title)` of every hit, sorted, which is what an assertion
+/// about who sees which row is actually about.
+fn rows(page: &crystalline_index::Page<crystalline_index::SearchHit>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = page
+        .items
+        .iter()
+        .map(|h| (h.permalink.clone(), h.title.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A search names whose rows it wants, and gets the base rows plus that actor's
+/// own drafts, with a draft standing in for the base row it replaces.
+///
+/// Three claims, and all three are the actor predicate rather than anything
+/// downstream. A draft at a path no file holds is a hit of its own. A draft
+/// over a base row is the hit, once, with the draft's own title - one engram,
+/// one answer. And another actor's draft is nowhere in it: bob's rewrite of
+/// the field notes never reaches alice, and neither reaches a search that names
+/// no actor at all, which is what every unauthenticated reader and every
+/// pre-overlay caller gets.
+///
+/// The lexical, filter-only and semantic legs each ask through a different
+/// candidate query, so all three are asserted: a predicate that landed on one
+/// of them would leak through the other two.
+async fn search_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates the rollout #t\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram(
+            "Field notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook stays open #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates nothing any more #t\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- [idea] an audit of the audit itself #t\n",
+        ),
+    )
+    .await;
+    let bob_notes = draft(
+        store,
+        domain,
+        "bob",
+        "notes.md",
+        &engram(
+            "Bob's notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook, bob's own copy #t\n",
+        ),
+    )
+    .await;
+
+    let base = vec![
+        ("notes".to_string(), "Field notes".to_string()),
+        ("plan".to_string(), "Rollout plan".to_string()),
+    ];
+    let alices = vec![
+        ("fresh".to_string(), "Fresh idea".to_string()),
+        ("notes".to_string(), "Field notes".to_string()),
+        ("plan".to_string(), "Rollout plan, revised".to_string()),
+    ];
+    let bobs = vec![
+        ("notes".to_string(), "Bob's notes".to_string()),
+        ("plan".to_string(), "Rollout plan".to_string()),
+    ];
+
+    // The lexical leg.
+    let lexical = |actor: Option<&str>| SearchQuery {
+        text: Some("audit".to_string()),
+        actor: actor.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        // An actor holding nothing sees exactly what the files say, which is
+        // also the answer for every account that never drafted here.
+        (Some("carol"), &base),
+    ] {
+        let page = store.search(&lexical(actor)).await.unwrap();
+        assert_eq!(rows(&page), *want, "the lexical leg, as {actor:?}");
+        assert_eq!(page.total, want.len(), "and its total, as {actor:?}");
+    }
+
+    // The filter-only leg: no text at all, so a different statement answers.
+    let filtered = |actor: Option<&str>| SearchQuery {
+        engram_type: Some("engram".to_string()),
+        actor: actor.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        (Some("carol"), &base),
+    ] {
+        let page = store.search(&filtered(actor)).await.unwrap();
+        assert_eq!(rows(&page), *want, "the filter-only leg, as {actor:?}");
+        assert_eq!(page.total, want.len(), "and its total, as {actor:?}");
+    }
+
+    // The semantic leg. A draft's chunks are written exactly as a base row's,
+    // keyed to the draft's own id, so the vector scan reaches them and the
+    // predicate is the only thing deciding whose rows come back.
+    for (id, text) in [
+        (alice_plan, "the audit gates nothing any more"),
+        (alice_fresh, "an audit of the audit itself"),
+        (bob_notes, "the audit notebook, bob's own copy"),
+    ] {
+        store
+            .replace_chunks(
+                id,
+                &[NewChunk {
+                    seq: 0,
+                    text: text.to_string(),
+                    text_hash: format!("hash-{}", id.0),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let embedded: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&embedded, "m8").await.unwrap();
+
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        (Some("carol"), &base),
+    ] {
+        let page = store
+            .search(&SearchQuery {
+                actor: actor.map(str::to_string),
+                limit: 50,
+                ..semantic_query("audit", 8, "m8")
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&page), *want, "the semantic leg, as {actor:?}");
+    }
+}
+parity!(
+    search_serves_base_plus_own_overlay_with_shadowing,
+    search_across_the_actor_dimension
+);
+
+/// A path its author has deleted is absent from that author's own search and
+/// present in everybody else's.
+///
+/// A tombstone is a full row carrying the base row's text, so it would match
+/// the same query the base row matches; a candidate leg that forgot to exclude
+/// it would answer a deletion with the deleted engram. And it has to shadow the
+/// base row while doing so, which is the half a `tombstone = 0` in the wrong
+/// place gets backwards: filter tombstones inside the anti-join and the
+/// deletion becomes invisible, with the base row showing through as though
+/// nobody had deleted anything.
+async fn a_tombstoned_path_leaves_its_authors_search(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Ledger",
+            "a",
+            "engram",
+            "",
+            "- [fact] the ledger reconciles nightly #t\n",
+        ),
+    );
+    write(
+        root,
+        "b.md",
+        &engram(
+            "Ledger appendix",
+            "b",
+            "engram",
+            "",
+            "- [fact] the ledger appendix lists the exceptions #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    // The tombstone the engine writes: the base row's own text, its path as its
+    // permalink, and the flag. The text is what makes this sharp - it matches
+    // the query as well as the base row does.
+    let mut stone = record(
+        "a.md",
+        "a.md",
+        "- [fact] the ledger reconciles nightly #t\n",
+        "alice-a",
+    );
+    stone.title = "Ledger".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let both = vec![
+        ("a".to_string(), "Ledger".to_string()),
+        ("b".to_string(), "Ledger appendix".to_string()),
+    ];
+    let without_a = vec![("b".to_string(), "Ledger appendix".to_string())];
+
+    for (actor, want) in [
+        (None, &both),
+        (Some("alice"), &without_a),
+        (Some("bob"), &both),
+    ] {
+        let lexical = store
+            .search(&SearchQuery {
+                text: Some("ledger".to_string()),
+                actor: actor.map(str::to_string),
+                limit: 50,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&lexical), *want, "the lexical leg, as {actor:?}");
+        assert_eq!(lexical.total, want.len(), "and its total, as {actor:?}");
+
+        let filtered = store
+            .search(&SearchQuery {
+                engram_type: Some("engram".to_string()),
+                actor: actor.map(str::to_string),
+                limit: 50,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&filtered), *want, "the filter-only leg, as {actor:?}");
+        assert_eq!(filtered.total, want.len(), "and its total, as {actor:?}");
+    }
+}
+parity!(
+    a_tombstoned_path_is_absent_for_its_author_and_present_for_base,
+    a_tombstoned_path_leaves_its_authors_search
+);
+
+/// The lead vectors `V301` compares are one actor's view of the domain, never
+/// everybody's rows at once.
+///
+/// The sweep asks for meaning, so the rows it measures have to be the rows that
+/// reader sees: their own draft where they hold one, the team's file where they
+/// do not, and nothing at all at a path they have deleted. `None` is the base
+/// dimension alone, byte for byte the answer this method gave before the actor
+/// was a parameter, which is what an unauthenticated sweep and every
+/// pre-overlay caller gets.
+///
+/// Asserted as id sets rather than as vectors: the vector is the payload, the
+/// row set is the claim.
+async fn lead_vectors_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates the rollout #t\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram(
+            "Field notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook stays open #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base: HashMap<String, EngramId> = store
+        .list_engrams("d", None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| (d.path, d.id))
+        .collect();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates nothing any more #t\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- [idea] an audit of the audit itself #t\n",
+        ),
+    )
+    .await;
+    let bob_notes = draft(
+        store,
+        domain,
+        "bob",
+        "notes.md",
+        &engram(
+            "Bob's notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook, bob's own copy #t\n",
+        ),
+    )
+    .await;
+    // Alice deleted the field notes. The tombstone carries the base row's own
+    // text, so a screen that only excluded the row would still hand the sweep
+    // the base row's meaning at a path she says is gone.
+    let mut stone = record(
+        "notes.md",
+        "notes.md",
+        "- [fact] the audit notebook stays open #t\n",
+        "alice-notes",
+    );
+    stone.title = "Field notes".to_string();
+    stone.tombstone = true;
+    let alice_stone = store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    // Every row gets a lead chunk and an embedding, the tombstone included, so
+    // nothing below is quiet for want of a vector.
+    for (id, text) in [
+        (base["plan.md"], "the audit gates the rollout"),
+        (base["notes.md"], "the audit notebook stays open"),
+        (alice_plan, "the audit gates nothing any more"),
+        (alice_fresh, "an audit of the audit itself"),
+        (bob_notes, "the audit notebook, bob's own copy"),
+        (alice_stone, "the audit notebook stays open"),
+    ] {
+        store
+            .replace_chunks(
+                id,
+                &[NewChunk {
+                    seq: 0,
+                    text: text.to_string(),
+                    text_hash: format!("hash-{}", id.0),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let embedded: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&embedded, "m8").await.unwrap();
+
+    let ids = |vectors: Vec<crystalline_index::LeadVector>| {
+        let mut out: Vec<i64> = vectors.into_iter().map(|lv| lv.engram_id.0).collect();
+        out.sort();
+        out
+    };
+    let sorted = |v: Vec<EngramId>| {
+        let mut out: Vec<i64> = v.into_iter().map(|id| id.0).collect();
+        out.sort();
+        out
+    };
+
+    for (actor, want) in [
+        (None, sorted(vec![base["plan.md"], base["notes.md"]])),
+        // Her draft stands in for the plan, her fresh idea joins, and the path
+        // she deleted contributes nothing - not the base row and not the
+        // tombstone's inherited text.
+        (Some("alice"), sorted(vec![alice_plan, alice_fresh])),
+        (Some("bob"), sorted(vec![bob_notes, base["plan.md"]])),
+        // An account that drafted nothing here reads the files, like nobody.
+        (
+            Some("carol"),
+            sorted(vec![base["plan.md"], base["notes.md"]]),
+        ),
+    ] {
+        let got = store.lead_vectors(domain, "m8", actor).await.unwrap();
+        assert_eq!(ids(got), want, "the lead vectors, as {actor:?}");
+    }
+
+    // The vectors themselves still arrive intact, and they are the drafted
+    // text rather than the file's.
+    let alices = store
+        .lead_vectors(domain, "m8", Some("alice"))
+        .await
+        .unwrap();
+    let revised = alices
+        .iter()
+        .find(|lv| lv.engram_id == alice_plan)
+        .expect("her draft of the plan carries a vector");
+    assert_eq!(revised.dims, 8);
+    assert_eq!(
+        revised.vector,
+        embed_one("the audit gates nothing any more", 8),
+        "the vector is the one her draft's lead chunk was embedded as"
+    );
+}
+parity!(
+    lead_vectors_answer_the_actors_shadowed_view,
+    lead_vectors_across_the_actor_dimension
+);
+
+/// The graph a reader walks is their own view of the domain: their drafts'
+/// edges, the team's edges everywhere they hold no draft, and nothing of
+/// anybody else's.
+///
+/// Both ends of every edge are screened, not just the node hydrate, because an
+/// edge reaching INTO a draft is as far outside that reader's graph as one
+/// leaving it - and a frontier that walked it would push the draft's id into
+/// the visited set and pull base engrams into the neighbourhood through
+/// somebody else's private draft.
+///
+/// `None` is the base graph alone, the answer this traversal gave before the
+/// dimension existed, which is what every unauthenticated reader gets.
+async fn neighbors_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram("Field notes", "notes", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "audit.md",
+        &engram("Audit", "audit", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+    let base_notes = store.lookup_id("d", "notes").await.unwrap().unwrap();
+
+    // Her draft of the plan points somewhere else than the file does, so the
+    // base edge and the drafted edge are distinguishable rather than equal.
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[audit]]\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    )
+    .await;
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram(
+            "Bob's own",
+            "bobs",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    )
+    .await;
+    // Setup, not assertion: a draft's references settle onto real ids exactly
+    // as a base row's do, and without this every edge below would be skipped
+    // for a reason that has nothing to do with the actor.
+    store.resolve_pending_relations(domain).await.unwrap();
+    store.resolve_pending_links(domain).await.unwrap();
+
+    /// The slice as `(node permalinks, edges as permalink pairs)`, both sorted.
+    fn shape(slice: &crystalline_index::GraphSlice) -> (Vec<String>, Vec<(String, String)>) {
+        let by_id: HashMap<i64, String> = slice
+            .nodes
+            .iter()
+            .map(|n| (n.id.0, n.permalink.clone()))
+            .collect();
+        let mut names: Vec<String> = by_id.values().cloned().collect();
+        names.sort();
+        let mut edges: Vec<(String, String)> = slice
+            .edges
+            .iter()
+            .map(|e| {
+                (
+                    by_id
+                        .get(&e.from.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("no node {}", e.from.0)),
+                    by_id
+                        .get(&e.to.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("no node {}", e.to.0)),
+                )
+            })
+            .collect();
+        edges.sort();
+        (names, edges)
+    }
+
+    let plan_to_notes = (
+        vec!["notes".to_string(), "plan".to_string()],
+        vec![("plan".to_string(), "notes".to_string())],
+    );
+    // Seeded at the plan, from each end of the dimension.
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, None).await.unwrap()),
+        plan_to_notes,
+        "the base graph is what the files say, for a reader who names no actor"
+    );
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, Some("bob")).await.unwrap()),
+        plan_to_notes,
+        "and for an actor who holds no draft at that path"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[alice_plan], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["audit".to_string(), "plan".to_string()],
+            vec![("plan".to_string(), "audit".to_string())]
+        ),
+        "her own draft's edge is the edge she walks, not the file's"
+    );
+
+    // Seeded at the other end, which is the half a screen on one endpoint
+    // alone gets wrong.
+    assert_eq!(
+        shape(&store.neighbors(&[base_notes], 1, None).await.unwrap()),
+        plan_to_notes,
+        "nobody's draft points at the field notes as far as the files know"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[base_notes], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["fresh".to_string(), "notes".to_string()],
+            vec![("fresh".to_string(), "notes".to_string())]
+        ),
+        "her draft-only engram reaches the notes, and the plan she is drafting \
+         over does not: her view of that path is her own draft, which points \
+         elsewhere"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[base_notes], 1, Some("bob"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["bobs".to_string(), "notes".to_string(), "plan".to_string()],
+            vec![
+                ("bobs".to_string(), "notes".to_string()),
+                ("plan".to_string(), "notes".to_string())
+            ]
+        ),
+        "bob walks his own draft and the team's plan, and never hers"
+    );
+    assert!(
+        !shape(
+            &store
+                .neighbors(&[base_notes], 2, Some("bob"))
+                .await
+                .unwrap()
+        )
+        .0
+        .contains(&"fresh".to_string()),
+        "and no depth reaches another actor's draft"
+    );
+    let _ = (alice_fresh, bob_own);
+
+    // A path its author deleted is not in that author's graph, so an edge into
+    // it is never walked and leaves no node behind.
+    let mut stone = record("audit.md", "audit.md", "plain\n", "alice-audit");
+    stone.title = "Audit".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[alice_plan], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (vec!["plan".to_string()], Vec::new()),
+        "her draft stands alone once she has deleted what it points at"
+    );
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, None).await.unwrap()),
+        plan_to_notes,
+        "and the team's graph never moved"
+    );
+}
+parity!(
+    neighbors_answer_the_actors_shadowed_graph,
+    neighbors_across_the_actor_dimension
+);
+
+// --- the author's own drafts as reference targets ----------------------------
+
+/// Whether one reference row bound to one particular candidate, read from
+/// outside the store's own SQL.
+///
+/// The graph frontier keys on the STORED `to_id` (`r.to_id IN (<seeds>)`)
+/// while the target hop redirects onto whatever the reader's view holds at
+/// that row's path, so seeding at a candidate and asking whether the edge
+/// comes back is the one way a test can tell which of two rows at the same
+/// address a reference actually named. Only meaningful about a reference that
+/// is bound at all - an unresolved row reaches its author's draft through the
+/// other arm - so every caller below asserts `resolved` off
+/// [`Store::outbound_refs`] with no actor first, which reads the stored column
+/// and nothing else.
+async fn binds_to(store: &dyn Store, from: EngramId, actor: Option<&str>, to: EngramId) -> bool {
+    store
+        .neighbors(&[to], 1, actor)
+        .await
+        .unwrap()
+        .edges
+        .iter()
+        .any(|e| e.from == from)
+}
+
+/// Whether every reference leaving an engram is bound to something, asked of
+/// the stored column alone.
+async fn all_bound(store: &dyn Store, from: EngramId) -> bool {
+    let refs = store.outbound_refs(from, None).await.unwrap();
+    !refs.is_empty() && refs.iter().all(|r| r.resolved)
+}
+
+/// A draft's own references resolve against its author's view: their drafts
+/// first, then the team's files.
+///
+/// The preference is the whole of it, and it is two mechanisms rather than
+/// one. Alice is drafting over `plan.md`, so `[[plan]]` written in another of
+/// her drafts means the page she is reading - her own - and not the one the
+/// folder still holds: her row stands at that path and the base row behind it
+/// is not a candidate at all. And where both ARE candidates, because her
+/// draft-only page answers to the same title as a team page at another path,
+/// hers is the one that wins - which is the ordering the screen alone cannot
+/// say. Bob is drafting nothing, so both readings mean the team's row for him,
+/// and the team's own engrams never reach either draft.
+async fn drafts_prefer_their_authors_rows(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram("Field Notes", "notes", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+    let base_notes = store.lookup_id("d", "notes").await.unwrap().unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram("Rollout plan, revised", "plan", "engram", "", "plain\n"),
+    )
+    .await;
+    // A page of her own at a path no file holds, answering to the SAME title
+    // the team's field notes answer to. Both are candidates in her view, so
+    // which of the two a title reading lands on is the preference and nothing
+    // else.
+    let alice_notes = draft(
+        store,
+        domain,
+        "alice",
+        "her-notes.md",
+        &engram("Field Notes", "her-notes", "engram", "", "plain\n"),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n- cites [[Field Notes]]\n",
+        ),
+    )
+    .await;
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram(
+            "Bob's own",
+            "bobs",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n- cites [[Field Notes]]\n",
+        ),
+    )
+    .await;
+
+    // Each author's rows, resolved in that author's view - which is what the
+    // overlay write path does for the row it has just written.
+    assert!(
+        store
+            .reresolve_actor_references(domain, "alice")
+            .await
+            .unwrap()
+            > 0
+    );
+    assert!(
+        store
+            .reresolve_actor_references(domain, "bob")
+            .await
+            .unwrap()
+            > 0
+    );
+
+    assert!(
+        all_bound(store, alice_fresh).await,
+        "her reference is bound to something"
+    );
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), alice_plan).await,
+        "and the something is her own draft of the plan, not the file she is redrafting"
+    );
+    assert!(
+        !binds_to(store, alice_fresh, Some("alice"), base_plan).await,
+        "the base row at that address is the fallback, and she did not fall back to it"
+    );
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), alice_notes).await,
+        "and where her page and the team's answer to one title, hers is the one \
+         her own draft means"
+    );
+    assert!(
+        !binds_to(store, alice_fresh, Some("alice"), base_notes).await,
+        "the team's page at that title is the fallback and she did not fall back \
+         to it either"
+    );
+
+    assert!(
+        all_bound(store, bob_own).await,
+        "his references are bound too"
+    );
+    assert!(
+        binds_to(store, bob_own, Some("bob"), base_plan).await,
+        "to the team's row, because he holds none of his own at that path"
+    );
+    assert!(
+        binds_to(store, bob_own, Some("bob"), base_notes).await,
+        "and to the team's field notes, because hers are hers"
+    );
+
+    assert!(
+        binds_to(store, charter, None, base_plan).await,
+        "and the team's own charter points where it always did"
+    );
+
+    // An empty actor is the base row's key, so a pass that took one would be
+    // the whole dimension's one forbidden write read backwards.
+    assert!(matches!(
+        store.reresolve_actor_references(domain, "").await,
+        Err(IndexError::Constraint(_))
+    ));
+}
+parity!(
+    a_drafts_reference_binds_the_authors_own_row_before_the_base,
+    drafts_prefer_their_authors_rows
+);
+
+/// A path its author has deleted answers nothing they write.
+///
+/// A tombstone is a row saying an engram is gone, so it is never a candidate,
+/// and the base row it deletes is gone for that author too. Their reference
+/// stays unbound rather than falling through to the row they deleted, which
+/// would be the deletion undone by a link.
+async fn a_tombstoned_path_answers_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+
+    let mut stone = record("plan.md", "plan.md", "plain\n", "alice-plan");
+    stone.title = "Rollout plan".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    )
+    .await;
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram("Bob's own", "bobs", "engram", "", "- relates_to [[plan]]\n"),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+    store
+        .reresolve_actor_references(domain, "bob")
+        .await
+        .unwrap();
+
+    assert!(
+        !all_bound(store, alice_fresh).await,
+        "her link names a page she has deleted, so it names nothing"
+    );
+    assert!(
+        all_bound(store, bob_own).await,
+        "and his names the page the team still holds"
+    );
+    assert!(
+        binds_to(store, bob_own, Some("bob"), base_plan).await,
+        "which is the base row, exactly as before anybody drafted a deletion"
+    );
+}
+parity!(
+    a_drafts_reference_never_binds_a_path_its_author_tombstoned,
+    a_tombstoned_path_answers_nothing
+);
+
+/// Every reading the resolver tries, tried inside the author's view: the
+/// target as a permalink, as a title, and - when the prefix names no domain -
+/// the whole bracket text as a permalink and then as a title at home.
+///
+/// The colon form is the one that matters most here, because it is the form
+/// the sweep's own draft pass never covered: `[[Log: Weekly]]` splits like
+/// `[[domain:Target]]` and only the registry settles it, so a draft-only page
+/// with that title is reachable from its author's other draft exactly as a
+/// base page with that title is reachable from the base.
+async fn draft_targets_answer_every_form(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "seed.md",
+        &engram("Seed", "seed", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    // A draft-only page whose title carries a colon, and a second one that
+    // does not, so the plain title arm and the whole-bracket arm are told
+    // apart rather than covered by one answer.
+    draft(
+        store,
+        domain,
+        "alice",
+        "log-weekly.md",
+        "---\ntype: engram\ntitle: 'Log: Weekly'\npermalink: log-weekly\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Log: Weekly\n\nWhat the week did.\n",
+    )
+    .await;
+    draft(
+        store,
+        domain,
+        "alice",
+        "notes.md",
+        &engram("Field Notes", "field-notes", "engram", "", "plain\n"),
+    )
+    .await;
+    // The whole-bracket-as-a-permalink arm, which needs a permalink that
+    // carries the colon itself. Written as a record rather than parsed,
+    // because nothing that slugifies a title produces one.
+    let mut odd = record("odd.md", "Ledger: Ledgers", "plain\n", "alice-odd");
+    odd.title = "Something else".to_string();
+    store.upsert_overlay(domain, "alice", &odd).await.unwrap();
+
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- a [[log-weekly]]\n- b [[Field Notes]]\n- c [[Log: Weekly]]\n- d [[Ledger: Ledgers]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+
+    let shape: Vec<(String, bool)> = store
+        .outbound_refs(alice_fresh, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.to_target.clone(), r.resolved))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("log-weekly".to_string(), true),
+            ("Field Notes".to_string(), true),
+            ("Weekly".to_string(), true),
+            ("Ledgers".to_string(), true),
+        ],
+        "all four readings answer inside her own view"
+    );
+
+    // And none of them answers anybody else: the pages are hers alone.
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram(
+            "Bob's own",
+            "bobs",
+            "engram",
+            "",
+            "- a [[log-weekly]]\n- b [[Field Notes]]\n- c [[Log: Weekly]]\n- d [[Ledger: Ledgers]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "bob")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .outbound_refs(bob_own, None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !r.resolved),
+        "her drafts are no reference target of his, in any of the four forms"
+    );
+}
+parity!(
+    a_drafts_reference_binds_by_title_and_by_the_colon_form_inside_the_view,
+    draft_targets_answer_every_form
+);
+
+/// One graph slice as `(node permalinks with the draft marker, edges as
+/// permalink pairs)`, both sorted: what a reader would see drawn, with no
+/// opaque id in it.
+fn drawn(slice: &crystalline_index::GraphSlice) -> (Vec<String>, Vec<(String, String)>) {
+    let by_id: HashMap<i64, String> = slice
+        .nodes
+        .iter()
+        .map(|n| {
+            let mark = if n.actor.is_empty() { "" } else { "*" };
+            (n.id.0, format!("{}{mark}", n.permalink))
+        })
+        .collect();
+    let mut names: Vec<String> = by_id.values().cloned().collect();
+    names.sort();
+    let mut edges: Vec<(String, String)> = slice
+        .edges
+        .iter()
+        .map(|e| {
+            let name = |id: i64| {
+                by_id
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("no node {id}"))
+            };
+            (name(e.from.0), name(e.to.0))
+        })
+        .collect();
+    edges.sort();
+    (names, edges)
+}
+
+/// A base edge is read at the reader's own address map: it lands on their
+/// draft of the target when they hold one.
+///
+/// The edge itself is the team's, written in a file neither reader has
+/// touched. What differs is where it arrives, and it arrives at whatever each
+/// reader holds at the target's path: her draft for her, the file for everyone
+/// else.
+async fn base_edges_land_on_the_readers_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram("Rollout plan, revised", "plan", "engram", "", "plain\n"),
+    )
+    .await;
+
+    let base = (
+        vec!["charter".to_string(), "plan".to_string()],
+        vec![("charter".to_string(), "plan".to_string())],
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, None).await.unwrap()),
+        base,
+        "the team's graph is the team's files, and no draft is marked in it"
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("bob")).await.unwrap()),
+        base,
+        "and it is what a reader drafting nothing there walks"
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("alice")).await.unwrap()),
+        (
+            vec!["charter".to_string(), "plan*".to_string()],
+            vec![("charter".to_string(), "plan*".to_string())]
+        ),
+        "she follows the team's own link into the page she is drafting, marked hers"
+    );
+}
+parity!(
+    neighbors_redirect_a_base_edge_onto_the_readers_draft_at_the_same_path,
+    base_edges_land_on_the_readers_row
+);
+
+/// A base edge into a path the reader has deleted arrives nowhere for them.
+///
+/// The other end of the same address map: their deletion is a deletion, so the
+/// edge has no target in their view and is not drawn at all - rather than
+/// drawn into a page they have said is gone.
+async fn base_edges_stop_at_a_readers_deletion(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    let mut stone = record("plan.md", "plan.md", "plain\n", "alice-plan");
+    stone.title = "Rollout plan".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("alice")).await.unwrap()),
+        (vec!["charter".to_string()], Vec::new()),
+        "the charter stands alone for her: it points at a page she has deleted"
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("bob")).await.unwrap()),
+        (
+            vec!["charter".to_string(), "plan".to_string()],
+            vec![("charter".to_string(), "plan".to_string())]
+        ),
+        "and her deletion is hers: nobody else's graph moved"
+    );
+}
+parity!(
+    neighbors_drop_a_base_edge_into_a_path_the_reader_tombstoned,
+    base_edges_stop_at_a_readers_deletion
+);
+
+/// A base link nobody could answer is answered by the reader's own draft.
+///
+/// The team's charter names a page that does not exist. Alice writes it, as a
+/// draft: for her the link now lands, and the traversal walks it, because her
+/// view is a view of the same domain rather than a second graph beside it.
+/// For everybody else the link still dangles.
+async fn unresolved_base_edges_reach_the_readers_draft(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[Nobody Wrote This]]\n\nAnd [[Nobody Wrote This]] in prose.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    draft(
+        store,
+        domain,
+        "alice",
+        "wrote-it.md",
+        &engram("Nobody Wrote This", "wrote-it", "engram", "", "plain\n"),
+    )
+    .await;
+
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("alice")).await.unwrap()),
+        (
+            vec!["charter".to_string(), "wrote-it*".to_string()],
+            vec![
+                ("charter".to_string(), "wrote-it*".to_string()),
+                ("charter".to_string(), "wrote-it*".to_string()),
+            ]
+        ),
+        "the relation and the prose link both arrive at the page she wrote"
+    );
+    for reader in [None, Some("bob")] {
+        assert_eq!(
+            drawn(&store.neighbors(&[charter], 1, reader).await.unwrap()),
+            (vec!["charter".to_string()], Vec::new()),
+            "and for {reader:?} the charter still names a page nobody wrote"
+        );
+    }
+}
+parity!(
+    neighbors_walk_an_unresolved_base_edge_onto_the_readers_own_draft,
+    unresolved_base_edges_reach_the_readers_draft
+);
+
+/// The team's own graph is the team's own graph, whatever anybody is drafting.
+///
+/// Two domains with byte-identical files, one of them full of drafts. A
+/// traversal that names no actor answers the same slice over both, node for
+/// node and edge for edge, and every node comes back with an empty `actor` -
+/// which is what makes every statement's `None` arm the statement that was
+/// there before this dimension existed.
+async fn a_draftless_reader_sees_the_files(store: &dyn Store) {
+    let files = |root: &Path| {
+        write(
+            root,
+            "plan.md",
+            &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+        );
+        write(
+            root,
+            "charter.md",
+            &engram(
+                "Charter",
+                "charter",
+                "engram",
+                "",
+                "- relates_to [[plan]]\n- cites [[Nobody Wrote This]]\n",
+            ),
+        );
+    };
+    let quiet_dir = tempfile::tempdir().unwrap();
+    files(quiet_dir.path());
+    sync_domain(store, "quiet", quiet_dir.path()).await.unwrap();
+
+    let busy_dir = tempfile::tempdir().unwrap();
+    files(busy_dir.path());
+    sync_domain(store, "busy", busy_dir.path()).await.unwrap();
+    let busy = store
+        .upsert_domain(
+            "busy",
+            Some(&busy_dir.path().to_string_lossy()),
+            DomainKind::File,
+        )
+        .await
+        .unwrap();
+
+    // Every shape of draft at once: over a base row, at a path no file holds,
+    // a deletion, and a page that answers the charter's dangling link.
+    draft(
+        store,
+        busy,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[Nobody Wrote This]]\n",
+        ),
+    )
+    .await;
+    draft(
+        store,
+        busy,
+        "alice",
+        "wrote-it.md",
+        &engram(
+            "Nobody Wrote This",
+            "wrote-it",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    )
+    .await;
+    let mut stone = record("charter.md", "charter.md", "plain\n", "bob-charter");
+    stone.title = "Charter".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(busy, "bob", &stone).await.unwrap();
+    store
+        .reresolve_actor_references(busy, "alice")
+        .await
+        .unwrap();
+
+    async fn seeds(store: &dyn Store, domain: &str) -> Vec<EngramId> {
+        vec![
+            store.lookup_id(domain, "charter").await.unwrap().unwrap(),
+            store.lookup_id(domain, "plan").await.unwrap().unwrap(),
+        ]
+    }
+    let quiet_slice = store
+        .neighbors(&seeds(store, "quiet").await, 2, None)
+        .await
+        .unwrap();
+    let busy_slice = store
+        .neighbors(&seeds(store, "busy").await, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        drawn(&quiet_slice),
+        drawn(&busy_slice),
+        "a domain full of drafts answers a reader who names no actor exactly as \
+         one with none does"
+    );
+    assert!(
+        busy_slice.nodes.iter().all(|n| n.actor.is_empty()),
+        "and every node in it is the team's own row"
+    );
+}
+parity!(
+    neighbors_with_no_actor_are_unchanged_by_every_draft_in_the_store,
+    a_draftless_reader_sees_the_files
+);
+
+/// Both reference reports answer the reader rather than the domain: a link
+/// into a path they deleted dangles for them, a dangling link their own draft
+/// answers lands for them, and a reader who names no actor gets neither
+/// reading.
+async fn reference_reports_answer_the_view(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n- cites [[Nobody Wrote This]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    let mut stone = record("plan.md", "plan.md", "plain\n", "alice-plan");
+    stone.title = "Rollout plan".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+    draft(
+        store,
+        domain,
+        "alice",
+        "wrote-it.md",
+        &engram(
+            "Nobody Wrote This",
+            "wrote-it",
+            "engram",
+            "",
+            "- relates_to [[Still Nobody]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+
+    let verdicts = |refs: Vec<crystalline_index::OutboundRef>| -> Vec<(String, bool)> {
+        refs.into_iter()
+            .map(|r| (r.to_target, r.resolved))
+            .collect()
+    };
+    assert_eq!(
+        verdicts(store.outbound_refs(charter, None).await.unwrap()),
+        vec![
+            ("plan".to_string(), true),
+            ("Nobody Wrote This".to_string(), false)
+        ],
+        "the team's own reading of the team's own page"
+    );
+    assert_eq!(
+        verdicts(store.outbound_refs(charter, Some("bob")).await.unwrap()),
+        vec![
+            ("plan".to_string(), true),
+            ("Nobody Wrote This".to_string(), false)
+        ],
+        "and a reader drafting nothing reads it the same way"
+    );
+    assert_eq!(
+        verdicts(store.outbound_refs(charter, Some("alice")).await.unwrap()),
+        vec![
+            ("plan".to_string(), false),
+            ("Nobody Wrote This".to_string(), true)
+        ],
+        "hers is the other way round on both: she deleted the one and wrote the other"
+    );
+
+    let dangling = |refs: Vec<crystalline_index::UnresolvedRef>| -> Vec<String> {
+        refs.into_iter().map(|r| r.target).collect()
+    };
+    assert_eq!(
+        dangling(store.unresolved_refs(domain, None).await.unwrap()),
+        vec!["Nobody Wrote This".to_string()],
+        "the domain's own queue is what its files leave dangling"
+    );
+    assert_eq!(
+        dangling(store.unresolved_refs(domain, Some("bob")).await.unwrap()),
+        vec!["Nobody Wrote This".to_string()],
+        "and a reader holding no draft reads that queue"
+    );
+    assert_eq!(
+        dangling(store.unresolved_refs(domain, Some("alice")).await.unwrap()),
+        vec!["plan".to_string(), "Still Nobody".to_string()],
+        "hers holds what her deletion broke and what her own draft leaves \
+         dangling, and not the link she answered"
+    );
+}
+parity!(
+    outbound_and_unresolved_refs_answer_the_actors_view,
+    reference_reports_answer_the_view
+);
+
+/// Re-resolving one actor's references is two halves of one sentence: what
+/// dangles is unbound, and what is pending is bound in that actor's view.
+///
+/// The case it exists for is a draft that goes away. Her `fresh.md` pointed at
+/// her draft of the plan; dropping that draft leaves the reference naming a
+/// row nobody holds, and the pass puts it back onto the team's own row at the
+/// same address - which is what she is reading there now.
+async fn reresolution_follows_the_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram("Rollout plan, revised", "plan", "engram", "", "plain\n"),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), alice_plan).await,
+        "it starts out naming her own draft"
+    );
+
+    store
+        .clear_overlay_entry(domain, "alice", "plan.md")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reresolve_actor_references(domain, "alice")
+            .await
+            .unwrap()
+            > 0,
+        "the pass reports the reference it bound"
+    );
+    assert!(
+        all_bound(store, alice_fresh).await,
+        "her link is bound again"
+    );
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), base_plan).await,
+        "and it names the team's row, which is the page she reads there now"
+    );
+}
+parity!(
+    reresolving_an_actors_references_unbinds_what_dangles_and_binds_what_is_pending,
+    reresolution_follows_the_row
+);
+
+/// The vocabulary is the team's everywhere a person is shown it, and the
+/// reader's own only where a finding is about what they wrote.
+///
+/// Alice's draft replaces the team's page at that path, so in her view the tag
+/// the team agreed on is not there and the one she is trying out is - which is
+/// what makes a drift finding about her draft honest. Asked with no actor, the
+/// same six scans answer what the domain's own files say, whoever is drafting.
+async fn vocabulary_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        "---\ntype: engram\ntitle: Rollout plan\npermalink: plan\ntags:\n  - database\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Rollout plan\n\n- [decision] the team agreed #database\n- shipped_with [[nowhere]]\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        "---\ntype: guide\ntitle: Rollout plan\npermalink: plan\ntags:\n  - data-base\nstatus: draft\nrecorded_at: 2026-01-01\n---\n\n# Rollout plan\n\n- [ruling] she is trying a word out #data-base\n- supersedes [[nowhere]]\n",
+    )
+    .await;
+
+    let names =
+        |counts: &[NamedCount]| -> Vec<String> { counts.iter().map(|c| c.name.clone()).collect() };
+    let tags = |counts: &[crystalline_index::TagCount]| -> Vec<String> {
+        counts.iter().map(|c| c.name.clone()).collect()
+    };
+    let team = store.vocabulary(Some("d"), None).await.unwrap();
+    assert_eq!(tags(&team.tags), vec!["database".to_string()]);
+    assert_eq!(names(&team.categories), vec!["decision".to_string()]);
+    assert_eq!(
+        names(&team.relation_types),
+        vec!["shipped_with".to_string()]
+    );
+    assert_eq!(names(&team.types), vec!["engram".to_string()]);
+    assert_eq!(names(&team.statuses), vec!["stable".to_string()]);
+
+    let hers = store.vocabulary(Some("d"), Some("alice")).await.unwrap();
+    assert_eq!(tags(&hers.tags), vec!["data-base".to_string()]);
+    assert_eq!(names(&hers.categories), vec!["ruling".to_string()]);
+    assert_eq!(names(&hers.relation_types), vec!["supersedes".to_string()]);
+    assert_eq!(names(&hers.types), vec!["guide".to_string()]);
+    assert_eq!(names(&hers.statuses), vec!["draft".to_string()]);
+
+    let bobs = store.vocabulary(Some("d"), Some("bob")).await.unwrap();
+    assert_eq!(
+        tags(&bobs.tags),
+        tags(&team.tags),
+        "and a reader drafting nothing reads the team's list"
+    );
+}
+parity!(
+    vocabulary_reads_the_actors_view_when_asked_and_the_teams_when_not,
+    vocabulary_across_the_actor_dimension
+);
+
+/// Every statement that reads the `engram` table says which actor's rows it
+/// means, or says in as many words that it means all of them.
+///
+/// A source scan rather than a behavioural assertion, because the failure this
+/// guards against is one a new statement introduces, not one an existing test
+/// exercises: the moment a read forgets the predicate, an actor's private draft
+/// leaks into somebody else's answer, and no existing test would notice because
+/// no existing test has a draft in it. Two cases are allowed and there is no
+/// third. Either the statement carries the base predicate (`actor = ''`, or a
+/// bound actor for the overlay verbs), or it carries a `-- actor: all` waiver
+/// saying in one line why it means every actor's rows.
+///
+/// `engram_tag` is not this table and is skipped: it has no actor column, and a
+/// predicate on it would not compile in either dialect. Writes are scanned
+/// alongside reads, because a `DELETE` that forgets the predicate destroys a
+/// draft rather than merely leaking one.
+///
+/// **What this scan structurally cannot see, and what covers it instead.** A
+/// draft's `relation`, `link`, `observation`, `engram_tag` and `chunk` rows are
+/// written exactly as a base row's, so a statement that stops at one of those
+/// tables reaches a draft's children without ever naming `engram` - and this
+/// scan would never know. Every such statement that feeds a base-facing answer
+/// has been given a join onto `engram` for exactly that reason, which is what
+/// puts it back inside this census (the graph frontier in both `search.rs`,
+/// `domain_stats`' four edge counts, and `vocabulary`'s unscoped branches and
+/// its relation-type scan). The behavioural counterpart is
+/// `a_draft_never_reaches_a_base_count_or_the_base_graph`, which gives a draft
+/// child rows of every kind and then asks those surfaces; a new statement over
+/// a child table alone needs that test extended, not this one.
+#[test]
+fn every_engram_reading_sql_carries_an_actor_predicate() {
+    let files: &[(&str, &str)] = &[
+        ("turso/mod.rs", include_str!("../src/turso/mod.rs")),
+        ("postgres/mod.rs", include_str!("../src/postgres/mod.rs")),
+        ("turso/search.rs", include_str!("../src/turso/search.rs")),
+        (
+            "postgres/search.rs",
+            include_str!("../src/postgres/search.rs"),
+        ),
+        ("store.rs", include_str!("../src/store.rs")),
+    ];
+    let census = census_engram_statements(files);
+    assert!(
+        census.failures.is_empty(),
+        "these statements read the engram table without saying whose rows they mean, \
+         and carry no waiver either:\n{}",
+        census.failures.join("\n")
+    );
+    assert_eq!(
+        census.sites, 146,
+        "the engram statement census moved; every new one needs a predicate or a waiver. \
+         59 per backend in mod.rs, 9 per backend in search.rs, 10 in the shared \
+         statement builders in store.rs: the reference-resolution expression's four \
+         arms, plus the three engram hops of each of the two graph frontiers. Those \
+         six used to be six per backend in search.rs, which is the whole of the move \
+         from 152: one copy of each frontier now, not one per dialect. One per \
+         backend in search.rs is the anti-join inside `actor_screen_on`, which asks \
+         whether the reader holds a row of their own at a base row's path - one site \
+         however many statements compose the screen. Two shapes carry no screen of \
+         their own on purpose, each sitting inside a screened statement and passing \
+         on the screen that statement carries: the `tgt` hop of the graph frontier \
+         (now in store.rs) and of the outbound verdict reads the row a reference was \
+         bound to for its address alone, with the screen on the `dst` beside it, and \
+         the dangling probe in `reresolve_actor_references` asks whether ANY row \
+         still stands at a `to_id`, since whose the vanished row was does not change \
+         that the reference now points at nothing"
+    );
+    assert_eq!(
+        census.waived, 16,
+        "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
+         Eight per backend: the five statements of `clear_domain`, the id-scoped delete inside \
+         `delete_engram` and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, \
+         plus `clear_overlay_entry`'s delete, which is `-- actor: by id` because the id it \
+         names was resolved by an actor-scoped lookup two statements above"
+    );
+}
+
+/// The census above, proved on a source it is handed rather than on the one it
+/// guards: a statement whose own predicate is deleted is caught even when a
+/// neighbouring statement still carries one.
+///
+/// This is the property the line-window version did not have. Measured over
+/// the real sources at the time it was written, breaking each of the 140
+/// predicate-carrying lines one at a time, the window caught 48 and missed 92:
+/// six adjacent `domain_stats` counts, four `inbound_refs` arms and six
+/// `vocabulary` branches each passed on a neighbour's predicate from inside the
+/// same fourteen lines. Scoping the search to the statement's own parentheses
+/// catches all 140. The fixture below is that shape in miniature, so the
+/// property is checked rather than remembered.
+#[test]
+fn the_census_reads_each_statement_alone() {
+    const INTACT: &str = "\
+fn stats() {
+    let sql = \"SELECT \\
+         (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = ''), \\
+         (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = '' AND e.tombstone=0)\";
+}
+";
+    let intact = census_engram_statements(&[("fixture.rs", INTACT)]);
+    assert_eq!(intact.sites, 2, "two statements, two sites");
+    assert!(
+        intact.failures.is_empty(),
+        "both carry their own predicate: {:?}",
+        intact.failures
+    );
+
+    let broken = INTACT.replacen("e.domain_id=d.id AND e.actor = ''", "e.domain_id=d.id", 1);
+    let broken = census_engram_statements(&[("fixture.rs", &broken)]);
+    assert_eq!(
+        broken.failures.len(),
+        1,
+        "the statement whose predicate went is named, and its neighbour's does \
+         not stand in for it: {:?}",
+        broken.failures
+    );
+
+    // And a composed statement still passes on the fragment its own function
+    // builds, which is the one place the window is still consulted.
+    const COMPOSED: &str = "\
+fn listing() {
+    where_clauses.insert(0, \"e.actor = ''\".to_string());
+    let where_sql = format!(\"WHERE {}\", where_clauses.join(\" AND \"));
+    let sql = format!(\"SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}\");
+}
+";
+    let composed = census_engram_statements(&[("fixture.rs", COMPOSED)]);
+    assert!(
+        composed.failures.is_empty(),
+        "a statement interpolating a fragment reads the lines around it: {:?}",
+        composed.failures
+    );
+}
+
+/// What [`census_engram_statements`] found.
+struct Census {
+    /// Every statement naming the `engram` table.
+    sites: usize,
+    /// How many of them answered with a waiver rather than a predicate.
+    waived: usize,
+    /// The ones that answered with neither, as `file:line: text`.
+    failures: Vec<String>,
+}
+
+/// The predicate in each of the spellings the two dialects and the bound forms
+/// use.
+const ACTOR_PREDICATES: &[&str] = &[
+    "actor = ''",
+    "actor=''",
+    "actor = ?",
+    "actor=?",
+    "actor = $",
+    "actor=$",
+    "actor=excluded",
+    // The overlay counts ask for every actor but the base one, which is as
+    // much a statement about whose rows it means as the base predicate is.
+    "actor <> ''",
+    // An insert says whose row it writes through the conflict target it names,
+    // which is the actor-aware unique index.
+    "ON CONFLICT(domain_id, path, actor)",
+    // A search candidate leg names its rows through the composed screen each
+    // backend's `actor_screen` builds: the base predicate verbatim when the
+    // search names no actor, and the shadowing form - this actor's own drafts
+    // minus tombstones, plus every base row they hold no row at - when it names
+    // one. The screen's own source is a site in this census too, and it is the
+    // one that carries the bound `actor =` spellings for both dialects.
+    "{actor_screen}",
+    // The graph frontier screens TWO ends of the `engram` table in one
+    // statement - the row an edge leaves and the row it reaches - so it names
+    // two composed screens rather than one, and the node hydrate that follows
+    // names a third. All three are built by the same `actor_screen` the search
+    // legs use, through its alias-taking form.
+    "{src_screen}",
+    "{dst_screen}",
+    "{node_screen}",
+];
+
+/// The two waiver tokens, each saying in one line why a statement means rows
+/// it does not screen: every actor's, or the one row an actor-scoped lookup
+/// already named by its id.
+const ACTOR_WAIVERS: &[&str] = &["-- actor: all", "-- actor: by id"];
+
+/// How far around a composed statement its fragment's predicate may sit, and
+/// how far around any statement its waiver may. Both are declared in the
+/// function that builds the statement rather than inside it, which is why these
+/// two questions still read a window where the predicate question does not.
+const ACTOR_WINDOW: usize = 14;
+
+/// Walk every statement that names the `engram` table and ask, of each one
+/// ALONE, whether it says whose rows it means.
+///
+/// **The unit is the statement, not a line window.** A site's scope runs from
+/// the innermost parenthesis still open before it to the one that closes it -
+/// so a subquery is its own scope and six counts in one `SELECT` are six
+/// scopes - bounded by the `;`, `{` or `}` that ends the Rust statement when no
+/// parenthesis is open. Parentheses inside a string literal count, because that
+/// is where the SQL is; `;`, `{` and `}` count only outside one, because a
+/// format placeholder is not a block.
+///
+/// Two questions still read a window of [`ACTOR_WINDOW`] lines, and both are
+/// about text that is deliberately declared beside a statement rather than
+/// inside it: a waiver, which is a comment a person wrote and whose count this
+/// census pins; and the predicate of a statement that interpolates a fragment
+/// (`{where_sql}`), where the fragment is built a few lines above. Deleting
+/// that fragment's predicate is still caught, because nothing in the window
+/// carries one afterwards.
+fn census_engram_statements(files: &[(&str, &str)]) -> Census {
+    let mut census = Census {
+        sites: 0,
+        waived: 0,
+        failures: Vec::new(),
+    };
+    for (file, src) in files {
+        let inside = string_mask(src);
+        let lines: Vec<&str> = src.lines().collect();
+        for (at, _) in src.match_indices("FROM engram").chain(
+            src.match_indices("JOIN engram")
+                .chain(src.match_indices("INTO engram"))
+                .chain(src.match_indices("UPDATE engram")),
+        ) {
+            // `engram_tag` and `engram_id` are not this table.
+            if src[at + "FROM engram".len()..].starts_with('_') {
+                continue;
+            }
+            let line_no = src[..at].matches('\n').count();
+            if lines[line_no].trim_start().starts_with("//") {
+                continue;
+            }
+            census.sites += 1;
+            let scope = statement_scope(src, &inside, at);
+            if ACTOR_PREDICATES.iter().any(|p| scope.contains(p)) {
+                continue;
+            }
+            let lo = line_no.saturating_sub(ACTOR_WINDOW);
+            let hi = (line_no + ACTOR_WINDOW + 1).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            // A composed statement carries a placeholder where its predicate
+            // would be, and the fragment behind it is built in the same
+            // function.
+            if scope.contains('{') && ACTOR_PREDICATES.iter().any(|p| window.contains(p)) {
+                continue;
+            }
+            if ACTOR_WAIVERS.iter().any(|w| window.contains(w)) {
+                census.waived += 1;
+                continue;
+            }
+            census
+                .failures
+                .push(format!("{file}:{}: {}", line_no + 1, lines[line_no].trim()));
+        }
+    }
+    census
+}
+
+/// Which bytes of a Rust source sit inside a string literal, so the scan can
+/// tell a format placeholder from a block and an SQL parenthesis from a call's.
+fn string_mask(src: &str) -> Vec<bool> {
+    let bytes = src.as_bytes();
+    let mut inside = vec![false; bytes.len()];
+    let (mut i, mut in_string, mut in_comment) = (0usize, false, false);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_comment {
+            if c == b'\n' {
+                in_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string {
+            inside[i] = true;
+            if c == b'\\' {
+                if i + 1 < bytes.len() {
+                    inside[i + 1] = true;
+                }
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            in_comment = true;
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            inside[i] = true;
+        }
+        i += 1;
+    }
+    inside
+}
+
+/// The statement a site stands in: see [`census_engram_statements`] for the
+/// rule and why it is the rule.
+fn statement_scope<'a>(src: &'a str, inside: &[bool], at: usize) -> &'a str {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for i in (0..at).rev() {
+        let c = bytes[i];
+        if !inside[i] && matches!(c, b';' | b'{' | b'}') {
+            start = i + 1;
+            break;
+        }
+        if c == b')' {
+            depth += 1;
+        } else if c == b'(' {
+            if depth == 0 {
+                start = i + 1;
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    let mut depth = 0usize;
+    let mut end = src.len();
+    for (i, c) in bytes.iter().enumerate().skip(at) {
+        if !inside[i] && matches!(c, b';' | b'{' | b'}') && depth == 0 {
+            end = i;
+            break;
+        }
+        if *c == b'(' {
+            depth += 1;
+        } else if *c == b')' {
+            if depth == 0 {
+                end = i;
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    &src[start..end]
+}
+
+/// A draft's child rows never reach a base-facing answer, even where the
+/// statement that would have to screen them never names the `engram` table.
+///
+/// `upsert_row` writes a draft's relations, links, observations, tags and
+/// chunks exactly as a base row's - that is what makes an overlay entry a full
+/// engram row rather than a second shape - so every one of those child rows is
+/// reachable from a statement that joins `relation`, `link`, `observation` or
+/// `engram_tag` and stops there. The source scan cannot see those statements at
+/// all, which is precisely why this one is behavioural: it gives a draft
+/// relation bullets, prose links, an observation with a category, a tag of its
+/// own and a type and status nobody else uses, and then asks every base-facing
+/// surface that counts or traverses them.
+///
+/// The graph is the sharpest of the three. The draft's edges resolve like any
+/// other row's (`resolve_pending_relations` scopes by domain, not by actor), so
+/// an unscreened frontier walks them, pushes the draft's id into the visited
+/// set, and the node hydrate - which does carry the predicate - then drops the
+/// node: an edge naming an id with no node, plus base engrams pulled into the
+/// neighbourhood through somebody else's private draft.
+async fn a_draft_reaches_no_base_answer_through_its_children(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- relates_to [[b]]\n"),
+    );
+    write(root, "b.md", &engram("B", "b", "engram", "", "plain\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let a = store.lookup_id("d", "a").await.unwrap().unwrap();
+    let b = store.lookup_id("d", "b").await.unwrap().unwrap();
+
+    let base_stats = || async {
+        store
+            .domain_stats()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "d")
+            .unwrap()
+    };
+    let before = base_stats().await;
+    let vocab_before = store.vocabulary(None, None).await.unwrap();
+    let scoped_before = store.vocabulary(Some("d"), None).await.unwrap();
+    let graph_before = store.neighbors(&[a], 2, None).await.unwrap();
+
+    // One draft, carrying every kind of child row a base row can carry: a
+    // relation and a prose link that both resolve onto base engrams, an
+    // observation in a category of its own, its own tag, and a type and status
+    // nobody else in the index uses.
+    let draft_body = "- [secretly] a private note #draftonly\n\n\
+                      - refers_privately [[b]]\n\n\
+                      and a prose link to [[b]] as well\n";
+    let parsed =
+        crystalline_core::parse_engram(&engram("Draft", "draft-only", "draftkind", "", draft_body))
+            .unwrap();
+    let mut draft = EngramRecord::from_engram(
+        &parsed,
+        "a.md",
+        FileStamp {
+            mtime: 0,
+            size: 0,
+            sha256: "draft".to_string(),
+        },
+    );
+    draft.status = "draftstatus".to_string();
+    store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    // Resolution runs over the whole domain, so the draft's references settle
+    // onto real ids exactly as a base row's do. This is the setup, not the
+    // assertion: without it the edges would be unresolved and the graph would
+    // skip them for a reason that has nothing to do with the actor.
+    store.resolve_pending_relations(domain).await.unwrap();
+    store.resolve_pending_links(domain).await.unwrap();
+
+    // The counts beside the two that were already predicated.
+    let after = base_stats().await;
+    assert_eq!(
+        (
+            after.engrams,
+            after.observations,
+            after.relations,
+            after.links,
+            after.unresolved_relations,
+            after.unresolved_links
+        ),
+        (
+            before.engrams,
+            before.observations,
+            before.relations,
+            before.links,
+            before.unresolved_relations,
+            before.unresolved_links
+        ),
+        "a domain holding a draft reports the counts it reported without one, \
+         edges included: `engrams: 0` beside `relations: 1` is not a domain state"
+    );
+
+    // The vocabulary, scoped and unscoped. A draft's tag, category, relation
+    // type, engram type and status are names, not just numbers.
+    for (label, vocab, before) in [
+        (
+            "all domains",
+            store.vocabulary(None, None).await.unwrap(),
+            vocab_before,
+        ),
+        (
+            "one domain",
+            store.vocabulary(Some("d"), None).await.unwrap(),
+            scoped_before,
+        ),
+    ] {
+        let names = |v: &Vocabulary| {
+            (
+                v.tags.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                v.categories
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+                v.relation_types
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .collect::<Vec<_>>(),
+                v.types.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                v.statuses
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            names(&vocab),
+            names(&before),
+            "the {label} vocabulary is what the domain's files are written in, \
+             and names nothing out of a draft"
+        );
+    }
+
+    // The graph. The seeds are base rows, so nothing the traversal returns may
+    // name the draft - and every edge it does return must have a node.
+    let graph = store.neighbors(&[a], 2, None).await.unwrap();
+    assert_eq!(
+        graph.edges.len(),
+        graph_before.edges.len(),
+        "the frontier walked no edge it did not walk before the draft existed"
+    );
+    assert_eq!(graph.nodes.len(), graph_before.nodes.len());
+    let node_ids: Vec<i64> = graph.nodes.iter().map(|n| n.id.0).collect();
+    for edge in &graph.edges {
+        assert!(
+            node_ids.contains(&edge.from.0) && node_ids.contains(&edge.to.0),
+            "every edge names nodes the slice carries; an edge with a missing \
+             node is a draft the hydrate dropped after the frontier walked it: \
+             {edge:?} among {node_ids:?}"
+        );
+    }
+    // And the same from the other end: seeding on the draft's target must not
+    // drag the draft in either.
+    let from_b = store.neighbors(&[b], 2, None).await.unwrap();
+    let from_b_ids: Vec<i64> = from_b.nodes.iter().map(|n| n.id.0).collect();
+    for edge in &from_b.edges {
+        assert!(
+            from_b_ids.contains(&edge.from.0) && from_b_ids.contains(&edge.to.0),
+            "an edge into a draft is an edge out of the base graph: {edge:?}"
+        );
+    }
+}
+parity!(
+    a_draft_never_reaches_a_base_count_or_the_base_graph,
+    a_draft_reaches_no_base_answer_through_its_children
 );

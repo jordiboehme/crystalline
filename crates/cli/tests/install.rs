@@ -375,12 +375,12 @@ fn install_into_an_empty_home_writes_the_exact_managed_shape() {
             "SessionStart": [
                 {
                     "matcher": "startup|clear|compact",
-                    "hooks": [ { "type": "command", "command": "crystalline prompt system", "timeout": 10 } ]
+                    "hooks": [ { "type": "command", "command": "crystalline prompt system --harness claude-code", "timeout": 10 } ]
                 }
             ],
             "Stop": [
                 {
-                    "hooks": [ { "type": "command", "command": "crystalline hook stop", "timeout": 10 } ]
+                    "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 10 } ]
                 }
             ]
         }
@@ -481,11 +481,11 @@ fn foreign_hooks_survive_install_and_uninstall() {
     // Ours added.
     assert_eq!(
         after_install["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        "crystalline prompt system"
+        "crystalline prompt system --harness claude-code"
     );
     assert_eq!(
         after_install["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "crystalline hook stop"
+        "crystalline hook stop --harness claude-code"
     );
 
     install_cmd(&home, &bin_dir)
@@ -646,11 +646,11 @@ fn codex_writes_hooks_json_and_agents_skills_with_a_trust_notice() {
     let settings = read_json(&hooks_json);
     assert_eq!(
         settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        "crystalline prompt system"
+        "crystalline prompt system --harness codex"
     );
     assert_eq!(
         settings["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "crystalline hook stop"
+        "crystalline hook stop --harness codex"
     );
 
     // Skills land under ~/.agents/skills.
@@ -693,10 +693,10 @@ fn copilot_managed_hooks() -> Value {
         "version": 1,
         "hooks": {
             "SessionStart": [
-                { "type": "command", "command": "crystalline prompt system --format copilot", "timeoutSec": 10 }
+                { "type": "command", "command": "crystalline prompt system --format copilot --harness copilot", "timeoutSec": 10 }
             ],
             "Stop": [
-                { "type": "command", "command": "crystalline hook stop", "timeoutSec": 10 }
+                { "type": "command", "command": "crystalline hook stop --harness copilot", "timeoutSec": 10 }
             ]
         }
     })
@@ -1163,10 +1163,18 @@ fn a_missing_harness_cli_prints_a_manual_command_and_still_succeeds() {
 }
 
 /// A `crystalline` shim answering `--version` with the given version string,
-/// for the PATH version-skew notice.
+/// for the PATH version-skew notice. Answers all three lines the real binary
+/// does (version, copyright/license, source) so the test exercises the
+/// first-line rule `path_binary_notice` applies, not a single-line stand-in
+/// that would pass even if that rule regressed to comparing the whole
+/// answer.
 fn write_version_shim(bin_dir: &Path, version: &str) {
     std::fs::create_dir_all(bin_dir).unwrap();
-    let script = format!("#!/bin/sh\necho 'crystalline {version}'\nexit 0\n");
+    let script = format!(
+        "#!/bin/sh\necho 'crystalline {version}'\necho 'Copyright (C) 2026 Jordi Böhme - {}'\necho '{}'\nexit 0\n",
+        env!("CARGO_PKG_LICENSE"),
+        env!("CARGO_PKG_REPOSITORY"),
+    );
     let path = bin_dir.join("crystalline");
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1526,9 +1534,14 @@ fn prompt_system_reconciles_an_install_from_another_version() {
         .unwrap();
     assert!(out.status.success(), "the hook path must succeed");
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        stdout.contains("[crystalline]"),
-        "a reconcile leaves a notice line: {stdout}"
+        !stdout.contains("[crystalline]"),
+        "the notice never rides on stdout, which an agent reads verbatim: {stdout}"
+    );
+    assert!(
+        stderr.contains("[crystalline]"),
+        "a reconcile leaves a notice line on stderr: {stderr}"
     );
 
     // Old clean copy: updated in place, no backup.
@@ -1596,6 +1609,180 @@ fn prompt_system_reconciles_an_install_from_another_version() {
     );
 }
 
+/// The text format is meant to be injected into an agent's context: a
+/// reconcile notice belongs on stderr, never mixed into stdout where an
+/// unattended agent would read it as part of the routing prompt and try to
+/// act on an instruction meant for a human.
+#[test]
+fn prompt_system_text_reconcile_notice_goes_to_stderr_not_stdout() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Same upgrade simulation as the reconcile test above: an older
+    // version wrote this install, so the next `prompt system` call has a
+    // notice to emit.
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+    });
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the hook path must succeed");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !stdout.contains("[crystalline]"),
+        "stdout must carry only the routing payload, not the reconcile notice: {stdout}"
+    );
+    assert!(
+        stderr.contains("[crystalline]"),
+        "the reconcile notice must be visible on stderr: {stderr}"
+    );
+}
+
+/// The settings file exactly as a release before the harness flag wrote it:
+/// both commands bare, under the matcher and timeout that release used.
+fn bare_claude_hooks() -> Value {
+    json!({
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup|clear|compact",
+                    "hooks": [ { "type": "command", "command": "crystalline prompt system", "timeout": 10 } ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [ { "type": "command", "command": "crystalline hook stop", "timeout": 10 } ]
+                }
+            ]
+        }
+    })
+}
+
+/// The whole point of the parametrized command: an install written before the
+/// hook commands named their harness heals itself on the first run of the new
+/// version. The session-start auto-reconcile replays the hooks part, and the
+/// bare commands it finds are rewritten in place - one SessionStart hook and
+/// one Stop hook, both carrying the harness, with the receipt stamped current.
+/// The failure this pins against is a second hook appended beside the first,
+/// which would nudge twice and leave an orphan behind on uninstall.
+#[test]
+fn prompt_system_rewrites_the_bare_hook_commands_of_an_older_release() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Roll the settings file back to what an older release left behind, and
+    // the receipt to the version that wrote it.
+    std::fs::write(
+        claude_settings(&home),
+        serde_json::to_string_pretty(&bare_claude_hooks()).unwrap(),
+    )
+    .unwrap();
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+    });
+
+    install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .assert()
+        .success();
+
+    let settings = read_json(&claude_settings(&home));
+    let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(session_start.len(), 1, "exactly one SessionStart group");
+    let session_start_hooks = session_start[0]["hooks"].as_array().unwrap();
+    assert_eq!(
+        session_start_hooks.len(),
+        1,
+        "exactly one SessionStart hook"
+    );
+    assert_eq!(
+        session_start_hooks[0]["command"],
+        "crystalline prompt system --harness claude-code"
+    );
+    assert_eq!(
+        session_start[0]["matcher"], "startup|clear|compact",
+        "the group is repaired in place, matcher and all"
+    );
+    let stop = settings["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop.len(), 1, "exactly one Stop group, never a second");
+    let stop_hooks = stop[0]["hooks"].as_array().unwrap();
+    assert_eq!(stop_hooks.len(), 1, "exactly one Stop hook");
+    assert_eq!(
+        stop_hooks[0]["command"],
+        "crystalline hook stop --harness claude-code"
+    );
+
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(receipt["installs"][0]["version"], env!("CARGO_PKG_VERSION"));
+
+    // A second session finds nothing left to do.
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("[crystalline]"),
+        "the healed install reconciles nothing on the next session: {stdout}"
+    );
+}
+
+/// The other half of ownership: a settings file still carrying the bare
+/// commands is recognized as ours by `uninstall`, which would otherwise walk
+/// away leaving a hook behind that nothing reconciles any more.
+#[test]
+fn uninstall_removes_the_bare_commands_of_an_older_release() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    let settings_path = claude_settings(&home);
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&bare_claude_hooks()).unwrap(),
+    )
+    .unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("removed"),
+        "the bare hooks are reported as removed, not as absent: {stdout}"
+    );
+    let settings = read_json(&settings_path);
+    assert!(
+        settings.get("hooks").is_none(),
+        "no orphan is left behind: {settings}"
+    );
+}
+
 #[test]
 fn copilot_receipt_entry_records_harness_copilot() {
     let work = tempfile::tempdir().unwrap();
@@ -1636,8 +1823,9 @@ fn copilot_receipt_entry_records_harness_copilot() {
 
 /// The copilot flavor of the reconcile test doubles as the notice-flow test
 /// for the copilot prompt format: an upgrade replays the hooks part (the
-/// deleted owned file comes back in the managed shape) and the reconcile
-/// notice rides inside the single JSON document, never beside it.
+/// deleted owned file comes back in the managed shape), stdout stays one JSON
+/// document with nothing beside it, and the reconcile notice reaches the
+/// person on stderr rather than the agent's context.
 #[test]
 fn prompt_system_reconciles_a_copilot_install_from_another_version() {
     let work = tempfile::tempdir().unwrap();
@@ -1665,15 +1853,22 @@ fn prompt_system_reconciles_a_copilot_install_from_another_version() {
         .unwrap();
     assert!(out.status.success(), "the hook path must succeed");
 
-    // The whole stdout is one JSON document; the reconcile notice sits
-    // inside the envelope.
+    // The whole stdout is one JSON document, and what it carries is the
+    // routing block alone: `additionalContext` is read as the agent's own
+    // context, and a notice about this machine's install belongs to the person
+    // running the hook.
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
     let parsed: Value = serde_json::from_str(stdout.trim())
         .expect("copilot hook stdout must be a single JSON document");
     let context = parsed["additionalContext"].as_str().unwrap();
     assert!(
-        context.contains("[crystalline]"),
-        "the reconcile notice rides inside the envelope: {context}"
+        !context.contains("[crystalline]"),
+        "no reconcile notice rides in the agent's context: {context}"
+    );
+    assert!(
+        stderr.contains("[crystalline]"),
+        "the reconcile notice reaches stderr instead: {stderr}"
     );
 
     // The owned hooks file is back in the managed shape and the receipt is

@@ -55,7 +55,7 @@ use crystalline_service::Engine;
 use crystalline_service::engine::ConfigureAction;
 use crystalline_service::mcp::McpServer;
 use rmcp::model::{
-    CallToolRequestParams, ClientInfo, ProtocolVersion, ServerNotification, SubscriptionFilter,
+    CallToolRequestParams, ClientConfig, ProtocolVersion, ServerNotification, SubscriptionFilter,
 };
 use rmcp::service::{ClientLifecycleMode, ClientServiceExt, RunningService, Subscription};
 use rmcp::{ClientHandler, RoleClient, RoleServer};
@@ -920,7 +920,7 @@ async fn the_modern_lifecycle_is_what_these_tests_actually_drive() {
     let info = client.peer().peer_info().expect("the peer published info");
     assert_eq!(info.protocol_version, newest_served());
     assert!(
-        ClientInfo::default().protocol_version >= ProtocolVersion::V_2025_03_26,
+        ClientConfig::default().protocol_version >= ProtocolVersion::V_2025_03_26,
         "sanity: the rmcp client default is a real revision"
     );
 }

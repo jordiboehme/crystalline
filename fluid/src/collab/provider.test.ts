@@ -56,6 +56,17 @@ describe("collabUrl", () => {
     );
     expect(collabUrl("a b", "x%y")).toBe("/api/v1/collab/a%20b/x%25y");
   });
+
+  // Whose document the room is over travels in the URL, because that is what
+  // the server decides the room on before it upgrades anything.
+  it("names the owner of a granted draft in the query", () => {
+    expect(collabUrl("eng", "notes/deep/gamma", "alice")).toBe(
+      "/api/v1/collab/eng/notes/deep/gamma?overlay=alice",
+    );
+    expect(collabUrl("eng", "alpha", "a b")).toBe(
+      "/api/v1/collab/eng/alpha?overlay=a%20b",
+    );
+  });
 });
 
 describe("collabSocketUrl", () => {

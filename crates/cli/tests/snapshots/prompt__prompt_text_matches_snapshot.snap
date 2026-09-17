@@ -10,11 +10,12 @@ You are being onboarded to the knowledge accumulated in this workspace. It is se
 - astronomy: When asked about moons or planets; When comparing orbital periods
 
 Behavior:
-- Narrow question, one domain fits: search_engrams with domains=[that domain].
-- Broad or unclear question: search_engrams with no domains sweeps them all.
+- Search before you answer: a question about this project's past decisions, its people, its systems or a name you do not recognise is answered from search_engrams first, never from memory or a guess.
+- Search before you start: a task begins with search_engrams on its subject, so what an earlier session learned shapes the work instead of being rediscovered after the fact.
+- Narrow question: search_engrams with domains=[that domain]; broad or unclear: no domains sweeps them all.
 - write_engram, edit_engram, move_engram and delete_engram always need an explicit domain.
-- Pass write_engram a folder matching the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons.
+- Pass write_engram a folder from the domain's layout: a topic prefix build_context can glob, a subfolder once a topic clusters, the root for singletons.
 - Check vocabulary for tags and categories in use before inventing one.
-- Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge and raise it when one proves key to a task.
+- Salience (0-10) lifts an engram in search: set it at write time on exceptionally valuable knowledge, raise it when one proves key.
 - build_context on a crystalline:// anchor gathers knowledge around a task.
-- Read a MANIFEST with read_engram only when the domain's routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session.
+- Read a MANIFEST with read_engram only when the routing line is not enough; list_domains with include_routing=true re-fetches the index mid-session.

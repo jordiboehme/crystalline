@@ -66,6 +66,31 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram attachments",
         sql: SCHEMA_V8,
     },
+    Migration {
+        version: 9,
+        label: "raw reference text",
+        sql: SCHEMA_V9,
+    },
+    Migration {
+        version: 10,
+        label: "domain registration stamp",
+        sql: SCHEMA_V10,
+    },
+    Migration {
+        version: 11,
+        label: "domain rebuild marker",
+        sql: SCHEMA_V11,
+    },
+    Migration {
+        version: 12,
+        label: "engram actor dimension",
+        sql: SCHEMA_V12,
+    },
+    Migration {
+        version: 13,
+        label: "domain rebuild kind",
+        sql: SCHEMA_V13,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -288,6 +313,87 @@ CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
 // its own table so the metadata listing never drags a blob through the row
 // cache. `size` is the byte length and `modified` an RFC 3339 instant, matching
 // the temporal columns' text form.
+// The bracket text a reference was written with, kept beside the split of it.
+//
+// `LinkTarget::parse` is domain-agnostic: it splits `[[Log: Weekly Garden
+// Notes]]` into a domain and a target exactly as it splits `[[ops:Runbook]]`,
+// because nothing inside the brackets says which is which. Only the registry
+// can tell them apart, and telling them apart means looking the whole original
+// string up as a title - which `to_target` and `to_domain` have by then lost
+// the whitespace of. So it is stored.
+//
+// Nullable, and deliberately not backfilled: a row written before this
+// migration has no bracket text to recover, and there is no expression over
+// `to_domain || to_target` that reconstructs it (the colon was trimmed around).
+// Such a row resolves exactly as it does today - the fallback compares against
+// NULL, which is never true - until the next reindex of its engram rewrites it.
+const SCHEMA_V9: &str = r#"
+ALTER TABLE relation ADD COLUMN IF NOT EXISTS to_raw TEXT;
+ALTER TABLE link ADD COLUMN IF NOT EXISTS to_raw TEXT;
+"#;
+
+// When this domain was last seen in the configuration. TEXT RFC 3339 rather
+// than `timestamptz`, matching `last_sync` and the Turso twin so the column
+// compares lexically and identically on both backends.
+//
+// Nullable with no default and no backfill, and that is the point: every row
+// that predates this migration reads NULL, and NULL means "never stamped", not
+// "stamped infinitely long ago". A caller that ages the stamp to decide whether
+// a domain has been gone long enough to collect must read NULL as no evidence
+// at all and leave the row alone, so the first sweep after an upgrade collects
+// nothing. Rows earn a stamp only by being seen registered.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS last_registered TEXT;
+"#;
+
+// The Turso v12 column, same meaning: when a forced rebuild of this domain was
+// stamped as started, RFC 3339, NULL when none is in flight. Nullable, no
+// default, no backfill - a row written before this migration reads NULL, which
+// is the truth for every one of them.
+const SCHEMA_V11: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS rebuild_started TEXT;
+"#;
+
+// The Turso v14 column, same meaning: which verb stamped the rebuild marker
+// beside it, `full` or `wipe`, NULL when no rebuild is in flight and for a
+// marker a binary older than the column stamped. Nullable, no default, no
+// backfill, and converging on a retry the way every migration in this dialect
+// does.
+const SCHEMA_V13: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS rebuild_kind TEXT;
+"#;
+
+// The actor dimension, the Turso v13 migration's twin. `actor = ''` is the base
+// row - the one the domain's files on disk say exists - and any other value is
+// one actor's private draft at that path, a full row in its own right so
+// chunks, embeddings and graph rows key to its id exactly as a base row's do.
+// `tombstone` is that actor's draft deletion of a base row. Both defaults are
+// the base reading, so every row an upgrade finds stays the row it was and
+// nothing needs a resync.
+//
+// Where Turso has to rebuild the table to be rid of a table-level UNIQUE, this
+// dialect drops the constraint in place, so the ids, the child rows and the
+// four non-unique indexes are never disturbed at all. What replaces the old
+// pair is the same pair of actor-aware unique indexes, under the same names, so
+// the two backends read alike: one path and one permalink may now carry one row
+// per actor, and no actor may hold two rows at either.
+//
+// Every statement converges on a retry, the way v10 and v11 above it do. This
+// dialect runs the DDL batch as one implicit transaction, so no half-applied
+// schema is possible - but the version stamp is a separate statement, so a
+// crash between the two would replay this migration on the next start, and a
+// bare `ADD COLUMN` would wedge it on a duplicate-column error.
+const SCHEMA_V12: &str = r#"
+ALTER TABLE engram ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAULT '';
+ALTER TABLE engram ADD COLUMN IF NOT EXISTS tombstone BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE engram DROP CONSTRAINT IF EXISTS engram_domain_id_permalink_key;
+DROP INDEX IF EXISTS idx_engram_path;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_engram_permalink_actor ON engram(domain_id, permalink, actor);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_engram_path_actor ON engram(domain_id, path, actor);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -367,4 +473,261 @@ async fn current_version(conn: &mut PgConnection) -> Result<i64> {
         .await
         .map_err(|e| IndexError::Migration(e.to_string()))?;
     Ok(row.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Connection;
+
+    /// The v11 column against a database written before it, which is the case
+    /// an upgrade actually meets: a schema raised to v10, domain rows already
+    /// in it, then v11 applied over the top.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate the
+    /// parity suite uses; without it there is no server to migrate and the test
+    /// is a silent no-op rather than a failure. It talks to sqlx directly
+    /// rather than through `PostgresStore`, because opening a store applies
+    /// every migration at once and there would be no pre-existing database
+    /// left to migrate.
+    #[tokio::test]
+    async fn v11_leaves_a_domain_row_written_before_it_unmarked() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // A database at v10: everything up to but not including the marker.
+        for m in &MIGRATIONS[..10] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[10].version, 11, "the eleventh migration is v11");
+        sqlx::raw_sql(
+            "INSERT INTO domain(name, path) VALUES ('old','/tmp/old'),('busy','/tmp/busy')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATIONS[10].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let unmarked: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_started IS NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            unmarked.0, 2,
+            "no backfill: both pre-existing rows read NULL, meaning no rebuild in flight"
+        );
+
+        sqlx::raw_sql("UPDATE domain SET rebuild_started='2026-09-14T00:00:00Z' WHERE name='busy'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let marked: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_started IS NOT NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            marked.0, 1,
+            "the stamped row carries a value and the row beside it still does not"
+        );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The v13 column against a database written before it, carrying a marker
+    /// an older binary stamped: the instant survives and the kind reads NULL,
+    /// which is the shape a reader has to tolerate - it says a rebuild did not
+    /// finish and claims nothing about what the rows hold.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate the
+    /// parity suite uses.
+    #[tokio::test]
+    async fn v13_leaves_a_marker_written_before_it_without_a_kind() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig13_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // A database at v12: everything up to but not including the kind.
+        for m in &MIGRATIONS[..12] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        assert_eq!(
+            MIGRATIONS[12].version, 13,
+            "the thirteenth migration is v13"
+        );
+        sqlx::raw_sql(
+            "INSERT INTO domain(name, path, rebuild_started) \
+             VALUES ('old','/tmp/old',NULL),('busy','/tmp/busy','2026-09-14T00:00:00Z')",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATIONS[12].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let kindless: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_kind IS NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            kindless.0, 2,
+            "no backfill: the standing marker keeps its instant and has no kind"
+        );
+        let marked: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_started IS NOT NULL")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(marked.0, 1, "and the marker itself survived the migration");
+
+        sqlx::raw_sql(
+            "UPDATE domain SET rebuild_started='2026-09-17T00:00:00Z', rebuild_kind='wipe' WHERE name='old'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let wiped: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM domain WHERE rebuild_kind='wipe'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(wiped.0, 1, "a new stamp carries the verb that is running");
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The v12 widening of `engram`, over a database that already carries both
+    /// of the `domain` columns added since - the shape an upgrade actually
+    /// meets. Postgres alters in place rather than rebuilding, so what has to
+    /// be proven here is different from Turso's swap: that the table-level
+    /// `UNIQUE(domain_id, permalink)` is really gone and the two actor-aware
+    /// unique indexes really took over, since a dropped constraint that was
+    /// never dropped would refuse a second actor's draft at the first write.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate the
+    /// parity suite uses.
+    #[tokio::test]
+    async fn v12_widens_engram_over_a_database_carrying_the_domain_columns() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig12_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // A database at v11: everything up to but not including the widening.
+        for m in &MIGRATIONS[..11] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[11].version, 12, "the twelfth migration is v12");
+        sqlx::raw_sql(
+            "INSERT INTO domain(name, path, last_registered) VALUES ('d','/tmp/d','2026-09-14T00:00:00Z'); \
+             INSERT INTO engram(domain_id, path, permalink, title, sha256) \
+             SELECT id, 'a.md', 'a', 'A', 'ff' FROM domain WHERE name='d'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATIONS[11].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // And again, because the version stamp is a statement of its own: a
+        // crash between the DDL and the stamp replays this migration on the
+        // next start, and it has to converge rather than wedge on a duplicate
+        // column.
+        sqlx::raw_sql(MIGRATIONS[11].sql)
+            .execute(&mut conn)
+            .await
+            .expect("v12 applies twice");
+
+        let base: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM engram WHERE path='a.md' AND sha256='ff' AND actor='' AND NOT tombstone",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            base.0, 1,
+            "the row carried over whole, as a base row, with no resync"
+        );
+
+        sqlx::raw_sql(
+            "INSERT INTO engram(domain_id, path, permalink, actor) \
+             SELECT id, 'a.md', 'a', 'alice' FROM domain WHERE name='d'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let both: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM engram WHERE path='a.md'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            both.0, 2,
+            "a draft sits beside the base row at the same path and the same permalink"
+        );
+
+        let dup = sqlx::raw_sql(
+            "INSERT INTO engram(domain_id, path, permalink, actor) \
+             SELECT id, 'a.md', 'a2', 'alice' FROM domain WHERE name='d'",
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(
+            dup.is_err(),
+            "but one actor still gets only one row at a path"
+        );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
 }

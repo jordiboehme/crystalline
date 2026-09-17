@@ -13,6 +13,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import { acrossElements } from "../test/assert";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
@@ -249,7 +250,7 @@ describe("the share dialog", () => {
     // The outcome is surfaced where the decision was made, rather than the
     // dialog closing on nothing.
     expect(
-      await within(dialog).findByText(/updated proposal #4/i),
+      await within(dialog).findByText(acrossElements(/updated proposal #4/i)),
     ).toBeInTheDocument();
     // And the line that said what a share WOULD do goes with it. Left
     // standing, the header would sit above the outcome telling somebody their
@@ -310,7 +311,7 @@ describe("the share dialog", () => {
     // rename. An untouched field means "your title", not "this one".
     expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({});
     expect(
-      await within(dialog).findByText(/opened proposal #7/i),
+      await within(dialog).findByText(acrossElements(/opened proposal #7/i)),
     ).toBeInTheDocument();
   });
 
@@ -431,7 +432,7 @@ describe("the share dialog", () => {
     expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({});
     expect(
       await within(dialog).findByText(
-        "Updated proposal #4, layer 1 of 2 on stack #42.",
+        acrossElements(/^Updated proposal #4, layer 1 of 2 on stack #42\.$/),
       ),
     ).toBeInTheDocument();
   });
@@ -880,7 +881,7 @@ describe("the share dialog", () => {
 
     expect(
       await within(dialog).findByText(
-        "Opened proposal #7, layer 2 of 2 on stack #42.",
+        acrossElements(/^Opened proposal #7, layer 2 of 2 on stack #42\.$/),
       ),
     ).toBeInTheDocument();
   });
@@ -921,9 +922,177 @@ describe("the share dialog", () => {
 
     expect(
       await within(dialog).findByText(
-        "Opened proposal #7, layer 2 of 2 (stack link pending).",
+        acrossElements(
+          /^Opened proposal #7, layer 2 of 2 \(stack link pending\)\.$/,
+        ),
       ),
     ).toBeInTheDocument();
+  });
+
+  it("links the proposal number a proposed outcome names", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    const link = await within(dialog).findByRole("link", { name: "#7" });
+    expect(link).toHaveAttribute(
+      "href",
+      "https://github.com/acme/knowledge/pull/7",
+    );
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(
+      within(dialog).getByText(acrossElements(/opened proposal #7/i)),
+    ).toBeVisible();
+  });
+
+  it("links the proposal number an updated outcome names", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "update",
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "updated",
+              proposal: {
+                number: 4,
+                url: "https://github.com/acme/knowledge/pull/4",
+              },
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    const link = await within(dialog).findByRole("link", { name: "#4" });
+    expect(link).toHaveAttribute(
+      "href",
+      "https://github.com/acme/knowledge/pull/4",
+    );
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(
+      within(dialog).getByText(acrossElements(/updated proposal #4/i)),
+    ).toBeVisible();
+  });
+
+  it("links the proposal number a proposal_diverged outcome names", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "update",
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposal_diverged",
+              proposal: {
+                number: 4,
+                url: "https://github.com/acme/knowledge/pull/4",
+                branch: "crystalline/eng-20260821",
+              },
+              guidance: "Withdraw it or let the review finish.",
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    const link = await within(dialog).findByRole("link", { name: "#4" });
+    expect(link).toHaveAttribute(
+      "href",
+      "https://github.com/acme/knowledge/pull/4",
+    );
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(
+      within(dialog).getByText(
+        acrossElements(/a reviewer amended proposal #4's branch/i),
+      ),
+    ).toBeVisible();
+  });
+
+  it("renders the proposal number as plain text when the outcome names no url", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              number: 7,
+              url: null,
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    expect(
+      await within(dialog).findByText("Opened proposal #7."),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByRole("link")).toBeNull();
   });
 
   it("offers no layer to amend when nothing is open", async () => {
