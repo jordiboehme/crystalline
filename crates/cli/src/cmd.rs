@@ -185,6 +185,18 @@ fn daemon_answered_badly(what: &str, error: &str) -> String {
     )
 }
 
+/// The words a listing uses when it never reached a daemon at all: the only
+/// other way [`reach_index`] fails is [`db_path`], which resolves the default
+/// database location and fails on a home directory it cannot read. Its own
+/// sentence rather than [`daemon_answered_badly`]'s, because that one asserts a
+/// daemon answered, and sending somebody to `crystalline ctl shutdown` over a
+/// failed path resolution points at the wrong machine entirely.
+fn listing_not_reached(what: &str, error: &str) -> String {
+    format!(
+        "{what} could not reach the index, so the per-domain counts are missing. Look at this machine's configuration with: crystalline doctor. The failure was: {error}"
+    )
+}
+
 /// The opened store a verb needs, or the error it fails with. Total over
 /// every route, so no caller has to write a panicking arm for a variant its
 /// own call cannot produce: a verb that sent no ctl request never sees
@@ -1176,7 +1188,15 @@ pub async fn domain_list(
     {
         Ok(route) => Some(route),
         Err(e) => {
-            not_read = Some(daemon_answered_badly("this listing", &e.to_string()));
+            // Which of the two failures this was. `db_path` is cheap and pure,
+            // so asking it again is how the arm tells a daemon that answered
+            // badly from a path that never resolved - the alternative is
+            // classifying the error by its text, which is exactly what this
+            // file stopped doing.
+            not_read = Some(match db_path(db_override) {
+                Ok(_) => daemon_answered_badly("this listing", &e.to_string()),
+                Err(_) => listing_not_reached("this listing", &e.to_string()),
+            });
             None
         }
     };
@@ -2896,7 +2916,7 @@ mod review_plan_tests {
 
 #[cfg(test)]
 mod index_reach_words_tests {
-    use super::daemon_answered_badly;
+    use super::{daemon_answered_badly, listing_not_reached};
 
     /// A daemon that answered badly is a different state from a locked file,
     /// and says so without borrowing the lock sentence.
@@ -2910,6 +2930,20 @@ mod index_reach_words_tests {
             "{words}"
         );
         assert!(!words.contains("owns the index at"), "{words}");
+    }
+
+    /// A failure that never reached a daemon does not blame one. The daemon
+    /// probe and the database-path resolution both fail through the same
+    /// `reach_index` return, and only one of them is the daemon's doing.
+    #[test]
+    fn a_failure_that_never_reached_a_daemon_does_not_name_one() {
+        let words = listing_not_reached("this listing", "could not resolve the default database path");
+        assert!(!words.contains("daemon"), "{words}");
+        assert!(words.contains("crystalline doctor"), "a remedy a person can paste: {words}");
+        assert!(
+            words.ends_with("The failure was: could not resolve the default database path"),
+            "and the raw text trails rather than leads: {words}"
+        );
     }
 }
 
