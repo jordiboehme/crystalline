@@ -714,9 +714,22 @@ enum PromptKind {
     /// that read and write them.
     System {
         /// The workspace path to route for. Defaults to the current
-        /// directory.
+        /// directory. Scoping comes from the global config's `prompt.rules`:
+        /// each key is a path glob, and the include and exclude lists of
+        /// every rule whose glob matches this path decide which registered
+        /// domains are rendered. A workspace no rule matches gets every
+        /// registered domain. A `.crystalline.yaml` in the workspace does
+        /// not scope: its `preferred_domains` reorder what is rendered,
+        /// preferred first.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Render only these registered domains, in the configured
+        /// preference order. Repeat the flag for several. A name that is
+        /// not registered is an error naming the ones that are. Applies on
+        /// top of the workspace scoping rather than instead of it, so a
+        /// domain the workspace's `prompt.rules` exclude stays excluded.
+        #[arg(long = "domain")]
+        domains: Vec<String>,
         /// Render the read-only variant: drop the write-tools line and state
         /// that this deployment's knowledge is curated externally. Forces the
         /// mode on regardless of service.read_only.
@@ -1541,12 +1554,13 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Prompt { kind }) => match kind {
             PromptKind::System {
                 workspace,
+                domains,
                 read_only,
                 config,
                 format,
                 harness,
             } => run_prompt(
-                workspace, read_only, config, cli.db, cli.json, format, harness,
+                workspace, domains, read_only, config, cli.db, cli.json, format, harness,
             ),
             PromptKind::Connector => run_prompt_connector(cli.json),
         },
@@ -3822,6 +3836,7 @@ fn run_prompt_connector(json: bool) -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_prompt(
     workspace: Option<PathBuf>,
+    only_domains: Vec<String>,
     read_only_flag: bool,
     config_path: Option<PathBuf>,
     db: Option<PathBuf>,
@@ -3923,7 +3938,25 @@ fn run_prompt(
         std::collections::BTreeMap::new()
     };
 
+    // Validated against the registry rather than against what survived the
+    // workspace scoping: a name that is registered but scoped out renders
+    // nothing and says nothing, which is what "applies both filters" means; a
+    // name that is registered nowhere is a typo, and the answer to a typo is
+    // the list of real names.
+    if let Some(unknown) = only_domains
+        .iter()
+        .find(|n| !global.domains.contains_key(n.as_str()))
+    {
+        let mut known: Vec<&str> = global.domains.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        anyhow::bail!(
+            "no domain named '{unknown}' is registered. Registered: {}. See them with: crystalline domain list",
+            known.join(", ")
+        );
+    }
+
     let mut output = crystalline_core::generate_prompt(&global, &workspace, &virtual_bullets);
+    crystalline_core::prompt::restrict_to_domains(&mut output, &only_domains);
     // The flag forces the read-only variant on top of service.read_only; it can
     // only turn the mode on, matching the daemon precedence.
     if read_only_flag {

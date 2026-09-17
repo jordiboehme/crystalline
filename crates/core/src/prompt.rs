@@ -150,6 +150,26 @@ pub fn generate_prompt(
     }
 }
 
+/// Keep only the named domains in a built prompt, in the order they are already
+/// in.
+///
+/// Separate from [`generate_prompt`] rather than a parameter of it because the
+/// order is the thing being preserved: the preference reorder and the registry
+/// order have already been applied, and a filter that rebuilt the list could
+/// only get that order wrong. An empty `names` changes nothing, so a caller
+/// with no flag passes its empty vector straight through.
+///
+/// Validation belongs to the caller: this crate knows nothing about how to
+/// tell somebody which domains their machine has registered.
+pub fn restrict_to_domains(output: &mut PromptOutput, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    output
+        .domains
+        .retain(|d| names.iter().any(|n| n == &d.name));
+}
+
 /// Build the routing prompt with no workspace context: every registered
 /// domain in config order, unfiltered. This is the shape the MCP
 /// `instructions` channel wants, where a server serves one index to every
