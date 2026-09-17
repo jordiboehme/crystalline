@@ -470,9 +470,9 @@ enum Command {
         /// Replace deeper subsections too when replacing a section.
         #[arg(long)]
         include_subsections: bool,
-        /// The checksum from a prior read (guards a virtual-domain edit against a
-        /// change since it was read; the edit is refused as a conflict if it
-        /// changed). Omit for last-write-wins.
+        /// The checksum from a prior read; the edit is refused as a conflict if
+        /// the engram changed since, whichever storage kind holds it. Omit for
+        /// last-write-wins.
         #[arg(long)]
         expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
@@ -523,8 +523,9 @@ enum Command {
         /// A domain-relative subfolder for the new engram.
         #[arg(long)]
         folder: Option<String>,
-        /// The checksum from a prior read; the split is refused as a conflict
-        /// if the source changed since. Omit for last-write-wins.
+        /// The checksum from a prior read; the split is refused as a conflict if
+        /// the source changed since, whichever storage kind holds it. Omit for
+        /// last-write-wins.
         #[arg(long)]
         expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.

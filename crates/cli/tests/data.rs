@@ -1508,3 +1508,17 @@ fn a_full_reindex_on_a_damaged_database_names_the_wipe() {
         "rebuilt from the files"
     );
 }
+
+/// Neither guard is virtual-only: the engine compares the checksum on a file
+/// domain inside the write lock and on a virtual domain in the store's
+/// compare-and-swap. The help used to say otherwise, which is the 0.17.0 field
+/// report's finding 8.
+#[test]
+fn the_checksum_help_does_not_claim_virtual_domains_only() {
+    for verb in ["edit", "split"] {
+        let out = bin().args([verb, "--help"]).output().unwrap();
+        let help = String::from_utf8(out.stdout).unwrap();
+        assert!(help.contains("whichever storage kind holds it"), "{verb}: {help}");
+        assert!(!help.contains("virtual-domain edit"), "{verb}: {help}");
+    }
+}
