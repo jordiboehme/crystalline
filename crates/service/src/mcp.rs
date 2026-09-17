@@ -4313,14 +4313,15 @@ fn delete_question(preview: &Value) -> String {
 }
 
 /// What an authenticated non-admin agent is told when it tries to change what
-/// this instance is: which domains are registered, and how it is configured.
+/// this instance is: which domains are registered, how it is configured, and
+/// what it provisions into the harnesses on the machine it runs on.
 ///
 /// The JSON API has always gated those admin-only; over MCP they were open to
 /// any account whose agent held a token, which is the last place the two
 /// surfaces disagreed. It names the role rather than the person, and it names
 /// the way out, because an agent that reads this has to be able to tell its
 /// user what to ask for.
-const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it and its settings - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
+const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it, its settings and what it provisions into the harnesses on its machine - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
 
 /// The sentence `remove_domain` asks before it acts, rendered from
 /// [`crate::engine::Engine::domain_remove_preview`].
@@ -6729,6 +6730,20 @@ mod tests {
         assert!(
             PROVISION_NOT_DECLARED.contains("status"),
             "{PROVISION_NOT_DECLARED}"
+        );
+    }
+
+    /// The refusal a non-admin agent reads names every class of change it
+    /// gates, provisioning included: a message that names two of three leaves
+    /// somebody refused on `provision apply` reading a sentence about
+    /// something else.
+    #[test]
+    fn the_instance_admin_refusal_names_provisioning_too() {
+        assert!(INSTANCE_ADMIN_ONLY.contains("domains registered on it"), "{INSTANCE_ADMIN_ONLY}");
+        assert!(INSTANCE_ADMIN_ONLY.contains("settings"), "{INSTANCE_ADMIN_ONLY}");
+        assert!(
+            INSTANCE_ADMIN_ONLY.contains("provision"),
+            "the third class is the one the message forgot: {INSTANCE_ADMIN_ONLY}"
         );
     }
 }
