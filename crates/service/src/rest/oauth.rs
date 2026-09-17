@@ -3726,12 +3726,12 @@ mod tests {
             "https://knowledge.example:8443",
             "an entry naming no port answers on every port, as the transport's does"
         );
-        assert!(
-            rule.origin(&headers_with("KNOWLEDGE.example", None))
-                .is_ok(),
-            "the match against the list is case insensitive, whatever spelling arrives - what is \
-             published keeps the spelling it came in, which `same_resource` deliberately does not \
-             fold"
+        assert_eq!(
+            rule.origin(&headers_with("KNOWLEDGE.example", None)).unwrap(),
+            "https://KNOWLEDGE.example",
+            "the match against the list is case insensitive, whatever spelling arrives - and what \
+             is published keeps the spelling it came in, which `same_resource` deliberately does \
+             not fold"
         );
         for local in ["127.0.0.1:7411", "localhost:7411", "[::1]:7411"] {
             assert!(
