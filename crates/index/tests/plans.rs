@@ -74,13 +74,37 @@ pub struct HotStatement {
     /// the same value the same way. Exactly one entry needs it: the semantic
     /// query vector is a blob in turso and a `vector` literal in postgres.
     pub literals_pg: Option<&'static [&'static str]>,
-    /// Tables whose scan IS the intended plan, each with the reason. Empty for
-    /// all but one; a non-empty one is a claim a reviewer has to read, and the
-    /// reason is written from an observed plan, never guessed.
+    /// Tables whose full pass IS the intended plan on TURSO, each with the
+    /// reason. Empty for all but one; a non-empty one is a claim a reviewer has
+    /// to read, and the reason is written from an observed plan, never guessed.
     pub scan_expected: &'static [(&'static str, &'static str)],
+    /// The same for POSTGRES, and `None` where the two backends are entitled to
+    /// the same permissions.
+    ///
+    /// A permission has to name its backend, because a permission a backend
+    /// does not spend is a blanket one. Entry 6 is the case: turso genuinely
+    /// cannot do better than a full pass over `chunk`, and postgres reaches the
+    /// same rows through `idx_chunk_model`. Sharing one list would mean that a
+    /// migration dropping or narrowing that index turned every semantic search
+    /// on postgres into a sequential scan of the chunk table with this test
+    /// still green - the statement the registry most wants to watch would be
+    /// the one it stopped watching.
+    pub scan_expected_pg: Option<&'static [(&'static str, &'static str)]>,
     /// Indexes the turso plan must name in full, where the entry's claim is
     /// about WHICH index serves it rather than merely that one does.
     pub turso_must_seek: &'static [&'static str],
+    /// The same for postgres, and deliberately not the same list.
+    ///
+    /// The two planners do not pick the same index for the same statement, and
+    /// measured on this fixture they mostly do not: postgres reaches the folder
+    /// derivation through `idx_engram_domain` rather than `idx_engram_path_actor`,
+    /// and the two dangling arms through `idx_relation_to` / `idx_link_to`
+    /// rather than the partial unresolved pair. Those are the turso design's
+    /// claims, so they are asserted where they are claims; copying them here
+    /// would pin a planner's mood as if it were a design. What IS a claim on
+    /// postgres is the index that stands between entry 6 and a sequential scan
+    /// of `chunk`, which is the other half of the fix for the same finding.
+    pub postgres_must_seek: &'static [&'static str],
 }
 
 /// The tables a scan of is a performance bug unless `scan_expected` says
@@ -156,7 +180,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["1"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             // The one entry whose tie-break differs from `reference_match`'s:
@@ -171,7 +197,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["'d'", "'p0'"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "Store::list_engrams",
@@ -180,7 +208,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["'d'"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             // The folder derivation, which used to be guarded by a hand-copied
@@ -199,7 +229,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["'d'"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &["idx_engram_path_actor"],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "search::scored_lexical",
@@ -220,7 +252,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["'d'"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "search::semantic_phase1_sql",
@@ -232,23 +266,45 @@ pub fn registry() -> Vec<HotStatement> {
             },
             literals: &[QVEC_TURSO, "'fake'"],
             literals_pg: Some(&[QVEC_PG, "'fake'"]),
-            // The only reason in the registry, and written from the plans as
-            // observed rather than guessed. This is the exact distance scan -
-            // one row per engram by min(distance) over every chunk - and an
-            // exact GROUP BY cannot read a nearest-neighbour index: the HNSW
-            // index postgres carries is present for a future top-k rewrite, and
-            // turso has no vector index at all. Turso spends it (`SCAN chunk AS
-            // c USING INDEX idx_chunk_engram`, a full pass). Postgres does not:
-            // with the model predicate to work from it reaches the rows through
-            // a bitmap scan of `idx_chunk_model`, so the permission goes unused
-            // there. It is written per table rather than per backend because
-            // which of the two spends it is a planner's business, and the
-            // reason is the same on both.
+            // The only permission in the registry, written from the plans as
+            // observed rather than guessed, and granted on turso ALONE. This is
+            // the exact distance scan - one row per engram by min(distance)
+            // over every chunk - and an exact GROUP BY cannot read a
+            // nearest-neighbour index: the HNSW index postgres carries is
+            // present for a future top-k rewrite, and turso has no vector index
+            // at all. So turso spends it (`SCAN chunk AS c USING INDEX
+            // idx_chunk_engram`, a full pass).
+            //
+            // Postgres spends its permission on the OTHER table, which is
+            // exactly why the two lists cannot be one. With the model predicate
+            // to work from it reaches `chunk` through a bitmap scan of
+            // `idx_chunk_model` - the only thing standing between every
+            // semantic search and a sequential pass over the whole chunk table,
+            // so `chunk` is NOT permitted there and that index is named in full
+            // below. What postgres does pass over is `engram`: an unscoped
+            // semantic query filters `engram` on nothing at all, so there is
+            // nothing there to seek and every chunk of the model has to meet
+            // its parent row. Postgres walks `idx_engram_domain` and applies
+            // the actor screen as a filter; turso reaches the same rows from
+            // the other end, one primary-key seek per chunk. A full pass by
+            // construction rather than by a missing index, and bounded by the
+            // engram count rather than the chunk count.
+            //
+            // The top-k rewrite the first paragraph anticipates would likely
+            // replace `idx_chunk_model` with a composite - and then this entry
+            // is where that is said out loud, which is the point of naming an
+            // index rather than settling for "some index".
             scan_expected: &[(
                 "chunk",
                 "the exact distance scan, which no nearest-neighbour index can serve",
             )],
+            scan_expected_pg: Some(&[(
+                "engram",
+                "an unscoped semantic query filters `engram` on nothing, so every chunk \
+                 of the model meets its parent row; bounded by the engram count",
+            )]),
             turso_must_seek: &[],
+            postgres_must_seek: &["idx_chunk_model"],
         },
         HotStatement {
             issued_by: "search::semantic_hydrate_sql",
@@ -257,7 +313,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &[],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "Store::lead_vectors",
@@ -266,7 +324,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["1", "'fake'"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "Store::resolve_pending_relations",
@@ -275,6 +335,7 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["1"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             // The driving index only: this pins that the pass itself stays
             // bounded by the partial unresolved index. Which index each of the
             // four COALESCE arms seeks is asked by name in
@@ -283,6 +344,7 @@ pub fn registry() -> Vec<HotStatement> {
             // can lose the title index to a rewrite that still has it seeking
             // something, and only that guard notices.
             turso_must_seek: &["idx_relation_unresolved"],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "Store::resolve_pending_links",
@@ -291,7 +353,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["1"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &["idx_link_unresolved"],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "Store::unresolved_refs",
@@ -312,9 +376,11 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &["1"],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             // The pair of partial indexes exists for exactly these two arms, so
             // this entry names both rather than settling for any index at all.
             turso_must_seek: &["idx_relation_unresolved", "idx_link_unresolved"],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "search::neighbors (relation frontier)",
@@ -337,7 +403,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &[],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "search::neighbors (link frontier)",
@@ -350,7 +418,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &[],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         HotStatement {
             issued_by: "search::neighbors (node hydrate)",
@@ -359,7 +429,9 @@ pub fn registry() -> Vec<HotStatement> {
             literals: &[],
             literals_pg: None,
             scan_expected: &[],
+            scan_expected_pg: None,
             turso_must_seek: &[],
+            postgres_must_seek: &[],
         },
         // The contradiction scorer wave (plans/2026-09-14-contradiction-scorer-plan.md)
         // adds two per-domain reads, and both belong here the day they land:
@@ -682,18 +754,55 @@ mod postgres_plans {
         }
     }
 
-    /// Every `Seq Scan` over a guarded table, as `(table, the node)`.
-    fn seq_scans(plan: &Value) -> Vec<(String, String)> {
+    /// Every read of a guarded table that is NOT an index seek, as
+    /// `(table, the node)`.
+    ///
+    /// Two shapes, and the second is the postgres twin of the one `read_of`
+    /// rejects on turso.
+    ///
+    /// `Seq Scan` is the obvious one. The other is an `Index Scan` or `Index
+    /// Only Scan` that carries a `Filter` and no `Index Cond`: postgres walks
+    /// every entry of the index and tests the predicate on each row, which is a
+    /// full pass that happens to be spelled as an index read - exactly what
+    /// `SCAN t USING INDEX i` is on turso. `enable_seqscan = off` does not make
+    /// that shape rarer, it makes it commoner, because a penalised sequential
+    /// scan is what the planner trades it against, and a statement carrying
+    /// `ORDER BY e.id` over an indexed column is the shape it reaches for. That
+    /// is `lexical_candidate_sql`, which is the statement whose bound is its
+    /// whole claim.
+    ///
+    /// `Bitmap Heap Scan` is deliberately not here: it always carries a
+    /// `Recheck Cond` and is driven by a `Bitmap Index Scan` beneath it, so it
+    /// can never be the shape in question.
+    fn unseeked_reads(plan: &Value) -> Vec<(String, String)> {
         let mut all = Vec::new();
         nodes(plan, &mut all);
         all.iter()
-            .filter(|node| node["Node Type"] == "Seq Scan")
+            .filter(|node| {
+                let kind = node["Node Type"].as_str().unwrap_or_default();
+                match kind {
+                    "Seq Scan" => true,
+                    "Index Scan" | "Index Only Scan" => {
+                        node.get("Index Cond").is_none() && node.get("Filter").is_some()
+                    }
+                    _ => false,
+                }
+            })
             .filter_map(|node| {
                 node["Relation Name"]
                     .as_str()
                     .map(|r| (r.to_string(), node.to_string()))
             })
             .filter(|(table, _)| GUARDED_TABLES.contains(&table.as_str()))
+            .collect()
+    }
+
+    /// Every index this plan reads by name.
+    fn index_names(plan: &Value) -> Vec<String> {
+        let mut all = Vec::new();
+        nodes(plan, &mut all);
+        all.iter()
+            .filter_map(|node| node["Index Name"].as_str().map(str::to_string))
             .collect()
     }
 
@@ -732,12 +841,22 @@ mod postgres_plans {
             let plan = store.explain_json(&sql).await.unwrap_or_else(|e| {
                 panic!("{} did not explain: {e}. Statement: {sql}", entry.issued_by)
             });
-            for (table, node) in seq_scans(&plan) {
-                let reason = entry.scan_expected.iter().find(|(t, _)| *t == table);
+            let permitted = entry.scan_expected_pg.unwrap_or(entry.scan_expected);
+            for (table, node) in unseeked_reads(&plan) {
                 assert!(
-                    reason.is_some(),
-                    "{} scans `{table}` with enable_seqscan off, so no index covers its \
-                     predicate. Node: {node}. Statement: {sql}",
+                    permitted.iter().any(|(t, _)| *t == table),
+                    "{} reads `{table}` without seeking an index, with enable_seqscan \
+                     off, so no index covers its predicate. Node: {node}. \
+                     Statement: {sql}",
+                    entry.issued_by
+                );
+            }
+            let seen = index_names(&plan);
+            for index in entry.postgres_must_seek {
+                assert!(
+                    seen.iter().any(|name| name == index),
+                    "{} must be served by {index} by name; the plan read {seen:?}. \
+                     Statement: {sql}",
                     entry.issued_by
                 );
             }
@@ -788,7 +907,7 @@ mod postgres_plans {
         );
         let plan = store.explain_json(&sql).await.unwrap();
         assert!(
-            seq_scans(&plan).iter().any(|(t, _)| t == "engram"),
+            unseeked_reads(&plan).iter().any(|(t, _)| t == "engram"),
             "with every engram index dropped the plan must be a scan, so the green run \
              means something: {plan}"
         );
