@@ -652,8 +652,10 @@ pub struct EngramFacts {
     pub verified_on: Option<NaiveDate>,
     /// The body text, frontmatter excluded.
     pub body: String,
-    /// The engram's top-level observation bullets, in file order. `V010` is
-    /// the only rule that reads them: every other rule that looks at content
+    /// The engram's top-level observation bullets, in file order. `V010`
+    /// reads them for its own purpose; `V105` also sums their stripped text
+    /// as a floor on what a granularity split can save, since no split moves
+    /// a bullet somewhere smaller. Every other rule that looks at content
     /// looks at [`EngramFacts::body`].
     pub observations: Vec<FactObservation>,
     /// The approximate token count, `body.chars() / 4`, the same estimate
@@ -1000,8 +1002,11 @@ pub struct Finding {
     /// opening the file.
     pub evidence: String,
     /// The one variable piece of the fix: the field assignment, the verbatim
-    /// link text or the exact command. The prose instruction lives once per
-    /// rule in [`RuleInfo::instruction`] rather than being repeated here.
+    /// link text or the exact command. The prose instruction usually lives
+    /// once per rule in [`RuleInfo::instruction`] rather than being repeated
+    /// here; a rule whose remedy differs by case (`V105`) instead puts the
+    /// case's own sentence here and leaves `instruction` as the frame that
+    /// says a row's own fix names which one applies.
     pub fix: String,
     /// The evidence discriminator an acknowledgment is matched against, per
     /// [`scope_for`]. It exists so an acknowledgment can hold while the

@@ -351,10 +351,11 @@ One shape earns verbatim retention, and only alongside its distillation, never
 instead of it: a transcript or a long document whose exact words you may need to
 quote later. The summary stays an ordinary engram where its topic already lives,
 the full text goes in as a `type: source` engram under a `sources/` folder, the
-two are linked both ways with `summarizes` and `summarized_by`, and a full text
-over the verify token budget (2500 tokens by default) becomes sequential part
-engrams. The sin was never keeping the words; it is mirroring instead of
-distilling.
+two are linked both ways with `summarizes` and `summarized_by`. A `type: source`
+engram is held to four times the ordinary verify token budget (10000 tokens by
+default), since verbatim capture is what it is for; a full text still over that
+becomes sequential part engrams. The sin was never keeping the words; it is
+mirroring instead of distilling.
 
 A second pass over the vendor's install guide lands another engram, and you tag
 that one `hyper-drive` out of habit - a drift the next chapter cleans up. The
