@@ -76,8 +76,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-
 /// How many joins this process holds open at once, across everybody.
 ///
 /// A cap rather than trust: opening a join is a route any signed-in account
@@ -328,7 +326,7 @@ impl Joins {
             return Err(JoinRefusal::InstanceFull);
         }
         let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
         let key = crystalline_index::hex_lower(&bytes);
         open.insert(
             key.clone(),

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use crystalline_core::config::{self, GlobalConfig, HttpSetting};
 use crystalline_index::{HostClaim, Store};
 use interprocess::local_socket::tokio::Stream as IpcStream;
@@ -936,15 +935,15 @@ async fn run_http(
 /// (a local peer is never asked for one) while a missing token on a reachable
 /// bind locks the wizard shut.
 ///
-/// 32 hex characters is 128 bits from the same `OsRng` the session tokens are
-/// drawn from - a one-shot secret a human retypes off a terminal, not a stored
-/// credential.
+/// 32 hex characters is 128 bits from the same OS CSPRNG the session tokens
+/// are drawn from - a one-shot secret a human retypes off a terminal, not a
+/// stored credential.
 fn setup_token_for(addr: &str) -> Option<String> {
     if bind_is_loopback(addr) {
         return None;
     }
     let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
     Some(crystalline_index::hex_lower(&bytes))
 }
 

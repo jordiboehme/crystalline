@@ -65,8 +65,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use argon2::Argon2;
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use sha2::{Digest, Sha256};
 use turso::{Builder, Connection, Database, Row, Value};
 
@@ -4635,7 +4635,7 @@ fn cell_text(row: &Row, idx: usize) -> Option<String> {
 /// randomness come from" reads one function rather than one per family.
 fn random_hex_bytes<const N: usize>() -> String {
     let mut bytes = [0u8; N];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
     crystalline_index::hex_lower(&bytes)
 }
 
@@ -4726,13 +4726,14 @@ fn token_hash(token: &str) -> String {
 /// Hash a password with argon2id at the crate's recommended defaults. Argon2
 /// is deliberately expensive in both time and memory, so it runs on the
 /// blocking pool: a login must not stall the runtime worker that other
-/// requests are sharing.
+/// requests are sharing. The salt is generated internally, under argon2's
+/// `getrandom` feature, rather than passed in: 0.6's `hash_password` no
+/// longer takes one.
 async fn hash_password(password: &str) -> Result<String> {
     let password = password.to_string();
     tokio::task::spawn_blocking(move || {
-        let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .map(|h| h.to_string())
             .map_err(|e| anyhow!("hashing a password failed: {e}"))
     })
@@ -4878,6 +4879,32 @@ mod tests {
                 .unwrap()
         );
         assert!(!verify_hash(hash, "other".to_string()).await.unwrap());
+    }
+
+    /// A hash written by argon2 0.5.3 still verifies after the 0.6 bump. Every
+    /// account provisioned before the upgrade carries one of these, so this is
+    /// the test that says an upgrade is not a mass password reset. Captured
+    /// verbatim from argon2 0.5.3 with `Argon2::default()` on 2026-09-14; the
+    /// password it was written for is beside it, because a hash without its
+    /// password pins nothing.
+    #[tokio::test]
+    async fn a_hash_written_under_argon2_0_5_still_verifies() {
+        const PASSWORD: &str = "correct horse battery staple";
+        const HASH_0_5: &str = "$argon2id$v=19$m=19456,t=2,p=1$lU1KHTS8csu8CtBAN/g/Zw$gq+EDJ0qxuAHNNk1oxZGDP88YjooUWCCp14VWhB+b30";
+
+        assert!(
+            verify_hash(HASH_0_5.to_string(), PASSWORD.to_string())
+                .await
+                .unwrap(),
+            "the stored parameters travel in the PHC string, so the hash verifies whatever this \
+             crate's current defaults are"
+        );
+        assert!(
+            !verify_hash(HASH_0_5.to_string(), "wrong".to_string())
+                .await
+                .unwrap(),
+            "and it still refuses the wrong password"
+        );
     }
 
     #[tokio::test]

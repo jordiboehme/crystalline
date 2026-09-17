@@ -1567,9 +1567,8 @@ pub(super) fn prune_at_start(auth: Arc<AuthStore>) {
 /// what it mints is written to a database, and what this mints never leaves
 /// memory.
 fn random_hex_32() -> String {
-    use argon2::password_hash::rand_core::{OsRng, RngCore};
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
     crystalline_index::hex_lower(&bytes)
 }
 

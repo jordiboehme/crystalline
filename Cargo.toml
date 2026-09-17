@@ -125,11 +125,23 @@ base64 = "0.23.1"
 # in the graph through axum and url; named directly because the MCP surface
 # decodes an attachment uri itself, with no extractor doing it on the way in.
 percent-encoding = "2.3.2"
-# Password hashing for the REST auth store (crates/service). Default features
-# already pull `password-hash` and its `rand_core`, so the salt and the session
-# token both draw from `password_hash::rand_core::OsRng` and no separate `rand`
-# dependency is needed; `std` is on so hashing errors carry `std::error::Error`.
-argon2 = { version = "0.5.3", features = ["std"] }
+# Password hashing for the REST auth store (crates/service). 0.6's default
+# set is `alloc`, `getrandom` and `password-hash` - `std` is gone and `simple`
+# became `password-hash` - and `rand_core` is no longer pulled in by default,
+# so `hash_password` draws its salt through `PasswordHasher::hash_password`
+# itself rather than a caller-supplied RNG, and every raw-bytes site (session
+# tokens, MCP tokens, setup tokens, OAuth ids and codes) settles on the
+# `getrandom` dependency below instead: password-hash 0.6.1's own `rand_core`
+# feature is optional and rand_core 0.10.1 exports no `OsRng` at all, so
+# `argon2::password_hash::rand_core::OsRng` cannot be reached any more.
+argon2 = { version = "0.6.0", features = ["alloc", "password-hash"] }
+# The direct entropy source for every raw random-bytes site in
+# crates/service (crates/service/src/daemon.rs, join.rs, rest/auth_store.rs,
+# rest/oauth.rs): already in the lock through argon2's own `getrandom`
+# feature by way of password-hash, so naming it directly adds no new version
+# to the graph, only a name every one of those sites can import instead of
+# reaching through argon2's re-export.
+getrandom = "0.4.3"
 
 # Zip archives for the domain archive download and import (crates/service).
 # Default features drag aes, bzip2, lzma, ppmd, zstd and xz in; the archives
