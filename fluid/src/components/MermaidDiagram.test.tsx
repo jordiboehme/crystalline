@@ -209,8 +209,14 @@ describe("MermaidDiagram", () => {
     // container's scrollWidth equalled its clientWidth.
     expect(wrapper?.className).toContain("[&_svg]:shrink-0");
     // A scrollable region is a tab stop with a name, so the arrow keys can
-    // reach it and a screen reader can say what it is.
-    expect(wrapper?.getAttribute("tabindex")).toBe("0");
+    // reach it and a screen reader can say what it is. That name comes from
+    // the overflow measurement, a second effect that lands one render after
+    // the svg itself does, so it is waited on rather than assumed: the
+    // `waitFor` above only guarantees the svg is in the document, not that
+    // the container has measured itself yet.
+    await waitFor(() => {
+      expect(wrapper?.getAttribute("tabindex")).toBe("0");
+    });
     const region = screen.getByRole("region");
     expect(region).toBe(wrapper);
     expect(region.getAttribute("aria-label")).toBeTruthy();
