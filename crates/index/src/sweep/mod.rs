@@ -1974,9 +1974,20 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
         let (evidence, class, fix) = match unregistered {
             // A prefix nobody registered is not a prefix: the resolver reads
             // the whole bracket text as a title in this engram's own domain, so
-            // that is what the repair scores against too. A candidate means the
-            // intended target is not in doubt and completing the spelling
-            // changes nothing the archive claims.
+            // that is what the repair scores against too, and the nearest local
+            // title is named for whoever decides.
+            //
+            // **Judgment even with a candidate, and that is the whole of the
+            // arm.** The score cannot tell the designed case - a local engram
+            // whose own title holds a colon - from a cross-domain reference
+            // into a domain nobody has connected on this machine yet, because
+            // `normalize` turns the colon into a space and a short prefix is
+            // nearly free: `[[ops:Incident Response Checklist]]` scores 0.93
+            // against a local `Incident Response Checklist`. Mechanical is the
+            // class an agent applies without asking, and applying it here drops
+            // the domain the author named and repoints the reference at
+            // something local. Naming the candidate is the help; taking the
+            // decision is not ours.
             Some(domain) => match title_candidate(input, graph, &fact.domain, &reference.raw) {
                 Some(candidate) => (
                     format!(
@@ -1984,7 +1995,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                          nothing in {} is titled `{}`; nearest is `{candidate}`",
                         reference.rel_type, fact.domain, reference.raw
                     ),
-                    Class::Mechanical,
+                    Class::Judgment,
                     format!("[[{}]] -> [[{candidate}]]", reference.raw),
                 ),
                 None => (

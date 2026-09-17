@@ -622,8 +622,8 @@ async fn a_title_holding_a_slash_or_a_colon_is_named_in_the_receipt() {
         "it names the permalink it produced: {text}"
     );
     assert!(
-        text.contains("folder"),
-        "and the parameter that places an engram on purpose: {text}"
+        text.contains("`folder: \"q3\"`") && text.contains("--folder q3"),
+        "and a spelling a person can paste, on both surfaces they write from: {text}"
     );
 
     let coloned = engine
@@ -640,9 +640,35 @@ async fn a_title_holding_a_slash_or_a_colon_is_named_in_the_receipt() {
         "it names the prefix a link would read: {text}"
     );
     assert!(
-        text.contains("crystalline://eng/murmur-the-dispatch-pipeline"),
-        "and the form that always resolves: {text}"
+        text.contains("`[[murmur-the-dispatch-pipeline]]`"),
+        "and the bare permalink, which resolves at home whatever is registered: {text}"
     );
+    assert!(
+        text.contains("`[[eng:murmur-the-dispatch-pipeline]]`"),
+        "and its cross-domain twin: {text}"
+    );
+    assert!(
+        !text.contains("crystalline://"),
+        "and never the scheme, which a wikilink splits at its own first colon: {text}"
+    );
+
+    // A trailing slash is not a nesting: `slugify` drops the empty segment, so
+    // `TODO/` lands at `todo` and there is nothing to report.
+    let trailing = engine
+        .write_engram(&write_params("eng", "TODO/", "body"))
+        .await
+        .unwrap();
+    assert_eq!(trailing["permalink"], "todo");
+    assert!(trailing.get("notices").is_none(), "{trailing}");
+
+    // Nor is a folder the caller asked for: the permalink is nested because
+    // they said so, and a notice there would be noise on every deliberate
+    // write.
+    let mut foldered = write_params("eng", "Deliberate", "body");
+    foldered.folder = Some("notes/deep".to_string());
+    let foldered = engine.write_engram(&foldered).await.unwrap();
+    assert_eq!(foldered["permalink"], "notes/deep/deliberate");
+    assert!(foldered.get("notices").is_none(), "{foldered}");
 
     // A title whose colon is followed by nothing, and one whose prefix holds a
     // space, are not what a link reads as a domain prefix, so neither earns the
@@ -665,6 +691,76 @@ async fn a_title_holding_a_slash_or_a_colon_is_named_in_the_receipt() {
         .await
         .unwrap();
     assert!(plain.get("notices").is_none(), "{plain}");
+}
+
+/// The colon notice's own remedy, followed to the letter and then swept.
+///
+/// A notice that names a spelling which does not resolve manufactures exactly
+/// the dangling reference it exists to prevent, and it would do it on an
+/// agent's first obedient try. So every bracket form the sentence offers - each
+/// one lifted out of the text rather than retyped here, so the test follows the
+/// notice and not a copy of it - is written into a second engram, the domain is
+/// synced, and V102 must find nothing.
+#[tokio::test]
+async fn the_colon_notices_remedy_is_a_link_that_resolves() {
+    let (tmp, engine) = engine_fixture().await;
+
+    let receipt = engine
+        .write_engram(&write_params(
+            "eng",
+            "Murmur: the dispatch pipeline",
+            "How dispatch works.",
+        ))
+        .await
+        .unwrap();
+    let notice = receipt["notices"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the colon notice: {receipt}"));
+
+    // Every `[[...]]` the sentence spells except the first, which is the shape
+    // it is warning about. What is left is what it recommends.
+    let offered: Vec<String> = notice
+        .match_indices("[[")
+        .filter_map(|(i, _)| {
+            let rest = &notice[i + 2..];
+            rest.find("]]").map(|end| rest[..end].to_string())
+        })
+        .skip(1)
+        .collect();
+    assert!(
+        !offered.is_empty(),
+        "the notice offers a spelling to write instead: {notice}"
+    );
+
+    let body: String = offered
+        .iter()
+        .map(|form| format!("A reader follows [[{form}]] here.\n\n"))
+        .collect();
+    std::fs::write(
+        tmp.path().join("eng/reader.md"),
+        format!(
+            "---\ntype: engram\ntitle: Reader\npermalink: reader\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-02\n---\n\n# Reader\n\n{body}"
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let report = engine
+        .evolve_detect(
+            &crystalline_service::params::EvolveParams {
+                domains: vec!["eng".to_string()],
+                rules: vec!["V102".to_string()],
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report["queue"].as_array().map(Vec::len),
+        Some(0),
+        "every spelling the notice offers resolves; it offered {offered:?}: {report}"
+    );
 }
 
 /// The same rule on the other pair-writing verb, and the sharper case: the

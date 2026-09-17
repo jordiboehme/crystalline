@@ -828,6 +828,41 @@ fn v102_names_an_unregistered_target_domain() {
     );
 }
 
+/// A cross-domain reference into a domain the author means to register is not a
+/// spelling mistake, and the fuzzy score cannot tell the two apart: a short
+/// prefix costs almost nothing once the title is long, so
+/// `[[ops:Incident Response Checklist]]` scores 0.93 against a local
+/// `Incident Response Checklist`. The candidate is named either way, and the
+/// class stays Judgment, because dropping a domain somebody named changes what
+/// the archive claims and a person has to say yes to that.
+#[test]
+fn v102_keeps_an_unregistered_prefix_a_judgment_even_with_a_candidate() {
+    let mut target = fact(1, "incident-response-checklist");
+    target.title = "Incident Response Checklist".to_string();
+    let writer = fact(2, "writer");
+
+    let mut sweep = input(vec![target, writer]);
+    let mut reference = unresolved(2, "Incident Response Checklist");
+    reference.target_domain = Some("ops".to_string());
+    reference.raw = "ops:Incident Response Checklist".to_string();
+    sweep.unresolved = vec![reference];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V102");
+    assert_eq!(
+        finding.class,
+        Class::Judgment,
+        "an agent working the queue must not silently repoint a cross-domain \
+         reference at a local engram: {}",
+        finding.fix
+    );
+    assert!(
+        finding.fix.contains("Incident Response Checklist"),
+        "the candidate is still named, so the person deciding has it in hand: {}",
+        finding.fix
+    );
+}
+
 /// V102's repair reads a link the way the resolver does. An unresolved
 /// `[[Murmur: the dispatch pipeline]]` is scored against the whole bracket
 /// text, not against `the dispatch pipeline`: a prefix nobody registered is not
@@ -847,7 +882,11 @@ fn v102_suggests_what_the_resolver_would_have_found() {
 
     let report = detect(&sweep);
     let finding = only(&report, "V102");
-    assert_eq!(finding.class, Class::Mechanical);
+    // Judgment, not Mechanical: an unregistered prefix is as often a domain
+    // nobody connected yet as it is a title that happens to hold a colon, and
+    // the score cannot tell them apart. See
+    // `v102_keeps_an_unregistered_prefix_a_judgment_even_with_a_candidate`.
+    assert_eq!(finding.class, Class::Judgment);
     assert!(
         finding.fix.contains("Murmur: the dispatch pipelines"),
         "the whole bracket text is what was scored: {}",

@@ -1578,6 +1578,11 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 r.rel_type.as_str(),
                 r.target_domain.as_deref(),
                 r.target.as_str(),
+                // The bracket text as written, read back off `to_raw` rather
+                // than rebuilt: an ordinal drift onto the neighbouring source
+                // path would pass every other assertion in the tree and score
+                // V102's repair against a file name.
+                r.raw.as_str(),
                 r.line,
             )
         })
@@ -1593,6 +1598,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "cites",
                 None,
                 "Absent",
+                "Absent",
                 Some(13)
             ),
             (
@@ -1600,6 +1606,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 EdgeKind::Relation,
                 "blocks",
                 None,
+                "Old  Deploy Pipeline",
                 "Old  Deploy Pipeline",
                 Some(14)
             ),
@@ -1609,6 +1616,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "links_to",
                 None,
                 "Ghost Title",
+                "Ghost Title",
                 Some(16)
             ),
             (
@@ -1617,6 +1625,7 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "links_to",
                 Some("ghosts"),
                 "Remote Thing",
+                "ghosts:Remote Thing",
                 Some(18)
             ),
             (
@@ -1625,10 +1634,12 @@ async fn unresolved_refs_dangling(store: &dyn Store) {
                 "supersedes",
                 Some("archive"),
                 "Old Note",
+                "archive:Old Note",
                 Some(13)
             ),
         ],
-        "unresolved refs are ordered by (path, line) and carry the target verbatim: {refs:?}"
+        "unresolved refs are ordered by (path, line) and carry the target and the \
+         whole bracket text verbatim: {refs:?}"
     );
     assert!(
         !refs.iter().any(|r| r.target == "Target"),

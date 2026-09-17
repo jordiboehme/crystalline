@@ -248,8 +248,9 @@ async fn a_title_that_will_not_read_back_reaches_the_agent_that_wrote_it() {
         .as_str()
         .unwrap_or_else(|| panic!("and so does the colon's: {coloned}"));
     assert!(
-        notice.contains("crystalline://eng/murmur-the-dispatch-pipeline"),
-        "naming the form that always resolves: {notice}"
+        notice.contains("`[[murmur-the-dispatch-pipeline]]`")
+            && notice.contains("`[[eng:murmur-the-dispatch-pipeline]]`"),
+        "naming the two forms that always resolve, both of them pasteable: {notice}"
     );
 
     // A plain title's receipt gains no key at all.

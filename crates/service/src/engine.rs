@@ -3940,17 +3940,35 @@ impl Engine {
     /// domain called `Murmur` is registered - and the day one is, every such
     /// link silently means something else. Neither is refused: the title is the
     /// author's. What the receipt owes them is the permalink that came out and
-    /// the spelling that always works.
+    /// a spelling they can paste.
+    ///
+    /// Both remedies are literals rather than the name of a parameter, because
+    /// the reader is about to type one. And the colon's remedy is deliberately
+    /// NOT a `crystalline://` address: [`crystalline_core::engram::LinkTarget`]
+    /// splits a wikilink at its own first colon, so `[[crystalline://...]]`
+    /// reads `crystalline` as the domain prefix and dangles - advice that would
+    /// manufacture the very finding this notice exists to prevent. A permalink
+    /// can never hold a colon, so the bare permalink and its `domain:permalink`
+    /// twin are the two spellings that always mean what they say.
     ///
     /// Empty when the title holds neither, so the receipt gains no key at all
     /// in the common case.
     fn title_notices(title: &str, domain: &str, permalink: &str) -> Vec<String> {
         let mut notices = Vec::new();
-        if title.contains('/') {
+        // The TITLE's own slug, not the permalink: the permalink is nested
+        // whenever the caller passed a `folder`, which is the deliberate case
+        // and earns no notice, and `slugify` drops empty segments, so a title
+        // `TODO/` lands at `todo` and nests nothing. The folder named in the
+        // remedy comes off the permalink, so it carries any folder the caller
+        // already passed and can be pasted as it stands.
+        if slugify(title).contains('/')
+            && let Some((folder, leaf)) = permalink.rsplit_once('/')
+        {
             notices.push(format!(
                 "the title holds a `/`, so this engram landed at the nested permalink \
-                 `{permalink}`. To place an engram in a folder on purpose, pass the `folder` \
-                 parameter and keep the slash out of the title."
+                 `{permalink}`. To place an engram in a folder on purpose, pass the folder as \
+                 its own argument - `folder: \"{folder}\"` over MCP or REST, `--folder {folder}` \
+                 on the command line - with the title `{leaf}` and no slash in it."
             ));
         }
         // The three conditions `LinkTarget::parse` applies before it reads a
@@ -3964,8 +3982,9 @@ impl Engine {
             notices.push(format!(
                 "the title holds a `:`, so a link written as `[[{title}]]` reads `{}` as a domain \
                  prefix. It resolves to this engram while no domain of that name is registered, \
-                 and stops the day one is. The form that always works is \
-                 `[[crystalline://{domain}/{permalink}]]`.",
+                 and stops the day one is. The form that always works is the bare permalink \
+                 `[[{permalink}]]` inside {domain}, or `[[{domain}:{permalink}]]` from another \
+                 domain: a permalink never holds a colon, so neither is ever read as a prefix.",
                 prefix.trim()
             ));
         }
