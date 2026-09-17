@@ -1227,8 +1227,13 @@ fn a_wipe_takes_the_drafts_back_from_the_overlay_journal() {
     let (config, db) = seed_two_engrams(work.path());
 
     let draft = "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: draft\nrecorded_at: 2026-01-02\n---\n\nGamma is alice's own draft.\n";
-    let mirror = home
-        .join("state/crystalline/overlays/eng/alice")
+    // Under the state directory THIS run resolves, which is not one path per
+    // platform: a hand-spelled `<home>/state/crystalline` is the XDG answer,
+    // and on Windows the binary reads `APPDATA` instead, so the draft would be
+    // mirrored in a folder nothing ever walks and the restore would find an
+    // empty journal.
+    let mirror = common::isolated_state_dir(&home)
+        .join("overlays/eng/alice")
         .join("gamma.md");
     std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
     std::fs::write(&mirror, draft).unwrap();
@@ -1265,6 +1270,52 @@ fn a_wipe_takes_the_drafts_back_from_the_overlay_journal() {
         report["drafts_restored"],
         serde_json::json!(0),
         "the row is in the index now, and a store row is never overwritten by its mirror: {report}"
+    );
+}
+
+/// The fixture above is planted in a folder the binary has to walk on its own,
+/// so where that folder is has to be derived rather than spelled - and derived
+/// per platform, because base-directory resolution is one strategy per
+/// platform and only one of them reads `XDG_STATE_HOME`. This says so directly,
+/// on whatever platform it runs: the state directory stands under the variable
+/// that governs here, with the layout that variable's strategy gives it. It is
+/// the cheap statement of what the wipe test proves the expensive way - a
+/// fixture in the wrong folder is a journal with nothing in it, which reads as
+/// a restore that found nothing rather than as a test looking in the wrong
+/// place.
+#[test]
+fn an_isolated_run_keeps_its_state_under_this_platform_s_own_base_directory() {
+    // Pure path arithmetic: nothing here is created, read or removed.
+    let home = std::env::temp_dir().join("cq-isolated-home");
+    let home = home.as_path();
+    let state = common::isolated_state_dir(home);
+
+    let governing = common::isolation_env(home)
+        .into_iter()
+        .find(|(name, _)| *name == common::STATE_HOME_VAR)
+        .map(|(_, dir)| dir)
+        .expect("the isolation environment sets this platform's state-home variable");
+    assert_eq!(
+        state.parent(),
+        Some(governing.as_path()),
+        "the state directory stands in the folder the governing variable names"
+    );
+    assert_eq!(
+        state.file_name().and_then(|n| n.to_str()),
+        Some("crystalline"),
+        "and carries the application folder under it"
+    );
+
+    let expected = if cfg!(windows) {
+        // No state directory of its own on Windows: the strategy falls back to
+        // the data directory, `APPDATA`.
+        home.join("roaming").join("crystalline")
+    } else {
+        home.join("state").join("crystalline")
+    };
+    assert_eq!(
+        state, expected,
+        "which is the layout this platform's strategy resolves"
     );
 }
 

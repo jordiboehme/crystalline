@@ -72,3 +72,36 @@ pub fn isolate(cmd: &mut Command, home: &Path) {
         cmd.env(name, value);
     }
 }
+
+/// The name in [`isolation_env`] that governs where a child isolated by
+/// [`isolate`] keeps its state directory, and the folder that variable points
+/// at.
+///
+/// There is one per platform because base-directory resolution is one strategy
+/// per platform (see [`isolation_env`]): the XDG strategy reads
+/// `XDG_STATE_HOME`, and the Windows strategy ignores it, has no state
+/// directory of its own and falls back to the data directory, `APPDATA`.
+/// Naming the pair together is what keeps [`isolated_state_dir`] honest: a
+/// fixture is placed under the same variable the binary will resolve through,
+/// so the two can never be edited apart.
+pub const STATE_HOME_VAR: &str = if cfg!(windows) {
+    "APPDATA"
+} else {
+    "XDG_STATE_HOME"
+};
+
+/// Where a child isolated by [`isolate`] keeps its state, the directory
+/// `crystalline_core::config::state_dir` resolves to under that environment.
+///
+/// A test that plants a fixture the binary is meant to find - an overlay
+/// journal draft, a receipt - has to write it here rather than spell
+/// `<home>/state/crystalline` by hand, which is the unix answer on every
+/// platform and silently the wrong folder on Windows.
+pub fn isolated_state_dir(home: &Path) -> PathBuf {
+    let base = isolation_env(home)
+        .into_iter()
+        .find(|(name, _)| *name == STATE_HOME_VAR)
+        .map(|(_, dir)| dir)
+        .expect("the isolation environment sets this platform's state-home variable");
+    base.join("crystalline")
+}
