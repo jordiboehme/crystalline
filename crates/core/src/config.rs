@@ -744,10 +744,12 @@ pub struct IdentityConfig {
     pub actor: Option<String>,
 }
 
-/// `auth.max_users`'s default: how many accounts trusted-header provisioning
-/// may mint in total when the setting is absent. Beside [`AuthConfig`] rather
-/// than buried in [`GlobalConfig::auth_max_users`] so a caller that needs the
-/// number without a config in hand (a test, a settings default) has it too.
+/// `auth.max_users`'s default: how many accounts external provisioning may
+/// mint in total when the setting is absent - the trusted header, the
+/// forward-auth headers and single sign-on all count against the one cap.
+/// Beside [`AuthConfig`] rather than buried in
+/// [`GlobalConfig::auth_max_users`] so a caller that needs the number without
+/// a config in hand (a test, a settings default) has it too.
 pub const DEFAULT_MAX_USERS: usize = 100;
 
 /// The `auth` block: how the served API identifies a caller. Reads like a
@@ -786,9 +788,11 @@ pub struct AuthConfig {
     /// be met. See [`GlobalConfig::auth_oauth`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<bool>,
-    /// `auth.max_users`. How many accounts trusted-header provisioning may
-    /// mint in total; absent means the default of 100. The CLI is never
-    /// capped.
+    /// `auth.max_users`. How many accounts external provisioning may mint in
+    /// total - the trusted header, the forward-auth headers and single sign-on
+    /// all count against the one cap; absent means the default of 100. Only
+    /// minting a new account is capped, and the `crystalline users` CLI is
+    /// never capped at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_users: Option<u32>,
     /// The single sign-on block. Absent means SSO is off and only the local

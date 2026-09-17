@@ -6143,7 +6143,8 @@ impl Engine {
     /// successor to this domain: the absolute `crystalline://` form overrides
     /// a domain hint wherever it is accepted, so "the same domain" is a rule
     /// enforced there rather than a property of passing the name in. The
-    /// target is then written first, and only then the successor's reciprocal `- supersedes [[..]]` line
+    /// target is then written first, and only then the successor's reciprocal
+    /// `- supersedes [[..]]` line
     /// (appended only when not already present, so a repeat call is
     /// idempotent). A failure on the successor write leaves the target
     /// retired with a one-sided pair; nothing here rolls that back, since the
