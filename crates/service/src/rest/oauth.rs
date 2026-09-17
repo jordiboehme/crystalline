@@ -3726,7 +3726,8 @@ mod tests {
             "an entry naming no port answers on every port, as the transport's does"
         );
         assert_eq!(
-            rule.origin(&headers_with("KNOWLEDGE.example", None)).unwrap(),
+            rule.origin(&headers_with("KNOWLEDGE.example", None))
+                .unwrap(),
             "https://KNOWLEDGE.example",
             "the match against the list is case insensitive, whatever spelling arrives - and what \
              is published keeps the spelling it came in, which `same_resource` deliberately does \

@@ -6739,8 +6739,14 @@ mod tests {
     /// something else.
     #[test]
     fn the_instance_admin_refusal_names_provisioning_too() {
-        assert!(INSTANCE_ADMIN_ONLY.contains("domains registered on it"), "{INSTANCE_ADMIN_ONLY}");
-        assert!(INSTANCE_ADMIN_ONLY.contains("settings"), "{INSTANCE_ADMIN_ONLY}");
+        assert!(
+            INSTANCE_ADMIN_ONLY.contains("domains registered on it"),
+            "{INSTANCE_ADMIN_ONLY}"
+        );
+        assert!(
+            INSTANCE_ADMIN_ONLY.contains("settings"),
+            "{INSTANCE_ADMIN_ONLY}"
+        );
         assert!(
             INSTANCE_ADMIN_ONLY.contains("provision"),
             "the third class is the one the message forgot: {INSTANCE_ADMIN_ONLY}"

@@ -1518,7 +1518,10 @@ fn the_checksum_help_does_not_claim_virtual_domains_only() {
     for verb in ["edit", "split"] {
         let out = bin().args([verb, "--help"]).output().unwrap();
         let help = String::from_utf8(out.stdout).unwrap();
-        assert!(help.contains("whichever storage kind holds it"), "{verb}: {help}");
+        assert!(
+            help.contains("whichever storage kind holds it"),
+            "{verb}: {help}"
+        );
         assert!(!help.contains("virtual-domain edit"), "{verb}: {help}");
     }
 }

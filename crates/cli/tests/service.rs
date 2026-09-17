@@ -1816,7 +1816,8 @@ fn a_foreground_serve_prints_the_copyright_line_to_a_redirected_stderr() {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let stderr = copyright_line.expect("a redirected foreground run still prints the copyright line");
+    let stderr =
+        copyright_line.expect("a redirected foreground run still prints the copyright line");
     assert!(
         stderr.contains(crystalline_service::daemon::COPYRIGHT_HOLDER),
         "a redirected foreground run still names the holder: {stderr}"

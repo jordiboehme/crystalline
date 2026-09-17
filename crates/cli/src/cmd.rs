@@ -2937,9 +2937,15 @@ mod index_reach_words_tests {
     /// `reach_index` return, and only one of them is the daemon's doing.
     #[test]
     fn a_failure_that_never_reached_a_daemon_does_not_name_one() {
-        let words = listing_not_reached("this listing", "could not resolve the default database path");
+        let words = listing_not_reached(
+            "this listing",
+            "could not resolve the default database path",
+        );
         assert!(!words.contains("daemon"), "{words}");
-        assert!(words.contains("crystalline doctor"), "a remedy a person can paste: {words}");
+        assert!(
+            words.contains("crystalline doctor"),
+            "a remedy a person can paste: {words}"
+        );
         assert!(
             words.ends_with("The failure was: could not resolve the default database path"),
             "and the raw text trails rather than leads: {words}"
