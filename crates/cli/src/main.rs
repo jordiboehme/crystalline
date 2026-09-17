@@ -2048,7 +2048,8 @@ async fn reindex_dispatch(
     json: bool,
 ) -> anyhow::Result<()> {
     use serde_json::json;
-    let cfg = cmd::load(config.as_deref())?.effective;
+    let loaded = cmd::load(config.as_deref())?;
+    let cfg = loaded.effective.clone();
 
     // A wipe needs the index to itself, and only the embedded backend can
     // establish that: opening the local database file takes an exclusive lock,
@@ -2091,17 +2092,44 @@ async fn reindex_dispatch(
             .map(|(name, _)| name.as_str())
             .collect();
         if !virtual_domains.is_empty() {
+            // Two routes out, because the refusal cannot tell which state the
+            // person is in without opening the file it refuses to touch. The
+            // first is the ordinary one and works whenever the index still
+            // opens. The second is the one this guard exists for, and it is the
+            // one that was missing: with the file unreadable, the export cannot
+            // read it, `--full` fails and points back here, and `domain remove`
+            // needs the index open too - so the only exit is the config file,
+            // which is also what `domain remove` names when it meets the same
+            // wall. Both are printed as commands to paste, one per line, and
+            // the step that loses the engrams is named as the step that loses
+            // them.
+            let db_path = cmd::db_path(db.as_deref())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "your index file".to_string());
+            let config_path = loaded.path.display().to_string();
+            let exports: String = virtual_domains
+                .iter()
+                .map(|name| format!("\n  crystalline domain export <dir> --domain {name}"))
+                .collect();
             anyhow::bail!(
-                "refusing to wipe: this configuration names {} virtual domain(s) whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed. Copy them out first with: crystalline domain export <name> <dir>, then wipe. To rebuild without destroying anything: crystalline reindex --full. If the database itself will not open any more, take a copy of the index file before anything else - a rebuild reads the files on disk, and a virtual domain has none.",
+                "refusing to wipe: this configuration names {} virtual domain(s) whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed.\n\n\
+                 If the index still opens, copy them out first, then wipe:{}\n  crystalline reindex --wipe\n\n\
+                 If a rebuild was all you wanted, nothing here needs wiping: crystalline reindex --full\n\n\
+                 If it does not open any more - the case --wipe exists for - then this file is the only copy those engrams have, and every command that could read them needs it to open:\n  {}\n\
+                 Copy it (and any -wal file beside it) somewhere outside the state directory first. Then either repair that copy with a SQLite tool and put it back, or give the engrams up: delete the domain's entry from this file by hand\n  {}\n\
+                 and run crystalline reindex --wipe again. Deleting the entry is the step that loses the domain's content for good; the wipe then sets the unreadable database aside under a timestamped name, never deleting it, and rebuilds your file domains from the files on disk.",
                 virtual_domains.len(),
-                virtual_domains.join(", ")
+                virtual_domains.join(", "),
+                exports,
+                db_path,
+                config_path
             );
         }
     }
 
     // `--wipe` is the corruption-recovery path and the only one that needs the
-    // resilient open, which discards a Turso database that will not open at
-    // all. It is also the only one a running daemon cannot do for us: it needs
+    // resilient open, which renames a Turso database that will not open at all
+    // out of the way and starts a fresh one beside it. It is also the only one a running daemon cannot do for us: it needs
     // the index file to itself, and the daemon is holding it. So it sends no
     // ctl request and always takes the direct path, where a daemon still
     // holding the file surfaces as the usual "who holds it and what to do"
@@ -2137,7 +2165,7 @@ async fn reindex_dispatch(
         // and nothing else in the program will ever name it to them. Said only
         // here, where the remedy is a flag on the command they just ran.
         cmd::IndexRoute::Unreachable(why) if !wipe => Err(anyhow::anyhow!(
-            "{} If the database file itself is damaged, throw it away and rebuild from your files with: crystalline reindex --wipe",
+            "{} If the database file itself is damaged, set it aside and rebuild from your files with: crystalline reindex --wipe - that renames the unreadable file rather than deleting it, so its bytes are still there afterwards.",
             cmd::index_unreachable("reindex", &why)
         )),
         other => {

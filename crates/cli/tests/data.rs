@@ -20,6 +20,30 @@ fn write(dir: &Path, rel: &str, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
+/// The `crystalline domain export ...` command a refusal printed, as argv, with
+/// `<dir>` replaced by a real destination. A remedy a person is handed has to be
+/// one they can paste, so these tests run it rather than matching its prefix -
+/// the wrong argument form satisfies a prefix match and exits 2 on a terminal.
+fn printed_export_command(err: &str, dest: &Path) -> Vec<String> {
+    let line = err
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("crystalline domain export"))
+        .unwrap_or_else(|| {
+            panic!("the refusal prints an export command on a line of its own: {err}")
+        });
+    line.split_whitespace()
+        .skip(1)
+        .map(|word| {
+            if word == "<dir>" {
+                dest.display().to_string()
+            } else {
+                word.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Register a domain `eng` holding two engrams for the human-render tests:
 /// `alpha` (which `depends_on` `beta`, and carries a multi-line body marker) and
 /// `beta`, both mentioning the token `zephyrtoken` so a search matches both.
@@ -1282,9 +1306,32 @@ fn wipe_refuses_while_a_virtual_domain_holds_the_only_copy() {
     assert!(
         err.contains("refusing to wipe")
             && err.contains("notes")
-            && err.contains("crystalline domain export")
             && err.contains("crystalline reindex --full"),
         "the refusal names the domain and both ways out: {err}"
+    );
+
+    // The way out it names is run, not matched: the index opens here, so the
+    // export the refusal prints has to work as printed.
+    let dest = work.path().join("exported");
+    let out = bin()
+        .args(printed_export_command(&err, &dest))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the printed export command runs: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let exported = std::fs::read_to_string(dest.join("kept-note.md"))
+        .unwrap_or_else(|e| panic!("the export wrote the engram out: {e}"));
+    assert!(
+        exported.contains("virtual body that must survive"),
+        "and the copy holds the engram the refusal was protecting: {exported}"
     );
 
     // The engram is still there, which is the whole point.
@@ -1384,6 +1431,30 @@ fn wipe_refuses_for_a_virtual_domain_the_config_does_not_mention() {
     assert!(
         err.contains("refusing to wipe") && err.contains("notes"),
         "the refusal names the domain the index holds: {err}"
+    );
+
+    // This is the database-side guard's own wording, and its index is open, so
+    // the export it prints is run rather than matched.
+    let dest = work.path().join("exported-narrow");
+    let out = bin()
+        .args(printed_export_command(&err, &dest))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the printed export command runs: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(dest.join("kept-note.md"))
+            .unwrap_or_default()
+            .contains("virtual body that must survive"),
+        "and the copy holds the engram the refusal was protecting"
     );
 
     // Still there, read back through the config that knows it.
@@ -1607,10 +1678,26 @@ fn wipe_refuses_for_a_virtual_domain_when_the_database_will_not_open() {
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("refusing to wipe")
-            && err.contains("notes")
-            && err.contains("crystalline domain export"),
-        "the refusal names the domain and the way out: {err}"
+        err.contains("refusing to wipe") && err.contains("notes"),
+        "the refusal names the domain: {err}"
+    );
+
+    // The export cannot succeed here - the database it would read is the
+    // damaged one - but it must still be a command that parses, or the sentence
+    // is worse than no sentence at all.
+    let dest = work.path().join("exported");
+    let out = bin()
+        .args(printed_export_command(&err, &dest))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let export_err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !export_err.contains("Usage:") && !export_err.contains("unexpected argument"),
+        "the printed export command parses, whatever the damaged file then does to it: {export_err}"
     );
 
     let after = std::fs::read(&db).unwrap();
@@ -1731,5 +1818,170 @@ fn an_interrupted_wipe_says_its_rows_and_embeddings_are_gone() {
     assert!(
         !human.contains("nothing was destroyed"),
         "and never reassures a person that nothing was destroyed: {human}"
+    );
+}
+
+/// The exit the refusal prints for a damaged database, followed end to end.
+///
+/// This is the state the guard exists for, and it is the state in which every
+/// other remedy the program knows is unreachable: the export cannot read the
+/// file, `reindex --full` fails and points back at `--wipe`, and `domain remove`
+/// needs the index open too. So the refusal names the config file, and what it
+/// names has to work - copy the database somewhere safe, delete the virtual
+/// domain's entry by hand, wipe. The engrams are gone at that point by the
+/// person's own decision, and the bytes are still on disk twice: in their copy
+/// and in the aside file the wipe leaves behind.
+#[test]
+fn the_exit_a_damaged_index_refusal_prints_runs_end_to_end() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    bin()
+        .args(["domain", "add", "notes", "--virtual", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    bin()
+        .args(["write", "notes", "Only Copy"])
+        .args(["--content", "virtualpayloadtoken that lives nowhere else"])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    bin()
+        .args(["reindex", "--full", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        f.seek(SeekFrom::Start(16)).unwrap();
+        f.write_all(b"\x0d\x0d").unwrap();
+        f.flush().unwrap();
+    }
+
+    let out = bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the wipe refuses");
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    // Step 0: the refusal names the two files by their real paths, so a person
+    // acting on it is not left resolving a default path themselves.
+    assert!(
+        err.contains(&db.display().to_string()),
+        "the refusal names the index file: {err}"
+    );
+    assert!(
+        err.contains(&config.display().to_string()),
+        "and the config file the next step edits: {err}"
+    );
+
+    // Step 1: take a copy, which is what keeps the engrams recoverable.
+    let safe = work.path().join("index.db.rescued");
+    std::fs::copy(&db, &safe).unwrap();
+    let needle = b"virtualpayloadtoken";
+    assert!(
+        std::fs::read(&safe)
+            .unwrap()
+            .windows(needle.len())
+            .any(|w| w == needle),
+        "the copy holds the engrams the damaged file still carries"
+    );
+
+    // Step 2: delete the virtual domain's entry by hand, which is the step the
+    // refusal calls the one that loses the content.
+    let text = std::fs::read_to_string(&config).unwrap();
+    let mut kept = String::new();
+    let mut dropping = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("notes:") && line.starts_with("  ") {
+            dropping = true;
+            continue;
+        }
+        if dropping {
+            // The entry's own keys are indented under it; anything at or above
+            // the entry's level ends it.
+            if line.starts_with("    ") {
+                continue;
+            }
+            dropping = false;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    assert!(
+        !kept.contains("notes:"),
+        "the entry really is gone from the config: {kept}"
+    );
+    std::fs::write(&config, &kept).unwrap();
+
+    // Step 3: the wipe now runs, sets the unreadable file aside and rebuilds
+    // the file domain from disk.
+    let out = bin()
+        .args(["reindex", "--wipe", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the exit the refusal printed ends in a wipe that runs: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        report.contains("set aside at"),
+        "and it says where the unreadable file went: {report}"
+    );
+
+    let aside: Vec<_> = db
+        .parent()
+        .unwrap()
+        .read_dir()
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.contains("unreadable-") && !name.ends_with("-wal") && !name.ends_with("-shm")
+        })
+        .collect();
+    assert_eq!(aside.len(), 1, "exactly one database was set aside");
+    assert!(
+        std::fs::read(aside[0].path())
+            .unwrap()
+            .windows(needle.len())
+            .any(|w| w == needle),
+        "the aside copy still holds the engrams too: nothing was deleted"
+    );
+
+    // The file domain is back, which is what the wipe was for.
+    let out = bin()
+        .args(["--json", "search", "zephyrtoken", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let search: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        search["total"],
+        serde_json::json!(2),
+        "the file domain rebuilt from its files: {search}"
     );
 }

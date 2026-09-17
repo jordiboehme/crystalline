@@ -73,8 +73,8 @@ async fn corrupt_database_recovers_via_reindex_wipe() {
         f.flush().unwrap();
     }
 
-    // The `reindex --wipe` recovery path: open resiliently (discarding the
-    // corrupt file), wipe what a readable-but-wrong database would still hold,
+    // The `reindex --wipe` recovery path: open resiliently (setting the corrupt
+    // file aside), wipe what a readable-but-wrong database would still hold,
     // then resync from the files on disk. This is the one verb that still
     // destroys the index, and the only case that needs it - `reindex --full`
     // re-reads every file without a wipe and could not open this file at all.

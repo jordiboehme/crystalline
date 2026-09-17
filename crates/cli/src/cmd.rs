@@ -1527,22 +1527,6 @@ pub async fn reindex(
     let targets = select_domains(cfg, None)?;
     let params = chunk_params(cfg);
 
-    // A wipe destroys everything in the database and rebuilds from the files on
-    // disk, so it is only ever safe when the files are the whole truth. A
-    // virtual domain's engrams live nowhere else: wiping them is not a rebuild,
-    // it is deleting knowledge, and no rebuild afterwards can bring them back.
-    // Refuse rather than quietly doing something narrower than the verb's name,
-    // and name the way out.
-    //
-    // The question is asked of the DATABASE, not of this config. `Store::wipe`
-    // is unscoped - thirteen bare deletes ending in `domain` - so what is at
-    // risk is every virtual domain the index holds, and the two are routinely
-    // not the same set: a domain dropped from the config keeps its rows until
-    // something collects them (the whole orphaned-rows surface exists for that
-    // state), and `--db`/`--config`, the flags that force this direct path in
-    // the first place, are the documented way to point a narrower config at a
-    // wider index. Reading `cfg.domains` here would refuse in the easy case and
-    // destroy silently in exactly the cases the flags exist for.
     // Set by the resilient open when the database it found would not open at
     // all: those bytes were renamed aside rather than deleted, and the run says
     // where they went. Read before the wipe, since the wipe is what this is
@@ -1553,6 +1537,29 @@ pub async fn reindex(
         None
     };
 
+    // A wipe destroys everything in the database and rebuilds from the files on
+    // disk, so it is only ever safe when the files are the whole truth. A
+    // virtual domain's engrams live nowhere else: wiping them is not a rebuild,
+    // it is deleting knowledge, and no rebuild afterwards can bring them back.
+    // Refuse rather than quietly doing something narrower than the verb's name,
+    // and name the way out.
+    //
+    // The question here is asked of the DATABASE, not of this config. `Store::wipe`
+    // is unscoped - thirteen bare deletes ending in `domain` - so what is at
+    // risk is every virtual domain the index holds, and the two are routinely
+    // not the same set: a domain dropped from the config keeps its rows until
+    // something collects them (the whole orphaned-rows surface exists for that
+    // state), and `--db`/`--config`, the flags that force this direct path in
+    // the first place, are the documented way to point a narrower config at a
+    // wider index. Asking only `cfg.domains` here would wave the wipe through in
+    // exactly the cases those flags exist for.
+    //
+    // The config IS asked, one frame up in `reindex_dispatch`, and the two
+    // guards are complements rather than a contradiction: this one is the
+    // precise question and can only be asked once the index opens, so it cannot
+    // fire in the state `--wipe` exists for, where the file does not open at all
+    // and a fresh empty database has taken its place. The config is the only
+    // signal left there. Neither is sufficient; both are cheap.
     if wipe {
         let store = store.lock().await;
         let stats = store
@@ -1565,10 +1572,15 @@ pub async fn reindex(
             .map(|d| d.name.as_str())
             .collect();
         if !virtual_domains.is_empty() {
+            let exports: String = virtual_domains
+                .iter()
+                .map(|name| format!("\n  crystalline domain export <dir> --domain {name}"))
+                .collect();
             bail!(
-                "refusing to wipe: the index holds {} virtual domain(s) whose engrams live nowhere else, so a wipe would delete them for good: {}. Copy them out first with: crystalline domain export <name> <dir>, or rebuild without destroying anything: crystalline reindex --full",
+                "refusing to wipe: the index holds {} virtual domain(s) whose engrams live nowhere else, so a wipe would delete them for good: {}. The index opened, so copying them out works - do that first, then wipe:{}\n  crystalline reindex --wipe\n\nOr rebuild without destroying anything: crystalline reindex --full",
                 virtual_domains.len(),
-                virtual_domains.join(", ")
+                virtual_domains.join(", "),
+                exports
             );
         }
         store
