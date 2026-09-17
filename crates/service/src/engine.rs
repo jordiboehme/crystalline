@@ -3957,19 +3957,27 @@ impl Engine {
         let mut notices = Vec::new();
         // The TITLE's own slug, not the permalink: the permalink is nested
         // whenever the caller passed a `folder`, which is the deliberate case
-        // and earns no notice, and `slugify` drops empty segments, so a title
-        // `TODO/` lands at `todo` and nests nothing. The folder named in the
-        // remedy comes off the permalink, so it carries any folder the caller
-        // already passed and can be pasted as it stands; the title comes off
-        // the TITLE, so the author reads their own words back rather than the
-        // slug those words became. The two agree: the last segment of the title
-        // slugifies to the last segment of the permalink, which is what makes
-        // the remedy land at the same address.
+        // and earns no notice, and `slugify` drops a segment that contributes
+        // nothing, so a title `TODO/` lands at `todo` and nests nothing.
+        //
+        // The folder named in the remedy comes off the permalink, so it carries
+        // any folder the caller already passed and can be pasted as it stands.
+        // The title comes off the TITLE, so the author reads their own words
+        // back rather than the slug those words became - but off the last
+        // segment that CONTRIBUTES a slug segment, not simply the last one.
+        // Splitting keeps an empty, blank or punctuation-only tail that
+        // `slugify` threw away, and naming it would hand back either an empty
+        // pair of backticks or a title like `!!!` that re-slugifies to a
+        // different address than the one this same sentence just quoted. The
+        // search cannot come up empty: the guard has already proved the title
+        // holds at least two slug-contributing segments.
         if slugify(title).contains('/')
             && let Some((folder, _)) = permalink.rsplit_once('/')
-            && let Some((_, leaf)) = title.rsplit_once('/')
+            && let Some(leaf) = title
+                .rsplit('/')
+                .map(str::trim)
+                .find(|segment| !slugify(segment).is_empty())
         {
-            let leaf = leaf.trim();
             notices.push(format!(
                 "the title holds a `/`, so this engram landed at the nested permalink \
                  `{permalink}`. To place an engram in a folder on purpose, pass the folder as \

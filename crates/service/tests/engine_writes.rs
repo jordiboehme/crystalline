@@ -698,6 +698,76 @@ async fn a_title_holding_a_slash_or_a_colon_is_named_in_the_receipt() {
     assert!(plain.get("notices").is_none(), "{plain}");
 }
 
+/// The folder and the title a slash notice tells the author to write instead,
+/// lifted out of the sentence rather than retyped, so a test that follows the
+/// remedy follows the notice and not a copy of it.
+fn remedy_of(notice: &str) -> (String, String) {
+    let folder = notice
+        .split_once("folder: \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(folder, _)| folder.to_string())
+        .unwrap_or_else(|| panic!("the notice names a folder to pass: {notice}"));
+    let title = notice
+        .split_once("with the title `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(title, _)| title.to_string())
+        .unwrap_or_else(|| panic!("the notice names a title to keep: {notice}"));
+    (folder, title)
+}
+
+/// The slash remedy has to land where the write just said it landed, for every
+/// title the notice fires on rather than only the tidy one.
+///
+/// `slugify` drops a segment that contributes nothing - empty, whitespace,
+/// punctuation - while splitting the title does not, so the title's last
+/// segment is not always the one that produced the permalink's last segment. A
+/// remedy built from the wrong segment is either an empty pair of backticks
+/// where the author's words belong, or a title that looks pasteable and
+/// re-slugifies to a different engram. Both send a reader somewhere other than
+/// the address the same sentence just quoted.
+#[tokio::test]
+async fn the_slash_remedy_lands_at_the_address_the_write_landed_at() {
+    let (_tmp, engine) = engine_fixture().await;
+
+    // The tidy case, a trailing slash, a punctuation-only last segment and a
+    // whitespace-only one. Every one of them nests, so every one earns a
+    // notice that has to be followable.
+    for title in ["Q3/Q4 planning", "notes/2026/", "a/b/!!!", "a/b/ "] {
+        // Overwriting throughout: two of these titles slugify to the same
+        // address, which is the point of the case rather than an accident, and
+        // a collision would end the loop before the notice was read.
+        let mut probe = write_params("eng", title, "body");
+        probe.overwrite = true;
+        let written = engine.write_engram(&probe).await.unwrap();
+        let permalink = written["permalink"].as_str().unwrap().to_string();
+        let notice = written["notices"][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{title}` landed nested, so it earns a notice: {written}"));
+        let (folder, leaf) = remedy_of(notice);
+        assert!(
+            !leaf.is_empty(),
+            "`{title}`: the remedy names the author's words, not an empty pair of \
+             backticks: {notice}"
+        );
+
+        // Follow it: the folder as its own argument, the title the notice
+        // handed back, and the same address it said the write landed at.
+        let mut followed = write_params("eng", &leaf, "body");
+        followed.folder = Some(folder.clone());
+        followed.overwrite = true;
+        let followed = engine.write_engram(&followed).await.unwrap();
+        assert_eq!(
+            followed["permalink"], permalink,
+            "`{title}`: the remedy (folder `{folder}`, title `{leaf}`) has to land where the \
+             write landed, or the notice sends its reader to a different engram"
+        );
+        assert!(
+            followed.get("notices").is_none(),
+            "`{title}`: and following it ends the notice rather than repeating it: {followed}"
+        );
+    }
+}
+
 /// The colon notice's own remedy, followed to the letter and then swept.
 ///
 /// A notice that names a spelling which does not resolve manufactures exactly
