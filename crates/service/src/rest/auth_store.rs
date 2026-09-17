@@ -7095,8 +7095,9 @@ mod tests {
             Some(RefusalKind::InvalidName)
         );
 
-        // And a failure that is nobody's doing carries no kind at all, so the
-        // surfaces keep answering 500 for what is genuinely theirs.
+        // A domain with no acl row is shared as far as this table knows, so it
+        // refuses as NotPrivate rather than as a fault. Named for what it
+        // asserts: this leg is not the no-kind one.
         let unregistered = store
             .upsert_domain_member("nosuchdomain", "mem", MemberLevel::Editor, "keeper")
             .await
@@ -7105,6 +7106,24 @@ mod tests {
             StoreRefusal::kind_of(&unregistered),
             Some(RefusalKind::NotPrivate),
             "a domain with no acl row is shared as far as this table knows"
+        );
+
+        // And a failure that is nobody's doing carries no kind at all, so the
+        // surfaces keep answering 500 for what is genuinely theirs. This is the
+        // arm `rest::members::store_error`'s `None` branch answers, and without
+        // a leg here nothing in the workspace pins it.
+        let no_actor = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "  ")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&no_actor),
+            None,
+            "an empty actor is this server's own bug, not a refusal with a kind"
+        );
+        assert!(
+            format!("{no_actor:#}").contains("needs an actor"),
+            "{no_actor:#}"
         );
     }
 
