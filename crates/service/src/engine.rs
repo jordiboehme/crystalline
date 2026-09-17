@@ -4361,11 +4361,12 @@ impl Engine {
     /// call in front of it is one.** [`Engine::write_engram_present`]'s live
     /// arm only takes a found room when `p.overwrite` is also true - that is
     /// the arm's own precondition, not a room-existence question - and this
-    /// preview tests nothing of the kind: it is right today only because
-    /// every caller gates it on `p.overwrite` itself (`mcp.rs`'s `wholesale`
-    /// check) before ever asking. A caller that asked "is there a document to
-    /// confirm replacing" without repeating that gate would be handed a
-    /// question about a capture that will never take the live arm.
+    /// preview tests nothing of the kind. `mcp.rs` asks it for any capture
+    /// that resolves onto an open document, wholesale or not, and a yes
+    /// becomes `overwrite = true` on the call that lands, which is what makes
+    /// the arm's precondition hold; a caller that took a yes without setting
+    /// `overwrite` would be handed a question about a capture that never
+    /// takes the live arm.
     pub async fn live_write_target(
         &self,
         p: &WriteParams,
@@ -17756,6 +17757,13 @@ impl Engine {
     /// [`Engine::write_lock`], whose map this shares: a base file's path and a
     /// draft mirror's path are different keys in one map, so no cycle is formed
     /// and a domain that takes changes directly is untouched by this.
+    ///
+    /// Keyed on the PATH, so two captures by one actor at two paths that both
+    /// claim one permalink are not serialized against each other and both
+    /// land; the conflict target is `(domain_id, path, actor)`, so no store
+    /// constraint backstops it. The direct-mode file arm has the same hole
+    /// under the same key, so this is parity, not a regression (whole-branch
+    /// re-review, 2026-09-17).
     fn draft_lock(
         &self,
         domain: &str,

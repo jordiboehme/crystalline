@@ -1012,26 +1012,6 @@ pub async fn domain_remove(
     Ok(report)
 }
 
-/// Turn review mode on for a domain, or take it off and settle every actor's
-/// drafts: over the daemon when one owns the index, else against a directly
-/// opened store.
-///
-/// The same shape [`domain_remove`] has, and for the same reasons: the CLI is
-/// the machine owner, so it passes [`Scope::Unrestricted`] and the gate resolves
-/// to `Own` on every domain - whoever can run this already holds the files. It
-/// opens the index because the verb reads every actor's drafts out of it and
-/// writes the folds back through a sync, and because a shared database's rows
-/// are every instance's: a config-only edit here would leave the domain
-/// reviewing for everybody else while this machine stopped.
-///
-/// `folds` carries the per-actor answers when there are any; an empty slice
-/// with `preview` false is the answer for a domain nobody is drafting in.
-/// `preview` asks for the plan and writes nothing.
-///
-/// The socket request omits the key entirely when there are no answers, which
-/// is how the daemon reads "none": the surfaces agree that fold answers are a
-/// question about LEAVING review mode, so a request on the way IN must carry
-/// no `folds` at all rather than an empty one.
 /// The socket request one `domain_review` call sends.
 ///
 /// Its own function so the shape can be asserted without a daemon: what is
@@ -1064,6 +1044,26 @@ fn review_request(
     request
 }
 
+/// Turn review mode on for a domain, or take it off and settle every actor's
+/// drafts: over the daemon when one owns the index, else against a directly
+/// opened store.
+///
+/// The same shape [`domain_remove`] has, and for the same reasons: the CLI is
+/// the machine owner, so it passes [`Scope::Unrestricted`] and the gate resolves
+/// to `Own` on every domain - whoever can run this already holds the files. It
+/// opens the index because the verb reads every actor's drafts out of it and
+/// writes the folds back through a sync, and because a shared database's rows
+/// are every instance's: a config-only edit here would leave the domain
+/// reviewing for everybody else while this machine stopped.
+///
+/// `folds` carries the per-actor answers when there are any; an empty slice
+/// with `preview` false is the answer for a domain nobody is drafting in.
+/// `preview` asks for the plan and writes nothing.
+///
+/// The socket request omits the key entirely when there are no answers, which
+/// is how the daemon reads "none": the surfaces agree that fold answers are a
+/// question about LEAVING review mode, so a request on the way IN must carry
+/// no `folds` at all rather than an empty one.
 pub async fn domain_review(
     name: &str,
     overlay_mode: bool,

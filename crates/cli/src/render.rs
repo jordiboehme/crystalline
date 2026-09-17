@@ -432,6 +432,10 @@ pub fn render_write(v: &Value, out: &mut impl Write) -> io::Result<()> {
             .map(|names| names.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         match names_in_words(&present) {
+            Some(names) if present.len() == 1 => writeln!(
+                out,
+                "  landed in the open document; {names} has it open right now"
+            )?,
             Some(names) => writeln!(
                 out,
                 "  landed in the open document; {names} have it open right now"
