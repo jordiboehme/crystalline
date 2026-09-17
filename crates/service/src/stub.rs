@@ -31,7 +31,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
@@ -243,8 +243,8 @@ impl ServerHandler for DegradedServer {
     /// The degraded handshake: identify as `crystalline` at this binary's
     /// version and hand the connecting agent the per-case degraded copy as its
     /// `instructions`, advertising only the tools capability.
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
         // The degraded server keeps rmcp's default `initialize`, so this field
         // **is** its downgrade target - both for a version it does not serve
@@ -253,7 +253,7 @@ impl ServerHandler for DegradedServer {
         // `service/server.rs:479`). It names the newest revision that still has
         // a handshake, for the reasons on
         // [`crate::mcp::newest_legacy_handshake_version`], and it is set
-        // explicitly because `ServerInfo::default()` would otherwise leave
+        // explicitly because `ServerConfig::default()` would otherwise leave
         // rmcp's own `LATEST` here - a value that moves when the crate does and
         // would one day answer a legacy handshake with a revision that has no
         // handshake at all.

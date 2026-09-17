@@ -8,7 +8,7 @@
 
 use crystalline_service::mcp::newest_legacy_handshake_version;
 use crystalline_service::{DegradedServer, StubStatus};
-use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
 use rmcp::service::RunningService;
 use rmcp::{RoleClient, RoleServer};
 use serde_json::Value;
@@ -110,7 +110,7 @@ async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours(
     let server_task = tokio::spawn(async move {
         rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
     });
-    let mut info = ClientInfo::default();
+    let mut info = ClientConfig::default();
     info.protocol_version =
         serde_json::from_value(serde_json::Value::String("2027-01-01".to_string())).unwrap();
     let client = rmcp::serve_client(info, client_io).await.unwrap();
@@ -138,7 +138,7 @@ async fn the_degraded_server_answers_an_era_handshake_like_the_healthy_one() {
     let server_task = tokio::spawn(async move {
         rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
     });
-    let mut info = ClientInfo::default();
+    let mut info = ClientConfig::default();
     info.protocol_version = ProtocolVersion::V_2026_07_28;
     let client = rmcp::serve_client(info, client_io).await.unwrap();
     let server = server_task.await.unwrap().unwrap();

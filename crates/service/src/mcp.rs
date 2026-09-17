@@ -264,7 +264,7 @@ use rmcp::model::{
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
     PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
-    ServerInfo, SubscriptionFilter, Tool,
+    ServerConfig, SubscriptionFilter, Tool,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
@@ -321,7 +321,7 @@ fn is_write_tool(name: &str) -> bool {
 ///
 /// **The bottom is deliberately NOT a decision.** `V_2024_11_05` is served today
 /// and stays served: rmcp branches nowhere between it and `V_2025_11_25`
-/// (`uses_legacy_lifecycle`, rmcp 3.1.2 `service.rs:196-202`, one `<` comparison
+/// (`uses_legacy_lifecycle`, rmcp 3.4.0 `service.rs:204-215`, one `<` comparison
 /// against 2026-07-28), so keeping the oldest costs one array element, and
 /// dropping a revision is a deprecation with a release note rather than a
 /// side effect of an upgrade.
@@ -358,7 +358,7 @@ pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
 /// SHOULD disconnect rather than proceed. It also has a concrete cost: rmcp
 /// keys `ping`'s removal, the `resultType` discriminator and the subscription
 /// dispatch on the peer's **negotiated** version (`handler/server.rs:112-118`,
-/// `:246-260`, `uses_legacy_lifecycle` at `service.rs:196-202`), so a client
+/// `:246-260`, `uses_legacy_lifecycle` at `service.rs:210-215`), so a client
 /// downgraded onto the era would lose `ping` without ever having asked for the
 /// era.
 ///
@@ -1512,7 +1512,7 @@ impl McpServer {
     /// reached through a dual-era client or a proxy that echoes the header.
     ///
     /// So the shape is decided by rmcp's own rule, `uses_legacy_lifecycle`
-    /// (rmcp 3.2.0 `service.rs:202-207`, reached from
+    /// (rmcp 3.4.0 `service.rs:210-215`, reached from
     /// `tower.rs`'s `is_legacy_request`), which this mirrors clause for clause.
     /// It reads TWO things from the request and they are not the same thing:
     ///
@@ -1559,6 +1559,15 @@ impl McpServer {
     /// `SERVED_PROTOCOL_VERSIONS` and `newest_legacy_handshake_version` doc
     /// comments near the top of this file for the sibling places an rmcp bump
     /// touches.
+    ///
+    /// Last walked at the 3.2.0 -> 3.4.0 bump (2026-09-17): both clauses are
+    /// unchanged (`uses_legacy_lifecycle` and `is_legacy_version` are
+    /// byte-identical, and so is `is_legacy_request`, which only moved to a
+    /// let-chain and a new error alias), `negotiate_protocol_version` is
+    /// byte-identical too, and 3.3.0's new `ServerHandler::negotiate_initialize`
+    /// is an opt-in helper that restates the default `initialize` body - this
+    /// server overrides `initialize` to supply its own downgrade target and does
+    /// not call it.
     fn holder_of(&self, ctx: &RequestContext<RoleServer>) -> Option<crate::join::Holder> {
         match self.transport {
             Transport::Stdio => Some(crate::join::Holder::Process(self.server)),
@@ -3333,7 +3342,7 @@ impl McpServer {
     /// no hook carries it, it describes this connection's wire format rather
     /// than the knowledge, and a client that cannot read a tool result is
     /// worse off than one that read the routing block twice.
-    fn arrival_info(&self) -> ServerInfo {
+    fn arrival_info(&self) -> ServerConfig {
         let mut info = self.get_info();
         if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
             let mut instructions = crystalline_core::render_minimal_instructions();
@@ -3358,7 +3367,7 @@ impl McpServer {
     /// A scope that cannot be resolved is an error rather than the unfiltered
     /// block: onboarding that names a domain the caller may not see is exactly
     /// what this exists to prevent, and a client that gets an error re-asks.
-    async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerInfo, ErrorData> {
+    async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerConfig, ErrorData> {
         let mut info = self.arrival_info();
         if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
             return Ok(info);
@@ -3561,18 +3570,18 @@ impl ServerHandler for McpServer {
     /// alike. The daemon and the embedded stdio stack refresh the
     /// virtual-domain routing cache just before this runs, so the sync render
     /// reads a current cache and never blocks on the store. `server_info` is
-    /// also set explicitly: `ServerInfo::default()` leaves
+    /// also set explicitly: `ServerConfig::default()` leaves
     /// `Implementation::from_build_env()`, which would report the rmcp crate's
     /// own name and version to harness logs rather than crystalline's.
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.server_info = Implementation::new("crystalline", crystalline_core::VERSION);
         // This field is the default `initialize` answer, and `initialize`
         // belongs to the legacy lifecycle, so it names the newest revision that
         // still has a handshake rather than the newest we serve. What we serve
         // is advertised through `supported_protocol_versions` and echoed by
         // `initialize` when a client asks for it. Set explicitly because
-        // `ServerInfo::default()` would leave rmcp's own `ProtocolVersion::
+        // `ServerConfig::default()` would leave rmcp's own `ProtocolVersion::
         // LATEST` here, which moves when the crate does.
         info.protocol_version = newest_legacy_handshake_version();
         // **Which block, and why the transport decides it.** This method is
@@ -3725,16 +3734,16 @@ impl ServerHandler for McpServer {
         let mut info = self.arrival_info();
         // **We supply the downgrade target; rmcp decides the echo.** Whatever
         // this handler returns is post-processed by rmcp's
-        // `negotiate_protocol_version` (`service/server.rs:479`) on every
-        // transport - stdio at `service/server.rs:653`, HTTP at
-        // `tower.rs:321` - which echoes the requested revision itself when it
+        // `negotiate_protocol_version` (`service/server.rs:480`) on every
+        // transport - stdio at `service/server.rs:652`, HTTP at
+        // `tower.rs:348` - which echoes the requested revision itself when it
         // is a legacy one we support and otherwise adopts this value, or the
         // newest legacy revision we advertise if this value is not legacy. So
         // an echoing branch here would be inert: it can only ever hand rmcp a
         // value it discards. What is left is the one thing rmcp reads, and it
         // has to stay legacy for rmcp to take it.
         //
-        // Read from our own list rather than left at `ServerInfo::default()`'s
+        // Read from our own list rather than left at `ServerConfig::default()`'s
         // `ProtocolVersion::LATEST`, so an rmcp whose LATEST moves cannot make
         // us offer a revision we do not serve, and capped below the era for
         // the reasons on [`newest_legacy_handshake_version`].
@@ -3768,7 +3777,7 @@ impl ServerHandler for McpServer {
     /// (`daemon.rs`), or a discover-first client reads a stale virtual-domain
     /// index. The rest is rmcp's own construction:
     /// `DiscoverResult::from_server_info` carries `instructions` out of
-    /// `ServerInfo` untouched and sets `ttl_ms: 0` with `cache_scope: Private`
+    /// `ServerConfig` untouched and sets `ttl_ms: 0` with `cache_scope: Private`
     /// (rmcp 3.1.2 `model.rs:1246-1268`), which already satisfies the
     /// caching MUST for this operation.
     ///

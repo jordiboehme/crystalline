@@ -4814,7 +4814,7 @@ async fn write_engram_records_the_connected_client_as_generated_by() {
     .unwrap();
 
     let expected = {
-        let info = rmcp::model::ClientInfo::default().client_info;
+        let info = rmcp::model::ClientConfig::default().client_info;
         format!("{}/{}", info.name, info.version)
     };
     let text = std::fs::read_to_string(h.root.join("eng/provenance.md")).unwrap();
@@ -4927,7 +4927,7 @@ async fn write_engram_records_the_reported_model() {
     .unwrap();
 
     let expected = {
-        let info = rmcp::model::ClientInfo::default().client_info;
+        let info = rmcp::model::ClientConfig::default().client_info;
         format!("{}/{}", info.name, info.version)
     };
     let text = std::fs::read_to_string(h.root.join("eng/with-a-model.md")).unwrap();
@@ -5075,7 +5075,7 @@ async fn a_write_without_a_model_emits_the_two_key_provenance_block() {
     .unwrap();
 
     let expected = {
-        let info = rmcp::model::ClientInfo::default().client_info;
+        let info = rmcp::model::ClientConfig::default().client_info;
         format!("{}/{}", info.name, info.version)
     };
     let text = std::fs::read_to_string(h.root.join("eng/silent.md")).unwrap();

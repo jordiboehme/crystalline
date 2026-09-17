@@ -24,7 +24,7 @@ use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::mcp::{McpServer, newest_legacy_handshake_version};
 use rmcp::RoleClient;
-use rmcp::model::{ClientInfo, Implementation, ProtocolVersion};
+use rmcp::model::{ClientConfig, Implementation, ProtocolVersion};
 use rmcp::service::RunningService;
 use tokio::sync::Mutex;
 
@@ -144,7 +144,7 @@ impl Harness {
         onboarded: bool,
         transport: ServedTransport,
     ) -> (
-        RunningService<RoleClient, ClientInfo>,
+        RunningService<RoleClient, ClientConfig>,
         RunningService<rmcp::RoleServer, McpServer>,
     ) {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -156,7 +156,7 @@ impl Harness {
             };
             rmcp::serve_server(server, server_io).await
         });
-        let mut info = ClientInfo::default();
+        let mut info = ClientConfig::default();
         info.client_info = Implementation::new("mcp-test-client", "1.2.3");
         let client = rmcp::serve_client(info, client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
@@ -172,7 +172,7 @@ impl Harness {
             tokio::spawn(
                 async move { rmcp::serve_server(McpServer::new(engine), server_io).await },
             );
-        let mut info = ClientInfo::default();
+        let mut info = ClientConfig::default();
         info.protocol_version = version;
         let client = rmcp::serve_client(info, client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
@@ -731,7 +731,7 @@ async fn instructions_via_initialize(h: &Harness, version: ProtocolVersion) -> S
     let engine = h.engine.clone();
     let server_task =
         tokio::spawn(async move { rmcp::serve_server(McpServer::new(engine), server_io).await });
-    let mut info = ClientInfo::default();
+    let mut info = ClientConfig::default();
     info.protocol_version = version;
     let client = rmcp::serve_client(info, client_io).await.unwrap();
     let server = server_task.await.unwrap().unwrap();
@@ -753,7 +753,7 @@ async fn instructions_via_discover(h: &Harness, version: ProtocolVersion) -> Str
     let engine = h.engine.clone();
     let server_task =
         tokio::spawn(async move { rmcp::serve_server(McpServer::new(engine), server_io).await });
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             client_io,
             ClientLifecycleMode::Discover {
