@@ -7445,20 +7445,23 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 152,
+        census.sites, 146,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         59 per backend in mod.rs, 15 per backend in search.rs, 4 in the shared \
-         reference-resolution expression. One per backend in search.rs is the \
-         anti-join inside `actor_screen_on`, which asks whether the reader holds \
-         a row of their own at a base row's path - one site however many \
-         statements compose the screen. Two shapes here sit INSIDE a screened \
-         statement and carry no screen of their own on purpose, and each passes \
-         on the screen its own statement carries: the `tgt` hop of the graph \
-         frontier and of the outbound verdict reads the row a reference was \
-         bound to for its address alone, with the screen on the `dst` beside it, \
-         and the dangling probe in `reresolve_actor_references` asks whether ANY \
-         row still stands at a `to_id`, since whose the vanished row was does \
-         not change that the reference now points at nothing"
+         59 per backend in mod.rs, 9 per backend in search.rs, 10 in the shared \
+         statement builders in store.rs: the reference-resolution expression's four \
+         arms, plus the three engram hops of each of the two graph frontiers. Those \
+         six used to be six per backend in search.rs, which is the whole of the move \
+         from 152: one copy of each frontier now, not one per dialect. One per \
+         backend in search.rs is the anti-join inside `actor_screen_on`, which asks \
+         whether the reader holds a row of their own at a base row's path - one site \
+         however many statements compose the screen. Two shapes carry no screen of \
+         their own on purpose, each sitting inside a screened statement and passing \
+         on the screen that statement carries: the `tgt` hop of the graph frontier \
+         (now in store.rs) and of the outbound verdict reads the row a reference was \
+         bound to for its address alone, with the screen on the `dst` beside it, and \
+         the dangling probe in `reresolve_actor_references` asks whether ANY row \
+         still stands at a `to_id`, since whose the vanished row was does not change \
+         that the reference now points at nothing"
     );
     assert_eq!(
         census.waived, 16,

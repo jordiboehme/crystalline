@@ -78,6 +78,15 @@
 mod migrations;
 mod search;
 
+/// The search statements the plan registry (`tests/plans.rs`) reads, reachable
+/// from outside the crate and from nowhere else in it. `search` is a private
+/// submodule, so without this the registry would hold a second copy of each
+/// statement, and a copy is a thing that can be right about SQL nobody runs.
+#[doc(hidden)]
+pub use search::{
+    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
+};
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,6 +284,70 @@ impl PostgresStore {
             .await
             .map_err(IndexError::from)?;
         }
+        Ok(())
+    }
+
+    /// `EXPLAIN (FORMAT JSON)` for one statement, with `enable_seqscan` off for
+    /// the duration, as the parsed first row.
+    ///
+    /// Test scaffolding for the plan registry (`tests/plans.rs`). All three
+    /// statements run on ONE acquired connection, which is the whole reason
+    /// this is a method rather than three calls: `SET` is per session, the
+    /// store hands out pooled connections, and a `SET` on one connection with
+    /// the `EXPLAIN` on another silently measures the default planner. `RESET`
+    /// afterwards, so the connection goes back to the pool as it came out.
+    ///
+    /// `enable_seqscan = off` is a cost penalty rather than a prohibition: a
+    /// statement no index can serve is still planned as a scan, and that is
+    /// exactly the signal the registry reads.
+    #[doc(hidden)]
+    pub async fn explain_json(&self, sql: &str) -> Result<serde_json::Value> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("SET enable_seqscan = off")
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        let explained = sqlx::query_scalar::<_, serde_json::Value>(AssertSqlSafe(format!(
+            "EXPLAIN (FORMAT JSON) {sql}"
+        )))
+        .fetch_one(conn.as_mut())
+        .await
+        .map_err(IndexError::from);
+        sqlx::query("RESET enable_seqscan")
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        explained
+    }
+
+    /// Run `ANALYZE`, so the planner has statistics for the rows a fixture just
+    /// seeded. Test scaffolding for the plan registry: a planner that has never
+    /// seen a row plans everything as a scan, and a statistics-free fixture
+    /// would make the whole guard vacuous.
+    #[doc(hidden)]
+    pub async fn analyze(&self) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("ANALYZE")
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    /// Drop one index by name. Test scaffolding for the plan registry's
+    /// red-first leg, which proves the guard has teeth by taking an index away
+    /// and watching the plan turn into a scan. Nothing ships calling this: the
+    /// schema is the migrations' business.
+    #[doc(hidden)]
+    pub async fn drop_index(&self, name: &str) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP INDEX IF EXISTS {}",
+            quote_ident(name)
+        )))
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
         Ok(())
     }
 
@@ -793,6 +866,124 @@ async fn delete_children(conn: &mut PgConnection, engram_id: i64) -> Result<()> 
     Ok(())
 }
 
+// --- the hot statements ------------------------------------------------------
+//
+// Named here rather than written inline in their methods so `tests/plans.rs`
+// can explain the statement this store issues rather than a copy of it. Every
+// one of them is in the registry there, and a rewrite that costs one its index
+// fails with the name of the function that issues it. Nothing else about them
+// changed when they moved: the text each method runs is byte for byte the text
+// it ran inline.
+
+/// The on-disk snapshot behind [`Store::file_stamps`].
+///
+/// The snapshot names what is on disk, so it is the base rows and only the base
+/// rows. The sync driver derives its deletes by subtracting the walk from this
+/// map, so a draft here - a row that is on nobody's disk - would be proposed as
+/// a deletion on every single sync, and a draft at a base path would corrupt
+/// change detection outright.
+#[doc(hidden)]
+pub const FILE_STAMPS_SQL: &str =
+    "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=$1 AND actor = ''";
+
+/// The address lookup behind [`Store::find_engram`].
+///
+/// A permalink hit wins over a title hit; among title hits the lowest path
+/// wins, and `LIMIT 1` makes that tie-break the whole answer, so the path key
+/// is pinned to `COLLATE "C"` to match turso's byte order. That pin is the one
+/// difference from the turso text, and it is why the two are two constants.
+///
+/// The tie-break is deliberately NOT the one `reference_match` uses - it ties
+/// by `e.id` - so where two engrams in one domain share a title, the oldest of
+/// them answers a reference and the byte-first of them answers a lookup.
+#[doc(hidden)]
+pub const FIND_ENGRAM_SQL: &str = "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+     FROM engram e JOIN domain d ON d.id=e.domain_id \
+     WHERE e.actor = '' AND d.name=$1 AND (e.permalink=$2 OR lower(e.title)=lower($2)) \
+     ORDER BY CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END, e.path COLLATE \"C\" LIMIT 1";
+
+/// The listing behind [`Store::list_engrams`], for the filters the caller built.
+#[doc(hidden)]
+pub fn list_engrams_sql(clauses: &str) -> String {
+    format!(
+        "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+         FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.actor = '' AND {clauses} \
+         ORDER BY e.path COLLATE \"C\""
+    )
+}
+
+/// The folder derivation inside [`Store::browse_level`]: the distinct first
+/// segment below the prefix, read out of the path column alone.
+///
+/// `rel` is the relative-path expression and `under` the under-prefix filter,
+/// both built by the method. The claim on `browse_level` - that no body is read
+/// to learn a folder exists - holds exactly while `idx_engram_path_actor`
+/// covers this on its `(domain_id, path)` prefix.
+#[doc(hidden)]
+pub fn folder_level_sql(rel: &str, under: &str) -> String {
+    format!(
+        "SELECT DISTINCT split_part({rel}, '/', 1) \
+         FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE e.actor = '' AND {under} AND strpos({rel}, '/') > 0"
+    )
+}
+
+/// The sweep's dangling-reference read behind [`Store::unresolved_refs`].
+///
+/// The turso query, column for column. The kind discriminator is cast to `int8`
+/// so `cell_i64` decodes it (a bare integer literal is `int4`), and the prose
+/// arm reports `links_to`, the same relation type the graph gives a wikilink
+/// edge. Both arms filter on `to_id IS NULL` and the source domain, which is
+/// exactly the pair of partial unresolved indexes.
+///
+/// The compound select is wrapped so the sort keys can carry an explicit
+/// `COLLATE "C"`: turso sorts TEXT byte-wise, while a postgres database created
+/// under a locale collation sorts `Beta.md` after `alpha.md`, so without the pin
+/// the two backends would return the same rows in different orders on any
+/// domain with a mixed-case path. Turso keeps the flat form because BINARY is
+/// already its default. The sort is (path, line, kind, target) on both.
+#[doc(hidden)]
+pub fn unresolved_refs_sql(src_screen: &str, rel_pending: &str, link_pending: &str) -> String {
+    format!(
+        "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path, u.to_raw \
+         FROM ( \
+           SELECT r.engram_id, 0::int8 AS kind, r.rel_type, r.to_domain, r.to_target, \
+                  r.line, e.path, r.to_raw \
+           FROM relation r JOIN engram e ON e.id=r.engram_id \
+           WHERE {src_screen} AND {rel_pending} AND r.domain_id=$1 \
+           UNION ALL \
+           SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path, \
+                  l.to_raw \
+           FROM link l JOIN engram e ON e.id=l.engram_id \
+           WHERE {src_screen} AND {link_pending} AND l.domain_id=$1 \
+         ) u \
+         ORDER BY u.path COLLATE \"C\", u.line, u.kind, u.to_target COLLATE \"C\""
+    )
+}
+
+/// The per-domain twin read behind [`Store::lead_vectors`]: one row per engram
+/// whose first chunk carries an embedding for the model asked about.
+///
+/// This selects the raw `embedding` column, whose type includes the column's
+/// typmod, so it is the second of the two statements in this module exposed to
+/// `ensure_embedding_width`'s DDL-vs-cached-plan hazard (see the module doc, and
+/// `replace_chunks` for the first). It carries the trailing `/* w{generation} */`
+/// comment for that reason: inert to postgres, but it changes sqlx's cache key
+/// on every resize, so whichever pooled connection runs this next prepares
+/// against the current column shape instead of raising "cached plan must not
+/// change result type". The comment is part of the statement, which is why the
+/// generation is an argument here rather than something a caller appends.
+#[doc(hidden)]
+pub fn lead_vectors_sql(actor_screen: &str, generation: u64) -> String {
+    format!(
+        "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
+         JOIN engram e ON e.id=c.engram_id \
+         WHERE {actor_screen} AND e.domain_id=$1 AND c.seq=0 AND c.model=$2 \
+           AND c.embedding IS NOT NULL \
+         ORDER BY c.engram_id ASC /* w{generation} */"
+    )
+}
+
 #[async_trait]
 impl Store for PostgresStore {
     async fn migrate(&self) -> Result<()> {
@@ -838,18 +1029,11 @@ impl Store for PostgresStore {
 
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>> {
         let mut conn = self.acquire().await?;
-        // The snapshot names what is on disk, so it is the base rows and only
-        // the base rows. The sync driver derives its deletes by subtracting the
-        // walk from this map, so a draft here - a row that is on nobody's disk -
-        // would be proposed as a deletion on every single sync, and a draft at a
-        // base path would corrupt change detection outright.
-        let rows = sqlx::query(
-            "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=$1 AND actor = ''",
-        )
-        .bind(domain.0)
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
+        let rows = sqlx::query(FILE_STAMPS_SQL)
+            .bind(domain.0)
+            .fetch_all(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
         let mut out = HashMap::with_capacity(rows.len());
         for r in &rows {
             let Some(path) = cell_text(r, 0) else {
@@ -1031,15 +1215,9 @@ impl Store for PostgresStore {
     }
 
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
-        // One statement. Target domain is `to_domain` when set, else the
-        // relation's own domain. Prefer a permalink match, then a title match,
-        // then the whole bracket text at home - see `reference_match`.
-        let sql = format!(
-            "UPDATE relation SET to_id = {resolved} \
-             WHERE relation.to_id IS NULL AND relation.domain_id = $1 \
-             AND {resolved} IS NOT NULL",
-            resolved = reference_match("relation", ReferenceCandidates::Base)
-        );
+        // The statement lives in `crate::store`, one copy for both backends;
+        // postgres binds the domain id as `$1`.
+        let sql = crate::store::resolve_pending_sql("relation", "$1");
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
             .bind(domain.0)
@@ -1052,12 +1230,7 @@ impl Store for PostgresStore {
     async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
         // The wikilink twin of resolve_pending_relations over the `link` table,
         // matching by the same rule. Links carry no rel_type.
-        let sql = format!(
-            "UPDATE link SET to_id = {resolved} \
-             WHERE link.to_id IS NULL AND link.domain_id = $1 \
-             AND {resolved} IS NOT NULL",
-            resolved = reference_match("link", ReferenceCandidates::Base)
-        );
+        let sql = crate::store::resolve_pending_sql("link", "$1");
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
             .bind(domain.0)
@@ -1130,21 +1303,13 @@ impl Store for PostgresStore {
     }
 
     async fn find_engram(&self, domain: &str, key: &str) -> Result<Option<EngramDescriptor>> {
-        // A permalink hit wins over a title hit; among title hits the lowest path
-        // wins, and `LIMIT 1` makes that tie-break the whole answer, so the path
-        // key is pinned to `COLLATE "C"` to match Turso's byte order.
         let mut conn = self.acquire().await?;
-        let row = sqlx::query(
-            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND d.name=$1 AND (e.permalink=$2 OR lower(e.title)=lower($2)) \
-             ORDER BY CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END, e.path COLLATE \"C\" LIMIT 1",
-        )
-        .bind(domain)
-        .bind(key)
-        .fetch_optional(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
+        let row = sqlx::query(FIND_ENGRAM_SQL)
+            .bind(domain)
+            .bind(key)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
         Ok(row.as_ref().map(descriptor_from_row))
     }
 
@@ -1182,12 +1347,7 @@ impl Store for PostgresStore {
             clauses.push(format!("e.engram_type=${n}"));
             params.push(Param::Text(t.to_string()));
         }
-        let sql = format!(
-            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.actor = '' AND {} \
-             ORDER BY e.path COLLATE \"C\"",
-            clauses.join(" AND ")
-        );
+        let sql = list_engrams_sql(&clauses.join(" AND "));
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;
         Ok(rows.iter().map(descriptor_from_row).collect())
@@ -1287,11 +1447,7 @@ impl Store for PostgresStore {
         let rel = format!("substr(e.path, {})", prefix.chars().count() + 1);
         let folder_rows = query_all(
             conn.as_mut(),
-            &format!(
-                "SELECT DISTINCT split_part({rel}, '/', 1) \
-                 FROM engram e JOIN domain d ON d.id=e.domain_id \
-                 WHERE e.actor = '' AND {under} AND strpos({rel}, '/') > 0"
-            ),
+            &folder_level_sql(&rel, &under),
             bound(&binds),
         )
         .await?;
@@ -1669,26 +1825,11 @@ impl Store for PostgresStore {
         domain: DomainId,
         actor: Option<&str>,
     ) -> Result<Vec<UnresolvedRef>> {
-        // The Turso query, column for column. The kind discriminator is cast to
-        // `int8` so `cell_i64` decodes it (a bare integer literal is `int4`), and
-        // the prose arm reports `links_to`, the same relation type the graph gives
-        // a wikilink edge. Both arms filter on `to_id IS NULL` and the source
-        // domain, which is exactly the pair of partial unresolved indexes. The
-        // source path is selected as column 7 purely to order by, with `to_raw`
-        // appended after it so the Turso twin's positional sort keeps its
-        // meaning.
-        //
-        // The compound select is wrapped so the sort keys can carry an explicit
-        // `COLLATE "C"`: Turso sorts TEXT byte-wise, while a Postgres database
-        // created under a locale collation sorts `Beta.md` after `alpha.md`, so
-        // without the pin the two backends would return the same rows in
-        // different orders on any domain with a mixed-case path. Turso keeps the
-        // flat form because BINARY is already its default. The sort is (path,
-        // line, kind, target) on both.
-        //
-        // With an actor the source join carries their screen and "is this
-        // dangling" is asked in their view rather than off the stored column,
-        // exactly as in the Turso twin.
+        // What the two arms are and why they are shaped this way is on
+        // `unresolved_refs_sql`, which holds the statement. With an actor the
+        // source join carries their screen and "is this dangling" is asked in
+        // their view rather than off the stored column, exactly as in the turso
+        // twin.
         let mut params = vec![Param::Int(domain.0)];
         let mut n = 2usize;
         let src_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
@@ -1696,21 +1837,7 @@ impl Store for PostgresStore {
         let mut conn = self.acquire().await?;
         let rows = query_all(
             conn.as_mut(),
-            &format!(
-                "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path, u.to_raw \
-             FROM ( \
-               SELECT r.engram_id, 0::int8 AS kind, r.rel_type, r.to_domain, r.to_target, \
-                      r.line, e.path, r.to_raw \
-               FROM relation r JOIN engram e ON e.id=r.engram_id \
-               WHERE {src_screen} AND {rel_pending} AND r.domain_id=$1 \
-               UNION ALL \
-               SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path, \
-                      l.to_raw \
-               FROM link l JOIN engram e ON e.id=l.engram_id \
-               WHERE {src_screen} AND {link_pending} AND l.domain_id=$1 \
-             ) u \
-             ORDER BY u.path COLLATE \"C\", u.line, u.kind, u.to_target COLLATE \"C\""
-            ),
+            &unresolved_refs_sql(&src_screen, &rel_pending, &link_pending),
             params,
         )
         .await?;
@@ -2072,26 +2199,14 @@ impl Store for PostgresStore {
         actor: Option<&str>,
     ) -> Result<Vec<LeadVector>> {
         let mut conn = self.acquire().await?;
-        // This selects the raw `embedding` column, whose type includes the
-        // column's typmod, so it is the second of the two statements in this
-        // module exposed to `ensure_embedding_width`'s DDL-vs-cached-plan
-        // hazard (see the module doc, and `replace_chunks` for the first). It
-        // carries the same trailing `/* w{generation} */` comment for the same
-        // reason: inert to Postgres, but it changes sqlx's cache key on every
-        // resize, so whichever pooled connection runs this next prepares
-        // against the current column shape instead of raising "cached plan
-        // must not change result type".
+        // The `/* w{generation} */` comment `lead_vectors_sql` carries is what
+        // keeps a resized embedding column out of sqlx's statement cache; see
+        // that builder.
         let generation = self.embedding_generation.load(Ordering::Relaxed);
         let mut params = vec![Param::Int(domain.0), Param::Text(model.to_string())];
         let mut n = 3usize;
         let actor_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
-        let sql = format!(
-            "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
-             JOIN engram e ON e.id=c.engram_id \
-             WHERE {actor_screen} AND e.domain_id=$1 AND c.seq=0 AND c.model=$2 \
-               AND c.embedding IS NOT NULL \
-             ORDER BY c.engram_id ASC /* w{generation} */"
-        );
+        let sql = lead_vectors_sql(&actor_screen, generation);
         let rows = query_all(conn.as_mut(), &sql, params).await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {

@@ -19,8 +19,8 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     CURRENT_STATUS_CLASS, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind,
     EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
-    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery, is_current_status, retired_factor,
-    salience_prior,
+    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery, is_current_status, link_frontier_sql,
+    relation_frontier_sql, retired_factor, salience_prior,
 };
 
 use super::{
@@ -312,14 +312,8 @@ async fn scored_lexical(
     } else {
         format!("AND {}", clauses.join(" AND "))
     };
-    // `ORDER BY e.id` is answered from the primary key, so this wide projection
-    // never reaches a sort node. Keep it that way: any other ordering here would
-    // sort every matched body.
     let actor_screen = actor_screen(query.actor.as_deref(), &mut params, &mut n);
-    let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
-    );
+    let sql = lexical_candidate_sql(&actor_screen, &and_filters, candidate_cap);
     let rows = query_all(conn, &sql, params).await?;
 
     // Consume the raw rows by value so each row's buffers are freed as its
@@ -582,6 +576,31 @@ const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_ty
      CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' \
      THEN (e.metadata ->> 'salience')::double precision END";
 
+/// The lexical candidate prefilter: every row matching the reader's terms and
+/// filters, capped, ranked afterwards in Rust.
+///
+/// `ORDER BY e.id` is answered from the primary key, so this wide projection
+/// never reaches a sort node of its own, and the `LIMIT` in the same statement
+/// bounds it whatever the planner picks. Keep the bound and keep the order: any
+/// other ordering here, or a `GROUP BY`, would sort every matched body.
+///
+/// The turso twin of this builder is `crate::turso::search::lexical_candidate_sql`,
+/// with the same signature; the two texts differ only in the dialect of the
+/// fragments the caller hands in. Built here rather than inline so the plan
+/// registry in `tests/plans.rs` explains the statement this store issues rather
+/// than a copy of it.
+#[doc(hidden)]
+pub fn lexical_candidate_sql(
+    actor_screen: &str,
+    and_filters: &str,
+    candidate_cap: usize,
+) -> String {
+    format!(
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
+    )
+}
+
 /// Phase 1 of the semantic scan: the narrow top-k, mirroring
 /// [`crate::turso::search`]'s split exactly. Groups the matching chunk rows by
 /// their parent engram, keeps each engram's closest chunk and projects nothing
@@ -595,7 +614,8 @@ const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_ty
 /// Ties. `dist` alone leaves engrams at an equal distance in an unspecified
 /// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
 /// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins).
-fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
+#[doc(hidden)]
+pub fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
     format!(
         "SELECT c.engram_id, min(c.embedding <=> $1) AS dist \
          FROM chunk c JOIN engram e ON e.id=c.engram_id JOIN domain d ON d.id=e.domain_id \
@@ -608,7 +628,8 @@ fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
 /// by primary key. No `ORDER BY` and no `GROUP BY`; the phase-1 order is
 /// reapplied in Rust. The id list is interpolated because every id is an `i64`
 /// read out of this same database.
-fn semantic_hydrate_sql(actor_screen: &str, ids: &str) -> String {
+#[doc(hidden)]
+pub fn semantic_hydrate_sql(actor_screen: &str, ids: &str) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
          WHERE {actor_screen} AND e.id IN ({ids})"
@@ -1203,6 +1224,23 @@ fn pending_arm(
     )
 }
 
+/// The node hydrate that closes [`neighbors`]: the addressing of every engram
+/// the traversal met, screened for this reader.
+///
+/// Not shared with turso, unlike the two frontier statements the traversal
+/// issues: the salience column is read out of postgres's `jsonb` operators and
+/// out of turso's `json_extract`, so the two texts genuinely differ.
+#[doc(hidden)]
+pub fn node_hydrate_sql(node_screen: &str, list: &str) -> String {
+    format!(
+        "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
+         CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
+         e.status, e.actor \
+         FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE {node_screen} AND e.id IN ({list}) ORDER BY e.id"
+    )
+}
+
 /// Traverse the neighborhood of the seed engrams up to `depth` hops, in
 /// `actor`'s view of the index: `None` walks the base rows alone and
 /// `Some(a)` walks that actor's shadowed view, their own drafts standing in
@@ -1259,32 +1297,11 @@ pub(super) async fn neighbors(
             &mut rel_params,
             &mut rel_n,
         );
+        // The statement, both screens and why they are there: see
+        // `crate::store::relation_frontier_sql`, which both backends issue.
         let rel_rows = query_all(
             conn,
-            &format!(
-                // A draft's relation and link rows are written exactly as a
-                // base row's, so a frontier that stops at those tables walks
-                // them without ever naming the table that knows whose they are:
-                // the traversal would push a row's id into the visited set and
-                // the node hydrate below - which does carry the screen - would
-                // then drop it, leaving an edge with no node and engrams
-                // pulled into the neighbourhood through somebody else's
-                // private draft. Both endpoints are screened, because an edge
-                // reaching INTO a row this reader may not see is as far
-                // outside their graph as one leaving it.
-                //
-                // `tgt` carries no screen and wants none: it is the row the
-                // reference was bound to, read for its address alone, and the
-                // screen that decides what this reader may meet is the one on
-                // `dst` beside it.
-                "SELECT r.engram_id, dst.id, r.rel_type FROM relation r \
-                 JOIN engram src ON src.id=r.engram_id AND {src_screen} \
-                 JOIN engram tgt ON tgt.id=r.to_id \
-                 JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
-                   AND {dst_screen} \
-                 WHERE r.to_id IS NOT NULL \
-                   AND (r.engram_id IN ({list}) OR r.to_id IN ({list})){rel_pending}"
-            ),
+            &relation_frontier_sql(&list, &src_screen, &dst_screen, &rel_pending),
             rel_params,
         )
         .await?;
@@ -1320,17 +1337,7 @@ pub(super) async fn neighbors(
         );
         let link_rows = query_all(
             conn,
-            &format!(
-                // The prose-link twin of the relation frontier above, and
-                // screened and redirected for the same reasons.
-                "SELECT l.engram_id, dst.id FROM link l \
-                 JOIN engram src ON src.id=l.engram_id AND {src_screen} \
-                 JOIN engram tgt ON tgt.id=l.to_id \
-                 JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
-                   AND {dst_screen} \
-                 WHERE l.to_id IS NOT NULL \
-                   AND (l.engram_id IN ({list}) OR l.to_id IN ({list})){link_pending}"
-            ),
+            &link_frontier_sql(&list, &src_screen, &dst_screen, &link_pending),
             link_params,
         )
         .await?;
@@ -1362,18 +1369,7 @@ pub(super) async fn neighbors(
         let mut node_params: Vec<Param> = Vec::new();
         let mut node_n = 1usize;
         let node_screen = actor_screen_on("e", actor, &mut node_params, &mut node_n);
-        let rows = query_all(
-            conn,
-            &format!(
-                "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
-                 CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
-                 e.status, e.actor \
-                 FROM engram e JOIN domain d ON d.id=e.domain_id \
-                 WHERE {node_screen} AND e.id IN ({list}) ORDER BY e.id"
-            ),
-            node_params,
-        )
-        .await?;
+        let rows = query_all(conn, &node_hydrate_sql(&node_screen, &list), node_params).await?;
         for r in &rows {
             nodes.push(GraphNode {
                 id: EngramId(cell_i64(r, 0).unwrap_or(0)),

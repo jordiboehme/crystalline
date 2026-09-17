@@ -176,6 +176,91 @@ pub(crate) enum ReferenceCandidates<'a> {
     DraftsOnly { screen: &'a str },
 }
 
+/// The resolve pass over one reference table: bind every row whose `to_id` is
+/// still NULL to the engram its bracket text names.
+///
+/// One statement. Target domain is `to_domain` when set, else the row's own
+/// domain. Prefer a permalink match, then a title match, then the whole
+/// bracket text at home - see [`reference_match`].
+///
+/// Shared by both backends because the text is the same in both dialects down
+/// to the bind placeholder, which is the one argument: `?1` for turso, `$1` for
+/// postgres. Built here rather than inline in the four trait methods so the
+/// plan guards - `the_reference_resolve_pass_seeks_the_title_index` in
+/// `turso/mod.rs` and the registry in `tests/plans.rs` - explain the statement
+/// the stores actually issue. The pass runs on every sync of every domain and
+/// is O(dangling references), so each of its four arms has to be an index seek;
+/// a hand-copied literal in a test is what let the title arm lose its index
+/// once already.
+#[doc(hidden)]
+pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
+    format!(
+        "UPDATE {table} SET to_id = {resolved} \
+         WHERE {table}.to_id IS NULL AND {table}.domain_id = {placeholder} \
+         AND {resolved} IS NOT NULL",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
+/// One step of the graph traversal over the `relation` table: every edge with
+/// an endpoint on the frontier, both endpoints screened.
+///
+/// Shared by both backends because the template is byte-identical in the two
+/// dialects: every dialect-specific piece is inside one of the three fragments
+/// the caller builds with its own placeholders and binds through its own
+/// parameter list. A second copy of this is a second thing that can lose the
+/// `dst` screen, which is why there is only one.
+///
+/// A draft's relation and link rows are written exactly as a base row's, so a
+/// frontier that stops at those tables walks them without ever naming the table
+/// that knows whose they are: the traversal would push a row's id into the
+/// visited set and the node hydrate - which does carry the screen - would then
+/// drop it, leaving an edge with no node and engrams pulled into the
+/// neighbourhood through somebody else's private draft. Both endpoints are
+/// screened, because an edge reaching INTO a row this reader may not see is as
+/// far outside their graph as one leaving it.
+///
+/// `tgt` carries no screen and wants none: it is the row the reference was
+/// bound to, read for its address alone, and the screen that decides what this
+/// reader may meet is the one on `dst` beside it.
+#[doc(hidden)]
+pub fn relation_frontier_sql(
+    list: &str,
+    src_screen: &str,
+    dst_screen: &str,
+    rel_pending: &str,
+) -> String {
+    format!(
+        "SELECT r.engram_id, dst.id, r.rel_type FROM relation r \
+         JOIN engram src ON src.id=r.engram_id AND {src_screen} \
+         JOIN engram tgt ON tgt.id=r.to_id \
+         JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+           AND {dst_screen} \
+         WHERE r.to_id IS NOT NULL \
+           AND (r.engram_id IN ({list}) OR r.to_id IN ({list})){rel_pending}"
+    )
+}
+
+/// The prose-link twin of [`relation_frontier_sql`] over the `link` table, and
+/// shared, screened and redirected for the same reasons.
+#[doc(hidden)]
+pub fn link_frontier_sql(
+    list: &str,
+    src_screen: &str,
+    dst_screen: &str,
+    link_pending: &str,
+) -> String {
+    format!(
+        "SELECT l.engram_id, dst.id FROM link l \
+         JOIN engram src ON src.id=l.engram_id AND {src_screen} \
+         JOIN engram tgt ON tgt.id=l.to_id \
+         JOIN engram dst ON dst.domain_id=tgt.domain_id AND dst.path=tgt.path \
+           AND {dst_screen} \
+         WHERE l.to_id IS NOT NULL \
+           AND (l.engram_id IN ({list}) OR l.to_id IN ({list})){link_pending}"
+    )
+}
+
 /// One relation bullet, ready to index. `to_id` is filled by
 /// [`Store::resolve_pending_relations`] once the target exists.
 #[derive(Debug, Clone, PartialEq)]

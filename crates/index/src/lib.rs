@@ -46,6 +46,21 @@ pub use store::{
     Vocabulary, is_current_status, is_retired_status, merge_vocabularies, parse_metadata_filters,
     retired_factor, salience_prior,
 };
+/// The shared statement builders, reachable from `tests/plans.rs` and from
+/// nothing else.
+///
+/// `mod store` is private, and the hot-statement registry lives in an
+/// integration test, which is a separate crate: without this block the registry
+/// would have to hold a second copy of each statement, and a registry holding a
+/// copy is a registry that can be right about SQL nobody runs. `#[doc(hidden)]`
+/// rather than a `test-internals` feature, so the registry compiles against the
+/// same crate the binary ships rather than against a variant of it.
+///
+/// `reference_match` is not here and needs nothing: it is reached through
+/// `resolve_pending_sql`, which is the statement the registry names, and its
+/// own argument type is crate-private.
+#[doc(hidden)]
+pub use store::{link_frontier_sql, relation_frontier_sql, resolve_pending_sql};
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,
     RULES, RuleInfo, SHARE_STALE_DAYS, ShareFacts, SweepInput, SweepOptions, SweepReport,

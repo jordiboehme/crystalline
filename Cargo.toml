@@ -50,6 +50,10 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
+    # `EXPLAIN (FORMAT JSON)` comes back as a `json` column, which the plan
+    # registry in crates/index/tests/plans.rs reads as a tree. serde_json is
+    # already a direct dependency of every crate that would see it.
+    "json",
 ] }
 pgvector = { version = "0.4.2", default-features = false, features = ["sqlx"] }
 notify = "8.2.0"

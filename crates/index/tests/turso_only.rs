@@ -12,6 +12,13 @@
 //! hand-copied literals, and a copy stops guarding the moment the shipped
 //! statement moves, which is how the resolve pass lost its title index for a
 //! whole wave while its guard stayed green.
+//!
+//! The folder derivation used to be guarded here the same wrong way, over a
+//! hand-copied literal, and is now the `Store::browse_level` entry of the
+//! registry in `tests/plans.rs`, which reads the shipped builder and keeps
+//! naming `idx_engram_path_actor` in full. `temporal_current_filter_uses_the_promoted_index`
+//! stays: it probes a shape nothing issues, rather than a statement the store
+//! builds.
 
 use std::path::Path;
 
@@ -113,49 +120,6 @@ fn a_body_projection_never_reaches_an_unbounded_sorter() {
         projections, 3,
         "expected the candidate prefilter, the filter-only page and the semantic \
          hydrate to be the only queries projecting bodies; a new one needs its own bound"
-    );
-}
-
-/// The folder derivation must stay index-only.
-///
-/// The claim on `Store::browse_level` - that no body is read to learn a folder
-/// exists - is true exactly while `idx_engram_path_actor` covers this query on
-/// its `(domain_id, path)` prefix. If a
-/// later edit widens the projection or the filter past the index, the cheapest
-/// of the three tree queries quietly becomes a table read per browse, and the
-/// tree's whole reason for existing goes with it.
-#[tokio::test]
-async fn the_folder_derivation_is_served_by_the_path_index() {
-    let store = open().await;
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "notes/a.md",
-        &engram("A", "notes/a", "engram", "", "b\n"),
-    );
-    sync_domain(&store, "d", dir.path()).await.unwrap();
-
-    // The statement `browse_level` issues, base predicate and all. The index it
-    // has to be served by is the actor-aware one v13 put in place of
-    // `idx_engram_path`, and it is named in full here: a substring test would
-    // pass on either of the two, which is exactly the distinction this guard
-    // exists to make.
-    let plan = store
-        .explain_query_plan(
-            "SELECT DISTINCT substr(e.path, 1, instr(substr(e.path, 1), '/') - 1) \
-             FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND d.name='d' AND instr(substr(e.path, 1), '/') > 0",
-        )
-        .await
-        .unwrap();
-    let joined = plan.join(" | ");
-    assert!(
-        joined.contains("idx_engram_path_actor"),
-        "the folder derivation should read the path index, plan was: {joined}"
-    );
-    assert!(
-        !joined.contains("SCAN engram") || joined.contains("INDEX"),
-        "and never a bare row scan, plan was: {joined}"
     );
 }
 

@@ -21,6 +21,15 @@
 mod migrations;
 mod search;
 
+/// The search statements the plan registry (`tests/plans.rs`) reads, reachable
+/// from outside the crate and from nowhere else in it. `search` is a private
+/// submodule, so without this the registry would hold a second copy of each
+/// statement, and a copy is a thing that can be right about SQL nobody runs.
+#[doc(hidden)]
+pub use search::{
+    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
+};
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -242,6 +251,16 @@ impl TursoStore {
     pub async fn explain_query_plan(&self, sql: &str) -> Result<Vec<String>> {
         let rows = query_all(&self.conn, &format!("EXPLAIN QUERY PLAN {sql}"), vec![]).await?;
         Ok(rows.iter().filter_map(|r| cell_text(r, 3)).collect())
+    }
+
+    /// Drop one index by name. Test scaffolding for the plan registry's
+    /// red-first leg (`tests/plans.rs`), which proves the guard has teeth by
+    /// taking an index away and watching the plan turn into a scan. Nothing
+    /// ships calling this: the schema is the migrations' business.
+    #[doc(hidden)]
+    pub async fn drop_index(&self, name: &str) -> Result<()> {
+        self.conn.execute(&format!("DROP INDEX {name}"), ()).await?;
+        Ok(())
     }
 
     /// Run `PRAGMA wal_checkpoint(TRUNCATE)`, shrinking the on-disk WAL file
@@ -793,25 +812,124 @@ fn observation_insert_sql(count: usize) -> String {
     )
 }
 
-/// The resolve pass over one reference table: bind every row whose `to_id` is
-/// still NULL to the engram its bracket text names.
-///
-/// One statement. Target domain is `to_domain` when set, else the row's own
-/// domain. Prefer a permalink match, then a title match, then the whole
-/// bracket text at home - see `reference_match`.
-///
-/// Built here rather than inline in the two trait methods so the plan guard
-/// `the_reference_resolve_pass_seeks_the_title_index` can explain the
-/// statement this store actually issues. The pass runs on every sync of every
-/// domain and is O(dangling references), so each of its four arms has to be an
-/// index seek; a hand-copied literal in a test is what let the title arm lose
-/// its index once already.
+/// This store's spelling of the shared resolve-pass statement: turso binds the
+/// domain id as `?1`. The statement itself lives in [`crate::store`], one copy
+/// for both backends.
 fn resolve_pending_sql(table: &str) -> String {
+    crate::store::resolve_pending_sql(table, "?1")
+}
+
+// --- the hot statements ------------------------------------------------------
+//
+// Named here rather than written inline in their methods so `tests/plans.rs`
+// can explain the statement this store issues rather than a copy of it. Every
+// one of them is in the registry there, and a rewrite that costs one its index
+// fails with the name of the function that issues it. Nothing else about them
+// changed when they moved: the text each method runs is byte for byte the text
+// it ran inline.
+
+/// The on-disk snapshot behind [`Store::file_stamps`].
+///
+/// The snapshot names what is on disk, so it is the base rows and only the base
+/// rows. The sync driver derives its deletes by subtracting the walk from this
+/// map, so a draft here - a row that is on nobody's disk - would be proposed as
+/// a deletion on every single sync, and a draft at a base path would corrupt
+/// change detection outright. Same phantom-deletion class the generated indexes
+/// already document in `crystalline_remote::changes`.
+#[doc(hidden)]
+pub const FILE_STAMPS_SQL: &str =
+    "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=?1 AND actor = ''";
+
+/// The address lookup behind [`Store::find_engram`].
+///
+/// A permalink hit wins over a title hit; among title hits the byte-lower path
+/// wins, and `LIMIT 1` makes that tie-break the whole answer. The postgres twin
+/// pins the same key to `COLLATE "C"` to match turso's byte order, which is why
+/// the two texts are two constants rather than one.
+///
+/// That tie-break is deliberately NOT the one `reference_match` uses - it ties
+/// by `e.id` - so where two engrams in one domain share a title, the oldest of
+/// them answers a reference and the byte-first of them answers a lookup. Both
+/// are deterministic and locale-free; unifying them would cost this lookup the
+/// index the path ordering is served from.
+#[doc(hidden)]
+pub const FIND_ENGRAM_SQL: &str = "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+     FROM engram e JOIN domain d ON d.id=e.domain_id \
+     WHERE e.actor = '' AND d.name=?1 AND (e.permalink=?2 OR lower(e.title)=lower(?2)) \
+     ORDER BY CASE WHEN e.permalink=?2 THEN 0 ELSE 1 END, e.path LIMIT 1";
+
+/// The listing behind [`Store::list_engrams`], for the filters the caller built.
+#[doc(hidden)]
+pub fn list_engrams_sql(clauses: &str) -> String {
     format!(
-        "UPDATE {table} SET to_id = {resolved} \
-         WHERE {table}.to_id IS NULL AND {table}.domain_id = ?1 \
-         AND {resolved} IS NOT NULL",
-        resolved = reference_match(table, ReferenceCandidates::Base)
+        "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
+         FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.actor = '' AND {clauses} \
+         ORDER BY e.path"
+    )
+}
+
+/// The folder derivation inside [`Store::browse_level`]: the distinct first
+/// segment below the prefix, read out of the path column alone.
+///
+/// `rel` is the relative-path expression and `under` the under-prefix filter,
+/// both built by the method. The claim on `browse_level` - that no body is read
+/// to learn a folder exists - holds exactly while `idx_engram_path_actor`
+/// covers this on its `(domain_id, path)` prefix, which the registry pins by
+/// that index's full name: a substring test would pass on either of the two
+/// engram path indexes, and the distinction is the whole point.
+#[doc(hidden)]
+pub fn folder_level_sql(rel: &str, under: &str) -> String {
+    format!(
+        "SELECT DISTINCT substr({rel}, 1, instr({rel}, '/') - 1) \
+         FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE e.actor = '' AND {under} AND instr({rel}, '/') > 0"
+    )
+}
+
+/// The sweep's dangling-reference read behind [`Store::unresolved_refs`].
+///
+/// Relation rows then link rows, both filtered on `to_id IS NULL` and the
+/// source domain so the pair of partial unresolved indexes carries the scan. A
+/// prose link reports `links_to`, the same relation type the graph gives a
+/// wikilink edge. The source path is selected as column 7 purely to order by,
+/// with `to_raw` appended after it so the positional sort keeps meaning what it
+/// means: the sort is (path, line, kind, target), positional because a compound
+/// select cannot name a column of a later arm. TEXT sorts byte-wise here, which
+/// is the order the postgres implementation pins itself to with an explicit
+/// `COLLATE "C"`.
+///
+/// With an actor the source join carries their screen - the base rows their
+/// drafts do not shadow, plus their own live drafts - and "is this dangling" is
+/// asked in their view rather than off the stored column, so the queue is about
+/// what they are reading. The partial indexes carry the base arm; the actor arm
+/// is bounded by that actor's own row count, which is what an overlay is.
+#[doc(hidden)]
+pub fn unresolved_refs_sql(src_screen: &str, rel_pending: &str, link_pending: &str) -> String {
+    format!(
+        "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path, r.to_raw \
+         FROM relation r JOIN engram e ON e.id=r.engram_id \
+         WHERE {src_screen} AND {rel_pending} AND r.domain_id=?1 \
+         UNION ALL \
+         SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path, l.to_raw \
+         FROM link l JOIN engram e ON e.id=l.engram_id \
+         WHERE {src_screen} AND {link_pending} AND l.domain_id=?1 \
+         ORDER BY 7, 6, 2, 5"
+    )
+}
+
+/// The per-domain twin read behind [`Store::lead_vectors`]: one row per engram
+/// whose first chunk carries an embedding for the model asked about.
+///
+/// A builder rather than a constant because the actor screen is composed by the
+/// caller, with its own placeholders.
+#[doc(hidden)]
+pub fn lead_vectors_sql(actor_screen: &str) -> String {
+    format!(
+        "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
+         JOIN engram e ON e.id=c.engram_id \
+         WHERE {actor_screen} AND e.domain_id=?1 AND c.seq=0 AND c.model=?2 \
+           AND c.embedding IS NOT NULL \
+         ORDER BY c.engram_id ASC"
     )
 }
 
@@ -907,19 +1025,7 @@ impl Store for TursoStore {
     }
 
     async fn file_stamps(&self, domain: DomainId) -> Result<HashMap<String, FileStamp>> {
-        let rows = query_all(
-            &self.conn,
-            // The snapshot names what is on disk, so it is the base rows and
-            // only the base rows. The sync driver derives its deletes by
-            // subtracting the walk from this map, so a draft here - a row that
-            // is on nobody's disk - would be proposed as a deletion on every
-            // single sync, and a draft at a base path would corrupt change
-            // detection outright. Same phantom-deletion class the generated
-            // indexes already document in `crystalline_remote::changes`.
-            "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=?1 AND actor = ''",
-            vec![Value::Integer(domain.0)],
-        )
-        .await?;
+        let rows = query_all(&self.conn, FILE_STAMPS_SQL, vec![Value::Integer(domain.0)]).await?;
         let mut out = HashMap::with_capacity(rows.len());
         for r in &rows {
             let Some(path) = cell_text(r, 0) else {
@@ -1176,11 +1282,11 @@ impl Store for TursoStore {
     async fn find_engram(&self, domain: &str, key: &str) -> Result<Option<EngramDescriptor>> {
         let rows = query_all(
             &self.conn,
-            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE e.actor = '' AND d.name=?1 AND (e.permalink=?2 OR lower(e.title)=lower(?2)) \
-             ORDER BY CASE WHEN e.permalink=?2 THEN 0 ELSE 1 END, e.path LIMIT 1",
-            vec![Value::Text(domain.to_string()), Value::Text(key.to_string())],
+            FIND_ENGRAM_SQL,
+            vec![
+                Value::Text(domain.to_string()),
+                Value::Text(key.to_string()),
+            ],
         )
         .await?;
         Ok(rows.first().map(descriptor_from_row))
@@ -1217,12 +1323,7 @@ impl Store for TursoStore {
             clauses.push(format!("e.engram_type=?{n}"));
             params.push(Value::Text(t.to_string()));
         }
-        let sql = format!(
-            "SELECT e.id, e.domain_id, d.name, e.path, e.permalink, e.title, e.engram_type, e.status \
-             FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.actor = '' AND {} \
-             ORDER BY e.path",
-            clauses.join(" AND ")
-        );
+        let sql = list_engrams_sql(&clauses.join(" AND "));
         let rows = query_all(&self.conn, &sql, params).await?;
         Ok(rows.iter().map(descriptor_from_row).collect())
     }
@@ -1314,16 +1415,7 @@ impl Store for TursoStore {
         // the wrong place and derive a wrong or empty folder name. That is what
         // a future reader has to re-check, not where the number came from.
         let rel = format!("substr(e.path, {})", prefix.chars().count() + 1);
-        let folder_rows = query_all(
-            &self.conn,
-            &format!(
-                "SELECT DISTINCT substr({rel}, 1, instr({rel}, '/') - 1) \
-                 FROM engram e JOIN domain d ON d.id=e.domain_id \
-                 WHERE e.actor = '' AND {under} AND instr({rel}, '/') > 0"
-            ),
-            params,
-        )
-        .await?;
+        let folder_rows = query_all(&self.conn, &folder_level_sql(&rel, &under), params).await?;
         let mut folders: Vec<String> = folder_rows.iter().filter_map(|r| cell_text(r, 0)).collect();
         // Sorted here rather than in SQL, so both backends order folder names
         // by bytes without either dialect's collation having a say.
@@ -1677,38 +1769,15 @@ impl Store for TursoStore {
         domain: DomainId,
         actor: Option<&str>,
     ) -> Result<Vec<UnresolvedRef>> {
-        // Relation rows then link rows, both filtered on `to_id IS NULL` and the
-        // source domain so the pair of partial unresolved indexes carries the
-        // scan. A prose link reports `links_to`, the same relation type the graph
-        // gives a wikilink edge. The source path is selected as column 7 purely
-        // to order by, with `to_raw` appended after it so the positional sort
-        // keeps meaning what it means: the sort is (path, line, kind, target),
-        // positional because a compound select cannot name a column of a later arm. TEXT
-        // sorts byte-wise here, which is the order the Postgres implementation
-        // pins itself to with an explicit `COLLATE "C"`.
-        //
-        // With an actor the source join carries their screen - the base rows
-        // their drafts do not shadow, plus their own live drafts - and "is this
-        // dangling" is asked in their view rather than off the stored column,
-        // so the queue is about what they are reading. The partial indexes
-        // carry the base arm; the actor arm is bounded by that actor's own row
-        // count, which is what an overlay is.
+        // What the two arms are and why they are shaped this way is on
+        // `unresolved_refs_sql`, which holds the statement.
         let mut params = vec![Value::Integer(domain.0)];
         let mut n = 2usize;
         let src_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
         let (rel_pending, link_pending) = pending_predicates(actor, &mut params, &mut n);
         let rows = query_all(
             &self.conn,
-            &format!(
-                "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path, r.to_raw \
-             FROM relation r JOIN engram e ON e.id=r.engram_id \
-             WHERE {src_screen} AND {rel_pending} AND r.domain_id=?1 \
-             UNION ALL \
-             SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path, l.to_raw \
-             FROM link l JOIN engram e ON e.id=l.engram_id \
-             WHERE {src_screen} AND {link_pending} AND l.domain_id=?1 \
-             ORDER BY 7, 6, 2, 5"
-            ),
+            &unresolved_refs_sql(&src_screen, &rel_pending, &link_pending),
             params,
         )
         .await?;
@@ -2036,18 +2105,7 @@ impl Store for TursoStore {
         let mut params = vec![Value::Integer(domain.0), Value::Text(model.to_string())];
         let mut n = 3usize;
         let actor_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
-        let rows = query_all(
-            &self.conn,
-            &format!(
-                "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
-                 JOIN engram e ON e.id=c.engram_id \
-                 WHERE {actor_screen} AND e.domain_id=?1 AND c.seq=0 AND c.model=?2 \
-                   AND c.embedding IS NOT NULL \
-                 ORDER BY c.engram_id ASC"
-            ),
-            params,
-        )
-        .await?;
+        let rows = query_all(&self.conn, &lead_vectors_sql(&actor_screen), params).await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             let (Some(id), Some(dims), Some(blob)) =
@@ -2798,6 +2856,13 @@ mod tests {
     }
 
     /// The resolve pass seeks the title index on the arm that needs it.
+    ///
+    /// The in-source twin of the registry's two `resolve_pending_*` entries
+    /// (`tests/plans.rs`), kept rather than folded into it: the registry asks
+    /// the general question - does any arm of this statement scan a guarded
+    /// table - and this asks the specific one, which index each arm seeks, by
+    /// name. A statement can lose the title index to a rewrite that still has
+    /// it seeking something, and only this notices that.
     ///
     /// The statement is the one `resolve_pending_sql` builds, not a copy of it:
     /// the guard this replaces asserted on a hand-copied literal, went on
