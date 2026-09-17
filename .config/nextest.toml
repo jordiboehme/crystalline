@@ -28,6 +28,11 @@ test-group = 'forge-wire'
 # 127.0.0.1:0), and without a terminate-after nextest waits forever.
 [profile.default]
 slow-timeout = { period = "120s", terminate-after = 2 }
+# A test whose child process outlives it by more than this is reported as a
+# leak. The only LEAK flags seen across sixty gate runs were sub-quarter-second
+# pure-computation unit tests caught by the 100ms default during teardown
+# under load, so the window is widened rather than the class investigated.
+leak-timeout = "500ms"
 
 # The same two loopback suites, given a far longer ceiling rather than a mute:
 # they finish in under a second standalone, but a machine under environmental
