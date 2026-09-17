@@ -427,17 +427,19 @@ async fn close_new_domain(state: &RestState, report: &Value, owner: &str) -> Res
         // routes answer for a name already taken. Admin-only path
         // (`identity.require_admin()` above), and an admin sees every domain,
         // so naming the owner on file discloses nothing.
+        //
+        // The remedy has to name a route that works in the state THIS branch
+        // leaves behind, and the two branches leave different states: rolled
+        // back, the registration is undone and PUT /domains/{domain}/owner
+        // 404s on a name nobody has registered, so the domain has to be
+        // registered again first; not rolled back, the domain is still
+        // registered and the owner route works right away.
         Ok(VisibilityWrite::AlreadyPrivate { owner: held }) => {
             let rolled_back = state.engine.domain_remove(&name).await.is_ok();
-            return Err(ApiError::conflict(format!(
-                "the name '{name}' already carries a private-domain record owned by '{held}', so it \
-                 was not made yours{}. Hand it over with: PUT /domains/{{domain}}/owner",
-                if rolled_back {
-                    "; the registration was rolled back, so nothing was left shared"
-                } else {
-                    "; it is REGISTERED AND SHARED - unregister it or make it private \
-                     from the `crystalline` CLI on the server"
-                }
+            return Err(ApiError::conflict(already_private_conflict(
+                &name,
+                &held,
+                rolled_back,
             )));
         }
         Err(e) => e,
@@ -452,6 +454,41 @@ async fn close_new_domain(state: &RestState, report: &Value, owner: &str) -> Res
              from the `crystalline` CLI on the server"
         }
     )))
+}
+
+/// The 409 body for a private-domain record this write does not take over,
+/// worded for the state the rollback above actually leaves rather than for
+/// the state before it ran. `name` still carries `held`'s ownership either
+/// way, but what a caller can DO about it differs by branch:
+///
+/// - rolled back: `domain_remove` undid the registration, so `name` is not
+///   registered at all any more and `PUT /domains/{domain}/owner` 404s on it
+///   (`require_domain_read` needs a registered domain first). The remedy has
+///   to register it again before it can hand anything over, which a plain
+///   create (no `private`) does without re-triggering this same conflict -
+///   the surviving record makes it private to `held` regardless of the flag,
+///   which is also why closing it again afterwards is nothing more than
+///   confirming what already holds;
+/// - not rolled back: `name` is still registered, and the surviving record
+///   still makes it private to `held`, so the owner route works right away -
+///   no re-registration needed, and nothing here was ever "shared".
+fn already_private_conflict(name: &str, held: &str, rolled_back: bool) -> String {
+    if rolled_back {
+        format!(
+            "the name '{name}' already carries a private-domain record owned by '{held}', so it \
+             was not made yours, and the registration was rolled back: '{name}' is not \
+             registered at all now. Register it again without asking for private (POST \
+             /domains), hand the existing record over with: PUT /domains/{{domain}}/owner, then \
+             close it with: PUT /domains/{{domain}}/visibility"
+        )
+    } else {
+        format!(
+            "the name '{name}' already carries a private-domain record owned by '{held}', so it \
+             was not made yours, and the registration could not be rolled back either: \
+             '{name}' is REGISTERED and still privately owned by '{held}'. Hand it over \
+             directly with: PUT /domains/{{domain}}/owner"
+        )
+    }
 }
 
 /// A mode-mismatched field is a 422 up front, not silently ignored.
@@ -2521,6 +2558,48 @@ pub async fn set_visibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each branch names a remedy that works in the state it leaves, and
+    /// only that one: pasting the rolled-back branch's owner route straight
+    /// away 404s (nothing is registered), and the not-rolled-back branch
+    /// must never claim the domain is shared, since the surviving record
+    /// keeps it private to `held` throughout.
+    #[test]
+    fn the_already_private_conflict_names_a_remedy_that_matches_its_branch() {
+        let rolled_back = already_private_conflict("orphaned", "stranger", true);
+        assert!(rolled_back.contains("orphaned"), "{rolled_back}");
+        assert!(rolled_back.contains("stranger"), "{rolled_back}");
+        assert!(rolled_back.contains("rolled back"), "{rolled_back}");
+        assert!(
+            rolled_back.contains("Register it again"),
+            "registering again has to come before the owner route can work: {rolled_back}"
+        );
+        assert!(
+            rolled_back.contains("PUT /domains/{domain}/owner"),
+            "{rolled_back}"
+        );
+        assert!(
+            !rolled_back.contains("REGISTERED"),
+            "rolled back, so it is not registered at all: {rolled_back}"
+        );
+
+        let kept = already_private_conflict("orphaned", "stranger", false);
+        assert!(kept.contains("orphaned"), "{kept}");
+        assert!(kept.contains("stranger"), "{kept}");
+        assert!(
+            kept.contains("REGISTERED"),
+            "not rolled back, so the domain is still registered: {kept}"
+        );
+        assert!(
+            !kept.contains("SHARED"),
+            "the surviving record keeps it private, never shared: {kept}"
+        );
+        assert!(
+            kept.contains("directly"),
+            "no re-registration needed, the owner route works right away: {kept}"
+        );
+        assert!(kept.contains("PUT /domains/{domain}/owner"), "{kept}");
+    }
 
     #[test]
     fn a_domain_name_is_one_plain_segment() {

@@ -3196,9 +3196,118 @@ async fn creating_a_domain_a_stranger_holds_privately_is_a_conflict() {
         detail.contains("rolled back"),
         "the registration did not survive the refusal: {detail}"
     );
+    assert!(
+        detail.contains("Register it again"),
+        "rolled back, so the remedy has to register the name again before the \
+         owner route can reach it: {detail}"
+    );
     // Rolled back, so nothing is left registered and shared.
     assert!(
         !fx.engine.config().domains.contains_key("orphaned"),
         "nothing was left registered"
+    );
+
+    // The remedy the 409 names, pasted: register the name again (without
+    // asking for private, which would only hit the same conflict again),
+    // hand the surviving record over, then close it. Each call has to
+    // succeed for the remedy to be real rather than aspirational.
+    let recreated = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &root)
+        .json(&serde_json::json!({ "mode": "local", "name": "orphaned" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        recreated.status(),
+        201,
+        "the plain create the remedy names must actually register the name again"
+    );
+    let handed_over = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/orphaned/owner",
+        &root,
+    )
+    .json(&serde_json::json!({ "owner": "root" }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        handed_over.status(),
+        204,
+        "the owner route the remedy names must work once the name is registered again"
+    );
+    let closed = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/orphaned/visibility",
+        &root,
+    )
+    .json(&serde_json::json!({ "private": true }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        closed.status(),
+        204,
+        "closing it again is a no-op once the hand-over already made it the caller's"
+    );
+}
+
+/// The sibling of the test above, for the branch its 409 cannot reach through
+/// the public API: a rollback that fails leaves the domain REGISTERED with
+/// the foreign private-domain record still standing, which is exactly the
+/// state built here directly (register plainly, then plant the record
+/// underneath it rather than going through `create`'s own conflict). The
+/// message for that branch must not claim the domain is shared, and its
+/// remedy - the owner route, with no re-registration first - has to work
+/// against this exact state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_direct_hand_over_works_on_a_registered_domain_a_stranger_holds_privately() {
+    let _serialized = support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let root = login(fx.addr, "root", "rootpw").await;
+    fx.auth
+        .add_user(
+            "stranger2",
+            "Stranger Two",
+            None,
+            Role::Viewer,
+            "strangerpw",
+        )
+        .await
+        .unwrap();
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &root)
+        .json(&serde_json::json!({ "mode": "local", "name": "keptregistered" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    // Planted directly, standing in for the record a failed rollback would
+    // have left standing underneath an already-registered domain.
+    fx.auth
+        .set_domain_visibility("keptregistered", true, "stranger2")
+        .await
+        .unwrap();
+    assert!(
+        fx.engine.config().domains.contains_key("keptregistered"),
+        "registered throughout, unlike the rolled-back branch"
+    );
+
+    let handed_over = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/keptregistered/owner",
+        &root,
+    )
+    .json(&serde_json::json!({ "owner": "root" }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        handed_over.status(),
+        204,
+        "the direct hand-over the not-rolled-back message names must work with no \
+         re-registration first"
     );
 }
