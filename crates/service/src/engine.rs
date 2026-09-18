@@ -15251,16 +15251,14 @@ impl Engine {
     /// effective one, the write-lock-first order every config mutation here
     /// follows so no env value bakes into the saved file.
     ///
-    /// A domain absent from the file snapshot answers
-    /// [`EngineError::UnknownDomain`], which is reachable in one shape and is
-    /// the same answer [`Engine::domain_remove`] gives it: a domain another
-    /// process registered in the config file after this engine started is in
-    /// the discovered-domain cache (where `domain_entry` finds it after missing
-    /// in `self.config`, so the gates above pass) and not in the snapshot this
-    /// persists from.
-    /// The refusal is confusing rather than damaging - nothing is written - and
-    /// closing it means every config mutation here re-reading the file under
-    /// its own lock, which is a change to all of them rather than to this one.
+    /// A domain absent from the file answers [`EngineError::UnknownDomain`],
+    /// the same answer [`Engine::domain_remove`] gives it. The file, not the
+    /// startup snapshot: a domain another process registered in the config
+    /// file after this engine started passed the gates above through
+    /// `domain_entry` and used to miss here, since the snapshot never learned
+    /// of it. Every config mutation now starts from the file on disk (see
+    /// [`Engine::fresh_file_config`]), so the one shape left is a domain the
+    /// file really does not hold.
     fn write_review_key(
         &self,
         domain: &str,
