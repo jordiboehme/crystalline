@@ -71,6 +71,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "version": crystalline_core::VERSION,
                 "uptime_secs": shared.uptime_secs(),
                 "sessions": shared.session_count(),
+                // The bounded life, when this daemon has one: seconds of
+                // idleness it leaves after, null for a daemon that outlives
+                // its clients. `crystalline status` renders it as a line.
+                "idle_exit_secs": shared.idle_exit().map(|d| d.as_secs()),
                 "http": shared.http_addr.clone(),
                 "http_sessions": shared.http_session_count(),
                 "read_only": shared.engine.read_only(),

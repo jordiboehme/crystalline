@@ -30,6 +30,12 @@ use crate::overlay;
 /// so `config show` and the daemon cannot drift apart.
 pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
 
+/// How long a daemon asked to `--exit-when-idle` waits after its last socket
+/// session ends before it leaves. Long enough for Claude Desktop to restart its
+/// extension server and find the same daemon, short enough that nothing of the
+/// extension outlives Desktop by more than a moment.
+pub const IDLE_EXIT_GRACE: Duration = Duration::from_secs(5);
+
 /// Startup banner, shown on a foreground start when stderr is a terminal.
 const BANNER: &str = r"
                                              ◆───◆───◆
@@ -105,6 +111,10 @@ pub struct Shared {
     next_session: AtomicU64,
     http_sessions: Arc<AtomicUsize>,
     shutdown_tx: watch::Sender<bool>,
+    /// The live socket-session count, published for the idle exit.
+    sessions_tx: watch::Sender<usize>,
+    /// The idle grace this daemon leaves after, when it was asked to.
+    idle_exit: Option<Duration>,
 }
 
 impl Shared {
@@ -116,6 +126,12 @@ impl Shared {
     /// The number of live socket sessions.
     pub fn session_count(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+
+    /// The grace after which this daemon exits idle, when it was started with
+    /// `--exit-when-idle`; `None` for a daemon that outlives its clients.
+    pub fn idle_exit(&self) -> Option<Duration> {
+        self.idle_exit
     }
 
     /// The cumulative number of HTTP sessions the daemon has served.
@@ -132,7 +148,8 @@ impl Shared {
 
     fn begin_session(&self, kind: &str) -> u64 {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
-        self.sessions.lock().unwrap().insert(
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.insert(
             id,
             SessionInfo {
                 id,
@@ -140,11 +157,16 @@ impl Shared {
                 since: chrono::Utc::now().to_rfc3339(),
             },
         );
+        // Nobody listens unless the idle exit runs; a send with no receiver
+        // is the normal case, not an error.
+        let _ = self.sessions_tx.send(sessions.len());
         id
     }
 
     fn end_session(&self, id: u64) {
-        self.sessions.lock().unwrap().remove(&id);
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.remove(&id);
+        let _ = self.sessions_tx.send(sessions.len());
     }
 
     /// Signal shutdown to every watcher.
@@ -175,7 +197,9 @@ impl Shared {
 /// turned off, so `--http` moves it or closes it rather than opening it; see
 /// [`resolve_http`]. The effective read-only mode is the explicit flag or
 /// `service.read_only`; `take_over` forces host-lock claims for a deliberate host
-/// migration in a shared database.
+/// migration in a shared database. `exit_when_idle` bounds the daemon's life to
+/// [`IDLE_EXIT_GRACE`] past its last socket session, the Claude Desktop
+/// extension's shape; see `spawn_daemon`.
 // The daemon's startup switches are flat on purpose, one clap flag each.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
@@ -187,6 +211,7 @@ pub async fn run_serve(
     config_path: Option<PathBuf>,
     read_only: bool,
     take_over: bool,
+    exit_when_idle: bool,
 ) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -333,6 +358,8 @@ pub async fn run_serve(
     ownership.publish()?;
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let (sessions_tx, sessions_rx) = watch::channel(0usize);
+    let idle_shutdown = shutdown_tx.clone();
     let http_sessions = Arc::new(AtomicUsize::new(0));
     let shared = Arc::new(Shared {
         engine: engine.clone(),
@@ -343,7 +370,16 @@ pub async fn run_serve(
         next_session: AtomicU64::new(1),
         http_sessions: http_sessions.clone(),
         shutdown_tx,
+        sessions_tx,
+        idle_exit: exit_when_idle.then_some(IDLE_EXIT_GRACE),
     });
+    // The extension's bounded life: started now, so a stub that dies before
+    // it ever attaches (Desktop quitting mid-spawn) still ends this daemon.
+    if exit_when_idle {
+        tokio::spawn(run_idle_exit(sessions_rx, IDLE_EXIT_GRACE, idle_shutdown));
+    } else {
+        drop(sessions_rx);
+    }
 
     if !daemon_flag {
         if std::io::stderr().is_terminal() {
@@ -1718,6 +1754,52 @@ async fn run_heartbeat(engine: Arc<Engine>, secs: u64, mut shutdown: watch::Rece
     }
 }
 
+/// End the daemon once it has had no socket session for `grace`, the bounded
+/// life of a daemon the Claude Desktop extension started (`--exit-when-idle`).
+///
+/// Only socket sessions count: `ctl` requests are transient and HTTP sessions
+/// (the web UI, a remote agent) are not what keeps a Desktop-started daemon
+/// alive. The grace restarts from zero whenever the count returns to zero, so a
+/// client that reconnects inside it (Desktop restarting its server) keeps the
+/// daemon. Ends quietly on an external shutdown.
+pub(crate) async fn run_idle_exit(
+    mut sessions: watch::Receiver<usize>,
+    grace: Duration,
+    shutdown: watch::Sender<bool>,
+) {
+    let mut stop = shutdown.subscribe();
+    loop {
+        while *sessions.borrow_and_update() > 0 {
+            tokio::select! {
+                _ = wait_true(&mut stop) => return,
+                changed = sessions.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = wait_true(&mut stop) => return,
+            changed = sessions.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(grace) => {
+                if *sessions.borrow_and_update() == 0 {
+                    tracing::info!(
+                        "no client for {}s; exiting, the bounded life of a daemon the Claude Desktop extension started",
+                        grace.as_secs()
+                    );
+                    let _ = shutdown.send(true);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// How often the origin poller wakes up to ask the engine which domains are
 /// due. This is only the scheduler's own heartbeat, not the poll interval
 /// any domain actually keeps: `Engine::origin_poll_tick` tracks each
@@ -2341,6 +2423,98 @@ pub(crate) async fn open_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idle exit on a paused clock: with no session it trips the shutdown
+    /// once the grace has elapsed, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_trips_shutdown_after_the_grace_with_no_session() {
+        let (_sessions_tx, sessions_rx) = watch::channel(0usize);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_idle_exit(
+            sessions_rx,
+            Duration::from_secs(5),
+            shutdown_tx.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!*shutdown_rx.borrow(), "not before the grace");
+        tokio::time::timeout(Duration::from_secs(10), shutdown_rx.wait_for(|v| *v))
+            .await
+            .expect("the idle exit trips within the grace")
+            .expect("the shutdown sender is alive");
+        task.await.unwrap();
+    }
+
+    /// A live session holds the daemon indefinitely; the grace only starts
+    /// once the last one is gone.
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_waits_while_a_session_is_live() {
+        let (sessions_tx, sessions_rx) = watch::channel(1usize);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_idle_exit(
+            sessions_rx,
+            Duration::from_secs(5),
+            shutdown_tx.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert!(!*shutdown_rx.borrow(), "a live session holds the daemon");
+        sessions_tx.send(0).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), shutdown_rx.wait_for(|v| *v))
+            .await
+            .expect("the grace starts when the last session ends")
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    /// A client that comes back inside the grace cancels the exit: Claude
+    /// Desktop restarting its server must find the same daemon.
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_is_cancelled_by_a_session_arriving_inside_the_grace() {
+        let (sessions_tx, sessions_rx) = watch::channel(0usize);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_idle_exit(
+            sessions_rx,
+            Duration::from_secs(5),
+            shutdown_tx.clone(),
+        ));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        sessions_tx.send(1).unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            !*shutdown_rx.borrow(),
+            "the returning client kept the daemon"
+        );
+        sessions_tx.send(0).unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !*shutdown_rx.borrow(),
+            "a fresh grace, not the remainder of the old one"
+        );
+        tokio::time::timeout(Duration::from_secs(10), shutdown_rx.wait_for(|v| *v))
+            .await
+            .expect("the idle exit trips after the fresh grace")
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    /// A shutdown from anywhere else (a signal, `ctl shutdown`) ends the task
+    /// without it sending anything of its own.
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_stops_on_an_external_shutdown() {
+        let (sessions_tx, sessions_rx) = watch::channel(1usize);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_idle_exit(
+            sessions_rx,
+            Duration::from_secs(5),
+            shutdown_tx.clone(),
+        ));
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the task ends on shutdown")
+            .unwrap();
+        drop(sessions_tx);
+    }
 
     /// Every path rmcp ends a session on runs through `close_session`, so
     /// releasing the identity claim there is what keeps the gate's map in step

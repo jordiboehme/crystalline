@@ -1824,6 +1824,11 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         println!(
             "Exposure: asked to bind HTTP {bound}, Host allow-list {host_note} (started by {started_by})"
         );
+        // A bounded life is the Claude Desktop extension's shape; a daemon
+        // that outlives its clients has no line, not a "never".
+        if let Some(secs) = data.get("idle_exit_secs").and_then(Value::as_u64) {
+            println!("Lifetime: exits {secs}s after its last client disconnects");
+        }
     }
     let registered: Vec<&str> = data["registered"]
         .as_array()
