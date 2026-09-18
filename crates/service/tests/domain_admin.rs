@@ -789,3 +789,153 @@ async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_pur
     assert_eq!(purged["unregistered"], serde_json::json!(true));
     assert_eq!(purged["files_kept"], serde_json::json!(false));
 }
+
+/// A domain registered after the engine started is listed. The CLI's `domain
+/// add` edits the config file from another process and never touches the
+/// daemon's in-memory snapshot, and a named read already finds such a domain
+/// through the same fresh re-read of the file, so the listing that Fluid's
+/// home screen and the `list_domains` tool read must find it the same way -
+/// synced or not, and without anybody having asked for it by name first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_registered_after_startup_is_listed() {
+    let (tmp, engine) = engine().await;
+    let listing = engine
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let names = |listing: &serde_json::Value| -> Vec<String> {
+        listing["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&listing), vec!["eng"]);
+
+    // Register a second domain the way the CLI does with a daemon running:
+    // edit the config file on disk, tell nothing in this process.
+    let config_path = tmp.path().join("config.yaml");
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let dir = tmp.path().join("extra");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST.replace("eng", "extra")).unwrap();
+    file.domains
+        .insert("extra".to_string(), DomainEntry::file(dir.clone()));
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    let listing = engine
+        .list_domains(
+            &ListDomainsParams {
+                include_routing: true,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&listing), vec!["eng", "extra"], "{listing}");
+    let extra = &listing["domains"][1];
+    assert_eq!(extra["kind"], "file");
+    assert_eq!(extra["path"], dir.display().to_string());
+    // Never synced, so the index has no counts for it: null, not zero, the
+    // same answer a registered-but-unindexed domain gets at startup.
+    assert_eq!(extra["engrams"], serde_json::Value::Null);
+    assert_eq!(
+        extra["when_to_use"],
+        serde_json::json!(["Route here for extra questions"]),
+        "its routing bullets are read from its MANIFEST: {extra}"
+    );
+}
+
+/// A domain registered after the engine started survives this engine's own
+/// config writes, and is a registration its own verbs can act on. Every
+/// config mutation here loads the file from disk, changes it and saves it:
+/// starting from the startup snapshot instead would persist a copy of the
+/// file without the domain the CLI's `domain add` wrote into it, which is how
+/// a daemon-side `config set` used to drop a freshly added domain from the
+/// registry, and how `domain remove` of one answered "not registered" while
+/// naming it among the registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_registered_after_startup_survives_this_engines_config_writes() {
+    let (tmp, engine) = engine().await;
+    let config_path = tmp.path().join("config.yaml");
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let dir = tmp.path().join("extra");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST.replace("eng", "extra")).unwrap();
+    file.domains
+        .insert("extra".to_string(), DomainEntry::file(dir.clone()));
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    // A setting written through this engine keeps the file's registration.
+    engine
+        .configure(&crystalline_service::engine::ConfigureAction::Set {
+            key: "search.salience_weight".to_string(),
+            value: "0.2".to_string(),
+        })
+        .await
+        .unwrap();
+    let file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(
+        file.domains.contains_key("extra"),
+        "the config write kept the domain the file already held: {:?}",
+        file.domains.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(file.salience_weight(), Some(0.2));
+
+    // And the registration is one this engine's own verbs act on: a removal
+    // finds it in the file rather than answering "not registered".
+    let report = engine.domain_remove("extra").await.unwrap();
+    assert_eq!(report["unregistered"], true);
+    let file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(!file.domains.contains_key("extra"), "removed from the file");
+    assert!(
+        file.domains.contains_key("eng"),
+        "and nothing else went with it"
+    );
+    let listing = engine
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(!listing.to_string().contains("\"extra\""), "{listing}");
+}
+
+/// Registering through this engine checks the name against every registration
+/// it has, a domain the CLI wrote into the file after startup included: the
+/// same name at another folder is refused rather than re-registered over, and
+/// the same name at the same folder is adopted rather than duplicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_through_the_engine_sees_a_domain_registered_after_startup() {
+    let (tmp, engine) = engine().await;
+    let config_path = tmp.path().join("config.yaml");
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let dir = tmp.path().join("extra");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST.replace("eng", "extra")).unwrap();
+    file.domains
+        .insert("extra".to_string(), DomainEntry::file(dir.clone()));
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    let elsewhere = tmp.path().join("elsewhere");
+    let err = engine
+        .domain_add_local(Some("extra"), Some(elsewhere.to_str().unwrap()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("already registered at a different folder"),
+        "{err}"
+    );
+    let file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert_eq!(
+        file.domains["extra"].file_path().as_deref(),
+        Some(dir.as_path()),
+        "the registration on disk is untouched"
+    );
+
+    let report = engine
+        .domain_add_local(Some("extra"), Some(dir.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(report["adopted"], true, "{report}");
+}
