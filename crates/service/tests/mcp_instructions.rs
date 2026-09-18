@@ -328,6 +328,36 @@ async fn scaffolding_a_virtual_manifest_makes_its_bullets_appear() {
     );
 }
 
+/// A virtual domain registered after startup gets its bullets too. The CLI's
+/// `domain add --virtual` writes the registration into the config file from
+/// its own process and asks a running daemon only to scaffold the MANIFEST,
+/// so the routing cache that refresh fills has to look past the daemon's
+/// startup snapshot to find the domain it is caching bullets for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_domain_added_after_startup_gets_its_bullets_on_scaffold() {
+    let mut h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+
+    h.config
+        .domains
+        .insert("notes".to_string(), DomainEntry::virtual_domain());
+    crystalline_core::config::save_yaml(&h.config_path, &h.config).unwrap();
+
+    h.engine
+        .scaffold_virtual_manifest(
+            "notes",
+            &manifest_md("notes", &["Route here for notes questions"]),
+        )
+        .await
+        .unwrap();
+
+    let (client, _s) = h.connect().await;
+    let block = instructions(&client);
+    assert!(
+        block.contains("- notes: Route here for notes questions"),
+        "the late-registered virtual domain's bullets are cached:\n{block}"
+    );
+}
+
 /// The read-only variant drops every content-mutating tool name and states the
 /// knowledge is curated externally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

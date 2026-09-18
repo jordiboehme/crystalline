@@ -10384,7 +10384,11 @@ impl Engine {
     /// [`Engine::refresh_routing_cache`] for the MCP server instructions.
     pub async fn virtual_routing_bullets(&self) -> BTreeMap<String, Vec<String>> {
         let mut out = BTreeMap::new();
-        let domains = self.config.read().unwrap().domains.clone();
+        // Every registration, not the startup snapshot: a virtual domain the
+        // CLI registered after this engine started asks it only to scaffold
+        // the MANIFEST, and the refresh that follows caches bullets for the
+        // domains found here.
+        let domains = self.registered_domain_entries();
         for (name, entry) in &domains {
             if entry.is_virtual() {
                 out.insert(name.clone(), self.virtual_routing_bullets_for(name).await);
@@ -13258,7 +13262,7 @@ impl Engine {
                     // synchronous (no .await), so holding the guard across it is
                     // safe. Lock order is always file_config then config.
                     let mut file_guard = self.file_config.write().unwrap();
-                    let mut file = file_guard.clone();
+                    let mut file = self.fresh_file_config(&file_guard);
                     settings::apply(&mut file, key, value)?;
                     self.persist_config(&file)?;
                     // Recompute the effective config from the freshly saved file
@@ -13281,7 +13285,7 @@ impl Engine {
                 let view = {
                     // Same write-lock-first discipline and lock order as Set above.
                     let mut file_guard = self.file_config.write().unwrap();
-                    let mut file = file_guard.clone();
+                    let mut file = self.fresh_file_config(&file_guard);
                     settings::unset(&mut file, key)?;
                     self.persist_config(&file)?;
                     let effective = self.overlay.apply(&file);
@@ -13352,11 +13356,40 @@ impl Engine {
             .unwrap_or(Value::Null)
     }
 
+    /// The file config a mutation starts from, read under the `file_config`
+    /// write lock the caller holds: the file on disk as it stands right now,
+    /// not the snapshot this engine took at startup.
+    ///
+    /// The file has other writers. The CLI's local `domain add` registers a
+    /// domain by editing it from its own process, and an operator edits it by
+    /// hand; neither reaches this engine's snapshot. A mutation that started
+    /// from the snapshot persisted a copy of the file without whatever those
+    /// writers had added, which is how a daemon-side `config set` used to drop
+    /// a freshly added domain from the registry, and how `domain remove` of
+    /// one answered "not registered" while naming it among the registered.
+    /// Loading the file first makes every mutation the load-modify-save
+    /// [`Engine::persist_config`] promises.
+    ///
+    /// The snapshot is the base only when there is no file to load: an engine
+    /// built over a configuration never written to disk, which is what a
+    /// one-shot command and many test engines are, or a file that will not
+    /// parse, where persisting the snapshot is what happened before too.
+    fn fresh_file_config(&self, snapshot: &GlobalConfig) -> GlobalConfig {
+        let Some(path) = self.config_file_path() else {
+            return snapshot.clone();
+        };
+        if !path.is_file() {
+            return snapshot.clone();
+        }
+        overlay::load_file(&path).unwrap_or_else(|_| snapshot.clone())
+    }
+
     /// Persist a config to the path this engine was started with (its
     /// `--config` override), or the default global config path when none was
     /// given. Never touches unrelated content: the caller always passes the
-    /// current, load-modify-save typed config, so the serde round trip keeps
-    /// every other key byte-for-byte.
+    /// current, load-modify-save typed config (see
+    /// [`Engine::fresh_file_config`] for the load), so the serde round trip
+    /// keeps every other key byte-for-byte.
     fn persist_config(&self, config: &GlobalConfig) -> Result<()> {
         let path = match &self.config_path {
             Some(p) => p.clone(),
@@ -13482,7 +13515,7 @@ impl Engine {
                 // in. Lock order is always file_config then config.
                 {
                     let mut file_guard = self.file_config.write().unwrap();
-                    let mut file = file_guard.clone();
+                    let mut file = self.fresh_file_config(&file_guard);
                     set_domain_provision_decision(&mut file, domain, allow)?;
                     self.persist_config(&file)?;
                     let effective = self.overlay.apply(&file);
@@ -13604,8 +13637,13 @@ impl Engine {
             .map_err(|e| EngineError::Internal(format!("resolving {}: {e}", root.display())))?;
 
         // Decide the domain name and whether we adopt an existing registration.
+        // Against every registration this instance has, not the startup
+        // snapshot alone: a domain the CLI registered after this engine
+        // started is in the file and would otherwise be re-registered over,
+        // or handed a name derived as if it were free.
         let (domain_name, adopted) = {
-            let cfg = self.config.read().unwrap();
+            let mut cfg = self.config();
+            cfg.domains = self.registered_domain_entries();
             match name {
                 Some(n) => {
                     // An env-defined domain of this name is owned by its variable.
@@ -13661,7 +13699,7 @@ impl Engine {
         // adopted registration is already in the config.
         if !adopted {
             let mut file_guard = self.file_config.write().unwrap();
-            let mut file = file_guard.clone();
+            let mut file = self.fresh_file_config(&file_guard);
             file.domains
                 .insert(domain_name.clone(), DomainEntry::file(canonical.clone()));
             self.persist_config(&file)?;
@@ -13727,7 +13765,7 @@ impl Engine {
         // content source, which requires the domain to already be registered.
         if is_new {
             let mut file_guard = self.file_config.write().unwrap();
-            let mut file = file_guard.clone();
+            let mut file = self.fresh_file_config(&file_guard);
             file.domains
                 .insert(name.to_string(), DomainEntry::virtual_domain());
             self.persist_config(&file)?;
@@ -15229,7 +15267,7 @@ impl Engine {
         review: Option<crystalline_core::config::ReviewMode>,
     ) -> Result<()> {
         let mut file_guard = self.file_config.write().unwrap();
-        let mut file = file_guard.clone();
+        let mut file = self.fresh_file_config(&file_guard);
         let Some(entry) = file.domains.get_mut(domain) else {
             return Err(EngineError::UnknownDomain {
                 domain: domain.to_string(),
@@ -15336,7 +15374,7 @@ impl Engine {
         // guard is released well before the awaits that follow.
         let removed = {
             let mut file_guard = self.file_config.write().unwrap();
-            let mut file = file_guard.clone();
+            let mut file = self.fresh_file_config(&file_guard);
             let removed = match file.domains.shift_remove(name) {
                 Some(entry) => entry,
                 None => {
@@ -15935,7 +15973,7 @@ impl Engine {
         // a half-applied config and no env value bakes into the saved file.
         {
             let mut file_guard = self.file_config.write().unwrap();
-            let mut file = file_guard.clone();
+            let mut file = self.fresh_file_config(&file_guard);
             file.domains.insert(
                 domain_name.clone(),
                 DomainEntry {
