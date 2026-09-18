@@ -789,3 +789,60 @@ async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_pur
     assert_eq!(purged["unregistered"], serde_json::json!(true));
     assert_eq!(purged["files_kept"], serde_json::json!(false));
 }
+
+/// A domain registered after the engine started is listed. The CLI's `domain
+/// add` edits the config file from another process and never touches the
+/// daemon's in-memory snapshot, and a named read already finds such a domain
+/// through the same fresh re-read of the file, so the listing that Fluid's
+/// home screen and the `list_domains` tool read must find it the same way -
+/// synced or not, and without anybody having asked for it by name first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_registered_after_startup_is_listed() {
+    let (tmp, engine) = engine().await;
+    let listing = engine
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let names = |listing: &serde_json::Value| -> Vec<String> {
+        listing["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&listing), vec!["eng"]);
+
+    // Register a second domain the way the CLI does with a daemon running:
+    // edit the config file on disk, tell nothing in this process.
+    let config_path = tmp.path().join("config.yaml");
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let dir = tmp.path().join("extra");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST.replace("eng", "extra")).unwrap();
+    file.domains
+        .insert("extra".to_string(), DomainEntry::file(dir.clone()));
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    let listing = engine
+        .list_domains(
+            &ListDomainsParams {
+                include_routing: true,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&listing), vec!["eng", "extra"], "{listing}");
+    let extra = &listing["domains"][1];
+    assert_eq!(extra["kind"], "file");
+    assert_eq!(extra["path"], dir.display().to_string());
+    // Never synced, so the index has no counts for it: null, not zero, the
+    // same answer a registered-but-unindexed domain gets at startup.
+    assert_eq!(extra["engrams"], serde_json::Value::Null);
+    assert_eq!(
+        extra["when_to_use"],
+        serde_json::json!(["Route here for extra questions"]),
+        "its routing bullets are read from its MANIFEST: {extra}"
+    );
+}

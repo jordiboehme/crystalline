@@ -49,6 +49,7 @@ use crystalline_remote::ops;
 use crystalline_remote::{
     GitHubProvider, OriginSpec, Provider, RemoteError, StoredToken, TokenIdentity, TokenStore,
 };
+use indexmap::IndexMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -3466,11 +3467,34 @@ impl Engine {
     /// [`Engine::known_domain_names`], whose two tiers miss a registration this
     /// process has never been asked about by name.
     pub fn registered_domain_names(&self) -> HashSet<String> {
-        let mut names: HashSet<String> = self.known_domain_names().into_iter().collect();
-        if let Some(fresh) = self.reread_config() {
-            names.extend(fresh.domains.keys().cloned());
+        self.registered_domain_entries().into_keys().collect()
+    }
+
+    /// [`Engine::registered_domain_names`] with each name's entry: the same
+    /// three-tier union, resolved in the order [`Engine::domain_entry`]
+    /// resolves a name (snapshot, then discovered overlay, then the file), so
+    /// a name every tier holds is served with the entry a named read would
+    /// get. The same one file read, and the same absence of side effects:
+    /// nothing found here is cached or watched.
+    ///
+    /// **This is what a listing iterates.** The CLI's `domain add` registers a
+    /// domain by editing the config file from another process and, with a
+    /// daemon running, only asks it to sync the new name; the daemon's
+    /// snapshot never learns of it. A listing drawn from the snapshot alone
+    /// therefore omitted a domain every named verb resolved and every search
+    /// hit, until the daemon restarted - which is what Fluid's home screen and
+    /// the `list_domains` tool showed a user who had just added one.
+    fn registered_domain_entries(&self) -> IndexMap<String, DomainEntry> {
+        let mut entries = self.config.read().unwrap().domains.clone();
+        for (name, entry) in self.discovered_domains.read().unwrap().iter() {
+            entries.entry(name.clone()).or_insert_with(|| entry.clone());
         }
-        names
+        if let Some(fresh) = self.reread_config() {
+            for (name, entry) in fresh.domains {
+                entries.entry(name).or_insert(entry);
+            }
+        }
+        entries
     }
 
     /// [`Engine::registered_domain_names`] for the one caller that may not
@@ -10091,9 +10115,12 @@ impl Engine {
         drop(store);
 
         let mut out = Vec::new();
-        // Cloned out from behind the lock before any `.await` below, matching
-        // the `hosted`/`discovered_domains` convention elsewhere in this file.
-        let domains = self.config.read().unwrap().domains.clone();
+        // Every registration this instance has, not the startup snapshot
+        // alone: a domain `domain add` wrote into the config file after this
+        // daemon started is registered, and a listing that left it out while
+        // named reads and search served it is the gap issue #70 reported.
+        // Cloned out from behind the locks before any `.await` below.
+        let domains = self.registered_domain_entries();
         // Sorted by name rather than left in registration order, which is what
         // the map preserves and what a reader scanning a sidebar has no use
         // for. Case-insensitive first, so capitalization never sorts a domain
@@ -10442,19 +10469,22 @@ impl Engine {
     /// and virtual arms and `origin_add` all persist to disk and then write
     /// `self.config` in the same call, under `file_config`-then-`config` lock
     /// order, before returning - a concurrent reader sees the new value the
-    /// instant the write lock releases, no re-read needed. `domain remove`
-    /// (`cmd::domain_remove` in the CLI crate) is the one path that does not:
-    /// it is a free function with no `Engine` reference at all, so it mutates
-    /// the config file directly regardless of whether a daemon is live; the
-    /// only in-process signal a running daemon gets is the `forget_domain` ctl
-    /// call, and `Engine::forget_domain` only drops the name from
-    /// `discovered_domains` and tells the watcher to stop - it never touches
-    /// `self.config`. Serving from `self.config` alone would therefore keep a
-    /// removed domain in every connection's routing block until the daemon
-    /// restarts, not just for one racing connection - a real regression, not
-    /// the already-accepted bounded staleness this comment describes for the
-    /// `None` branch below. So the re-read stays for as long as `domain
-    /// remove` is the one mutation path that does not refresh `self.config`.
+    /// instant the write lock releases, no re-read needed. The CLI's local
+    /// `domain add` (`cmd::domain_add_register` in the CLI crate) is the one
+    /// path that does not: it is a free function with no `Engine` reference
+    /// at all, so it edits the config file directly regardless of whether a
+    /// daemon is live, and the only in-process signal a running daemon gets is
+    /// the `sync` ctl call that follows, which resolves the name through
+    /// `refresh_domain` into `discovered_domains` and never touches
+    /// `self.config`. (`domain remove` used to be this path too; it now goes
+    /// through `Engine::domain_remove`, over ctl when a daemon runs.) Serving
+    /// from `self.config` alone would therefore leave a freshly added domain
+    /// out of every connection's routing block until the daemon restarts, not
+    /// just for one racing connection - a real regression, not the
+    /// already-accepted bounded staleness this comment describes for the
+    /// `None` branch below. So the re-read stays for as long as `domain add`
+    /// is a mutation path that does not refresh `self.config`, and
+    /// [`Engine::registered_domain_entries`] is the same rule for the listing.
     pub fn routing_text(&self) -> String {
         crystalline_core::render_instructions(&self.routing_output(&HashSet::new()))
     }
