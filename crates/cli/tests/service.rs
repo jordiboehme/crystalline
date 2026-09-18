@@ -485,6 +485,132 @@ fn single_daemon_two_clients_and_stale_recovery() {
     assert!(!env.lock_path().exists(), "lock removed on shutdown");
 }
 
+/// The Claude Desktop extension's daemon: started attached with a bounded
+/// life, it reports that life, keeps serving a client that returns inside the
+/// grace (Desktop restarting its server) and leaves on its own once the last
+/// client is gone, taking its lock and record with it.
+#[test]
+fn an_extension_started_daemon_leaves_once_its_last_client_is_gone() {
+    let env = Env::new("idle");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn_with_env(&env, "CRYSTALLINE_CHANNEL", "mcpb");
+    c1.initialize();
+    env.wait_ready();
+    let status = status_json(&env);
+    assert_eq!(status["idle_exit_secs"], json!(5), "bounded life: {status}");
+    assert_eq!(status["started_by"], json!("autostart"), "{status}");
+    let pid = status["pid"].as_u64().unwrap();
+    let (ok, out) = env.run(&["status"]);
+    assert!(ok, "status: {out}");
+    assert!(
+        out.contains("Lifetime: exits 5s after its last client disconnects"),
+        "the bounded life renders: {out}"
+    );
+
+    // The client is killed outright (`Mcp::drop` is `child.kill()`, SIGKILL on
+    // unix: the abrupt end Desktop's teardown is, not a polite stdin close)
+    // and another comes back inside the grace: same daemon.
+    drop(c1);
+    std::thread::sleep(Duration::from_secs(2));
+    let mut c2 = Mcp::spawn(&env);
+    c2.initialize();
+    std::thread::sleep(Duration::from_secs(6));
+    let status = status_json(&env);
+    assert_eq!(
+        status["pid"].as_u64(),
+        Some(pid),
+        "the returning client kept the daemon: {status}"
+    );
+    assert_eq!(status["sessions"], json!(1), "{status}");
+
+    // The last client leaves: gone within the grace plus its own shutdown.
+    drop(c2);
+    let start = Instant::now();
+    while (env.lock_path().exists() || env.info_path().exists())
+        && start.elapsed() < Duration::from_secs(15)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !env.lock_path().exists() && !env.info_path().exists(),
+        "the daemon left on its own after {:?}",
+        start.elapsed()
+    );
+}
+
+/// A stub counts as a client from the moment it attaches, not from its
+/// client's first request: a Claude Desktop stub whose client stays silent
+/// past the grace must not lose its daemon under it.
+#[test]
+fn a_silent_stub_holds_an_extension_started_daemon_past_the_grace() {
+    let env = Env::new("silent");
+    env.setup_domain("eng");
+
+    // Spawned, never spoken to: no initialize for longer than the grace.
+    let mut c1 = Mcp::spawn_with_env(&env, "CRYSTALLINE_CHANNEL", "mcpb");
+    env.wait_ready();
+    std::thread::sleep(Duration::from_secs(7));
+    let status = status_json(&env);
+    assert_eq!(status["idle_exit_secs"], json!(5), "{status}");
+    assert_eq!(
+        status["sessions"],
+        json!(1),
+        "the silent stub is a counted session: {status}"
+    );
+    let pid = status["pid"].as_u64().unwrap();
+
+    // It still serves once the client finally speaks.
+    c1.initialize();
+    let status = status_json(&env);
+    assert_eq!(status["pid"].as_u64(), Some(pid), "same daemon: {status}");
+
+    drop(c1);
+    let start = Instant::now();
+    while (env.lock_path().exists() || env.info_path().exists())
+        && start.elapsed() < Duration::from_secs(15)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !env.lock_path().exists() && !env.info_path().exists(),
+        "gone after its only client left"
+    );
+}
+
+/// The control: a daemon any other client started has no bounded life and is
+/// still there long after the grace an extension's daemon would have left in.
+#[test]
+fn a_plain_autostarted_daemon_outlives_its_clients() {
+    let env = Env::new("stay");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+    let status = status_json(&env);
+    assert!(
+        status["idle_exit_secs"].is_null(),
+        "no bounded life: {status}"
+    );
+    let pid = status["pid"].as_u64().unwrap();
+
+    drop(c1);
+    std::thread::sleep(Duration::from_secs(7));
+    let status = status_json(&env);
+    assert_eq!(
+        status["pid"].as_u64(),
+        Some(pid),
+        "still the same daemon: {status}"
+    );
+    assert_eq!(status["sessions"], json!(0), "{status}");
+
+    let (ok, _) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown");
+    wait_lock_released(&env);
+    assert!(!env.lock_path().exists(), "lock removed on shutdown");
+}
+
 /// End to end: a daemon started read-only reports it over ctl status, hides
 /// the write-gated tools from tools/list and refuses a write call by name with
 /// the read-only error.
@@ -2015,6 +2141,10 @@ fn status_with_a_daemon_renders_text_with_the_daemon_line() {
     assert!(out.contains("Index: "), "{out}");
     assert!(out.contains("Activity: "), "{out}");
     assert!(out.contains("eng\t"), "{out}");
+    assert!(
+        !out.contains("Lifetime:"),
+        "a plain daemon has no lifetime line: {out}"
+    );
 
     let (ok, out) = env.run(&["status", "--json"]);
     assert!(ok, "{out}");

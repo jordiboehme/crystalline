@@ -1086,8 +1086,20 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
     Some(file.into())
 }
 
-/// Spawn `current_exe serve --daemon` fully detached, forwarding `--read-only`
-/// when this instance was asked to serve read-only.
+/// Spawn `current_exe serve --daemon`, forwarding `--read-only` when this
+/// instance was asked to serve read-only.
+///
+/// Off the Claude Desktop extension the daemon is fully detached (its own
+/// session on unix, a breakaway from the parent's job on Windows) and outlives
+/// every client, by design: it serves the user's state directory and the web
+/// UI to whoever comes next. On the extension (`CRYSTALLINE_CHANNEL=mcpb`) it is
+/// neither: `current_exe` is then the in-place binary inside Claude Desktop's
+/// own extension folder, and a detached daemon running from it kept that file
+/// locked past Desktop's teardown, which on Windows blocked the packaged host
+/// from updating or relaunching (2026-09-18). So the extension's daemon stays
+/// in the stub's process group and job, where Desktop's own teardown reaches
+/// it, and carries `--exit-when-idle`, which ends it on its own once its last
+/// client is gone even when that teardown never comes.
 ///
 /// No `--http off` is passed and none ever should be: a daemon started this way
 /// (an agent's `crystalline mcp` connection, the Desktop extension) serves the
@@ -1104,31 +1116,14 @@ fn spawn_daemon(
     read_only: bool,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
+    let extension = crate::stub::is_mcpb_channel();
     let mut cmd = std::process::Command::new(exe);
-    if let Some(db) = db {
-        cmd.arg("--db").arg(db);
-    }
-    cmd.arg("serve").arg("--daemon");
-    // Tell the child it is an autostart rather than an invocation somebody
-    // made. A hidden flag, not the `--daemon` flag: an operator may well run
-    // `serve --daemon` by hand, and systemd and the container image both run
-    // `serve` in the foreground, so `--daemon` answers a different question.
-    // Not an environment variable either: the child inherits this process's
-    // whole environment, and a variable left set in a shell would mislabel a
-    // daemon somebody started deliberately.
-    cmd.arg("--autostarted");
-
-    if read_only {
-        cmd.arg("--read-only");
-    }
-    if let Some(cfg) = config_path {
-        cmd.arg("--config").arg(cfg);
-    }
+    cmd.args(daemon_args(db, config_path, read_only, extension));
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(daemon_log_sink().unwrap_or_else(std::process::Stdio::null));
     #[cfg(unix)]
-    {
+    if !extension {
         use std::os::unix::process::CommandExt;
         // A full new session, not just a process group: the daemon leads its
         // own session with no controlling terminal, so it survives whichever
@@ -1150,16 +1145,22 @@ fn spawn_daemon(
         use windows_sys::Win32::System::Threading::{
             CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
         };
-        // No console window for the detached daemon, its own process group,
-        // and a breakaway from the parent's job object so it outlives a
-        // harness that kills its job on exit. A job that forbids breakaway
-        // fails the spawn outright, so retry inside the job: starting at all
-        // beats outliving the parent.
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
-        if cmd.spawn().is_err() {
-            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-            cmd.spawn()?;
+        // No console window for the daemon and its own process group. Off the
+        // extension, also a breakaway from the parent's job object so it
+        // outlives a harness that kills its job on exit; a job that forbids
+        // breakaway fails the spawn outright, so retry inside the job:
+        // starting at all beats outliving the parent. The extension's daemon
+        // stays inside the job on purpose (see above).
+        if !extension {
+            cmd.creation_flags(
+                CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+            );
+            if cmd.spawn().is_ok() {
+                return Ok(());
+            }
         }
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        cmd.spawn()?;
         Ok(())
     }
     #[cfg(not(windows))]
@@ -1167,6 +1168,40 @@ fn spawn_daemon(
         cmd.spawn()?;
         Ok(())
     }
+}
+
+/// The spawned daemon's arguments, in the order the CLI parses them: the
+/// global `--db` ahead of the subcommand, `--config` after it. `--autostarted`
+/// tells the child it is an autostart rather than an invocation somebody made
+/// (a hidden flag, not `--daemon`, which an operator passes by hand too, and
+/// not an environment variable, which a shell could leave set and mislabel a
+/// daemon somebody started deliberately). `--exit-when-idle` is the extension's
+/// bounded lifetime; see [`spawn_daemon`].
+fn daemon_args(
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    read_only: bool,
+    exit_when_idle: bool,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(db) = db {
+        args.push("--db".into());
+        args.push(db.into());
+    }
+    args.push("serve".into());
+    args.push("--daemon".into());
+    args.push("--autostarted".into());
+    if exit_when_idle {
+        args.push("--exit-when-idle".into());
+    }
+    if read_only {
+        args.push("--read-only".into());
+    }
+    if let Some(cfg) = config_path {
+        args.push("--config".into());
+        args.push(cfg.into());
+    }
+    args
 }
 
 /// The exit code a `crystalline serve` uses when it could not take the index
@@ -1501,6 +1536,43 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spawned daemon's command line: `serve --daemon --autostarted` always,
+    /// `--db` ahead of the subcommand and `--config` after it when given, and
+    /// `--exit-when-idle` only for the extension's daemon, which must not
+    /// outlive Claude Desktop.
+    #[test]
+    fn daemon_args_add_exit_when_idle_only_for_the_extension() {
+        let plain = daemon_args(None, None, false, false);
+        assert_eq!(plain, ["serve", "--daemon", "--autostarted"]);
+
+        let idle = daemon_args(None, None, false, true);
+        assert_eq!(
+            idle,
+            ["serve", "--daemon", "--autostarted", "--exit-when-idle"]
+        );
+
+        let full = daemon_args(
+            Some(Path::new("/x/index.db")),
+            Some(Path::new("/x/config.yaml")),
+            true,
+            true,
+        );
+        assert_eq!(
+            full,
+            [
+                "--db",
+                "/x/index.db",
+                "serve",
+                "--daemon",
+                "--autostarted",
+                "--exit-when-idle",
+                "--read-only",
+                "--config",
+                "/x/config.yaml",
+            ]
+        );
+    }
 
     // --- the words a locked index is refused in -----------------------------
 

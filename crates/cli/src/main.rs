@@ -327,6 +327,12 @@ enum Command {
         /// as one a client started because it found none running.
         #[arg(long, hide = true)]
         autostarted: bool,
+        /// Set by the Claude Desktop extension's spawn path, never by a person:
+        /// exit once no client has been connected for a few seconds, so a
+        /// daemon running from inside Claude Desktop's own extension folder
+        /// never outlives Claude Desktop.
+        #[arg(long, hide = true)]
+        exit_when_idle: bool,
         /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
@@ -1648,6 +1654,7 @@ fn main() -> anyhow::Result<()> {
             allowed_host,
             daemon,
             autostarted,
+            exit_when_idle,
             read_only,
             take_over,
             config,
@@ -1673,6 +1680,7 @@ fn main() -> anyhow::Result<()> {
                     config,
                     read_only,
                     take_over,
+                    exit_when_idle,
                 )
             }) {
                 Ok(()) => Ok(()),

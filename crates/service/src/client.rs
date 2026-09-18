@@ -219,11 +219,17 @@ pub async fn run_mcp(
         (read_session_opener(&mut reader).await, None)
     } else {
         // `read_only` is forwarded only to a daemon this call spawns; attaching
-        // to an already-running daemon uses that daemon's own mode.
-        let (opened, daemon) = tokio::join!(
-            read_session_opener(&mut reader),
-            ensure_daemon(true, db, config_path, read_only),
-        );
+        // to an already-running daemon uses that daemon's own mode. The `mcp`
+        // handshake goes out the moment the daemon is attached, ahead of the
+        // client's opener: the daemon counts a session from that line, and a
+        // daemon with a bounded life (`--exit-when-idle`) must see this stub
+        // as a client while the client is still composing its first request.
+        let (opened, daemon) = tokio::join!(read_session_opener(&mut reader), async {
+            let conn = ensure_daemon(true, db, config_path, read_only).await?;
+            conn.into_mcp(harness_onboarded)
+                .await
+                .map_err(|e| anyhow::anyhow!("daemon MCP handshake failed ({e})"))
+        });
         (opened, Some(daemon))
     };
 
@@ -237,25 +243,23 @@ pub async fn run_mcp(
     // reads it as its first stdin line with no special replay.
     let primed = prime_reader(&opener_line, reader);
 
-    // A daemon is up: relay through it. A failed `mcp` handshake falls through
-    // to the embedded path rather than propagating, so an unreachable daemon
-    // still yields a working in-process server instead of a mid-window close.
+    // A daemon is up: relay through it. A failed attach or handshake falls
+    // through to the embedded path rather than propagating, so an unreachable
+    // daemon still yields a working in-process server instead of a mid-window
+    // close.
     if let Some(daemon) = daemon {
         match daemon {
-            Ok(conn) => match conn.into_mcp(harness_onboarded).await {
-                Ok(stream) => {
-                    return pump_stdio(
-                        stream,
-                        primed,
-                        db,
-                        config_path,
-                        read_only,
-                        harness_onboarded,
-                    )
-                    .await;
-                }
-                Err(e) => tracing::warn!("daemon MCP handshake failed ({e}); running embedded"),
-            },
+            Ok(stream) => {
+                return pump_stdio(
+                    stream,
+                    primed,
+                    db,
+                    config_path,
+                    read_only,
+                    harness_onboarded,
+                )
+                .await;
+            }
             Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
         }
     }

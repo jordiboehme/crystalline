@@ -44,6 +44,19 @@ pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
 /// The Claude Desktop extension channel value.
 pub const MCPB_CHANNEL: &str = "mcpb";
 
+/// Whether `channel` (the `CRYSTALLINE_CHANNEL` value, when set) is the Claude
+/// Desktop extension's marker. Exact match: the manifest sets the literal.
+pub fn channel_is_mcpb(channel: Option<&str>) -> bool {
+    channel == Some(MCPB_CHANNEL)
+}
+
+/// Whether this process runs as the Claude Desktop extension. Read from the
+/// environment each time; it is cheap and the variable never changes under a
+/// running process.
+pub fn is_mcpb_channel() -> bool {
+    channel_is_mcpb(std::env::var(CHANNEL_ENV).ok().as_deref())
+}
+
 /// The description of the single `status` tool, agent-facing product copy: it
 /// tells the model to relay the fix to the user rather than keeping it.
 const STATUS_TOOL_DESCRIPTION: &str = "Report why Crystalline is degraded this session: the startup failure, this binary's version, the daemon that owns the knowledge index and how to fix it. Relay the fix to the user.";
@@ -108,7 +121,7 @@ impl StubStatus {
     fn case(&self) -> StubCase {
         match &self.daemon_version {
             Some(daemon) if crate::instance::strictly_newer(daemon, &self.binary_version) => {
-                if self.channel.as_deref() == Some(MCPB_CHANNEL) {
+                if channel_is_mcpb(self.channel.as_deref()) {
                     StubCase::OutdatedMcpb
                 } else {
                     StubCase::OutdatedBinary
@@ -347,6 +360,18 @@ impl ServerHandler for DegradedServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the exact marker the mcpb manifest sets names the extension: an
+    /// unset, empty or differently spelled channel is some other install.
+    #[test]
+    fn only_the_exact_mcpb_marker_is_the_extension_channel() {
+        assert!(channel_is_mcpb(Some("mcpb")));
+        assert!(!channel_is_mcpb(None));
+        assert!(!channel_is_mcpb(Some("")));
+        assert!(!channel_is_mcpb(Some("MCPB")));
+        assert!(!channel_is_mcpb(Some("mcpb ")));
+        assert!(!channel_is_mcpb(Some("brew")));
+    }
 
     /// Build a status directly (no lock, no env): unit tests never touch the
     /// process environment, which is global and would race nextest's
