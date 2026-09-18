@@ -121,7 +121,7 @@ impl StubStatus {
     fn case(&self) -> StubCase {
         match &self.daemon_version {
             Some(daemon) if crate::instance::strictly_newer(daemon, &self.binary_version) => {
-                if self.channel.as_deref() == Some(MCPB_CHANNEL) {
+                if channel_is_mcpb(self.channel.as_deref()) {
                     StubCase::OutdatedMcpb
                 } else {
                     StubCase::OutdatedBinary

@@ -501,6 +501,12 @@ fn an_extension_started_daemon_leaves_once_its_last_client_is_gone() {
     assert_eq!(status["idle_exit_secs"], json!(5), "bounded life: {status}");
     assert_eq!(status["started_by"], json!("autostart"), "{status}");
     let pid = status["pid"].as_u64().unwrap();
+    let (ok, out) = env.run(&["status"]);
+    assert!(ok, "status: {out}");
+    assert!(
+        out.contains("Lifetime: exits 5s after its last client disconnects"),
+        "the bounded life renders: {out}"
+    );
 
     // The client is killed outright (`Mcp::drop` is `child.kill()`, SIGKILL on
     // unix: the abrupt end Desktop's teardown is, not a polite stdin close)
@@ -530,6 +536,45 @@ fn an_extension_started_daemon_leaves_once_its_last_client_is_gone() {
         !env.lock_path().exists() && !env.info_path().exists(),
         "the daemon left on its own after {:?}",
         start.elapsed()
+    );
+}
+
+/// A stub counts as a client from the moment it attaches, not from its
+/// client's first request: a Claude Desktop stub whose client stays silent
+/// past the grace must not lose its daemon under it.
+#[test]
+fn a_silent_stub_holds_an_extension_started_daemon_past_the_grace() {
+    let env = Env::new("silent");
+    env.setup_domain("eng");
+
+    // Spawned, never spoken to: no initialize for longer than the grace.
+    let mut c1 = Mcp::spawn_with_env(&env, "CRYSTALLINE_CHANNEL", "mcpb");
+    env.wait_ready();
+    std::thread::sleep(Duration::from_secs(7));
+    let status = status_json(&env);
+    assert_eq!(status["idle_exit_secs"], json!(5), "{status}");
+    assert_eq!(
+        status["sessions"],
+        json!(1),
+        "the silent stub is a counted session: {status}"
+    );
+    let pid = status["pid"].as_u64().unwrap();
+
+    // It still serves once the client finally speaks.
+    c1.initialize();
+    let status = status_json(&env);
+    assert_eq!(status["pid"].as_u64(), Some(pid), "same daemon: {status}");
+
+    drop(c1);
+    let start = Instant::now();
+    while (env.lock_path().exists() || env.info_path().exists())
+        && start.elapsed() < Duration::from_secs(15)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !env.lock_path().exists() && !env.info_path().exists(),
+        "gone after its only client left"
     );
 }
 
