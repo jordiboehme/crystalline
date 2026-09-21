@@ -128,6 +128,18 @@ impl GlobalConfig {
         self.api_enabled() && self.service.as_ref().and_then(|s| s.ui).unwrap_or(true)
     }
 
+    /// The address people open the Fluid web UI at, from
+    /// `service.public_url`, trimmed. `None` when the key is unset or holds
+    /// nothing but blanks, which means the address is derived per caller
+    /// instead.
+    pub fn service_public_url(&self) -> Option<&str> {
+        self.service
+            .as_ref()
+            .and_then(|s| s.public_url.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     /// How the MCP server encodes list-shaped tool results, from
     /// `service.response_format`. Absent config or an absent key means TOON,
     /// the token-efficient default; `json` restores plain compact JSON for
@@ -905,6 +917,11 @@ pub struct ServiceConfig {
     /// Absent means loopback-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
+    /// The address people open the Fluid web UI at, used verbatim as the base
+    /// of every `web_url` and as the OAuth resource identifier. Absent means
+    /// derive it per caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     /// How the MCP server encodes list-shaped tool results. Absent means
     /// TOON, the token-efficient default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1556,6 +1573,33 @@ mod tests {
             serde_yaml_ng::from_str("service:\n  ui: true\n  api: true\n").unwrap();
         assert!(both_on.ui_enabled());
         assert!(both_on.api_enabled());
+    }
+
+    /// The address people open the web UI at is read trimmed, and every
+    /// spelling of "nothing was written here" answers `None`: an absent
+    /// `service` block, an absent key, an empty string and a string of blanks
+    /// all mean the address is derived per caller instead.
+    #[test]
+    fn service_public_url_is_none_when_unset_or_blank() {
+        assert_eq!(GlobalConfig::default().service_public_url(), None);
+
+        let absent_key: GlobalConfig = serde_yaml_ng::from_str("service: {}\n").unwrap();
+        assert_eq!(absent_key.service_public_url(), None);
+
+        let with = |value: &str| GlobalConfig {
+            service: Some(ServiceConfig {
+                public_url: Some(value.to_string()),
+                ..ServiceConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        assert_eq!(with("").service_public_url(), None);
+        assert_eq!(with("  ").service_public_url(), None);
+        assert_eq!(
+            with(" https://kb.example.com ").service_public_url(),
+            Some("https://kb.example.com"),
+            "a value written with stray blanks is read as the address it names"
+        );
     }
 
     #[test]

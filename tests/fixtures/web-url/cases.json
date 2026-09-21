@@ -1,0 +1,13 @@
+{
+  "urls": [
+    { "base": "http://127.0.0.1:7411", "domain": "eng", "permalink": "alpha", "web_url": "http://127.0.0.1:7411/d/eng/e/alpha", "heading": "API", "fragment": "api", "section_url": "http://127.0.0.1:7411/d/eng/e/alpha#api" },
+    { "base": "https://kb.example.com", "domain": "team notes", "permalink": "notes/deep/gamma", "web_url": "https://kb.example.com/d/team%20notes/e/notes/deep/gamma", "heading": "Auth & Tokens", "fragment": "auth-tokens", "section_url": "https://kb.example.com/d/team%20notes/e/notes/deep/gamma#auth-tokens" },
+    { "base": "https://kb.example.com", "domain": "ops", "permalink": "runbooks/db-failover", "web_url": "https://kb.example.com/d/ops/e/runbooks/db-failover", "heading": "Step 2: verify", "fragment": "step-2-verify", "section_url": "https://kb.example.com/d/ops/e/runbooks/db-failover#step-2-verify" },
+    { "base": "http://[::1]:7411", "domain": "büro", "permalink": "a/b", "web_url": "http://[::1]:7411/d/b%C3%BCro/e/a/b", "heading": "Über uns", "fragment": "über-uns", "section_url": "http://[::1]:7411/d/b%C3%BCro/e/a/b#über-uns" },
+    { "base": "http://192.168.1.5:7411", "domain": "it's (odd)", "permalink": "why-not", "web_url": "http://192.168.1.5:7411/d/it's%20(odd)/e/why-not", "heading": "", "fragment": "section", "section_url": "http://192.168.1.5:7411/d/it's%20(odd)/e/why-not#section" }
+  ],
+  "slugs": [
+    { "headings": ["API", "API", "api", "API 1"], "fragments": ["api", "api-1", "api-2", "api-1-1"] },
+    { "headings": ["  Spaced   out  ", "under_score-kept", "Ünïcödé Marks"], "fragments": ["spaced-out", "under_score-kept", "ünïcödé-marks"] }
+  ]
+}

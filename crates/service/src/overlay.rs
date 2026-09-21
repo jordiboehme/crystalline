@@ -706,6 +706,7 @@ mod tests {
                 "CRYSTALLINE_SERVICE_ALLOWED_HOSTS",
                 "muthur.lan,mcp.example.com",
             ),
+            ("CRYSTALLINE_SERVICE_PUBLIC_URL", "https://kb.example.com"),
             ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
             ("CRYSTALLINE_DATABASE_URL", "postgres://u:p@db/crystalline"),
         ])
@@ -725,6 +726,7 @@ mod tests {
             "service.ui",
             "service.api",
             "service.allowed_hosts",
+            "service.public_url",
             "database.backend",
             "database.url",
         ] {
@@ -756,6 +758,11 @@ mod tests {
                 .as_ref()
                 .and_then(|s| s.allowed_hosts.as_deref()),
             Some(["muthur.lan".to_string(), "mcp.example.com".to_string()].as_slice())
+        );
+        assert_eq!(
+            effective.service_public_url(),
+            Some("https://kb.example.com"),
+            "the address people open the web UI at arrives from the environment too"
         );
         assert_eq!(effective.database().backend, DatabaseBackend::Postgres);
         assert_eq!(

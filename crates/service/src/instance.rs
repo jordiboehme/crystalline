@@ -145,6 +145,19 @@ impl HttpBinding {
     }
 }
 
+/// Rewrite an unroutable bind address to its loopback equivalent: `0.0.0.0`
+/// and `[::]` are addresses a server can listen on but a client can never
+/// dial, and people naturally paste the same address they gave `serve --http`.
+pub fn loopback_connect_addr(addr: &str) -> String {
+    if let Some(port) = addr.strip_prefix("0.0.0.0:") {
+        format!("127.0.0.1:{port}")
+    } else if let Some(port) = addr.strip_prefix("[::]:") {
+        format!("127.0.0.1:{port}")
+    } else {
+        addr.to_string()
+    }
+}
+
 /// What this process asked to serve, recorded by `run_serve` before it takes
 /// the lock.
 ///
@@ -1536,6 +1549,25 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the two bind wildcards are rewritten. Every other spelling is an
+    /// address something can really dial, and rewriting one would send a
+    /// client somewhere it was never pointed at.
+    #[test]
+    fn loopback_connect_addr_rewrites_only_the_wildcards() {
+        assert_eq!(loopback_connect_addr("0.0.0.0:7411"), "127.0.0.1:7411");
+        assert_eq!(loopback_connect_addr("[::]:7411"), "127.0.0.1:7411");
+        assert_eq!(loopback_connect_addr("127.0.0.1:7411"), "127.0.0.1:7411");
+        assert_eq!(loopback_connect_addr("[::1]:7411"), "[::1]:7411");
+        assert_eq!(
+            loopback_connect_addr("192.168.1.5:7411"),
+            "192.168.1.5:7411"
+        );
+        assert_eq!(
+            loopback_connect_addr("fluid.example:7411"),
+            "fluid.example:7411"
+        );
+    }
 
     /// The spawned daemon's command line: `serve --daemon --autostarted` always,
     /// `--db` ahead of the subcommand and `--config` after it when given, and

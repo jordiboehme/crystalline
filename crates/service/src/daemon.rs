@@ -399,7 +399,7 @@ pub async fn run_serve(
                 eprintln!("crystalline warning: {line}");
             }
             if let Some(token) = &setup_token {
-                for line in setup_token_lines(addr, token) {
+                for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
                     eprintln!("{line}");
                 }
             }
@@ -417,7 +417,7 @@ pub async fn run_serve(
         // lines go to the daemon log instead, once. Without them a backgrounded
         // non-loopback serve would offer a first-run wizard nobody can get
         // through and no way to find out why.
-        for line in setup_token_lines(addr, token) {
+        for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
             tracing::info!("{line}");
         }
     }
@@ -1002,9 +1002,13 @@ fn bind_is_loopback(addr: &str) -> bool {
 /// The two lines a serve process says about its setup token, in the order it
 /// says them. Built here rather than inlined so the exact wording is testable
 /// and so the foreground banner and the daemon log cannot drift apart.
-fn setup_token_lines(addr: &str, token: &str) -> [String; 2] {
+///
+/// `at` is the full address, already resolved by [`setup_address`]: that line
+/// is read by a person on another machine, so the bind as given is right for
+/// it and the loopback rewrite is not.
+fn setup_token_lines(at: &str, token: &str) -> [String; 2] {
     [
-        format!("first-run setup token (create the first admin at http://{addr}): {token}"),
+        format!("first-run setup token (create the first admin at {at}): {token}"),
         "this token is not shown again; a restart mints a new one".to_string(),
     ]
 }
@@ -1494,6 +1498,12 @@ fn http_base(
     // first store.
     engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
 
+    // And the same rule answers where this instance's pages are, for an HTTP
+    // caller from its own headers and for a local one from the address this
+    // daemon started with. Installed here for the same reason: one function
+    // both router builders funnel through.
+    engine.set_web_origin(Arc::new(origin_rule.clone()));
+
     // The session manager drives per-request stream priming (e.g. the
     // tools/list response); its own `session_config.sse_retry` default must be
     // cleared independently of `http_config`'s, since `SessionConfig` is
@@ -1637,6 +1647,26 @@ async fn dispatch_ui<E: rust_embed::RustEmbed>(
     next.run(request).await
 }
 
+/// The address the web UI line prints: the configured public address, or the
+/// bind rewritten to something a browser on this machine can dial. Never the
+/// raw `0.0.0.0`, which is a wildcard and not an address.
+fn web_ui_address(config: &GlobalConfig, addr: &str) -> String {
+    match config.service_public_url() {
+        Some(url) => url.to_string(),
+        None => format!("http://{}", crate::instance::loopback_connect_addr(addr)),
+    }
+}
+
+/// The address the setup-token line names: the public address when there is
+/// one, otherwise the bind as given. Not the loopback rewrite - that line is
+/// for a person on another machine, for whom loopback is wrong.
+fn setup_address(config: &GlobalConfig, addr: &str) -> String {
+    match config.service_public_url() {
+        Some(url) => url.to_string(),
+        None => format!("http://{addr}"),
+    }
+}
+
 /// The one line a foreground start prints about the web UI, beside the HTTP
 /// endpoint's own line. Every state is named out loud: a UI that is off because
 /// of a config key, off because the API it needs is off, or missing because
@@ -1650,7 +1680,7 @@ fn ui_startup_line(config: &GlobalConfig, addr: &str) -> String {
         return "web UI off (service.ui=false)".to_string();
     }
     if ui_bundled() {
-        return format!("crystalline web UI at http://{addr}");
+        return format!("crystalline web UI at {}", web_ui_address(config, addr));
     }
     // Either built without the `fluid-ui` feature, so there is no bundle at
     // all, or a dev build whose `fluid/dist` was never built (or was built
@@ -2758,7 +2788,9 @@ mod tests {
         #[cfg(feature = "fluid-ui")]
         {
             let expected = if crate::ui::ui_available::<crate::ui::FluidAssets>() {
-                "crystalline web UI at http://0.0.0.0:7411"
+                // The bind is a wildcard, which is an address nothing can
+                // dial: the line prints what a browser on this machine opens.
+                "crystalline web UI at http://127.0.0.1:7411"
             } else {
                 // A tree whose `fluid/dist` was never built: the embed is
                 // empty and the line says so rather than pointing a browser at
@@ -2772,6 +2804,27 @@ mod tests {
             line, "web UI not built into this binary",
             "a binary built without the feature carries no bundle at all"
         );
+    }
+
+    /// Where an operator has said what address people reach this instance at,
+    /// that is the address the line prints: the bind is this process's own
+    /// business and says nothing about how anybody gets here.
+    #[test]
+    fn the_ui_startup_line_prints_the_public_url_when_one_is_configured() {
+        let mut config = config_with_ui(None, None);
+        config.service.as_mut().unwrap().public_url = Some("https://kb.example.com".to_string());
+        let line = ui_startup_line(&config, "0.0.0.0:7411");
+        #[cfg(feature = "fluid-ui")]
+        {
+            let expected = if crate::ui::ui_available::<crate::ui::FluidAssets>() {
+                "crystalline web UI at https://kb.example.com"
+            } else {
+                "web UI not built into this binary"
+            };
+            assert_eq!(line, expected);
+        }
+        #[cfg(not(feature = "fluid-ui"))]
+        assert_eq!(line, "web UI not built into this binary");
     }
 
     /// A binary with no consent page in it says so when OAuth is on, rather
@@ -3402,7 +3455,7 @@ mod tests {
 
     #[test]
     fn the_setup_token_lines_name_the_address_and_say_it_is_said_once() {
-        let lines = setup_token_lines("0.0.0.0:7411", "a1b2c3d4e5f60718293a4b5c6d7e8f90");
+        let lines = setup_token_lines("http://0.0.0.0:7411", "a1b2c3d4e5f60718293a4b5c6d7e8f90");
         assert_eq!(
             lines[0],
             "first-run setup token (create the first admin at http://0.0.0.0:7411): a1b2c3d4e5f60718293a4b5c6d7e8f90"
@@ -3414,6 +3467,27 @@ mod tests {
         assert!(
             !lines[1].contains("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
             "the caveat line carries no secret of its own"
+        );
+    }
+
+    /// That line is read by a person on another machine, so it names the
+    /// public address where there is one and the bind as given otherwise -
+    /// never the loopback rewrite, which is right only for this machine.
+    #[test]
+    fn the_setup_token_line_names_the_public_url_when_one_is_configured() {
+        let mut config = GlobalConfig::default();
+        assert_eq!(
+            setup_address(&config, "0.0.0.0:7411"),
+            "http://0.0.0.0:7411"
+        );
+
+        config.service = Some(crystalline_core::config::ServiceConfig {
+            public_url: Some("https://kb.example.com".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            setup_address(&config, "0.0.0.0:7411"),
+            "https://kb.example.com"
         );
     }
 
