@@ -335,7 +335,7 @@ describe("MermaidDiagram", () => {
       expect(svg?.getAttribute("width")).toBe("100%");
       expect(svg?.getAttribute("style") ?? "").toContain("min-width: 600px");
       expect(svg?.getAttribute("style") ?? "").not.toContain("max-width");
-      // The same scroll region the measured wide path uses: a diagram wider
+      // The same scroll region a widened diagram always uses: a diagram wider
       // than the column has to be reachable, not merely unclamped.
       const wrapper = svg?.parentElement;
       expect(wrapper?.className).toContain("overflow-x-auto");

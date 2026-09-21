@@ -35,7 +35,7 @@ describe("unclampDiagram", () => {
     expect(style(svg)).not.toContain("max-width");
   });
 
-  it("says the same thing about a diagram past the threshold", () => {
+  it("says the same thing about a diagram wider than any column", () => {
     // One shape for every diagram: the floor is the drawing's own width, so a
     // 1600px one keeps 1600px in a column that cannot hold it and grows with a
     // column that can.
