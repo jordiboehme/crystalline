@@ -111,11 +111,14 @@ export function ReviewModeCard({
   });
 
   return (
-    <section aria-labelledby={headingId}>
-      <h2 id={headingId} className="mb-2 text-section">
+    <section
+      aria-labelledby={headingId}
+      className="flex flex-col gap-4 rounded border border-slate-200 p-4 dark:border-slate-800"
+    >
+      <h2 id={headingId} className="text-section">
         Review mode
       </h2>
-      <div className="rounded border border-slate-200 p-4 dark:border-slate-800">
+      <div>
         <p className="text-sm text-slate-600 dark:text-slate-400">
           {reviewing
             ? "Every write in this domain joins its author's own draft. The folder the team shares changes only through a proposal somebody reviewed."

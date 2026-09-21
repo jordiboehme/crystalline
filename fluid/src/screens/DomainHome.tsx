@@ -344,26 +344,6 @@ function DomainPage({
       */}
       {capabilities.canShare && <ProposalsCard domain={domain} />}
 
-      {/*
-        No capability gate here: `GET /members` is served to any account that
-        may see the domain at all, and the card itself decides what it may
-        offer from what that read says rather than from an instance-wide
-        capability; see its own module doc.
-      */}
-      <MembersCard domain={domain} />
-
-      {/*
-        Which way a write in this domain goes, and the control that changes it.
-        Under the same instance-wide capability the two share cards above are
-        under, because review mode is about proposing changes to a team and an
-        instance that shares with nobody has no use for it. It is NOT a
-        per-domain gate: the card is drawn on a virtual or origin-less domain
-        too, where the button answers 409 in the server's own words.
-      */}
-      {capabilities.canShare && summary !== undefined && (
-        <ReviewModeCard domain={domain} reviewing={summary.review !== null} />
-      )}
-
       <section aria-labelledby="domain-manifest">
         <div className="mb-2 flex flex-wrap items-baseline justify-between gap-3">
           <h2 id="domain-manifest" className="text-section">
@@ -468,6 +448,30 @@ function DomainPage({
           )
         }
       />
+
+      {/*
+        The team's furniture comes after the engrams: who may reach the
+        domain and which way a write goes are settled once and read rarely,
+        so they sit below what a reader opens the page for.
+
+        No capability gate here: `GET /members` is served to any account that
+        may see the domain at all, and the card itself decides what it may
+        offer from what that read says rather than from an instance-wide
+        capability; see its own module doc.
+      */}
+      <MembersCard domain={domain} />
+
+      {/*
+        Which way a write in this domain goes, and the control that changes it.
+        Under the same instance-wide capability the two share cards above are
+        under, because review mode is about proposing changes to a team and an
+        instance that shares with nobody has no use for it. It is NOT a
+        per-domain gate: the card is drawn on a virtual or origin-less domain
+        too, where the button answers 409 in the server's own words.
+      */}
+      {capabilities.canShare && summary !== undefined && (
+        <ReviewModeCard domain={domain} reviewing={summary.review !== null} />
+      )}
     </div>
   );
 }
