@@ -430,10 +430,16 @@ test("a domain is registered, filled from an archive and unregistered", async ({
     .toContain("lantern-protocol");
 
   // Unregistering, behind the second press that says what is lost - and what
-  // is not: the files stay, which is the sentence the spec pins.
-  await page.getByRole("button", { name: "Unregister domain" }).click();
-  await expect(page.getByText(/files stay on disk/i)).toBeVisible();
-  await page.getByRole("button", { name: "Confirm unregister" }).click();
+  // is not: the files stay, which is the sentence the spec pins. The control
+  // lives in the danger zone, behind the domain's own name typed into the
+  // field it opens.
+  const dangerZone = page.getByRole("region", { name: "Danger zone" });
+  await dangerZone.getByRole("button", { name: "Unregister domain" }).click();
+  await expect(dangerZone.getByText(/files stay on disk/i)).toBeVisible();
+  await dangerZone
+    .getByLabel(new RegExp(`Type ${RESTORE_DOMAIN} to confirm`))
+    .fill(RESTORE_DOMAIN);
+  await dangerZone.getByRole("button", { name: "Confirm unregister" }).click();
 
   // Nowhere to stay: the address is a wrong address now, so the app leaves.
   await expect(page).toHaveURL(/\/$/);

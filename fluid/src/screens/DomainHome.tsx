@@ -447,8 +447,7 @@ function FolderPage({
   folders: string[];
 }) {
   const { capabilities } = useAuth();
-  const { filters, browse, filtering, listingOrder, apply } =
-    useListingState();
+  const { filters, browse, filtering, listingOrder, apply } = useListingState();
   const [creating, setCreating] = useState(false);
   const tags = useQuery({
     queryKey: vocabularyKey(domain),
