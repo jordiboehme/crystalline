@@ -18,7 +18,7 @@ import { useTheme } from "../theme/context";
 import { mermaidConfig } from "../theme/mermaid";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
-import { unclampDiagram, unclampWideDiagram } from "./wideDiagram";
+import { unclampDiagram } from "./wideDiagram";
 
 /**
  * The scroll container's own classes, the ones that hold whether or not there
@@ -49,15 +49,24 @@ const SCROLLER =
 const SCROLLABLE =
   "[mask-image:linear-gradient(to_right,black_calc(100%_-_1.5rem),transparent)] focus-visible:ring-2 focus-visible:ring-accent-600 focus-visible:outline-none dark:focus-visible:ring-accent-400";
 
-export default function MermaidDiagram({ source }: { source: string }) {
+export default function MermaidDiagram({
+  source,
+  name,
+}: {
+  source: string;
+  /**
+   * The document this diagram sits in, which is what a file taken out of the
+   * full window is named after. Absent - a preview with no document behind
+   * it, say - the download is named after the drawing alone.
+   */
+  name?: string;
+}) {
   const { resolved } = useTheme();
   // `useId` is stable across renders and unique per instance, which is what
   // mermaid wants for the element it names its definitions after. Its colons
   // are not valid in a CSS identifier, so they come out.
   const id = `mermaid-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const [drawn, setDrawn] = useState<{ svg: string; wide: boolean } | null>(
-    null,
-  );
+  const [drawn, setDrawn] = useState<{ svg: string } | null>(null);
   // Both asked for, never inferred, and neither of them remembered: the width
   // is this reader's decision about this diagram on this visit, and a diagram
   // that came back wide because somebody once widened it would be a preference
@@ -81,7 +90,7 @@ export default function MermaidDiagram({ source }: { source: string }) {
       .render(id, source)
       .then((result) => {
         if (live) {
-          setDrawn(unclampWideDiagram(result.svg));
+          setDrawn({ svg: result.svg });
         }
       })
       .catch(() => {
@@ -97,10 +106,14 @@ export default function MermaidDiagram({ source }: { source: string }) {
   // The markup is mermaid's own output, produced by its sanitizing mode from
   // the source above; nothing from the document reaches here unparsed.
   //
-  // Full width forces the path the measurement below chooses on its own past
-  // the threshold: the same unclamp, the same scroll container, asked for by
-  // the reader rather than decided by the drawing's size.
-  const wide = drawn !== null && (fullWidth || drawn.wide);
+  // A diagram fits its column until the reader says otherwise: mermaid's own
+  // scale-to-fit is the default for every size, and full width is the one
+  // way past it. Once, a measurement widened a big diagram on its own, so
+  // for exactly the diagrams this button exists for both states drew the
+  // same picture and pressing it did nothing anybody could see. What the
+  // fitted drawing costs - small labels on a huge diagram - is one click
+  // away from undone, and the full-window overlay is the reading path.
+  const wide = drawn !== null && fullWidth;
   const markup =
     drawn === null ? "" : fullWidth ? unclampDiagram(drawn.svg) : drawn.svg;
 
@@ -148,7 +161,7 @@ export default function MermaidDiagram({ source }: { source: string }) {
     // shows itself when the pointer or the keyboard is anywhere in here.
     <div className="group relative">
       {wide ? (
-        // Past the threshold the diagram keeps its own width and this
+        // Asked for full width, the diagram keeps its own width and this
         // container scrolls, because scaling it to fit leaves labels too small
         // to read. Why this and not a click-to-expand lightbox: a focusable
         // scroll region is the WAI pattern for exactly this, it needs no focus
@@ -180,9 +193,11 @@ export default function MermaidDiagram({ source }: { source: string }) {
         glyph.
       */}
       <DiagramToolbar
-        fullWidth={fullWidth}
-        onToggleFullWidth={() => {
-          setFullWidth((on) => !on);
+        width={{
+          fullWidth,
+          onToggle: () => {
+            setFullWidth((on) => !on);
+          },
         }}
         onOpenFullWindow={() => {
           setFullWindow(true);
@@ -194,7 +209,14 @@ export default function MermaidDiagram({ source }: { source: string }) {
         // overlay sizes the root itself, and a width this page forced on it
         // would be one scale factor too many.
         <DiagramOverlay
-          svg={drawn.svg}
+          content={{
+            kind: "diagram",
+            svg: drawn.svg,
+            // The fence as the author wrote it, which is what a reader who
+            // asks for the source gets back.
+            source,
+            ...(name === undefined ? {} : { name }),
+          }}
           returnFocusTo={fullWindowRef}
           onClose={() => {
             setFullWindow(false);

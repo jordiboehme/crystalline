@@ -40,6 +40,7 @@ import { PresenceChips } from "../collab/PresenceChips";
 import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { CopyAddress } from "../components/DetailsPanel";
 import { DraftLinkDialog } from "../components/DraftLinkDialog";
 import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
@@ -1179,6 +1180,14 @@ function Surface({
           <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
             {engram.permalink}
           </span>
+          {/*
+            And the address itself, one press away: it is what a person hands
+            an agent to join the document they are in, and the editor is
+            where they are when they want to. The reading page carries the
+            same control; the editor has no details panel to hold it, so it
+            stands beside the permalink at both widths.
+          */}
+          <CopyAddress address={engram.url} />
           {inRoom && (
             <PresenceChips
               participants={collab.participants}

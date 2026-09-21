@@ -1,5 +1,5 @@
 /**
- * The two things a reader can ask of a diagram, offered on the diagram itself.
+ * What a reader can ask of a picture, offered on the picture itself.
  *
  * They float in its top-right corner and stay out of the way until they are
  * wanted: hidden by opacity while nobody is near, shown on hover and on focus
@@ -13,9 +13,12 @@
  * document has no business requiring. The name lives on `aria-label` and is
  * repeated as `title`, which is the browser's own tooltip and costs nothing.
  *
- * Both names are verbs that say what pressing will do, and the first one
+ * Both names are verbs that say what pressing will do, and the width one
  * changes with the state rather than sitting there as a label of it, so the
  * full-width button reads "Show at reading width" once the diagram is wide.
+ * The width action is the one a caller may leave out: an image is drawn at
+ * the width its own directive asked for, so there is no second width for a
+ * button to fold it back to, and the full window is all it offers.
  */
 
 import { Maximize2, UnfoldHorizontal, FoldHorizontal } from "lucide-react";
@@ -31,9 +34,8 @@ import { FOCUS_RING } from "./primitives";
 const ACTION = `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border border-slate-200 bg-white/90 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900/90 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`;
 
 export interface DiagramToolbarProps {
-  /** Whether the diagram is currently showing at full width. */
-  fullWidth: boolean;
-  onToggleFullWidth: () => void;
+  /** The width action, for a drawing that has one; an image has none. */
+  width?: { fullWidth: boolean; onToggle: () => void };
   onOpenFullWindow: () => void;
   /**
    * The full-window button, so the overlay it opens can hand the keyboard
@@ -68,8 +70,7 @@ function Action({
 }
 
 export default function DiagramToolbar({
-  fullWidth,
-  onToggleFullWidth,
+  width,
   onOpenFullWindow,
   fullWindowRef,
 }: DiagramToolbarProps): ReactElement {
@@ -89,11 +90,15 @@ export default function DiagramToolbar({
       className="pointer-events-none absolute top-1 right-1 flex gap-1 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100 print:hidden [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100"
       data-testid="diagram-toolbar"
     >
-      <Action
-        label={fullWidth ? "Show at reading width" : "Show at full width"}
-        icon={fullWidth ? FoldHorizontal : UnfoldHorizontal}
-        onClick={onToggleFullWidth}
-      />
+      {width !== undefined && (
+        <Action
+          label={
+            width.fullWidth ? "Show at reading width" : "Show at full width"
+          }
+          icon={width.fullWidth ? FoldHorizontal : UnfoldHorizontal}
+          onClick={width.onToggle}
+        />
+      )}
       <Action
         label="Open in full window"
         icon={Maximize2}

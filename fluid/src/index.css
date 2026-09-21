@@ -208,8 +208,8 @@
    * on any screen: the measure is one rule about every rendered document in
    * the app, and a screen that had to lift its own would be a screen that can
    * forget to. The frame sets the attribute on `main`, and every rendered
-   * document under it follows: the engram page, the MANIFEST page and the
-   * domain home, which are what carry `.measured`.
+   * document under it follows: the engram page and the domain page, which
+   * now renders the MANIFEST; those are what carry `.measured`.
    *
    * On screens only. The print sheet below widens `main` and leaves the
    * measure on the document's own children, which is the typography of the
@@ -220,6 +220,35 @@
     main[data-width="full"] .measured > :not(.breakout) {
       max-width: none;
     }
+  }
+}
+
+@media screen {
+  /*
+   * Large text: three Safari zoom steps, for a shared screen. Only the
+   * rendered document and the editor grow; the frame around them does not.
+   * The document's own size tokens are redefined in this scope so headings,
+   * code blocks, tables and chips scale with the prose, and the editor's
+   * root scales everything inside it because every size there is relative.
+   * Diagrams are left alone on purpose: mermaid sets its own size inside
+   * the drawing and a fitted diagram fills the same column either way,
+   * which is what browser zoom gets wrong.
+   */
+  main[data-text="large"] .measured {
+    font-size: 1.5rem;
+    --text-2xl: 2.25rem;
+    --text-2xl--line-height: 3rem;
+    --text-xl: 1.875rem;
+    --text-xl--line-height: 2.625rem;
+    --text-lg: 1.6875rem;
+    --text-lg--line-height: 2.625rem;
+    --text-sm: 1.3125rem;
+    --text-sm--line-height: 1.875rem;
+    --text-xs: 1.125rem;
+    --text-xs--line-height: 1.5rem;
+  }
+  main[data-text="large"] .cm-editor {
+    font-size: 1.40625rem;
   }
 }
 
@@ -396,6 +425,41 @@
     animation-duration: 0.01s;
   }
   .plaque-in {
+    animation: none;
+  }
+}
+/*
+ * "End of line." typed out at the bottom of a list that had to scroll, in the
+ * READY voice: the width grows one character at a time over twelve steps and
+ * the block cursor keeps blinking once the line is there. A reader who asked
+ * for less motion gets the line whole and the cursor still.
+ */
+.end-of-line {
+  display: inline-block;
+  overflow: hidden;
+  white-space: nowrap;
+  letter-spacing: 0.18em;
+  width: 12.2ch;
+  border-right: 0.6em solid currentColor;
+  animation:
+    end-of-line-type 1.2s steps(12, end) both,
+    end-of-line-blink 1s steps(1, end) infinite;
+}
+@keyframes end-of-line-type {
+  from {
+    width: 0;
+  }
+  to {
+    width: 12.2ch;
+  }
+}
+@keyframes end-of-line-blink {
+  50% {
+    border-color: transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .end-of-line {
     animation: none;
   }
 }

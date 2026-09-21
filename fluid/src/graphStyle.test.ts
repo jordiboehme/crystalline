@@ -122,6 +122,59 @@ describe("the graph stylesheet", () => {
     ).toBe("#978bd3");
   });
 
+  it("stands nodes at least twice as far apart as the library would", async () => {
+    // Eight engrams in a ring with two chords: enough for the layout to have
+    // decisions to make, small enough to settle in a test. The defaults are
+    // what the picture had before 0.18.3, when labels touched.
+    const ring = Array.from({ length: 8 }, (_, i) => ({
+      data: {
+        id: `n${String(i)}`,
+        label: `Engram ${String(i)}`,
+        domain: "eng",
+        permalink: `n${String(i)}`,
+      },
+    }));
+    const edges = ring.map((_, i) => ({
+      data: {
+        id: `e${String(i)}`,
+        source: `n${String(i)}`,
+        target: `n${String((i + 1) % 8)}`,
+        label: "relates_to",
+      },
+    }));
+    edges.push(
+      { data: { id: "c1", source: "n0", target: "n4", label: "links_to" } },
+      { data: { id: "c2", source: "n2", target: "n6", label: "links_to" } },
+    );
+    const elements = [...ring, ...edges];
+    const settle = (layout: cytoscape.LayoutOptions) =>
+      new Promise<number>((resolve) => {
+        const cy = cytoscape({ headless: true, elements, styleEnabled: false });
+        const run = cy.layout(layout);
+        run.one("layoutstop", () => {
+          const points = cy.nodes().map((n) => n.position());
+          let closest = Number.POSITIVE_INFINITY;
+          for (let i = 0; i < points.length; i += 1) {
+            for (let j = i + 1; j < points.length; j += 1) {
+              const a = points[i];
+              const b = points[j];
+              if (!a || !b) {
+                continue;
+              }
+              closest = Math.min(closest, Math.hypot(a.x - b.x, a.y - b.y));
+            }
+          }
+          cy.destroy();
+          resolve(closest);
+        });
+        run.run();
+      });
+    const before = await settle({ name: "cose", animate: false, padding: 24 });
+    const after = await settle(GRAPH_LAYOUT);
+    expect(before).toBeGreaterThan(0);
+    expect(after).toBeGreaterThanOrEqual(before * 2);
+  });
+
   it("repaints an instance that is already drawn, without moving it", () => {
     // What lets a change of theme swap the stylesheet on the graph the reader
     // is looking at instead of building a new one and laying it out again.

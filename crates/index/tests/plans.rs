@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, fourteen entries, each named by the function that issues it, so a
+//! One place, eighteen entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -22,7 +22,7 @@
 //! markers with each arm's own rows between them, and an `UPDATE` comes back as
 //! one row per table it reads.
 //!
-//! (b) The spellings these fourteen statements actually produce are `SEARCH
+//! (b) The spellings these eighteen statements actually produce are `SEARCH
 //! <alias> USING INDEX <name> (<cols>)`, `SEARCH <alias> USING INTEGER PRIMARY
 //! KEY (rowid=?)`, `SCAN <table> AS <alias> USING INDEX <name>`, `MULTI-INDEX
 //! OR <alias> (<idx>, <idx>)` and, once the indexes are dropped, a bare `SCAN
@@ -49,6 +49,7 @@
 //! The decision, on that evidence: plan assertions, not the index inventory the
 //! spec named as a fallback.
 
+use crystalline_index::SearchOrder;
 use crystalline_index::{DomainId, DomainKind, EmbeddingRow, Store, TursoStore, sync_domain};
 
 // --- the registry ------------------------------------------------------------
@@ -120,7 +121,7 @@ pub const GUARDED_TABLES: &[&str] = &["engram", "chunk", "relation", "link"];
 ///
 /// Turso names the ALIAS in a plan line (`SEARCH e USING ...`), not the table,
 /// so without this a guarded table would hide behind every one-letter alias in
-/// the codebase. One map for all fourteen entries, because the aliases are used
+/// the codebase. One map for all eighteen entries, because the aliases are used
 /// consistently across both backends; a name absent here stands for itself.
 const ALIASES: &[(&str, &str)] = &[
     ("e", "engram"),
@@ -170,6 +171,49 @@ const BASE_SCREEN: &str = "e.actor = ''";
 /// green this file has no business giving.
 const QVEC_TURSO: &str = "x'00'";
 const QVEC_PG: &str = "'[0,0,0,0,0,0,0,0]'::vector";
+
+/// One filter-only page, once per order a reader can ask for: the listing the
+/// domain page and every folder view page through, scoped to one domain. Every
+/// order sorts, bounded by the `LIMIT` in the same statement, and reaches
+/// `engram` through the domain filter rather than by walking the table.
+///
+/// A macro rather than a table of `(label, order)` read by one constructor
+/// because `HotStatement` holds plain `fn() -> String` pointers: a closure that
+/// read its order out of a table would capture it and stop coercing to one,
+/// while an order pasted in here is a path expression and the closure stays
+/// non-capturing. So this is that one table, with the four rows at the call
+/// site and the single shape here.
+macro_rules! filter_only_entry {
+    ($label:expr, $order:expr) => {
+        HotStatement {
+            issued_by: $label,
+            turso: || {
+                crystalline_index::turso::filter_only_sql(
+                    BASE_SCREEN,
+                    "AND d.name IN (?1)",
+                    $order,
+                    50,
+                    0,
+                )
+            },
+            postgres: || {
+                crystalline_index::postgres::filter_only_sql(
+                    BASE_SCREEN,
+                    "AND d.name IN ($1)",
+                    $order,
+                    50,
+                    0,
+                )
+            },
+            literals: &["'d'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        }
+    };
+}
 
 pub fn registry() -> Vec<HotStatement> {
     vec![
@@ -256,6 +300,16 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &[],
             postgres_must_seek: &[],
         },
+        filter_only_entry!(
+            "search::filter_only (recorded, newest first)",
+            SearchOrder::RecordedDesc
+        ),
+        filter_only_entry!(
+            "search::filter_only (recorded, oldest first)",
+            SearchOrder::RecordedAsc
+        ),
+        filter_only_entry!("search::filter_only (path, A to Z)", SearchOrder::PathAsc),
+        filter_only_entry!("search::filter_only (path, Z to A)", SearchOrder::PathDesc),
         HotStatement {
             issued_by: "search::semantic_phase1_sql",
             turso: || {
@@ -552,7 +606,7 @@ async fn seed(store: &dyn Store) -> DomainId {
 /// What a turso plan line reads, as `(the table or alias, is it a seek)`, and
 /// `None` for a line that reads no table at all.
 ///
-/// The three cases the fourteen statements produce, and the reasoning the module
+/// The three cases the eighteen statements produce, and the reasoning the module
 /// doc records the measurement for:
 ///
 /// - `SEARCH <name> USING ...` is a seek, unless the index it names is an
@@ -654,6 +708,65 @@ async fn the_lexical_candidate_scan_is_never_sorted_unbounded() {
         !plan.contains("GROUP BY"),
         "the candidate scan grew a GROUP BY, which unbounds the sorter: {plan}"
     );
+}
+
+/// The filter-only page sorts by design, in every order, and is bounded by
+/// the LIMIT in the same statement: the property that keeps one page of
+/// bodies in the sorter rather than a domain's worth.
+///
+/// What is asserted here is the keys, one spelling per order, because the
+/// bound itself is pinned from the source by
+/// `a_body_projection_never_reaches_an_unbounded_sorter` in
+/// `tests/turso_only.rs`, which reads the `LIMIT` off the same line as the
+/// `ORDER BY`. Asserting it again on a string this builder always emits would
+/// pin the builder's own `format!` rather than a property. What is left for
+/// this test is what turso does with those keys: no `GROUP BY`, which is the
+/// one thing that would take the bounded-sorter optimization away, and rows
+/// reached through an index rather than by walking the table.
+#[tokio::test]
+async fn the_filter_only_page_is_sorted_and_bounded_in_every_order() {
+    let store = turso_fixture().await;
+    let expected: &[(&str, &str)] = &[
+        (
+            "search::filter_only (recorded, newest first)",
+            "ORDER BY e.recorded_at IS NULL, e.recorded_at DESC, e.path ASC",
+        ),
+        (
+            "search::filter_only (recorded, oldest first)",
+            "ORDER BY e.recorded_at IS NULL, e.recorded_at ASC, e.path ASC",
+        ),
+        ("search::filter_only (path, A to Z)", "ORDER BY e.path ASC"),
+        ("search::filter_only (path, Z to A)", "ORDER BY e.path DESC"),
+    ];
+    let entries: Vec<HotStatement> = registry()
+        .into_iter()
+        .filter(|e| e.issued_by.starts_with("search::filter_only"))
+        .collect();
+    assert_eq!(entries.len(), expected.len(), "one entry per order");
+    for entry in entries {
+        let keys = expected
+            .iter()
+            .find(|(label, _)| *label == entry.issued_by)
+            .unwrap_or_else(|| panic!("{} is an order with no expected keys", entry.issued_by))
+            .1;
+        let sql = bind_literals(&(entry.turso)(), entry.literals);
+        assert!(
+            sql.contains(keys),
+            "{} orders by `{keys}`: {sql}",
+            entry.issued_by
+        );
+        assert!(
+            !sql.contains("GROUP BY"),
+            "{} groups, which unbounds the sorter: {sql}",
+            entry.issued_by
+        );
+        let plan = store.explain_query_plan(&sql).await.unwrap().join(" | ");
+        assert!(
+            plan.contains("SEARCH"),
+            "{} reaches its rows through an index: {plan}",
+            entry.issued_by
+        );
+    }
 }
 
 /// The turso guard fails when an index it depends on is gone.
@@ -862,7 +975,9 @@ mod postgres_plans {
             }
             // The lexical prefilter's real claim, the same one the turso leg
             // makes: bounded whenever it is sorted.
-            if entry.issued_by == "search::scored_lexical" {
+            if entry.issued_by == "search::scored_lexical"
+                || entry.issued_by.starts_with("search::filter_only")
+            {
                 assert!(
                     !has_node(&plan, "Sort") || has_node(&plan, "Limit"),
                     "{} sorts a body projection with no bound: {plan}",

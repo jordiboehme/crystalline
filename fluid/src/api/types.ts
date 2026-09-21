@@ -422,6 +422,8 @@ export interface paths {
          *
          *     Under `path`, `total` counts the folder recursively - every engram below it at any depth - which is the number to show when promising a folder's size. The tree endpoint's `total` counts a single level and is deliberately smaller, because it states a fact about the level it drew rather than a promise about the folder. The tree still owns the navigation view and this one owns the listing.
          *
+         *     `sort` and `dir` order the page: `recorded` (the default) is by the date each engram was recorded, newest first unless `dir=asc`, an undated engram last either way; `path` is by path in byte order, A to Z unless `dir=desc`. Both are pushed into the query beside the filters, so `total` and paging stay exact under them. Any other value is a 400 naming the parameter.
+         *
          *     A domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.
          */
         get: operations["list_engrams"];
@@ -569,6 +571,8 @@ export interface paths {
          * @description The source, not a reduction of it, so a client can render or edit it directly.
          *
          *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
+         *
+         *     `sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and the `generated_indexes` switch. `null` for `provisioning` or `tag_aliases` means the section is absent.
          */
         get: operations["get_domain_manifest"];
         /**
@@ -2044,6 +2048,20 @@ export interface components {
          * @enum {string}
          */
         FoldArg: "fold" | "discard";
+        /** @description The `generated_indexes` switch: declared, and effective. */
+        GeneratedIndexesView: {
+            /**
+             * @description The value as the frontmatter writes it, or `null` when the key is
+             *     absent.
+             * @example shared
+             */
+            declared?: string | null;
+            /**
+             * @description `local` or `shared`. Absent and unrecognized both fall to `local`.
+             * @example local
+             */
+            effective: string;
+        };
         /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
         GithubIdentityResponse: {
             /**
@@ -2247,6 +2265,68 @@ export interface components {
         LogoutResponse: {
             /** @description Always true. */
             ok: boolean;
+        };
+        /** @description A bullet the core crate flagged, kept verbatim beside why. */
+        ManifestProblem: {
+            /**
+             * @description The bullet as written, without its dash.
+             * @example widgets: w
+             */
+            bullet: string;
+            /**
+             * @description The category, in snake case: `malformed`, `unknown_type`,
+             *     `invalid_path`, `duplicate_type`, `self_alias`, `duplicate_alias`,
+             *     `non_canonical_target`, `chained_alias`.
+             * @example unknown_type
+             */
+            kind: string;
+            /** @description Why it was flagged, in the crate's words. */
+            reason: string;
+        };
+        /** @description The MANIFEST source beside the domain it belongs to, its checksum, and the features parsed out of it: what an agent routes by, what the domain provisions, which tags fold into which, and the one frontmatter switch. */
+        ManifestResponse: {
+            /**
+             * @description sha256 of the markdown, the token a later `PUT` carries in `If-Match`.
+             * @example 3f8a1c05e2
+             */
+            checksum: string;
+            /**
+             * @description The domain the MANIFEST introduces.
+             * @example eng
+             */
+            domain: string;
+            /** @description The MANIFEST markdown as written, frontmatter included. */
+            markdown: string;
+            /** @description The features read out of the markdown. */
+            sections: components["schemas"]["ManifestSections"];
+        };
+        /**
+         * @description The MANIFEST's features as the core crate reads them. Nothing here is
+         *     interpreted a second time, and a change goes through the editor: this is
+         *     a view of the source beside it.
+         */
+        ManifestSections: {
+            /**
+             * @description The `generated_indexes` frontmatter switch: what is declared and what
+             *     holds.
+             */
+            generated_indexes: components["schemas"]["GeneratedIndexesView"];
+            /**
+             * @description The required sections the MANIFEST lacks, by name: `Scope`, `When to
+             *     Use`. Empty when both are there.
+             */
+            missing: string[];
+            provisioning?: null | components["schemas"]["ProvisioningView"];
+            /**
+             * @description Which of the two an agent reads: `when_to_use`, or `scope` when When
+             *     to Use is absent or empty, or `none` when both are.
+             */
+            routing: components["schemas"]["RoutingSource"];
+            /** @description The `Scope` bullets; empty when the section is absent or empty. */
+            scope: string[];
+            tag_aliases?: null | components["schemas"]["TagAliasesView"];
+            /** @description The `When to Use` bullets; empty when the section is absent or empty. */
+            when_to_use: string[];
         };
         /**
          * @description One row of an account's MCP token list, for a management UI or CLI. Never
@@ -2614,6 +2694,26 @@ export interface components {
             /** @description The single sign-on provider, if one is configured. */
             oidc: components["schemas"]["OidcProviderView"];
         };
+        /** @description One `kind: path` declaration. */
+        ProvisioningDeclView: {
+            /**
+             * @description `skills`, `commands`, `agents` or `mcps`.
+             * @example skills
+             */
+            kind: string;
+            /**
+             * @description The folder, relative to the MANIFEST, trailing slash trimmed.
+             * @example skills
+             */
+            path: string;
+        };
+        /** @description The `Provisioning` section: what parsed, and what did not. */
+        ProvisioningView: {
+            /** @description The declarations that parsed, in document order, one per kind. */
+            decls: components["schemas"]["ProvisioningDeclView"][];
+            /** @description The bullets that did not parse, or lost to an earlier duplicate. */
+            problems: components["schemas"]["ManifestProblem"][];
+        };
         /** @description RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored. */
         RegisterBody: {
             /**
@@ -2765,6 +2865,11 @@ export interface components {
          * @enum {string}
          */
         Role: "viewer" | "editor" | "admin";
+        /**
+         * @description Which routing section an agent reads.
+         * @enum {string}
+         */
+        RoutingSource: "when_to_use" | "scope" | "none";
         /** @description The complete file text, frontmatter included. It is written verbatim: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed. */
         SaveEngramBody: {
             /**
@@ -2785,6 +2890,10 @@ export interface components {
              * @example ---
              *     title: eng
              *     ---
+             *
+             *     ## Scope
+             *
+             *     - Everything about eng
              *
              *     ## When to Use
              *
@@ -2854,6 +2963,23 @@ export interface components {
              * @example https://idp.example/authorize?client_id=...
              */
             location: string;
+        };
+        /** @description One `old -> canonical` mapping, both sides verbatim. */
+        TagAliasDeclView: {
+            /** @example Multi_Word */
+            alias: string;
+            /** @example multi-word */
+            canonical: string;
+        };
+        /** @description The `Tag Aliases` section: the mappings kept, and the bullets flagged. */
+        TagAliasesView: {
+            /** @description The mappings kept, in document order. */
+            decls: components["schemas"]["TagAliasDeclView"][];
+            /**
+             * @description The bullets flagged. A non-canonical target or a chained alias is in
+             *     both lists: kept, and flagged.
+             */
+            problems: components["schemas"]["ManifestProblem"][];
         };
         /** @description A share-link, as it was handed over. */
         TokenBody: {
@@ -4539,6 +4665,20 @@ export interface operations {
                  */
                 path?: string;
                 /**
+                 * @description The order of the listing: `recorded` (the default) is by the date each
+                 *     engram was recorded, an undated one last whichever way it runs; `path`
+                 *     is by path in byte order. Anything else is a 400 naming this parameter.
+                 * @example recorded
+                 */
+                sort?: string;
+                /**
+                 * @description The direction: `asc` or `desc`. Defaults to `desc` for `recorded`
+                 *     (newest first) and `asc` for `path` (A to Z). Anything else is a 400
+                 *     naming this parameter.
+                 * @example desc
+                 */
+                dir?: string;
+                /**
                  * @description One-based page number. Defaults to 1.
                  * @example 1
                  */
@@ -4591,7 +4731,7 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
-            /** @description The query string will not parse. */
+            /** @description The query string will not parse, or `sort` or `dir` names an order there is none of. */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -5592,10 +5732,26 @@ export interface operations {
                      * @example {
                      *       "checksum": "3f8a1c05e2",
                      *       "domain": "eng",
-                     *       "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                     *       "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                     *       "sections": {
+                     *         "generated_indexes": {
+                     *           "declared": null,
+                     *           "effective": "local"
+                     *         },
+                     *         "missing": [],
+                     *         "provisioning": null,
+                     *         "routing": "when_to_use",
+                     *         "scope": [
+                     *           "Everything about eng"
+                     *         ],
+                     *         "tag_aliases": null,
+                     *         "when_to_use": [
+                     *           "Route here for eng questions."
+                     *         ]
+                     *       }
                      *     }
                      */
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["ManifestResponse"];
                 };
             };
             /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
@@ -5668,10 +5824,26 @@ export interface operations {
                      * @example {
                      *       "checksum": "3f8a1c05e2",
                      *       "domain": "eng",
-                     *       "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                     *       "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                     *       "sections": {
+                     *         "generated_indexes": {
+                     *           "declared": null,
+                     *           "effective": "local"
+                     *         },
+                     *         "missing": [],
+                     *         "provisioning": null,
+                     *         "routing": "when_to_use",
+                     *         "scope": [
+                     *           "Everything about eng"
+                     *         ],
+                     *         "tag_aliases": null,
+                     *         "when_to_use": [
+                     *           "Route here for eng questions."
+                     *         ]
+                     *       }
                      *     }
                      */
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["ManifestResponse"];
                 };
             };
             /** @description `If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list. */
@@ -6331,7 +6503,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /**
-             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not.
+             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not.
              *
              *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
              *
@@ -8848,7 +9020,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /**
-             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
+             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
              *
              *     Three chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.
              */

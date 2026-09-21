@@ -13,11 +13,28 @@
  */
 
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
 import { Markdown } from "./Markdown";
+
+// The full-window layer loads the pan-and-zoom library on first open, and
+// jsdom has no layout for it to work with. What this file is about is that an
+// image offers the layer at all; the layer's own contract is pinned in
+// `DiagramOverlay.test.tsx`.
+vi.mock("@panzoom/panzoom", () => ({
+  default: vi.fn(() => ({
+    zoomIn: vi.fn(),
+    zoomOut: vi.fn(),
+    zoom: vi.fn(),
+    pan: vi.fn(),
+    reset: vi.fn(),
+    zoomWithWheel: vi.fn(),
+    destroy: vi.fn(),
+  })),
+}));
 
 const DOMAIN = "eng";
 
@@ -48,6 +65,19 @@ function image(container: HTMLElement): HTMLImageElement {
   return found;
 }
 
+/**
+ * The wrapper around it, which is what carries the placement: the image fills
+ * the wrapper and the wrapper sits where the fragment asked for, so the
+ * toolbar floating in its corner floats in the image's corner.
+ */
+function placement(container: HTMLElement): HTMLElement {
+  const wrapper = image(container).parentElement;
+  if (!wrapper) {
+    throw new Error("the image was drawn without its wrapper");
+  }
+  return wrapper;
+}
+
 describe("attachments in the reading view", () => {
   it("draws a stored image from the files route", async () => {
     const { container } = await renderMarkdown(
@@ -63,12 +93,15 @@ describe("attachments in the reading view", () => {
 
   it("centers a fragment-free image as a responsive block", async () => {
     const { container } = await renderMarkdown("![Shot](assets/a.png)", DOMAIN);
-    const drawn = image(container);
-    expect(drawn.style.display).toBe("block");
-    expect(drawn.style.marginLeft).toBe("auto");
-    expect(drawn.style.marginRight).toBe("auto");
-    expect(drawn.style.maxWidth).toBe("100%");
-    expect(drawn.style.float).toBe("");
+    const around = placement(container);
+    expect(around.style.display).toBe("block");
+    expect(around.style.marginLeft).toBe("auto");
+    expect(around.style.marginRight).toBe("auto");
+    expect(around.style.maxWidth).toBe("100%");
+    expect(around.style.float).toBe("");
+    // The wrapper hugs a picture nobody gave a width to, so the image inside
+    // it keeps its own size rather than filling a box measured from itself.
+    expect(image(container).classList.contains("w-full")).toBe(false);
   });
 
   it("reads the fragment for placement and width, and never sends it", async () => {
@@ -80,21 +113,25 @@ describe("attachments in the reading view", () => {
     expect(drawn.getAttribute("src")).toBe(
       "/api/v1/domains/eng/files/assets/a.png",
     );
-    expect(drawn.style.float).toBe("right");
-    expect(drawn.style.width).toBe("50%");
+    expect(placement(container).style.float).toBe("right");
+    expect(placement(container).style.width).toBe("50%");
   });
 
   it("floats left, fills the column and measures in pixels", async () => {
     const left = await renderMarkdown("![a](assets/a.png#left)", DOMAIN);
-    expect(image(left.container).style.float).toBe("left");
+    expect(placement(left.container).style.float).toBe("left");
     left.unmount();
 
     const full = await renderMarkdown("![a](assets/a.png#full)", DOMAIN);
-    expect(image(full.container).style.width).toBe("100%");
+    expect(placement(full.container).style.width).toBe("100%");
     full.unmount();
 
     const pixels = await renderMarkdown("![a](assets/a.png#w=300)", DOMAIN);
-    expect(image(pixels.container).style.width).toBe("300px");
+    expect(placement(pixels.container).style.width).toBe("300px");
+    // And the image fills the width that was asked for, which is what it did
+    // when the width sat on the image itself: a file narrower than 300px is
+    // still drawn at 300px.
+    expect(image(pixels.container).classList.contains("w-full")).toBe(true);
   });
 
   it("links a non-image attachment to the files route in a new tab", async () => {
@@ -120,7 +157,7 @@ describe("attachments in the reading view", () => {
     expect(image(container).getAttribute("src")).toBe(
       "/api/v1/domains/eng/files/assets/2026/08/shot.png",
     );
-    expect(image(container).style.float).toBe("right");
+    expect(placement(container).style.float).toBe("right");
     expect(screen.getByRole("link", { name: "The deck" })).toHaveAttribute(
       "href",
       "/api/v1/domains/eng/files/assets/deck.pdf",
@@ -195,5 +232,45 @@ describe("attachments in the reading view", () => {
     expect(image(container).getAttribute("src")).toBe(
       "/api/v1/domains/eng/files/assets/2026/08/a%25b.png",
     );
+  });
+
+  it("offers an image in the full window, by its button and by a click", async () => {
+    const { container } = await renderMarkdown(
+      "![The map](assets/map.png)",
+      DOMAIN,
+    );
+    expect(placement(container).className).toContain("group");
+    const open = screen.getByRole("button", { name: "Open in full window" });
+    // An image has no reading width to fold back to, so the width action the
+    // diagram toolbar carries is simply not there.
+    expect(screen.queryByRole("button", { name: /width/ })).toBeNull();
+    await userEvent.click(open);
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.querySelector("img")?.getAttribute("alt")).toBe("The map");
+    // And the file it offers is named after the target the author wrote, not
+    // after the route this app built to fetch it.
+    expect(
+      screen
+        .getByRole("link", { name: "Download image" })
+        .getAttribute("download"),
+    ).toBe("map.png");
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    await userEvent.click(image(container));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("lets a link win over the full window when the image is inside one", async () => {
+    const { container } = await renderMarkdown(
+      "[![The map](assets/map.png)](https://example.org/map)",
+      DOMAIN,
+    );
+    await userEvent.click(image(container));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Open in full window" }),
+    ).toBeNull();
   });
 });

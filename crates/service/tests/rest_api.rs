@@ -1893,6 +1893,205 @@ async fn domain_manifest_honours_if_none_match() {
     assert_eq!(body["domain"], "eng");
 }
 
+/// Overwrite the fixture domain's MANIFEST on disk. The manifest route reads
+/// the file at request time, so no sync stands between the write and the
+/// next GET.
+fn write_manifest(fixture: &Fixture, markdown: &str) {
+    std::fs::write(fixture._tmp.path().join("eng/MANIFEST.md"), markdown).unwrap();
+}
+
+/// The manifest response carries the features the core crate reads out of
+/// the source: routing bullets and which of them an agent reads, the
+/// provisioning and tag alias declarations, and the one frontmatter switch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_manifest_carries_every_section_it_declares() {
+    let fixture = serve_anonymous().await;
+    write_manifest(
+        &fixture,
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n\n## Provisioning\n\n- skills: skills\n- agents: ../agents\n\n## Tag Aliases\n\n- Multi_Word -> multi-word\n- old-tag -> new-tag\n",
+    );
+
+    let body: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/manifest")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["domain"], "eng");
+    assert!(
+        body["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("## Tag Aliases")
+    );
+    assert!(body["checksum"].is_string());
+    assert_eq!(
+        body["sections"],
+        serde_json::json!({
+            "scope": ["Everything about eng"],
+            "when_to_use": ["Route here for eng questions"],
+            "routing": "when_to_use",
+            "missing": [],
+            "provisioning": {
+                "decls": [
+                    { "kind": "skills", "path": "skills" },
+                    { "kind": "agents", "path": "../agents" }
+                ],
+                "problems": []
+            },
+            "tag_aliases": {
+                "decls": [
+                    { "alias": "Multi_Word", "canonical": "multi-word" },
+                    { "alias": "old-tag", "canonical": "new-tag" }
+                ],
+                "problems": []
+            },
+            "generated_indexes": { "declared": "shared", "effective": "shared" }
+        }),
+        "{body}"
+    );
+}
+
+/// A MANIFEST with only the required sections answers `null` for the two
+/// optional ones and the local default for the switch; one missing a
+/// required section names it, and routing falls back to Scope, then to
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_manifest_names_what_it_lacks() {
+    let fixture = serve_anonymous().await;
+
+    // The fixture's own MANIFEST: Scope and When to Use, nothing else.
+    let body: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/manifest")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["sections"],
+        serde_json::json!({
+            "scope": ["Everything about eng"],
+            "when_to_use": ["Route here for eng questions"],
+            "routing": "when_to_use",
+            "missing": [],
+            "provisioning": null,
+            "tag_aliases": null,
+            "generated_indexes": { "declared": null, "effective": "local" }
+        }),
+        "{body}"
+    );
+
+    write_manifest(
+        &fixture,
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n",
+    );
+    let body: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/manifest")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["sections"]["routing"], "scope", "{body}");
+    assert_eq!(body["sections"]["when_to_use"], serde_json::json!([]));
+    assert_eq!(
+        body["sections"]["missing"],
+        serde_json::json!(["When to Use"])
+    );
+
+    write_manifest(
+        &fixture,
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\nNothing routes here yet.\n",
+    );
+    let body: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/manifest")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["sections"]["routing"], "none", "{body}");
+    assert_eq!(
+        body["sections"]["missing"],
+        serde_json::json!(["Scope", "When to Use"])
+    );
+}
+
+/// Every problem bullet the core crate flags rides along with its kind and
+/// its reason, in the order the crate reports them: the parse is the crate's
+/// and this surface adds nothing to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_manifest_lists_its_problem_bullets() {
+    let fixture = serve_anonymous().await;
+    write_manifest(
+        &fixture,
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n\n## Provisioning\n\n- skills: skills\n- widgets: w\n- skills: other\n- nonsense\n\n## Tag Aliases\n\n- a -> a\n- x -> Not_Canonical\n- broken\n- foo -> bar\n- bar -> baz\n",
+    );
+
+    let body: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/manifest")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let provisioning = &body["sections"]["provisioning"];
+    assert_eq!(
+        provisioning["decls"],
+        serde_json::json!([{ "kind": "skills", "path": "skills" }]),
+        "{body}"
+    );
+    assert_eq!(
+        provisioning["problems"],
+        serde_json::json!([
+            {
+                "kind": "unknown_type",
+                "bullet": "widgets: w",
+                "reason": "unknown provisioning type `widgets`, expected one of skills, commands, agents or mcps"
+            },
+            {
+                "kind": "duplicate_type",
+                "bullet": "skills: other",
+                "reason": "duplicate `skills` declaration, the first one wins"
+            },
+            {
+                "kind": "malformed",
+                "bullet": "nonsense",
+                "reason": "expected a `type: path` shape, no colon found in `nonsense`"
+            }
+        ]),
+        "{body}"
+    );
+    let aliases = &body["sections"]["tag_aliases"];
+    assert_eq!(
+        aliases["decls"],
+        serde_json::json!([
+            { "alias": "x", "canonical": "Not_Canonical" },
+            { "alias": "foo", "canonical": "bar" },
+            { "alias": "bar", "canonical": "baz" }
+        ]),
+        "a non-canonical target and a chained alias are kept as decls: {body}"
+    );
+    assert_eq!(
+        aliases["problems"],
+        serde_json::json!([
+            {
+                "kind": "self_alias",
+                "bullet": "a -> a",
+                "reason": "`a` is aliased to itself, nothing to merge"
+            },
+            {
+                "kind": "non_canonical_target",
+                "bullet": "x -> Not_Canonical",
+                "reason": "canonical `Not_Canonical` is not a lowercase-with-hyphens tag"
+            },
+            {
+                "kind": "malformed",
+                "bullet": "broken",
+                "reason": "expected an `old -> canonical` shape, no `->` arrow found in `broken`"
+            },
+            {
+                "kind": "chained_alias",
+                "bullet": "foo -> bar",
+                "reason": "canonical `bar` is itself an alias, resolution stays a single hop"
+            }
+        ]),
+        "{body}"
+    );
+}
+
 /// The listing is `search_engrams` with no query behind a query string: the
 /// filters select, and the page envelope the engine already writes comes
 /// through unchanged so a client can page without a second shape to learn.
@@ -2079,6 +2278,85 @@ async fn engram_list_scopes_to_a_folder() {
     .unwrap();
     assert_eq!(page["total"], 3, "{page}");
     assert_eq!(page["count"], 1, "the last page of three: {page}");
+}
+
+/// The listing's order is the client's to name: `sort` is `recorded` (the
+/// default) or `path`, `dir` is `asc` or `desc`, and a value outside those
+/// is a 400 naming the parameter. Every fixture engram was recorded on one
+/// day, so the recorded order falls through to its tie-break, the path in
+/// byte order, where `MANIFEST.md` sorts before `alpha.md` because a capital
+/// is the smaller byte; the reversed name order proves the pair reaches the
+/// store, and the engine test beside `engine_writes.rs` proves the dates do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_list_takes_sort_and_dir() {
+    let fixture = serve_anonymous().await;
+    let by_path = vec![
+        "manifest".to_string(),
+        "alpha".to_string(),
+        "notes/beta".to_string(),
+        "notes/deep/gamma".to_string(),
+    ];
+
+    for query in [
+        "",
+        "?sort=recorded",
+        "?sort=recorded&dir=desc",
+        "?sort=recorded&dir=asc",
+        "?sort=path",
+        "?sort=path&dir=asc",
+    ] {
+        let page: serde_json::Value =
+            get(fixture.addr, &format!("/api/v1/domains/eng/engrams{query}"))
+                .await
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(hit_permalinks(&page), by_path, "query `{query}`: {page}");
+    }
+
+    let reversed: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?sort=path&dir=desc",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let mut expected = by_path.clone();
+    expected.reverse();
+    assert_eq!(hit_permalinks(&reversed), expected, "Z to A: {reversed}");
+
+    // The order decides which rows land on a page, so paging is exact under it.
+    let page: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?sort=path&dir=desc&limit=3&page=2",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        hit_permalinks(&page),
+        vec!["manifest".to_string()],
+        "{page}"
+    );
+    assert_eq!(page["total"], 4, "{page}");
+
+    let bad_sort = get(fixture.addr, "/api/v1/domains/eng/engrams?sort=sideways").await;
+    assert_eq!(bad_sort.status(), 400);
+    let problem: serde_json::Value = bad_sort.json().await.unwrap();
+    assert_eq!(
+        problem["detail"], "`sort` must be `recorded` or `path`, not `sideways`",
+        "{problem}"
+    );
+
+    let bad_dir = get(fixture.addr, "/api/v1/domains/eng/engrams?dir=up").await;
+    assert_eq!(bad_dir.status(), 400);
+    let problem: serde_json::Value = bad_dir.json().await.unwrap();
+    assert_eq!(
+        problem["detail"], "`dir` must be `asc` or `desc`, not `up`",
+        "{problem}"
+    );
 }
 
 /// The tree is a navigation aid, not the listing, so a level it cannot show

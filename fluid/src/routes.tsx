@@ -14,17 +14,17 @@
  */
 
 import { Suspense, lazy } from "react";
-import { Route, Routes } from "react-router";
+import { Navigate, Route, Routes, useParams } from "react-router";
 
 import LoginPage from "./auth/LoginPage";
 import { RequireAuth } from "./auth/RequireAuth";
 import { Layout } from "./components/Layout";
 import { Skeleton } from "./components/Skeleton";
+import { domainRoute } from "./paths";
 import DomainHome from "./screens/DomainHome";
 import GraphView from "./screens/GraphView";
 import Home from "./screens/Home";
 import Maintenance from "./screens/Maintenance";
-import ManifestPage from "./screens/ManifestPage";
 import NotFound from "./screens/NotFound";
 import OauthConsent from "./screens/OauthConsent";
 import Search from "./screens/Search";
@@ -81,6 +81,16 @@ const Profile = lazy(() => import("./screens/Profile"));
  * wait is one request on a screen that is itself the arrival.
  */
 const GrantedDraft = lazy(() => import("./screens/GrantedDraft"));
+
+/**
+ * The MANIFEST's old address. The document is read on the domain page now,
+ * so a link that still points here lands there rather than on the not-found
+ * screen; the editor keeps its own segment beneath it.
+ */
+function ManifestRedirect() {
+  const { domain = "" } = useParams();
+  return <Navigate to={domainRoute(domain)} replace />;
+}
 
 const EDITOR_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -144,12 +154,13 @@ export function AppRoutes() {
           {/*
             Both MANIFEST routes sit above `/d/:domain/e/*` for readability,
             though nothing here collides: `manifest` is its own segment, not a
-            permalink the splat below would otherwise swallow. The page is a
-            static import - it renders markdown, no editor weight - while the
-            editor rides its own lazy chunk, gated to admins by the screen
-            itself the same way `/users` is.
+            permalink the splat below would otherwise swallow. The first is a
+            redirect, kept so a link somebody saved still lands where the
+            MANIFEST is read now, the domain page; the editor rides its own
+            lazy chunk, gated to admins by the screen itself the same way
+            `/users` is.
           */}
-          <Route path="/d/:domain/manifest" element={<ManifestPage />} />
+          <Route path="/d/:domain/manifest" element={<ManifestRedirect />} />
           <Route
             path="/d/:domain/manifest/edit"
             element={

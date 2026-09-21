@@ -22,6 +22,8 @@
 
 import { useQuery } from "@tanstack/react-query";
 import {
+  AArrowDown,
+  AArrowUp,
   FoldHorizontal,
   House,
   Moon,
@@ -69,12 +71,25 @@ import { useAuth } from "../auth/AuthContext";
 import { useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import {
+  LAYOUT_TEXT_KEY,
+  LayoutTextContext,
+  storedLargeText,
+  useLargeText,
+} from "../layoutText";
+import type { LayoutText } from "../layoutText";
+import {
   LAYOUT_WIDTH_KEY,
   LayoutWidthContext,
   storedFullWidth,
   useFullWidth,
 } from "../layoutWidth";
 import type { LayoutWidth } from "../layoutWidth";
+import {
+  ENGRAMS_ORDER_KEY,
+  EngramsOrderContext,
+  storedEngramsOrder,
+} from "../engramsOrder";
+import type { EngramsOrder, EngramsOrderChoice } from "../engramsOrder";
 import {
   domainRoute,
   githubSettingsRoute,
@@ -412,6 +427,8 @@ export function Layout() {
   const [navOpen, setNavOpen] = useState(false);
   const [rail, setRail] = useState(storedRail);
   const [fullWidth, setFullWidth] = useState(storedFullWidth);
+  const [largeText, setLargeText] = useState(storedLargeText);
+  const [engramsOrder, setEngramsOrderState] = useState(storedEngramsOrder);
   const wide = useWide();
   const [helpOpen, setHelpOpen] = useState(false);
   // Registering a domain is the frame's own act rather than any screen's: it
@@ -479,6 +496,42 @@ export function Layout() {
     [fullWidth, toggleFullWidth],
   );
 
+  // The other frame-level choice, kept and read the same way. Memoized for
+  // the same reason `toggleFullWidth` is: the palette registration and the
+  // context value both key off identity.
+  const toggleLargeText = useCallback(() => {
+    setLargeText((was) => {
+      const next = !was;
+      try {
+        localStorage.setItem(LAYOUT_TEXT_KEY, next ? "large" : "regular");
+      } catch {
+        // A browser that refuses storage still gets the session's choice.
+      }
+      return next;
+    });
+  }, []);
+
+  const text = useMemo<LayoutText>(
+    () => ({ largeText, toggleLargeText }),
+    [largeText, toggleLargeText],
+  );
+
+  // The third frame-level choice, about what is listed rather than how the
+  // frame is drawn: which way a domain's engrams are ordered. Kept and read
+  // the way the width is, and memoized for the same reason.
+  const setEngramsOrder = useCallback((next: EngramsOrder) => {
+    setEngramsOrderState(next);
+    try {
+      localStorage.setItem(ENGRAMS_ORDER_KEY, next);
+    } catch {
+      // A browser that refuses storage still gets the session's choice.
+    }
+  }, []);
+  const engramsOrderChoice = useMemo<EngramsOrderChoice>(
+    () => ({ order: engramsOrder, setOrder: setEngramsOrder }),
+    [engramsOrder, setEngramsOrder],
+  );
+
   // What is offered on every screen, because the frame is on every screen: a
   // reader who found the palette can find everything else from inside it.
   // Registered as the frame's, so it sits under whatever the screen in front
@@ -503,6 +556,11 @@ export function Layout() {
         id: "layout.full-width",
         title: "Toggle full width",
         run: toggleFullWidth,
+      },
+      {
+        id: "layout.large-text",
+        title: "Toggle large text",
+        run: toggleLargeText,
       },
     ];
     if (capabilities.canAdminister) {
@@ -543,6 +601,7 @@ export function Layout() {
     share.enabled,
     share.visible,
     toggleFullWidth,
+    toggleLargeText,
   ]);
   useRegisterCommands(commands, "frame");
 
@@ -590,101 +649,112 @@ export function Layout() {
     // Around the whole frame rather than around the outlet: the top bar's own
     // width button is a reader of this value too.
     <LayoutWidthContext value={width}>
-      <div className="min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-        <TopBar
-          navOpen={navOpen}
-          onToggleNav={() => {
-            setNavOpen((open) => !open);
-          }}
-          onShare={openShare}
-        />
-        {/*
+      <LayoutTextContext value={text}>
+        <EngramsOrderContext value={engramsOrderChoice}>
+          <div className="min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+            <TopBar
+              navOpen={navOpen}
+              onToggleNav={() => {
+                setNavOpen((open) => !open);
+              }}
+              onShare={openShare}
+            />
+            {/*
           Above everything, on every screen, for as long as this window is
           inside somebody else's draft. Working in another person's unfolded
           work is a state the WINDOW is in rather than something one page
           does, so it is drawn here and not by the screen that started it.
         */}
-        <JoinedDraftBar />
-        <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
-          {/*
+            <JoinedDraftBar />
+            <div
+              className={`mx-auto flex w-full gap-6 px-4 py-6 ${
+                fullWidth ? "" : "max-w-350"
+              }`}
+            >
+              {/*
             The stored rail only reaches the sidebar where there is a sidebar
             to apply it to: below `md` this is a drawer, and it is always
             expanded.
           */}
-          <DomainSidebar
-            open={navOpen}
-            rail={rail && wide}
-            onToggleRail={toggleRail}
-            onCreateDomain={() => {
-              setCreatingDomain(true);
-            }}
-          />
-          {/*
+              <DomainSidebar
+                open={navOpen}
+                rail={rail && wide}
+                onToggleRail={toggleRail}
+                onCreateDomain={() => {
+                  setCreatingDomain(true);
+                }}
+              />
+              {/*
             One attribute for the whole app's measure: the stylesheet lifts the
             cap under it, so no screen has to know anything about the choice to
-            be drawn at the width it asks for.
+            be drawn at the width it asks for. The frame's own cap goes with
+            it: full width means the window, not a wider column inside the
+            same box.
           */}
-          <main
-            ref={mainRef}
-            tabIndex={-1}
-            data-width={fullWidth ? "full" : undefined}
-            className="min-w-0 flex-1 focus:outline-none"
-          >
-            <Outlet />
-          </main>
-        </div>
-        <RouteFocus target={mainRef} />
-        {/*
+              <main
+                ref={mainRef}
+                tabIndex={-1}
+                data-width={fullWidth ? "full" : undefined}
+                data-text={largeText ? "large" : undefined}
+                className="min-w-0 flex-1 focus:outline-none"
+              >
+                <Outlet />
+              </main>
+            </div>
+            <RouteFocus target={mainRef} />
+            {/*
           Once for the whole app, so the shortcut works on every screen and the
           palette outlives the screen a jump leaves behind.
         */}
-        <CommandPalette />
-        {/*
+            <CommandPalette />
+            {/*
           And the map of the keys that drive it, one press away from anywhere.
         */}
-        <HelpOverlay
-          open={helpOpen}
-          onClose={() => {
-            setHelpOpen(false);
-          }}
-        />
-        {/*
+            <HelpOverlay
+              open={helpOpen}
+              onClose={() => {
+                setHelpOpen(false);
+              }}
+            />
+            {/*
           Mounted by the frame rather than by the sidebar, because both ways in
           - the launcher under the listing and the palette row - are the
           frame's.
         */}
-        {creatingDomain && (
-          <CreateDomainDialog
-            onClose={() => {
-              setCreatingDomain(false);
-            }}
-          />
-        )}
-        {/*
+            {creatingDomain && (
+              <CreateDomainDialog
+                onClose={() => {
+                  setCreatingDomain(false);
+                }}
+              />
+            )}
+            {/*
           The same pair, for the same reason: the button and the palette row
           both belong to the frame, and the picker hands straight over to the
           dialog beside it rather than opening a second one over itself.
         */}
-        {pickingShare && (
-          <SharePickerDialog
-            onPick={(domain) => {
-              setPickingShare(false);
-              setShareDomain(domain);
-            }}
-            onClose={() => {
-              setPickingShare(false);
-            }}
-          />
-        )}
-        {shareDomain !== null && (
-          <ShareDialog
-            domain={shareDomain}
-            onClose={() => {
-              setShareDomain(null);
-            }}
-          />
-        )}
-      </div>
+            {pickingShare && (
+              <SharePickerDialog
+                onPick={(domain) => {
+                  setPickingShare(false);
+                  setShareDomain(domain);
+                }}
+                onClose={() => {
+                  setPickingShare(false);
+                }}
+              />
+            )}
+            {shareDomain !== null && (
+              <ShareDialog
+                domain={shareDomain}
+                onClose={() => {
+                  setShareDomain(null);
+                }}
+              />
+            )}
+          </div>
+        </EngramsOrderContext>
+      </LayoutTextContext>
     </LayoutWidthContext>
   );
 }
@@ -719,6 +789,7 @@ function TopBar({
   onShare: (domain: string | null) => void;
 }) {
   const { capabilities } = useAuth();
+  const { fullWidth } = useFullWidth();
 
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur print:hidden dark:border-slate-800 dark:bg-slate-950/90">
@@ -727,9 +798,14 @@ function TopBar({
         below it - the reading surface's own sticky pieces, the editor's
         toolbar - are measured against this height, so it is a number the rest
         of the frame can rely on rather than whatever the tallest control in
-        here happens to be today.
+        here happens to be today. The row follows the body's cap so the
+        controls keep aligning with the content's edge at either width.
       */}
-      <div className="mx-auto flex h-14 w-full max-w-350 items-center gap-3 px-4">
+      <div
+        className={`mx-auto flex h-14 w-full items-center gap-3 px-4 ${
+          fullWidth ? "" : "max-w-350"
+        }`}
+      >
         <IconButton
           label="Domains"
           icon={PanelLeft}
@@ -760,6 +836,7 @@ function TopBar({
         )}
 
         <WidthToggle />
+        <TextSizeToggle />
         <ThemeMenu />
         <UserMenu />
       </div>
@@ -944,6 +1021,21 @@ function WidthToggle() {
       label={fullWidth ? "Use reading width" : "Use full width"}
       icon={fullWidth ? FoldHorizontal : UnfoldHorizontal}
       onClick={toggleFullWidth}
+    />
+  );
+}
+
+/**
+ * The other frame-level choice about the content, named the way the width
+ * toggle is: for the act, not the state.
+ */
+function TextSizeToggle() {
+  const { largeText, toggleLargeText } = useLargeText();
+  return (
+    <IconButton
+      label={largeText ? "Use regular text" : "Use large text"}
+      icon={largeText ? AArrowDown : AArrowUp}
+      onClick={toggleLargeText}
     />
   );
 }
@@ -1170,13 +1262,6 @@ function DomainSidebar({
     : rest.startsWith("edit/")
       ? rest.slice(5)
       : "";
-  // The MANIFEST page and its editor both live outside the splat's engram
-  // shapes above - `manifest` is its own reserved segment (`routes.tsx`),
-  // never a permalink the splat would otherwise swallow - so this is the
-  // you-are-here cue the pinned tree row needs, the same thing `permalink`
-  // already gives the ordinary rows.
-  const onManifest = rest === "manifest" || rest.startsWith("manifest/");
-
   return (
     <nav
       id="domain-sidebar"
@@ -1268,7 +1353,6 @@ function DomainSidebar({
               <DomainNav
                 domain={domain}
                 permalink={permalink}
-                onManifest={onManifest}
                 domains={listing.data?.domains ?? []}
               />
             </>

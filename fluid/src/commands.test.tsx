@@ -264,6 +264,11 @@ describe("the palette's actions", () => {
     expect(
       screen.queryByRole("option", { name: /edit manifest/i }),
     ).not.toBeInTheDocument();
+    // And no link either, for the same reason: the panel is showing the
+    // refusal, and the two doors into the editor open on the same condition.
+    expect(
+      screen.queryByRole("link", { name: "Edit MANIFEST" }),
+    ).not.toBeInTheDocument();
   });
 
   it("leaves the first domain the default where a screen offers nothing", async () => {

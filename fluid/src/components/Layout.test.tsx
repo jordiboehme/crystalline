@@ -4,7 +4,13 @@
  * the sidebar becomes once a domain is open.
  */
 
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -504,9 +510,14 @@ describe("the sidebar inside a domain", () => {
     renderApp("/d/eng");
 
     const nav = await screen.findByRole("navigation", { name: "Domain eng" });
-    // The switcher says where you are, and is the control that moves you.
+    // The domain row says where you are: its name goes to the domain page,
+    // and it is marked current because that page is what is open.
+    const row = await within(nav).findByRole("link", { name: "eng" });
+    expect(row).toHaveAttribute("href", "/d/eng");
+    expect(row).toHaveAttribute("aria-current", "page");
+    // And the control that moves you stands beside it, named for the act.
     expect(
-      await within(nav).findByRole("button", { name: "Domain: eng" }),
+      within(nav).getByRole("button", { name: "Switch domain" }),
     ).toBeVisible();
     // The way back to everything stays on screen rather than being a browser
     // button somebody has to remember.
@@ -524,6 +535,10 @@ describe("the sidebar inside a domain", () => {
     // The flat list is gone: two lists of domains at once would be two answers
     // to the same question.
     expect(within(nav).queryByRole("link", { name: /^ops/ })).toBeNull();
+    // No dropdown wearing the domain's name, and no pinned MANIFEST row: the
+    // MANIFEST is read on the domain page the row already links to.
+    expect(within(nav).queryByRole("button", { name: /^Domain:/ })).toBeNull();
+    expect(within(nav).queryByRole("link", { name: "MANIFEST" })).toBeNull();
   });
 
   it("moves to another domain when the switcher picks one", async () => {
@@ -548,7 +563,7 @@ describe("the sidebar inside a domain", () => {
     renderApp("/d/eng");
     const user = userEvent.setup();
     await user.click(
-      await screen.findByRole("button", { name: "Domain: eng" }),
+      await screen.findByRole("button", { name: "Switch domain" }),
     );
 
     // Every domain is offered with what it holds, which is what makes the
@@ -560,9 +575,10 @@ describe("the sidebar inside a domain", () => {
     expect(
       await screen.findByRole("heading", { level: 1, name: "ops" }),
     ).toBeVisible();
+    const nav = await screen.findByRole("navigation", { name: "Domain ops" });
     expect(
-      await screen.findByRole("button", { name: "Domain: ops" }),
-    ).toBeVisible();
+      await within(nav).findByRole("link", { name: "ops" }),
+    ).toHaveAttribute("aria-current", "page");
   });
 
   it("badges a private domain in the switcher", async () => {
@@ -587,7 +603,7 @@ describe("the sidebar inside a domain", () => {
     renderApp("/d/eng");
     const user = userEvent.setup();
     await user.click(
-      await screen.findByRole("button", { name: "Domain: eng" }),
+      await screen.findByRole("button", { name: "Switch domain" }),
     );
 
     expect(
@@ -822,7 +838,7 @@ describe("the sidebar inside a domain", () => {
     expect(retired.className).toContain("opacity-60");
   });
 
-  it("says the MANIFEST once, above the tree rather than inside it", async () => {
+  it("keeps the MANIFEST out of the tree, and pins no row for it", async () => {
     serveInDomain();
 
     renderApp("/d/eng");
@@ -831,9 +847,37 @@ describe("the sidebar inside a domain", () => {
     // The tree has arrived, so a row the engine listed would be on screen by
     // now if the sidebar were drawing it.
     await within(nav).findByRole("link", { name: "Alpha" });
-    const pinned = within(nav).getAllByRole("link", { name: "MANIFEST" });
-    expect(pinned).toHaveLength(1);
-    expect(pinned[0]).toHaveAttribute("href", "/d/eng/manifest");
+    expect(within(nav).queryByRole("link", { name: "MANIFEST" })).toBeNull();
+    expect(within(nav).queryByText("MANIFEST")).toBeNull();
+  });
+
+  it("marks the domain row current on the domain page only", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng?tags=eng");
+    let nav = await sidebar();
+    // A filter keeps the page it is on: the domain page, still current.
+    expect(
+      await within(nav).findByRole("link", { name: "eng" }),
+    ).toHaveAttribute("aria-current", "page");
+    cleanup();
+
+    renderApp("/d/eng?path=notes");
+    nav = await sidebar();
+    // A folder is its own page, and the folder's row is what is current.
+    expect(
+      await within(nav).findByRole("link", { name: "eng" }),
+    ).not.toHaveAttribute("aria-current");
+    expect(
+      await within(nav).findByRole("link", { name: "notes" }),
+    ).toHaveAttribute("aria-current", "page");
+    cleanup();
+
+    renderApp("/d/eng/e/alpha");
+    nav = await sidebar();
+    expect(
+      await within(nav).findByRole("link", { name: "eng" }),
+    ).not.toHaveAttribute("aria-current");
   });
 
   it("says why a folder is empty instead of showing an empty one", async () => {
@@ -851,10 +895,10 @@ describe("the sidebar inside a domain", () => {
 
     const alert = await within(await sidebar()).findByRole("alert");
     expect(alert).toHaveTextContent("this account may not browse eng");
-    // The switcher survives the failure: one domain refusing to be browsed is
-    // not a reason to strand somebody in it.
+    // The row and its switch button survive the failure: one domain refusing
+    // to be browsed is not a reason to strand somebody in it.
     expect(
-      within(await sidebar()).getByRole("button", { name: "Domain: eng" }),
+      within(await sidebar()).getByRole("button", { name: "Switch domain" }),
     ).toBeVisible();
   });
 });
@@ -1085,6 +1129,29 @@ describe("the content's own width", () => {
     expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
   });
 
+  it("lifts the frame's own cap at full width, header and body alike", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const main = await screen.findByRole("main");
+    expect(main.parentElement?.className).toContain("max-w-350");
+    const headerRow = document.querySelector("header > div");
+    expect(headerRow?.className).toContain("max-w-350");
+
+    await user.click(screen.getByRole("button", { name: "Use full width" }));
+
+    // Full width means the window: dropping the details column and lifting
+    // the measure while the frame keeps its cap would hand back the room and
+    // then refuse to use it.
+    expect(main.parentElement?.className).not.toContain("max-w-350");
+    expect(headerRow?.className).not.toContain("max-w-350");
+
+    await user.click(screen.getByRole("button", { name: "Use reading width" }));
+    expect(main.parentElement?.className).toContain("max-w-350");
+    expect(headerRow?.className).toContain("max-w-350");
+  });
+
   it("goes back to the measure, and remembers that too", async () => {
     localStorage.setItem("fluid.layout.width", "full");
     serveSignedIn();
@@ -1192,5 +1259,55 @@ describe("the content's own width", () => {
       name: /keyboard shortcuts/i,
     });
     expect(help).toHaveTextContent(/full width/i);
+  });
+});
+
+describe("the text size", () => {
+  it("switches the document to large text and remembers it", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const main = await screen.findByRole("main");
+    expect(main).not.toHaveAttribute("data-text");
+
+    await user.click(screen.getByRole("button", { name: "Use large text" }));
+
+    // One attribute on the frame is the whole of what the stylesheet reads,
+    // for the rendered document and the editor alike.
+    expect(main).toHaveAttribute("data-text", "large");
+    expect(
+      screen.getByRole("button", { name: "Use regular text" }),
+    ).toBeVisible();
+    expect(localStorage.getItem("fluid.layout.text")).toBe("large");
+  });
+
+  it("reads a stored large text at mount, and goes back", async () => {
+    localStorage.setItem("fluid.layout.text", "large");
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    expect(await screen.findByRole("main")).toHaveAttribute(
+      "data-text",
+      "large",
+    );
+    await user.click(screen.getByRole("button", { name: "Use regular text" }));
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-text");
+    expect(localStorage.getItem("fluid.layout.text")).toBe("regular");
+  });
+
+  it("offers the toggle on the palette", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByRole("main");
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(screen.getByRole("combobox"), "large text");
+    await user.click(
+      await screen.findByRole("option", { name: "Toggle large text" }),
+    );
+    expect(screen.getByRole("main")).toHaveAttribute("data-text", "large");
   });
 });

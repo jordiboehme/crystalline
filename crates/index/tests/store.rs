@@ -16,7 +16,7 @@ use crystalline_index::{
     AttachmentRow, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage,
     EmbeddingRow, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage,
     InboundQuery, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode,
-    SearchQuery, Store, TursoStore, Vocabulary, resolve_forward_refs, sync_domain,
+    SearchOrder, SearchQuery, Store, TursoStore, Vocabulary, resolve_forward_refs, sync_domain,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -2626,13 +2626,15 @@ async fn search_pages(store: &dyn Store) {
     assert_eq!(page3.items.len(), 1, "7 items, page 3 of size 3 has 1");
 
     // The filter-only path (no query text) pages in SQL instead, ordered by
-    // recorded_at then permalink. Both keys are text and every fixture shares a
-    // date, so the permalink tie-break alone decides who lands on the page:
-    // `Zeta` sorts before `e0` byte-wise and after `e6` under a locale
-    // collation, which would silently change the first page on Postgres.
+    // recorded_at then the path. Both keys are text and every fixture shares a
+    // date, so the path tie-break alone decides who lands on the page:
+    // `Zeta.md` sorts before `e0.md` byte-wise and after `e6.md` under a locale
+    // collation, which would silently change the first page on Postgres. The
+    // capital lives in the file name rather than in the permalink alone,
+    // because the path is the key the tie-break reads.
     write(
         root,
-        "zeta.md",
+        "Zeta.md",
         &engram("Zeta", "Zeta", "engram", "", "shared_term here\n"),
     );
     sync_domain(store, "d", root).await.unwrap();
@@ -2652,10 +2654,187 @@ async fn search_pages(store: &dyn Store) {
             .map(|h| h.permalink.as_str())
             .collect::<Vec<_>>(),
         vec!["Zeta", "e0"],
-        "the filter-only page is ordered by permalink in byte order"
+        "the filter-only page is ordered by path in byte order"
     );
 }
 parity!(search_paginates, search_pages);
+
+/// A filter-only listing - the one the domain page and every folder view page
+/// through - comes back newest recorded first, and an engram carrying no
+/// `recorded_at` comes LAST on either backend.
+///
+/// The date is the sort key and a missing one is a real state on disk: the
+/// field is required of a written engram, and a file may still be missing it.
+/// The two backends disagree about a NULL sort key by default - SQLite puts it
+/// last under `DESC`, Postgres puts it first - so a domain page opening on the
+/// newest engrams would lead with the one engram nobody dated on Postgres and
+/// end with it on Turso. The order is pinned in the statement rather than
+/// inherited from the dialect, and it is pinned across the page boundary too,
+/// because the sort decides which rows land on a page at all.
+async fn filter_only_orders_undated_last(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Written out of date order, so nothing about the answer can come from the
+    // order the files were indexed in.
+    write(
+        root,
+        "jan.md",
+        "---\ntype: engram\ntitle: Jan\npermalink: jan\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "mar.md",
+        "---\ntype: engram\ntitle: Mar\npermalink: mar\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-03-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "feb.md",
+        "---\ntype: engram\ntitle: Feb\npermalink: feb\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-02-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
+    sync_domain(store, "eng", root).await.unwrap();
+
+    let page = store
+        .search(&SearchQuery {
+            domains: Some(vec!["eng".to_string()]),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, 4);
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mar", "feb", "jan", "undated"],
+        "newest recorded first, and the undated engram last"
+    );
+
+    // The same order across a page boundary: the undated engram is on the last
+    // page rather than on the first.
+    let second = store
+        .search(&SearchQuery {
+            domains: Some(vec!["eng".to_string()]),
+            limit: 2,
+            page: 2,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["jan", "undated"],
+        "page two of two"
+    );
+}
+parity!(
+    a_filter_only_listing_orders_undated_last,
+    filter_only_orders_undated_last
+);
+
+/// The four orders a filter-only listing can be asked for, on the rows the
+/// test above uses: newest or oldest recorded first, the undated engram last
+/// in BOTH directions, and by name either way, where name is the path in
+/// byte order. Pinned across a page boundary for the reversed orders too,
+/// because the sort decides which rows land on a page at all.
+async fn filter_only_orders_by_the_readers_choice(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "jan.md",
+        "---\ntype: engram\ntitle: Jan\npermalink: jan\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "mar.md",
+        "---\ntype: engram\ntitle: Mar\npermalink: mar\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-03-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "feb.md",
+        "---\ntype: engram\ntitle: Feb\npermalink: feb\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-02-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
+    sync_domain(store, "eng", root).await.unwrap();
+
+    async fn permalinks(
+        store: &dyn Store,
+        order: SearchOrder,
+        limit: usize,
+        page: usize,
+    ) -> Vec<String> {
+        store
+            .search(&SearchQuery {
+                domains: Some(vec!["eng".to_string()]),
+                order,
+                limit,
+                page,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|h| h.permalink.clone())
+            .collect()
+    }
+
+    assert_eq!(
+        SearchOrder::default(),
+        SearchOrder::RecordedDesc,
+        "the default is the order the domain page opened on before the choice existed"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::RecordedDesc, 10, 1).await,
+        ["mar", "feb", "jan", "undated"],
+        "newest first, undated last"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::RecordedAsc, 10, 1).await,
+        ["jan", "feb", "mar", "undated"],
+        "oldest first, and the undated engram is still last"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::PathAsc, 10, 1).await,
+        ["feb", "jan", "mar", "undated"],
+        "by name, which is the path in byte order"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::PathDesc, 10, 1).await,
+        ["undated", "mar", "jan", "feb"],
+        "by name, reversed"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::RecordedAsc, 2, 2).await,
+        ["mar", "undated"],
+        "page two of two, oldest first"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::PathDesc, 3, 2).await,
+        ["feb"],
+        "page two of two, by name reversed"
+    );
+}
+parity!(
+    a_filter_only_listing_orders_by_the_readers_choice,
+    filter_only_orders_by_the_readers_choice
+);
 
 async fn neighbors_cross_domain(store: &dyn Store) {
     // domain2 holds the cross-domain target C.
@@ -2848,6 +3027,13 @@ parity!(neighbors_carries_status_prior, neighbors_carries_status);
 /// `Zeta` sorts first byte-wise and last under a locale collation, so an
 /// unpinned Postgres sort would not merely reorder the page, it would return a
 /// different engram at `limit: 1`.
+///
+/// An engram carrying no `recorded_at` comes last on either backend, the same
+/// rule the filter-only listing holds to. It is a real state on disk - the
+/// field is required of a written engram and a file may still be missing it -
+/// and the two dialects disagree about a NULL sort key by default: SQLite puts
+/// it last under `DESC`, Postgres puts it first. A recency answer that leads
+/// with the one engram nobody dated is wrong on both.
 async fn recent_newest_first(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -2862,6 +3048,11 @@ async fn recent_newest_first(store: &dyn Store) {
         "zeta.md",
         "---\ntype: engram\ntitle: Zeta\npermalink: Zeta\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-06-01\n---\n\nb\n",
     );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
     sync_domain(store, "d", root).await.unwrap();
     let recent = store
         .recent(&RecentFilter {
@@ -2875,8 +3066,9 @@ async fn recent_newest_first(store: &dyn Store) {
             .iter()
             .map(|e| e.permalink.as_str())
             .collect::<Vec<_>>(),
-        vec!["Zeta", "new", "old"],
-        "2026-06-01 before 2026-01-01, same-day ties broken by permalink in byte order"
+        vec!["Zeta", "new", "old", "undated"],
+        "2026-06-01 before 2026-01-01, same-day ties broken by permalink in byte \
+         order, and the undated engram last on either backend"
     );
 
     // The tie-break decides what a capped read sees at all.

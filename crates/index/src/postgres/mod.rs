@@ -84,7 +84,8 @@ mod search;
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
 #[doc(hidden)]
 pub use search::{
-    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
+    filter_only_sql, lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql,
+    semantic_phase1_sql,
 };
 
 use std::collections::HashMap;
@@ -1939,12 +1940,16 @@ impl Store for PostgresStore {
         // Both sort keys are TEXT, and the `LIMIT` makes their order decide which
         // rows come back at all, so both are pinned to `COLLATE "C"` to match
         // Turso's byte order: engrams recorded on the same day are separated by
-        // the permalink tie-break alone.
+        // the permalink tie-break alone. `NULLS LAST` is pinned for the same
+        // reason: Postgres puts a NULL first under `DESC` where SQLite puts it
+        // last, so an undated engram led a recency answer here and ended one
+        // on Turso.
         let sql = format!(
             "SELECT d.name, e.permalink, e.title, e.engram_type, e.status, e.recorded_at, \
              (SELECT string_agg(t.name, ',') FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id) \
              FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
-             ORDER BY e.recorded_at COLLATE \"C\" DESC, e.permalink COLLATE \"C\" ASC LIMIT {limit}"
+             ORDER BY e.recorded_at COLLATE \"C\" DESC NULLS LAST, \
+             e.permalink COLLATE \"C\" ASC LIMIT {limit}"
         );
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;

@@ -55,9 +55,8 @@ export function editRoute(domain: string, permalink: string): string {
 }
 
 /**
- * The MANIFEST page of one domain. Its own segment rather than a permalink
- * under `/e/`: a MANIFEST is not an engram and carries no permalink of its
- * own to encode.
+ * The route is kept as the base of the editor's address and redirects to
+ * the domain page, where the MANIFEST is now read.
  */
 export function manifestRoute(domain: string): string {
   return `${domainRoute(domain)}/manifest`;

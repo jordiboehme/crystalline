@@ -48,6 +48,20 @@ const MANIFEST = [
   "",
 ].join("\n");
 
+/** The sections a server reads out of `MANIFEST`, in the wire shape. */
+function sectionsResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    scope: [],
+    when_to_use: ["Route here for eng questions."],
+    routing: "when_to_use",
+    missing: ["Scope"],
+    provisioning: null,
+    tag_aliases: null,
+    generated_indexes: { declared: null, effective: "local" },
+    ...overrides,
+  };
+}
+
 /** The tree, which answers with the folder that was asked for. */
 function treeResponse(path: string) {
   if (path.includes("path=notes")) {
@@ -193,7 +207,11 @@ function serve(
     answersFor({
       "/auth/me": probe,
       "/domains": domainsResponse,
-      "/domains/eng/manifest": () => ({ domain: "eng", markdown: MANIFEST }),
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse(),
+      }),
       "/domains/eng/tree": treeResponse,
       "/domains/eng/engrams": engramsResponse,
       "/vocabulary": vocabularyResponse,
@@ -248,29 +266,282 @@ async function screenBody(): Promise<HTMLElement> {
 
 beforeEach(() => {
   apiMock.mockReset();
+  // The listing's order is remembered across sessions, so each test starts
+  // from a browser that has never been told anything.
+  localStorage.clear();
 });
 
 describe("the domain screen", () => {
-  it("renders the manifest's lede and the engrams at the root of the domain", async () => {
+  it("renders the whole MANIFEST and the engrams at the root of the domain", async () => {
     serve();
 
     renderApp("/d/eng");
 
-    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
-    // The manifest is one paragraph here and a link to the rest: what a
-    // reader arriving in a domain needs is what it is for, then its engrams,
-    // and a whole document in between put the list below the fold.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "eng" }),
+    ).toBeVisible();
+    // The whole document, rendered where the domain is introduced: its
+    // prose, its sections, the lot. The MANIFEST's own `# eng` folds into
+    // the page's heading, so the domain is named once.
     expect(
       await screen.findByText("What this domain is for, in one paragraph."),
     ).toBeVisible();
     expect(
-      screen.getByRole("link", { name: "Read the MANIFEST" }),
-    ).toHaveAttribute("href", "/d/eng/manifest");
-    expect(screen.queryByRole("heading", { name: "When to Use" })).toBeNull();
+      screen.getByRole("heading", { level: 2, name: "When to Use" }),
+    ).toBeVisible();
+    expect(screen.getAllByRole("heading", { name: "eng" })).toHaveLength(1);
+    expect(
+      screen.queryByRole("link", { name: "Read the MANIFEST" }),
+    ).toBeNull();
     const row = await within(await screenBody()).findByRole("link", {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
+    expect(
+      within(await screenBody()).getByText(
+        "Newest first, by the date they were recorded.",
+      ),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(
+        requested().some(
+          (path) =>
+            path.startsWith("/domains/eng/engrams?") &&
+            path.includes("sort=recorded") &&
+            path.includes("dir=desc"),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("offers Edit MANIFEST to an admin", async () => {
+    serve({}, "admin");
+
+    renderApp("/d/eng");
+
+    const section = await screen.findByRole("region", { name: "Manifest" });
+    expect(
+      await within(section).findByRole("link", { name: "Edit MANIFEST" }),
+    ).toHaveAttribute("href", "/d/eng/manifest/edit");
+  });
+
+  it("offers no Edit MANIFEST below admin", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    const section = await screen.findByRole("region", { name: "Manifest" });
+    await within(section).findByText(
+      "What this domain is for, in one paragraph.",
+    );
+    expect(
+      within(section).queryByRole("link", { name: "Edit MANIFEST" }),
+    ).toBeNull();
+  });
+  it("shows the manifest's features when every section is there", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          scope: ["Everything about eng"],
+          missing: [],
+          provisioning: {
+            decls: [
+              { kind: "skills", path: "skills" },
+              { kind: "agents", path: "../agents" },
+            ],
+            problems: [],
+          },
+          tag_aliases: {
+            decls: [{ alias: "Multi_Word", canonical: "multi-word" }],
+            problems: [],
+          },
+          generated_indexes: { declared: "shared", effective: "shared" },
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const routing = await screen.findByRole("region", { name: "Routing" });
+    expect(
+      within(routing).getByRole("heading", { name: "When to Use" }),
+    ).toBeVisible();
+    expect(
+      within(routing).getByText("Route here for eng questions."),
+    ).toBeVisible();
+    expect(
+      within(routing).getByRole("heading", { name: "Scope" }),
+    ).toBeVisible();
+    expect(within(routing).getByText("Everything about eng")).toBeVisible();
+    expect(
+      within(routing).getByText("Agents route by When to Use."),
+    ).toBeVisible();
+
+    const provisioning = screen.getByRole("region", { name: "Provisioning" });
+    expect(within(provisioning).getByText("skills: skills")).toBeVisible();
+    expect(within(provisioning).getByText("agents: ../agents")).toBeVisible();
+    expect(within(provisioning).queryByText("Nothing declared")).toBeNull();
+
+    const aliases = screen.getByRole("region", { name: "Tag aliases" });
+    expect(within(aliases).getByText("Multi_Word -> multi-word")).toBeVisible();
+    expect(within(aliases).queryByText("No aliases")).toBeNull();
+
+    const configuration = screen.getByRole("region", {
+      name: "Configuration",
+    });
+    expect(
+      within(configuration).getByText("generated_indexes: shared"),
+    ).toBeVisible();
+    expect(
+      within(configuration).getByText(
+        "Effective: shared. The generated directory indexes travel with the domain.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("names what a MANIFEST lacks, panel by panel", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          scope: ["Everything about eng"],
+          when_to_use: [],
+          routing: "scope",
+          missing: ["When to Use"],
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const routing = await screen.findByRole("region", { name: "Routing" });
+    expect(within(routing).getByText("No When to Use section")).toBeVisible();
+    expect(within(routing).queryByText("No Scope section")).toBeNull();
+    expect(
+      within(routing).getByText(
+        "Agents route by Scope, because When to Use is absent or empty.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(screen.getByRole("region", { name: "Provisioning" })).getByText(
+        "Nothing declared",
+      ),
+    ).toBeVisible();
+    expect(
+      within(screen.getByRole("region", { name: "Tag aliases" })).getByText(
+        "No aliases",
+      ),
+    ).toBeVisible();
+    const configuration = screen.getByRole("region", {
+      name: "Configuration",
+    });
+    expect(
+      within(configuration).getByText("generated_indexes: not declared"),
+    ).toBeVisible();
+    expect(
+      within(configuration).getByText(
+        "Effective: local. The generated directory indexes stay on this machine.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("says when no agent can route here", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          when_to_use: [],
+          routing: "none",
+          missing: ["Scope", "When to Use"],
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const routing = await screen.findByRole("region", { name: "Routing" });
+    expect(within(routing).getByText("No Scope section")).toBeVisible();
+    expect(within(routing).getByText("No When to Use section")).toBeVisible();
+    expect(
+      within(routing).getByText(
+        "Agents cannot route here until When to Use has a bullet.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("lists every problem bullet with its reason", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          provisioning: {
+            decls: [{ kind: "skills", path: "skills" }],
+            problems: [
+              {
+                kind: "unknown_type",
+                bullet: "widgets: w",
+                reason:
+                  "unknown provisioning type `widgets`, expected one of skills, commands, agents or mcps",
+              },
+            ],
+          },
+          tag_aliases: {
+            decls: [{ alias: "foo", canonical: "bar" }],
+            problems: [
+              {
+                kind: "chained_alias",
+                bullet: "foo -> bar",
+                reason:
+                  "canonical `bar` is itself an alias, resolution stays a single hop",
+              },
+            ],
+          },
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const provisioning = await screen.findByRole("region", {
+      name: "Provisioning",
+    });
+    expect(within(provisioning).getByText("widgets: w")).toBeVisible();
+    expect(
+      within(provisioning).getByText(
+        "unknown provisioning type `widgets`, expected one of skills, commands, agents or mcps",
+      ),
+    ).toBeVisible();
+    const aliases = screen.getByRole("region", { name: "Tag aliases" });
+    // A chained alias is a declaration AND a problem, so the bullet stands
+    // twice in the panel: once in the list the MANIFEST declares, once above
+    // the reason it was flagged for.
+    expect(within(aliases).getAllByText("foo -> bar")).toHaveLength(2);
+    expect(
+      within(aliases).getByText(
+        "canonical `bar` is itself an alias, resolution stays a single hop",
+      ),
+    ).toBeVisible();
+  });
+
+  it("draws no panels for a server that sends no sections", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({ domain: "eng", markdown: MANIFEST }),
+    });
+
+    renderApp("/d/eng");
+
+    // An older daemon answers the markdown alone. The document is still
+    // read; the panels, which would say nothing true, are not drawn.
+    expect(
+      await screen.findByText("What this domain is for, in one paragraph."),
+    ).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Routing" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Configuration" })).toBeNull();
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
@@ -380,7 +651,7 @@ describe("the domain screen", () => {
     expect(screen.queryByText("private")).toBeNull();
   });
 
-  it("says a manifest with no prose at all is there without quoting nothing", async () => {
+  it("renders a MANIFEST that is only a title without calling it missing", async () => {
     serve({
       "/domains/eng/manifest": () => ({
         domain: "eng",
@@ -390,11 +661,10 @@ describe("the domain screen", () => {
 
     renderApp("/d/eng");
 
-    // Headings and frontmatter are not a lede. The link is still the way in:
-    // an empty summary is not the same fact as a missing MANIFEST.
-    expect(
-      await screen.findByRole("link", { name: "Read the MANIFEST" }),
-    ).toBeVisible();
+    // A document with nothing but its title is still a document: it is not
+    // the same fact as a missing MANIFEST.
+    await screen.findByRole("region", { name: "Manifest" });
+    await within(await screenBody()).findByRole("link", { name: /Alpha/ });
     expect(screen.queryByText(/no MANIFEST yet/)).toBeNull();
   });
 
@@ -489,6 +759,27 @@ describe("the domain screen", () => {
     ).toBeVisible();
   });
 
+  it("offers an admin the editor over a manifest that is not there yet", async () => {
+    serve(
+      {
+        "/domains/eng/manifest": () => {
+          throw new ApiProblem(404, "not found", "no MANIFEST in domain 'eng'");
+        },
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    // A domain with no MANIFEST is exactly the domain an admin opens the
+    // editor to fix, so the gap sentence comes with the way to close it.
+    const section = await screen.findByRole("region", { name: "Manifest" });
+    await within(section).findByText(/no MANIFEST yet/);
+    expect(
+      within(section).getByRole("link", { name: "Edit MANIFEST" }),
+    ).toHaveAttribute("href", "/d/eng/manifest/edit");
+  });
+
   it("opens a folder into its own list", async () => {
     serve();
 
@@ -508,30 +799,34 @@ describe("the domain screen", () => {
     });
   });
 
-  it("pages a folder from the listing rather than from the tree", async () => {
-    serve({
-      "/domains/eng/engrams": (path) =>
-        path.includes("path=notes")
-          ? {
-              mode: "text",
-              total: 620,
-              page: 1,
-              limit: 50,
-              count: 1,
-              hits: [
-                {
-                  domain: "eng",
-                  permalink: "notes/beta",
-                  title: "Beta",
-                  engram_type: "engram",
-                  kind: "engram",
-                  status: "stable",
-                  tags: [],
-                },
-              ],
-            }
-          : engramsResponse(path),
-    });
+  it("shows a folder as its own page: the trail, the count, and none of the domain's furniture", async () => {
+    serve(
+      {
+        "/domains/eng/engrams": (path) =>
+          path.includes("path=notes")
+            ? {
+                mode: "text",
+                total: 620,
+                page: 1,
+                limit: 50,
+                count: 1,
+                hits: [
+                  {
+                    domain: "eng",
+                    permalink: "notes/beta",
+                    title: "Beta",
+                    engram_type: "engram",
+                    kind: "engram",
+                    status: "stable",
+                    tags: [],
+                  },
+                ],
+              }
+            : engramsResponse(path),
+        "/domains/eng/sync": () => syncResponse(),
+      },
+      "admin",
+    );
 
     // Straight to the folder, because the whole of this screen's state is its
     // URL: the same link somebody sends, and the same address the back button
@@ -539,11 +834,24 @@ describe("the domain screen", () => {
     renderApp("/d/eng?path=notes");
     const body = await screenBody();
 
-    expect(
-      await within(body).findByRole("link", { name: /Beta/ }),
-    ).toBeVisible();
-    // The listing endpoint, scoped and paged, rather than the tree's own rows:
-    // a folder of six hundred engrams costs one page here.
+    // The heading is the folder's path: the domain links to its page, the
+    // folder itself is plain text.
+    const heading = await within(body).findByRole("heading", {
+      level: 1,
+      name: "eng / notes",
+    });
+    expect(within(heading).getByRole("link", { name: "eng" })).toHaveAttribute(
+      "href",
+      "/d/eng",
+    );
+    expect(within(heading).queryByRole("link", { name: "notes" })).toBeNull();
+    // All of them: the list pages towards the envelope's six hundred and the
+    // stub answers every page with the same row, so what is pinned here is
+    // that the folder's engrams are listed, not how many pages landed first.
+    const rows = await within(body).findAllByRole("link", { name: /Beta/ });
+    expect(rows[0]).toBeVisible();
+    // The listing endpoint, scoped and paged, rather than the tree's own
+    // rows: a folder of six hundred engrams costs one page here.
     await waitFor(() => {
       expect(
         requested().some(
@@ -554,10 +862,172 @@ describe("the domain screen", () => {
         ),
       ).toBe(true);
     });
-    // And the count is the envelope's, not the number of rows in hand.
+    // The count is the envelope's, which counts the subtree, and it stands
+    // under the heading once.
     expect(
-      await within(body).findByText(/620 engrams in this folder/),
+      await within(body).findByText("620 engrams in this folder"),
     ).toBeVisible();
+    expect(
+      within(body).getByText("Newest first, by the date they were recorded."),
+    ).toBeVisible();
+    expect(
+      within(body).getByText(/Browsing notes, subfolders included/),
+    ).toBeVisible();
+    // What a folder page carries: New engram and the order menu.
+    expect(
+      within(body).getByRole("button", { name: "New engram" }),
+    ).toBeVisible();
+    expect(
+      within(body).getByRole("button", { name: "Order: Newest first" }),
+    ).toBeVisible();
+    // And what it does not, as an admin on a team domain, where the domain
+    // page would draw every one of these.
+    expect(
+      within(body).queryByRole("region", { name: "Team sync" }),
+    ).toBeNull();
+    expect(
+      within(body).queryByRole("region", { name: "Proposals" }),
+    ).toBeNull();
+    expect(within(body).queryByRole("region", { name: "Members" })).toBeNull();
+    expect(
+      within(body).queryByRole("region", { name: "Review mode" }),
+    ).toBeNull();
+    expect(within(body).queryByRole("region", { name: "Manifest" })).toBeNull();
+    expect(
+      within(body).queryByRole("link", { name: "Download archive" }),
+    ).toBeNull();
+    expect(
+      within(body).queryByRole("button", { name: "Import archive" }),
+    ).toBeNull();
+    expect(
+      within(body).queryByRole("button", { name: "Unregister domain" }),
+    ).toBeNull();
+    expect(within(body).queryByText(/engrams$/)).toBeNull();
+  });
+
+  it("walks a nested folder's trail back out, one link per parent", async () => {
+    serve({
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "notes/deep",
+        folders: [],
+        engrams: [],
+      }),
+      "/domains/eng/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+    });
+
+    renderApp("/d/eng?path=notes%2Fdeep");
+    const body = await screenBody();
+
+    const heading = await within(body).findByRole("heading", {
+      level: 1,
+      name: "eng / notes / deep",
+    });
+    expect(
+      within(heading).getByRole("link", { name: "notes" }),
+    ).toHaveAttribute("href", "/d/eng?path=notes");
+    expect(within(heading).queryByRole("link", { name: "deep" })).toBeNull();
+    expect(
+      await within(body).findByText("0 engrams in this folder"),
+    ).toBeVisible();
+    expect(within(body).getByText("This folder has no engrams.")).toBeVisible();
+  });
+
+  it("orders the listing the way the reader chose, and remembers it", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
+
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Order: Newest first" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitemradio", { name: "Name A to Z" }),
+    );
+
+    // The caption says the order in words, the trigger wears the choice,
+    // the request carries it, and the browser keeps it.
+    expect(await within(body).findByText("By name, A to Z.")).toBeVisible();
+    expect(
+      within(body).getByRole("button", { name: "Order: Name A to Z" }),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(
+        requested().some(
+          (path) =>
+            path.startsWith("/domains/eng/engrams?") &&
+            path.includes("sort=path") &&
+            path.includes("dir=asc"),
+        ),
+      ).toBe(true);
+    });
+    expect(localStorage.getItem("fluid.engrams.order")).toBe("name-asc");
+  });
+
+  it("reads a remembered order at mount", async () => {
+    localStorage.setItem("fluid.engrams.order", "oldest");
+    serve();
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    expect(
+      await within(body).findByText(
+        "Oldest first, by the date they were recorded.",
+      ),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(
+        requested().some(
+          (path) =>
+            path.startsWith("/domains/eng/engrams?") &&
+            path.includes("sort=recorded") &&
+            path.includes("dir=asc"),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("applies the order to a filtered listing too, and never to a search", async () => {
+    localStorage.setItem("fluid.engrams.order", "name-desc");
+    serve();
+
+    renderApp("/d/eng?tags=eng");
+    const body = await screenBody();
+    await screen.findByRole("link", { name: /Gamma/ });
+
+    expect(within(body).getByText("By name, Z to A.")).toBeVisible();
+    const filtered = requested().filter(
+      (path) =>
+        path.startsWith("/domains/eng/engrams?") && path.includes("tags=eng"),
+    );
+    expect(filtered.length).toBeGreaterThan(0);
+    expect(
+      filtered.every(
+        (path) => path.includes("sort=path") && path.includes("dir=desc"),
+      ),
+    ).toBe(true);
+    // Every listing request carries the order, not only the ones the filter
+    // is visible on: a request that went out before the filter resolved
+    // would otherwise slip through unordered.
+    const listings = requested().filter((path) =>
+      path.startsWith("/domains/eng/engrams?"),
+    );
+    expect(listings.length).toBeGreaterThan(0);
+    expect(
+      listings.every(
+        (path) => path.includes("sort=path") && path.includes("dir=desc"),
+      ),
+    ).toBe(true);
   });
 
   it("keeps a filter across the whole domain while a folder is open", async () => {
@@ -580,6 +1050,10 @@ describe("the domain screen", () => {
     );
     expect(filtered.length).toBeGreaterThan(0);
     expect(filtered.every((path) => !path.includes("path="))).toBe(true);
+    // Still the folder page: a filter keeps the page it is on.
+    expect(
+      screen.getByRole("heading", { level: 1, name: "eng / notes" }),
+    ).toBeVisible();
   });
 
   it("switches to the whole domain when a tag is filtered on", async () => {

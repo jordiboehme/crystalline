@@ -27,7 +27,8 @@ mod search;
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
 #[doc(hidden)]
 pub use search::{
-    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
+    filter_only_sql, lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql,
+    semantic_phase1_sql,
 };
 
 use std::collections::HashMap;
@@ -1927,11 +1928,16 @@ impl Store for TursoStore {
         where_clauses.insert(0, "e.actor = ''".to_string());
         let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
         let limit = if filter.limit == 0 { 20 } else { filter.limit };
+        // The undated engram sorts last, said out loud rather than inherited
+        // from the dialect: SQLite already puts a NULL last under `DESC` and
+        // Postgres puts it first, so the twin statement has to spell `NULLS
+        // LAST` and this one spells the same rule with the key SQLite would
+        // apply anyway. The same placement the filter-only listing holds to.
         let sql = format!(
             "SELECT d.name, e.permalink, e.title, e.engram_type, e.status, e.recorded_at, \
              (SELECT group_concat(t.name, ',') FROM engram_tag et JOIN tag t ON t.id=et.tag_id WHERE et.engram_id=e.id) \
              FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql} \
-             ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit}"
+             ORDER BY e.recorded_at IS NULL, e.recorded_at DESC, e.permalink ASC LIMIT {limit}"
         );
         let rows = query_all(&self.conn, &sql, params).await?;
         let mut out = Vec::with_capacity(rows.len());

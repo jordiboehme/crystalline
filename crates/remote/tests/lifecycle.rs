@@ -8482,6 +8482,182 @@ async fn a_status_counts_real_work_and_leaves_index_refreshes_out() {
 }
 
 #[tokio::test]
+async fn a_status_on_a_stacked_chain_counts_only_the_work_above_the_tip() {
+    // The badge, the CLI status line and both share nudges read this count,
+    // and every one of them said "2 unshared changes" about two changes an
+    // open proposal already carried, while the share dialog said there was
+    // nothing to share. The plan counts against the chain tip on the stacked
+    // path; a status has to count against the same base.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    let options = || ShareOptions {
+        title: None,
+        description: None,
+        proposal: None,
+        stacks_allowed: true,
+        author_login: None,
+        files: None,
+    };
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(before.local_changes, 2, "nothing is proposed yet");
+
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ProposeOutcome::Proposed(_)),
+        "{outcome:?}"
+    );
+    let layer = open_numbers(&sub.state_dir)[0];
+
+    // Both changes stand in the open layer: not unshared, and the plan agrees.
+    let shared = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        shared.local_changes, 0,
+        "work an open proposal carries is not unshared"
+    );
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::NothingToShare),
+        "{:?}",
+        plan.action
+    );
+
+    // New work above the tip counts, and only it.
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let more = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(more.local_changes, 1, "one engram above the tip");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::StackOnTop { .. }),
+        "{:?}",
+        plan.action
+    );
+    assert_eq!(plan.changes.changes.len(), 1);
+
+    // A declined layer hands its work back: the probe learns the decline and
+    // the count taken after it says three again.
+    mock.set_proposal_state(layer, ProposalState::Declined);
+    let declined = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        declined.local_changes, 3,
+        "a declined layer's files are unshared again"
+    );
+}
+
+#[tokio::test]
+async fn a_merged_layer_nobody_pulled_yet_is_carried_not_unshared() {
+    // Why a Merged record belongs in the base a count is taken against: the
+    // share plan pulls before it detects, and that pull consumes the merged
+    // layer into the trunk, so the plan has nothing to offer for its files. A
+    // status cannot pull, so the only way it agrees with the plan is to count
+    // the merged layer as carried.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let options = || ShareOptions {
+        title: None,
+        description: None,
+        proposal: None,
+        stacks_allowed: true,
+        author_login: None,
+        files: None,
+    };
+
+    // The forge merges the layer and the trunk moves onto a commit carrying
+    // its file. One probing status learns that and records it; nothing pulls,
+    // so the record stands here merged and unconsumed, and the trunk snapshot
+    // this machine holds still predates the merge.
+    merge_the_bottom(&mock, &sub, first.number).await;
+    let learned = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock), true)
+        .await
+        .unwrap();
+    assert_eq!(learned.merged_unconsumed, vec![first.number]);
+
+    // The tree is what the merged layer carries, so there is nothing unshared
+    // about it - offline, with no probe and no pull.
+    let quiet = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        quiet.local_changes, 0,
+        "a merged layer's own files are upstream already"
+    );
+
+    // Editing one of those files is work again: the count is against the
+    // layer's recorded digest, not a blanket exemption for its paths.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let edited = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        edited.local_changes, 1,
+        "editing a merged layer's file is unshared work"
+    );
+
+    // Back to the tree the count of zero was taken over, so the plan is asked
+    // the same question: it pulls, the pull consumes the merged layer, and it
+    // offers nothing. The two agree.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::NothingToShare),
+        "{:?}",
+        plan.action
+    );
+}
+
+#[tokio::test]
 async fn a_generated_index_replays_with_its_layer_like_any_other_file() {
     let mock = MockProvider::new();
     mock.enable_stacks();

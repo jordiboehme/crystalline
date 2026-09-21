@@ -124,18 +124,136 @@ export function manifestKey(domain: string): readonly unknown[] {
   return ["domain-manifest", domain];
 }
 
+/** A bullet the core crate flagged, kept verbatim beside why. */
+export interface ManifestProblem {
+  /** The category, in snake case: `malformed`, `unknown_type`, ... */
+  kind: string;
+  /** The bullet as written, without its dash. */
+  bullet: string;
+  /** Why it was flagged, in the crate's words. */
+  reason: string;
+}
+
 /**
- * Fetch a domain's MANIFEST markdown.
+ * The MANIFEST's features as the server reads them out of the source.
  *
- * Answers the empty string for a domain whose MANIFEST carries nothing, which
- * a caller shows the same way it shows a missing one: there is nothing to read
- * either way.
+ * Nothing here is interpreted a second time: the server parsed it, the
+ * panels show it, and a change goes through the editor. `null` for the two
+ * optional sections means the MANIFEST has no such section.
  */
-export async function fetchManifest(domain: string): Promise<string> {
+export interface ManifestSections {
+  scope: string[];
+  whenToUse: string[];
+  /** Which of the two an agent reads, or `none` when both are empty. */
+  routing: "when_to_use" | "scope" | "none";
+  /** The required sections the MANIFEST lacks: `Scope`, `When to Use`. */
+  missing: string[];
+  provisioning: {
+    decls: { kind: string; path: string }[];
+    problems: ManifestProblem[];
+  } | null;
+  tagAliases: {
+    decls: { alias: string; canonical: string }[];
+    problems: ManifestProblem[];
+  } | null;
+  generatedIndexes: {
+    /** As the frontmatter writes it, or null when the key is absent. */
+    declared: string | null;
+    effective: "local" | "shared";
+  };
+}
+
+/** A MANIFEST as the domain page reads it. */
+export interface ManifestView {
+  /** The markdown as written; empty when the MANIFEST carries nothing. */
+  markdown: string;
+  /**
+   * The features the server read out of it, or null when the server sent
+   * none: an older daemon answers the markdown alone, and the page draws
+   * the document without the panels rather than panels that say nothing.
+   */
+  sections: ManifestSections | null;
+}
+
+function readProblems(value: unknown): ManifestProblem[] {
+  return asArray(value).flatMap((entry) => {
+    const record = asObject(entry);
+    const kind = asString(record?.kind);
+    const bullet = asString(record?.bullet);
+    const reason = asString(record?.reason);
+    return kind !== null && bullet !== null && reason !== null
+      ? [{ kind, bullet, reason }]
+      : [];
+  });
+}
+
+/** Read the `sections` member of a manifest payload, or null when it is not there. */
+export function readManifestSections(value: unknown): ManifestSections | null {
+  const record = asObject(value);
+  if (record === null) {
+    return null;
+  }
+  const routing = record.routing;
+  const provisioning = asObject(record.provisioning);
+  const aliases = asObject(record.tag_aliases);
+  const generated = asObject(record.generated_indexes);
+  return {
+    scope: asStrings(record.scope),
+    whenToUse: asStrings(record.when_to_use),
+    routing:
+      routing === "when_to_use" || routing === "scope" ? routing : "none",
+    missing: asStrings(record.missing),
+    provisioning:
+      provisioning === null
+        ? null
+        : {
+            decls: asArray(provisioning.decls).flatMap((entry) => {
+              const decl = asObject(entry);
+              const kind = asString(decl?.kind);
+              const path = asString(decl?.path);
+              return kind !== null && path !== null ? [{ kind, path }] : [];
+            }),
+            problems: readProblems(provisioning.problems),
+          },
+    tagAliases:
+      aliases === null
+        ? null
+        : {
+            decls: asArray(aliases.decls).flatMap((entry) => {
+              const decl = asObject(entry);
+              const alias = asString(decl?.alias);
+              const canonical = asString(decl?.canonical);
+              return alias !== null && canonical !== null
+                ? [{ alias, canonical }]
+                : [];
+            }),
+            problems: readProblems(aliases.problems),
+          },
+    generatedIndexes: {
+      declared: asString(generated?.declared),
+      effective:
+        asString(generated?.effective) === "shared" ? "shared" : "local",
+    },
+  };
+}
+
+/**
+ * Fetch a domain's MANIFEST: the markdown, and the features the server read
+ * out of it.
+ *
+ * Answers an empty markdown for a domain whose MANIFEST carries nothing,
+ * which a caller shows the same way it shows a missing one: there is nothing
+ * to read either way.
+ */
+export async function fetchManifest(domain: string): Promise<ManifestView> {
   const payload = await api<unknown>(
     `/domains/${encodeSegment(domain)}/manifest`,
   );
-  return asString(asObject(payload)?.markdown) ?? "";
+  const record = asObject(payload);
+  return {
+    markdown: asString(record?.markdown) ?? "",
+    sections: readManifestSections(record?.sections),
+  };
 }
 
 /** A manifest with the version token an edit of it needs. */
@@ -148,9 +266,10 @@ export interface ManifestDetail {
 /**
  * The cache key of one domain's MANIFEST detail read - a different shape
  * from `manifestKey`, and its own key rather than a reuse of it: the plain
- * `fetchManifest` DomainHome reads answers with just the markdown, and a
- * detail read landing under the same key would overwrite it with a shape the
- * plain reader cannot parse the checksum out of.
+ * `fetchManifest` DomainHome reads answers with the markdown plus the
+ * sections the server read out of it, and a detail read landing under the
+ * same key would overwrite it with a shape the plain reader cannot parse the
+ * checksum out of.
  */
 export function manifestDetailKey(domain: string): readonly unknown[] {
   return ["domain-manifest-detail", domain];

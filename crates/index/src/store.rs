@@ -492,6 +492,29 @@ pub enum SearchMode {
     Hybrid,
 }
 
+/// How a filter-only listing is ordered.
+///
+/// A text search is ranked by relevance and never reads this. A listing has
+/// no relevance to rank by, so the reader chooses: by the date the knowledge
+/// was recorded, newest or oldest first, or by name, which is the path in
+/// byte order. An engram carrying no `recorded_at` is last in both directions
+/// of the recorded order - a listing must never lead with the one engram
+/// nobody dated - and every order breaks its ties on the path, so a page
+/// boundary never wobbles between two requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchOrder {
+    /// Newest recorded first, undated last, then the path. The default: the
+    /// order the domain page opens on.
+    #[default]
+    RecordedDesc,
+    /// Oldest recorded first, undated last, then the path.
+    RecordedAsc,
+    /// By path, in byte order.
+    PathAsc,
+    /// By path, reversed.
+    PathDesc,
+}
+
 /// A comparison operator for a metadata filter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterOp {
@@ -627,6 +650,9 @@ pub struct SearchQuery {
     pub today: Option<String>,
     /// The match mode.
     pub mode: SearchMode,
+    /// How a filter-only search is ordered. Ignored whenever `text` is set:
+    /// a ranked search has its own order.
+    pub order: SearchOrder,
     /// Minimum cosine similarity for a semantic hit, `None` uses the store
     /// default (`0.55`). Ignored by the text, title and permalink modes.
     pub min_similarity: Option<f32>,

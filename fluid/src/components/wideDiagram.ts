@@ -1,11 +1,12 @@
 /**
- * The one thing a wide diagram needs before it can scroll: its own width back.
+ * The one thing a widened diagram needs: its own width back.
  *
  * Mermaid renders with `useMaxWidth` on by default, so the root arrives as
  * `width="100%"` with an inline `max-width` and the browser scales the whole
- * drawing down to whatever column it lands in. That is right for the diagrams
- * that fit and wrong past a point: a 1600px flowchart squeezed into a reading
- * column is a picture of some text, not text anyone can read.
+ * drawing down to whatever column it lands in. That is the fitted drawing
+ * every diagram shows first. A reader who asks for full width wants the room
+ * there is, and never less than the drawing's own size; this module rewrites
+ * the root tag to say exactly that.
  *
  * Pure string work on purpose. It runs on markup mermaid just produced, before
  * that markup is ever in the document, so there is no element to measure and
@@ -14,57 +15,15 @@
  */
 
 /**
- * The natural width past which mermaid's scale-to-fit stops being readable.
- * The bottom of the illegibility band measured during the design review
- * (roughly 1100 to 1250px natural width); at or past it the diagram scrolls.
- */
-export const WIDE_DIAGRAM_PX = 1100;
-
-/**
- * Let a diagram past the threshold keep its own width so its container can
- * scroll: the root's inline `max-width` is dropped and its `width` is REPLACED
- * (never appended to - a root with two `width` attributes is honored at the
- * first, which is mermaid's `100%`, and the fix would do nothing on screen).
- * Returns the markup unchanged, and `wide: false`, whenever the natural width
- * cannot be read or is under the threshold.
- */
-export function unclampWideDiagram(svg: string): {
-  svg: string;
-  wide: boolean;
-} {
-  const root = findRootTag(svg);
-  if (root === null) {
-    return { svg, wide: false };
-  }
-  const tag = svg.slice(root.start, root.end);
-  const width = naturalWidth(tag);
-  if (width === null || width < WIDE_DIAGRAM_PX) {
-    return { svg, wide: false };
-  }
-  const unclamped = withoutClamp(withWidth(tag, `${width}px`));
-  return {
-    svg: svg.slice(0, root.start) + unclamped + svg.slice(root.end),
-    wide: true,
-  };
-}
-
-/**
- * The same unclamp, asked for rather than measured, and with a different
- * answer: as wide as the column allows.
- *
- * The measured form answers "would scaling this down make it unreadable" and
- * hands a diagram past the threshold its own width back. This one answers a
- * reader who said "show me this one wide", and wide means the room there is.
- * So the root takes `width="100%"` with mermaid's clamp gone, which lets the
- * viewBox scale a small diagram UP to fill a wide column, and an inline
- * `min-width` of the drawing's own width, which stops a column narrower than
- * the drawing from squeezing it: there the scroll container carries it at its
- * natural size, exactly as the measured path does.
+ * Give a diagram full width: the root takes `width="100%"` with mermaid's
+ * clamp gone, which lets the viewBox scale a small diagram UP to fill a wide
+ * column, and an inline `min-width` of the drawing's own width, which stops a
+ * column narrower than the drawing from squeezing it.
  *
  * A diagram whose natural width cannot be read gets `width="100%"` and no
  * floor, because there is no number to hold it up with. Running this twice
- * changes nothing, so it is safe over markup the measured path has already
- * rewritten.
+ * changes nothing, so a second press of the same button never stacks a second
+ * floor.
  */
 export function unclampDiagram(svg: string): string {
   const root = findRootTag(svg);

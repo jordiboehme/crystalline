@@ -40,10 +40,11 @@ use crystalline_index::{
     EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord,
     EngramSummary, FactObservation, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim,
     InboundQuery, IndexError, RULES, RebuildKind, RecentFilter, ReindexHooks, SearchMode,
-    SearchQuery, ShareFacts, Store, StoredEngram, SweepInput, SweepOptions, SweepReport,
-    SyncReport, apply_scan, chunk_engram, configured_model_id, detect, is_retired_status,
-    order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, reindex_domains,
-    resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    SearchOrder, SearchQuery, ShareFacts, Store, StoredEngram, SweepInput, SweepOptions,
+    SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
+    is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
+    reindex_domains, resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain,
+    scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -9251,7 +9252,8 @@ impl Engine {
         p: &SearchParams,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        self.search_engrams_under(p, None, scope).await
+        self.search_engrams_under(p, None, SearchOrder::default(), scope)
+            .await
     }
 
     /// [`Engine::search_engrams`] narrowed to one domain-relative folder, which
@@ -9262,6 +9264,11 @@ impl Engine {
     /// The folder is segment-safe - see [`folder_prefix`] - and `None` or an
     /// empty value searches the whole scope, which is what every caller that
     /// never names a folder keeps getting.
+    ///
+    /// `order` is the listing's, and a separate argument for the reason the
+    /// folder is: [`SearchParams`] is the MCP search tool's argument schema,
+    /// and the MCP tool keeps the store's default order. A ranked search
+    /// ignores it either way.
     ///
     /// The `total` in the envelope counts the folder recursively: every engram
     /// under it at any depth, since a folder listing promises the folder. The
@@ -9274,6 +9281,7 @@ impl Engine {
         &self,
         p: &SearchParams,
         folder: Option<&str>,
+        order: SearchOrder,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let requested = parse_mode(p.search_type.as_deref())?;
@@ -9289,6 +9297,7 @@ impl Engine {
             after: p.after.clone(),
             min_similarity: p.min_similarity,
             path_prefix: folder.and_then(folder_prefix),
+            order,
             // Whose rows this search is entitled to: the base dimension plus
             // this caller's own drafts, where any domain in range reviews
             // changes at all. One value for the whole query, because a search

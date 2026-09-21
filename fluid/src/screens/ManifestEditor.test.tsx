@@ -1,6 +1,6 @@
 /**
  * The MANIFEST editor's own session behavior, as opposed to the route wiring
- * and the admin gate `ManifestPage.test.tsx` proves.
+ * and the admin gate `ManifestRoute.test.tsx` proves.
  *
  * The screen holds none of this itself any more: buffer, checksum, the Mod-S
  * save and the draft safety net all come from `useEditorSession`, which the
@@ -60,6 +60,22 @@ function serveEditor(routes: Record<string, Answer> = {}) {
       "/domains/eng/manifest": () => manifestResponse(),
       "/domains/eng/tree": () => emptyTree(),
       "/validate": () => ({ findings: [], errors: 0 }),
+      // What the domain page reads on landing: the editor leaves to it, so
+      // every walkout below renders it rather than a screen of refusals.
+      "/domains/eng/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/vocabulary": () => ({ domain: "eng", tags: [] }),
+      "/domains/eng/members": () => ({
+        owner: null,
+        visibility: "shared",
+        members: [],
+      }),
       ...routes,
     }),
   );
@@ -258,8 +274,9 @@ describe("the MANIFEST editor", () => {
     await userEvent.click(screen.getByRole("button", { name: "Close" }));
 
     // Nothing was typed, so there is nothing to keep and nothing to lose.
+    // The way out is the domain page, where the MANIFEST is read.
     expect(
-      await screen.findByRole("heading", { name: "MANIFEST", level: 1 }),
+      await screen.findByRole("heading", { name: "eng", level: 1 }),
     ).toBeInTheDocument();
     expect(put).not.toHaveBeenCalled();
     expect(screen.queryByText("Close the editor?")).not.toBeInTheDocument();
@@ -282,12 +299,13 @@ describe("the MANIFEST editor", () => {
     );
 
     // The write lands first and the leaving hangs off its receipt, exactly as
-    // it does on the engram editor: the two screens are one editor.
+    // it does on the engram editor: the two screens are one editor. And the
+    // editor leaves to the domain page, which is headed by the domain's name.
     await waitFor(() => {
       expect(put).toHaveBeenCalled();
     });
     expect(
-      await screen.findByRole("heading", { name: "MANIFEST", level: 1 }),
+      await screen.findByRole("heading", { name: "eng", level: 1 }),
     ).toBeInTheDocument();
   });
 
@@ -318,7 +336,8 @@ describe("the MANIFEST editor", () => {
       screen.getByRole("button", { name: "Discard changes" }),
     );
 
-    await screen.findByRole("heading", { name: "MANIFEST", level: 1 });
+    // Out to the domain page, the address the editor returns to.
+    await screen.findByRole("heading", { name: "eng", level: 1 });
     expect(put).not.toHaveBeenCalled();
     expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toBeNull();
   });
@@ -354,7 +373,8 @@ describe("the MANIFEST editor", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Discard changes" }),
     );
-    await screen.findByRole("heading", { name: "MANIFEST", level: 1 });
+    // Out to the domain page again, this time over a save still in flight.
+    await screen.findByRole("heading", { name: "eng", level: 1 });
     expect(localStorage.getItem("fluid.draft.ada.eng/MANIFEST")).toBeNull();
 
     // The save the author walked out on lands behind them, and must not put
@@ -393,9 +413,8 @@ describe("the MANIFEST editor", () => {
     expect(await screen.findByText("Saved")).toBeInTheDocument();
     await settled();
     expect(screen.getByLabelText("MANIFEST source")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("heading", { name: "MANIFEST", level: 1 }),
-    ).toBeNull();
+    // Nobody left, so the domain page's heading is nowhere on screen.
+    expect(screen.queryByRole("heading", { name: "eng", level: 1 })).toBeNull();
   });
 
   it("offers a stored draft and restores it into the buffer", async () => {

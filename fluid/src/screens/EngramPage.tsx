@@ -60,7 +60,7 @@ import { AttachmentsSection } from "../components/AttachmentsSection";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { CopyAddress, DetailsPanel } from "../components/DetailsPanel";
-import { EngramActions } from "../components/EngramActions";
+import { EngramActions, documentSlug } from "../components/EngramActions";
 import type { EngramActionHandlers } from "../components/EngramActions";
 import { LifecycleBanner } from "../components/LifecycleBanner";
 import type { LifecycleLink } from "../components/LifecycleBanner";
@@ -403,6 +403,10 @@ export default function EngramPage() {
               // What a relative `assets/` target is relative to: without it an
               // attachment reference is a path with nowhere to point.
               domain={engram.domain}
+              // And what a diagram or an image saved out of the full window
+              // is named after, so a folder of downloads says which document
+              // each picture came from.
+              documentName={documentSlug(engram.permalink)}
             />
           </article>
           {/*

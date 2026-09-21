@@ -1,5 +1,6 @@
 /**
- * One diagram, on its own, in the whole window, with pan and zoom.
+ * One picture, on its own, in the whole window, with pan and zoom: a diagram
+ * as mermaid drew it, or an image a document attached.
  *
  * An in-window layer rather than the browser's Fullscreen API as the primary
  * path, because element fullscreen does not exist on iOS Safari at all: a
@@ -22,6 +23,9 @@
  */
 
 import {
+  Copy,
+  Download,
+  FileCode,
   Maximize2,
   Minimize2,
   RotateCcw,
@@ -34,6 +38,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactElement, RefObject } from "react";
 import { createPortal } from "react-dom";
 
+import { diagramFileName, saveBlob } from "./downloads";
 import { FOCUS_RING } from "./primitives";
 
 /**
@@ -44,6 +49,9 @@ const FOCUS_STOPS = 'button, a[href], [tabindex]:not([tabindex="-1"])';
 
 /** How far an arrow key moves the drawing, in pixels of the stage. */
 const ARROW_STEP_PX = 40;
+
+/** How long the copy confirmation stays up, matching `EngramActions`. */
+const CONFIRMED_FOR_MS = 2000;
 
 /**
  * Whether the browser is showing something fullscreen right now.
@@ -68,36 +76,77 @@ const CLICK_SLOP_PX = 5;
 
 const BAR_BUTTON = `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`;
 
+/**
+ * What this layer can be asked to show. Two kinds rather than one element,
+ * because the two arrive differently - a diagram as markup this app produced,
+ * an image as an address the browser fetches - and the fit has to ask each of
+ * them for its own size in its own way.
+ */
+export type OverlayContent =
+  | { kind: "diagram"; svg: string; source: string; name?: string }
+  | { kind: "image"; src: string; alt: string; filename: string };
+
 export interface DiagramOverlayProps {
-  /** The diagram's markup, exactly as mermaid rendered it. */
-  svg: string;
+  content: OverlayContent;
   onClose: () => void;
   /** The control that opened this, where the keyboard goes when it closes. */
   returnFocusTo: RefObject<HTMLElement | null>;
 }
 
-/** The drawing's own size, for the fit: the viewBox is what mermaid always writes. */
+/**
+ * The picture's own size, for the fit. A drawing states it in the viewBox
+ * mermaid always writes; an image has it only once the browser has the file,
+ * and answers zero until then, which is no size rather than a small one.
+ *
+ * The drawing is asked first, and the order is the whole point: a diagram may
+ * carry an `<img>` of its own inside a label, and a host that answered with
+ * that picture's size would fit the window to the label rather than to the
+ * diagram around it. An image host has no drawing in it and falls through.
+ */
 function naturalSize(
-  svg: SVGElement,
+  host: HTMLElement,
 ): { width: number; height: number } | null {
-  const viewBox = svg.getAttribute("viewBox");
-  if (viewBox === null) {
+  const drawing = host.querySelector("svg");
+  if (drawing !== null) {
+    const viewBox = drawing.getAttribute("viewBox");
+    if (viewBox === null) {
+      return null;
+    }
+    const parts = viewBox.trim().split(/[\s,]+/);
+    if (parts.length !== 4) {
+      return null;
+    }
+    const width = Number(parts[2]);
+    const height = Number(parts[3]);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) {
+      return null;
+    }
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+  const image = host.querySelector("img");
+  if (image === null) {
     return null;
   }
-  const parts = viewBox.trim().split(/[\s,]+/);
-  if (parts.length !== 4) {
-    return null;
+  return image.naturalWidth > 0 && image.naturalHeight > 0
+    ? { width: image.naturalWidth, height: image.naturalHeight }
+    : null;
+}
+
+/**
+ * The dialog's own name. An image is named by its alt, which is the author's
+ * own words for it; a diagram has none to be named by.
+ */
+function overlayName(content: OverlayContent): string {
+  if (content.kind === "diagram") {
+    return "Diagram, full window";
   }
-  const width = Number(parts[2]);
-  const height = Number(parts[3]);
-  if (!Number.isFinite(width) || !Number.isFinite(height)) {
-    return null;
-  }
-  return width > 0 && height > 0 ? { width, height } : null;
+  return content.alt === ""
+    ? "Image, full window"
+    : `${content.alt}, in the full window`;
 }
 
 export default function DiagramOverlay({
-  svg,
+  content,
   onClose,
   returnFocusTo,
 }: DiagramOverlayProps): ReactElement {
@@ -108,25 +157,34 @@ export default function DiagramOverlay({
   const instanceRef = useRef<PanzoomObject | null>(null);
   const pressedAt = useRef<{ x: number; y: number } | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  // What the copy control has to say for itself, and nothing else: a clipboard
+  // write is the one action in this bar with an outcome the screen does not
+  // already show.
+  const [said, setSaid] = useState<string | null>(null);
 
   // Read at render rather than remembered: a browser that has no element
   // fullscreen must not be offered a button that would do nothing, and jsdom
   // (where `fullscreenEnabled` is simply absent) is that browser.
   const canFullscreen = document.fullscreenEnabled === true;
 
+  // The one string this content is: the markup of a diagram or the address of
+  // an image. It is what the pan-and-zoom effect hangs off.
+  const shown = content.kind === "diagram" ? content.svg : content.src;
+
   /**
-   * Fit and centre. The drawing's own size comes from its viewBox and the room
+   * Fit and centre. The picture's own size comes from the host and the room
    * from the stage; where either is unknown - a layout-less test environment
-   * says zero to everything - the diagram is left at its natural size rather
-   * than scaled by a number derived from nothing.
+   * says zero to everything, and so does an image that has not loaded yet -
+   * it is left at its natural size rather than scaled by a number derived
+   * from nothing.
    */
   const fit = useCallback((instance: PanzoomObject) => {
     const stage = stageRef.current;
-    const drawing = hostRef.current?.querySelector("svg");
-    if (stage === null || drawing === null || drawing === undefined) {
+    const host = hostRef.current;
+    if (stage === null || host === null) {
       return;
     }
-    const natural = naturalSize(drawing);
+    const natural = naturalSize(host);
     const room = stage.getBoundingClientRect();
     if (natural === null || room.width <= 0 || room.height <= 0) {
       return;
@@ -155,7 +213,7 @@ export default function DiagramOverlay({
       // drawing to the host instead of letting the transform do it. Its own
       // pixel size goes on instead, so one scale factor means one thing.
       const drawing = host.querySelector("svg");
-      const natural = drawing === null ? null : naturalSize(drawing);
+      const natural = drawing === null ? null : naturalSize(host);
       if (drawing !== null && natural !== null) {
         drawing.setAttribute("width", `${natural.width}px`);
         drawing.setAttribute("height", `${natural.height}px`);
@@ -209,10 +267,27 @@ export default function DiagramOverlay({
       instanceRef.current?.destroy();
       instanceRef.current = null;
     };
-    // The markup is a dependency: a scheme change while this is open redraws
-    // the diagram, and the new drawing needs its own sizing and its own fit
-    // rather than the transform that belonged to the old one.
-  }, [fit, svg]);
+    // What is shown is a dependency: a scheme change while this is open
+    // redraws the diagram, and the new picture needs its own sizing and its
+    // own fit rather than the transform that belonged to the old one. The
+    // markup and the address stand for it rather than the object around them,
+    // which both callers build inline on every render and which would
+    // otherwise rebuild the instance under a reader mid-zoom.
+  }, [fit, shown]);
+
+  // The confirmation clears itself, the same two seconds the engram page's
+  // own copy gives its announcement.
+  useEffect(() => {
+    if (said === null) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setSaid(null);
+    }, CONFIRMED_FOR_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [said]);
 
   // The keyboard comes in here and goes back where it came from, and the page
   // behind holds still while this is open. The previous overflow is restored
@@ -388,13 +463,113 @@ export default function DiagramOverlay({
       // focus outside it would take Escape, the zoom keys and the arrows with
       // it. -1 keeps it out of the Tab order all the same.
       tabIndex={-1}
-      aria-label="Diagram, full window"
+      aria-label={overlayName(content)}
       // Opaque rather than a translucent scrim: what is behind is a page of
       // prose, and a diagram's own thin lines read badly over it.
       className="fixed inset-0 z-50 flex flex-col bg-white dark:bg-slate-950"
       onKeyDown={onKeyDown}
     >
       <div className="flex shrink-0 items-center justify-end gap-1 border-b border-slate-200 px-2 py-1 dark:border-slate-800">
+        {/*
+          In the document from the start and empty, so the text arriving in it
+          is what gets read out, and first in the bar so the buttons this bar
+          right-aligns keep their places while it says something.
+        */}
+        <span
+          role="status"
+          aria-live="polite"
+          className="text-caption text-slate-500 dark:text-slate-400"
+        >
+          {said ?? ""}
+        </span>
+        {content.kind === "diagram" ? (
+          <>
+            <button
+              type="button"
+              aria-label="Copy source"
+              title="Copy source"
+              className={BAR_BUTTON}
+              onClick={() => {
+                void (async () => {
+                  // Wrapped, not chained: `navigator.clipboard` is absent on
+                  // an insecure context and reading `.writeText` off it
+                  // throws synchronously, the same reason the address copy
+                  // control wraps its call.
+                  try {
+                    await navigator.clipboard.writeText(content.source);
+                    setSaid("Copied");
+                  } catch {
+                    setSaid("Copy refused");
+                  }
+                })();
+              }}
+            >
+              <Copy size={16} strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="Download source (.mmd)"
+              title="Download source (.mmd)"
+              className={BAR_BUTTON}
+              onClick={() => {
+                saveBlob(
+                  new Blob([content.source], { type: "text/plain" }),
+                  diagramFileName(content.name, content.source, "mmd"),
+                );
+              }}
+            >
+              <FileCode size={16} strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="Download SVG"
+              title="Download SVG"
+              className={BAR_BUTTON}
+              onClick={() => {
+                // The drawing as shown, not as mermaid handed it over: by now
+                // the host's pass has given the root its own pixel size, so
+                // the file opens at that size instead of stretching to a
+                // viewer's width. The declaration is what makes it a file
+                // rather than a fragment.
+                const drawing = hostRef.current?.querySelector("svg");
+                const markup =
+                  drawing === null || drawing === undefined
+                    ? content.svg
+                    : new XMLSerializer().serializeToString(drawing);
+                saveBlob(
+                  new Blob(
+                    [`<?xml version="1.0" encoding="UTF-8"?>\n${markup}`],
+                    {
+                      type: "image/svg+xml",
+                    },
+                  ),
+                  diagramFileName(content.name, content.source, "svg"),
+                );
+              }}
+            >
+              <Download size={16} strokeWidth={1.75} />
+            </button>
+          </>
+        ) : (
+          <a
+            href={content.src}
+            download={content.filename}
+            aria-label="Download image"
+            title="Download image"
+            className={BAR_BUTTON}
+            // A real anchor rather than a button with a handler: the browser
+            // fetches and saves the file itself, with no copy of it in this
+            // page's memory. A same-origin attachment downloads under its own
+            // name; a remote image is best effort, since a browser ignores
+            // the name across origins and opens the picture instead.
+            //
+            // It stays a link and is not dressed as a button: a button role
+            // on an anchor promises activation by Space, which an anchor does
+            // not honour, and this control really is a link to a file.
+          >
+            <Download size={16} strokeWidth={1.75} />
+          </a>
+        )}
         <button
           type="button"
           aria-label="Zoom in"
@@ -463,12 +638,36 @@ export default function DiagramOverlay({
         onClick={onStageClick}
         onDoubleClick={onStageDoubleClick}
       >
-        {/*
-          The markup is mermaid's own output, produced by its sanitizing mode
-          from the source in the document; the reading view hands it over
-          unchanged and this layer only resizes the root.
-        */}
-        <div ref={hostRef} dangerouslySetInnerHTML={{ __html: svg }} />
+        {content.kind === "diagram" ? (
+          /*
+            The markup is mermaid's own output, produced by its sanitizing
+            mode from the source in the document; the reading view hands it
+            over unchanged and this layer only resizes the root.
+          */
+          <div
+            ref={hostRef}
+            dangerouslySetInnerHTML={{ __html: content.svg }}
+          />
+        ) : (
+          <div ref={hostRef}>
+            <img
+              src={content.src}
+              alt={content.alt}
+              // The stage owns the drag: a draggable image would start the
+              // browser's own drag and the pan would never begin.
+              draggable={false}
+              onLoad={() => {
+                // The size arrives with the file, which is usually after the
+                // instance exists; when it is the other way round the fit at
+                // construction already had it and this one is a no-op.
+                const instance = instanceRef.current;
+                if (instance !== null) {
+                  fit(instance);
+                }
+              }}
+            />
+          </div>
+        )}
       </div>
     </div>,
     document.body,

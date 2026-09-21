@@ -33,7 +33,7 @@ export function prefetchEngramEditor(): void {
   void import("./screens/EngramEditor");
 }
 
-/** And the MANIFEST editor, from the MANIFEST screen's own Edit. */
+/** And the MANIFEST editor, from the domain page's Manifest section. */
 export function prefetchManifestEditor(): void {
   void import("./screens/ManifestEditor");
 }

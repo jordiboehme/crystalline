@@ -286,3 +286,45 @@ describe("the dark syntax-highlighting palette keeps its tokens apart", () => {
     }
   });
 });
+
+/**
+ * The blocks that enclose a rule, outermost first, read the way the browser
+ * reads the file: comments skipped, one entry per `{` still open at `at`.
+ */
+function enclosingBlocks(source: string, at: number): string[] {
+  const stack: string[] = [];
+  let i = 0;
+  while (i < at) {
+    const ch = source[i];
+    if (ch === "/" && source[i + 1] === "*") {
+      i = source.indexOf("*/", i + 2) + 2;
+      continue;
+    }
+    if (ch === "{") {
+      const head = source.slice(source.lastIndexOf("}", i) + 1, i).trim();
+      const last = head.lastIndexOf(";");
+      stack.push((last >= 0 ? head.slice(last + 1) : head).trim());
+    } else if (ch === "}") {
+      stack.pop();
+    }
+    i += 1;
+  }
+  return stack;
+}
+
+describe("the large-text rules sit outside every cascade layer", () => {
+  // Tailwind orders its layers theme, base, components, utilities, and a
+  // layered rule loses to a utility on the same element whatever its
+  // specificity. The document sizes its prose with a utility, so a rule
+  // inside `@layer components` changed nothing on screen (0.18.3 candidate).
+  it.each([
+    'main[data-text="large"] .measured',
+    'main[data-text="large"] .cm-editor',
+  ])("%s is unlayered and on screens only", (selector) => {
+    const at = css.indexOf(selector);
+    expect(at).toBeGreaterThan(-1);
+    const blocks = enclosingBlocks(css, at);
+    expect(blocks.some((block) => block.startsWith("@layer"))).toBe(false);
+    expect(blocks).toEqual(["@media screen"]);
+  });
+});

@@ -12,9 +12,9 @@ use axum::extract::State;
 use axum::http::header::{CACHE_CONTROL, ETAG};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use utoipa::IntoParams;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use utoipa::{IntoParams, ToSchema};
 
 use super::auth::Identity;
 use super::{
@@ -23,6 +23,9 @@ use super::{
 };
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
+use crystalline_core::{
+    GeneratedIndexes, Manifest, ProblemKind, TagAliasProblemKind, parse_engram,
+};
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
 /// routing bullets, plus the behavior rules that govern them.
@@ -242,7 +245,13 @@ pub async fn tree(
                    naming the current checksum answers 304 with no body, and \
                    `Cache-Control: no-cache` on both the 200 and the 304 keeps \
                    a stored copy revalidating instead of going heuristically \
-                   fresh, so a save elsewhere is picked up on its next use.",
+                   fresh, so a save elsewhere is picked up on its next \
+                   use.\n\n`sections` is what the core crate reads out of the \
+                   source: the routing bullets and which of them an agent \
+                   reads, the provisioning and tag alias declarations with \
+                   every bullet that did not parse, and the \
+                   `generated_indexes` switch. `null` for `provisioning` or \
+                   `tag_aliases` means the section is absent.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -257,7 +266,7 @@ pub async fn tree(
         (
             status = 200,
             description = "The manifest source beside the domain it belongs to.",
-            body = Object,
+            body = ManifestResponse,
             headers(
                 ("etag" = String, description = "The quoted checksum of \
                  the manifest as read, the token a later `PUT` carries \
@@ -267,8 +276,17 @@ pub async fn tree(
             ),
             example = json!({
                 "domain": "eng",
-                "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n",
-                "checksum": "3f8a1c05e2"
+                "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                "checksum": "3f8a1c05e2",
+                "sections": {
+                    "scope": ["Everything about eng"],
+                    "when_to_use": ["Route here for eng questions."],
+                    "routing": "when_to_use",
+                    "missing": [],
+                    "provisioning": null,
+                    "tag_aliases": null,
+                    "generated_indexes": { "declared": null, "effective": "local" }
+                }
             }),
         ),
         (
@@ -329,6 +347,235 @@ pub async fn manifest(
     Ok(resp)
 }
 
+/// What `GET` and `PUT /domains/{domain}/manifest` answer with: the source,
+/// its checksum and the features the core crate reads out of it.
+#[derive(Debug, Serialize, ToSchema)]
+#[schema(description = "The MANIFEST source beside the domain it belongs to, \
+                        its checksum, and the features parsed out of it: \
+                        what an agent routes by, what the domain provisions, \
+                        which tags fold into which, and the one frontmatter \
+                        switch.")]
+pub struct ManifestResponse {
+    /// The domain the MANIFEST introduces.
+    #[schema(example = "eng")]
+    pub domain: String,
+    /// The MANIFEST markdown as written, frontmatter included.
+    pub markdown: String,
+    /// sha256 of the markdown, the token a later `PUT` carries in `If-Match`.
+    #[schema(example = "3f8a1c05e2")]
+    pub checksum: String,
+    /// The features read out of the markdown.
+    pub sections: ManifestSections,
+}
+
+/// The MANIFEST's features as the core crate reads them. Nothing here is
+/// interpreted a second time, and a change goes through the editor: this is
+/// a view of the source beside it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ManifestSections {
+    /// The `Scope` bullets; empty when the section is absent or empty.
+    pub scope: Vec<String>,
+    /// The `When to Use` bullets; empty when the section is absent or empty.
+    pub when_to_use: Vec<String>,
+    /// Which of the two an agent reads: `when_to_use`, or `scope` when When
+    /// to Use is absent or empty, or `none` when both are.
+    pub routing: RoutingSource,
+    /// The required sections the MANIFEST lacks, by name: `Scope`, `When to
+    /// Use`. Empty when both are there.
+    pub missing: Vec<String>,
+    /// The `Provisioning` section, or `null` when the MANIFEST has none.
+    pub provisioning: Option<ProvisioningView>,
+    /// The `Tag Aliases` section, or `null` when the MANIFEST has none.
+    pub tag_aliases: Option<TagAliasesView>,
+    /// The `generated_indexes` frontmatter switch: what is declared and what
+    /// holds.
+    pub generated_indexes: GeneratedIndexesView,
+}
+
+/// Which routing section an agent reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingSource {
+    /// The `When to Use` bullets.
+    WhenToUse,
+    /// The `Scope` bullets, because `When to Use` is absent or empty.
+    Scope,
+    /// Nothing: both are absent or empty, and no agent can route here.
+    None,
+}
+
+/// The `Provisioning` section: what parsed, and what did not.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProvisioningView {
+    /// The declarations that parsed, in document order, one per kind.
+    pub decls: Vec<ProvisioningDeclView>,
+    /// The bullets that did not parse, or lost to an earlier duplicate.
+    pub problems: Vec<ManifestProblem>,
+}
+
+/// One `kind: path` declaration.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProvisioningDeclView {
+    /// `skills`, `commands`, `agents` or `mcps`.
+    #[schema(example = "skills")]
+    pub kind: String,
+    /// The folder, relative to the MANIFEST, trailing slash trimmed.
+    #[schema(example = "skills")]
+    pub path: String,
+}
+
+/// A bullet the core crate flagged, kept verbatim beside why.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ManifestProblem {
+    /// The category, in snake case: `malformed`, `unknown_type`,
+    /// `invalid_path`, `duplicate_type`, `self_alias`, `duplicate_alias`,
+    /// `non_canonical_target`, `chained_alias`.
+    #[schema(example = "unknown_type")]
+    pub kind: String,
+    /// The bullet as written, without its dash.
+    #[schema(example = "widgets: w")]
+    pub bullet: String,
+    /// Why it was flagged, in the crate's words.
+    pub reason: String,
+}
+
+/// The `Tag Aliases` section: the mappings kept, and the bullets flagged.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TagAliasesView {
+    /// The mappings kept, in document order.
+    pub decls: Vec<TagAliasDeclView>,
+    /// The bullets flagged. A non-canonical target or a chained alias is in
+    /// both lists: kept, and flagged.
+    pub problems: Vec<ManifestProblem>,
+}
+
+/// One `old -> canonical` mapping, both sides verbatim.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TagAliasDeclView {
+    #[schema(example = "Multi_Word")]
+    pub alias: String,
+    #[schema(example = "multi-word")]
+    pub canonical: String,
+}
+
+/// The `generated_indexes` switch: declared, and effective.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GeneratedIndexesView {
+    /// The value as the frontmatter writes it, or `null` when the key is
+    /// absent.
+    #[schema(example = "shared")]
+    pub declared: Option<String>,
+    /// `local` or `shared`. Absent and unrecognized both fall to `local`.
+    #[schema(example = "local")]
+    pub effective: String,
+}
+
+impl ManifestSections {
+    /// The features of `markdown`, read the way the engine reads every
+    /// MANIFEST. A source the format layer will not parse - no frontmatter,
+    /// a broken block - has no sections to speak of, and says so as a
+    /// MANIFEST lacking both required sections rather than as a failure of
+    /// the read: the markdown beside it is still the thing to fix, in the
+    /// editor.
+    pub fn of(markdown: &str) -> ManifestSections {
+        let Ok(engram) = parse_engram(markdown) else {
+            return ManifestSections {
+                scope: Vec::new(),
+                when_to_use: Vec::new(),
+                routing: RoutingSource::None,
+                missing: vec!["Scope".to_string(), "When to Use".to_string()],
+                provisioning: None,
+                tag_aliases: None,
+                generated_indexes: GeneratedIndexesView {
+                    declared: None,
+                    effective: GeneratedIndexes::Local.as_str().to_string(),
+                },
+            };
+        };
+        let manifest = Manifest::from_engram(&engram, markdown);
+        let routing = if !manifest.when_to_use().is_empty() {
+            RoutingSource::WhenToUse
+        } else if !manifest.scope().is_empty() {
+            RoutingSource::Scope
+        } else {
+            RoutingSource::None
+        };
+        ManifestSections {
+            scope: manifest.scope().to_vec(),
+            when_to_use: manifest.when_to_use().to_vec(),
+            routing,
+            missing: manifest
+                .missing_required_sections()
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            provisioning: manifest.provisioning().map(|section| ProvisioningView {
+                decls: section
+                    .decls
+                    .iter()
+                    .map(|decl| ProvisioningDeclView {
+                        kind: decl.kind.id().to_string(),
+                        path: decl.path.clone(),
+                    })
+                    .collect(),
+                problems: section
+                    .problems
+                    .iter()
+                    .map(|problem| ManifestProblem {
+                        kind: provisioning_problem_kind(problem.kind).to_string(),
+                        bullet: problem.bullet.clone(),
+                        reason: problem.reason.clone(),
+                    })
+                    .collect(),
+            }),
+            tag_aliases: manifest.tag_aliases().map(|section| TagAliasesView {
+                decls: section
+                    .decls
+                    .iter()
+                    .map(|decl| TagAliasDeclView {
+                        alias: decl.alias.clone(),
+                        canonical: decl.canonical.clone(),
+                    })
+                    .collect(),
+                problems: section
+                    .problems
+                    .iter()
+                    .map(|problem| ManifestProblem {
+                        kind: tag_alias_problem_kind(problem.kind).to_string(),
+                        bullet: problem.bullet.clone(),
+                        reason: problem.reason.clone(),
+                    })
+                    .collect(),
+            }),
+            generated_indexes: GeneratedIndexesView {
+                declared: manifest.declared_generated_indexes().map(str::to_string),
+                effective: manifest.generated_indexes().as_str().to_string(),
+            },
+        }
+    }
+}
+
+/// The wire spelling of a provisioning problem's kind.
+fn provisioning_problem_kind(kind: ProblemKind) -> &'static str {
+    match kind {
+        ProblemKind::Malformed => "malformed",
+        ProblemKind::UnknownType => "unknown_type",
+        ProblemKind::InvalidPath => "invalid_path",
+        ProblemKind::DuplicateType => "duplicate_type",
+    }
+}
+
+/// The wire spelling of a tag alias problem's kind.
+fn tag_alias_problem_kind(kind: TagAliasProblemKind) -> &'static str {
+    match kind {
+        TagAliasProblemKind::Malformed => "malformed",
+        TagAliasProblemKind::SelfAlias => "self_alias",
+        TagAliasProblemKind::DuplicateAlias => "duplicate_alias",
+        TagAliasProblemKind::NonCanonicalTarget => "non_canonical_target",
+        TagAliasProblemKind::ChainedAlias => "chained_alias",
+    }
+}
+
 /// What `PUT /domains/{domain}/manifest` takes: the complete MANIFEST source.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[schema(description = "The full MANIFEST markdown as the editor holds it, \
@@ -337,7 +584,7 @@ pub async fn manifest(
 pub struct SaveManifestBody {
     /// The full MANIFEST markdown as the editor holds it.
     #[schema(
-        example = "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+        example = "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n"
     )]
     markdown: String,
 }
@@ -382,14 +629,23 @@ pub struct SaveManifestBody {
         (
             status = 200,
             description = "The manifest as saved, mirroring the GET shape.",
-            body = Object,
+            body = ManifestResponse,
             headers(("etag" = String, description = "The quoted checksum of \
                      the manifest as saved, the token the next save \
                      carries.")),
             example = json!({
                 "domain": "eng",
-                "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n",
-                "checksum": "3f8a1c05e2"
+                "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                "checksum": "3f8a1c05e2",
+                "sections": {
+                    "scope": ["Everything about eng"],
+                    "when_to_use": ["Route here for eng questions."],
+                    "routing": "when_to_use",
+                    "missing": [],
+                    "provisioning": null,
+                    "tag_aliases": null,
+                    "generated_indexes": { "declared": null, "effective": "local" }
+                }
             }),
         ),
         (
@@ -507,6 +763,9 @@ const STALE_EDIT: &str = "stale edit";
 /// the markdown, its checksum, and the same checksum again as a quoted `ETag`
 /// header - one shape for a manifest on this surface, so a client that has
 /// just saved one holds what the GET route would have given it.
+///
+/// The sections are read from the markdown on every answer, a save's
+/// included, so a client that just saved holds the features of what it saved.
 fn manifest_response(
     domain: &str,
     markdown: String,
@@ -515,9 +774,15 @@ fn manifest_response(
     let checksum = manifest_checksum(&markdown);
     let etag = HeaderValue::from_str(&format!("\"{checksum}\""))
         .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
+    let sections = ManifestSections::of(&markdown);
     let mut resp = (
         status,
-        Json(json!({ "domain": domain, "markdown": markdown, "checksum": checksum })),
+        Json(ManifestResponse {
+            domain: domain.to_string(),
+            markdown,
+            checksum,
+            sections,
+        }),
     )
         .into_response();
     resp.headers_mut().insert(ETAG, etag);

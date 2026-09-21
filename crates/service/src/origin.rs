@@ -247,6 +247,12 @@ pub(crate) fn status_report_json(
 /// `generated_indexes` and named in no array, the one quiet line every surface
 /// draws for the files that ride along with a share.
 ///
+/// The sum holds because both walks count against the same base,
+/// [`crystalline_remote::ops::unshared_base`] - the chain tip on the stacked
+/// path, the trunk everywhere else. Detecting against the trunk here would
+/// name files an open layer already carries beside a count that leaves them
+/// out.
+///
 /// That sum holds for a tree nobody is writing to. This is a second walk,
 /// moments after the one the status itself made, and the origin lock excludes
 /// other origin operations but not an engram written between the two - so a
@@ -275,8 +281,11 @@ pub(crate) fn status_report_json(
 /// rather than threaded through every reader who did not.
 pub(crate) fn local_change_detail(domain_root: &Path, state_dir: &Path) -> Option<Value> {
     let state = OriginState::load(state_dir).ok().flatten()?;
-    let detected =
-        crystalline_remote::changes::detect_local_changes(domain_root, &state.files).ok()?;
+    let detected = crystalline_remote::changes::detect_local_changes(
+        domain_root,
+        &crystalline_remote::ops::unshared_base(&state),
+    )
+    .ok()?;
     let mut added: Vec<&str> = Vec::new();
     let mut modified: Vec<&str> = Vec::new();
     let mut deleted: Vec<&str> = Vec::new();
@@ -542,8 +551,14 @@ impl UnsharedWork {
 }
 
 /// One team domain's unshared substantive work, detected offline: the local
-/// delta against the base snapshot, exactly as `origin status` computes it,
-/// with no probe and no forge call of any kind.
+/// delta against [`crystalline_remote::ops::unshared_base`], exactly as
+/// `origin status` computes it, with no probe and no forge call of any kind.
+///
+/// That base rather than the trunk snapshot, and for the reason the status
+/// has: on a stacked chain the work an open layer already carries is not
+/// unshared, so a nudge computed against the trunk would tell somebody to
+/// share what they have already shared, and the owned-changes count built on
+/// this could exceed the `local_changes` beside it.
 ///
 /// `None` when the domain has no recorded origin state, when the state cannot
 /// be read and when the working tree cannot be walked. All three mean the same
@@ -560,8 +575,11 @@ impl UnsharedWork {
 /// that went round review entirely.
 pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWork> {
     let state = OriginState::load(state_dir).ok().flatten()?;
-    let detected =
-        crystalline_remote::changes::detect_local_changes(domain_root, &state.files).ok()?;
+    let detected = crystalline_remote::changes::detect_local_changes(
+        domain_root,
+        &crystalline_remote::ops::unshared_base(&state),
+    )
+    .ok()?;
     let paths: Vec<String> = detected
         .changes
         .iter()
@@ -1077,6 +1095,76 @@ mod tests {
             "naming the work and counting it are one measurement: {detail}"
         );
         assert_eq!(named, 3);
+    }
+
+    /// Both walks here count against the chain tip, not the trunk, so a file
+    /// an open layer already carries reaches neither the count the share
+    /// nudge reads nor the detail the CLI's `--files` list draws. Counting
+    /// against the trunk here would tell somebody to share what they have
+    /// already shared, and name the file while the badge beside it left the
+    /// file out.
+    #[test]
+    fn a_stacked_layers_own_files_reach_neither_the_count_nor_the_detail() {
+        let (_dir, root, state_dir) = tracked_domain();
+        let proposed = engram_source("Proposed", None);
+        std::fs::write(root.join("proposed.md"), &proposed).unwrap();
+        std::fs::write(root.join("fresh.md"), engram_source("Fresh", None)).unwrap();
+
+        // An open layer on a chain this machine knows as a stack, recording
+        // exactly the file on disk. No forge is involved: the tip is assembled
+        // from the record.
+        let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+        state.stacks_available = Some(true);
+        state.proposals.push(crystalline_remote::state::Proposal {
+            number: 7,
+            url: "https://example.invalid/7".to_string(),
+            branch: "share-7".to_string(),
+            title: "Share 1 new engram".to_string(),
+            created_at: chrono::Utc::now(),
+            status: crystalline_remote::state::ProposalStatus::Open,
+            files: vec![crystalline_remote::state::ProposedFile {
+                path: "proposed.md".to_string(),
+                change: crystalline_remote::state::ProposedChange::Added,
+                sha256: Some({
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(proposed.as_bytes());
+                    crystalline_index::hex_lower(&hasher.finalize())
+                }),
+                blob_sha: None,
+                size: Some(proposed.len() as u64),
+            }],
+            head_commit: None,
+            pending_head_commit: None,
+            base_commit: None,
+            review_state: None,
+            feedback: Vec::new(),
+            updated_at: None,
+            author_login: None,
+        });
+        state.save(&state_dir).unwrap();
+
+        let work = unshared_work(&root, &state_dir).expect("the domain has origin state");
+        assert_eq!(
+            work.paths,
+            vec!["fresh.md".to_string()],
+            "the layer's own file is proposed, not unshared"
+        );
+
+        let detail = local_change_detail(&root, &state_dir).expect("the domain has origin state");
+        assert_eq!(detail["added"], json!(["fresh.md"]));
+        assert_eq!(detail["modified"], json!([]));
+        assert_eq!(detail["deleted"], json!([]));
+
+        let named = ["added", "modified", "deleted"]
+            .iter()
+            .map(|key| detail[*key].as_array().unwrap().len())
+            .sum::<usize>();
+        assert_eq!(
+            named,
+            work.count(),
+            "naming the work and counting it are one measurement: {detail}"
+        );
     }
 
     /// A domain that declares nothing keeps its listings at home, and "at

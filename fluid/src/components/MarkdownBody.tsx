@@ -28,7 +28,16 @@
  * reason to list the same lines a second time somewhere else.
  */
 
-import { Children, Suspense, isValidElement, lazy, useMemo } from "react";
+import {
+  Children,
+  Suspense,
+  isValidElement,
+  lazy,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ComponentProps, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
@@ -45,6 +54,9 @@ import {
 } from "../editor/imageFormat";
 import { WIKILINK, referenceState } from "../wikilinks";
 import type { WikilinkResolution, WikilinkResolver } from "../wikilinks";
+import DiagramOverlay from "./DiagramOverlay";
+import DiagramToolbar from "./DiagramToolbar";
+import { imageFileName } from "./downloads";
 import { Chip } from "./primitives";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
@@ -424,7 +436,19 @@ const components: Components = {
       </code>
     );
   },
-  pre: ({ children, node }) => {
+};
+
+/**
+ * The fenced block, which is a diagram wherever the fence says mermaid.
+ *
+ * It takes the document's name rather than reading it from anywhere, because
+ * a diagram a reader takes out of the full window is named after the document
+ * it came from and only the caller knows which document that is.
+ */
+function preFor(
+  documentName: string | undefined,
+): NonNullable<Components["pre"]> {
+  return ({ children, node }) => {
     const fence = (node as HastNode | undefined)?.children?.[0];
     const source = textOf(fence);
     if (languageOf(fence) === "mermaid" && source.trim() !== "") {
@@ -434,7 +458,10 @@ const components: Components = {
           className="breakout my-4 rounded border border-slate-200 p-3 dark:border-slate-800"
         >
           <Suspense fallback={<DiagramSource source={source} />}>
-            <MermaidDiagram source={source} />
+            <MermaidDiagram
+              source={source}
+              {...(documentName === undefined ? {} : { name: documentName })}
+            />
           </Suspense>
         </figure>
       );
@@ -444,8 +471,8 @@ const components: Components = {
         {children}
       </pre>
     );
-  },
-};
+  };
+}
 
 /**
  * The files-route URL a target names, or null when it names no file of this
@@ -541,6 +568,13 @@ function MarkdownAnchor({
  * The placement fragment is read on the way through, and the style it means is
  * the same one the editor's preview widget applies, so a floated image looks
  * the same in both places.
+ *
+ * In the column an image is as wide as the prose lets it be, which for a
+ * screenshot of anything is too small to read, so it opens in the same
+ * full-window layer a diagram does - by the button in its corner, or by a
+ * click on the picture, which is what a reader tries first. A `span` and not
+ * a `figure`, because the wrapper stands where the image stood and an image
+ * lives inside a paragraph, where only phrasing content may go.
  */
 function MarkdownImage({
   src,
@@ -556,28 +590,101 @@ function MarkdownImage({
   // The directives are read off the decoded target for the same reason the
   // path is: micromark hands `w=50%` over as `w=50%25`, which is no width at
   // all. Decoding happens once, here and in `assetPath`, never in sequence.
-  const { format } = parseImageFragment(decodeTarget(written));
+  const decoded = decodeTarget(written);
+  const { format } = parseImageFragment(decoded);
+  const wrapperRef = useRef<HTMLSpanElement>(null);
+  const fullWindowRef = useRef<HTMLButtonElement>(null);
+  const [fullWindow, setFullWindow] = useState(false);
+  // Whether a link is in charge here, which only the tree can answer: this
+  // component is handed its own props and nothing about what it sits in, so
+  // the answer comes from the DOM once it is in one. An image inside a link
+  // belongs to the link, and a corner button offering a second destination
+  // beside it is a choice nobody asked for.
+  const [linked, setLinked] = useState(false);
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    setLinked(wrapper !== null && wrapper.closest("a") !== null);
+  }, []);
+  // Ours is rebuilt from the decoded path, which re-encodes exactly once;
+  // anything else keeps the URL the renderer produced, escapes and all.
+  const shown = file ?? written;
+  const placement = imageStyle(file === null ? { align: "center" } : format);
+  // The wrapper takes the placement the image had - the float, the margins,
+  // the block and any width the fragment asked for - and hugs the picture
+  // where no width was asked for, so the toolbar's corner is the image's
+  // corner rather than the column's. The image fills a wrapper that was given
+  // a width and keeps its own size otherwise, where a share of the column
+  // would be a share of itself.
+  const wrapperStyle = {
+    ...placement,
+    width: placement.width ?? "fit-content",
+    maxWidth: "100%",
+  };
+  const fills = placement.width !== undefined;
   return (
-    <img
-      // Ours is rebuilt from the decoded path, which re-encodes exactly once;
-      // anything else keeps the URL the renderer produced, escapes and all.
-      src={file ?? written}
-      // Never null: react-markdown hands the alt text through as written, and
-      // an image with no alt at all is one a screen reader cannot skip.
-      alt={alt ?? ""}
-      loading="lazy"
-      style={imageStyle(file === null ? { align: "center" } : format)}
-    />
+    <span ref={wrapperRef} className="group relative" style={wrapperStyle}>
+      <img
+        src={shown}
+        // Never null: react-markdown hands the alt text through as written,
+        // and an image with no alt at all is one a screen reader cannot skip.
+        alt={alt ?? ""}
+        loading="lazy"
+        className={`h-auto max-w-full${fills ? " w-full" : ""}${
+          linked ? "" : " cursor-zoom-in"
+        }`}
+        onClick={(event) => {
+          // Inside a link the link wins: the click is the reader's way to
+          // follow it, and the full window stays a hover away on the button -
+          // except that inside a link there is no button either.
+          if (event.currentTarget.closest("a") !== null) {
+            return;
+          }
+          setFullWindow(true);
+        }}
+      />
+      {!linked && (
+        <DiagramToolbar
+          onOpenFullWindow={() => {
+            setFullWindow(true);
+          }}
+          fullWindowRef={fullWindowRef}
+        />
+      )}
+      {fullWindow && (
+        <DiagramOverlay
+          content={{
+            kind: "image",
+            src: shown,
+            alt: alt ?? "",
+            // The name the author wrote, not the address this app built: a
+            // file saved out of the full window keeps the name it has in the
+            // document rather than a route's last segment. The target goes
+            // over as written, because the helper decodes it once itself.
+            filename: imageFileName(written),
+          }}
+          returnFocusTo={fullWindowRef}
+          onClose={() => {
+            setFullWindow(false);
+          }}
+        />
+      )}
+    </span>
   );
 }
 
 /**
- * The component map for one domain: everything above, plus the two elements
- * that need to know which domain a relative `assets/` target belongs to.
+ * The component map for one domain: everything above, plus the three elements
+ * that need to know more than the markdown says - which domain a relative
+ * `assets/` target belongs to, and which document a picture taken out of the
+ * full window is named after.
  */
-function componentsFor(domain: string | undefined): Components {
+function componentsFor(
+  domain: string | undefined,
+  documentName: string | undefined,
+): Components {
   return {
     ...components,
+    pre: preFor(documentName),
     a: ({ children, href, node }) => (
       <MarkdownAnchor
         href={href}
@@ -611,6 +718,7 @@ export default function MarkdownBody({
   wikilinks,
   foldTitle,
   domain,
+  documentName,
 }: {
   source: string;
   wikilinks?: WikilinkResolver;
@@ -621,8 +729,16 @@ export default function MarkdownBody({
    * attachment path means nothing without the domain holding it.
    */
   domain?: string;
+  /**
+   * What this document is called, for the name on a file a reader takes out
+   * of it. Absent, a diagram's download is named after the drawing alone.
+   */
+  documentName?: string;
 }) {
-  const componentMap = useMemo(() => componentsFor(domain), [domain]);
+  const componentMap = useMemo(
+    () => componentsFor(domain, documentName),
+    [domain, documentName],
+  );
   const rehypePlugins = useMemo<RehypePlugins>(
     () => [
       // `plainText` keeps the highlighter's hands off a mermaid fence, whose
