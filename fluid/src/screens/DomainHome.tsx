@@ -40,6 +40,7 @@ import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
+import { EngramsOrderMenu } from "../components/EngramsOrderMenu";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
 import { MembersCard } from "../components/MembersCard";
@@ -48,6 +49,7 @@ import { ReviewModeCard } from "../components/ReviewModeCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
+import { orderCaption, orderQuery, useEngramsOrder } from "../engramsOrder";
 import { frontmatterFilters } from "../filters";
 import { plural } from "../format";
 import { manifestRoute } from "../paths";
@@ -82,6 +84,11 @@ export default function DomainHome() {
     [path],
   );
   const filtering = hasFilters(filters);
+
+  // The reader's order, the frame's to keep: it rides on the key and on the
+  // request of both lists below, so changing it starts a new list.
+  const { order } = useEngramsOrder();
+  const listingOrder = orderQuery(order);
 
   const listing = useQuery({
     queryKey: DOMAINS_QUERY_KEY,
@@ -326,10 +333,20 @@ export default function DomainHome() {
 
       <section aria-labelledby="domain-engrams">
         <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3">
-          <h2 id="domain-engrams" className="text-section">
-            Engrams
-          </h2>
+          <div>
+            <h2 id="domain-engrams" className="text-section">
+              Engrams
+            </h2>
+            {/*
+              The order in words, on every listing: the rows carry no date,
+              so nothing else on screen says which way they run.
+            */}
+            <p className="text-caption mt-1 text-slate-500 dark:text-slate-400">
+              {orderCaption(order)}
+            </p>
+          </div>
           <div className="flex flex-wrap items-center gap-2">
+            <EngramsOrderMenu />
             {capabilities.canWrite && (
               <button
                 type="button"
@@ -434,31 +451,26 @@ export default function DomainHome() {
           }}
         />
 
-        <p className="py-3 text-sm text-slate-500 dark:text-slate-400">
-          {/*
-            What the list below is a list of, in one line. The browse view is
-            a folder and everything under it, which is what the endpoint's
-            `path` means, so the line says so rather than letting a reader read
-            "Browsing notes" as the four files sitting directly in it.
-
-            At the root of the domain the interesting fact is not the scope -
-            a reader who chose no folder knows they are looking at the whole
-            domain - but the order: the listing comes back newest recorded
-            first, so what a reader arriving here reads from the top is what
-            the domain learned most recently. The line says so rather than
-            leaving the order to be guessed at from the dates in the rows.
-          */}
-          {filtering
-            ? "Filtered across the whole domain, every folder included."
-            : path === ""
-              ? "Newest first, by the date they were recorded."
+        {/*
+          What the list below is a list of, where that is not the whole
+          domain: a folder and everything under it, which is what the
+          endpoint's `path` means, or a filter across every folder. At the
+          root the caption under the heading has already said everything.
+        */}
+        {(filtering || path !== "") && (
+          <p className="py-3 text-sm text-slate-500 dark:text-slate-400">
+            {filtering
+              ? "Filtered across the whole domain, every folder included."
               : `Browsing ${path}, subfolders included.`}
-        </p>
+          </p>
+        )}
 
         {filtering ? (
           <EngramList
-            queryKey={domainEngramsKey(domain, filters)}
-            loadPage={(page) => fetchDomainEngrams(domain, filters, page)}
+            queryKey={domainEngramsKey(domain, filters, listingOrder)}
+            loadPage={(page) =>
+              fetchDomainEngrams(domain, filters, page, listingOrder)
+            }
             label={`Engrams in ${domain}`}
             emptyMessage="No engram matches these filters."
           />
@@ -468,8 +480,10 @@ export default function DomainHome() {
             // instead of filtered: a folder holding thousands of engrams costs
             // one page here rather than the whole folder, and the key carries
             // the scope, so opening another folder starts another list.
-            queryKey={domainEngramsKey(domain, browse)}
-            loadPage={(page) => fetchDomainEngrams(domain, browse, page)}
+            queryKey={domainEngramsKey(domain, browse, listingOrder)}
+            loadPage={(page) =>
+              fetchDomainEngrams(domain, browse, page, listingOrder)
+            }
             label={`Engrams in ${domain}`}
             // The count this list would draw on its own is "50 of 620 shown",
             // which says nothing about where those 620 are, and reads as a

@@ -86,6 +86,26 @@ export function hasFilters(filters: EngramFilters): boolean {
 }
 
 /**
+ * The order a listing is asked for: what `sort` and `dir` carry on
+ * `GET /domains/{d}/engrams`.
+ *
+ * Beside the filters rather than inside them, because it selects nothing: a
+ * filter decides which rows answer and the order decides which page they
+ * land on. `recorded` is by the date each engram was recorded, an undated
+ * one last either way; `path` is by path in byte order.
+ */
+export interface ListingOrder {
+  sort: "recorded" | "path";
+  dir: "asc" | "desc";
+}
+
+/** The order the server lists in when nobody asks: newest recorded first. */
+export const DEFAULT_LISTING_ORDER: ListingOrder = {
+  sort: "recorded",
+  dir: "desc",
+};
+
+/**
  * How many rows a page asks for.
  *
  * Larger than the API's default of ten because these lists are virtualized and
@@ -185,10 +205,11 @@ export function domainEngramsRoot(domain: string): readonly unknown[] {
   return ["domain-engrams", domain];
 }
 
-/** The cache key of one domain's filtered listing. */
+/** The cache key of one domain's filtered listing, in one order. */
 export function domainEngramsKey(
   domain: string,
   filters: EngramFilters,
+  order: ListingOrder = DEFAULT_LISTING_ORDER,
 ): readonly unknown[] {
   return [
     ...domainEngramsRoot(domain),
@@ -196,6 +217,8 @@ export function domainEngramsKey(
     filters.status,
     filters.tags,
     filters.path,
+    order.sort,
+    order.dir,
   ];
 }
 
@@ -204,6 +227,7 @@ export async function fetchDomainEngrams(
   domain: string,
   filters: EngramFilters,
   page: number,
+  order: ListingOrder = DEFAULT_LISTING_ORDER,
 ): Promise<EngramPage> {
   const query = new URLSearchParams();
   // Absent is the whole domain, which is what the endpoint means by no `path`
@@ -220,6 +244,10 @@ export async function fetchDomainEngrams(
   if (filters.tags.length > 0) {
     query.set("tags", filters.tags.join(","));
   }
+  // Said out loud even when it is the default, so a request never leans on
+  // the server's guess about what a silent client meant.
+  query.set("sort", order.sort);
+  query.set("dir", order.dir);
   query.set("page", String(page));
   query.set("limit", String(ENGRAM_PAGE_SIZE));
   const payload = await api<unknown>(

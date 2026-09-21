@@ -248,6 +248,9 @@ async function screenBody(): Promise<HTMLElement> {
 
 beforeEach(() => {
   apiMock.mockReset();
+  // The listing's order is remembered across sessions, so each test starts
+  // from a browser that has never been told anything.
+  localStorage.clear();
 });
 
 describe("the domain screen", () => {
@@ -279,6 +282,18 @@ describe("the domain screen", () => {
         "Newest first, by the date they were recorded.",
       ),
     ).toBeVisible();
+    // The request says the order out loud, default included, so the server
+    // never has to guess what a client that sends nothing meant.
+    await waitFor(() => {
+      expect(
+        requested().some(
+          (path) =>
+            path.startsWith("/domains/eng/engrams?") &&
+            path.includes("sort=recorded") &&
+            path.includes("dir=desc"),
+        ),
+      ).toBe(true);
+    });
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
@@ -566,12 +581,104 @@ describe("the domain screen", () => {
     expect(
       await within(body).findByText(/620 engrams in this folder/),
     ).toBeVisible();
-    // The order line belongs to the root of the domain: a folder says which
-    // folder it is browsing, which is the fact a reader inside one needs.
-    expect(within(body).queryByText(/Newest first/)).toBeNull();
+    // The order caption is on every listing, and the folder says which
+    // folder it is browsing beneath it.
+    expect(
+      within(body).getByText("Newest first, by the date they were recorded."),
+    ).toBeVisible();
     expect(
       within(body).getByText(/Browsing notes, subfolders included/),
     ).toBeVisible();
+  });
+
+  it("orders the listing the way the reader chose, and remembers it", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
+
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Order: Newest first" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitemradio", { name: "Name A to Z" }),
+    );
+
+    // The caption says the order in words, the trigger wears the choice,
+    // the request carries it, and the browser keeps it.
+    expect(await within(body).findByText("By name, A to Z.")).toBeVisible();
+    expect(
+      within(body).getByRole("button", { name: "Order: Name A to Z" }),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(
+        requested().some(
+          (path) =>
+            path.startsWith("/domains/eng/engrams?") &&
+            path.includes("sort=path") &&
+            path.includes("dir=asc"),
+        ),
+      ).toBe(true);
+    });
+    expect(localStorage.getItem("fluid.engrams.order")).toBe("name-asc");
+  });
+
+  it("reads a remembered order at mount", async () => {
+    localStorage.setItem("fluid.engrams.order", "oldest");
+    serve();
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    expect(
+      await within(body).findByText(
+        "Oldest first, by the date they were recorded.",
+      ),
+    ).toBeVisible();
+    await waitFor(() => {
+      expect(
+        requested().some(
+          (path) =>
+            path.startsWith("/domains/eng/engrams?") &&
+            path.includes("sort=recorded") &&
+            path.includes("dir=asc"),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("applies the order to a filtered listing too, and never to a search", async () => {
+    localStorage.setItem("fluid.engrams.order", "name-desc");
+    serve();
+
+    renderApp("/d/eng?tags=eng");
+    const body = await screenBody();
+    await screen.findByRole("link", { name: /Gamma/ });
+
+    expect(within(body).getByText("By name, Z to A.")).toBeVisible();
+    const filtered = requested().filter(
+      (path) =>
+        path.startsWith("/domains/eng/engrams?") && path.includes("tags=eng"),
+    );
+    expect(filtered.length).toBeGreaterThan(0);
+    expect(
+      filtered.every(
+        (path) => path.includes("sort=path") && path.includes("dir=desc"),
+      ),
+    ).toBe(true);
+    // Every listing request carries the order, not only the ones the filter
+    // is visible on: a request that went out before the filter resolved
+    // would otherwise slip through unordered.
+    const listings = requested().filter((path) =>
+      path.startsWith("/domains/eng/engrams?"),
+    );
+    expect(listings.length).toBeGreaterThan(0);
+    expect(
+      listings.every(
+        (path) => path.includes("sort=path") && path.includes("dir=desc"),
+      ),
+    ).toBe(true);
   });
 
   it("keeps a filter across the whole domain while a folder is open", async () => {

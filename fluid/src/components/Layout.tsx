@@ -85,6 +85,12 @@ import {
 } from "../layoutWidth";
 import type { LayoutWidth } from "../layoutWidth";
 import {
+  ENGRAMS_ORDER_KEY,
+  EngramsOrderContext,
+  storedEngramsOrder,
+} from "../engramsOrder";
+import type { EngramsOrder, EngramsOrderChoice } from "../engramsOrder";
+import {
   domainRoute,
   githubSettingsRoute,
   maintenanceRoute,
@@ -422,6 +428,7 @@ export function Layout() {
   const [rail, setRail] = useState(storedRail);
   const [fullWidth, setFullWidth] = useState(storedFullWidth);
   const [largeText, setLargeText] = useState(storedLargeText);
+  const [engramsOrder, setEngramsOrderState] = useState(storedEngramsOrder);
   const wide = useWide();
   const [helpOpen, setHelpOpen] = useState(false);
   // Registering a domain is the frame's own act rather than any screen's: it
@@ -507,6 +514,22 @@ export function Layout() {
   const text = useMemo<LayoutText>(
     () => ({ largeText, toggleLargeText }),
     [largeText, toggleLargeText],
+  );
+
+  // The third frame-level choice, about what is listed rather than how the
+  // frame is drawn: which way a domain's engrams are ordered. Kept and read
+  // the way the width is, and memoized for the same reason.
+  const setEngramsOrder = useCallback((next: EngramsOrder) => {
+    setEngramsOrderState(next);
+    try {
+      localStorage.setItem(ENGRAMS_ORDER_KEY, next);
+    } catch {
+      // A browser that refuses storage still gets the session's choice.
+    }
+  }, []);
+  const engramsOrderChoice = useMemo<EngramsOrderChoice>(
+    () => ({ order: engramsOrder, setOrder: setEngramsOrder }),
+    [engramsOrder, setEngramsOrder],
   );
 
   // What is offered on every screen, because the frame is on every screen: a
@@ -627,108 +650,110 @@ export function Layout() {
     // width button is a reader of this value too.
     <LayoutWidthContext value={width}>
       <LayoutTextContext value={text}>
-        <div className="min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-          <TopBar
-            navOpen={navOpen}
-            onToggleNav={() => {
-              setNavOpen((open) => !open);
-            }}
-            onShare={openShare}
-          />
-          {/*
+        <EngramsOrderContext value={engramsOrderChoice}>
+          <div className="min-h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+            <TopBar
+              navOpen={navOpen}
+              onToggleNav={() => {
+                setNavOpen((open) => !open);
+              }}
+              onShare={openShare}
+            />
+            {/*
           Above everything, on every screen, for as long as this window is
           inside somebody else's draft. Working in another person's unfolded
           work is a state the WINDOW is in rather than something one page
           does, so it is drawn here and not by the screen that started it.
         */}
-          <JoinedDraftBar />
-          <div
-            className={`mx-auto flex w-full gap-6 px-4 py-6 ${
-              fullWidth ? "" : "max-w-350"
-            }`}
-          >
-            {/*
+            <JoinedDraftBar />
+            <div
+              className={`mx-auto flex w-full gap-6 px-4 py-6 ${
+                fullWidth ? "" : "max-w-350"
+              }`}
+            >
+              {/*
             The stored rail only reaches the sidebar where there is a sidebar
             to apply it to: below `md` this is a drawer, and it is always
             expanded.
           */}
-            <DomainSidebar
-              open={navOpen}
-              rail={rail && wide}
-              onToggleRail={toggleRail}
-              onCreateDomain={() => {
-                setCreatingDomain(true);
-              }}
-            />
-            {/*
+              <DomainSidebar
+                open={navOpen}
+                rail={rail && wide}
+                onToggleRail={toggleRail}
+                onCreateDomain={() => {
+                  setCreatingDomain(true);
+                }}
+              />
+              {/*
             One attribute for the whole app's measure: the stylesheet lifts the
             cap under it, so no screen has to know anything about the choice to
             be drawn at the width it asks for. The frame's own cap goes with
             it: full width means the window, not a wider column inside the
             same box.
           */}
-            <main
-              ref={mainRef}
-              tabIndex={-1}
-              data-width={fullWidth ? "full" : undefined}
-              data-text={largeText ? "large" : undefined}
-              className="min-w-0 flex-1 focus:outline-none"
-            >
-              <Outlet />
-            </main>
-          </div>
-          <RouteFocus target={mainRef} />
-          {/*
+              <main
+                ref={mainRef}
+                tabIndex={-1}
+                data-width={fullWidth ? "full" : undefined}
+                data-text={largeText ? "large" : undefined}
+                className="min-w-0 flex-1 focus:outline-none"
+              >
+                <Outlet />
+              </main>
+            </div>
+            <RouteFocus target={mainRef} />
+            {/*
           Once for the whole app, so the shortcut works on every screen and the
           palette outlives the screen a jump leaves behind.
         */}
-          <CommandPalette />
-          {/*
+            <CommandPalette />
+            {/*
           And the map of the keys that drive it, one press away from anywhere.
         */}
-          <HelpOverlay
-            open={helpOpen}
-            onClose={() => {
-              setHelpOpen(false);
-            }}
-          />
-          {/*
+            <HelpOverlay
+              open={helpOpen}
+              onClose={() => {
+                setHelpOpen(false);
+              }}
+            />
+            {/*
           Mounted by the frame rather than by the sidebar, because both ways in
           - the launcher under the listing and the palette row - are the
           frame's.
         */}
-          {creatingDomain && (
-            <CreateDomainDialog
-              onClose={() => {
-                setCreatingDomain(false);
-              }}
-            />
-          )}
-          {/*
+            {creatingDomain && (
+              <CreateDomainDialog
+                onClose={() => {
+                  setCreatingDomain(false);
+                }}
+              />
+            )}
+            {/*
           The same pair, for the same reason: the button and the palette row
           both belong to the frame, and the picker hands straight over to the
           dialog beside it rather than opening a second one over itself.
         */}
-          {pickingShare && (
-            <SharePickerDialog
-              onPick={(domain) => {
-                setPickingShare(false);
-                setShareDomain(domain);
-              }}
-              onClose={() => {
-                setPickingShare(false);
-              }}
-            />
-          )}
-          {shareDomain !== null && (
-            <ShareDialog
-              domain={shareDomain}
-              onClose={() => {
-                setShareDomain(null);
-              }}
-            />
-          )}
-        </div>
+            {pickingShare && (
+              <SharePickerDialog
+                onPick={(domain) => {
+                  setPickingShare(false);
+                  setShareDomain(domain);
+                }}
+                onClose={() => {
+                  setPickingShare(false);
+                }}
+              />
+            )}
+            {shareDomain !== null && (
+              <ShareDialog
+                domain={shareDomain}
+                onClose={() => {
+                  setShareDomain(null);
+                }}
+              />
+            )}
+          </div>
+        </EngramsOrderContext>
       </LayoutTextContext>
     </LayoutWidthContext>
   );
