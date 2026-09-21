@@ -364,9 +364,12 @@ function DomainPage({
             Offered whether the MANIFEST is empty or not: an admin looking at
             nothing needs exactly this link to fix that, and an admin looking
             at prose needs it to change it. The same gate the editor itself
-            enforces if the address is typed directly.
+            enforces if the address is typed directly, plus the one the
+            palette row is under: a read that failed is nothing to edit, and
+            the panel below is showing the refusal rather than a document. An
+            empty MANIFEST is a read that landed, so it keeps its link.
           */}
-          {capabilities.canAdminister && (
+          {capabilities.canAdminister && manifestLoaded && (
             <Link
               to={manifestEditRoute(domain)}
               onPointerEnter={prefetchManifestEditor}
