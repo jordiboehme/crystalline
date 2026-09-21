@@ -4,7 +4,13 @@
  * the sidebar becomes once a domain is open.
  */
 
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -504,9 +510,14 @@ describe("the sidebar inside a domain", () => {
     renderApp("/d/eng");
 
     const nav = await screen.findByRole("navigation", { name: "Domain eng" });
-    // The switcher says where you are, and is the control that moves you.
+    // The domain row says where you are: its name goes to the domain page,
+    // and it is marked current because that page is what is open.
+    const row = await within(nav).findByRole("link", { name: "eng" });
+    expect(row).toHaveAttribute("href", "/d/eng");
+    expect(row).toHaveAttribute("aria-current", "page");
+    // And the control that moves you stands beside it, named for the act.
     expect(
-      await within(nav).findByRole("button", { name: "Domain: eng" }),
+      within(nav).getByRole("button", { name: "Switch domain" }),
     ).toBeVisible();
     // The way back to everything stays on screen rather than being a browser
     // button somebody has to remember.
@@ -524,6 +535,10 @@ describe("the sidebar inside a domain", () => {
     // The flat list is gone: two lists of domains at once would be two answers
     // to the same question.
     expect(within(nav).queryByRole("link", { name: /^ops/ })).toBeNull();
+    // No dropdown wearing the domain's name, and no pinned MANIFEST row: the
+    // MANIFEST is read on the domain page the row already links to.
+    expect(within(nav).queryByRole("button", { name: /^Domain:/ })).toBeNull();
+    expect(within(nav).queryByRole("link", { name: "MANIFEST" })).toBeNull();
   });
 
   it("moves to another domain when the switcher picks one", async () => {
@@ -547,9 +562,7 @@ describe("the sidebar inside a domain", () => {
 
     renderApp("/d/eng");
     const user = userEvent.setup();
-    await user.click(
-      await screen.findByRole("button", { name: "Domain: eng" }),
-    );
+    await user.click(await screen.findByRole("button", { name: "Switch domain" }));
 
     // Every domain is offered with what it holds, which is what makes the
     // choice between them a choice rather than a guess.
@@ -560,9 +573,10 @@ describe("the sidebar inside a domain", () => {
     expect(
       await screen.findByRole("heading", { level: 1, name: "ops" }),
     ).toBeVisible();
+    const nav = await screen.findByRole("navigation", { name: "Domain ops" });
     expect(
-      await screen.findByRole("button", { name: "Domain: ops" }),
-    ).toBeVisible();
+      await within(nav).findByRole("link", { name: "ops" }),
+    ).toHaveAttribute("aria-current", "page");
   });
 
   it("badges a private domain in the switcher", async () => {
@@ -586,9 +600,7 @@ describe("the sidebar inside a domain", () => {
 
     renderApp("/d/eng");
     const user = userEvent.setup();
-    await user.click(
-      await screen.findByRole("button", { name: "Domain: eng" }),
-    );
+    await user.click(await screen.findByRole("button", { name: "Switch domain" }));
 
     expect(
       await screen.findByRole("menuitemradio", { name: /^ops/ }),
@@ -822,7 +834,7 @@ describe("the sidebar inside a domain", () => {
     expect(retired.className).toContain("opacity-60");
   });
 
-  it("says the MANIFEST once, above the tree rather than inside it", async () => {
+  it("keeps the MANIFEST out of the tree, and pins no row for it", async () => {
     serveInDomain();
 
     renderApp("/d/eng");
@@ -831,9 +843,37 @@ describe("the sidebar inside a domain", () => {
     // The tree has arrived, so a row the engine listed would be on screen by
     // now if the sidebar were drawing it.
     await within(nav).findByRole("link", { name: "Alpha" });
-    const pinned = within(nav).getAllByRole("link", { name: "MANIFEST" });
-    expect(pinned).toHaveLength(1);
-    expect(pinned[0]).toHaveAttribute("href", "/d/eng/manifest");
+    expect(within(nav).queryByRole("link", { name: "MANIFEST" })).toBeNull();
+    expect(within(nav).queryByText("MANIFEST")).toBeNull();
+  });
+
+  it("marks the domain row current on the domain page only", async () => {
+    serveInDomain();
+
+    renderApp("/d/eng?tags=eng");
+    let nav = await sidebar();
+    // A filter keeps the page it is on: the domain page, still current.
+    expect(
+      await within(nav).findByRole("link", { name: "eng" }),
+    ).toHaveAttribute("aria-current", "page");
+    cleanup();
+
+    renderApp("/d/eng?path=notes");
+    nav = await sidebar();
+    // A folder is its own page, and the folder's row is what is current.
+    expect(
+      await within(nav).findByRole("link", { name: "eng" }),
+    ).not.toHaveAttribute("aria-current");
+    expect(
+      await within(nav).findByRole("link", { name: "notes" }),
+    ).toHaveAttribute("aria-current", "page");
+    cleanup();
+
+    renderApp("/d/eng/e/alpha");
+    nav = await sidebar();
+    expect(
+      await within(nav).findByRole("link", { name: "eng" }),
+    ).not.toHaveAttribute("aria-current");
   });
 
   it("says why a folder is empty instead of showing an empty one", async () => {
@@ -851,10 +891,10 @@ describe("the sidebar inside a domain", () => {
 
     const alert = await within(await sidebar()).findByRole("alert");
     expect(alert).toHaveTextContent("this account may not browse eng");
-    // The switcher survives the failure: one domain refusing to be browsed is
-    // not a reason to strand somebody in it.
+    // The row and its switch button survive the failure: one domain refusing
+    // to be browsed is not a reason to strand somebody in it.
     expect(
-      within(await sidebar()).getByRole("button", { name: "Domain: eng" }),
+      within(await sidebar()).getByRole("button", { name: "Switch domain" }),
     ).toBeVisible();
   });
 });

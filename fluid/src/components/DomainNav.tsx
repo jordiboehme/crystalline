@@ -5,10 +5,11 @@
  * A domain is a place somebody works in rather than an entry they picked once,
  * so while they are inside one the sidebar stops being a list of everything and
  * becomes the way around this one thing. Two controls make that true: a
- * switcher that names the current domain and moves across to another, and the
- * folder tree below it, which is the domain's own shape rather than a flat
- * listing of it. The way back out to every domain stays on screen beside them,
- * because a place you cannot leave is a trap.
+ * domain row that names the current domain, goes to its page, and carries
+ * the button that moves across to another; and the folder tree below it,
+ * which is the domain's own shape rather than a flat listing of it. The way
+ * back out to every domain stays on screen beside them, because a place you
+ * cannot leave is a trap.
  *
  * The tree is walked rather than downloaded. `GET /domains/{d}/tree` answers
  * one folder at a time - its subfolder names and the engrams directly in it -
@@ -38,10 +39,14 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { FolderOpen, Folder as FolderShut } from "lucide-react";
+import {
+  ArrowLeftRight,
+  FolderOpen,
+  Folder as FolderShut,
+} from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router";
+import { Link, useMatch, useNavigate, useSearchParams } from "react-router";
 
 import { problemDetail } from "../api/client";
 import { treeQuery } from "../api/domain";
@@ -51,11 +56,11 @@ import { hasFilters } from "../api/engrams";
 import { useAuth } from "../auth/AuthContext";
 import { frontmatterFilters } from "../filters";
 import { RETIRED_CLASS, isRetired } from "../lifecycle";
-import { domainRoute, engramRoute, folderRoute, manifestRoute } from "../paths";
+import { domainRoute, engramRoute, folderRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
-import { Chip, FOCUS_RING } from "./primitives";
+import { Chip, FOCUS_RING, Tooltip } from "./primitives";
 
 export interface DomainNavProps {
   /** The domain the route is inside. */
@@ -65,29 +70,20 @@ export interface DomainNavProps {
    * own home screen, where there is none.
    */
   permalink: string;
-  /** Whether the MANIFEST page or its editor is the screen open right now. */
-  onManifest: boolean;
   /** Every registered domain, for the switcher. */
   domains: DomainSummary[];
 }
 
-export function DomainNav({
-  domain,
-  permalink,
-  onManifest,
-  domains,
-}: DomainNavProps) {
+export function DomainNav({ domain, permalink, domains }: DomainNavProps) {
   const { capabilities } = useAuth();
   const [creating, setCreating] = useState(false);
   const [params] = useSearchParams();
-  // Which folder the screen beside the tree was last pointed at. Only the
-  // domain's own screen writes `path`; `permalink` being empty is what says
-  // the screen beside the tree is that one rather than an engram page, so the
-  // pair is read as one state rather than two that could contradict each
-  // other. (The MANIFEST page also has no permalink, and no link in this app
-  // puts `?path=` on that route, so nothing is browsing there either.)
-  const browsing =
-    permalink === "" && !onManifest ? (params.get("path") ?? "") : "";
+  // Whether the domain's own page is what stands beside the tree: the exact
+  // route, no engram, no editor. Only that page writes `path`, so the folder
+  // being browsed is read from the URL there and nowhere else, and the pair
+  // is one state rather than two that could contradict each other.
+  const onDomainPage = useMatch("/d/:domain") !== null;
+  const browsing = onDomainPage ? (params.get("path") ?? "") : "";
   // Which folder may call itself the page the reader is on - not the same
   // question. Under a frontmatter filter the screen leaves the folder and
   // lists the whole domain, so no folder is the current page: the mark would
@@ -108,31 +104,14 @@ export function DomainNav({
         All domains
       </Link>
 
-      <DomainSwitcher domain={domain} domains={domains} />
-
-      {/*
-        Pinned ahead of the tree, because a MANIFEST is what introduces the
-        domain rather than something filed inside it, and drawn as an ordinary
-        row: position is the thing that says it is different, and a second
-        treatment on top of it would only be decoration. Its name stays in
-        capitals because that is the file's actual name, not a heading style.
-        The you-are-here cue is `EngramLink`'s own mechanism, `aria-current`
-        plus a highlight class, so a reader on either page gets the same signal
-        regardless of which row it marks. The tree drops its duplicate of this
-        row below, so the domain's introduction is offered once.
-      */}
-      <Link
-        to={manifestRoute(domain)}
-        aria-current={onManifest ? "page" : undefined}
-        // The tree rows' own padding, to the half unit: "drawn as an ordinary
-        // row" is the rule above, and a row a shade taller than the ones under
-        // it is precisely the second treatment that rule turns down.
-        className={`block truncate rounded px-2 py-1 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:hover:bg-slate-800 ${
-          onManifest ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
-        }`}
-      >
-        MANIFEST
-      </Link>
+      <DomainRow
+        domain={domain}
+        domains={domains}
+        // Current while the domain page is open: no folder, whatever
+        // filter. A folder is its own page and its own row in the tree
+        // says so; an engram or the editor is somewhere else again.
+        current={onDomainPage && browsing === ""}
+      />
 
       <div>
         <h2 className="text-caption px-2 pb-2 font-semibold text-slate-500 dark:text-slate-400">
@@ -180,75 +159,96 @@ export function DomainNav({
 }
 
 /**
- * Which domain this is, and the way across to another.
+ * The domain the reader is in, and the way across to another.
  *
- * Each entry carries what that domain holds, which is what makes choosing
- * between them a choice rather than a guess. A domain the listing does not
- * name - a wrong address, or one this identity may not list - still shows on
- * the trigger, so the switcher says where the reader actually is.
+ * One row: the name is a link to the domain page, marked current while that
+ * page is open, and the button beside it opens every domain by name with
+ * what each holds, which is what makes choosing between them a choice rather
+ * than a guess. A domain the listing does not name - a wrong address, or one
+ * this identity may not list - still shows in the row, so the sidebar says
+ * where the reader actually is.
+ *
+ * The trigger is drawn the way the top bar's theme trigger is: the menu's
+ * own trigger element with an icon inside and the app's tooltip around it,
+ * so the pointer and the screen reader are told the same name.
  */
-function DomainSwitcher({
+function DomainRow({
   domain,
   domains,
+  current,
 }: {
   domain: string;
   domains: DomainSummary[];
+  current: boolean;
 }) {
   const navigate = useNavigate();
 
   return (
-    <DropdownMenu.Root>
-      <DropdownMenu.Trigger
-        aria-label={`Domain: ${domain}`}
-        className="flex w-full items-center gap-2 rounded border border-slate-300 px-2 py-1.5 text-sm hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700 dark:hover:bg-slate-800"
+    <div
+      className={`flex items-center gap-1 rounded text-sm hover:bg-slate-100 dark:hover:bg-slate-800 ${
+        current ? "bg-slate-100 font-medium dark:bg-slate-800" : ""
+      }`}
+    >
+      <Link
+        to={domainRoute(domain)}
+        aria-current={current ? "page" : undefined}
+        className={`min-w-0 grow truncate rounded px-2 py-1 ${FOCUS_RING}`}
       >
-        <span className="truncate font-medium">{domain}</span>
-        <span aria-hidden="true" className="ml-auto text-xs text-slate-500">
-          ▾
-        </span>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="start"
-          sideOffset={6}
-          className={MENU_CLASSES}
-        >
-          <DropdownMenu.RadioGroup
-            value={domain}
-            onValueChange={(value) => {
-              if (value !== domain) {
-                void navigate(domainRoute(value));
-              }
-            }}
+        {domain}
+      </Link>
+      <DropdownMenu.Root>
+        <Tooltip label="Switch domain">
+          <DropdownMenu.Trigger
+            aria-label="Switch domain"
+            className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700 ${FOCUS_RING}`}
           >
-            {domains.map((entry) => (
-              <DropdownMenu.RadioItem
-                key={entry.name}
-                value={entry.name}
-                className={ITEM_CLASSES}
-              >
-                <DropdownMenu.ItemIndicator>
-                  <span aria-hidden="true">*</span>
-                </DropdownMenu.ItemIndicator>
-                <span className="truncate">{entry.name}</span>
-                {/*
-                  The same badge the flat sidebar list gives a private domain,
-                  in the sidebar's other form: a reader inside a domain picks
-                  the next one from here, and a domain that reads as private
-                  in one list must not read as ordinary in the other.
-                */}
-                {entry.private && <Chip variant="accent">private</Chip>}
-                {entry.engrams !== null && (
-                  <span className="ml-auto text-xs text-slate-500 tabular-nums dark:text-slate-400">
-                    {entry.engrams}
-                  </span>
-                )}
-              </DropdownMenu.RadioItem>
-            ))}
-          </DropdownMenu.RadioGroup>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
+            <ArrowLeftRight aria-hidden="true" size={16} strokeWidth={1.75} />
+          </DropdownMenu.Trigger>
+        </Tooltip>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align="start"
+            sideOffset={6}
+            className={MENU_CLASSES}
+          >
+            <DropdownMenu.RadioGroup
+              value={domain}
+              onValueChange={(value) => {
+                if (value !== domain) {
+                  void navigate(domainRoute(value));
+                }
+              }}
+            >
+              {domains.map((entry) => (
+                <DropdownMenu.RadioItem
+                  key={entry.name}
+                  value={entry.name}
+                  className={ITEM_CLASSES}
+                >
+                  <DropdownMenu.ItemIndicator>
+                    <span aria-hidden="true">*</span>
+                  </DropdownMenu.ItemIndicator>
+                  <span className="truncate">{entry.name}</span>
+                  {/*
+                    The same badge the flat sidebar list gives a private
+                    domain, in the sidebar's other form: a reader inside a
+                    domain picks the next one from here, and a domain that
+                    reads as private in one list must not read as ordinary
+                    in the other.
+                  */}
+                  {entry.private && <Chip variant="accent">private</Chip>}
+                  {entry.engrams !== null && (
+                    <span className="ml-auto text-xs text-slate-500 tabular-nums dark:text-slate-400">
+                      {entry.engrams}
+                    </span>
+                  )}
+                </DropdownMenu.RadioItem>
+              ))}
+            </DropdownMenu.RadioGroup>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+    </div>
   );
 }
 
@@ -378,8 +378,8 @@ function BrowseAll({ domain, path }: { domain: string; path: string }) {
 }
 
 /**
- * Whether a browse row is the domain's MANIFEST, which is pinned above the
- * tree and so must not be drawn inside it as well.
+ * Whether a browse row is the domain's MANIFEST, which is read on the domain
+ * page and so must not be drawn inside the tree.
  *
  * The engine lists the manifest among a domain's engrams like any other file,
  * and its permalink is either the reserved name itself or whatever the file's
