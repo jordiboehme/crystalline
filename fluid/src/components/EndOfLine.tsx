@@ -6,7 +6,10 @@
  * last one. Decoration, so it is hidden from the accessibility tree: a screen
  * reader that reached the end of the list knows it did. It is drawn by the
  * engram list alone and only where the list had to scroll; a list that fit
- * its box ends where it ends.
+ * its box ends where it ends. In light the color is the accent token; in dark
+ * it is the C64 screen's own light blue, which the accent scale has no stop
+ * for, because the sign-off belongs to the same screen as READY. does, not
+ * to the accent ramp.
  */
 
 import type { ReactElement } from "react";
@@ -15,7 +18,7 @@ export default function EndOfLine(): ReactElement {
   return (
     <p
       aria-hidden="true"
-      className="flex justify-center px-4 pt-6 pb-4 font-mono text-[#6c5eb5] dark:text-[#7c70da]"
+      className="flex justify-center px-4 pt-6 pb-4 font-mono text-accent-500 dark:text-[#7c70da]"
     >
       <span className="end-of-line">End of line.</span>
     </p>
