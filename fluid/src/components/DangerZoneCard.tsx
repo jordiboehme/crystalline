@@ -101,7 +101,7 @@ export function DangerZoneCard({
       setNotice(
         makePrivate
           ? "This domain is private now."
-          : "This domain is shared with everyone again.",
+          : "This domain is shared with everyone.",
       );
       // The members card reads the same key and says which state the domain
       // is in beside its own heading, so it hears about this at once.
@@ -114,11 +114,19 @@ export function DangerZoneCard({
 
   // Armed from the palette, the card is very likely off screen: the reader
   // pressed a row in a dialog and the question is at the foot of the page.
-  // `nearest` because a confirmation already in view must not jump.
+  // `nearest` because a confirmation already in view must not jump. The
+  // typed field is focused here too, rather than left to its own
+  // `autoFocus`: the closing palette restores focus to its own trigger row
+  // in a later passive effect's cleanup, and React runs every passive
+  // unmount cleanup before any passive mount effect, so a plain `autoFocus`
+  // (set during commit) loses the race and the palette's restore wins. This
+  // effect is itself a passive mount effect, so it runs after that cleanup
+  // and lands last.
   const wasConfirming = useRef(confirming);
   useEffect(() => {
     if (confirming && !wasConfirming.current) {
       card.current?.scrollIntoView({ block: "nearest" });
+      card.current?.querySelector<HTMLInputElement>("input")?.focus();
     }
     wasConfirming.current = confirming;
   }, [confirming]);
@@ -182,6 +190,7 @@ export function DangerZoneCard({
             label="Unregister domain"
             confirmLabel="Confirm unregister"
             pending={unregister.isPending}
+            disabledReason={disabledReason}
             requireMatch={domain}
             confirming={confirming}
             onConfirmingChange={onConfirmingChange}

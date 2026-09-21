@@ -478,6 +478,28 @@ describe("the danger zone", () => {
     ).toBeVisible();
   });
 
+  it("focuses the typed field once the palette arms it, after the palette's own focus restore", async () => {
+    serve({}, "admin");
+
+    renderApp("/d/eng");
+    const card = await dangerZone();
+
+    const user = userEvent.setup();
+    await user.keyboard("{Meta>}k{/Meta}");
+    const dialog = await screen.findByRole("dialog");
+    const row = await within(dialog).findByRole("option", {
+      name: /Unregister domain/,
+    });
+    await user.click(row);
+
+    // The closing palette restores focus to its own trigger in a later
+    // passive cleanup; without an explicit focus call in the same effect as
+    // the scroll, that restore would win the race and strand focus off the
+    // field the confirmation exists to have typed into.
+    const field = await within(card).findByLabelText("Type eng to confirm");
+    expect(document.activeElement).toBe(field);
+  });
+
   it("closes a shared domain once the name is typed, with the disk-truth caption", async () => {
     serve(
       {
@@ -570,9 +592,7 @@ describe("the danger zone", () => {
       });
     });
     expect(
-      await within(card).findByText(
-        "This domain is shared with everyone again.",
-      ),
+      await within(card).findByText("This domain is shared with everyone."),
     ).toBeVisible();
   });
 
@@ -608,7 +628,7 @@ describe("the danger zone", () => {
     );
   });
 
-  it("keeps the visibility control inert, and says why, on a read-only instance", async () => {
+  it("keeps both controls inert, and says why, on a read-only instance", async () => {
     serve({}, "admin", "boss", () =>
       meResponse({
         user: userFixture({ name: "boss", role: "admin" }),
@@ -635,6 +655,23 @@ describe("the danger zone", () => {
     expect(apiMock.mock.calls.length).toBe(before);
     expect(
       within(card).queryByRole("button", { name: "Confirm make private" }),
+    ).toBeNull();
+
+    // Unregister sits beside it in the same card, and a read-only instance
+    // shuts both controls with the same reason rather than leaving one live.
+    const unregisterTrigger = within(card).getByRole("button", {
+      name: "Unregister domain",
+    });
+    expect(unregisterTrigger).not.toBeDisabled();
+    expect(unregisterTrigger).toHaveAttribute("aria-disabled", "true");
+    expect(unregisterTrigger).toHaveAccessibleDescription(
+      "This instance is read only, so nothing here can be changed.",
+    );
+
+    await userEvent.click(unregisterTrigger);
+    expect(apiMock.mock.calls.length).toBe(before);
+    expect(
+      within(card).queryByRole("button", { name: "Confirm unregister" }),
     ).toBeNull();
   });
 });

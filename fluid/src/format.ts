@@ -33,12 +33,8 @@ const INSTANT_SHAPE = /^\d{4}-\d{2}-\d{2}T/;
  * that is not a parseable instant - a plain day, or anything else - has no
  * time-of-day to translate, so it is shown the way `formatDay` shows it
  * instead.
- *
- * `now` is accepted only so a caller that also calls {@link relativeTime} can
- * pass the same tick to both without a branch; the date and time here never
- * move with it.
  */
-export function formatInstant(value: string, _now: Date = new Date()): string {
+export function formatInstant(value: string): string {
   if (!INSTANT_SHAPE.test(value)) {
     return formatDay(value);
   }
