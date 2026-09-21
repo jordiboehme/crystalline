@@ -854,7 +854,11 @@ fn single_domain(
                            and is never the reason for a share, riding along \
                            with one where the domain's MANIFEST declares \
                            `generated_indexes: shared` and staying on this \
-                           machine where it does not. `owned_changes` counts how many of \
+                           machine where it does not. On a stacked chain the \
+                           count is taken against the chain tip, so work an \
+                           open proposal already carries is not counted as \
+                           unshared and the count agrees with the share plan. \
+                           `owned_changes` counts how many of \
                            those changes THIS session's account last wrote, by \
                            the changed file's own `generated.by` line - \
                            last-writer provenance, never authorship - so a \
@@ -1066,7 +1070,11 @@ pub async fn sync_status(
                            a share action shows as pending, real work only: a \
                            refreshed folder listing (`index.md`) never makes \
                            a share worth offering, and rides along with one \
-                           only where the domain shares its listings. \
+                           only where the domain shares its listings. On a \
+                           stacked chain the count is taken against the chain \
+                           tip, so work an open proposal already carries is \
+                           not counted as unshared and the count agrees with \
+                           the share plan. \
                            `owned_changes` is how many of that domain's \
                            changes this session's account last wrote, by the \
                            file's own `generated.by` line, or null when there \

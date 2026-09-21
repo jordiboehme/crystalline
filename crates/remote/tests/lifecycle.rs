@@ -8482,6 +8482,111 @@ async fn a_status_counts_real_work_and_leaves_index_refreshes_out() {
 }
 
 #[tokio::test]
+async fn a_status_on_a_stacked_chain_counts_only_the_work_above_the_tip() {
+    // The badge, the CLI status line and both share nudges read this count,
+    // and every one of them said "2 unshared changes" about two changes an
+    // open proposal already carried, while the share dialog said there was
+    // nothing to share. The plan counts against the chain tip on the stacked
+    // path; a status has to count against the same base.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    let options = || ShareOptions {
+        title: None,
+        description: None,
+        proposal: None,
+        stacks_allowed: true,
+        author_login: None,
+        files: None,
+    };
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(before.local_changes, 2, "nothing is proposed yet");
+
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ProposeOutcome::Proposed(_)),
+        "{outcome:?}"
+    );
+    let layer = open_numbers(&sub.state_dir)[0];
+
+    // Both changes stand in the open layer: not unshared, and the plan agrees.
+    let shared = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        shared.local_changes, 0,
+        "work an open proposal carries is not unshared"
+    );
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::NothingToShare),
+        "{:?}",
+        plan.action
+    );
+
+    // New work above the tip counts, and only it.
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let more = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(more.local_changes, 1, "one engram above the tip");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::StackOnTop { .. }),
+        "{:?}",
+        plan.action
+    );
+    assert_eq!(plan.changes.changes.len(), 1);
+
+    // A declined layer hands its work back: the probe learns the decline and
+    // the count taken after it says three again.
+    mock.set_proposal_state(layer, ProposalState::Declined);
+    let declined = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        declined.local_changes, 3,
+        "a declined layer's files are unshared again"
+    );
+}
+
+#[tokio::test]
 async fn a_generated_index_replays_with_its_layer_like_any_other_file() {
     let mock = MockProvider::new();
     mock.enable_stacks();

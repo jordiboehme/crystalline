@@ -894,8 +894,6 @@ pub async fn status(
         )
     })?;
 
-    let local = detect_local_changes(domain_root, &state.files)?;
-
     let mut behind = None;
     if let Some(provider) = probe {
         match provider
@@ -1008,6 +1006,10 @@ pub async fn status(
             }
         }
     }
+
+    // After the probe, not before: a layer the forge just reported declined
+    // hands its files back to this count.
+    let local = detect_local_changes(domain_root, &status_base(&state))?;
 
     let open_proposals = state
         .proposals
@@ -1322,6 +1324,32 @@ fn tip_files_over(
         }
     }
     tip
+}
+
+/// The base a status counts unshared work against.
+///
+/// On the stacked path a share detects against the chain tip, so a status
+/// must too, or the badge, the CLI status line and both share nudges say
+/// "unshared" about work an open proposal already carries while the share
+/// plan says there is nothing to share. The path is known from the cached
+/// probe verdict alone: a status may run offline and never probes, and an
+/// origin that has not shared on the stacked path has no stacked chain to
+/// count against. Every Open or Merged record is in the tip - an open layer's
+/// files are proposed, a merged record still standing here is one the next
+/// sync consumes and its files are upstream already - and a Declined record
+/// is not, so its files read as work again. Off the stacked path the amend
+/// flow re-proposes everything against the trunk, and the trunk count is
+/// right there.
+fn status_base(state: &OriginState) -> BTreeMap<String, BaseStamp> {
+    if state.stacks_available != Some(true) || !chain_is_stacked(state) {
+        return state.files.clone();
+    }
+    let carried: Vec<&Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| matches!(p.status, ProposalStatus::Open | ProposalStatus::Merged))
+        .collect();
+    tip_files_over(&state.files, &carried)
 }
 
 /// Whether a stack write failed because the stack this machine records is no
