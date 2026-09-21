@@ -434,7 +434,14 @@ describe("the engram list", () => {
       const loadPage = vi.fn((page: number) =>
         Promise.resolve(numberedPage(page, 40)),
       );
-      mount(<EngramList queryKey={["t"]} loadPage={loadPage} label="Hits" emptyMessage="Nothing" />);
+      mount(
+        <EngramList
+          queryKey={["t"]}
+          loadPage={loadPage}
+          label="Hits"
+          emptyMessage="Nothing"
+        />,
+      );
       const list = await screen.findByRole("list", { name: "Hits" });
       const scroller = list.parentElement as HTMLElement;
       expect(screen.queryByText("End of line.")).toBeNull();
@@ -464,7 +471,14 @@ describe("the engram list", () => {
       const loadPage = vi.fn(() =>
         Promise.resolve(pageOf(1, [row(0), row(1), row(2)], 3)),
       );
-      mount(<EngramList queryKey={["s"]} loadPage={loadPage} label="Hits" emptyMessage="Nothing" />);
+      mount(
+        <EngramList
+          queryKey={["s"]}
+          loadPage={loadPage}
+          label="Hits"
+          emptyMessage="Nothing"
+        />,
+      );
       await screen.findByRole("list", { name: "Hits" });
       expect(await screen.findByText("Alpha 2")).toBeVisible();
       expect(screen.queryByText("End of line.")).toBeNull();
