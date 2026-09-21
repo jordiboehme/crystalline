@@ -2932,6 +2932,13 @@ parity!(neighbors_carries_status_prior, neighbors_carries_status);
 /// `Zeta` sorts first byte-wise and last under a locale collation, so an
 /// unpinned Postgres sort would not merely reorder the page, it would return a
 /// different engram at `limit: 1`.
+///
+/// An engram carrying no `recorded_at` comes last on either backend, the same
+/// rule the filter-only listing holds to. It is a real state on disk - the
+/// field is required of a written engram and a file may still be missing it -
+/// and the two dialects disagree about a NULL sort key by default: SQLite puts
+/// it last under `DESC`, Postgres puts it first. A recency answer that leads
+/// with the one engram nobody dated is wrong on both.
 async fn recent_newest_first(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -2946,6 +2953,11 @@ async fn recent_newest_first(store: &dyn Store) {
         "zeta.md",
         "---\ntype: engram\ntitle: Zeta\npermalink: Zeta\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-06-01\n---\n\nb\n",
     );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
     sync_domain(store, "d", root).await.unwrap();
     let recent = store
         .recent(&RecentFilter {
@@ -2959,8 +2971,9 @@ async fn recent_newest_first(store: &dyn Store) {
             .iter()
             .map(|e| e.permalink.as_str())
             .collect::<Vec<_>>(),
-        vec!["Zeta", "new", "old"],
-        "2026-06-01 before 2026-01-01, same-day ties broken by permalink in byte order"
+        vec!["Zeta", "new", "old", "undated"],
+        "2026-06-01 before 2026-01-01, same-day ties broken by permalink in byte \
+         order, and the undated engram last on either backend"
     );
 
     // The tie-break decides what a capped read sees at all.
