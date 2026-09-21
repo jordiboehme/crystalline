@@ -186,7 +186,9 @@ describe("MermaidDiagram", () => {
     expect(wrapper?.getAttribute("role")).toBeNull();
   });
 
-  it("lets a wide diagram scroll at its own size instead of shrinking", async () => {
+  it("fits a wide diagram to the column until the reader widens it", async () => {
+    // A drawing far past what any column holds, exactly the case the old
+    // threshold widened on its own. The reader widens it now, or not.
     measuresAt(1600, 654);
     renderDiagram.mockResolvedValue({
       svg: '<svg viewBox="0 0 1600 400" width="100%" style="max-width: 1600px;"><g/></svg>',
@@ -196,42 +198,41 @@ describe("MermaidDiagram", () => {
     await waitFor(() => {
       expect(container.querySelector("svg")).not.toBeNull();
     });
-    const wrapper = container.querySelector("svg")?.parentElement;
+    expect(container.querySelector("svg")?.getAttribute("width")).toBe("100%");
+    expect(container.querySelector("svg")?.getAttribute("style")).toContain(
+      "max-width: 1600px",
+    );
+    const fitted = container.querySelector("svg")?.parentElement;
+    expect(fitted?.className).toContain("justify-center");
+    expect(fitted?.className).toContain("[&_svg]:max-w-full");
+    expect(fitted?.className).not.toContain("overflow-x-auto");
+    expect(fitted?.getAttribute("tabindex")).toBeNull();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Show at full width" }),
+    );
+
+    const svg = container.querySelector("svg");
+    expect(svg?.getAttribute("width")).toBe("100%");
+    expect(svg?.getAttribute("style") ?? "").toContain("min-width: 1600px");
+    expect(svg?.getAttribute("style") ?? "").not.toContain("max-width");
+    const wrapper = svg?.parentElement;
     expect(wrapper?.className).toContain("overflow-x-auto");
-    // The clamp class is the whole point: stripping mermaid's inline
-    // max-width while `[&_svg]:max-w-full` is still on the wrapper changes
-    // nothing on screen.
     expect(wrapper?.className).not.toContain("max-w-full");
-    expect(wrapper?.className).toContain("justify-start");
-    // A flex item shrinks to its line by default, which scales the diagram
-    // back down to the column and leaves nothing to scroll. Measured in a real
-    // browser: without this the 3112px diagram rendered at 774px and the
-    // container's scrollWidth equalled its clientWidth.
     expect(wrapper?.className).toContain("[&_svg]:shrink-0");
-    // A scrollable region is a tab stop with a name, so the arrow keys can
-    // reach it and a screen reader can say what it is. That name comes from
-    // the overflow measurement, a second effect that lands one render after
-    // the svg itself does, so it is waited on rather than assumed: the
-    // `waitFor` above only guarantees the svg is in the document, not that
-    // the container has measured itself yet.
+    expect(wrapper?.className).toContain("overscroll-x-contain");
     await waitFor(() => {
       expect(wrapper?.getAttribute("tabindex")).toBe("0");
     });
-    const region = screen.getByRole("region");
-    expect(region).toBe(wrapper);
-    expect(region.getAttribute("aria-label")).toBeTruthy();
-    // A horizontal scroller nested in a scrolling page must not walk the page
-    // or fire the browser's back gesture, and it must still let both axes pan.
-    expect(wrapper?.className).toContain("overscroll-x-contain");
-    expect(wrapper?.className).toContain("touch-pan-x");
-    expect(wrapper?.className).toContain("touch-pan-y");
-    // And it has to LOOK scrollable, otherwise the fix trades "too small to
-    // read" for "looks cut off".
+    expect(screen.getByRole("region")).toBe(wrapper);
     expect(wrapper?.className).toContain("mask-image");
-    // Mermaid's scale-to-fit is off for this one: the diagram keeps its own
-    // width.
-    expect(container.querySelector("svg")?.getAttribute("width")).toBe(
-      "1600px",
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Show at reading width" }),
+    );
+    expect(container.querySelector("svg")?.getAttribute("width")).toBe("100%");
+    expect(container.querySelector("svg")?.parentElement?.className).toContain(
+      "justify-center",
     );
   });
 
