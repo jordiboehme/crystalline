@@ -423,6 +423,98 @@ async fn a_pass_that_completes_coverage_reaches_the_prune_and_reports_it() {
     );
 }
 
+#[tokio::test]
+async fn a_single_model_index_at_full_coverage_issues_no_prune_statement() {
+    // The statement is a scan of the chunk table, and under the full-coverage
+    // gate a single-model index has already proved there is nothing for it to
+    // match: every chunk carries the active model. A pass runs on every write,
+    // so issuing it anyway is a scan per write for nothing.
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = Arc::new(virtual_engine(store));
+    engine.set_provider(Arc::new(CountingEmbedder::new()));
+
+    for i in 0..3 {
+        engine
+            .write_engram(&write_params(
+                &format!("Note {i:02}"),
+                &format!("the body of note number {i:02}"),
+            ))
+            .await
+            .unwrap();
+    }
+    engine.embed_pending().await.unwrap();
+    assert_eq!(
+        engine.prune_stale_embeddings_if_complete().await.unwrap(),
+        Some(0),
+        "the trigger still fires and still reports nothing cleared"
+    );
+    assert_eq!(
+        engine.prune_statements_issued(),
+        0,
+        "and no statement was sent to the store"
+    );
+}
+
+#[tokio::test]
+async fn an_index_with_a_second_embedding_group_still_issues_the_prune() {
+    // The one shape that reaches the gate with the snapshot showing more than
+    // one group: the active model at two widths, which is what a dims change
+    // leaves behind. The snapshot no longer proves the index is clean, so the
+    // statement runs.
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = Arc::new(virtual_engine(store));
+    engine.set_provider(Arc::new(CountingEmbedder::new()));
+
+    for i in 0..3 {
+        engine
+            .write_engram(&write_params(
+                &format!("Note {i:02}"),
+                &format!("the body of note number {i:02}"),
+            ))
+            .await
+            .unwrap();
+    }
+    engine.embed_pending().await.unwrap();
+    assert_eq!(engine.prune_statements_issued(), 0, "the clean case first");
+
+    // One chunk re-embedded at another width under the same model.
+    let model = engine.model_id().to_string();
+    {
+        let store = engine.store();
+        let store = store.lock().await;
+        let chunk = store
+            .chunks_needing_embedding("another-model", None, 64, None)
+            .await
+            .unwrap()
+            .remove(0)
+            .chunk_id;
+        store
+            .store_embeddings(
+                &[crystalline_index::EmbeddingRow {
+                    chunk_id: chunk,
+                    dims: 8,
+                    embedding: vec![0.25_f32; 8],
+                }],
+                &model,
+            )
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        engine.prune_stale_embeddings_if_complete().await.unwrap(),
+        Some(0),
+        "nothing of another model is there to clear"
+    );
+    assert_eq!(
+        engine.prune_statements_issued(),
+        1,
+        "but the statement was sent, because the snapshot no longer rules it out"
+    );
+}
+
 // --- one pass at a time ------------------------------------------------------
 
 /// An embedder that holds every batch until the test opens the gate, says when

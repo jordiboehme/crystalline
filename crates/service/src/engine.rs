@@ -717,6 +717,12 @@ pub struct Engine {
     // Compiled only into a test build (`cfg(test)` for this crate's unit tests,
     // the `testing` feature for its integration tests), so a released binary
     // carries neither the flag nor the branches that read it.
+    // The third test seam: how many prune statements the embed pass has sent to
+    // the store. The prune's whole point is the statements it does NOT send, and
+    // a skipped scan is invisible from the outside. See
+    // `Engine::prune_statements_issued`.
+    #[cfg(any(test, feature = "testing"))]
+    prune_statements: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "testing"))]
     fail_next_source_edit: std::sync::atomic::AtomicBool,
     // The second, and it is a stopwatch rather than a failure: when armed, the
@@ -1528,6 +1534,8 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            #[cfg(any(test, feature = "testing"))]
+            prune_statements: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
@@ -13052,6 +13060,80 @@ impl Engine {
         *self.model_cache_pruned.write().unwrap() = removed;
     }
 
+    /// The repository the model cache is pruned down to, or `None` when this
+    /// instance must not prune weights at all.
+    ///
+    /// Three conditions, and every one of them has to hold. The instance is
+    /// writable: a read-only instance serves a database and a model cache it
+    /// does not own, and deleting another install's weights is not its
+    /// business. The configured provider is the local one: a remote config may
+    /// legitimately name one of the table's models by its repository id,
+    /// because that is what the endpoint serving it calls it, and that string
+    /// says nothing about which weights this disk needs. And the active model
+    /// is one the table knows, so there is a repository to keep; a model this
+    /// build does not know keeps everything, since nothing is deleted on a
+    /// guess.
+    fn model_cache_keep(&self) -> Option<&'static str> {
+        if self.read_only {
+            return None;
+        }
+        let local = match self.config.read().unwrap().embeddings.as_ref() {
+            Some(e) => e.provider.trim() == "local",
+            // No embeddings block is the local provider on the default model.
+            None => true,
+        };
+        if !local {
+            return None;
+        }
+        crystalline_index::local_model(&self.model_id).map(|m| m.repo)
+    }
+
+    /// Prune the model cache down to the active model's weights, recording what
+    /// went so `ctl status` can report it.
+    ///
+    /// The daemon calls this once per start and only after the active model has
+    /// LOADED, never before: a failed download must not be the reason the only
+    /// working weights are deleted. The keep list is a slice because the
+    /// contradiction scorer adds its own model id to it; until then it holds
+    /// one entry. Every failure is logged and swallowed, because an unpruned
+    /// cache costs disk and nothing else.
+    pub async fn prune_model_cache(&self, models_dir: PathBuf) {
+        let Some(keep) = self.model_cache_keep() else {
+            return;
+        };
+        let removed = tokio::task::spawn_blocking(move || {
+            crystalline_index::prune_model_cache(&models_dir, &[keep])
+        })
+        .await;
+        match removed {
+            Ok(Ok(removed)) if !removed.is_empty() => {
+                let bytes: u64 = removed.iter().map(|(_, b)| b).sum();
+                tracing::info!(
+                    models = removed.len(),
+                    bytes,
+                    "pruned unused embedding models from the cache"
+                );
+                self.record_model_cache_prune(removed);
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!("could not prune the model cache: {err}"),
+            Err(err) => tracing::warn!("the model cache prune task failed: {err}"),
+        }
+    }
+
+    /// How many prune statements [`Engine::prune_stale_embeddings_if_complete`]
+    /// has sent to the store since this engine was built.
+    ///
+    /// The seam exists because the prune's cost is the statement, not its
+    /// result: at full coverage it clears nothing whether it runs or not, so
+    /// "it was skipped" is invisible in every observable the engine otherwise
+    /// has. Nothing in the daemon, the CLI or the MCP surface reads this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn prune_statements_issued(&self) -> u64 {
+        self.prune_statements
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Clear the vectors of every model but the active one, but only once the
     /// active model covers every chunk in the index.
     ///
@@ -13068,6 +13150,21 @@ impl Engine {
         {
             return Ok(None);
         }
+        // Under the gate above every chunk already carries the active model, so
+        // a snapshot showing one embedding group and no chunk this model does
+        // not account for has already proved the statement would match nothing.
+        // Skip it there: a pass runs on every write and the statement is a scan
+        // of the chunk table. What survives this is the index the snapshot
+        // cannot vouch for, a second group or an embedded chunk outside the
+        // model's count, and that one still runs.
+        if coverage.models.len() <= 1
+            && coverage.embedded_chunks == coverage.embedded_for(&self.model_id)
+        {
+            return Ok(Some(0));
+        }
+        #[cfg(any(test, feature = "testing"))]
+        self.prune_statements
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pruned = store.prune_embeddings_except(&self.model_id).await?;
         drop(store);
         if pruned > 0 {

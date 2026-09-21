@@ -233,12 +233,9 @@ fn twin_rules(value: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The weights half of the upgrade: once the active model has loaded, the
-/// cache keeps that model and nothing else, and the start says what it freed.
-#[tokio::test]
-async fn a_successful_load_prunes_the_models_the_config_no_longer_names() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cache = tmp.path().join("models");
+/// A model cache holding three models' weights, one of them the active one.
+fn seeded_cache(tmp: &std::path::Path) -> std::path::PathBuf {
+    let cache = tmp.join("models");
     for repo in [
         "ibm-granite/granite-embedding-97m-multilingual-r2",
         "BAAI/bge-small-en-v1.5",
@@ -248,17 +245,40 @@ async fn a_successful_load_prunes_the_models_the_config_no_longer_names() {
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
         std::fs::write(dir.join("blobs/weights"), [0u8; 128]).unwrap();
     }
+    cache
+}
 
-    let keep = crystalline_index::local_model("granite-embedding-97m-multilingual-r2")
-        .unwrap()
-        .repo;
-    let removed = crystalline_index::prune_model_cache(&cache, &[keep]).unwrap();
-    assert_eq!(removed.len(), 2, "{removed:?}");
+fn cached_repos(cache: &std::path::Path) -> Vec<String> {
+    crystalline_index::cached_model_dirs(cache)
+        .into_iter()
+        .map(|(repo, _)| repo)
+        .collect()
+}
 
+/// An engine over a fresh store, its config as given.
+async fn engine_over_a_fresh_store(cfg: GlobalConfig, read_only: bool) -> Arc<Engine> {
     let store = TursoStore::open_in_memory().await.unwrap();
     let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
-    let engine = Arc::new(Engine::new(store, GlobalConfig::default(), None, None));
-    engine.record_model_cache_prune(removed.clone());
+    Arc::new(Engine::new(store, cfg, None, None).with_read_only(read_only))
+}
+
+/// The weights half of the upgrade: once the active model has loaded, the
+/// cache keeps that model and nothing else, and the start says what it freed.
+#[tokio::test]
+async fn a_successful_load_prunes_the_models_the_config_no_longer_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = seeded_cache(tmp.path());
+
+    // No embeddings block at all, which is the local provider on the default
+    // model: the shape of the install this whole wave is about.
+    let engine = engine_over_a_fresh_store(base_config(), false).await;
+    engine.prune_model_cache(cache.clone()).await;
+    assert_eq!(
+        cached_repos(&cache),
+        vec!["ibm-granite/granite-embedding-97m-multilingual-r2".to_string()],
+        "only the active model's weights survive"
+    );
+
     let report = engine.status_report().await.unwrap();
     let pruned = &report["embeddings"]["pruned_model_cache"];
     assert_eq!(pruned.as_array().map(Vec::len), Some(2), "{report}");
@@ -267,12 +287,65 @@ async fn a_successful_load_prunes_the_models_the_config_no_longer_names() {
 
     // An install that pruned nothing reports nothing, so its status output is
     // byte-identical to what it printed before this shipped.
-    let store = TursoStore::open_in_memory().await.unwrap();
-    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
-    let quiet = Arc::new(Engine::new(store, GlobalConfig::default(), None, None));
+    let quiet = engine_over_a_fresh_store(base_config(), false).await;
     let report = quiet.status_report().await.unwrap();
     assert!(
         report["embeddings"].get("pruned_model_cache").is_none(),
         "{report}"
+    );
+}
+
+/// A read-only instance owns nothing on that disk it should be deleting: it
+/// serves an index and a model cache somebody else's install may be the one
+/// maintaining, so it leaves both alone.
+#[tokio::test]
+async fn a_read_only_instance_never_prunes_the_model_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = seeded_cache(tmp.path());
+    let before = cached_repos(&cache);
+
+    let engine = engine_over_a_fresh_store(base_config(), true).await;
+    engine.prune_model_cache(cache.clone()).await;
+
+    assert_eq!(
+        cached_repos(&cache),
+        before,
+        "every model's weights are kept"
+    );
+    let report = engine.status_report().await.unwrap();
+    assert!(
+        report["embeddings"].get("pruned_model_cache").is_none(),
+        "and nothing is reported: {report}"
+    );
+}
+
+/// An endpoint may serve one of the table's models under its repository id.
+/// That string says nothing about the weights on this disk, so a remote
+/// provider never deletes any of them.
+#[tokio::test]
+async fn a_remote_provider_never_prunes_the_model_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = seeded_cache(tmp.path());
+    let before = cached_repos(&cache);
+
+    let mut cfg = base_config();
+    cfg.embeddings = Some(EmbeddingsConfig {
+        provider: "openai-compatible".to_string(),
+        model: "BAAI/bge-small-en-v1.5".to_string(),
+        endpoint: Some("https://example.invalid/v1".to_string()),
+        api_key_env: None,
+    });
+    let engine = engine_over_a_fresh_store(cfg, false).await;
+    engine.prune_model_cache(cache.clone()).await;
+
+    assert_eq!(
+        cached_repos(&cache),
+        before,
+        "every model's weights are kept"
+    );
+    let report = engine.status_report().await.unwrap();
+    assert!(
+        report["embeddings"].get("pruned_model_cache").is_none(),
+        "and nothing is reported: {report}"
     );
 }

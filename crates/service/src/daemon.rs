@@ -456,34 +456,13 @@ pub async fn run_serve(
                 e.set_provider(provider);
                 // Only now, with the active model loaded and working, are the
                 // other weights in the cache dead: a failed download must never
-                // be the reason the only working model is deleted. The keep
-                // list is a slice because the contradiction scorer adds its own
-                // model id to it; until then it holds one entry, and a model
-                // this build does not know keeps everything (nothing is deleted
-                // on a guess).
-                if let Some(model) = crystalline_index::local_model(e.model_id()) {
-                    let keep = model.repo.to_string();
-                    let removed = tokio::task::spawn_blocking(move || {
-                        let dir =
-                            crystalline_core::config::models_dir().map_err(|e| e.to_string())?;
-                        crystalline_index::prune_model_cache(&dir, &[keep.as_str()])
-                            .map_err(|e| e.to_string())
-                    })
-                    .await;
-                    match removed {
-                        Ok(Ok(removed)) if !removed.is_empty() => {
-                            let bytes: u64 = removed.iter().map(|(_, b)| b).sum();
-                            tracing::info!(
-                                models = removed.len(),
-                                bytes,
-                                "pruned unused embedding models from the cache"
-                            );
-                            e.record_model_cache_prune(removed);
-                        }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => tracing::warn!("could not prune the model cache: {err}"),
-                        Err(err) => tracing::warn!("the model cache prune task failed: {err}"),
-                    }
+                // be the reason the only working model is deleted. The engine
+                // decides whether this instance prunes at all (it does not when
+                // it is read-only, when the provider is a remote one, or when
+                // the active model is not one this build knows).
+                match crystalline_core::config::models_dir() {
+                    Ok(dir) => e.prune_model_cache(dir).await,
+                    Err(err) => tracing::warn!("could not locate the model cache: {err}"),
                 }
                 // Schedule on the worker, like every other caller: an inline
                 // pass here runs beside the worker's, and two passes walk one
