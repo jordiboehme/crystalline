@@ -305,7 +305,8 @@ async fn scored_lexical(
     for term in terms {
         let mut ors: Vec<String> = Vec::new();
         for col in cols {
-            ors.push(format!("lower(e.{col}) LIKE ${n} ESCAPE '\\'"));
+            let column = lexical_column(col);
+            ors.push(format!("lower({column}) LIKE ${n} ESCAPE '\\'"));
             params.push(Param::Text(like_pattern(term)));
             n += 1;
         }
@@ -572,9 +573,27 @@ async fn run_hybrid(
 /// The projection every candidate row carries, in the column order
 /// [`Candidate::from_row`] reads. Shared by the lexical scan, the filter-only
 /// listing and the semantic hydrate so all three decode identically.
-const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
+const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, \
+     COALESCE(ec.content, ''), \
      CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' \
      THEN (e.metadata ->> 'salience')::double precision END";
+
+/// The body's table, joined in by every statement that projects
+/// [`CANDIDATE_COLUMNS`], mirroring the Turso backend's join exactly.
+///
+/// A LEFT join, with the `COALESCE` beside it in the projection: a row whose
+/// body was never written hydrates with an empty body rather than vanishing out
+/// of a search page.
+const CONTENT_JOIN: &str = "LEFT JOIN engram_content ec ON ec.engram_id=e.id";
+
+/// Where a lexical column lives, now that the body sits in its own table.
+fn lexical_column(col: &str) -> String {
+    if col == "content" {
+        "ec.content".to_string()
+    } else {
+        format!("e.{col}")
+    }
+}
 
 /// The `ORDER BY` of a filter-only page, one spelling per [`SearchOrder`].
 ///
@@ -613,7 +632,7 @@ pub fn filter_only_sql(
     let order_by = order_clause(order);
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} {order_by} LIMIT {limit} OFFSET {offset}"
+         {CONTENT_JOIN} WHERE {actor_screen} {and_filters} {order_by} LIMIT {limit} OFFSET {offset}"
     )
 }
 
@@ -638,7 +657,7 @@ pub fn lexical_candidate_sql(
 ) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
+         {CONTENT_JOIN} WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
     )
 }
 
@@ -673,7 +692,7 @@ pub fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
 pub fn semantic_hydrate_sql(actor_screen: &str, ids: &str) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} AND e.id IN ({ids})"
+         {CONTENT_JOIN} WHERE {actor_screen} AND e.id IN ({ids})"
     )
 }
 
@@ -1577,12 +1596,22 @@ mod tests {
             projection, "c.engram_id, min(c.embedding <=> $1) AS dist",
             "phase 1 projects the grouping key and the distance, nothing else"
         );
-        for wide in ["e.content", "e.description", "e.title", "e.metadata"] {
+        for wide in [
+            "e.content",
+            "ec.content",
+            "e.description",
+            "e.title",
+            "e.metadata",
+        ] {
             assert!(
                 !projection.contains(wide),
                 "phase 1 must not carry {wide} through the aggregate, projection was: {projection}"
             );
         }
+        assert!(
+            !sql.contains("engram_content"),
+            "and phase 1 does not join the body's table either: {sql}"
+        );
         assert!(
             sql.contains("GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC"),
             "the LIMIT cut stays deterministic on a distance tie: {sql}"
@@ -1604,8 +1633,12 @@ mod tests {
             "no grouping in the hydrate: {sql}"
         );
         assert!(
-            projection_of(&sql).contains("e.content"),
+            projection_of(&sql).contains("ec.content"),
             "the hydrate is where the bodies are read: {sql}"
+        );
+        assert!(
+            sql.contains("LEFT JOIN engram_content ec ON ec.engram_id=e.id"),
+            "and it reaches them through the body's table, by primary key: {sql}"
         );
     }
 
@@ -1613,7 +1646,7 @@ mod tests {
     /// must list the same nine columns in the same order.
     #[test]
     fn the_candidate_column_order_matches_the_turso_backend() {
-        let ours: Vec<&str> = CANDIDATE_COLUMNS.split(',').map(str::trim).collect();
+        let ours = candidate_column_list();
         assert_eq!(ours.len(), 9, "nine columns, matching Candidate::from_row");
         assert_eq!(
             &ours[..8],
@@ -1625,7 +1658,7 @@ mod tests {
                 "e.engram_type",
                 "e.status",
                 "e.description",
-                "e.content",
+                "COALESCE(ec.content, '')",
             ]
         );
         assert!(
@@ -1633,5 +1666,33 @@ mod tests {
             "the ninth column is the salience prior, got {}",
             ours[8]
         );
+    }
+
+    /// [`CANDIDATE_COLUMNS`] split at its TOP-LEVEL commas, which is the only
+    /// split that counts columns: two of the nine are calls carrying commas of
+    /// their own, and a naive `split(',')` reads them as columns.
+    fn candidate_column_list() -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut current = String::new();
+        for ch in CANDIDATE_COLUMNS.chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    out.push(current.split_whitespace().collect::<Vec<_>>().join(" "));
+                    current = String::new();
+                }
+                _ => current.push(ch),
+            }
+        }
+        out.push(current.split_whitespace().collect::<Vec<_>>().join(" "));
+        out
     }
 }

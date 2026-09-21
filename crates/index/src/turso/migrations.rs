@@ -92,6 +92,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain rebuild kind",
         sql: SCHEMA_V14,
     },
+    Migration {
+        version: 15,
+        label: "engram body in its own table",
+        sql: SCHEMA_V15,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -456,6 +461,79 @@ CREATE INDEX idx_engram_domain ON engram(domain_id);
 CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
 "#;
 
+// The body moves out of `engram` into a table of its own, one row per engram,
+// keyed by the engram's id.
+//
+// Why: turso materializes a whole row payload - overflow chain included - for
+// any column read, so every seek into `engram` cost the body of that engram
+// even when the statement wanted an 8-byte column. Phase 1 of the semantic scan
+// seeks the parent row once per chunk to evaluate the actor screen, so a 7 MB
+// body with 4,287 chunks was copied 4,287 times for one search: a 254 MiB index
+// took two minutes a query. With the body in its own table those seeks read a
+// row of about a kilobyte, and the body is read once per hit, by the hydrate
+// that actually wants it. Measured on a throwaway bench (30 engrams of 2 MB,
+// 300 chunks each): 1.60 s of phase 1 before, 13 ms after.
+//
+// Nothing else moves: `metadata`, `description` and `title` are bounded by what
+// a frontmatter holds.
+//
+// The shape is v13's create-copy-swap, for the same reason - a column cannot be
+// dropped in place in this dialect - and with the same two consequences. The
+// ids are carried verbatim, which is what keeps `observation`, `relation`,
+// `link`, `engram_tag`, `chunk` and `engram_content` itself pointing at the
+// rows they already point at; and every index the old table carried is
+// recreated, all seven of them, because they die with the dropped table. The
+// copy into `engram_content` happens BEFORE the swap, since it is the doomed
+// table it reads the bodies out of.
+const SCHEMA_V15: &str = r#"
+CREATE TABLE engram_content (
+    engram_id INTEGER PRIMARY KEY REFERENCES engram(id),
+    content TEXT NOT NULL DEFAULT ''
+);
+
+INSERT INTO engram_content (engram_id, content) SELECT id, content FROM engram;
+
+CREATE TABLE engram_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_id INTEGER NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    permalink TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    engram_type TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    recorded_at TEXT,
+    valid_from TEXT,
+    valid_to TEXT,
+    timestamp TEXT,
+    description TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    mtime INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    tombstone INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT INTO engram_new (id, domain_id, path, permalink, title, engram_type, status,
+    recorded_at, valid_from, valid_to, timestamp, description, metadata,
+    mtime, size, sha256, actor, tombstone)
+SELECT id, domain_id, path, permalink, title, engram_type, status,
+    recorded_at, valid_from, valid_to, timestamp, description, metadata,
+    mtime, size, sha256, actor, tombstone
+FROM engram;
+
+DROP TABLE engram;
+ALTER TABLE engram_new RENAME TO engram;
+
+CREATE UNIQUE INDEX idx_engram_permalink_actor ON engram(domain_id, permalink, actor);
+CREATE UNIQUE INDEX idx_engram_path_actor ON engram(domain_id, path, actor);
+CREATE INDEX idx_engram_current ON engram(status, valid_from, valid_to);
+CREATE INDEX idx_engram_type ON engram(engram_type);
+CREATE INDEX idx_engram_recorded ON engram(recorded_at);
+CREATE INDEX idx_engram_domain ON engram(domain_id);
+CREATE INDEX idx_engram_title_lower ON engram(domain_id, lower(title));
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,7 +556,7 @@ CREATE TABLE attachment_blob (
 /// The tables cleared by `wipe()`, child rows first. `tag_alias`, `attachment`
 /// and `domain_lock` all reference `domain(id)`, so they are cleared before
 /// `domain`; `attachment_blob` references `attachment`, so it goes first of the
-/// three.
+/// three, and `engram_content` references `engram`, so it goes before it.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",
@@ -487,6 +565,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "relation",
     "link",
     "tag",
+    "engram_content",
     "engram",
     "tag_alias",
     "attachment_blob",
@@ -1060,6 +1139,13 @@ mod tests {
             "and the domain columns the swap did not touch are untouched"
         );
 
+        // And the migrations after it, because `WIPE_TABLES` below is the
+        // current list and v15 added a table to it. The rows under test come
+        // through those migrations untouched, which is the point of them.
+        for m in &MIGRATIONS[13..] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+
         // `WIPE_TABLES` names `engram` as a table, and the swap dropped the
         // table that name pointed at. It is only still a valid name because the
         // rename put it back, so every name in that list is checked against the
@@ -1161,6 +1247,215 @@ mod tests {
             .is_err(),
             "and only one row per permalink, per actor"
         );
+    }
+
+    /// The v15 move of the body out of `engram`, over a database carrying a
+    /// draft beside its base row and bodies of several sizes - the shape an
+    /// upgrade meets on a machine somebody has been drafting on.
+    ///
+    /// Four claims. Every body comes through at the id it was written under,
+    /// base and draft alike, so nothing needs a resync and no actor's draft is
+    /// flattened onto another's. The child rows still point at the ids they
+    /// pointed at, because this swap preserves ids exactly as v13's did. There
+    /// is one `engram_content` row per engram, which is what makes the join an
+    /// inner-shaped read even where it is spelled `LEFT`. And the swapped table
+    /// carries every index it carried before, since they all die with the
+    /// dropped table.
+    ///
+    /// The last leg opens a real store over the migrated file, because the
+    /// whole point of the move is that the statements still answer: a lexical
+    /// search snippets out of a body that now lives in another table, and the
+    /// two content reads answer for the base row and the draft.
+    #[tokio::test]
+    async fn v15_moves_every_body_into_its_own_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let bodies: [(i64, &str, &str, usize); 3] = [
+            (7, "a.md", "", 3),
+            (8, "b.md", "", 200_000),
+            (9, "a.md", "alice", 64),
+        ];
+        {
+            let db = Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            for m in &MIGRATIONS[..14] {
+                conn.execute_batch(m.sql).await.unwrap();
+            }
+            assert_eq!(MIGRATIONS[14].version, 15, "the fifteenth migration is v15");
+            // The ledger too, so opening a store over this file later runs v15
+            // and nothing before it.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_migration \
+                 (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);\n\
+                 INSERT INTO schema_migration(version, applied_at) VALUES (14,'2026-09-21T00:00:00Z');\n\
+                 INSERT INTO domain(id, name, path) VALUES (1,'d','/tmp/d');\n\
+                 INSERT INTO observation(engram_id, line, category, content) VALUES (7,1,'note','x');\n\
+                 INSERT INTO chunk(engram_id, seq, text) VALUES (7,0,'x');\n",
+            )
+            .await
+            .unwrap();
+            for (id, file, actor, len) in bodies {
+                conn.execute(
+                    "INSERT INTO engram(id, domain_id, path, permalink, title, status, content, \
+                     sha256, actor) VALUES (?1,1,?2,?3,'A','stable',?4,'ff',?5)",
+                    vec![
+                        turso::Value::Integer(id),
+                        turso::Value::Text(file.to_string()),
+                        turso::Value::Text(format!("p{id}")),
+                        turso::Value::Text(body_of(len)),
+                        turso::Value::Text(actor.to_string()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+
+            conn.execute_batch(MIGRATIONS[14].sql).await.unwrap();
+            // The stamp `apply` would have written in the same transaction, so
+            // the store opened on this file below runs nothing further.
+            conn.execute_batch(
+                "INSERT INTO schema_migration(version, applied_at) \
+                 VALUES (15,'2026-09-21T00:00:00Z');",
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM engram_content").await,
+                scalar(&conn, "SELECT COUNT(*) FROM engram").await,
+                "one body row per engram row after the move"
+            );
+            for (id, _, _, len) in bodies {
+                let bytes = body_of(len).len();
+                assert_eq!(
+                    scalar(
+                        &conn,
+                        &format!(
+                            "SELECT COUNT(*) FROM engram e JOIN engram_content ec \
+                             ON ec.engram_id=e.id \
+                             WHERE e.id={id} AND length(ec.content)={bytes} \
+                             AND ec.content LIKE 'needle %'"
+                        ),
+                    )
+                    .await,
+                    1,
+                    "the body of engram {id} came through at its own id"
+                );
+            }
+            assert_eq!(
+                scalar(&conn, "SELECT COUNT(*) FROM observation WHERE engram_id=7").await
+                    + scalar(&conn, "SELECT COUNT(*) FROM chunk WHERE engram_id=7").await,
+                2,
+                "the child rows still point at the engram they pointed at"
+            );
+            assert!(
+                conn.query("SELECT content FROM engram", ()).await.is_err(),
+                "and the column the body used to sit in is gone"
+            );
+
+            // Every index the table carried is back, the same seven v13 left.
+            let mut indexes = Vec::new();
+            {
+                let mut rows = conn
+                    .query(
+                        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='engram' \
+                         AND name IS NOT NULL ORDER BY name",
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                while let Some(r) = rows.next().await.unwrap() {
+                    if let Ok(turso::Value::Text(n)) = r.get_value(0) {
+                        indexes.push(n);
+                    }
+                }
+            }
+            assert_eq!(
+                indexes,
+                vec![
+                    "idx_engram_current".to_string(),
+                    "idx_engram_domain".to_string(),
+                    "idx_engram_path_actor".to_string(),
+                    "idx_engram_permalink_actor".to_string(),
+                    "idx_engram_recorded".to_string(),
+                    "idx_engram_title_lower".to_string(),
+                    "idx_engram_type".to_string(),
+                ],
+                "the swap carries every index across"
+            );
+
+            // `WIPE_TABLES` has to name the new table, and every name in it has
+            // to still be a table after the swap.
+            assert!(
+                WIPE_TABLES.contains(&"engram_content"),
+                "a wipe that leaves the bodies behind leaves the whole index behind"
+            );
+            for table in WIPE_TABLES {
+                assert_eq!(
+                    scalar(
+                        &conn,
+                        &format!(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+                        ),
+                    )
+                    .await,
+                    1,
+                    "wipe names a table that exists after the swap: {table}"
+                );
+            }
+        }
+
+        // And the statements answer over the migrated file: a store opened on
+        // it reads both bodies back and snippets a lexical hit out of one.
+        let store = crate::TursoStore::open(&path).await.unwrap();
+        let domain = crate::DomainId(1);
+        assert_eq!(
+            crate::Store::engram_content(&store, domain, "a.md")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(body_of(3).as_str()),
+            "the base row's body reads back through the join"
+        );
+        let all = crate::Store::all_engram_contents(&store, domain)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.content.len()).collect::<Vec<_>>(),
+            vec![body_of(3).len(), body_of(200_000).len()],
+            "every base body in the domain, path-ordered, unchanged"
+        );
+        let mine = crate::Store::overlay_entry(&store, domain, "alice", "a.md")
+            .await
+            .unwrap()
+            .expect("alice's draft survived the move");
+        assert_eq!(mine.content, body_of(64), "and so did her body");
+        let hits = crate::Store::search(
+            &store,
+            &crate::SearchQuery {
+                text: Some("needle".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            hits.items.iter().any(|h| h.snippet.contains("needle")),
+            "a lexical search still snippets out of the body: {:?}",
+            hits.items
+        );
+    }
+
+    /// A body of `len` bytes carrying the word a lexical search looks for.
+    fn body_of(len: usize) -> String {
+        let mut body = "needle ".to_string();
+        while body.len() < len {
+            body.push('x');
+        }
+        body
     }
 
     /// A migration that dies partway through leaves the database exactly as it

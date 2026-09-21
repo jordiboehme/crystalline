@@ -1,0 +1,261 @@
+/**
+ * The two ways of taking a domain away from the people who read it:
+ * unregistering it, and changing who may see it at all.
+ *
+ * They sit together, in a box that wears the destructive button's own red
+ * border, because what they have in common is what a reader needs warning
+ * about: neither is undone by pressing something else afterwards.
+ * Unregistering ends this instance's reach into a folder, or - on a virtual
+ * domain, whose engrams are the database's - deletes them outright. Closing a
+ * shared domain hides it from everybody who was reading it, and opening a
+ * private one forgets the membership list on the way out.
+ *
+ * So both ask for the domain's name to be typed rather than for a second
+ * press alone, which is what this app asks for a loss it can describe in one
+ * sentence. The visibility control moved here from the members card for
+ * exactly that reason: administering a team is one thing, and deciding who
+ * may see everything in a domain is another.
+ *
+ * Who sees what follows the server's own gates rather than one flag for the
+ * card. Unregistering is admin-only (`DELETE /domains/{domain}`), so its
+ * trigger is drawn for an admin alone. The visibility control needs `Own`,
+ * which is the owner or an admin - the same derivation the members card
+ * makes off the same read, and the reason an owner who administers nothing
+ * can still open its own domain back up. A caller with neither right is
+ * drawn no card at all, rather than an empty box headed "Danger zone".
+ *
+ * `confirming` is the screen's rather than the control's, because the command
+ * palette offers the same unregister row: the keyboard route arms this exact
+ * confirmation - and scrolls it into view, since it sits at the foot of a
+ * long page - rather than skipping the step the control exists for.
+ */
+
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { ReactElement } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { useNavigate } from "react-router";
+
+import { unregisterDomain } from "../api/admin";
+import { problemDetail } from "../api/client";
+import { DOMAINS_QUERY_KEY } from "../api/domains";
+import {
+  fetchMembers,
+  membersKey,
+  sameAccount,
+  setVisibility,
+} from "../api/members";
+import { useAuth } from "../auth/AuthContext";
+import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
+
+export function DangerZoneCard({
+  domain,
+  kind,
+  confirming,
+  onConfirmingChange,
+}: {
+  domain: string;
+  /** `file`, `virtual`, or null when the listing did not say. */
+  kind: string | null;
+  /** Whether the unregister confirmation is armed; the palette arms it too. */
+  confirming: boolean;
+  onConfirmingChange: (confirming: boolean) => void;
+}): ReactElement | null {
+  const { user, capabilities } = useAuth();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const headingId = useId();
+  const [problem, setProblem] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const card = useRef<HTMLElement>(null);
+
+  // The same read the members card makes, under the same key: react-query
+  // serves both from one request, and this card needs only one fact off it -
+  // which way round the visibility control points.
+  const members = useQuery({
+    queryKey: membersKey(domain),
+    queryFn: () => fetchMembers(domain),
+  });
+
+  const unregister = useMutation({
+    // A virtual domain's engrams are deleted with it and the server refuses to
+    // guess that the loss was intended, so the confirmed press is what carries
+    // `purge`: the typed name is the confirmation the flag stands for.
+    mutationFn: () => unregisterDomain(domain, kind === "virtual"),
+    onSuccess: () => {
+      // The listing is what every sidebar, card and switcher draws from, and
+      // the domain this screen is about is no longer in it.
+      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      // Nowhere to stay: this address is now a wrong address.
+      void navigate("/");
+    },
+    onError: (error: Error) => {
+      onConfirmingChange(false);
+      setProblem(problemDetail(error));
+    },
+  });
+
+  const visibility = useMutation({
+    mutationFn: (makePrivate: boolean) => setVisibility(domain, makePrivate),
+    onSuccess: (_void, makePrivate) => {
+      setProblem(null);
+      setNotice(
+        makePrivate
+          ? "This domain is private now."
+          : "This domain is shared with everyone.",
+      );
+      // The members card reads the same key and says which state the domain
+      // is in beside its own heading, so it hears about this at once.
+      void queryClient.invalidateQueries({ queryKey: membersKey(domain) });
+    },
+    onError: (error: Error) => {
+      setProblem(problemDetail(error));
+    },
+  });
+
+  // Armed from the palette, the card is very likely off screen: the reader
+  // pressed a row in a dialog and the question is at the foot of the page.
+  // `nearest` because a confirmation already in view must not jump. The
+  // typed field is focused here too, rather than left to its own
+  // `autoFocus`: the closing palette restores focus to its own trigger row
+  // in a later passive effect's cleanup, and React runs every passive
+  // unmount cleanup before any passive mount effect, so a plain `autoFocus`
+  // (set during commit) loses the race and the palette's restore wins. This
+  // effect is itself a passive mount effect, so it runs after that cleanup
+  // and lands last.
+  const wasConfirming = useRef(confirming);
+  useEffect(() => {
+    if (confirming && !wasConfirming.current) {
+      card.current?.scrollIntoView({ block: "nearest" });
+      card.current?.querySelector<HTMLInputElement>("input")?.focus();
+    }
+    wasConfirming.current = confirming;
+  }, [confirming]);
+
+  const owner = members.data?.owner ?? null;
+  // `Own`, exactly as the members card derives it and as `set_visibility`
+  // reads it: an instance admin holds it on every domain before the acl is
+  // ever looked at, and a domain's owner holds it on that one domain. A
+  // shared domain has no owner, so on that side this reduces to "is an
+  // admin", which is what making a domain private asks for anyway.
+  const own =
+    capabilities.canAdminister ||
+    (user !== null && owner !== null && sameAccount(owner, user.name));
+  const isPrivate = members.data?.visibility === "private";
+  // `readOnly` is a certainty this side already holds, unlike a per-domain
+  // right: the control is shown shut, with the reason as its accessible
+  // description, rather than removed. See `READ_ONLY_REASON` itself.
+  const disabledReason = capabilities.readOnly ? READ_ONLY_REASON : undefined;
+  const visibilityLabel = isPrivate ? "Share with everyone" : "Make private";
+
+  // Nothing to offer, nothing to draw: a member or a manager administers the
+  // team from the card above and reaches neither verb here.
+  if (!capabilities.canAdminister && !own) {
+    return null;
+  }
+
+  return (
+    <section
+      ref={card}
+      aria-labelledby={headingId}
+      className="flex flex-col gap-4 rounded border border-red-300 p-4 dark:border-red-800"
+    >
+      <h2 id={headingId} className="text-section">
+        Danger zone
+      </h2>
+
+      {problem !== null && (
+        <p
+          role="alert"
+          className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+        >
+          {problem}
+        </p>
+      )}
+      {notice !== null && (
+        <p
+          role="status"
+          className="rounded bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300"
+        >
+          {notice}
+        </p>
+      )}
+
+      {/*
+        Admin only, the way `DELETE /domains/{domain}` is: an owner owns the
+        domain and does not administer the instance this one is registered on.
+      */}
+      {capabilities.canAdminister && (
+        <div className="flex flex-col gap-1">
+          <DestructiveAction
+            label="Unregister domain"
+            confirmLabel="Confirm unregister"
+            pending={unregister.isPending}
+            disabledReason={disabledReason}
+            requireMatch={domain}
+            confirming={confirming}
+            onConfirmingChange={onConfirmingChange}
+            onConfirm={() => {
+              setProblem(null);
+              setNotice(null);
+              unregister.mutate();
+            }}
+          />
+          {/*
+            What the second step says is not one sentence but two, and which one
+            it is is a fact about the domain rather than a softening: a file
+            domain keeps its markdown on disk and can be registered again from
+            it, while a virtual domain's engrams are the database's and go with
+            it. Saying "the files stay" over a virtual domain would be the app
+            telling somebody their engrams are safe on the way to deleting them.
+
+            A `kind` of null - a listing that has not landed - falls back to the
+            file sentence, because virtual is the kind that has to be declared
+            and every domain this app has ever registered from a folder answers
+            `file`.
+          */}
+          {confirming && (
+            <p className="text-caption text-slate-500 dark:text-slate-400">
+              {kind === "virtual"
+                ? "This domain's engrams live in the database and will be deleted with it; this cannot be undone, so download the archive first if you need a copy."
+                : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/*
+        For a caller the server would let through, and drawn once the members
+        read has landed, because which way this control points is that read's
+        answer: offering "Make private" over a domain that already is one
+        would be the card guessing in place of asking.
+      */}
+      {own && members.data !== undefined && (
+        <div className="flex flex-col gap-1">
+          <DestructiveAction
+            label={visibilityLabel}
+            confirmLabel={`Confirm ${visibilityLabel.toLowerCase()}`}
+            pending={visibility.isPending}
+            disabledReason={disabledReason}
+            requireMatch={domain}
+            onConfirm={() => {
+              setProblem(null);
+              setNotice(null);
+              visibility.mutate(!isPrivate);
+            }}
+          />
+          {/*
+            The honest disk-truth sentence, beside the control it is about: a
+            private domain is protected from the other accounts on this
+            instance and from nobody else, and opening one throws away the
+            list of who was invited into it.
+          */}
+          <p className="text-caption text-slate-500 dark:text-slate-400">
+            {isPrivate
+              ? "Opening this domain forgets who was invited into it."
+              : "Private domains protect from other users of this instance, not from whoever operates the machine."}
+          </p>
+        </div>
+      )}
+    </section>
+  );
+}

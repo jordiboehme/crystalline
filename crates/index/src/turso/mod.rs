@@ -389,7 +389,6 @@ impl TursoStore {
             opt_text(&record.valid_to),
             opt_text(&record.timestamp),
             opt_text(&record.description),
-            Value::Text(record.content.clone()),
             Value::Text(record.metadata.to_string()),
             Value::Integer(record.stamp.mtime),
             Value::Integer(record.stamp.size as i64),
@@ -400,14 +399,14 @@ impl TursoStore {
         self.conn
             .execute(
                 "INSERT INTO engram(domain_id, path, permalink, title, engram_type, status, \
-                 recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
+                 recorded_at, valid_from, valid_to, timestamp, description, metadata, \
                  mtime, size, sha256, actor, tombstone) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) \
                  ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
                  permalink=excluded.permalink, title=excluded.title, engram_type=excluded.engram_type, \
                  status=excluded.status, recorded_at=excluded.recorded_at, valid_from=excluded.valid_from, \
                  valid_to=excluded.valid_to, timestamp=excluded.timestamp, description=excluded.description, \
-                 content=excluded.content, metadata=excluded.metadata, mtime=excluded.mtime, \
+                 metadata=excluded.metadata, mtime=excluded.mtime, \
                  size=excluded.size, sha256=excluded.sha256, tombstone=excluded.tombstone",
                 params,
             )
@@ -422,6 +421,20 @@ impl TursoStore {
             }
             None => self.conn.last_insert_rowid(),
         };
+
+        // The body, in the same write: its own row keyed by the engram's id, so
+        // every seek into `engram` reads about a kilobyte instead of dragging a
+        // multi-megabyte payload through the row cache.
+        self.conn
+            .execute(
+                "INSERT INTO engram_content(engram_id, content) VALUES(?1, ?2) \
+                 ON CONFLICT(engram_id) DO UPDATE SET content=excluded.content",
+                vec![
+                    Value::Integer(engram_id),
+                    Value::Text(record.content.clone()),
+                ],
+            )
+            .await?;
 
         // Observations: insert in chunks and read each new row's id back joined
         // on its source line (unique within one engram), so observation tags map
@@ -765,7 +778,8 @@ fn path_prefix_like(n: usize, negated: bool) -> String {
 }
 
 /// The `path, permalink, content, sha256, actor, tombstone, id` projection as a
-/// [`StoredEngram`], in that column order.
+/// [`StoredEngram`], in that column order. The body is the third column
+/// wherever it is read from, which since v15 is `engram_content`.
 fn stored_engram_from_row(row: &Row) -> StoredEngram {
     StoredEngram {
         path: cell_text(row, 0).unwrap_or_default(),
@@ -1142,7 +1156,9 @@ impl Store for TursoStore {
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
         let row = query_first(
             &self.conn,
-            "SELECT content FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
+            "SELECT COALESCE(ec.content, '') FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=?1 AND e.path=?2 AND e.actor = ''",
             vec![Value::Integer(domain.0), Value::Text(path.to_string())],
         )
         .await?;
@@ -1162,8 +1178,10 @@ impl Store for TursoStore {
         // differ from turso's binary one.
         let rows = query_all(
             &self.conn,
-            "SELECT path, permalink, content, sha256, actor, tombstone, id \
-             FROM engram WHERE domain_id=?1 AND actor = ''",
+            "SELECT e.path, e.permalink, COALESCE(ec.content, ''), e.sha256, e.actor, \
+             e.tombstone, e.id FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=?1 AND e.actor = ''",
             vec![Value::Integer(domain.0)],
         )
         .await?;
@@ -1178,8 +1196,11 @@ impl Store for TursoStore {
         // Delete a single domain's engram, attachment and child rows, keeping
         // the domain row. Child rows first, then chunks, then the engram rows
         // themselves; attachment blobs before the attachment rows that own
-        // them. `upsert_domain` reuses the id for a name it has seen, so
-        // anything left here would resurface as the next registration's own.
+        // them, and the bodies in `engram_content` before the engram rows they
+        // hang off, which is written out rather than left to a cascade because
+        // foreign keys are not enforced here. `upsert_domain` reuses the id for
+        // a name it has seen, so anything left here would resurface as the next
+        // registration's own.
         // -- actor: all - a domain's removal takes its drafts with it. Nothing
         // survives the domain they were drafts of, so these statements name
         // every actor's rows on purpose; the overlay journal is swept on the
@@ -1193,6 +1214,10 @@ impl Store for TursoStore {
             "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM relation WHERE domain_id=?1",
             "DELETE FROM link WHERE domain_id=?1",
+            // -- actor: all - the bodies of every row about to go, named
+            // through them since `engram_content` has no domain of its own.
+            "DELETE FROM engram_content WHERE engram_id IN \
+             (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM engram WHERE domain_id=?1",
             "DELETE FROM tag_alias WHERE domain_id=?1",
             "DELETE FROM attachment_blob WHERE attachment_id IN \
@@ -1222,6 +1247,12 @@ impl Store for TursoStore {
             self.conn
                 .execute(
                     "DELETE FROM chunk WHERE engram_id=?1",
+                    vec![Value::Integer(id)],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM engram_content WHERE engram_id=?1",
                     vec![Value::Integer(id)],
                 )
                 .await?;
@@ -2311,8 +2342,10 @@ impl Store for TursoStore {
         }
         let row = query_first(
             &self.conn,
-            "SELECT path, permalink, content, sha256, actor, tombstone, id \
-             FROM engram WHERE domain_id=?1 AND actor=?2 AND path=?3",
+            "SELECT e.path, e.permalink, COALESCE(ec.content, ''), e.sha256, e.actor, \
+             e.tombstone, e.id FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=?1 AND e.actor=?2 AND e.path=?3",
             vec![
                 Value::Integer(domain.0),
                 Value::Text(actor.to_string()),
@@ -2332,8 +2365,10 @@ impl Store for TursoStore {
         // an `ORDER BY` would push every one of them through the sorter.
         let rows = query_all(
             &self.conn,
-            "SELECT path, permalink, content, sha256, actor, tombstone, id \
-             FROM engram WHERE domain_id=?1 AND actor=?2",
+            "SELECT e.path, e.permalink, COALESCE(ec.content, ''), e.sha256, e.actor, \
+             e.tombstone, e.id FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=?1 AND e.actor=?2",
             vec![Value::Integer(domain.0), Value::Text(actor.to_string())],
         )
         .await?;
@@ -2366,6 +2401,12 @@ impl Store for TursoStore {
         self.conn
             .execute(
                 "DELETE FROM chunk WHERE engram_id=?1",
+                vec![Value::Integer(id)],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM engram_content WHERE engram_id=?1",
                 vec![Value::Integer(id)],
             )
             .await?;

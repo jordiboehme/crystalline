@@ -505,6 +505,68 @@ async fn a_slow_provider_is_cut_at_the_timeout() {
     );
 }
 
+/// A probe that finishes inside the budget logs its elapsed time at `debug`,
+/// alongside attaching the advisory as usual.
+#[tokio::test]
+async fn a_completed_probe_logs_its_elapsed_time() {
+    let (_tmp, engine) = engine().await;
+    two_retry_engrams(&engine).await;
+    engine.embed_pending().await.unwrap();
+    let (logs, _guard) = support::capture_logs();
+    let mut receipt = retry_receipt();
+    engine
+        .attach_similar(&mut receipt, retry_probe(), &Scope::Unrestricted)
+        .await;
+    assert!(
+        receipt.get("similar").is_some(),
+        "a neighbour should have been found"
+    );
+    assert!(
+        logs.any_contains("similar probe completed in"),
+        "{:?}",
+        logs.lines()
+    );
+}
+
+/// The bug this covers: `tokio::time::timeout` only cuts a future at a point
+/// where it yields, and the turso binding steps a store statement
+/// synchronously with no such point inside it, so a slow query runs to
+/// completion no matter what the timeout is set to and leaves no trace
+/// unless the wall clock is checked afterward.
+///
+/// [`support::BlockingEmbedder`] reproduces that shape at the provider
+/// instead of the store, which is the same failure mode from the timeout's
+/// point of view: unlike [`support::SleepyEmbedder`]'s `tokio::time::sleep`
+/// (an async, cancellable delay - see `a_slow_provider_is_cut_at_the_timeout`
+/// above), its delay is a `std::thread::sleep` inside the poll, so nothing
+/// yields and the timeout cannot cut it.
+#[tokio::test]
+async fn a_probe_that_blocks_the_thread_logs_an_overrun() {
+    let (_tmp, engine) = engine().await;
+    two_retry_engrams(&engine).await;
+    engine.embed_pending().await.unwrap();
+    let over_budget = SIMILAR_TIMEOUT + Duration::from_millis(1300);
+    engine.set_provider(Arc::new(support::BlockingEmbedder { delay: over_budget }));
+    let (logs, _guard) = support::capture_logs();
+    let mut receipt = retry_receipt();
+    let started = std::time::Instant::now();
+    engine
+        .attach_similar(&mut receipt, retry_probe(), &Scope::Unrestricted)
+        .await;
+    assert!(
+        started.elapsed() >= over_budget,
+        "a synchronous block runs past the timeout uncut: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        logs.any_contains("similar probe overran its budget"),
+        "{:?}",
+        logs.lines()
+    );
+    assert!(logs.any_contains("on domain 'open'"), "{:?}", logs.lines());
+    assert!(logs.any_contains("(write)"), "{:?}", logs.lines());
+}
+
 /// The backlog wait: bounded when a worker is wired, absent when none is.
 ///
 /// Both halves start from the same shape - two engrams written, nothing

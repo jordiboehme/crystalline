@@ -13,7 +13,7 @@
  */
 
 import { screen, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "../api/client";
 import type { Answer } from "../test/harness";
@@ -149,5 +149,65 @@ describe("SyncCard", () => {
     ).toBeInTheDocument();
     expect(within(region).queryByText(/draft/)).not.toBeInTheDocument();
     expect(screen.queryByText(/draft changes here/)).not.toBeInTheDocument();
+  });
+
+  describe("Last checked", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("says not yet when there is no check on record", async () => {
+      serve({
+        "/domains/eng/sync": () => syncResponse({ last_checked: null }),
+      });
+      renderApp("/d/eng");
+
+      const region = await screen.findByRole("region", { name: "Team sync" });
+      const dd = within(region).getByText("not yet");
+      expect(dd.tagName).toBe("DD");
+      expect(dd).not.toHaveAttribute("title");
+    });
+
+    it("shows the local date and time, how long ago, and (stale) after it", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      vi.setSystemTime(new Date("2026-08-10T08:13:00Z"));
+      serve({
+        "/domains/eng/sync": () =>
+          syncResponse({
+            last_checked: "2026-08-10T08:00:00Z",
+            probe_error: "no route to github.com",
+          }),
+      });
+      renderApp("/d/eng");
+
+      const region = await screen.findByRole("region", { name: "Team sync" });
+      const parsed = new Date("2026-08-10T08:00:00Z");
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const instant = `${String(parsed.getFullYear())}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+
+      const dd = within(region).getByText(`${instant}, 13 minutes ago (stale)`);
+      expect(dd.tagName).toBe("DD");
+      expect(dd).toHaveAttribute("title", "2026-08-10T08:00:00Z");
+    });
+
+    it("ticks the relative phrase once a minute without a refetch", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      vi.setSystemTime(new Date("2026-08-10T08:00:30Z"));
+      const sync = vi.fn(() =>
+        syncResponse({ last_checked: "2026-08-10T08:00:00Z" }),
+      );
+      serve({ "/domains/eng/sync": sync });
+      renderApp("/d/eng");
+
+      const region = await screen.findByRole("region", { name: "Team sync" });
+      expect(within(region).getByText(/, just now$/)).toBeInTheDocument();
+      expect(sync).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(within(region).getByText(/, 1 minute ago$/)).toBeInTheDocument();
+      // The tick redraws the sentence; it never asks the server again.
+      expect(sync).toHaveBeenCalledTimes(1);
+    });
   });
 });

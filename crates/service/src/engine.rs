@@ -9495,12 +9495,15 @@ impl Engine {
 
     /// Put the neighbours advisory on a write receipt, or leave it alone.
     ///
-    /// Runs after the write has landed and can neither fail nor delay it past
-    /// [`SIMILAR_TIMEOUT`]: every failure - no provider, no embeddings, a
-    /// store error, the clock - is a debug line and an unchanged receipt. Off
-    /// when `capture.similar` is off. The probe first waits, briefly, for the
-    /// embed worker to drain what was just written, so a capture made a moment
-    /// ago can be a neighbour of this one.
+    /// Runs after the write has landed and can never fail it: every failure -
+    /// no provider, no embeddings, a store error, the clock - is a debug line
+    /// and an unchanged receipt. [`SIMILAR_TIMEOUT`] bounds the wait, but only
+    /// where the probe yields; a store statement that steps synchronously is
+    /// not cut by it and can run well past the budget, which is logged at
+    /// `warn` rather than left silent. Off when `capture.similar` is off. The
+    /// probe first waits, briefly, for the embed worker to drain what was
+    /// just written, so a capture made a moment ago can be a neighbour of
+    /// this one.
     ///
     /// The receipt must already name the engram that landed, as top-level
     /// string `domain` and `permalink` keys: they are what the advisory
@@ -9534,6 +9537,14 @@ impl Engine {
             .get("path")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // Read off the variant before `probe` is moved into `work` below, so
+        // the overrun warning can still name what kind of probe this was.
+        let kind = match &probe {
+            SimilarProbe::Write { .. } => "write",
+            SimilarProbe::Markdown { .. } => "markdown",
+            SimilarProbe::Edit { .. } => "edit",
+        };
+        let started = std::time::Instant::now();
         let work = async {
             // This writer's own view of the domain they just wrote in. The
             // write itself already screened the domain (`refuse_hidden_domain`
@@ -9583,9 +9594,19 @@ impl Engine {
                 .await
         };
         match tokio::time::timeout(SIMILAR_TIMEOUT, work).await {
-            Ok(Ok(found)) => similar::attach(receipt, &found),
+            Ok(Ok(found)) => {
+                tracing::debug!("similar probe completed in {:?}", started.elapsed());
+                similar::attach(receipt, &found);
+            }
             Ok(Err(e)) => tracing::debug!("similar probe skipped: {e}"),
             Err(_) => tracing::debug!("similar probe cut at {SIMILAR_TIMEOUT:?}"),
+        }
+        // The timeout above only cuts a poll that yields; a store statement
+        // that steps synchronously runs past it undetected unless the wall
+        // clock is checked here, after the fact.
+        let elapsed = started.elapsed();
+        if similar::probe_overran(elapsed) {
+            tracing::warn!("{}", similar::overrun_warning(elapsed, &domain, kind));
         }
     }
 

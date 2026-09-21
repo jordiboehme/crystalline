@@ -243,12 +243,6 @@ function olderProbe(role: "admin" | "editor"): () => unknown {
   };
 }
 
-/** The listing as it reads for a domain of the given kind. */
-function listingOf(kind: string) {
-  const listing = domainsResponse();
-  return { ...listing, domains: [{ ...listing.domains[0], kind }] };
-}
-
 /** Every path the app asked for, in order. */
 function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
@@ -297,11 +291,20 @@ describe("the domain screen", () => {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
+    // The count and the order menu sit together on the row above the list,
+    // not under the heading, and the old caption is gone.
+    const body = await screenBody();
+    const count = within(body).getByText("2 engrams in this domain");
+    expect(count).toBeVisible();
+    expect(count.parentElement).not.toBeNull();
     expect(
-      within(await screenBody()).getByText(
-        "Newest first, by the date they were recorded.",
-      ),
+      within(count.parentElement as HTMLElement).getByRole("button", {
+        name: "Order: Newest first",
+      }),
     ).toBeVisible();
+    expect(
+      within(body).queryByText(/, by the date they were recorded\.$/),
+    ).toBeNull();
     await waitFor(() => {
       expect(
         requested().some(
@@ -868,9 +871,6 @@ describe("the domain screen", () => {
       await within(body).findByText("620 engrams in this folder"),
     ).toBeVisible();
     expect(
-      within(body).getByText("Newest first, by the date they were recorded."),
-    ).toBeVisible();
-    expect(
       within(body).getByText(/Browsing notes, subfolders included/),
     ).toBeVisible();
     // What a folder page carries: New engram and the order menu.
@@ -893,6 +893,10 @@ describe("the domain screen", () => {
       within(body).queryByRole("region", { name: "Review mode" }),
     ).toBeNull();
     expect(within(body).queryByRole("region", { name: "Manifest" })).toBeNull();
+    expect(within(body).queryByRole("region", { name: "Backup" })).toBeNull();
+    expect(
+      within(body).queryByRole("region", { name: "Danger zone" }),
+    ).toBeNull();
     expect(
       within(body).queryByRole("link", { name: "Download archive" }),
     ).toBeNull();
@@ -954,11 +958,10 @@ describe("the domain screen", () => {
       await screen.findByRole("menuitemradio", { name: "Name A to Z" }),
     );
 
-    // The caption says the order in words, the trigger wears the choice,
-    // the request carries it, and the browser keeps it.
-    expect(await within(body).findByText("By name, A to Z.")).toBeVisible();
+    // The trigger wears the choice, the request carries it, and the browser
+    // keeps it.
     expect(
-      within(body).getByRole("button", { name: "Order: Name A to Z" }),
+      await within(body).findByRole("button", { name: "Order: Name A to Z" }),
     ).toBeVisible();
     await waitFor(() => {
       expect(
@@ -981,9 +984,7 @@ describe("the domain screen", () => {
     const body = await screenBody();
 
     expect(
-      await within(body).findByText(
-        "Oldest first, by the date they were recorded.",
-      ),
+      await within(body).findByRole("button", { name: "Order: Oldest first" }),
     ).toBeVisible();
     await waitFor(() => {
       expect(
@@ -1005,7 +1006,9 @@ describe("the domain screen", () => {
     const body = await screenBody();
     await screen.findByRole("link", { name: /Gamma/ });
 
-    expect(within(body).getByText("By name, Z to A.")).toBeVisible();
+    expect(
+      within(body).getByRole("button", { name: "Order: Name Z to A" }),
+    ).toBeVisible();
     const filtered = requested().filter(
       (path) =>
         path.startsWith("/domains/eng/engrams?") && path.includes("tags=eng"),
@@ -1081,264 +1084,6 @@ describe("the domain screen", () => {
     // silent one.
     expect(screen.getByText(/whole domain/i)).toBeVisible();
   });
-
-  it("unregisters behind a second press, and says the files stay", async () => {
-    const removed = vi.fn(() => ({ files_kept: true, rooms_closed: 0 }));
-    serve(
-      {
-        "/domains/eng": (_path, init) =>
-          init?.method === "DELETE" ? removed() : domainsResponse(),
-        "/activity": () => ({ timeframe: "7d", items: [] }),
-      },
-      "admin",
-    );
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-
-    await userEvent.click(
-      await within(body).findByRole("button", { name: "Unregister domain" }),
-    );
-    // The first press only asks. Nothing has been unregistered yet.
-    expect(removed).not.toHaveBeenCalled();
-    expect(within(body).getByText(/files stay on disk/i)).toBeVisible();
-
-    await userEvent.click(
-      within(body).getByRole("button", { name: "Confirm unregister" }),
-    );
-
-    await waitFor(() => {
-      expect(removed).toHaveBeenCalled();
-    });
-    // The domain the reader was on is gone, so the screen is: home, with the
-    // listing every screen reads asked again rather than left one domain long.
-    expect(
-      await screen.findByRole("heading", { level: 1, name: "Home" }),
-    ).toBeVisible();
-    await waitFor(() => {
-      expect(
-        requested().filter((path) => path === "/domains").length,
-      ).toBeGreaterThan(1);
-    });
-  });
-
-  it("does not offer unregistering below admin", async () => {
-    serve();
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-    await within(body).findByRole("link", { name: /Alpha/ });
-
-    expect(
-      within(body).queryByRole("button", { name: "Unregister domain" }),
-    ).toBeNull();
-  });
-
-  it("offers the archive round trip to an admin", async () => {
-    serve({}, "admin");
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-
-    // A link the browser saves rather than a fetch the app holds in memory:
-    // the download is a cookie-authenticated GET, so the anchor is the whole
-    // mechanism, and `download` is what makes it a save rather than a
-    // navigation into a zip.
-    const download = await within(body).findByRole("link", {
-      name: "Download archive",
-    });
-    expect(download).toHaveAttribute("href", "/api/v1/domains/eng/archive");
-    expect(download).toHaveAttribute("download");
-    expect(
-      within(body).getByRole("button", { name: "Import archive" }),
-    ).toBeVisible();
-  });
-
-  it("offers neither half of the archive round trip below admin", async () => {
-    serve();
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-    await within(body).findByRole("link", { name: /Alpha/ });
-
-    // Both endpoints are admin-only, so neither control is drawn for anybody
-    // who would be refused at it.
-    expect(
-      within(body).queryByRole("link", { name: "Download archive" }),
-    ).toBeNull();
-    expect(
-      within(body).queryByRole("button", { name: "Import archive" }),
-    ).toBeNull();
-  });
-
-  it("returns focus to the trigger when a refusal blocks the confirm", async () => {
-    serve(
-      {
-        "/domains/eng": (_path, init) => {
-          if (init?.method === "DELETE") {
-            throw new ApiProblem(
-              409,
-              "conflict",
-              "domain 'eng' is defined by the environment and cannot be unregistered here",
-            );
-          }
-          return domainsResponse();
-        },
-      },
-      "admin",
-    );
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-    const trigger = await within(body).findByRole("button", {
-      name: "Unregister domain",
-    });
-
-    await userEvent.click(trigger);
-    await userEvent.click(
-      within(body).getByRole("button", { name: "Confirm unregister" }),
-    );
-
-    // The refusal lives in the parent's mutation `onError`, which cannot
-    // reach the child's trigger ref; the fix is a transition-aware effect in
-    // the child, not a copy of `abandon()`'s one-liner.
-    const alert = await within(body).findByRole("alert");
-    expect(alert).toHaveTextContent(/cannot be unregistered/);
-    // The confirm buttons unmounted with the refusal, which would otherwise
-    // drop focus to the document body - a keyboard or screen-reader user
-    // loses their place entirely. Identity, not merely "not the trigger":
-    // asserting `document.activeElement` really is `trigger`.
-    expect(document.activeElement).toBe(trigger);
-    // `role="alert"` is already an implicit ARIA live region (assertive), so
-    // the refusal text is announced without the trigger needing to point at
-    // it: the connection decision 26 asks for already exists here.
-    expect(alert).toHaveAttribute("role", "alert");
-  });
-
-  it("leaves focus where the blur path put it, not on the trigger", async () => {
-    serve({}, "admin");
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-    const trigger = await within(body).findByRole("button", {
-      name: "Unregister domain",
-    });
-
-    await userEvent.click(trigger);
-    within(body).getByRole("button", { name: "Confirm unregister" });
-
-    // Shift-tab out of the confirm row entirely: the first hop stays inside
-    // it (trigger to confirm are siblings under the same wrapper), the
-    // second leaves it for "Import archive", the control immediately before
-    // it in the row. That crossing is what the wrapper's own `onBlur`
-    // collapses `confirming` for - deliberately, because focus moved
-    // somewhere else on purpose.
-    await userEvent.tab({ shift: true });
-    await userEvent.tab({ shift: true });
-    const importButton = within(body).getByRole("button", {
-      name: "Import archive",
-    });
-
-    // The counterweight: a fix that steals focus back to the trigger
-    // whenever `confirming` goes false would pass a check that only asserts
-    // "not the trigger" on a jsdom that parks focus on the body mid-blur.
-    // Asserting identity against the actual destination is what catches
-    // that over-reach.
-    expect(document.activeElement).toBe(importButton);
-    expect(
-      within(body).queryByRole("button", { name: "Confirm unregister" }),
-    ).toBeNull();
-  });
-
-  it("warns that a virtual domain's engrams go with it", async () => {
-    serve(
-      {
-        "/domains": () => listingOf("virtual"),
-        "/activity": () => ({ timeframe: "7d", items: [] }),
-      },
-      "admin",
-    );
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-
-    await userEvent.click(
-      await within(body).findByRole("button", { name: "Unregister domain" }),
-    );
-
-    // Nothing stays on disk here, so nothing here says it does: the engrams
-    // are the database's, and the way to keep a copy is named.
-    expect(within(body).getByText(/live in the database/i)).toBeVisible();
-    expect(within(body).getByText(/cannot be undone/i)).toBeVisible();
-    expect(within(body).getByText(/download the archive first/i)).toBeVisible();
-    expect(within(body).queryByText(/files stay on disk/i)).toBeNull();
-  });
-
-  it("sends the purge confirmation for a virtual domain", async () => {
-    const deletes: string[] = [];
-    const removed = (path: string) => {
-      deletes.push(path);
-      return { files_kept: false, rooms_closed: 0 };
-    };
-    serve(
-      {
-        "/domains": () => listingOf("virtual"),
-        "/domains/eng": (path, init) =>
-          init?.method === "DELETE" ? removed(path) : domainsResponse(),
-        "/activity": () => ({ timeframe: "7d", items: [] }),
-      },
-      "admin",
-    );
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-    await userEvent.click(
-      await within(body).findByRole("button", { name: "Unregister domain" }),
-    );
-    await userEvent.click(
-      within(body).getByRole("button", { name: "Confirm unregister" }),
-    );
-
-    // The second press IS the confirmation the server asks for, so it travels
-    // with the request rather than being re-collected server-side.
-    await waitFor(() => {
-      expect(deletes.length).toBe(1);
-    });
-    expect(deletes[0]).toContain("purge=true");
-  });
-
-  it("sends no purge confirmation for a file domain", async () => {
-    const deletes: string[] = [];
-    const removed = (path: string) => {
-      deletes.push(path);
-      return { files_kept: true, rooms_closed: 0 };
-    };
-    serve(
-      {
-        "/domains": () => listingOf("file"),
-        "/domains/eng": (path, init) =>
-          init?.method === "DELETE" ? removed(path) : domainsResponse(),
-        "/activity": () => ({ timeframe: "7d", items: [] }),
-      },
-      "admin",
-    );
-
-    renderApp("/d/eng");
-    const body = await screenBody();
-    await userEvent.click(
-      await within(body).findByRole("button", { name: "Unregister domain" }),
-    );
-    await userEvent.click(
-      within(body).getByRole("button", { name: "Confirm unregister" }),
-    );
-
-    // Nothing is deleted here, so nothing is confirmed: a file domain's
-    // markdown survives the removal and the flag would be meaningless.
-    await waitFor(() => {
-      expect(deletes.length).toBe(1);
-    });
-    expect(deletes[0]).not.toContain("purge");
-  });
 });
 
 describe("the team sync card", () => {
@@ -1353,9 +1098,16 @@ describe("the team sync card", () => {
     });
     expect(within(card).getByText("acme/kb")).toBeVisible();
     expect(within(card).getByText("main")).toBeVisible();
-    // The day the instant names, cut out of the string: this app never turns
-    // a written date into a browser's local one.
-    expect(within(card).getByText("2026-08-10")).toBeVisible();
+    // The instant, parsed into this machine's own local date and time (built
+    // off the same Date the component parses, since the suite may run in any
+    // zone), with how long ago it was after it - the relative phrase is left
+    // to a wildcard since it moves with the wall clock the test runs against.
+    const parsed = new Date("2026-08-10T08:00:00Z");
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const instant = `${String(parsed.getFullYear())}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+    expect(
+      within(card).getByText(new RegExp(`^${instant}, .+ ago$`)),
+    ).toBeVisible();
     expect(within(card).getByText("2 pending local changes")).toBeVisible();
     expect(within(card).getByText("1 open proposal")).toBeVisible();
     // Nothing was declined and nothing conflicts, so neither is mentioned: a
@@ -1486,7 +1238,16 @@ describe("the team sync card", () => {
     expect(warning).toHaveTextContent(
       "offline: could not reach api.github.com",
     );
-    expect(within(card).getByText(/2026-08-09 \(stale\)/)).toBeVisible();
+    // Built off the same Date the component parses, so the local date and
+    // time read the same here as they do on whatever machine runs the suite;
+    // the relative phrase is left to a wildcard since it moves with the wall
+    // clock the test runs against.
+    const parsed = new Date("2026-08-09T08:00:00Z");
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const instant = `${String(parsed.getFullYear())}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+    expect(
+      within(card).getByText(new RegExp(`^${instant}, .+ ago \\(stale\\)$`)),
+    ).toBeVisible();
   });
 
   it("says the instance is not connected, and where that is fixed", async () => {
