@@ -78,18 +78,20 @@ pub trait EmbeddingProvider: Send + Sync {
 /// configured. The chunker and the provider must agree on this string so
 /// fingerprints computed at sync time match the model that later embeds them.
 ///
-/// A value [`models`] recognises resolves to that entry's canonical short id,
-/// so the three legal spellings of one local model (the short id, the
-/// repository id, either of them padded) key their vectors the same way and
-/// agree with what [`EmbeddingProvider::model_id`] reports. Anything else is
-/// passed through as written, trimmed of nothing: an openai-compatible
-/// endpoint names its own ids and nothing here knows better than the config
-/// what one of those means.
+/// Under the `local` provider a value [`models`] recognises resolves to that
+/// entry's canonical short id, so the three legal spellings of one local model
+/// (the short id, the repository id, either of them padded) key their vectors
+/// the same way and agree with what [`EmbeddingProvider::model_id`] reports.
+/// Every other provider's id is passed through as written, trimmed of nothing,
+/// and that includes an id this table happens to know: an endpoint may serve
+/// one of these models under the repository id it names it by, and the remote
+/// provider echoes the configured string, so resolving it here would key the
+/// vectors one way in the daemon and another in the standalone fill.
 pub fn configured_model_id(cfg: Option<&EmbeddingsConfig>) -> String {
     match cfg {
         Some(c) if !c.model.trim().is_empty() => match local_model(&c.model) {
-            Some(m) => m.id.to_string(),
-            None => c.model.clone(),
+            Some(m) if c.provider.trim() == "local" => m.id.to_string(),
+            _ => c.model.clone(),
         },
         _ => DEFAULT_MODEL_ID.to_string(),
     }
@@ -284,6 +286,15 @@ mod tests {
         }
     }
 
+    fn remote_cfg(model: &str) -> EmbeddingsConfig {
+        EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: model.to_string(),
+            endpoint: Some("https://example.invalid/v1".to_string()),
+            api_key_env: None,
+        }
+    }
+
     #[test]
     fn a_configured_model_the_table_knows_resolves_to_its_canonical_id() {
         // The three spellings of one model. Each has to key vectors the same
@@ -309,6 +320,18 @@ mod tests {
         assert_eq!(
             configured_model_id(Some(&cfg("text-embedding-3-small"))),
             "text-embedding-3-small"
+        );
+    }
+
+    #[test]
+    fn a_remote_model_keeps_its_raw_id_even_when_the_table_knows_it() {
+        // An endpoint may well serve one of the models the table knows, under
+        // the repo id that endpoint names it by. `RemoteProvider::model_id`
+        // echoes the configured string, so canonicalizing it here would key
+        // the vectors one way in the daemon and another in `sync --embed`.
+        assert_eq!(
+            configured_model_id(Some(&remote_cfg("BAAI/bge-small-en-v1.5"))),
+            "BAAI/bge-small-en-v1.5"
         );
     }
 
