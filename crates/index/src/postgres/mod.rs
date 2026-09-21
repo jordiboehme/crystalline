@@ -1093,13 +1093,16 @@ impl Store for PostgresStore {
 
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
         let mut conn = self.acquire().await?;
-        let row =
-            sqlx::query("SELECT content FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''")
-                .bind(domain.0)
-                .bind(path)
-                .fetch_optional(conn.as_mut())
-                .await
-                .map_err(IndexError::from)?;
+        let row = sqlx::query(
+            "SELECT COALESCE(ec.content, '') FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=$1 AND e.path=$2 AND e.actor = ''",
+        )
+        .bind(domain.0)
+        .bind(path)
+        .fetch_optional(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
         Ok(row.and_then(|r| cell_text(&r, 0)))
     }
 
@@ -1112,8 +1115,10 @@ impl Store for PostgresStore {
         // backends agree byte for byte, where Postgres' locale collation could
         // otherwise differ from turso's binary one.
         let rows = sqlx::query(
-            "SELECT path, permalink, content, sha256, actor, tombstone, id \
-             FROM engram WHERE domain_id=$1 AND actor = ''",
+            "SELECT e.path, e.permalink, COALESCE(ec.content, ''), e.sha256, e.actor, \
+             e.tombstone, e.id FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=$1 AND e.actor = ''",
         )
         .bind(domain.0)
         .fetch_all(conn.as_mut())
@@ -1129,7 +1134,9 @@ impl Store for PostgresStore {
         self.invalidate_coverage();
         // Delete a single domain's engram, attachment and child rows, keeping
         // the domain row. Child rows first so the enforced foreign keys are
-        // satisfied, attachment blobs before the attachment rows that own them.
+        // satisfied, attachment blobs before the attachment rows that own them
+        // and the bodies in `engram_content` before the engram rows they hang
+        // off.
         // `upsert_domain` reuses the id for a name it has seen, so anything left
         // here would resurface as the next registration's own.
         // -- actor: all - a domain's removal takes its drafts with it. Nothing
@@ -1146,6 +1153,10 @@ impl Store for PostgresStore {
             "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
             "DELETE FROM relation WHERE domain_id=$1",
             "DELETE FROM link WHERE domain_id=$1",
+            // -- actor: all - the bodies of every row about to go, named
+            // through them since `engram_content` has no domain of its own.
+            "DELETE FROM engram_content WHERE engram_id IN \
+             (SELECT id FROM engram WHERE domain_id=$1)",
             "DELETE FROM engram WHERE domain_id=$1",
             "DELETE FROM tag_alias WHERE domain_id=$1",
             "DELETE FROM attachment_blob WHERE attachment_id IN \
@@ -1179,6 +1190,11 @@ impl Store for PostgresStore {
         if let Some(id) = id {
             delete_children(&mut *c, id).await?;
             sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
+                .bind(id)
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+            sqlx::query("DELETE FROM engram_content WHERE engram_id=$1")
                 .bind(id)
                 .execute(&mut *c)
                 .await
@@ -2349,8 +2365,10 @@ impl Store for PostgresStore {
         }
         let mut conn = self.acquire().await?;
         let row = sqlx::query(
-            "SELECT path, permalink, content, sha256, actor, tombstone, id \
-             FROM engram WHERE domain_id=$1 AND actor=$2 AND path=$3",
+            "SELECT e.path, e.permalink, COALESCE(ec.content, ''), e.sha256, e.actor, \
+             e.tombstone, e.id FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=$1 AND e.actor=$2 AND e.path=$3",
         )
         .bind(domain.0)
         .bind(actor)
@@ -2369,8 +2387,10 @@ impl Store for PostgresStore {
         // Unordered in SQL and sorted by path in Rust, for the reason
         // `all_engram_contents` spells out: this projection carries bodies.
         let rows = sqlx::query(
-            "SELECT path, permalink, content, sha256, actor, tombstone, id \
-             FROM engram WHERE domain_id=$1 AND actor=$2",
+            "SELECT e.path, e.permalink, COALESCE(ec.content, ''), e.sha256, e.actor, \
+             e.tombstone, e.id FROM engram e \
+             LEFT JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.domain_id=$1 AND e.actor=$2",
         )
         .bind(domain.0)
         .bind(actor)
@@ -2403,6 +2423,11 @@ impl Store for PostgresStore {
         };
         delete_children(&mut *c, id).await?;
         sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
+            .bind(id)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM engram_content WHERE engram_id=$1")
             .bind(id)
             .execute(&mut *c)
             .await
@@ -2984,14 +3009,14 @@ impl PostgresStore {
         // separate id lookup is needed.
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO engram(domain_id, path, permalink, title, engram_type, status, \
-             recorded_at, valid_from, valid_to, timestamp, description, content, metadata, \
+             recorded_at, valid_from, valid_to, timestamp, description, metadata, \
              mtime, size, sha256, actor, tombstone) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17,$18) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,$17) \
              ON CONFLICT(domain_id, path, actor) DO UPDATE SET \
              permalink=EXCLUDED.permalink, title=EXCLUDED.title, engram_type=EXCLUDED.engram_type, \
              status=EXCLUDED.status, recorded_at=EXCLUDED.recorded_at, valid_from=EXCLUDED.valid_from, \
              valid_to=EXCLUDED.valid_to, timestamp=EXCLUDED.timestamp, description=EXCLUDED.description, \
-             content=EXCLUDED.content, metadata=EXCLUDED.metadata, mtime=EXCLUDED.mtime, \
+             metadata=EXCLUDED.metadata, mtime=EXCLUDED.mtime, \
              size=EXCLUDED.size, sha256=EXCLUDED.sha256, tombstone=EXCLUDED.tombstone \
              RETURNING id",
         )
@@ -3006,7 +3031,6 @@ impl PostgresStore {
         .bind(record.valid_to.as_deref())
         .bind(record.timestamp.as_deref())
         .bind(record.description.as_deref())
-        .bind(&record.content)
         .bind(record.metadata.to_string())
         .bind(record.stamp.mtime)
         .bind(record.stamp.size as i64)
@@ -3017,6 +3041,19 @@ impl PostgresStore {
         .await
         .map_err(IndexError::from)?;
         let engram_id = row.0;
+
+        // The body, in the same write: its own row keyed by the engram's id, so
+        // every seek into `engram` reads a narrow row instead of the whole
+        // payload. Mirrored from the Turso backend, which is where the cost was.
+        sqlx::query(
+            "INSERT INTO engram_content(engram_id, content) VALUES($1, $2) \
+             ON CONFLICT(engram_id) DO UPDATE SET content=EXCLUDED.content",
+        )
+        .bind(engram_id)
+        .bind(&record.content)
+        .execute(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
 
         // Only an update needs its stale child rows cleared first.
         if existing_id.is_some() {

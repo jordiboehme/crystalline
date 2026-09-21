@@ -115,7 +115,12 @@ pub struct HotStatement {
 /// it is reached through a unique index anyway, and guarding it would turn every
 /// fixture into a question about a backend's small-table heuristics rather than
 /// about our indexes.
-pub const GUARDED_TABLES: &[&str] = &["engram", "chunk", "relation", "link"];
+///
+/// `engram_content` IS here. It is the table the body moved into, reached by
+/// primary key from the three statements that project one, and a full pass over
+/// it would carry every body in the index into exactly the read the move took
+/// them out of.
+pub const GUARDED_TABLES: &[&str] = &["engram", "engram_content", "chunk", "relation", "link"];
 
 /// Which table each alias in these statements stands for.
 ///
@@ -125,6 +130,7 @@ pub const GUARDED_TABLES: &[&str] = &["engram", "chunk", "relation", "link"];
 /// consistently across both backends; a name absent here stands for itself.
 const ALIASES: &[(&str, &str)] = &[
     ("e", "engram"),
+    ("ec", "engram_content"),
     ("src", "engram"),
     ("dst", "engram"),
     ("tgt", "engram"),

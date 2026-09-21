@@ -293,7 +293,8 @@ async fn scored_lexical(
     for term in terms {
         let mut ors: Vec<String> = Vec::new();
         for col in cols {
-            ors.push(format!("lower(e.{col}) LIKE ?{n} ESCAPE '\\'"));
+            let column = lexical_column(col);
+            ors.push(format!("lower({column}) LIKE ?{n} ESCAPE '\\'"));
             params.push(Value::Text(like_pattern(term)));
             n += 1;
         }
@@ -584,7 +585,27 @@ async fn run_hybrid(
 /// [`Candidate::from_row`] reads. Shared by the lexical scan, the filter-only
 /// listing and the semantic hydrate so all three decode identically.
 const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
-     e.description, e.content, CAST(json_extract(e.metadata, '$.salience') AS REAL)";
+     e.description, COALESCE(ec.content, ''), CAST(json_extract(e.metadata, '$.salience') AS REAL)";
+
+/// The body's table, joined in by every statement that projects
+/// [`CANDIDATE_COLUMNS`].
+///
+/// A LEFT join, and the `COALESCE` beside it in the projection is the other
+/// half of the same decision: a row whose body was never written still hydrates
+/// with an empty body rather than vanishing out of a search page. It is a seek
+/// by primary key - `engram_content.engram_id` IS the rowid - so it costs one
+/// page per hit, which is the whole point of the split: the statements that
+/// only screen `engram` no longer read a body at all.
+const CONTENT_JOIN: &str = "LEFT JOIN engram_content ec ON ec.engram_id=e.id";
+
+/// Where a lexical column lives, now that the body sits in its own table.
+fn lexical_column(col: &str) -> String {
+    if col == "content" {
+        "ec.content".to_string()
+    } else {
+        format!("e.{col}")
+    }
+}
 
 /// The sort keys of a filter-only page, one spelling per [`SearchOrder`].
 ///
@@ -625,7 +646,7 @@ pub fn filter_only_sql(
     let order_keys = order_keys(order);
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} \
+         {CONTENT_JOIN} WHERE {actor_screen} {and_filters} \
          ORDER BY {order_keys} LIMIT {limit} OFFSET {offset}"
     )
 }
@@ -658,7 +679,7 @@ pub fn lexical_candidate_sql(
 ) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
+         {CONTENT_JOIN} WHERE {actor_screen} {and_filters} ORDER BY e.id LIMIT {candidate_cap}"
     )
 }
 
@@ -695,7 +716,7 @@ pub fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
 pub fn semantic_hydrate_sql(actor_screen: &str, ids: &str) -> String {
     format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} AND e.id IN ({ids})"
+         {CONTENT_JOIN} WHERE {actor_screen} AND e.id IN ({ids})"
     )
 }
 
@@ -1599,12 +1620,22 @@ mod tests {
             projection, "c.engram_id, min(vector_distance_cos(c.embedding, ?1)) AS dist",
             "phase 1 projects the grouping key and the distance, nothing else"
         );
-        for wide in ["e.content", "e.description", "e.title", "e.metadata"] {
+        for wide in [
+            "e.content",
+            "ec.content",
+            "e.description",
+            "e.title",
+            "e.metadata",
+        ] {
             assert!(
                 !projection.contains(wide),
                 "phase 1 must not feed {wide} into the sorter, projection was: {projection}"
             );
         }
+        assert!(
+            !sql.contains("engram_content"),
+            "and phase 1 does not join the body's table either: {sql}"
+        );
         assert!(
             sql.contains("GROUP BY c.engram_id ORDER BY dist ASC, c.engram_id ASC"),
             "the LIMIT cut stays deterministic on a distance tie: {sql}"
@@ -1626,8 +1657,12 @@ mod tests {
             "no grouping in the hydrate: {sql}"
         );
         assert!(
-            projection_of(&sql).contains("e.content"),
+            projection_of(&sql).contains("ec.content"),
             "the hydrate is where the bodies are read: {sql}"
+        );
+        assert!(
+            sql.contains("LEFT JOIN engram_content ec ON ec.engram_id=e.id"),
+            "and it reaches them through the body's table, by primary key: {sql}"
         );
     }
 
@@ -1638,13 +1673,13 @@ mod tests {
         assert_eq!(
             CANDIDATE_COLUMNS,
             "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
-     e.description, e.content, CAST(json_extract(e.metadata, '$.salience') AS REAL)"
+     e.description, COALESCE(ec.content, ''), CAST(json_extract(e.metadata, '$.salience') AS REAL)"
         );
     }
 
     /// The lexical candidate scan keeps its index order under a folder filter.
     ///
-    /// This is the one query in the tree that carries full bodies (`e.content`,
+    /// This is the one query in the tree that carries full bodies (`ec.content`,
     /// `e.description`) past a plan decision: it loads up to
     /// `LEXICAL_CANDIDATE_CAP` rows and ranks them in Rust. `ORDER BY e.id` is
     /// served from the table's own rowid order, so nothing sorts those bodies,
@@ -1691,7 +1726,8 @@ mod tests {
         // `scored_lexical` composes it for a full-text mode.
         let mut ors: Vec<String> = Vec::new();
         for col in ["title", "description", "content"] {
-            ors.push(format!("lower(e.{col}) LIKE ?{n} ESCAPE '\\'"));
+            let column = lexical_column(col);
+            ors.push(format!("lower({column}) LIKE ?{n} ESCAPE '\\'"));
             n += 1;
         }
         clauses.push(format!("({})", ors.join(" OR ")));
@@ -1746,6 +1782,13 @@ mod tests {
         assert!(
             hydrate.contains("INTEGER PRIMARY KEY") || hydrate.contains("USING INDEX"),
             "the hydrate is a keyed lookup, plan was: {hydrate}"
+        );
+        // And the body's table is reached the same way: `engram_content.engram_id`
+        // IS the rowid, so the join that fetches a body is one page per hit.
+        // A full pass here would hand back the cost the split removed.
+        assert!(
+            hydrate.contains("SEARCH ec USING INTEGER PRIMARY KEY"),
+            "the body is read by primary key, plan was: {hydrate}"
         );
     }
 }

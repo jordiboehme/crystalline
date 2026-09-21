@@ -91,6 +91,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "domain rebuild kind",
         sql: SCHEMA_V13,
     },
+    Migration {
+        version: 14,
+        label: "engram body in its own table",
+        sql: SCHEMA_V14,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -394,6 +399,59 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_engram_permalink_actor ON engram(domain_id
 CREATE UNIQUE INDEX IF NOT EXISTS idx_engram_path_actor ON engram(domain_id, path, actor);
 "#;
 
+// The body moves out of `engram` into a table of its own, the Turso v15
+// migration's twin. One row per engram, keyed by the engram's id.
+//
+// The reason is Turso's, not this dialect's: turso materializes a whole row
+// payload for any column read, so every seek into `engram` paid for the body of
+// that engram, and phase 1 of the semantic scan seeks the parent row once per
+// chunk. Postgres TOASTs a large body out of line and never had that cost. The
+// shape is mirrored anyway, because the two backends share every statement
+// builder above them and a schema that differed here would mean two spellings
+// of every read of a body.
+//
+// Where Turso has to rebuild the table to be rid of a column, this dialect
+// drops it in place, so the ids, the child rows and every index are never
+// disturbed. The copy runs before the drop, for the obvious reason.
+//
+// Every statement converges on a retry, the way the migrations above it do: the
+// version stamp is a statement of its own, so a crash between the DDL and the
+// stamp replays this migration on the next start. `IF NOT EXISTS` and `DROP
+// COLUMN IF EXISTS` cover two of the three statements; the copy needs the
+// block, because on a replay the column it reads is already gone and a bare
+// `SELECT id, content FROM engram` would wedge the migration on an error rather
+// than finding nothing to do.
+//
+// The guard asks `'engram'::regclass` rather than `information_schema` and a
+// schema name, and that is load bearing: `regclass` resolves the bare name
+// through `search_path` exactly as the `INSERT` and the `ALTER TABLE` below it
+// do. A guard that named `current_schema()` instead would agree with them only
+// while `engram` sits in the first entry of the path, and on a connection where
+// it does not it would read false, skip the copy, and let the drop - which
+// still finds the table through the path - take every body with it.
+const SCHEMA_V14: &str = r#"
+CREATE TABLE IF NOT EXISTS engram_content (
+    engram_id BIGINT PRIMARY KEY REFERENCES engram(id),
+    content TEXT NOT NULL DEFAULT ''
+);
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'engram'::regclass
+          AND attname = 'content'
+          AND NOT attisdropped
+    ) THEN
+        INSERT INTO engram_content (engram_id, content)
+        SELECT id, content FROM engram
+        ON CONFLICT (engram_id) DO NOTHING;
+    END IF;
+END $$;
+
+ALTER TABLE engram DROP COLUMN IF EXISTS content;
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -417,7 +475,7 @@ CREATE TABLE attachment_blob (
 /// keys are satisfied at every step. `tag_alias`, `attachment` and
 /// `domain_lock` all reference `domain(id)`, so they are cleared before
 /// `domain`; `attachment_blob` references `attachment`, so it goes first of the
-/// three.
+/// three, and `engram_content` references `engram`, so it goes before it.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_tag",
     "engram_tag",
@@ -426,6 +484,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "relation",
     "link",
     "tag",
+    "engram_content",
     "engram",
     "tag_alias",
     "attachment_blob",
@@ -723,6 +782,134 @@ mod tests {
         assert!(
             dup.is_err(),
             "but one actor still gets only one row at a path"
+        );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The v14 move of the body out of `engram`, over a database carrying a
+    /// draft beside its base row - the Turso v15 migration's twin.
+    ///
+    /// Every body comes through at the id it was written under, base and draft
+    /// alike, there is one `engram_content` row per engram, and the column the
+    /// body used to sit in is gone. The migration is applied twice, because the
+    /// version stamp is a statement of its own and a crash between the two
+    /// replays it: it has to converge rather than wedge on a table that is
+    /// already there or a column that is already dropped.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate the
+    /// parity suite uses.
+    #[tokio::test]
+    async fn v14_moves_every_body_into_its_own_table() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig14_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        // A database at v13: everything up to but not including the move.
+        for m in &MIGRATIONS[..13] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+        }
+        assert_eq!(
+            MIGRATIONS[13].version, 14,
+            "the fourteenth migration is v14"
+        );
+        // Bodies of several sizes, the largest past the TOAST threshold, and a
+        // draft beside the base row at the same path.
+        let big = "x".repeat(200_000);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO domain(name, path) VALUES ('d','/tmp/d'); \
+             INSERT INTO engram(domain_id, path, permalink, content, actor) \
+             SELECT id, 'a.md', 'a', 'short body', '' FROM domain WHERE name='d'; \
+             INSERT INTO engram(domain_id, path, permalink, content, actor) \
+             SELECT id, 'b.md', 'b', '{big}', '' FROM domain WHERE name='d'; \
+             INSERT INTO engram(domain_id, path, permalink, content, actor) \
+             SELECT id, 'a.md', 'a', 'alice''s draft', 'alice' FROM domain WHERE name='d'"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATIONS[13].sql)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql(MIGRATIONS[13].sql)
+            .execute(&mut conn)
+            .await
+            .expect("v14 applies twice");
+
+        let paired: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM engram e JOIN engram_content ec ON ec.engram_id=e.id",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM engram")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            paired.0, rows.0,
+            "one body row per engram row after the move"
+        );
+
+        let base: (String,) = sqlx::query_as(
+            "SELECT ec.content FROM engram e JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.path='a.md' AND e.actor=''",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(base.0, "short body", "the base body came through whole");
+        let draft: (String,) = sqlx::query_as(
+            "SELECT ec.content FROM engram e JOIN engram_content ec ON ec.engram_id=e.id \
+             WHERE e.path='a.md' AND e.actor='alice'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            draft.0, "alice's draft",
+            "and the draft's is its own, at its own id"
+        );
+        let long: (i64,) = sqlx::query_as(
+            "SELECT length(ec.content)::bigint FROM engram e JOIN engram_content ec \
+             ON ec.engram_id=e.id WHERE e.path='b.md'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            long.0,
+            big.len() as i64,
+            "a body past the TOAST threshold too"
+        );
+
+        let gone = sqlx::query_as::<_, (String,)>("SELECT content FROM engram LIMIT 1")
+            .fetch_optional(&mut conn)
+            .await;
+        assert!(
+            gone.is_err(),
+            "the column the body used to sit in is gone: {gone:?}"
+        );
+
+        assert!(
+            WIPE_TABLES.contains(&"engram_content"),
+            "a wipe that leaves the bodies behind fails on the foreign key"
         );
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

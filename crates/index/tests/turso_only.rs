@@ -52,8 +52,8 @@ async fn store_info_reports_turso_schema_version() {
     // v7 case-folded tag identity, v8 tag alias map, v9 engram attachments,
     // v10 raw reference text, v11 domain registration stamp,
     // v12 domain rebuild marker, v13 engram actor dimension,
-    // v14 domain rebuild kind.
-    assert_eq!(info.schema_version, 14);
+    // v14 domain rebuild kind, v15 engram body in its own table.
+    assert_eq!(info.schema_version, 15);
 }
 
 #[tokio::test]
@@ -152,7 +152,13 @@ fn the_inbound_reference_query_selects_no_body() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            for body in ["e.content", "e.description", "i.content", "i.description"] {
+            for body in [
+                "e.content",
+                "ec.content",
+                "e.description",
+                "i.content",
+                "i.description",
+            ] {
                 assert!(
                     !line.contains(body),
                     "{file}:{} selects a body into the inbound query, whose summary \

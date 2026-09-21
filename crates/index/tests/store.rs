@@ -7637,9 +7637,9 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 146,
+        census.sites, 148,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         59 per backend in mod.rs, 9 per backend in search.rs, 10 in the shared \
+         60 per backend in mod.rs, 9 per backend in search.rs, 10 in the shared \
          statement builders in store.rs: the reference-resolution expression's four \
          arms, plus the three engram hops of each of the two graph frontiers. Those \
          six used to be six per backend in search.rs, which is the whole of the move \
@@ -7656,11 +7656,13 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          that the reference now points at nothing"
     );
     assert_eq!(
-        census.waived, 16,
+        census.waived, 18,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Eight per backend: the five statements of `clear_domain`, the id-scoped delete inside \
-         `delete_engram` and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, \
-         plus `clear_overlay_entry`'s delete, which is `-- actor: by id` because the id it \
+         Nine per backend: the six statements of `clear_domain` - the sixth is the one that \
+         takes the bodies out of `engram_content`, which names the rows about to go because \
+         that table has no domain of its own - the id-scoped delete inside `delete_engram` \
+         and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, plus \
+         `clear_overlay_entry`'s delete, which is `-- actor: by id` because the id it \
          names was resolved by an actor-scoped lookup two statements above"
     );
 }
