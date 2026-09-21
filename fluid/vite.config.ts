@@ -54,15 +54,21 @@ export default defineConfig({
         ws: true,
       },
     },
-    // The unit suite reads one file from outside this package: the shared
+    // The unit suite reads two files from outside this package: the shared
     // asset-ref corpus in crates/core/tests/fixtures, which pins Fluid's
-    // scanner and the core's to the same cases. Vite refuses to transform a
+    // scanner and the core's to the same cases, and the web-url corpus in
+    // tests/fixtures, which pins this app's route builder and slug rules to
+    // the very bytes the server hands an agent. Vite refuses to transform a
     // module outside the project root unless the folder is allowed, and the
     // allowance is scoped to the test run so a dev or preview server keeps
     // serving this package and nothing else in the repository.
     ...(process.env.VITEST === undefined
       ? {}
-      : { fs: { allow: [".", "../crates/core/tests/fixtures"] } }),
+      : {
+          fs: {
+            allow: [".", "../crates/core/tests/fixtures", "../tests/fixtures"],
+          },
+        }),
   },
   test: {
     // The app is a browser app, so the tests run in one: components are

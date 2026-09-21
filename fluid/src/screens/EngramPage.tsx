@@ -407,6 +407,16 @@ export default function EngramPage() {
               // is named after, so a folder of downloads says which document
               // each picture came from.
               documentName={documentSlug(engram.permalink)}
+              // The page these headings are read at, which is what a link
+              // symbol beside one copies. The server's own spelling of this
+              // address where it could work one out - so the URL a reader
+              // hands over is the URL an agent hands over, byte for byte -
+              // and this browser's origin where it could not.
+              anchors={{
+                pageUrl:
+                  engram.webUrl ??
+                  `${window.location.origin}${engramRoute(engram.domain, engram.permalink)}`,
+              }}
             />
           </article>
           {/*

@@ -11,7 +11,13 @@
  * fence, which becomes a diagram rather than a code block.
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it, vi } from "vitest";
@@ -61,15 +67,18 @@ async function renderMarkdown(
   wikilinks?: WikilinkResolver,
   foldTitle?: string,
   documentName?: string,
+  anchors?: { pageUrl: string },
+  entry = "/",
 ) {
   const result = render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[entry]}>
       <ThemeProvider>
         <Markdown
           source={source}
           {...(wikilinks ? { wikilinks } : {})}
           {...(foldTitle === undefined ? {} : { foldTitle })}
           {...(documentName === undefined ? {} : { documentName })}
+          {...(anchors === undefined ? {} : { anchors })}
         />
       </ThemeProvider>
     </MemoryRouter>,
@@ -437,6 +446,171 @@ describe("the markdown renderer", () => {
       expect(saved[0]).toMatch(/^alpha-diagram-[0-9a-f]{4}\.mmd$/);
     } finally {
       clicked.mockRestore();
+    }
+  });
+});
+
+/**
+ * Section anchors: the name every heading is reachable by, and the control
+ * that hands that name over.
+ *
+ * What is pinned here is what a reader and an agent can rely on. Every heading
+ * carries an id derived from its own text, so a URL written from the heading
+ * text lands on the heading; the control beside it is a real button with a
+ * real name, so a keyboard reaches it and a screen reader says what it is; and
+ * arriving with a fragment points the section out rather than leaving somebody
+ * to find it. A surface that does not opt in has none of it: no ids, no
+ * buttons, nothing to trip over.
+ */
+describe("section anchors", () => {
+  const PAGE = "https://kb.example.com/d/eng/e/alpha";
+  const SOURCE = ["## API", "", "## API", "", "### Auth & Tokens", ""].join(
+    "\n",
+  );
+
+  it("gives every heading an id from its text, numbered when repeated", async () => {
+    const { container } = await renderMarkdown(
+      SOURCE,
+      undefined,
+      undefined,
+      undefined,
+      { pageUrl: PAGE },
+    );
+
+    const ids = [...container.querySelectorAll("h2, h3")].map(
+      (heading) => heading.id,
+    );
+    expect(ids).toEqual(["api", "api-1", "auth-tokens"]);
+  });
+
+  it("draws no ids and no link symbols without anchors", async () => {
+    const { container } = await renderMarkdown(SOURCE);
+
+    for (const heading of container.querySelectorAll("h2, h3")) {
+      expect(heading.hasAttribute("id")).toBe(false);
+    }
+    expect(
+      screen.queryByRole("button", { name: "Link to this section" }),
+    ).toBeNull();
+  });
+
+  it("the link symbol is reachable by name and activates on Enter and Space", async () => {
+    const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+      Promise.resolve(),
+    );
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    await renderMarkdown(SOURCE, undefined, undefined, undefined, {
+      pageUrl: PAGE,
+    });
+
+    // One per heading, and each one is found by its name rather than by its
+    // position: a control with no text in it has nothing else to be known by.
+    expect(
+      screen.getAllByRole("button", { name: "Link to this section" }),
+    ).toHaveLength(3);
+
+    // In the tab order from the start, so it is reachable without a pointer
+    // ever hovering the heading it belongs to.
+    await userEvent.tab();
+    expect(document.activeElement).toBe(
+      screen.getAllByRole("button", { name: "Link to this section" })[0],
+    );
+
+    await userEvent.keyboard("{Enter}");
+    expect(writeText).toHaveBeenLastCalledWith(`${PAGE}#api`);
+    await userEvent.keyboard(" ");
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenLastCalledWith(`${PAGE}#api`);
+  });
+
+  it("says Link copied in the live region and beside the heading, then falls silent", async () => {
+    const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+      Promise.resolve(),
+    );
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    const { container } = await renderMarkdown(
+      SOURCE,
+      undefined,
+      undefined,
+      undefined,
+      { pageUrl: PAGE },
+    );
+    const region = screen.getByRole("status", {
+      name: "Section link result",
+    });
+    expect(region).toHaveTextContent("");
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "Link to this section" })[2]!,
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(region).toHaveTextContent("Link copied");
+      // And beside the heading that was activated, which is the one a reader
+      // watching the pointer is looking at rather than the foot of the page.
+      expect(container.querySelector("#auth-tokens")).toHaveTextContent(
+        "Link copied",
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(region).toHaveTextContent("");
+      expect(container.querySelector("#auth-tokens")).not.toHaveTextContent(
+        "Link copied",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("scrolls to and flashes the heading the hash names, and does nothing for a missing one", async () => {
+    const scrolled = vi
+      .spyOn(Element.prototype, "scrollIntoView")
+      .mockImplementation(() => undefined);
+    try {
+      const { container, unmount } = await renderMarkdown(
+        SOURCE,
+        undefined,
+        undefined,
+        undefined,
+        { pageUrl: PAGE },
+        "/x#auth-tokens",
+      );
+
+      const target = container.querySelector("#auth-tokens");
+      expect(scrolled).toHaveBeenCalledWith({ block: "start" });
+      expect(scrolled.mock.instances[0]).toBe(target);
+      expect(target).toHaveClass("section-flash");
+      unmount();
+
+      // A fragment naming nothing in this document opens the page at the top,
+      // says nothing and throws nothing: an anchor is a hint, never a promise
+      // the page has to keep.
+      scrolled.mockClear();
+      const missing = await renderMarkdown(
+        SOURCE,
+        undefined,
+        undefined,
+        undefined,
+        { pageUrl: PAGE },
+        "/x#nowhere",
+      );
+      expect(scrolled).not.toHaveBeenCalled();
+      expect(missing.container.querySelector(".section-flash")).toBeNull();
+    } finally {
+      scrolled.mockRestore();
     }
   });
 });

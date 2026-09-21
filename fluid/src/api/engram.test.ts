@@ -118,3 +118,28 @@ describe("the neighbours advisory a write receipt carries", () => {
     expect(quiet.guidance).toBeNull();
   });
 });
+
+describe("the page address a detail payload carries", () => {
+  it("reads web_url and tolerates its absence", () => {
+    const served = readEngramDetail(
+      {
+        domain: "eng",
+        permalink: "alpha",
+        web_url: "https://kb.example.com/d/eng/e/alpha",
+      },
+      "eng",
+      "alpha",
+    );
+    expect(served.webUrl).toBe("https://kb.example.com/d/eng/e/alpha");
+
+    // A server that could not work out an address says so in `web_url_note`
+    // and carries no `web_url` at all, so the page has no browser URL to
+    // hand over and says nothing rather than inventing one.
+    const unresolved = readEngramDetail(
+      { domain: "eng", permalink: "alpha" },
+      "eng",
+      "alpha",
+    );
+    expect(unresolved.webUrl).toBeNull();
+  });
+});
