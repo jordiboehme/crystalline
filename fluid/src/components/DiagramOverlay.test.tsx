@@ -447,6 +447,10 @@ describe("DiagramOverlay", () => {
         text?.startsWith('<?xml version="1.0" encoding="UTF-8"?>\n<svg'),
       ).toBe(true);
       expect(text).toContain('xmlns="http://www.w3.org/2000/svg"');
+      // The sized drawing, not the markup that arrived: the fixture's viewBox
+      // is 600 by 400 and the host's pass writes that on in pixels, so a file
+      // that still said `width="100%"` would be the wrong one.
+      expect(text).toContain('width="600px"');
     });
 
     it("puts a diagram's source on the clipboard and says so", async () => {
@@ -512,7 +516,7 @@ describe("DiagramOverlay", () => {
       expect(
         screen.queryByRole("button", { name: /Download source|Download SVG/ }),
       ).toBeNull();
-      const link = screen.getByRole("button", { name: "Download image" });
+      const link = screen.getByRole("link", { name: "Download image" });
       expect(link.getAttribute("download")).toBe("map.png");
       expect(link.getAttribute("href")).toBe(
         "/api/v1/files/eng/assets/map.png",

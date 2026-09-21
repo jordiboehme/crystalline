@@ -247,6 +247,13 @@ describe("attachments in the reading view", () => {
     await userEvent.click(open);
     const dialog = await screen.findByRole("dialog");
     expect(dialog.querySelector("img")?.getAttribute("alt")).toBe("The map");
+    // And the file it offers is named after the target the author wrote, not
+    // after the route this app built to fetch it.
+    expect(
+      screen
+        .getByRole("link", { name: "Download image" })
+        .getAttribute("download"),
+    ).toBe("map.png");
     await userEvent.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).toBeNull();

@@ -562,7 +562,10 @@ export default function DiagramOverlay({
             // page's memory. A same-origin attachment downloads under its own
             // name; a remote image is best effort, since a browser ignores
             // the name across origins and opens the picture instead.
-            role="button"
+            //
+            // It stays a link and is not dressed as a button: a button role
+            // on an anchor promises activation by Space, which an anchor does
+            // not honour, and this control really is a link to a file.
           >
             <Download size={16} strokeWidth={1.75} />
           </a>

@@ -658,8 +658,9 @@ function MarkdownImage({
             alt: alt ?? "",
             // The name the author wrote, not the address this app built: a
             // file saved out of the full window keeps the name it has in the
-            // document rather than a route's last segment.
-            filename: imageFileName(decoded),
+            // document rather than a route's last segment. The target goes
+            // over as written, because the helper decodes it once itself.
+            filename: imageFileName(written),
           }}
           returnFocusTo={fullWindowRef}
           onClose={() => {
