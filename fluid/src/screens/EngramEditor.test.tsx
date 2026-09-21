@@ -350,6 +350,24 @@ describe("the engram editor", () => {
     });
   });
 
+  it("offers the crystalline:// address beside the permalink while editing", async () => {
+    serveEditor();
+
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByRole("heading", { name: "Editing Alpha" });
+
+    // The address is what a person hands an agent to join this document, and
+    // the editor is where they are when they want to.
+    const copy = screen.getByRole("button", {
+      name: "Copy crystalline:// address",
+    });
+    expect(copy).toBeVisible();
+    // CopyAddress draws its own wrapper span around the button and its live
+    // region, so the title row - which is what has to hold both the
+    // permalink and this control - is two hops up from the button.
+    expect(copy.parentElement?.parentElement?.textContent).toContain("alpha");
+  });
+
   it("wears the Raw switch as a glyph, named rather than lettered", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");
