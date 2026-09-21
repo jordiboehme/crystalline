@@ -14,6 +14,71 @@ export function formatDay(value: string): string {
   return /^\d{4}-\d{2}-\d{2}/.test(value) ? value.slice(0, 10) : value;
 }
 
+/** An RFC 3339 instant: a day, a `T`, and a time. */
+const INSTANT_SHAPE = /^\d{4}-\d{2}-\d{2}T/;
+
+/**
+ * A stored instant, in the local date and time a reader's own clock shows:
+ * `2026-08-10 08:00`.
+ *
+ * {@link formatDay} exists because most dates in a knowledge base are days
+ * somebody wrote down, where parsing and reformatting would shift the date
+ * itself across the browser's own midnight. A `last_checked` timestamp is the
+ * opposite kind of value: it names a precise moment, in whatever zone the
+ * check happened to run, and a reader wants that moment translated into
+ * theirs - the whole point of showing it at all. So this one DOES parse: the
+ * fields come off a `Date` built from the string, read with `getFullYear`,
+ * `getHours` and so on rather than `toISOString`, which would hand back UTC
+ * and reintroduce the same shift `formatDay` was written to avoid. A value
+ * that is not a parseable instant - a plain day, or anything else - has no
+ * time-of-day to translate, so it is shown the way `formatDay` shows it
+ * instead.
+ *
+ * `now` is accepted only so a caller that also calls {@link relativeTime} can
+ * pass the same tick to both without a branch; the date and time here never
+ * move with it.
+ */
+export function formatInstant(value: string, _now: Date = new Date()): string {
+  if (!INSTANT_SHAPE.test(value)) {
+    return formatDay(value);
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return formatDay(value);
+  }
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${localDay(parsed)} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+}
+
+/**
+ * How long ago (or from now) a stored instant was, in the words a reader
+ * reads: "just now", "13 minutes ago", "2 hours ago", "3 days ago".
+ *
+ * `Intl.RelativeTimeFormat` supplies the wording; what this picks is the
+ * unit, off the largest one that still fits the gap - the same reason a
+ * calendar app says "2 hours ago" rather than "120 minutes ago". Under a
+ * minute is answered as "just now" rather than `Intl`'s own "now" or "3
+ * seconds ago", since nothing this app checks on a per-second cadence is
+ * worth a reader trusting to the second. Returns null when `value` does not
+ * parse, which a caller reads as "say nothing" rather than "say now".
+ */
+export function relativeTime(value: string, now: Date): string | null {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  const diffSeconds = (parsed.getTime() - now.getTime()) / 1000;
+  const absSeconds = Math.abs(diffSeconds);
+  if (absSeconds < 60) {
+    return "just now";
+  }
+  const unit: Intl.RelativeTimeFormatUnit =
+    absSeconds < 3600 ? "minute" : absSeconds < 86400 ? "hour" : "day";
+  const secondsInUnit = unit === "minute" ? 60 : unit === "hour" ? 3600 : 86400;
+  const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+  return rtf.format(Math.trunc(diffSeconds / secondsInUnit), unit);
+}
+
 /**
  * An OKF actor, in the words a reader reads.
  *

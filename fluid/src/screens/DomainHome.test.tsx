@@ -1353,9 +1353,16 @@ describe("the team sync card", () => {
     });
     expect(within(card).getByText("acme/kb")).toBeVisible();
     expect(within(card).getByText("main")).toBeVisible();
-    // The day the instant names, cut out of the string: this app never turns
-    // a written date into a browser's local one.
-    expect(within(card).getByText("2026-08-10")).toBeVisible();
+    // The instant, parsed into this machine's own local date and time (built
+    // off the same Date the component parses, since the suite may run in any
+    // zone), with how long ago it was after it - the relative phrase is left
+    // to a wildcard since it moves with the wall clock the test runs against.
+    const parsed = new Date("2026-08-10T08:00:00Z");
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const instant = `${String(parsed.getFullYear())}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+    expect(
+      within(card).getByText(new RegExp(`^${instant}, .+ ago$`)),
+    ).toBeVisible();
     expect(within(card).getByText("2 pending local changes")).toBeVisible();
     expect(within(card).getByText("1 open proposal")).toBeVisible();
     // Nothing was declined and nothing conflicts, so neither is mentioned: a
@@ -1486,7 +1493,16 @@ describe("the team sync card", () => {
     expect(warning).toHaveTextContent(
       "offline: could not reach api.github.com",
     );
-    expect(within(card).getByText(/2026-08-09 \(stale\)/)).toBeVisible();
+    // Built off the same Date the component parses, so the local date and
+    // time read the same here as they do on whatever machine runs the suite;
+    // the relative phrase is left to a wildcard since it moves with the wall
+    // clock the test runs against.
+    const parsed = new Date("2026-08-09T08:00:00Z");
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const instant = `${String(parsed.getFullYear())}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+    expect(
+      within(card).getByText(new RegExp(`^${instant}, .+ ago \\(stale\\)$`)),
+    ).toBeVisible();
   });
 
   it("says the instance is not connected, and where that is fixed", async () => {

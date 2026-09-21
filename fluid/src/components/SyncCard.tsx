@@ -26,12 +26,12 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ReactElement } from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { fetchSyncStatus, syncDomain, syncStatusKey } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
-import { formatDay, plural } from "../format";
+import { formatInstant, plural, relativeTime } from "../format";
 import { ConflictDialog } from "./ConflictDialog";
 import { BUTTON, FOCUS_RING } from "./primitives";
 
@@ -69,6 +69,20 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
   // The conflict being settled, by id, or null while none is. One at a time:
   // settling one is a decision that wants the whole screen.
   const [openConflict, setOpenConflict] = useState<string | null>(null);
+
+  // The clock "Last checked" reads its relative phrase against. A minute
+  // tick rather than a refetch: the check itself does not move, only how long
+  // ago it reads does, so this redraws the sentence without asking the server
+  // anything.
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const id = setInterval(() => {
+      setNow(new Date());
+    }, 60_000);
+    return () => {
+      clearInterval(id);
+    };
+  }, []);
 
   // No retry: the two answers this call has to distinguish are both immediate
   // and final - a domain with no origin, and an instance with GitHub off - and
@@ -177,7 +191,9 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
               </>
             )}
             <dt className="text-slate-500 dark:text-slate-400">Last checked</dt>
-            <dd className="tabular-nums">{lastChecked(sync)}</dd>
+            <dd className="tabular-nums" title={sync.lastChecked ?? undefined}>
+              {lastChecked(sync, now)}
+            </dd>
           </dl>
           <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
             <span>
@@ -351,22 +367,29 @@ function conflictLead(sync: {
 }
 
 /**
- * The day the origin was last checked, and whether that day still stands.
+ * When the origin was last checked, in words, and whether that check still
+ * stands.
  *
- * A failed probe leaves the timestamp untouched - it is when the check last
- * SUCCEEDED - so the day alone would read as "checked this morning" on a copy
- * that has not reached GitHub since. Never checked at all says so instead: a
- * day that does not exist gets no staleness marker.
+ * The instant reads as this browser's own local date and time, with how long
+ * ago it was alongside it - "2026-09-17 14:32, 13 minutes ago" - because a
+ * bare timestamp asks a reader to do the subtraction themselves. A failed
+ * probe leaves the timestamp untouched - it is when the check last SUCCEEDED
+ * - so that pair alone would read as fresh on a copy that has not reached
+ * GitHub since; `(stale)` after it says otherwise. Never checked at all says
+ * so instead: a day that does not exist gets neither a time nor a staleness
+ * marker.
  */
-function lastChecked(sync: {
-  lastChecked: string | null;
-  probeError: string | null;
-}): string {
+function lastChecked(
+  sync: { lastChecked: string | null; probeError: string | null },
+  now: Date,
+): string {
   if (sync.lastChecked === null) {
     return "not yet";
   }
-  const day = formatDay(sync.lastChecked);
-  return sync.probeError === null ? day : `${day} (stale)`;
+  const instant = formatInstant(sync.lastChecked);
+  const relative = relativeTime(sync.lastChecked, now);
+  const when = relative === null ? instant : `${instant}, ${relative}`;
+  return sync.probeError === null ? when : `${when} (stale)`;
 }
 
 /**
