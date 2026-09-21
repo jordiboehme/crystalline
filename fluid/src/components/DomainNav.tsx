@@ -39,11 +39,7 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import {
-  ArrowLeftRight,
-  FolderOpen,
-  Folder as FolderShut,
-} from "lucide-react";
+import { ArrowLeftRight, FolderOpen, Folder as FolderShut } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { useState } from "react";
 import { Link, useMatch, useNavigate, useSearchParams } from "react-router";

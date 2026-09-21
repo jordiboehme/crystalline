@@ -562,7 +562,9 @@ describe("the sidebar inside a domain", () => {
 
     renderApp("/d/eng");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "Switch domain" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Switch domain" }),
+    );
 
     // Every domain is offered with what it holds, which is what makes the
     // choice between them a choice rather than a guess.
@@ -600,7 +602,9 @@ describe("the sidebar inside a domain", () => {
 
     renderApp("/d/eng");
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "Switch domain" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Switch domain" }),
+    );
 
     expect(
       await screen.findByRole("menuitemradio", { name: /^ops/ }),
