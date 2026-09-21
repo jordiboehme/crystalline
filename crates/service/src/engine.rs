@@ -698,6 +698,11 @@ pub struct Engine {
     // One embedding pass at a time, whoever asks: the worker, a verb that just
     // wrote, the daemon's startup task or the self-heal tick. See [`EmbedGate`].
     embed_gate: Arc<std::sync::Mutex<EmbedGate>>,
+    // What the last successful embedding-model load pruned from the model
+    // cache, so `ctl status` after a start says what that start freed. Empty on
+    // every install that had nothing to prune, which is every install that
+    // never changed model.
+    model_cache_pruned: std::sync::RwLock<Vec<(String, u64)>>,
     // Swappable so the daemon can build the (possibly downloading) provider in the
     // background without blocking readiness or text search.
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
@@ -1415,8 +1420,10 @@ pub(crate) struct EmbedGate {
 /// whole area has been fixing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedOutcome {
-    /// This call walked the backlog and embedded that many chunks.
-    Embedded(usize),
+    /// This call walked the backlog and embedded that many chunks, then, when
+    /// the walk left the active model covering every chunk, cleared that many
+    /// chunks of another model's vectors.
+    Embedded { chunks: usize, pruned: usize },
     /// A pass was already walking the backlog, so this request was folded into
     /// it: that pass walks the backlog again and covers whatever this caller
     /// had just written. Nothing was dropped and nothing needs re-asking.
@@ -1428,7 +1435,7 @@ impl EmbedOutcome {
     /// reading as zero.
     pub fn embedded(self) -> usize {
         match self {
-            EmbedOutcome::Embedded(n) => n,
+            EmbedOutcome::Embedded { chunks, .. } => chunks,
             EmbedOutcome::AlreadyRunning => 0,
         }
     }
@@ -1516,6 +1523,7 @@ impl Engine {
             watch_tx: None,
             embed_tx: None,
             embed_gate: Arc::default(),
+            model_cache_pruned: std::sync::RwLock::new(Vec::new()),
             provider: std::sync::RwLock::new(provider),
             model_id,
             chunk_params,
@@ -13004,6 +13012,18 @@ impl Engine {
             },
             "activity": activity,
         });
+        let pruned: Vec<Value> = self
+            .model_cache_pruned
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(repo, bytes)| json!({ "repo": repo, "bytes": bytes }))
+            .collect();
+        if !pruned.is_empty()
+            && let Some(emb) = result.get_mut("embeddings").and_then(Value::as_object_mut)
+        {
+            emb.insert("pruned_model_cache".to_string(), Value::Array(pruned));
+        }
         // Omitted entirely while collaboration is off, so pre-feature output
         // stays byte-stable for an install that never touches GitHub.
         if self.config.read().unwrap().github_enabled()
@@ -13024,6 +13044,40 @@ impl Engine {
             store.embedding_coverage().await?
         };
         Ok(coverage.backlog_for(&self.model_id))
+    }
+
+    /// Record what the model-cache prune removed, for `ctl status`. Called once
+    /// per start, right after the active model has loaded.
+    pub fn record_model_cache_prune(&self, removed: Vec<(String, u64)>) {
+        *self.model_cache_pruned.write().unwrap() = removed;
+    }
+
+    /// Clear the vectors of every model but the active one, but only once the
+    /// active model covers every chunk in the index.
+    ///
+    /// `None` says the condition was not met and nothing was touched; `Some(n)`
+    /// says the prune ran and cleared `n` chunks. The gate is the whole point:
+    /// below full coverage the chunks a pass has not reached yet still carry
+    /// the previous model's vectors, and those are what search and the
+    /// neighbours answer from until it does.
+    pub async fn prune_stale_embeddings_if_complete(&self) -> Result<Option<usize>> {
+        let store = self.store.lock().await;
+        let coverage = store.embedding_coverage().await?;
+        if coverage.total_chunks == 0
+            || coverage.embedded_for(&self.model_id) < coverage.total_chunks
+        {
+            return Ok(None);
+        }
+        let pruned = store.prune_embeddings_except(&self.model_id).await?;
+        drop(store);
+        if pruned > 0 {
+            tracing::info!(
+                model = %self.model_id,
+                pruned,
+                "cleared the vectors of a model this install no longer uses"
+            );
+        }
+        Ok(Some(pruned))
     }
 
     /// Best-effort WAL checkpoint: reclaims disk after a burst of writes (a
@@ -13116,7 +13170,10 @@ impl Engine {
     /// up whatever the second caller had just written.
     async fn embed_pass_with_page(&self, page_size: usize) -> Result<EmbedOutcome> {
         if self.provider().is_none() {
-            return Ok(EmbedOutcome::Embedded(0));
+            return Ok(EmbedOutcome::Embedded {
+                chunks: 0,
+                pruned: 0,
+            });
         }
         let Some(mut pass) = EmbedPass::claim(&self.embed_gate) else {
             tracing::debug!("an embed pass is already running; it walks the backlog again");
@@ -13131,7 +13188,22 @@ impl Engine {
                 break;
             }
         }
-        Ok(EmbedOutcome::Embedded(embedded))
+        // A completed pass is the moment the previous model's vectors stop
+        // being the answer to anything: the active model now covers every
+        // chunk, so what is left of another model is dead weight. Never fatal -
+        // a failure here costs disk, not correctness.
+        let pruned = match self.prune_stale_embeddings_if_complete().await {
+            Ok(Some(n)) => n,
+            Ok(None) => 0,
+            Err(e) => {
+                tracing::warn!("could not prune stale embeddings after an embed pass: {e}");
+                0
+            }
+        };
+        Ok(EmbedOutcome::Embedded {
+            chunks: embedded,
+            pruned,
+        })
     }
 
     /// One walk of the backlog, head to tail, for [`Self::embed_pass_with_page`].

@@ -317,6 +317,112 @@ async fn a_rejected_batch_never_starves_the_backlog() {
     );
 }
 
+#[tokio::test]
+async fn the_prune_runs_only_once_the_active_model_covers_every_chunk() {
+    // Below full coverage the pass must not clear anything: the chunks it has
+    // not reached yet still carry the previous model's vectors, and they are
+    // what search and the neighbours are answering from until it does.
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = Arc::new(virtual_engine(store));
+    engine.set_provider(Arc::new(PoisonEmbedder));
+
+    for i in 0..4 {
+        let body = if i == 2 {
+            "a POISON body the provider rejects".to_string()
+        } else {
+            format!("the body of note number {i:02}")
+        };
+        engine
+            .write_engram(&write_params(&format!("Note {i:02}"), &body))
+            .await
+            .unwrap();
+    }
+    engine.embed_pending_with_page(1).await.unwrap();
+    assert_eq!(
+        engine.embedding_backlog().await.unwrap(),
+        1,
+        "the poisoned chunk keeps coverage short of complete"
+    );
+    assert_eq!(
+        engine.prune_stale_embeddings_if_complete().await.unwrap(),
+        None,
+        "the trigger does not fire below full coverage"
+    );
+}
+
+#[tokio::test]
+async fn a_pass_that_completes_coverage_reaches_the_prune_and_reports_it() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = Arc::new(virtual_engine(store));
+    engine.set_provider(Arc::new(CountingEmbedder::new()));
+
+    for i in 0..3 {
+        engine
+            .write_engram(&write_params(
+                &format!("Note {i:02}"),
+                &format!("the body of note number {i:02}"),
+            ))
+            .await
+            .unwrap();
+    }
+    let outcome = engine.embed_pending_outcome().await.unwrap();
+    match outcome {
+        crystalline_service::engine::EmbedOutcome::Embedded { chunks, pruned } => {
+            assert_eq!(chunks, 3);
+            // Nothing stale was there to clear; what this pins is that the
+            // pass reached the prune and carried its count out.
+            assert_eq!(pruned, 0);
+        }
+        other => panic!("expected an Embedded outcome, got {other:?}"),
+    }
+    assert_eq!(
+        engine.prune_stale_embeddings_if_complete().await.unwrap(),
+        Some(0),
+        "at full coverage the trigger fires and finds nothing left of another model"
+    );
+
+    // Seeded stale state, the shape a scoped pass in a shared database leaves:
+    // the trigger clears it and says how much.
+    {
+        let store = engine.store();
+        let store = store.lock().await;
+        let jobs = store
+            .chunks_needing_embedding("some-other-model", None, 64, None)
+            .await
+            .unwrap();
+        let rows: Vec<crystalline_index::EmbeddingRow> = jobs
+            .iter()
+            .take(1)
+            .map(|j| crystalline_index::EmbeddingRow {
+                chunk_id: j.chunk_id,
+                dims: 4,
+                embedding: vec![0.5_f32; 4],
+            })
+            .collect();
+        store
+            .store_embeddings(&rows, "some-other-model")
+            .await
+            .unwrap();
+    }
+    // One chunk now belongs to another model, so coverage is short again.
+    assert_eq!(
+        engine.prune_stale_embeddings_if_complete().await.unwrap(),
+        None,
+        "a chunk taken by another model puts the active model below full coverage"
+    );
+    assert_eq!(
+        engine.embed_pending().await.unwrap(),
+        1,
+        "and back in the backlog"
+    );
+    assert_eq!(
+        engine.prune_stale_embeddings_if_complete().await.unwrap(),
+        Some(0)
+    );
+}
+
 // --- one pass at a time ------------------------------------------------------
 
 /// An embedder that holds every batch until the test opens the gate, says when

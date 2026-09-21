@@ -2177,6 +2177,20 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn prune_embeddings_except(&self, model: &str) -> Result<usize> {
+        // Clears embeddings, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let n = self
+            .conn
+            .execute(
+                "UPDATE chunk SET embedding=NULL, dims=NULL, model=NULL \
+                 WHERE embedding IS NOT NULL AND (model IS NULL OR model <> ?1)",
+                vec![Value::Text(model.to_string())],
+            )
+            .await?;
+        Ok(n as usize)
+    }
+
     async fn embedding_coverage(&self) -> Result<EmbeddingCoverage> {
         // Fast path in a tight scope so the std::sync guard is dropped before the
         // recompute await below (clippy::await_holding_lock), tag_cache style.

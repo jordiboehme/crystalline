@@ -205,11 +205,11 @@ CREATE INDEX idx_chunk_hash ON chunk(text_hash);
 
 // M4 gives the chunk table a native vector embedding column. The v1 table used
 // a placeholder `BLOB`; v2 recreates it with `F32_BLOB(384)` so `vector_distance_cos`
-// runs over it. The 384 matches the local bge default; turso 0.6.1 does not
-// enforce the declared width, so other providers (whose dims are recorded in the
-// `dims` column and validated in Rust) store their vectors here too. The chunk
-// table is a derived, rebuildable cache, so recreating it loses nothing that a
-// resync plus embed pass does not restore.
+// runs over it. The 384 matches the models in `embed::models`, all of which are
+// 384 wide; turso 0.6.1 does not enforce the declared width, so other providers
+// (whose dims are recorded in the `dims` column and validated in Rust) store
+// their vectors here too. The chunk table is a derived, rebuildable cache, so
+// recreating it loses nothing that a resync plus embed pass does not restore.
 const SCHEMA_V2: &str = r#"
 DROP TABLE IF EXISTS chunk;
 

@@ -77,9 +77,20 @@ pub trait EmbeddingProvider: Send + Sync {
 /// The model id implied by a config, defaulting to the local model when none is
 /// configured. The chunker and the provider must agree on this string so
 /// fingerprints computed at sync time match the model that later embeds them.
+///
+/// A value [`models`] recognises resolves to that entry's canonical short id,
+/// so the three legal spellings of one local model (the short id, the
+/// repository id, either of them padded) key their vectors the same way and
+/// agree with what [`EmbeddingProvider::model_id`] reports. Anything else is
+/// passed through as written, trimmed of nothing: an openai-compatible
+/// endpoint names its own ids and nothing here knows better than the config
+/// what one of those means.
 pub fn configured_model_id(cfg: Option<&EmbeddingsConfig>) -> String {
     match cfg {
-        Some(c) if !c.model.trim().is_empty() => c.model.clone(),
+        Some(c) if !c.model.trim().is_empty() => match local_model(&c.model) {
+            Some(m) => m.id.to_string(),
+            None => c.model.clone(),
+        },
         _ => DEFAULT_MODEL_ID.to_string(),
     }
 }
@@ -258,4 +269,52 @@ pub async fn run_embedding_pass_with_page(
         chunks: done,
         batches,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(model: &str) -> EmbeddingsConfig {
+        EmbeddingsConfig {
+            provider: "local".to_string(),
+            model: model.to_string(),
+            endpoint: None,
+            api_key_env: None,
+        }
+    }
+
+    #[test]
+    fn a_configured_model_the_table_knows_resolves_to_its_canonical_id() {
+        // The three spellings of one model. Each has to key vectors the same
+        // way, because the id the config implies is what the daemon stores
+        // against every vector while the provider reports the table's id.
+        for spelling in [
+            "bge-small-en-v1.5",
+            "BAAI/bge-small-en-v1.5",
+            "  BAAI/bge-small-en-v1.5  ",
+        ] {
+            assert_eq!(
+                configured_model_id(Some(&cfg(spelling))),
+                "bge-small-en-v1.5",
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_the_table_does_not_know_is_passed_through_unchanged() {
+        // An openai-compatible endpoint names its own ids, and nothing here
+        // knows better than the config what one of those means.
+        assert_eq!(
+            configured_model_id(Some(&cfg("text-embedding-3-small"))),
+            "text-embedding-3-small"
+        );
+    }
+
+    #[test]
+    fn no_model_and_a_blank_model_both_mean_the_default() {
+        assert_eq!(configured_model_id(None), DEFAULT_MODEL_ID);
+        assert_eq!(configured_model_id(Some(&cfg("   "))), DEFAULT_MODEL_ID);
+    }
 }
