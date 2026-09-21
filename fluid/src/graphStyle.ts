@@ -17,11 +17,29 @@ import { ANCHOR_CLASS, FADED_CLASS } from "./graphElements";
 /**
  * Force directed, and settled before it is shown rather than animated into
  * place: the picture is there to be read, not watched.
+ *
+ * The spacing is named because the library's defaults (an ideal edge of 32,
+ * repulsion of 2048, components 40 apart) stand engram names on top of one
+ * another the moment a neighbourhood has more than a handful of nodes. The
+ * numbers here are tuned to one measurement the test pins: the closest pair
+ * of nodes in a settled layout stands at least twice as far apart as with
+ * the defaults.
+ *
+ * Repulsion, not edge length, is the lever: cose caps how far a node can move
+ * per step, not how hard it is pushed, so a longer ideal edge just stretches
+ * and folds the ring, standing non-adjacent nodes back on top of each other -
+ * measured worse than the default, not better. Repulsion is the one force
+ * that pushes every pair apart, so it does almost all the work here; it is a
+ * function because the library reads it per node.
  */
 export const GRAPH_LAYOUT: LayoutOptions = {
   name: "cose",
   animate: false,
   padding: 24,
+  idealEdgeLength: () => 40,
+  nodeRepulsion: () => 3000000,
+  componentSpacing: 80,
+  nodeOverlap: 12,
 };
 
 /**
