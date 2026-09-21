@@ -1,10 +1,14 @@
-//! The local embedding provider: BAAI/bge-small-en-v1.5 on CPU via candle.
+//! The local embedding provider: one of the models in [`crate::embed::models`]
+//! on CPU via candle.
 //!
-//! The model, tokenizer and config are fetched with hf-hub into Crystalline's
-//! own model cache on first use (not hf-hub's default location). bge produces a
-//! sentence embedding from the `[CLS]` token followed by L2 normalization, and it
-//! expects a short instruction prefix in front of a search query but embeds
-//! documents bare; both are handled here. Inference is CPU only (no metal or cuda
+//! The model files are fetched with hf-hub into Crystalline's own model cache
+//! on first use (not hf-hub's default location). Which encoder the weights load
+//! into and what a search query is prefixed with come from the model's table
+//! entry: bge runs through candle's stock `bert` and wants a short instruction
+//! in front of a query, granite runs through the vendored [`super::modernbert`]
+//! and wants nothing in front of anything. Both produce a sentence embedding
+//! from the `[CLS]` position followed by L2 normalization, and documents are
+//! embedded bare under either. Inference is CPU only (no metal or cuda
 //! features) so the release binaries stay portable, and it runs on a blocking
 //! thread so it never stalls the async runtime. A load failure from a truncated
 //! or corrupt cache self-heals: the model directory is wiped and fetched once
@@ -18,21 +22,22 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config};
+use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use crystalline_core::config::{self, EmbeddingsConfig};
 use hf_hub::api::Progress;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Cache, Repo, RepoType};
+use indexmap::IndexMap;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-use super::{BGE_QUERY_PREFIX, DEFAULT_MODEL_ID, EmbeddingProvider};
+use super::models::{Architecture, LocalModel, lookup_local_model};
+use super::modernbert::{Config as ModernBertConfig, ModernBert};
+use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
 use crate::error::{IndexError, Result};
 
-/// The Hugging Face repository the weights come from.
-const HF_REPO: &str = "BAAI/bge-small-en-v1.5";
-/// bge-small-en-v1.5 embedding width.
-const DIMS: usize = 384;
-/// The model's maximum input length in tokens.
+/// The model's maximum input length in tokens. Both table entries truncate
+/// here: the chunker never produces more, and granite's 32k positions
+/// notwithstanding the cap is what bounds the tokenizer's own allocation.
 const MAX_INPUT_TOKENS: usize = 512;
 /// The hard character cap applied to every input before tokenization. The
 /// tokenizer materializes the full `Encoding` (ids, tokens, offsets and masks,
@@ -42,75 +47,86 @@ const MAX_INPUT_TOKENS: usize = 512;
 /// chunker produced; it only bounds a caller that skipped chunking.
 const MAX_INPUT_CHARS: usize = MAX_INPUT_TOKENS * 6;
 
-/// A locally hosted bge provider.
+/// A locally hosted provider, running the model its configuration named.
 pub struct LocalProvider {
-    inner: Arc<Bert>,
-    model_id: String,
+    inner: Arc<Encoder>,
+    model: &'static LocalModel,
 }
 
 /// The loaded model, tokenizer and device, shared into the blocking inference
 /// task.
-struct Bert {
-    model: BertModel,
+struct Encoder {
+    loaded: Loaded,
     tokenizer: Tokenizer,
     device: Device,
+}
+
+/// The two encoders behind one seam. Both return `(batch, seq, hidden)`.
+enum Loaded {
+    Bert(BertModel),
+    ModernBert(ModernBert),
 }
 
 impl LocalProvider {
     /// Load the provider, downloading the model on first use. Runs on a blocking
     /// thread because loading mmaps and parses the weights.
     pub async fn load(cfg: &EmbeddingsConfig) -> Result<LocalProvider> {
-        let model_id = if cfg.model.trim().is_empty() {
-            DEFAULT_MODEL_ID.to_string()
-        } else {
-            cfg.model.clone()
-        };
+        // Refused here rather than guessed: a model whose architecture and
+        // prefix the code does not know produces vectors that are quietly
+        // wrong.
+        let model = lookup_local_model(configured_or_default(cfg))?;
         let cache_dir = models_cache_dir()?;
-        let id_for_task = model_id.clone();
-        let bert = tokio::task::spawn_blocking(move || load_bert(&cache_dir, &id_for_task))
+        let encoder = tokio::task::spawn_blocking(move || load_encoder(&cache_dir, model))
             .await
             .map_err(|e| IndexError::Embedding(format!("model load task failed: {e}")))??;
         Ok(LocalProvider {
-            inner: Arc::new(bert),
-            model_id,
+            inner: Arc::new(encoder),
+            model,
         })
+    }
+
+    /// The batch path both entry points share: already prefixed and capped.
+    async fn run(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || embed_texts(&inner, &texts))
+            .await
+            .map_err(|e| IndexError::Embedding(format!("embedding task failed: {e}")))?
     }
 }
 
 #[async_trait]
 impl EmbeddingProvider for LocalProvider {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let inner = self.inner.clone();
-        // Capped here, where the batch is first copied for the blocking task, so
-        // an oversized chunk row bounds every copy downstream. See
+        // Documents are embedded bare under both models. The character cap is
+        // applied here, where the batch is first copied for the blocking task,
+        // so an oversized chunk row bounds every copy downstream. See
         // MAX_INPUT_CHARS.
-        let texts: Vec<String> = texts
+        let prepared: Vec<String> = texts
             .iter()
             .map(|t| cap_chars(t, MAX_INPUT_CHARS).to_string())
             .collect();
-        tokio::task::spawn_blocking(move || embed_texts(&inner, &texts))
-            .await
-            .map_err(|e| IndexError::Embedding(format!("embedding task failed: {e}")))?
+        self.run(prepared).await
     }
 
     async fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        // bge expects the query instruction prefix; documents are embedded bare.
-        let prefixed: Vec<String> = texts
+        // The table entry's query prefix: bge's instruction, granite's nothing.
+        // Capped before the prefix so the prefix always survives the cap.
+        let prepared: Vec<String> = texts
             .iter()
-            .map(|t| format!("{BGE_QUERY_PREFIX}{t}"))
+            .map(|t| self.model.query_text(cap_chars(t, MAX_INPUT_CHARS)))
             .collect();
-        self.embed(&prefixed).await
+        self.run(prepared).await
     }
 
     fn model_id(&self) -> &str {
-        &self.model_id
+        self.model.id
     }
 
     fn dims(&self) -> usize {
-        DIMS
+        self.model.dims
     }
 
     fn max_input_tokens(&self) -> usize {
@@ -118,18 +134,30 @@ impl EmbeddingProvider for LocalProvider {
     }
 }
 
+/// The model a configuration names, or the default when it names none.
+fn configured_or_default(cfg: &EmbeddingsConfig) -> &str {
+    let requested = cfg.model.trim();
+    if requested.is_empty() {
+        DEFAULT_MODEL_ID
+    } else {
+        requested
+    }
+}
+
 /// Pre-fetch the model files and report the cache location and size.
-pub async fn download(_cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
+pub async fn download(cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
+    let model = lookup_local_model(configured_or_default(cfg))?;
     let cache_dir = models_cache_dir()?;
     tokio::task::spawn_blocking(move || {
-        let files = ensure_files(&cache_dir)?;
-        let bytes = [&files.config, &files.tokenizer, &files.weights]
-            .iter()
+        let files = ensure_files(&cache_dir, model)?;
+        let bytes = files
+            .paths
+            .values()
             .filter_map(|p| std::fs::metadata(p).ok())
             .map(|m| m.len())
             .sum();
         let path = files
-            .weights
+            .weights()?
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or(cache_dir);
@@ -143,11 +171,43 @@ fn models_cache_dir() -> Result<PathBuf> {
     config::models_dir().map_err(|e| IndexError::Embedding(format!("model cache dir: {e}")))
 }
 
-/// The fetched file paths for the model repo.
+/// The fetched file paths for the model repo, by file name, in fetch order.
 struct ModelFiles {
-    config: PathBuf,
-    tokenizer: PathBuf,
-    weights: PathBuf,
+    paths: IndexMap<String, PathBuf>,
+}
+
+impl ModelFiles {
+    fn get(&self, name: &str) -> Option<&PathBuf> {
+        self.paths.get(name)
+    }
+
+    /// A file the loader cannot do without. Missing means the table entry's
+    /// file list and the loader disagree, which is a bug rather than a bad
+    /// download, so it says so plainly.
+    fn required(&self, name: &str) -> Result<&PathBuf> {
+        self.get(name).ok_or_else(|| {
+            IndexError::Embedding(format!(
+                "the model's file list does not name {name}, which the loader needs"
+            ))
+        })
+    }
+
+    fn config(&self) -> Result<&PathBuf> {
+        self.required("config.json")
+    }
+
+    fn tokenizer(&self) -> Result<&PathBuf> {
+        self.required("tokenizer.json")
+    }
+
+    /// Absent for bge, which never shipped one in its three-file list.
+    fn tokenizer_config(&self) -> Option<&PathBuf> {
+        self.get("tokenizer_config.json")
+    }
+
+    fn weights(&self) -> Result<&PathBuf> {
+        self.required("model.safetensors")
+    }
 }
 
 /// Adapts hf-hub's per-chunk [`Progress`] callbacks (one `update` call per
@@ -215,8 +275,9 @@ impl Progress for ByteProgress {
     }
 }
 
-/// Fetch `config.json`, `tokenizer.json` and `model.safetensors` into the
-/// cache, announcing a first-use download once to stderr. When the whole
+/// Fetch the model entry's own file list into the cache, announcing a
+/// first-use download once to stderr. The list is per model, so a model that
+/// never needed a file is never made to dial out for it. When the whole
 /// download is needed (nothing cached yet) and stderr is a live terminal, each
 /// file also gets a `\r`-updated byte-progress line via [`ByteProgress`];
 /// piped or redirected stderr (a log file, `--json`'s non-interactive
@@ -224,19 +285,23 @@ impl Progress for ByteProgress {
 /// A file already present in the cache is resolved with no network call at
 /// all, so a fully warmed cache - the air-gapped and CI-prefetch paths -
 /// never dials out just to check.
-fn ensure_files(cache_dir: &Path) -> Result<ModelFiles> {
+fn ensure_files(cache_dir: &Path, model: &LocalModel) -> Result<ModelFiles> {
     std::fs::create_dir_all(cache_dir).map_err(|e| IndexError::Io {
         path: cache_dir.display().to_string(),
         source: e,
     })?;
 
-    let hub_cache =
-        Cache::new(cache_dir.to_path_buf()).repo(Repo::new(HF_REPO.to_string(), RepoType::Model));
+    let hub_cache = Cache::new(cache_dir.to_path_buf())
+        .repo(Repo::new(model.repo.to_string(), RepoType::Model));
+    // The weights alone decide whether this is a first-use download: they are
+    // the file worth a notice and a progress line.
     let cached = hub_cache.get("model.safetensors").is_some();
     if !cached {
         eprintln!(
-            "crystalline: downloading embedding model {HF_REPO} to {} (first use, about 130 MB)...",
-            cache_dir.display()
+            "crystalline: downloading embedding model {} to {} (first use, about {} MB)...",
+            model.repo,
+            cache_dir.display(),
+            model.download_mb
         );
     }
     let show_progress = !cached && std::io::stderr().is_terminal();
@@ -249,7 +314,7 @@ fn ensure_files(cache_dir: &Path) -> Result<ModelFiles> {
         .with_progress(false)
         .build()
         .map_err(|e| IndexError::Embedding(format!("hub client: {e}")))?;
-    let repo = api.model(HF_REPO.to_string());
+    let repo = api.model(model.repo.to_string());
     let fetch = |name: &str| -> Result<PathBuf> {
         if let Some(path) = hub_cache.get(name) {
             return Ok(path);
@@ -261,43 +326,47 @@ fn ensure_files(cache_dir: &Path) -> Result<ModelFiles> {
         }
         .map_err(|e| IndexError::Embedding(format!("downloading {name}: {e}")))
     };
-    Ok(ModelFiles {
-        config: fetch("config.json")?,
-        tokenizer: fetch("tokenizer.json")?,
-        weights: fetch("model.safetensors")?,
-    })
+    let mut paths = IndexMap::with_capacity(model.files.len());
+    for name in model.files {
+        paths.insert((*name).to_string(), fetch(name)?);
+    }
+    Ok(ModelFiles { paths })
 }
 
 /// Load the model, self-healing once from a corrupt cache.
-fn load_bert(cache_dir: &Path, _model_id: &str) -> Result<Bert> {
-    let files = ensure_files(cache_dir)?;
-    match build_bert(&files) {
-        Ok(bert) => Ok(bert),
+fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder> {
+    let files = ensure_files(cache_dir, model)?;
+    match build_encoder(&files, model) {
+        Ok(encoder) => Ok(encoder),
         Err(first) => {
             // A truncated or corrupt cache: wipe the model directory and fetch
             // once more before surfacing the failure.
             eprintln!(
                 "crystalline: embedding model failed to load ({first}); re-downloading once..."
             );
-            wipe_model_dir(cache_dir);
-            let files = ensure_files(cache_dir)?;
-            build_bert(&files)
+            wipe_model_dir(cache_dir, model);
+            let files = ensure_files(cache_dir, model)?;
+            build_encoder(&files, model)
         }
     }
 }
 
-fn build_bert(files: &ModelFiles) -> Result<Bert> {
-    let config_text = std::fs::read_to_string(&files.config).map_err(|e| IndexError::Io {
-        path: files.config.display().to_string(),
-        source: e,
-    })?;
-    let config: Config = serde_json::from_str(&config_text)
-        .map_err(|e| IndexError::Embedding(format!("parsing config.json: {e}")))?;
+fn build_encoder(files: &ModelFiles, model: &LocalModel) -> Result<Encoder> {
+    let config_text = read(files.config()?)?;
+    // A cache holding another model's files fails here, by name, rather than
+    // deep inside candle on a missing tensor.
+    check_model_type(&config_text, model)?;
 
-    let mut tokenizer = Tokenizer::from_file(&files.tokenizer)
+    let mut tokenizer = Tokenizer::from_file(files.tokenizer()?)
         .map_err(|e| IndexError::Embedding(format!("loading tokenizer.json: {e}")))?;
+    let tokenizer_config_text = match files.tokenizer_config() {
+        Some(path) => read(path)?,
+        None => "{}".to_string(),
+    };
+    let pad = pad_id(&tokenizer, &tokenizer_config_text, &config_text)?;
     tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::BatchLongest,
+        pad_id: pad,
         ..PaddingParams::default()
     }));
     tokenizer
@@ -309,23 +378,96 @@ fn build_bert(files: &ModelFiles) -> Result<Bert> {
 
     let device = Device::Cpu;
     // Safety: the file is a trusted, freshly verified download; mmap is the
-    // standard candle load path.
+    // standard candle load path. BF16 weights (granite) become F32 here.
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(
-            std::slice::from_ref(&files.weights),
+            std::slice::from_ref(files.weights()?),
             DType::F32,
             &device,
         )
         .map_err(|e| IndexError::Embedding(format!("loading weights: {e}")))?
     };
-    let model = BertModel::load(vb, &config)
-        .map_err(|e| IndexError::Embedding(format!("building model: {e}")))?;
+    let loaded = match model.architecture {
+        Architecture::Bert => {
+            let config: BertConfig = parse_config(&config_text)?;
+            Loaded::Bert(BertModel::load(vb, &config).map_err(build_error)?)
+        }
+        Architecture::ModernBert => {
+            let config: ModernBertConfig = parse_config(&config_text)?;
+            Loaded::ModernBert(ModernBert::load(vb, &config).map_err(build_error)?)
+        }
+    };
 
-    Ok(Bert {
-        model,
+    Ok(Encoder {
+        loaded,
         tokenizer,
         device,
     })
+}
+
+fn read(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| IndexError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })
+}
+
+fn parse_config<T: serde::de::DeserializeOwned>(config_json: &str) -> Result<T> {
+    serde_json::from_str(config_json)
+        .map_err(|e| IndexError::Embedding(format!("parsing config.json: {e}")))
+}
+
+fn build_error(e: candle_core::Error) -> IndexError {
+    IndexError::Embedding(format!("building model: {e}"))
+}
+
+/// The `model_type` in `config.json` must be the table entry's.
+fn check_model_type(config_json: &str, model: &LocalModel) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|e| IndexError::Embedding(format!("parsing config.json: {e}")))?;
+    match value.get("model_type").and_then(|v| v.as_str()) {
+        Some(found) if found == model.model_type() => Ok(()),
+        found => Err(IndexError::Embedding(format!(
+            "the cached config.json for {} declares model_type {:?}, expected \"{}\"; the model cache holds the wrong files",
+            model.repo,
+            found,
+            model.model_type()
+        ))),
+    }
+}
+
+/// The pad id: the tokenizer's id for `tokenizer_config.json`'s `pad_token`,
+/// which has to agree with `config.json`'s `pad_token_id`. The default of 0 is
+/// a real content token in granite's vocabulary (its pad is 179935), so it is
+/// never assumed. Only batched calls pad at all, and the mask hides the pad
+/// positions either way; the check is free and a mismatch means a mixed cache.
+fn pad_id(tokenizer: &Tokenizer, tokenizer_config_json: &str, config_json: &str) -> Result<u32> {
+    let config: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|e| IndexError::Embedding(format!("parsing config.json: {e}")))?;
+    let from_model = config
+        .get("pad_token_id")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let tokenizer_config: serde_json::Value = serde_json::from_str(tokenizer_config_json)
+        .map_err(|e| IndexError::Embedding(format!("parsing tokenizer_config.json: {e}")))?;
+    let from_tokenizer = tokenizer_config
+        .get("pad_token")
+        // A pad token is written either as the plain string or, in the
+        // transformers "AddedToken" form, as an object carrying `content`.
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.as_str()),
+            other => other.get("content").and_then(|c| c.as_str()),
+        })
+        .and_then(|t| tokenizer.token_to_id(t));
+    match (from_tokenizer, from_model) {
+        (Some(t), Some(m)) if t == m => Ok(t),
+        (Some(t), Some(m)) => Err(IndexError::Embedding(format!(
+            "pad token mismatch: tokenizer_config.json's pad token is id {t}, config.json says pad_token_id {m}; the model cache holds mixed files"
+        ))),
+        (Some(t), None) => Ok(t),
+        (None, Some(m)) => Ok(m),
+        (None, None) => Ok(0),
+    }
 }
 
 /// Truncate to at most `max_chars` characters on a char boundary.
@@ -336,7 +478,7 @@ fn cap_chars(text: &str, max_chars: usize) -> &str {
     }
 }
 
-fn embed_texts(bert: &Bert, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+fn embed_texts(encoder: &Encoder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     // The last line of defense before `encode_batch`, a no-op on a batch the
     // caller already capped. The batch is copied for `encode_batch` either way,
     // so the cap costs nothing on top.
@@ -344,7 +486,9 @@ fn embed_texts(bert: &Bert, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         .iter()
         .map(|t| cap_chars(t, MAX_INPUT_CHARS).to_string())
         .collect();
-    let encodings = bert
+    // `true` is what puts `<|startoftext|>` at position 0 for granite and
+    // `[CLS]` there for bge, which is what the pooling below reads.
+    let encodings = encoder
         .tokenizer
         .encode_batch(inputs, true)
         .map_err(|e| IndexError::Embedding(format!("tokenizing: {e}")))?;
@@ -359,32 +503,134 @@ fn embed_texts(bert: &Bert, texts: &[String]) -> Result<Vec<Vec<f32>>> {
     }
 
     let compute = || -> candle_core::Result<Vec<Vec<f32>>> {
-        let input_ids = Tensor::from_vec(ids, (batch, seq_len), &bert.device)?;
-        let attention = Tensor::from_vec(mask, (batch, seq_len), &bert.device)?;
-        let token_type = input_ids.zeros_like()?;
-        let sequence = bert
-            .model
-            .forward(&input_ids, &token_type, Some(&attention))?;
-        // bge sentence embedding: the [CLS] token (position 0), then L2 norm.
-        let cls = sequence.narrow(1, 0, 1)?.squeeze(1)?;
-        let normalized = normalize_l2(&cls)?;
+        let input_ids = Tensor::from_vec(ids, (batch, seq_len), &encoder.device)?;
+        let attention = Tensor::from_vec(mask, (batch, seq_len), &encoder.device)?;
+        let sequence = match &encoder.loaded {
+            Loaded::Bert(model) => {
+                let token_type = input_ids.zeros_like()?;
+                model.forward(&input_ids, &token_type, Some(&attention))?
+            }
+            // ModernBERT has no segment embeddings and takes the raw
+            // (batch, seq) mask: it builds its own 4D additive mask and the
+            // sliding-window band inside `forward`. Do not pre-expand it.
+            Loaded::ModernBert(model) => model.forward(&input_ids, &attention)?,
+        };
+        // (batch, seq, hidden) out of either encoder; the sentence vector is
+        // the [CLS] position (both models' own pooling), then L2 norm.
+        let pooled = cls_pool(&sequence)?;
+        let normalized = normalize_l2(&pooled)?;
         normalized.to_vec2::<f32>()
     };
     compute().map_err(|e| IndexError::Embedding(format!("inference: {e}")))
+}
+
+/// The `[CLS]` position of every row: position 0, which the tokenizer's
+/// post-processor guarantees is the start token for both table entries.
+fn cls_pool(sequence: &Tensor) -> candle_core::Result<Tensor> {
+    sequence.narrow(1, 0, 1)?.squeeze(1)
 }
 
 fn normalize_l2(v: &Tensor) -> candle_core::Result<Tensor> {
     v.broadcast_div(&v.sqr()?.sum_keepdim(1)?.sqrt()?)
 }
 
-fn wipe_model_dir(cache_dir: &Path) {
-    let dir = cache_dir.join(format!("models--{}", HF_REPO.replace('/', "--")));
+fn wipe_model_dir(cache_dir: &Path, model: &LocalModel) {
+    let dir = cache_dir.join(model.cache_dir_name());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_INPUT_CHARS, cap_chars};
+    use candle_core::{Device, Tensor};
+
+    use super::{MAX_INPUT_CHARS, cap_chars, check_model_type, cls_pool, pad_id};
+    use crate::embed::models::lookup_local_model;
+
+    #[test]
+    fn cls_pooling_takes_the_first_position_of_every_row() {
+        let device = Device::Cpu;
+        let sequence = Tensor::from_vec(
+            vec![
+                1.0f32, 2.0, 3.0, 4.0, 100.0, 100.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+            ],
+            (2, 3, 2),
+            &device,
+        )
+        .unwrap();
+        let pooled = cls_pool(&sequence).unwrap().to_vec2::<f32>().unwrap();
+        assert_eq!(pooled[0], vec![1.0, 2.0]);
+        assert_eq!(pooled[1], vec![5.0, 6.0]);
+    }
+
+    /// A cache holding the wrong model's files would otherwise fail deep
+    /// inside candle with a missing-tensor message; the refusal names both.
+    #[test]
+    fn a_config_whose_model_type_is_not_the_tables_is_refused() {
+        let granite = lookup_local_model("granite-embedding-97m-multilingual-r2").unwrap();
+        assert!(check_model_type(r#"{"model_type": "modernbert"}"#, granite).is_ok());
+        let err = check_model_type(r#"{"model_type": "bert"}"#, granite)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("modernbert") && err.contains("bert"), "{err}");
+        // bge's config.json declares "bert".
+        let bge = lookup_local_model("bge-small-en-v1.5").unwrap();
+        assert!(check_model_type(r#"{"model_type": "bert"}"#, bge).is_ok());
+        // A config with no model_type at all is a refusal too, not a guess.
+        assert!(check_model_type(r#"{}"#, granite).is_err());
+    }
+
+    /// The pad id is what the tokenizer says the configured pad token is, and
+    /// it has to agree with the model config; a disagreement means a mixed or
+    /// corrupt cache.
+    #[test]
+    fn the_pad_id_comes_from_the_tokenizer_config_and_must_match_the_model_config() {
+        // A three-token tokenizer built in place: no download, no fixture.
+        // Written as a tokenizer.json rather than through the WordLevel
+        // builder, whose vocabulary type is a hasher this crate does not
+        // depend on.
+        let tokenizer = tokenizers::Tokenizer::from_bytes(
+            br#"{"version": "1.0", "truncation": null, "padding": null,
+                 "added_tokens": [], "normalizer": null, "pre_tokenizer": null,
+                 "post_processor": null, "decoder": null,
+                 "model": {"type": "WordLevel", "unk_token": "[UNK]",
+                           "vocab": {"[UNK]": 0, "hello": 1, "<|pad|>": 2}}}"#,
+        )
+        .unwrap();
+
+        let id = pad_id(
+            &tokenizer,
+            r#"{"pad_token": "<|pad|>"}"#,
+            r#"{"pad_token_id": 2}"#,
+        )
+        .unwrap();
+        assert_eq!(id, 2);
+        let err = pad_id(
+            &tokenizer,
+            r#"{"pad_token": "<|pad|>"}"#,
+            r#"{"pad_token_id": 7}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("pad"), "{err}");
+        // bge's config.json carries pad_token_id 0 and its tokenizer_config
+        // names "[PAD]"; a tokenizer config with no pad_token falls back to
+        // the model config's id alone.
+        assert_eq!(
+            pad_id(&tokenizer, r#"{}"#, r#"{"pad_token_id": 2}"#).unwrap(),
+            2
+        );
+        // The transformers "AddedToken" form of pad_token, an object with a
+        // `content` field, is the same token said another way.
+        assert_eq!(
+            pad_id(
+                &tokenizer,
+                r#"{"pad_token": {"content": "<|pad|>", "lstrip": false}}"#,
+                r#"{"pad_token_id": 2}"#
+            )
+            .unwrap(),
+            2
+        );
+    }
 
     #[test]
     fn cap_chars_bounds_input_on_a_char_boundary() {

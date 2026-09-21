@@ -1,18 +1,22 @@
 //! The embedding pipeline: the provider trait, its local and remote
 //! implementations, chunking and the batch executor that fills the index.
 //!
-//! A provider turns text into unit-normalized vectors. The default is a local
-//! bge model run on CPU with candle (behind the `local-embeddings` feature); the
-//! alternative is any OpenAI-compatible `/embeddings` endpoint. The [`Store`]
-//! itself never depends on a provider: callers embed the query and hand the
-//! vector to [`crate::SearchQuery`], and the batch executor embeds chunk text and
-//! writes it back through [`Store::store_embeddings`].
+//! A provider turns text into unit-normalized vectors. The default is one of
+//! the models in [`models`] run on CPU with candle (behind the
+//! `local-embeddings` feature); the alternative is any OpenAI-compatible
+//! `/embeddings` endpoint. The [`Store`] itself never depends on a provider:
+//! callers embed the query and hand the vector to [`crate::SearchQuery`], and
+//! the batch executor embeds chunk text and writes it back through
+//! [`Store::store_embeddings`].
 
 pub mod chunk;
+pub mod models;
 mod remote;
 
 #[cfg(feature = "local-embeddings")]
 mod local;
+#[cfg(feature = "local-embeddings")]
+mod modernbert;
 
 use std::path::PathBuf;
 
@@ -26,11 +30,10 @@ pub use chunk::{
     ChunkParams, DEFAULT_MAX_TOKENS, DEFAULT_MODEL_ID, chunk_engram, chunk_engram_with,
     estimate_tokens, fingerprint,
 };
-
-/// The bge query instruction prefix. bge embeds documents bare but expects a
-/// short instruction in front of a search query; the provider applies it in
-/// [`EmbeddingProvider::embed_queries`].
-pub const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
+pub use models::{
+    Architecture, LOCAL_MODELS, LocalModel, cached_model_dirs, hub_dir_name, local_model,
+    lookup_local_model, prune_model_cache,
+};
 
 /// How many chunks are embedded per provider call.
 pub const EMBED_BATCH_SIZE: usize = 16;
@@ -44,8 +47,8 @@ pub const EMBED_PAGE_SIZE: usize = 512;
 /// Turns text into unit-normalized embedding vectors.
 ///
 /// `embed` is for documents (chunk text, embedded bare). `embed_queries` is for
-/// search queries; its default just calls `embed`, and a model that wants a
-/// query instruction prefix (bge) overrides it.
+/// search queries; its default just calls `embed`, and a model whose table
+/// entry carries a query instruction prefix overrides it.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Embed document texts, returning one unit-normalized vector per input in
@@ -63,8 +66,9 @@ pub trait EmbeddingProvider: Send + Sync {
     /// The maximum input length in tokens, used to size chunk packing.
     fn max_input_tokens(&self) -> usize;
 
-    /// Embed search-query texts. The default falls back to [`Self::embed`]; bge
-    /// overrides it to add the query instruction prefix.
+    /// Embed search-query texts. The default falls back to [`Self::embed`]; a
+    /// provider whose model carries a query instruction prefix overrides it to
+    /// apply that prefix.
     async fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed(texts).await
     }

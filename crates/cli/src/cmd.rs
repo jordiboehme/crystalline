@@ -20,7 +20,7 @@ use crystalline_index::{
 };
 use tokio::sync::Mutex as TokioMutex;
 
-/// The embeddings config to use: the configured one, or the local bge default.
+/// The embeddings config to use: the configured one, or the local default.
 fn embeddings_config(cfg: &GlobalConfig) -> EmbeddingsConfig {
     cfg.embeddings.clone().unwrap_or_else(|| EmbeddingsConfig {
         provider: "local".to_string(),

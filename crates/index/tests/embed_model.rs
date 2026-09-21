@@ -1,7 +1,7 @@
-//! Real-model tests for the local bge provider. These download the model, so
-//! they are `#[ignore]`d and run only in the dedicated cached CI job (and
-//! locally by the implementer). Run single-threaded so the two tests do not race
-//! on the first-download file lock:
+//! Real-model tests for the local granite provider. These download the model
+//! (about 220 MB on a cold cache), so they are `#[ignore]`d and run only in the
+//! dedicated cached CI job (and locally by the implementer). Run
+//! single-threaded so the tests do not race on the first-download file lock:
 //!
 //! ```text
 //! cargo test -p crystalline-index --test embed_model -- --ignored --nocapture --test-threads=1
@@ -35,14 +35,14 @@ fn engram(title: &str, permalink: &str, body: &str) -> String {
 fn local_config() -> EmbeddingsConfig {
     EmbeddingsConfig {
         provider: "local".to_string(),
-        model: "bge-small-en-v1.5".to_string(),
+        model: "granite-embedding-97m-multilingual-r2".to_string(),
         endpoint: None,
         api_key_env: None,
     }
 }
 
 #[tokio::test]
-#[ignore = "downloads the real bge model"]
+#[ignore = "downloads the real granite model"]
 async fn model_download_reports_path_and_size() {
     let dl = download_local_model(&local_config()).await.unwrap();
     eprintln!(
@@ -55,11 +55,15 @@ async fn model_download_reports_path_and_size() {
 }
 
 #[tokio::test]
-#[ignore = "downloads the real bge model"]
+#[ignore = "downloads the real granite model"]
 async fn semantic_query_without_term_overlap_ranks_related_engram_top_three() {
     let cfg = local_config();
     let provider = provider_from_config(&cfg).await.unwrap();
-    assert_eq!(provider.dims(), 384, "bge-small is 384 dimensional");
+    assert_eq!(
+        provider.dims(),
+        384,
+        "granite-embedding-97m-multilingual-r2 is 384 dimensional"
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -135,8 +139,8 @@ async fn semantic_query_without_term_overlap_ranks_related_engram_top_three() {
         report.chunks as f64 / secs.max(1e-6)
     );
 
-    // A query with no term overlap with the target, embedded with the bge query
-    // instruction prefix via embed_queries.
+    // A query with no term overlap with the target, embedded through
+    // embed_queries so the model's own query convention applies.
     let qtext = "how do users authenticate and log in";
     let qvec = provider
         .embed_queries(&[qtext.to_string()])
@@ -177,4 +181,108 @@ async fn semantic_query_without_term_overlap_ranks_related_engram_top_three() {
         .unwrap();
     assert!(pending.is_empty(), "a warm resync re-embeds nothing");
     eprintln!("warm resync: 0 re-embeds");
+}
+
+/// The point of the model swap: one fact said in two languages has to sit
+/// closer together than either does to an unrelated fact in the same language.
+#[tokio::test]
+#[ignore = "downloads the real granite model"]
+async fn a_german_statement_is_closer_to_its_english_twin_than_to_an_unrelated_one() {
+    let provider = provider_from_config(&local_config()).await.unwrap();
+    let vectors = provider
+        .embed(&[
+            "Der Build nutzt Node 18".to_string(),
+            "The build uses Node 18".to_string(),
+            "Deployments run on Fridays".to_string(),
+        ])
+        .await
+        .unwrap();
+    let twin = cosine(&vectors[0], &vectors[1]);
+    let unrelated = cosine(&vectors[0], &vectors[2]);
+    eprintln!("cosine: de/en twin {twin:.4}, unrelated {unrelated:.4}");
+    assert!(
+        twin > unrelated,
+        "the German sentence is closer to its English twin ({twin:.4}) than to an unrelated English one ({unrelated:.4})"
+    );
+}
+
+/// Gate 1 of the granite ruling (spec section 10): the vendored, patched
+/// ModernBERT module reproduces the vendor's own ONNX export. A wrong
+/// activation lands at cosine 0.78 to 0.88 and never trips a shape error, so
+/// this is the only thing that proves the vectors are right. One text per
+/// call first (no padding can differ), then the five as one padded batch,
+/// which is the pad-id and mask check.
+#[tokio::test]
+#[ignore = "downloads the real granite model"]
+async fn the_vendored_modernbert_reproduces_the_onnx_reference_vectors() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        tolerance: Tolerance,
+        items: Vec<Item>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Tolerance {
+        min_cosine: f32,
+        max_abs_diff: f32,
+    }
+    #[derive(serde::Deserialize)]
+    struct Item {
+        label: String,
+        text: String,
+        vector: Vec<f32>,
+    }
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("fixtures/granite-parity.json")).unwrap();
+    let provider = provider_from_config(&local_config()).await.unwrap();
+
+    let mut single = Vec::new();
+    for item in &fixture.items {
+        let v = provider
+            .embed(std::slice::from_ref(&item.text))
+            .await
+            .unwrap()
+            .remove(0);
+        let cos = cosine(&v, &item.vector);
+        let diff = v
+            .iter()
+            .zip(&item.vector)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!("{}: cosine {cos:.9}, max abs diff {diff:.2e}", item.label);
+        assert!(
+            cos >= fixture.tolerance.min_cosine,
+            "{}: cosine {cos}",
+            item.label
+        );
+        assert!(
+            diff <= fixture.tolerance.max_abs_diff,
+            "{}: max abs diff {diff}",
+            item.label
+        );
+        single.push(v);
+    }
+
+    let texts: Vec<String> = fixture.items.iter().map(|i| i.text.clone()).collect();
+    let batched = provider.embed(&texts).await.unwrap();
+    for ((item, one), many) in fixture.items.iter().zip(&single).zip(&batched) {
+        let diff = one
+            .iter()
+            .zip(many)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!(
+            "{}: padded batch vs single call, max abs diff {diff:.2e}",
+            item.label
+        );
+        assert!(
+            diff <= fixture.tolerance.max_abs_diff,
+            "{}: the padded batch differs from the single call by {diff}",
+            item.label
+        );
+    }
+}
+
+/// Unit vectors, so the dot product is the cosine.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
