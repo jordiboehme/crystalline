@@ -99,6 +99,9 @@ describe("attachments in the reading view", () => {
     expect(around.style.marginRight).toBe("auto");
     expect(around.style.maxWidth).toBe("100%");
     expect(around.style.float).toBe("");
+    // The wrapper hugs a picture nobody gave a width to, so the image inside
+    // it keeps its own size rather than filling a box measured from itself.
+    expect(image(container).classList.contains("w-full")).toBe(false);
   });
 
   it("reads the fragment for placement and width, and never sends it", async () => {
@@ -125,6 +128,10 @@ describe("attachments in the reading view", () => {
 
     const pixels = await renderMarkdown("![a](assets/a.png#w=300)", DOMAIN);
     expect(placement(pixels.container).style.width).toBe("300px");
+    // And the image fills the width that was asked for, which is what it did
+    // when the width sat on the image itself: a file narrower than 300px is
+    // still drawn at 300px.
+    expect(image(pixels.container).classList.contains("w-full")).toBe(true);
   });
 
   it("links a non-image attachment to the files route in a new tab", async () => {

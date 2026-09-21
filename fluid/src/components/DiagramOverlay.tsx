@@ -90,31 +90,39 @@ export interface DiagramOverlayProps {
  * The picture's own size, for the fit. A drawing states it in the viewBox
  * mermaid always writes; an image has it only once the browser has the file,
  * and answers zero until then, which is no size rather than a small one.
+ *
+ * The drawing is asked first, and the order is the whole point: a diagram may
+ * carry an `<img>` of its own inside a label, and a host that answered with
+ * that picture's size would fit the window to the label rather than to the
+ * diagram around it. An image host has no drawing in it and falls through.
  */
 function naturalSize(
   host: HTMLElement,
 ): { width: number; height: number } | null {
-  const image = host.querySelector("img");
-  if (image !== null) {
-    return image.naturalWidth > 0 && image.naturalHeight > 0
-      ? { width: image.naturalWidth, height: image.naturalHeight }
-      : null;
-  }
   const drawing = host.querySelector("svg");
-  const viewBox = drawing?.getAttribute("viewBox") ?? null;
-  if (viewBox === null) {
+  if (drawing !== null) {
+    const viewBox = drawing.getAttribute("viewBox");
+    if (viewBox === null) {
+      return null;
+    }
+    const parts = viewBox.trim().split(/[\s,]+/);
+    if (parts.length !== 4) {
+      return null;
+    }
+    const width = Number(parts[2]);
+    const height = Number(parts[3]);
+    if (!Number.isFinite(width) || !Number.isFinite(height)) {
+      return null;
+    }
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+  const image = host.querySelector("img");
+  if (image === null) {
     return null;
   }
-  const parts = viewBox.trim().split(/[\s,]+/);
-  if (parts.length !== 4) {
-    return null;
-  }
-  const width = Number(parts[2]);
-  const height = Number(parts[3]);
-  if (!Number.isFinite(width) || !Number.isFinite(height)) {
-    return null;
-  }
-  return width > 0 && height > 0 ? { width, height } : null;
+  return image.naturalWidth > 0 && image.naturalHeight > 0
+    ? { width: image.naturalWidth, height: image.naturalHeight }
+    : null;
 }
 
 /**
