@@ -27,17 +27,12 @@
  * send, and the back button moves between them.
  */
 
-import {
-  useInfiniteQuery,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { Fragment, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
-import { archiveDownloadUrl, unregisterDomain } from "../api/admin";
+import { archiveDownloadUrl } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import type {
@@ -59,7 +54,9 @@ import type { TagCount } from "../api/vocabulary";
 import { useAuth } from "../auth/AuthContext";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
+import { BackupCard } from "../components/BackupCard";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
+import { DangerZoneCard } from "../components/DangerZoneCard";
 import { EngramList } from "../components/EngramList";
 import { EngramsOrderMenu } from "../components/EngramsOrderMenu";
 import { FilterFields, TagChips } from "../components/FilterControls";
@@ -170,13 +167,11 @@ function DomainPage({
 }) {
   const { capabilities } = useAuth();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const { path, filters, browse, filtering, order, listingOrder, apply } =
     useListingState();
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [confirmingUnregister, setConfirmingUnregister] = useState(false);
-  const [problem, setProblem] = useState<string | null>(null);
 
   const listing = useQuery({
     queryKey: DOMAINS_QUERY_KEY,
@@ -267,24 +262,6 @@ function DomainPage({
     navigate,
   ]);
   useRegisterCommands(commands);
-
-  const unregister = useMutation({
-    // A virtual domain's engrams are deleted with it and the server refuses to
-    // guess that the loss was intended, so the second press is what carries
-    // `purge`: this dialog is the confirmation the flag stands for.
-    mutationFn: () => unregisterDomain(domain, summary?.kind === "virtual"),
-    onSuccess: () => {
-      // The listing is what every sidebar, card and switcher draws from, and
-      // the domain this screen is about is no longer in it.
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
-      // Nowhere to stay: this address is now a wrong address.
-      void navigate("/");
-    },
-    onError: (error: Error) => {
-      setConfirmingUnregister(false);
-      setProblem(problemDetail(error));
-    },
-  });
 
   return (
     <div className="flex flex-col gap-8">
@@ -378,14 +355,6 @@ function DomainPage({
         />
       </section>
 
-      {problem !== null && (
-        <p
-          role="alert"
-          className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-        >
-          {problem}
-        </p>
-      )}
       {importing && (
         <ImportArchiveDialog
           domain={domain}
@@ -408,45 +377,6 @@ function DomainPage({
         creating={creating}
         onCreatingChange={setCreating}
         onApply={apply}
-        actions={
-          capabilities.canAdminister && (
-            <>
-              {/*
-                An anchor rather than a button that fetches: the archive
-                route is a cookie-authenticated GET, so the browser saves the
-                file itself and this app never holds a whole domain in
-                memory to hand it back. `download` is what makes it a save
-                rather than a navigation into a zip.
-              */}
-              <a
-                href={archiveDownloadUrl(domain)}
-                download
-                className={`inline-flex items-center ${BUTTON.secondary}`}
-              >
-                Download archive
-              </a>
-              <button
-                type="button"
-                onClick={() => {
-                  setImporting(true);
-                }}
-                className={BUTTON.secondary}
-              >
-                Import archive
-              </button>
-              <UnregisterDomain
-                kind={summary?.kind ?? null}
-                confirming={confirmingUnregister}
-                pending={unregister.isPending}
-                onConfirmingChange={setConfirmingUnregister}
-                onUnregister={() => {
-                  setProblem(null);
-                  unregister.mutate();
-                }}
-              />
-            </>
-          )
-        }
       />
 
       {/*
@@ -472,6 +402,32 @@ function DomainPage({
       {capabilities.canShare && summary !== undefined && (
         <ReviewModeCard domain={domain} reviewing={summary.review !== null} />
       )}
+
+      {/*
+        Last on the page: a copy of the domain, and the two ways of taking it
+        away from the people who read it. Both halves of the archive round
+        trip are admin-only endpoints, so that card is gated here. The danger
+        zone gates itself, because one of its two verbs is the owner's as well
+        as an admin's and only the members read says who the owner is; it
+        draws nothing for a caller who may reach neither. The unregister
+        confirmation is the screen's state rather than the card's, because the
+        palette row above asks the same question and must arm that exact
+        control.
+      */}
+      {capabilities.canAdminister && (
+        <BackupCard
+          domain={domain}
+          onImport={() => {
+            setImporting(true);
+          }}
+        />
+      )}
+      <DangerZoneCard
+        domain={domain}
+        kind={summary?.kind ?? null}
+        confirming={confirmingUnregister}
+        onConfirmingChange={setConfirmingUnregister}
+      />
     </div>
   );
 }
@@ -605,11 +561,12 @@ function FolderHeading({ domain, path }: { domain: string; path: string }) {
 
 /**
  * The engrams of a domain or of a folder: the heading with the order under
- * it, the actions, the subfolders, the filters, and the list.
+ * it, the subfolders, the filters, and the list.
  *
  * Shared by both pages so a folder lists exactly the way its domain does.
- * What differs between them arrives as props: the domain page adds its
- * administrative actions beside New engram, and the folder page adds none.
+ * Nothing administrative is drawn here any more: the archive round trip and
+ * unregistering have cards of their own at the foot of the domain page, so
+ * this heading carries New engram and the order menu on both pages.
  * The create dialog's open state is the page's rather than this section's,
  * because the page's palette row opens the same dialog. The order arrives as
  * a prop too, derived once by `useListingState`, so the caption, the key and
@@ -628,7 +585,6 @@ function EngramsSection({
   creating,
   onCreatingChange,
   onApply,
-  actions,
 }: {
   domain: string;
   /** The folder being browsed, empty at the domain's root. */
@@ -647,8 +603,6 @@ function EngramsSection({
   onCreatingChange: (creating: boolean) => void;
   /** Change the URL, which is the whole of the listing's state. */
   onApply: (next: ListingChange) => void;
-  /** Controls drawn beside New engram. The domain page's admin set; nothing on a folder. */
-  actions?: ReactNode;
 }) {
   const { capabilities } = useAuth();
 
@@ -683,7 +637,6 @@ function EngramsSection({
               New engram
             </button>
           )}
-          {actions}
         </div>
       </div>
       {creating && (
@@ -775,137 +728,6 @@ function EngramsSection({
         />
       )}
     </section>
-  );
-}
-
-/**
- * Unregistering a domain, behind a second press that says what is lost.
- *
- * Two steps rather than a browser confirm, for the reason the account screen
- * gives: a dialog the browser owns cannot be reached by a test, cannot be
- * styled and cannot be dismissed by the keyboard the way the rest of this can.
- *
- * What the second step says is not one sentence but two, and which one it is
- * is a fact about the domain rather than a softening: a file domain keeps its
- * markdown on disk and can be registered again from it, while a virtual
- * domain's engrams are the database's and go with it. Saying "the files stay"
- * over a virtual domain would be the app telling somebody their engrams are
- * safe on the way to deleting them.
- *
- * A `kind` of null - a listing that has not landed, which is also a listing
- * that left the chips under the domain's name unwritten - falls back to the
- * file sentence, because virtual is the kind that has to be declared and every
- * domain this app has ever registered from a folder answers `file`.
- */
-function UnregisterDomain({
-  kind,
-  confirming,
-  pending,
-  onConfirmingChange,
-  onUnregister,
-}: {
-  /** `file`, `virtual`, or null when the listing did not say. */
-  kind: string | null;
-  confirming: boolean;
-  pending: boolean;
-  onConfirmingChange: (confirming: boolean) => void;
-  onUnregister: () => void;
-}) {
-  const trigger = useRef<HTMLButtonElement>(null);
-  const wasConfirming = useRef(confirming);
-
-  /** Give up on the pending unregister, and hand the focus back to what asked. */
-  function abandon() {
-    onConfirmingChange(false);
-    trigger.current?.focus();
-  }
-
-  // The safety net for every path that collapses `confirming` without going
-  // through `abandon()` - today that is only the refusal: `unregister`'s
-  // mutation lives in the PARENT (`onError` at DomainHome.tsx), which sets
-  // `confirming` false directly and has no way to reach this ref. Escape and
-  // "Keep" both already call `abandon()` and focus the trigger synchronously,
-  // so by the time this effect runs afterward, focus is already there and
-  // the check below is a no-op for them.
-  //
-  // The body check is the discriminator that keeps the deliberate blur path
-  // honest: that path (the wrapper's own `onBlur`) also collapses
-  // `confirming`, but BECAUSE focus already moved somewhere else on purpose -
-  // stealing it back here would undo that intent. When the confirm buttons
-  // unmount out from under a refusal, the browser drops focus to the
-  // document body, which is exactly what distinguishes "focus was lost" from
-  // "focus moved on purpose".
-  useEffect(() => {
-    if (wasConfirming.current && !confirming) {
-      const active = document.activeElement;
-      if (active === document.body || active === null) {
-        trigger.current?.focus();
-      }
-    }
-    wasConfirming.current = confirming;
-  }, [confirming]);
-
-  return (
-    <div
-      className="flex flex-wrap items-center gap-2"
-      onKeyDown={(event) => {
-        if (event.key === "Escape" && confirming) {
-          event.stopPropagation();
-          abandon();
-        }
-      }}
-      onBlur={(event) => {
-        // Only when the focus actually landed somewhere else: a `focusout`
-        // with no destination is what a click looks like mid-flight, and
-        // taking the confirmation away there would eat the second press this
-        // exists to require.
-        const next = event.relatedTarget;
-        if (
-          confirming &&
-          next instanceof Node &&
-          !event.currentTarget.contains(next)
-        ) {
-          onConfirmingChange(false);
-        }
-      }}
-    >
-      <button
-        ref={trigger}
-        type="button"
-        aria-expanded={confirming}
-        disabled={pending}
-        onClick={() => {
-          onConfirmingChange(true);
-        }}
-        className={BUTTON.destructive}
-      >
-        Unregister domain
-      </button>
-      {confirming && (
-        <>
-          <button
-            type="button"
-            autoFocus
-            // Disabled while the unregister is in flight, like the trigger it
-            // replaced: a second press would send a second DELETE for a domain
-            // that is already on its way out.
-            disabled={pending}
-            onClick={onUnregister}
-            className={BUTTON.destructive}
-          >
-            Confirm unregister
-          </button>
-          <button type="button" onClick={abandon} className={BUTTON.secondary}>
-            Keep
-          </button>
-          <span className="text-sm text-slate-500 dark:text-slate-400">
-            {kind === "virtual"
-              ? "This domain's engrams live in the database and will be deleted with it; this cannot be undone, so download the archive first if you need a copy."
-              : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
-          </span>
-        </>
-      )}
-    </div>
   );
 }
 
