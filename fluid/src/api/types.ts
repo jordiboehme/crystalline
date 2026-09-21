@@ -571,6 +571,8 @@ export interface paths {
          * @description The source, not a reduction of it, so a client can render or edit it directly.
          *
          *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
+         *
+         *     `sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and the `generated_indexes` switch. `null` for `provisioning` or `tag_aliases` means the section is absent.
          */
         get: operations["get_domain_manifest"];
         /**
@@ -2046,6 +2048,20 @@ export interface components {
          * @enum {string}
          */
         FoldArg: "fold" | "discard";
+        /** @description The `generated_indexes` switch: declared, and effective. */
+        GeneratedIndexesView: {
+            /**
+             * @description The value as the frontmatter writes it, or `null` when the key is
+             *     absent.
+             * @example shared
+             */
+            declared?: string | null;
+            /**
+             * @description `local` or `shared`. Absent and unrecognized both fall to `local`.
+             * @example local
+             */
+            effective: string;
+        };
         /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
         GithubIdentityResponse: {
             /**
@@ -2249,6 +2265,68 @@ export interface components {
         LogoutResponse: {
             /** @description Always true. */
             ok: boolean;
+        };
+        /** @description A bullet the core crate flagged, kept verbatim beside why. */
+        ManifestProblem: {
+            /**
+             * @description The bullet as written, without its dash.
+             * @example widgets: w
+             */
+            bullet: string;
+            /**
+             * @description The category, in snake case: `malformed`, `unknown_type`,
+             *     `invalid_path`, `duplicate_type`, `self_alias`, `duplicate_alias`,
+             *     `non_canonical_target`, `chained_alias`.
+             * @example unknown_type
+             */
+            kind: string;
+            /** @description Why it was flagged, in the crate's words. */
+            reason: string;
+        };
+        /** @description The MANIFEST source beside the domain it belongs to, its checksum, and the features parsed out of it: what an agent routes by, what the domain provisions, which tags fold into which, and the one frontmatter switch. */
+        ManifestResponse: {
+            /**
+             * @description sha256 of the markdown, the token a later `PUT` carries in `If-Match`.
+             * @example 3f8a1c05e2
+             */
+            checksum: string;
+            /**
+             * @description The domain the MANIFEST introduces.
+             * @example eng
+             */
+            domain: string;
+            /** @description The MANIFEST markdown as written, frontmatter included. */
+            markdown: string;
+            /** @description The features read out of the markdown. */
+            sections: components["schemas"]["ManifestSections"];
+        };
+        /**
+         * @description The MANIFEST's features as the core crate reads them. Nothing here is
+         *     interpreted a second time, and a change goes through the editor: this is
+         *     a view of the source beside it.
+         */
+        ManifestSections: {
+            /**
+             * @description The `generated_indexes` frontmatter switch: what is declared and what
+             *     holds.
+             */
+            generated_indexes: components["schemas"]["GeneratedIndexesView"];
+            /**
+             * @description The required sections the MANIFEST lacks, by name: `Scope`, `When to
+             *     Use`. Empty when both are there.
+             */
+            missing: string[];
+            provisioning?: null | components["schemas"]["ProvisioningView"];
+            /**
+             * @description Which of the two an agent reads: `when_to_use`, or `scope` when When
+             *     to Use is absent or empty, or `none` when both are.
+             */
+            routing: components["schemas"]["RoutingSource"];
+            /** @description The `Scope` bullets; empty when the section is absent or empty. */
+            scope: string[];
+            tag_aliases?: null | components["schemas"]["TagAliasesView"];
+            /** @description The `When to Use` bullets; empty when the section is absent or empty. */
+            when_to_use: string[];
         };
         /**
          * @description One row of an account's MCP token list, for a management UI or CLI. Never
@@ -2616,6 +2694,26 @@ export interface components {
             /** @description The single sign-on provider, if one is configured. */
             oidc: components["schemas"]["OidcProviderView"];
         };
+        /** @description One `kind: path` declaration. */
+        ProvisioningDeclView: {
+            /**
+             * @description `skills`, `commands`, `agents` or `mcps`.
+             * @example skills
+             */
+            kind: string;
+            /**
+             * @description The folder, relative to the MANIFEST, trailing slash trimmed.
+             * @example skills
+             */
+            path: string;
+        };
+        /** @description The `Provisioning` section: what parsed, and what did not. */
+        ProvisioningView: {
+            /** @description The declarations that parsed, in document order, one per kind. */
+            decls: components["schemas"]["ProvisioningDeclView"][];
+            /** @description The bullets that did not parse, or lost to an earlier duplicate. */
+            problems: components["schemas"]["ManifestProblem"][];
+        };
         /** @description RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored. */
         RegisterBody: {
             /**
@@ -2767,6 +2865,11 @@ export interface components {
          * @enum {string}
          */
         Role: "viewer" | "editor" | "admin";
+        /**
+         * @description Which routing section an agent reads.
+         * @enum {string}
+         */
+        RoutingSource: "when_to_use" | "scope" | "none";
         /** @description The complete file text, frontmatter included. It is written verbatim: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed. */
         SaveEngramBody: {
             /**
@@ -2787,6 +2890,10 @@ export interface components {
              * @example ---
              *     title: eng
              *     ---
+             *
+             *     ## Scope
+             *
+             *     - Everything about eng
              *
              *     ## When to Use
              *
@@ -2856,6 +2963,23 @@ export interface components {
              * @example https://idp.example/authorize?client_id=...
              */
             location: string;
+        };
+        /** @description One `old -> canonical` mapping, both sides verbatim. */
+        TagAliasDeclView: {
+            /** @example Multi_Word */
+            alias: string;
+            /** @example multi-word */
+            canonical: string;
+        };
+        /** @description The `Tag Aliases` section: the mappings kept, and the bullets flagged. */
+        TagAliasesView: {
+            /** @description The mappings kept, in document order. */
+            decls: components["schemas"]["TagAliasDeclView"][];
+            /**
+             * @description The bullets flagged. A non-canonical target or a chained alias is in
+             *     both lists: kept, and flagged.
+             */
+            problems: components["schemas"]["ManifestProblem"][];
         };
         /** @description A share-link, as it was handed over. */
         TokenBody: {
@@ -5608,10 +5732,26 @@ export interface operations {
                      * @example {
                      *       "checksum": "3f8a1c05e2",
                      *       "domain": "eng",
-                     *       "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                     *       "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                     *       "sections": {
+                     *         "generated_indexes": {
+                     *           "declared": null,
+                     *           "effective": "local"
+                     *         },
+                     *         "missing": [],
+                     *         "provisioning": null,
+                     *         "routing": "when_to_use",
+                     *         "scope": [
+                     *           "Everything about eng"
+                     *         ],
+                     *         "tag_aliases": null,
+                     *         "when_to_use": [
+                     *           "Route here for eng questions."
+                     *         ]
+                     *       }
                      *     }
                      */
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["ManifestResponse"];
                 };
             };
             /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
@@ -5684,10 +5824,26 @@ export interface operations {
                      * @example {
                      *       "checksum": "3f8a1c05e2",
                      *       "domain": "eng",
-                     *       "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                     *       "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                     *       "sections": {
+                     *         "generated_indexes": {
+                     *           "declared": null,
+                     *           "effective": "local"
+                     *         },
+                     *         "missing": [],
+                     *         "provisioning": null,
+                     *         "routing": "when_to_use",
+                     *         "scope": [
+                     *           "Everything about eng"
+                     *         ],
+                     *         "tag_aliases": null,
+                     *         "when_to_use": [
+                     *           "Route here for eng questions."
+                     *         ]
+                     *       }
                      *     }
                      */
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["ManifestResponse"];
                 };
             };
             /** @description `If-Match` carries more than one entity tag: this surface expects exactly one strong checksum, not a comma-separated list. */

@@ -3154,7 +3154,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and the `generated_indexes` switch. `null` for `provisioning` or `tag_aliases` means the section is absent.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -3200,12 +3200,28 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/ManifestResponse"
                 },
                 "example": {
                   "checksum": "3f8a1c05e2",
                   "domain": "eng",
-                  "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                  "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                  "sections": {
+                    "generated_indexes": {
+                      "declared": null,
+                      "effective": "local"
+                    },
+                    "missing": [],
+                    "provisioning": null,
+                    "routing": "when_to_use",
+                    "scope": [
+                      "Everything about eng"
+                    ],
+                    "tag_aliases": null,
+                    "when_to_use": [
+                      "Route here for eng questions."
+                    ]
+                  }
                 }
               }
             }
@@ -3297,12 +3313,28 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/ManifestResponse"
                 },
                 "example": {
                   "checksum": "3f8a1c05e2",
                   "domain": "eng",
-                  "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+                  "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                  "sections": {
+                    "generated_indexes": {
+                      "declared": null,
+                      "effective": "local"
+                    },
+                    "missing": [],
+                    "provisioning": null,
+                    "routing": "when_to_use",
+                    "scope": [
+                      "Everything about eng"
+                    ],
+                    "tag_aliases": null,
+                    "when_to_use": [
+                      "Route here for eng questions."
+                    ]
+                  }
                 }
               }
             }
@@ -8444,6 +8476,28 @@
           "discard"
         ]
       },
+      "GeneratedIndexesView": {
+        "type": "object",
+        "description": "The `generated_indexes` switch: declared, and effective.",
+        "required": [
+          "effective"
+        ],
+        "properties": {
+          "declared": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The value as the frontmatter writes it, or `null` when the key is\nabsent.",
+            "example": "shared"
+          },
+          "effective": {
+            "type": "string",
+            "description": "`local` or `shared`. Absent and unrecognized both fall to `local`.",
+            "example": "local"
+          }
+        }
+      },
       "GithubIdentityResponse": {
         "type": "object",
         "description": "One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.",
@@ -8745,6 +8799,125 @@
           "ok": {
             "type": "boolean",
             "description": "Always true."
+          }
+        }
+      },
+      "ManifestProblem": {
+        "type": "object",
+        "description": "A bullet the core crate flagged, kept verbatim beside why.",
+        "required": [
+          "kind",
+          "bullet",
+          "reason"
+        ],
+        "properties": {
+          "bullet": {
+            "type": "string",
+            "description": "The bullet as written, without its dash.",
+            "example": "widgets: w"
+          },
+          "kind": {
+            "type": "string",
+            "description": "The category, in snake case: `malformed`, `unknown_type`,\n`invalid_path`, `duplicate_type`, `self_alias`, `duplicate_alias`,\n`non_canonical_target`, `chained_alias`.",
+            "example": "unknown_type"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it was flagged, in the crate's words."
+          }
+        }
+      },
+      "ManifestResponse": {
+        "type": "object",
+        "description": "The MANIFEST source beside the domain it belongs to, its checksum, and the features parsed out of it: what an agent routes by, what the domain provisions, which tags fold into which, and the one frontmatter switch.",
+        "required": [
+          "domain",
+          "markdown",
+          "checksum",
+          "sections"
+        ],
+        "properties": {
+          "checksum": {
+            "type": "string",
+            "description": "sha256 of the markdown, the token a later `PUT` carries in `If-Match`.",
+            "example": "3f8a1c05e2"
+          },
+          "domain": {
+            "type": "string",
+            "description": "The domain the MANIFEST introduces.",
+            "example": "eng"
+          },
+          "markdown": {
+            "type": "string",
+            "description": "The MANIFEST markdown as written, frontmatter included."
+          },
+          "sections": {
+            "$ref": "#/components/schemas/ManifestSections",
+            "description": "The features read out of the markdown."
+          }
+        }
+      },
+      "ManifestSections": {
+        "type": "object",
+        "description": "The MANIFEST's features as the core crate reads them. Nothing here is\ninterpreted a second time, and a change goes through the editor: this is\na view of the source beside it.",
+        "required": [
+          "scope",
+          "when_to_use",
+          "routing",
+          "missing",
+          "generated_indexes"
+        ],
+        "properties": {
+          "generated_indexes": {
+            "$ref": "#/components/schemas/GeneratedIndexesView",
+            "description": "The `generated_indexes` frontmatter switch: what is declared and what\nholds."
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The required sections the MANIFEST lacks, by name: `Scope`, `When to\nUse`. Empty when both are there."
+          },
+          "provisioning": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProvisioningView",
+                "description": "The `Provisioning` section, or `null` when the MANIFEST has none."
+              }
+            ]
+          },
+          "routing": {
+            "$ref": "#/components/schemas/RoutingSource",
+            "description": "Which of the two an agent reads: `when_to_use`, or `scope` when When\nto Use is absent or empty, or `none` when both are."
+          },
+          "scope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The `Scope` bullets; empty when the section is absent or empty."
+          },
+          "tag_aliases": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TagAliasesView",
+                "description": "The `Tag Aliases` section, or `null` when the MANIFEST has none."
+              }
+            ]
+          },
+          "when_to_use": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The `When to Use` bullets; empty when the section is absent or empty."
           }
         }
       },
@@ -9228,6 +9401,50 @@
           }
         }
       },
+      "ProvisioningDeclView": {
+        "type": "object",
+        "description": "One `kind: path` declaration.",
+        "required": [
+          "kind",
+          "path"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`skills`, `commands`, `agents` or `mcps`.",
+            "example": "skills"
+          },
+          "path": {
+            "type": "string",
+            "description": "The folder, relative to the MANIFEST, trailing slash trimmed.",
+            "example": "skills"
+          }
+        }
+      },
+      "ProvisioningView": {
+        "type": "object",
+        "description": "The `Provisioning` section: what parsed, and what did not.",
+        "required": [
+          "decls",
+          "problems"
+        ],
+        "properties": {
+          "decls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProvisioningDeclView"
+            },
+            "description": "The declarations that parsed, in document order, one per kind."
+          },
+          "problems": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManifestProblem"
+            },
+            "description": "The bullets that did not parse, or lost to an earlier duplicate."
+          }
+        }
+      },
       "RegisterBody": {
         "type": "object",
         "description": "RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored.",
@@ -9452,6 +9669,15 @@
           "admin"
         ]
       },
+      "RoutingSource": {
+        "type": "string",
+        "description": "Which routing section an agent reads.",
+        "enum": [
+          "when_to_use",
+          "scope",
+          "none"
+        ]
+      },
       "SaveEngramBody": {
         "type": "object",
         "description": "The complete file text, frontmatter included. It is written verbatim: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed.",
@@ -9476,7 +9702,7 @@
           "markdown": {
             "type": "string",
             "description": "The full MANIFEST markdown as the editor holds it.",
-            "example": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n"
+            "example": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n"
           }
         }
       },
@@ -9564,6 +9790,48 @@
             "type": "string",
             "description": "The provider's authorization endpoint, with PKCE, state and nonce.",
             "example": "https://idp.example/authorize?client_id=..."
+          }
+        }
+      },
+      "TagAliasDeclView": {
+        "type": "object",
+        "description": "One `old -> canonical` mapping, both sides verbatim.",
+        "required": [
+          "alias",
+          "canonical"
+        ],
+        "properties": {
+          "alias": {
+            "type": "string",
+            "example": "Multi_Word"
+          },
+          "canonical": {
+            "type": "string",
+            "example": "multi-word"
+          }
+        }
+      },
+      "TagAliasesView": {
+        "type": "object",
+        "description": "The `Tag Aliases` section: the mappings kept, and the bullets flagged.",
+        "required": [
+          "decls",
+          "problems"
+        ],
+        "properties": {
+          "decls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TagAliasDeclView"
+            },
+            "description": "The mappings kept, in document order."
+          },
+          "problems": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManifestProblem"
+            },
+            "description": "The bullets flagged. A non-canonical target or a chained alias is in\nboth lists: kept, and flagged."
           }
         }
       },
