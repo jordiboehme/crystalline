@@ -1,12 +1,9 @@
 /**
- * The MANIFEST: pinned first in the sidebar tree, read on its own page, and
- * edited there by an admin only.
+ * The MANIFEST's addresses: the old read page, which lands on the domain
+ * page now, and the editor, which an admin reaches and leaves from there.
  *
- * The pin is presentation over an address every domain already answers at -
- * `GET /domains/{d}/manifest` - so what this file proves is the route wiring
- * and the gate, not a new fetch. The editor half rides the same If-Match
- * discipline the engram editor uses, over `saveManifest` rather than
- * `saveEngram`.
+ * The editor half rides the same If-Match discipline the engram editor uses,
+ * over `saveManifest` rather than `saveEngram`.
  */
 
 import { screen, waitFor } from "@testing-library/react";
@@ -46,38 +43,6 @@ function emptyTree() {
   return { domain: "eng", path: "", folders: [], engrams: [] };
 }
 
-/** A minimal engram, for the one test that opens through the engram page. */
-function alphaResponse() {
-  return {
-    domain: "eng",
-    permalink: "alpha",
-    title: "Alpha",
-    type: "engram",
-    status: "stable",
-    url: "crystalline://eng/alpha",
-    content: "Alpha's body.",
-    checksum: "abc123",
-    frontmatter: { engram_type: "engram", status: "stable", tags: [] },
-    observations: [],
-    relations: [],
-    links: [],
-  };
-}
-
-/** Everything the shell needs to open a domain, an ordinary session. */
-function serve() {
-  apiMock.mockImplementation(
-    answersFor({
-      "/auth/me": () => meResponse({ user: userFixture() }),
-      "/domains": domainsResponse,
-      "/domains/eng/manifest": () => manifestResponse(),
-      "/domains/eng/tree": () => emptyTree(),
-      "/domains/eng/engrams/alpha": () => alphaResponse(),
-      "/graph": () => ({ nodes: [], edges: [], truncated: false }),
-    }),
-  );
-}
-
 /** The app, signed in at the given role, with the manifest and an empty
  *  domain tree served underneath it. */
 function serveAs(
@@ -110,47 +75,34 @@ beforeEach(() => {
   apiMock.mockReset();
 });
 
-describe("the MANIFEST", () => {
-  it("the sidebar pins MANIFEST first, apart from the engrams", async () => {
-    serve();
-    renderApp("/d/eng/e/alpha");
-    const nav = await screen.findByRole("link", { name: "MANIFEST" });
-    expect(nav).toHaveAttribute("href", "/d/eng/manifest");
-    // Not the current screen here - an engram page is open, not the manifest.
-    expect(nav).not.toHaveAttribute("aria-current");
-  });
-
-  it("the manifest page renders the markdown and offers Edit to an admin only", async () => {
-    serveAs("admin");
+describe("the MANIFEST route", () => {
+  it("lands the old manifest address on the domain page", async () => {
+    serveAs("editor", {
+      "/domains/eng/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/vocabulary": () => ({ domain: "eng", tags: [] }),
+      "/domains/eng/members": () => ({
+        owner: null,
+        visibility: "shared",
+        members: [],
+      }),
+    });
     renderApp("/d/eng/manifest");
     expect(
-      await screen.findByRole("heading", { name: "MANIFEST", level: 1 }),
-    ).toBeInTheDocument();
-    // The trail above says "eng > MANIFEST", so the title does not say the
-    // domain a second time - the line under it does, once.
-    expect(
-      screen.getByText("The eng domain, in its own words."),
+      await screen.findByRole("heading", { name: "eng", level: 1 }),
     ).toBeInTheDocument();
     expect(
-      await screen.findByText(/Route here for eng questions/),
+      await screen.findByRole("heading", { name: "Manifest", level: 2 }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("link", { name: "Edit MANIFEST" }),
-    ).toBeInTheDocument();
-    // The pinned row marks itself current the same way an engram row does.
-    expect(screen.getByRole("link", { name: "MANIFEST" })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
-  });
-
-  it("no Edit below admin", async () => {
-    serveAs("editor");
-    renderApp("/d/eng/manifest");
-    await screen.findByRole("heading", { name: /manifest/i });
-    expect(
-      screen.queryByRole("link", { name: "Edit MANIFEST" }),
-    ).not.toBeInTheDocument();
+      screen.queryByRole("heading", { name: "MANIFEST", level: 1 }),
+    ).toBeNull();
   });
 
   it("the editor saves the manifest with its If-Match token", async () => {

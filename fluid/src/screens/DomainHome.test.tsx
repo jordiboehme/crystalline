@@ -254,36 +254,36 @@ beforeEach(() => {
 });
 
 describe("the domain screen", () => {
-  it("renders the manifest's lede and the engrams at the root of the domain", async () => {
+  it("renders the whole MANIFEST and the engrams at the root of the domain", async () => {
     serve();
 
     renderApp("/d/eng");
 
-    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
-    // The manifest is one paragraph here and a link to the rest: what a
-    // reader arriving in a domain needs is what it is for, then its engrams,
-    // and a whole document in between put the list below the fold.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "eng" }),
+    ).toBeVisible();
+    // The whole document, rendered where the domain is introduced: its
+    // prose, its sections, the lot. The MANIFEST's own `# eng` folds into
+    // the page's heading, so the domain is named once.
     expect(
       await screen.findByText("What this domain is for, in one paragraph."),
     ).toBeVisible();
     expect(
-      screen.getByRole("link", { name: "Read the MANIFEST" }),
-    ).toHaveAttribute("href", "/d/eng/manifest");
-    expect(screen.queryByRole("heading", { name: "When to Use" })).toBeNull();
+      screen.getByRole("heading", { level: 2, name: "When to Use" }),
+    ).toBeVisible();
+    expect(screen.getAllByRole("heading", { name: "eng" })).toHaveLength(1);
+    expect(
+      screen.queryByRole("link", { name: "Read the MANIFEST" }),
+    ).toBeNull();
     const row = await within(await screenBody()).findByRole("link", {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
-    // At the root the line above the list says the order rather than the
-    // scope: the listing comes back newest recorded first, so the top of this
-    // page is what the domain learned most recently.
     expect(
       within(await screenBody()).getByText(
         "Newest first, by the date they were recorded.",
       ),
     ).toBeVisible();
-    // The request says the order out loud, default included, so the server
-    // never has to guess what a client that sends nothing meant.
     await waitFor(() => {
       expect(
         requested().some(
@@ -294,6 +294,31 @@ describe("the domain screen", () => {
         ),
       ).toBe(true);
     });
+  });
+
+  it("offers Edit MANIFEST to an admin", async () => {
+    serve({}, "admin");
+
+    renderApp("/d/eng");
+
+    const section = await screen.findByRole("region", { name: "Manifest" });
+    expect(
+      await within(section).findByRole("link", { name: "Edit MANIFEST" }),
+    ).toHaveAttribute("href", "/d/eng/manifest/edit");
+  });
+
+  it("offers no Edit MANIFEST below admin", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    const section = await screen.findByRole("region", { name: "Manifest" });
+    await within(section).findByText(
+      "What this domain is for, in one paragraph.",
+    );
+    expect(
+      within(section).queryByRole("link", { name: "Edit MANIFEST" }),
+    ).toBeNull();
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
@@ -403,7 +428,7 @@ describe("the domain screen", () => {
     expect(screen.queryByText("private")).toBeNull();
   });
 
-  it("says a manifest with no prose at all is there without quoting nothing", async () => {
+  it("renders a MANIFEST that is only a title without calling it missing", async () => {
     serve({
       "/domains/eng/manifest": () => ({
         domain: "eng",
@@ -413,11 +438,10 @@ describe("the domain screen", () => {
 
     renderApp("/d/eng");
 
-    // Headings and frontmatter are not a lede. The link is still the way in:
-    // an empty summary is not the same fact as a missing MANIFEST.
-    expect(
-      await screen.findByRole("link", { name: "Read the MANIFEST" }),
-    ).toBeVisible();
+    // A document with nothing but its title is still a document: it is not
+    // the same fact as a missing MANIFEST.
+    await screen.findByRole("region", { name: "Manifest" });
+    await within(await screenBody()).findByRole("link", { name: /Alpha/ });
     expect(screen.queryByText(/no MANIFEST yet/)).toBeNull();
   });
 
@@ -531,30 +555,34 @@ describe("the domain screen", () => {
     });
   });
 
-  it("pages a folder from the listing rather than from the tree", async () => {
-    serve({
-      "/domains/eng/engrams": (path) =>
-        path.includes("path=notes")
-          ? {
-              mode: "text",
-              total: 620,
-              page: 1,
-              limit: 50,
-              count: 1,
-              hits: [
-                {
-                  domain: "eng",
-                  permalink: "notes/beta",
-                  title: "Beta",
-                  engram_type: "engram",
-                  kind: "engram",
-                  status: "stable",
-                  tags: [],
-                },
-              ],
-            }
-          : engramsResponse(path),
-    });
+  it("shows a folder as its own page: the trail, the count, and none of the domain's furniture", async () => {
+    serve(
+      {
+        "/domains/eng/engrams": (path) =>
+          path.includes("path=notes")
+            ? {
+                mode: "text",
+                total: 620,
+                page: 1,
+                limit: 50,
+                count: 1,
+                hits: [
+                  {
+                    domain: "eng",
+                    permalink: "notes/beta",
+                    title: "Beta",
+                    engram_type: "engram",
+                    kind: "engram",
+                    status: "stable",
+                    tags: [],
+                  },
+                ],
+              }
+            : engramsResponse(path),
+        "/domains/eng/sync": () => syncResponse(),
+      },
+      "admin",
+    );
 
     // Straight to the folder, because the whole of this screen's state is its
     // URL: the same link somebody sends, and the same address the back button
@@ -562,11 +590,24 @@ describe("the domain screen", () => {
     renderApp("/d/eng?path=notes");
     const body = await screenBody();
 
-    expect(
-      await within(body).findByRole("link", { name: /Beta/ }),
-    ).toBeVisible();
-    // The listing endpoint, scoped and paged, rather than the tree's own rows:
-    // a folder of six hundred engrams costs one page here.
+    // The heading is the folder's path: the domain links to its page, the
+    // folder itself is plain text.
+    const heading = await within(body).findByRole("heading", {
+      level: 1,
+      name: "eng / notes",
+    });
+    expect(within(heading).getByRole("link", { name: "eng" })).toHaveAttribute(
+      "href",
+      "/d/eng",
+    );
+    expect(within(heading).queryByRole("link", { name: "notes" })).toBeNull();
+    // All of them: the list pages towards the envelope's six hundred and the
+    // stub answers every page with the same row, so what is pinned here is
+    // that the folder's engrams are listed, not how many pages landed first.
+    const rows = await within(body).findAllByRole("link", { name: /Beta/ });
+    expect(rows[0]).toBeVisible();
+    // The listing endpoint, scoped and paged, rather than the tree's own
+    // rows: a folder of six hundred engrams costs one page here.
     await waitFor(() => {
       expect(
         requested().some(
@@ -577,18 +618,82 @@ describe("the domain screen", () => {
         ),
       ).toBe(true);
     });
-    // And the count is the envelope's, not the number of rows in hand.
+    // The count is the envelope's, which counts the subtree, and it stands
+    // under the heading once.
     expect(
-      await within(body).findByText(/620 engrams in this folder/),
+      await within(body).findByText("620 engrams in this folder"),
     ).toBeVisible();
-    // The order caption is on every listing, and the folder says which
-    // folder it is browsing beneath it.
     expect(
       within(body).getByText("Newest first, by the date they were recorded."),
     ).toBeVisible();
     expect(
       within(body).getByText(/Browsing notes, subfolders included/),
     ).toBeVisible();
+    // What a folder page carries: New engram and the order menu.
+    expect(
+      within(body).getByRole("button", { name: "New engram" }),
+    ).toBeVisible();
+    expect(
+      within(body).getByRole("button", { name: "Order: Newest first" }),
+    ).toBeVisible();
+    // And what it does not, as an admin on a team domain, where the domain
+    // page would draw every one of these.
+    expect(
+      within(body).queryByRole("region", { name: "Team sync" }),
+    ).toBeNull();
+    expect(
+      within(body).queryByRole("region", { name: "Proposals" }),
+    ).toBeNull();
+    expect(within(body).queryByRole("region", { name: "Members" })).toBeNull();
+    expect(
+      within(body).queryByRole("region", { name: "Review mode" }),
+    ).toBeNull();
+    expect(within(body).queryByRole("region", { name: "Manifest" })).toBeNull();
+    expect(
+      within(body).queryByRole("link", { name: "Download archive" }),
+    ).toBeNull();
+    expect(
+      within(body).queryByRole("button", { name: "Import archive" }),
+    ).toBeNull();
+    expect(
+      within(body).queryByRole("button", { name: "Unregister domain" }),
+    ).toBeNull();
+    expect(within(body).queryByText(/engrams$/)).toBeNull();
+  });
+
+  it("walks a nested folder's trail back out, one link per parent", async () => {
+    serve({
+      "/domains/eng/tree": () => ({
+        domain: "eng",
+        path: "notes/deep",
+        folders: [],
+        engrams: [],
+      }),
+      "/domains/eng/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+    });
+
+    renderApp("/d/eng?path=notes%2Fdeep");
+    const body = await screenBody();
+
+    const heading = await within(body).findByRole("heading", {
+      level: 1,
+      name: "eng / notes / deep",
+    });
+    expect(
+      within(heading).getByRole("link", { name: "notes" }),
+    ).toHaveAttribute("href", "/d/eng?path=notes");
+    expect(within(heading).queryByRole("link", { name: "deep" })).toBeNull();
+    expect(
+      await within(body).findByText("0 engrams in this folder"),
+    ).toBeVisible();
+    expect(within(body).getByText("This folder has no engrams.")).toBeVisible();
   });
 
   it("orders the listing the way the reader chose, and remembers it", async () => {
@@ -701,6 +806,10 @@ describe("the domain screen", () => {
     );
     expect(filtered.length).toBeGreaterThan(0);
     expect(filtered.every((path) => !path.includes("path="))).toBe(true);
+    // Still the folder page: a filter keeps the page it is on.
+    expect(
+      screen.getByRole("heading", { level: 1, name: "eng / notes" }),
+    ).toBeVisible();
   });
 
   it("switches to the whole domain when a tag is filtered on", async () => {

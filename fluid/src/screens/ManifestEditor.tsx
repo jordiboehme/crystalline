@@ -52,7 +52,7 @@ import { formattingKeymap } from "../editor/toolbar";
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import { useFullWidth } from "../layoutWidth";
-import { manifestRoute } from "../paths";
+import { domainRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import NotFound from "./NotFound";
 
@@ -167,7 +167,7 @@ function EditorSurface({
    */
   const exit = useExitRequest();
   const leave = () => {
-    void navigate(manifestRoute(domain));
+    void navigate(domainRoute(domain));
   };
 
   // The shared shell: buffer, checksum, dirty state, the dry-run gate,
