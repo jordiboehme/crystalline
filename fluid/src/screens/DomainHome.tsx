@@ -199,9 +199,13 @@ function DomainPage({
   // does. Unregistering rides on the same gates, one role higher: the palette
   // row does what the button does, which is to ASK - the second press is the
   // point of the control and the keyboard route does not get to skip it.
-  // Editing the MANIFEST is behind the same gate as its link, plus a read
-  // that landed: a read that failed is nothing to edit.
+  // Editing the MANIFEST is behind the same gate as its link, and under the
+  // same second condition: a read that landed, or a domain that has no
+  // MANIFEST yet, which is precisely what an admin opens the editor to fix.
+  // Only a refused read is nothing to edit, and a read still in flight is
+  // nothing to edit yet. Named once so the two doors cannot drift apart.
   const manifestLoaded = manifest.data !== undefined;
+  const manifestEditable = manifestLoaded || isMissing(manifest.error);
   const commands = useMemo<readonly PaletteCommand[]>(() => {
     const rows: PaletteCommand[] = [];
     if (capabilities.canWrite) {
@@ -214,7 +218,7 @@ function DomainPage({
       });
     }
     if (capabilities.canAdminister) {
-      if (manifestLoaded) {
+      if (manifestEditable) {
         rows.push({
           id: "manifest-edit",
           title: "Edit MANIFEST",
@@ -254,7 +258,7 @@ function DomainPage({
     capabilities.canAdminister,
     capabilities.canWrite,
     domain,
-    manifestLoaded,
+    manifestEditable,
     navigate,
   ]);
   useRegisterCommands(commands);
@@ -361,15 +365,16 @@ function DomainPage({
             Manifest
           </h2>
           {/*
-            Offered whether the MANIFEST is empty or not: an admin looking at
-            nothing needs exactly this link to fix that, and an admin looking
-            at prose needs it to change it. The same gate the editor itself
-            enforces if the address is typed directly, plus the one the
-            palette row is under: a read that failed is nothing to edit, and
-            the panel below is showing the refusal rather than a document. An
-            empty MANIFEST is a read that landed, so it keeps its link.
+            Offered whether the MANIFEST loaded empty or full, and offered on
+            a domain that has none yet: an admin looking at nothing needs
+            exactly this link to fix that, and an admin looking at prose
+            needs it to change it. The same gate the editor itself enforces
+            if the address is typed directly. It is withheld in two states
+            only, both of them states where the panel below is not showing a
+            document: while the read is in flight, and after one the server
+            refused.
           */}
-          {capabilities.canAdminister && manifestLoaded && (
+          {capabilities.canAdminister && manifestEditable && (
             <Link
               to={manifestEditRoute(domain)}
               onPointerEnter={prefetchManifestEditor}

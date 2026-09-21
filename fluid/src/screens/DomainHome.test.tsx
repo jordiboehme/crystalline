@@ -536,6 +536,27 @@ describe("the domain screen", () => {
     ).toBeVisible();
   });
 
+  it("offers an admin the editor over a manifest that is not there yet", async () => {
+    serve(
+      {
+        "/domains/eng/manifest": () => {
+          throw new ApiProblem(404, "not found", "no MANIFEST in domain 'eng'");
+        },
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    // A domain with no MANIFEST is exactly the domain an admin opens the
+    // editor to fix, so the gap sentence comes with the way to close it.
+    const section = await screen.findByRole("region", { name: "Manifest" });
+    await within(section).findByText(/no MANIFEST yet/);
+    expect(
+      within(section).getByRole("link", { name: "Edit MANIFEST" }),
+    ).toHaveAttribute("href", "/d/eng/manifest/edit");
+  });
+
   it("opens a folder into its own list", async () => {
     serve();
 
