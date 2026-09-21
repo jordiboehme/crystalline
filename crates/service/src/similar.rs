@@ -30,8 +30,14 @@ pub const SIMILAR_PROBE_MIN_CHARS: usize = 80;
 pub const SIMILAR_PAGE: usize = 4;
 /// How many neighbours a receipt names.
 pub const SIMILAR_LIMIT: usize = 3;
-/// The whole probe, backlog wait included, is bounded by this; past it the
-/// receipt goes out without an advisory and the write is unaffected.
+/// The whole probe, backlog wait included, is meant to be bounded by this;
+/// past it the receipt goes out without an advisory and the write is
+/// unaffected. Read that as intent rather than a hard bound though: the
+/// timeout is only honored at the store's await points, and a statement
+/// that steps synchronously (the turso binding only yields on an IO status)
+/// is not cut by it and can run well past this budget. `attach_similar`
+/// measures wall time around the whole probe and logs a warning when that
+/// happens, since the timeout alone cannot be trusted to say so.
 pub const SIMILAR_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the probe waits for the embed worker to catch up, so a capture
 /// written moments ago can be a neighbour of the next one.
@@ -159,6 +165,24 @@ pub fn metadata_description(metadata: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|d| !d.is_empty())
+}
+
+/// Whether a completed probe ran long enough past [`SIMILAR_TIMEOUT`] to earn
+/// a warning line. This only fires when a store statement steps
+/// synchronously and never reaches the timeout's cancellation point, so the
+/// wall clock is the only signal left that catches it; a probe that is
+/// legitimately cut by the timeout never gets here at anywhere near this
+/// elapsed time.
+pub fn probe_overran(elapsed: Duration) -> bool {
+    elapsed > SIMILAR_TIMEOUT + Duration::from_secs(1)
+}
+
+/// The `warn` line a probe that overran its budget logs: the wall time, the
+/// domain and which kind of probe it was.
+pub fn overrun_warning(elapsed: Duration, domain: &str, kind: &str) -> String {
+    format!(
+        "similar probe overran its budget: {elapsed:?} on domain '{domain}' ({kind}); a store statement that steps synchronously is not cut by the timeout"
+    )
 }
 
 /// Put the advisory on a receipt. Nothing is added for an empty list, so a
@@ -298,5 +322,29 @@ mod tests {
         );
         assert!(rendered.contains("d,q,stable,Q,engram"), "{rendered}");
         assert!(rendered.contains("d,r,draft,R,guide"), "{rendered}");
+    }
+
+    #[test]
+    fn a_probe_at_or_under_the_budget_plus_a_second_has_not_overrun() {
+        assert!(!probe_overran(SIMILAR_TIMEOUT));
+        assert!(!probe_overran(SIMILAR_TIMEOUT + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_probe_more_than_a_second_past_the_budget_has_overrun() {
+        assert!(probe_overran(
+            SIMILAR_TIMEOUT + Duration::from_secs(1) + Duration::from_millis(1)
+        ));
+        assert!(probe_overran(SIMILAR_TIMEOUT + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn the_overrun_warning_names_the_elapsed_time_domain_and_kind() {
+        let msg = overrun_warning(Duration::from_secs(131), "team", "write");
+        assert_eq!(
+            msg,
+            "similar probe overran its budget: 131s on domain 'team' (write); \
+             a store statement that steps synchronously is not cut by the timeout"
+        );
     }
 }

@@ -1177,6 +1177,38 @@ impl EmbeddingProvider for SleepyEmbedder {
     }
 }
 
+/// A provider that answers like [`TopicEmbedder`] after blocking the calling
+/// thread for `delay` via `std::thread::sleep`, unlike [`SleepyEmbedder`]'s
+/// `tokio::time::sleep`. The synchronous sleep is not a cancellation point,
+/// so nothing yields back to the runtime while it runs: this is what a store
+/// statement that steps synchronously looks like from the caller's side (the
+/// turso binding only yields on an IO status), and it is the only way this
+/// suite can make a probe run well past [`crystalline_service::similar::SIMILAR_TIMEOUT`]
+/// without `tokio::time::timeout` cutting it.
+pub struct BlockingEmbedder {
+    pub delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for BlockingEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        std::thread::sleep(self.delay);
+        Ok(texts.iter().map(|t| TopicEmbedder::embed_one(t)).collect())
+    }
+
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
 // --- tracing capture --------------------------------------------------------
 
 /// Every `tracing` event emitted while this is the thread's default
