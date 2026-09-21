@@ -1217,3 +1217,53 @@ describe("the content's own width", () => {
     expect(help).toHaveTextContent(/full width/i);
   });
 });
+
+describe("the text size", () => {
+  it("switches the document to large text and remembers it", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const main = await screen.findByRole("main");
+    expect(main).not.toHaveAttribute("data-text");
+
+    await user.click(screen.getByRole("button", { name: "Use large text" }));
+
+    // One attribute on the frame is the whole of what the stylesheet reads,
+    // for the rendered document and the editor alike.
+    expect(main).toHaveAttribute("data-text", "large");
+    expect(
+      screen.getByRole("button", { name: "Use regular text" }),
+    ).toBeVisible();
+    expect(localStorage.getItem("fluid.layout.text")).toBe("large");
+  });
+
+  it("reads a stored large text at mount, and goes back", async () => {
+    localStorage.setItem("fluid.layout.text", "large");
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    expect(await screen.findByRole("main")).toHaveAttribute(
+      "data-text",
+      "large",
+    );
+    await user.click(screen.getByRole("button", { name: "Use regular text" }));
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-text");
+    expect(localStorage.getItem("fluid.layout.text")).toBe("regular");
+  });
+
+  it("offers the toggle on the palette", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByRole("main");
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.type(screen.getByRole("combobox"), "large text");
+    await user.click(
+      await screen.findByRole("option", { name: "Toggle large text" }),
+    );
+    expect(screen.getByRole("main")).toHaveAttribute("data-text", "large");
+  });
+});
