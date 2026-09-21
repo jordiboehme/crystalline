@@ -233,6 +233,8 @@
      */
     main[data-text="large"] .measured {
       font-size: 1.5rem;
+      --text-2xl: 2.25rem;
+      --text-2xl--line-height: 3rem;
       --text-xl: 1.875rem;
       --text-xl--line-height: 2.625rem;
       --text-lg: 1.6875rem;
