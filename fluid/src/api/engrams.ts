@@ -99,12 +99,6 @@ export interface ListingOrder {
   dir: "asc" | "desc";
 }
 
-/** The order the server lists in when nobody asks: newest recorded first. */
-export const DEFAULT_LISTING_ORDER: ListingOrder = {
-  sort: "recorded",
-  dir: "desc",
-};
-
 /**
  * How many rows a page asks for.
  *
@@ -209,7 +203,7 @@ export function domainEngramsRoot(domain: string): readonly unknown[] {
 export function domainEngramsKey(
   domain: string,
   filters: EngramFilters,
-  order: ListingOrder = DEFAULT_LISTING_ORDER,
+  order: ListingOrder,
 ): readonly unknown[] {
   return [
     ...domainEngramsRoot(domain),
@@ -227,7 +221,7 @@ export async function fetchDomainEngrams(
   domain: string,
   filters: EngramFilters,
   page: number,
-  order: ListingOrder = DEFAULT_LISTING_ORDER,
+  order: ListingOrder,
 ): Promise<EngramPage> {
   const query = new URLSearchParams();
   // Absent is the whole domain, which is what the endpoint means by no `path`

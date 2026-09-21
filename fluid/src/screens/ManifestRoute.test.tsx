@@ -139,7 +139,7 @@ describe("the MANIFEST route", () => {
       ).not.toBeInTheDocument();
     });
     expect(
-      await screen.findByText(/this memory could not be recalled/i),
+      await screen.findByText(/nothing is filed at this address/i),
     ).toBeInTheDocument();
   });
 });

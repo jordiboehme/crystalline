@@ -586,21 +586,6 @@ async fn run_hybrid(
 const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
      e.description, e.content, CAST(json_extract(e.metadata, '$.salience') AS REAL)";
 
-/// Phase 1 of the semantic scan: the narrow top-k. Groups the matching chunk
-/// rows by their parent engram, keeps each engram's closest chunk and orders by
-/// that distance, projecting nothing but the id and the distance.
-///
-/// The narrowness is the whole point. Turso feeds one record per chunk row into
-/// the `GROUP BY` sorter, so any wide column in this projection is written to
-/// the sorter's spill file once per chunk of its own engram: quadratic in engram
-/// size, measured at tens of GB on a real corpus (see
-/// `research/2026-07-28-turso-sorter-spill.md`). Two 8-byte columns per record
-/// keep the sorter in its 2MB buffer instead.
-///
-/// Ties. `dist` alone leaves engrams at an equal distance in sorter-defined
-/// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
-/// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins)
-/// and costs nothing: it is the grouping key, already in the sorter record.
 /// The sort keys of a filter-only page, one spelling per [`SearchOrder`].
 ///
 /// The undated engram sorts last, said out loud rather than inherited from
@@ -677,6 +662,21 @@ pub fn lexical_candidate_sql(
     )
 }
 
+/// Phase 1 of the semantic scan: the narrow top-k. Groups the matching chunk
+/// rows by their parent engram, keeps each engram's closest chunk and orders by
+/// that distance, projecting nothing but the id and the distance.
+///
+/// The narrowness is the whole point. Turso feeds one record per chunk row into
+/// the `GROUP BY` sorter, so any wide column in this projection is written to
+/// the sorter's spill file once per chunk of its own engram: quadratic in engram
+/// size, measured at tens of GB on a real corpus (see
+/// `research/2026-07-28-turso-sorter-spill.md`). Two 8-byte columns per record
+/// keep the sorter in its 2MB buffer instead.
+///
+/// Ties. `dist` alone leaves engrams at an equal distance in sorter-defined
+/// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
+/// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins)
+/// and costs nothing: it is the grouping key, already in the sorter record.
 #[doc(hidden)]
 pub fn semantic_phase1_sql(actor_screen: &str, and_filters: &str) -> String {
     format!(

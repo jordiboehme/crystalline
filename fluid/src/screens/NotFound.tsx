@@ -28,7 +28,7 @@ export default function NotFound() {
   return (
     <div className="max-w-xl">
       <h1 className="font-mono text-xl font-semibold">
-        this memory could not be recalled
+        nothing is filed at this address
       </h1>
       <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
         The address names nothing this mind still holds. It may have been

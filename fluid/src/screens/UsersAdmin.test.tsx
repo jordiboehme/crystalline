@@ -126,7 +126,7 @@ describe("the user admin screen", () => {
     // The address leaks nothing: it is the not-found screen, not a shell with
     // an empty table in it.
     expect(
-      await screen.findByText(/this memory could not be recalled/i),
+      await screen.findByText(/nothing is filed at this address/i),
     ).toBeInTheDocument();
     expect(
       apiMock.mock.calls.filter(([path]) => path === "/users"),
