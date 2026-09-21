@@ -605,7 +605,11 @@ export function Layout() {
           does, so it is drawn here and not by the screen that started it.
         */}
         <JoinedDraftBar />
-        <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
+        <div
+          className={`mx-auto flex w-full gap-6 px-4 py-6 ${
+            fullWidth ? "" : "max-w-350"
+          }`}
+        >
           {/*
             The stored rail only reaches the sidebar where there is a sidebar
             to apply it to: below `md` this is a drawer, and it is always
@@ -622,7 +626,9 @@ export function Layout() {
           {/*
             One attribute for the whole app's measure: the stylesheet lifts the
             cap under it, so no screen has to know anything about the choice to
-            be drawn at the width it asks for.
+            be drawn at the width it asks for. The frame's own cap goes with
+            it: full width means the window, not a wider column inside the
+            same box.
           */}
           <main
             ref={mainRef}
@@ -719,6 +725,7 @@ function TopBar({
   onShare: (domain: string | null) => void;
 }) {
   const { capabilities } = useAuth();
+  const { fullWidth } = useFullWidth();
 
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur print:hidden dark:border-slate-800 dark:bg-slate-950/90">
@@ -727,9 +734,14 @@ function TopBar({
         below it - the reading surface's own sticky pieces, the editor's
         toolbar - are measured against this height, so it is a number the rest
         of the frame can rely on rather than whatever the tallest control in
-        here happens to be today.
+        here happens to be today. The row follows the body's cap so the
+        controls keep aligning with the content's edge at either width.
       */}
-      <div className="mx-auto flex h-14 w-full max-w-350 items-center gap-3 px-4">
+      <div
+        className={`mx-auto flex h-14 w-full items-center gap-3 px-4 ${
+          fullWidth ? "" : "max-w-350"
+        }`}
+      >
         <IconButton
           label="Domains"
           icon={PanelLeft}

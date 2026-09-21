@@ -1085,6 +1085,29 @@ describe("the content's own width", () => {
     expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
   });
 
+  it("lifts the frame's own cap at full width, header and body alike", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const main = await screen.findByRole("main");
+    expect(main.parentElement?.className).toContain("max-w-350");
+    const headerRow = document.querySelector("header > div");
+    expect(headerRow?.className).toContain("max-w-350");
+
+    await user.click(screen.getByRole("button", { name: "Use full width" }));
+
+    // Full width means the window: dropping the details column and lifting
+    // the measure while the frame keeps its cap would hand back the room and
+    // then refuse to use it.
+    expect(main.parentElement?.className).not.toContain("max-w-350");
+    expect(headerRow?.className).not.toContain("max-w-350");
+
+    await user.click(screen.getByRole("button", { name: "Use reading width" }));
+    expect(main.parentElement?.className).toContain("max-w-350");
+    expect(headerRow?.className).toContain("max-w-350");
+  });
+
   it("goes back to the measure, and remembers that too", async () => {
     localStorage.setItem("fluid.layout.width", "full");
     serveSignedIn();
