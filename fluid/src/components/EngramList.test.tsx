@@ -420,4 +420,57 @@ describe("the engram list", () => {
     await screen.findByText("No engram matches these filters.");
     expect(screen.getByRole("button", { name: "Clear filters" })).toBeVisible();
   });
+
+  it("signs off with End of line. once a list that had to scroll is complete", async () => {
+    // Two pages of twenty against a 600px box: the box scrolled, and once
+    // the last page is in there is nothing more to fetch.
+    const tall = vi
+      .spyOn(HTMLElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(40 * ENGRAM_ROW_HEIGHT);
+    const box = vi
+      .spyOn(HTMLElement.prototype, "clientHeight", "get")
+      .mockReturnValue(VIEWPORT);
+    try {
+      const loadPage = vi.fn((page: number) =>
+        Promise.resolve(numberedPage(page, 40)),
+      );
+      mount(<EngramList queryKey={["t"]} loadPage={loadPage} label="Hits" emptyMessage="Nothing" />);
+      const list = await screen.findByRole("list", { name: "Hits" });
+      const scroller = list.parentElement as HTMLElement;
+      expect(screen.queryByText("End of line.")).toBeNull();
+      scrollToEnd(scroller, 20);
+      await waitFor(() => {
+        expect(loadPage).toHaveBeenCalledWith(2);
+      });
+      const sign = await screen.findByText("End of line.");
+      // Inside the scroll box, after the rows: where a reader who scrolled
+      // arrives. Decoration to a screen reader.
+      expect(scroller.contains(sign)).toBe(true);
+      expect(sign.closest("[aria-hidden='true']")).not.toBeNull();
+    } finally {
+      tall.mockRestore();
+      box.mockRestore();
+    }
+  });
+
+  it("stays silent on a list that fit its box", async () => {
+    const short = vi
+      .spyOn(HTMLElement.prototype, "scrollHeight", "get")
+      .mockReturnValue(3 * ENGRAM_ROW_HEIGHT);
+    const box = vi
+      .spyOn(HTMLElement.prototype, "clientHeight", "get")
+      .mockReturnValue(VIEWPORT);
+    try {
+      const loadPage = vi.fn(() =>
+        Promise.resolve(pageOf(1, [row(0), row(1), row(2)], 3)),
+      );
+      mount(<EngramList queryKey={["s"]} loadPage={loadPage} label="Hits" emptyMessage="Nothing" />);
+      await screen.findByRole("list", { name: "Hits" });
+      expect(await screen.findByText("Alpha 2")).toBeVisible();
+      expect(screen.queryByText("End of line.")).toBeNull();
+    } finally {
+      short.mockRestore();
+      box.mockRestore();
+    }
+  });
 });

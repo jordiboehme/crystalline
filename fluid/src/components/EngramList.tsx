@@ -17,7 +17,7 @@
 
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router";
 
@@ -28,6 +28,7 @@ import { RETIRED_CLASS, isRetired } from "../lifecycle";
 import { engramRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
 import { snippetParts, stripSnippetMarkup } from "../snippet";
+import EndOfLine from "./EndOfLine";
 import { Chip, statusVariant } from "./primitives";
 
 /** How tall one row is, in pixels. The tests scroll by it, so it is exported. */
@@ -125,6 +126,30 @@ export function EngramList({
   });
   const drawn = virtualizer.getVirtualItems();
 
+  // Whether the box had to scroll, which is the one condition the sign-off at
+  // the bottom waits for besides the last page: a list that fit its box ends
+  // where it ends. Measured after the rows land and again when the box
+  // resizes, because both change the answer.
+  const [scrolled, setScrolled] = useState(false);
+  useEffect(() => {
+    const box = scroller.current;
+    if (box === null) {
+      return;
+    }
+    const measure = () => {
+      setScrolled(box.scrollHeight - box.clientHeight > 1);
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(box);
+    return () => {
+      observer.disconnect();
+    };
+  }, [rows.length]);
+
   // Reaching the last row is the request for the next page. Watching the drawn
   // window rather than a scroll handler is what makes that true whatever moved
   // it: a wheel, a keyboard, or a row that was removed under the reader.
@@ -207,6 +232,7 @@ export function EngramList({
             );
           })}
         </ul>
+        {!hasNextPage && rows.length > 0 && scrolled && <EndOfLine />}
       </div>
       {isFetchingNextPage && (
         <p className="pt-2 text-xs text-slate-500 dark:text-slate-400">
