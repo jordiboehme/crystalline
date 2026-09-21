@@ -28,7 +28,16 @@
  * reason to list the same lines a second time somewhere else.
  */
 
-import { Children, Suspense, isValidElement, lazy, useMemo } from "react";
+import {
+  Children,
+  Suspense,
+  isValidElement,
+  lazy,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ComponentProps, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
@@ -45,6 +54,8 @@ import {
 } from "../editor/imageFormat";
 import { WIKILINK, referenceState } from "../wikilinks";
 import type { WikilinkResolution, WikilinkResolver } from "../wikilinks";
+import DiagramOverlay from "./DiagramOverlay";
+import DiagramToolbar from "./DiagramToolbar";
 import { Chip } from "./primitives";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
@@ -541,6 +552,13 @@ function MarkdownAnchor({
  * The placement fragment is read on the way through, and the style it means is
  * the same one the editor's preview widget applies, so a floated image looks
  * the same in both places.
+ *
+ * In the column an image is as wide as the prose lets it be, which for a
+ * screenshot of anything is too small to read, so it opens in the same
+ * full-window layer a diagram does - by the button in its corner, or by a
+ * click on the picture, which is what a reader tries first. A `span` and not
+ * a `figure`, because the wrapper stands where the image stood and an image
+ * lives inside a paragraph, where only phrasing content may go.
  */
 function MarkdownImage({
   src,
@@ -557,17 +575,74 @@ function MarkdownImage({
   // path is: micromark hands `w=50%` over as `w=50%25`, which is no width at
   // all. Decoding happens once, here and in `assetPath`, never in sequence.
   const { format } = parseImageFragment(decodeTarget(written));
+  const wrapperRef = useRef<HTMLSpanElement>(null);
+  const fullWindowRef = useRef<HTMLButtonElement>(null);
+  const [fullWindow, setFullWindow] = useState(false);
+  // Whether a link is in charge here, which only the tree can answer: this
+  // component is handed its own props and nothing about what it sits in, so
+  // the answer comes from the DOM once it is in one. An image inside a link
+  // belongs to the link, and a corner button offering a second destination
+  // beside it is a choice nobody asked for.
+  const [linked, setLinked] = useState(false);
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    setLinked(wrapper !== null && wrapper.closest("a") !== null);
+  }, []);
+  // Ours is rebuilt from the decoded path, which re-encodes exactly once;
+  // anything else keeps the URL the renderer produced, escapes and all.
+  const shown = file ?? written;
+  const placement = imageStyle(file === null ? { align: "center" } : format);
+  // The wrapper takes the placement the image had - the float, the margins,
+  // the block and any width the fragment asked for - and hugs the picture
+  // where no width was asked for, so the toolbar's corner is the image's
+  // corner rather than the column's. The image fills a wrapper that was given
+  // a width and keeps its own size otherwise, where a share of the column
+  // would be a share of itself.
+  const wrapperStyle = {
+    ...placement,
+    width: placement.width ?? "fit-content",
+    maxWidth: "100%",
+  };
+  const fills = placement.width !== undefined;
   return (
-    <img
-      // Ours is rebuilt from the decoded path, which re-encodes exactly once;
-      // anything else keeps the URL the renderer produced, escapes and all.
-      src={file ?? written}
-      // Never null: react-markdown hands the alt text through as written, and
-      // an image with no alt at all is one a screen reader cannot skip.
-      alt={alt ?? ""}
-      loading="lazy"
-      style={imageStyle(file === null ? { align: "center" } : format)}
-    />
+    <span ref={wrapperRef} className="group relative" style={wrapperStyle}>
+      <img
+        src={shown}
+        // Never null: react-markdown hands the alt text through as written,
+        // and an image with no alt at all is one a screen reader cannot skip.
+        alt={alt ?? ""}
+        loading="lazy"
+        className={`h-auto max-w-full${fills ? " w-full" : ""}${
+          linked ? "" : " cursor-zoom-in"
+        }`}
+        onClick={(event) => {
+          // Inside a link the link wins: the click is the reader's way to
+          // follow it, and the full window stays a hover away on the button -
+          // except that inside a link there is no button either.
+          if (event.currentTarget.closest("a") !== null) {
+            return;
+          }
+          setFullWindow(true);
+        }}
+      />
+      {!linked && (
+        <DiagramToolbar
+          onOpenFullWindow={() => {
+            setFullWindow(true);
+          }}
+          fullWindowRef={fullWindowRef}
+        />
+      )}
+      {fullWindow && (
+        <DiagramOverlay
+          content={{ kind: "image", src: shown, alt: alt ?? "" }}
+          returnFocusTo={fullWindowRef}
+          onClose={() => {
+            setFullWindow(false);
+          }}
+        />
+      )}
+    </span>
   );
 }
 

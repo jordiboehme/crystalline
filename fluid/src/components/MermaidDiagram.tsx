@@ -182,9 +182,11 @@ export default function MermaidDiagram({ source }: { source: string }) {
         glyph.
       */}
       <DiagramToolbar
-        fullWidth={fullWidth}
-        onToggleFullWidth={() => {
-          setFullWidth((on) => !on);
+        width={{
+          fullWidth,
+          onToggle: () => {
+            setFullWidth((on) => !on);
+          },
         }}
         onOpenFullWindow={() => {
           setFullWindow(true);
@@ -196,7 +198,7 @@ export default function MermaidDiagram({ source }: { source: string }) {
         // overlay sizes the root itself, and a width this page forced on it
         // would be one scale factor too many.
         <DiagramOverlay
-          svg={drawn.svg}
+          content={{ kind: "diagram", svg: drawn.svg }}
           returnFocusTo={fullWindowRef}
           onClose={() => {
             setFullWindow(false);

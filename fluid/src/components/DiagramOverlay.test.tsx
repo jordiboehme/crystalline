@@ -21,6 +21,7 @@ import { useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import DiagramOverlay from "./DiagramOverlay";
+import type { OverlayContent } from "./DiagramOverlay";
 
 const instance = {
   zoomIn: vi.fn(),
@@ -67,7 +68,7 @@ function press(x: number, y: number) {
  * only observable this way round - the overlay lets go of the keyboard as it
  * goes away, not while it is still on screen.
  */
-function Harness({ svg }: { svg: string }) {
+function Harness({ content }: { content: OverlayContent }) {
   const opener = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
   return (
@@ -83,7 +84,7 @@ function Harness({ svg }: { svg: string }) {
       </button>
       {open && (
         <DiagramOverlay
-          svg={svg}
+          content={content}
           returnFocusTo={opener}
           onClose={() => {
             setOpen(false);
@@ -94,8 +95,26 @@ function Harness({ svg }: { svg: string }) {
   );
 }
 
-async function open(svg: string = DIAGRAM) {
-  render(<Harness svg={svg} />);
+/**
+ * The stage has no size of its own in jsdom, and a fit computed from nothing
+ * is skipped rather than guessed at, so a test about fitting has to hand the
+ * layer the room it would have in a browser.
+ */
+function sizeStage(width: number, height: number) {
+  Object.defineProperty(
+    screen.getByTestId("diagram-overlay-stage"),
+    "getBoundingClientRect",
+    {
+      value: () => ({ width, height }) as DOMRect,
+      configurable: true,
+    },
+  );
+}
+
+async function open(
+  content: OverlayContent = { kind: "diagram", svg: DIAGRAM },
+) {
+  render(<Harness content={content} />);
   await userEvent.click(
     screen.getByRole("button", { name: "Open in full window" }),
   );
@@ -125,6 +144,37 @@ describe("DiagramOverlay", () => {
     expect(dialog.getAttribute("aria-modal")).toBe("true");
     expect(dialog.getAttribute("aria-label")).toBeTruthy();
     expect(dialog.querySelector("#drawing")).not.toBeNull();
+  });
+
+  it("holds an image, fits it once it has loaded and names it by its alt", async () => {
+    await open({
+      kind: "image",
+      src: "/api/v1/files/eng/assets/map.png",
+      alt: "The map",
+    });
+    const dialog = screen.getByRole("dialog");
+    const image = dialog.querySelector("img");
+    expect(image).not.toBeNull();
+    expect(image?.getAttribute("src")).toBe("/api/v1/files/eng/assets/map.png");
+    expect(image?.getAttribute("alt")).toBe("The map");
+    expect(image?.getAttribute("draggable")).toBe("false");
+    // jsdom loads nothing, so the natural size is 0 by 0 and the fit is
+    // skipped rather than computed from nothing: the instance is created and
+    // never asked to zoom.
+    expect(panzoom).toHaveBeenCalledTimes(1);
+    expect(instance.zoom).not.toHaveBeenCalled();
+    // Once the browser reports a size, the fit runs.
+    sizeStage(1000, 800);
+    Object.defineProperty(image, "naturalWidth", {
+      value: 800,
+      configurable: true,
+    });
+    Object.defineProperty(image, "naturalHeight", {
+      value: 600,
+      configurable: true,
+    });
+    fireEvent.load(image as HTMLImageElement);
+    expect(instance.zoom).toHaveBeenCalled();
   });
 
   it("puts the keyboard on the way out", async () => {
@@ -214,7 +264,7 @@ describe("DiagramOverlay", () => {
   });
 
   it("keeps the keys working when focus is on a link inside the diagram", async () => {
-    await open(LINKED);
+    await open({ kind: "diagram", svg: LINKED });
     const link = screen.getByRole("link");
     link.focus();
     expect(document.activeElement).toBe(link);
@@ -225,7 +275,7 @@ describe("DiagramOverlay", () => {
   });
 
   it("wraps Tab around the layer, the diagram's own links included", async () => {
-    await open(LINKED);
+    await open({ kind: "diagram", svg: LINKED });
     const link = screen.getByRole("link");
     // The link is the last stop in document order, after the bar's buttons.
     link.focus();

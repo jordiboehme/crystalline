@@ -1,5 +1,6 @@
 /**
- * One diagram, on its own, in the whole window, with pan and zoom.
+ * One picture, on its own, in the whole window, with pan and zoom: a diagram
+ * as mermaid drew it, or an image a document attached.
  *
  * An in-window layer rather than the browser's Fullscreen API as the primary
  * path, because element fullscreen does not exist on iOS Safari at all: a
@@ -68,19 +69,39 @@ const CLICK_SLOP_PX = 5;
 
 const BAR_BUTTON = `inline-flex h-8 w-8 shrink-0 items-center justify-center rounded text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800 ${FOCUS_RING}`;
 
+/**
+ * What this layer can be asked to show. Two kinds rather than one element,
+ * because the two arrive differently - a diagram as markup this app produced,
+ * an image as an address the browser fetches - and the fit has to ask each of
+ * them for its own size in its own way.
+ */
+export type OverlayContent =
+  | { kind: "diagram"; svg: string }
+  | { kind: "image"; src: string; alt: string };
+
 export interface DiagramOverlayProps {
-  /** The diagram's markup, exactly as mermaid rendered it. */
-  svg: string;
+  content: OverlayContent;
   onClose: () => void;
   /** The control that opened this, where the keyboard goes when it closes. */
   returnFocusTo: RefObject<HTMLElement | null>;
 }
 
-/** The drawing's own size, for the fit: the viewBox is what mermaid always writes. */
+/**
+ * The picture's own size, for the fit. A drawing states it in the viewBox
+ * mermaid always writes; an image has it only once the browser has the file,
+ * and answers zero until then, which is no size rather than a small one.
+ */
 function naturalSize(
-  svg: SVGElement,
+  host: HTMLElement,
 ): { width: number; height: number } | null {
-  const viewBox = svg.getAttribute("viewBox");
+  const image = host.querySelector("img");
+  if (image !== null) {
+    return image.naturalWidth > 0 && image.naturalHeight > 0
+      ? { width: image.naturalWidth, height: image.naturalHeight }
+      : null;
+  }
+  const drawing = host.querySelector("svg");
+  const viewBox = drawing?.getAttribute("viewBox") ?? null;
   if (viewBox === null) {
     return null;
   }
@@ -96,8 +117,21 @@ function naturalSize(
   return width > 0 && height > 0 ? { width, height } : null;
 }
 
+/**
+ * The dialog's own name. An image is named by its alt, which is the author's
+ * own words for it; a diagram has none to be named by.
+ */
+function overlayName(content: OverlayContent): string {
+  if (content.kind === "diagram") {
+    return "Diagram, full window";
+  }
+  return content.alt === ""
+    ? "Image, full window"
+    : `${content.alt}, in the full window`;
+}
+
 export default function DiagramOverlay({
-  svg,
+  content,
   onClose,
   returnFocusTo,
 }: DiagramOverlayProps): ReactElement {
@@ -114,19 +148,24 @@ export default function DiagramOverlay({
   // (where `fullscreenEnabled` is simply absent) is that browser.
   const canFullscreen = document.fullscreenEnabled === true;
 
+  // The one string this content is: the markup of a diagram or the address of
+  // an image. It is what the pan-and-zoom effect hangs off.
+  const shown = content.kind === "diagram" ? content.svg : content.src;
+
   /**
-   * Fit and centre. The drawing's own size comes from its viewBox and the room
+   * Fit and centre. The picture's own size comes from the host and the room
    * from the stage; where either is unknown - a layout-less test environment
-   * says zero to everything - the diagram is left at its natural size rather
-   * than scaled by a number derived from nothing.
+   * says zero to everything, and so does an image that has not loaded yet -
+   * it is left at its natural size rather than scaled by a number derived
+   * from nothing.
    */
   const fit = useCallback((instance: PanzoomObject) => {
     const stage = stageRef.current;
-    const drawing = hostRef.current?.querySelector("svg");
-    if (stage === null || drawing === null || drawing === undefined) {
+    const host = hostRef.current;
+    if (stage === null || host === null) {
       return;
     }
-    const natural = naturalSize(drawing);
+    const natural = naturalSize(host);
     const room = stage.getBoundingClientRect();
     if (natural === null || room.width <= 0 || room.height <= 0) {
       return;
@@ -155,7 +194,7 @@ export default function DiagramOverlay({
       // drawing to the host instead of letting the transform do it. Its own
       // pixel size goes on instead, so one scale factor means one thing.
       const drawing = host.querySelector("svg");
-      const natural = drawing === null ? null : naturalSize(drawing);
+      const natural = drawing === null ? null : naturalSize(host);
       if (drawing !== null && natural !== null) {
         drawing.setAttribute("width", `${natural.width}px`);
         drawing.setAttribute("height", `${natural.height}px`);
@@ -209,10 +248,13 @@ export default function DiagramOverlay({
       instanceRef.current?.destroy();
       instanceRef.current = null;
     };
-    // The markup is a dependency: a scheme change while this is open redraws
-    // the diagram, and the new drawing needs its own sizing and its own fit
-    // rather than the transform that belonged to the old one.
-  }, [fit, svg]);
+    // What is shown is a dependency: a scheme change while this is open
+    // redraws the diagram, and the new picture needs its own sizing and its
+    // own fit rather than the transform that belonged to the old one. The
+    // markup and the address stand for it rather than the object around them,
+    // which both callers build inline on every render and which would
+    // otherwise rebuild the instance under a reader mid-zoom.
+  }, [fit, shown]);
 
   // The keyboard comes in here and goes back where it came from, and the page
   // behind holds still while this is open. The previous overflow is restored
@@ -388,7 +430,7 @@ export default function DiagramOverlay({
       // focus outside it would take Escape, the zoom keys and the arrows with
       // it. -1 keeps it out of the Tab order all the same.
       tabIndex={-1}
-      aria-label="Diagram, full window"
+      aria-label={overlayName(content)}
       // Opaque rather than a translucent scrim: what is behind is a page of
       // prose, and a diagram's own thin lines read badly over it.
       className="fixed inset-0 z-50 flex flex-col bg-white dark:bg-slate-950"
@@ -463,12 +505,36 @@ export default function DiagramOverlay({
         onClick={onStageClick}
         onDoubleClick={onStageDoubleClick}
       >
-        {/*
-          The markup is mermaid's own output, produced by its sanitizing mode
-          from the source in the document; the reading view hands it over
-          unchanged and this layer only resizes the root.
-        */}
-        <div ref={hostRef} dangerouslySetInnerHTML={{ __html: svg }} />
+        {content.kind === "diagram" ? (
+          /*
+            The markup is mermaid's own output, produced by its sanitizing
+            mode from the source in the document; the reading view hands it
+            over unchanged and this layer only resizes the root.
+          */
+          <div
+            ref={hostRef}
+            dangerouslySetInnerHTML={{ __html: content.svg }}
+          />
+        ) : (
+          <div ref={hostRef}>
+            <img
+              src={content.src}
+              alt={content.alt}
+              // The stage owns the drag: a draggable image would start the
+              // browser's own drag and the pan would never begin.
+              draggable={false}
+              onLoad={() => {
+                // The size arrives with the file, which is usually after the
+                // instance exists; when it is the other way round the fit at
+                // construction already had it and this one is a no-op.
+                const instance = instanceRef.current;
+                if (instance !== null) {
+                  fit(instance);
+                }
+              }}
+            />
+          </div>
+        )}
       </div>
     </div>,
     document.body,
