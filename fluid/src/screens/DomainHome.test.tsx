@@ -271,6 +271,14 @@ describe("the domain screen", () => {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
+    // At the root the line above the list says the order rather than the
+    // scope: the listing comes back newest recorded first, so the top of this
+    // page is what the domain learned most recently.
+    expect(
+      within(await screenBody()).getByText(
+        "Newest first, by the date they were recorded.",
+      ),
+    ).toBeVisible();
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
@@ -557,6 +565,12 @@ describe("the domain screen", () => {
     // And the count is the envelope's, not the number of rows in hand.
     expect(
       await within(body).findByText(/620 engrams in this folder/),
+    ).toBeVisible();
+    // The order line belongs to the root of the domain: a folder says which
+    // folder it is browsing, which is the fact a reader inside one needs.
+    expect(within(body).queryByText(/Newest first/)).toBeNull();
+    expect(
+      within(body).getByText(/Browsing notes, subfolders included/),
     ).toBeVisible();
   });
 

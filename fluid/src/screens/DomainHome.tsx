@@ -440,11 +440,18 @@ export default function DomainHome() {
             a folder and everything under it, which is what the endpoint's
             `path` means, so the line says so rather than letting a reader read
             "Browsing notes" as the four files sitting directly in it.
+
+            At the root of the domain the interesting fact is not the scope -
+            a reader who chose no folder knows they are looking at the whole
+            domain - but the order: the listing comes back newest recorded
+            first, so what a reader arriving here reads from the top is what
+            the domain learned most recently. The line says so rather than
+            leaving the order to be guessed at from the dates in the rows.
           */}
           {filtering
             ? "Filtered across the whole domain, every folder included."
             : path === ""
-              ? "Browsing this domain, every folder included."
+              ? "Newest first, by the date they were recorded."
               : `Browsing ${path}, subfolders included.`}
         </p>
 
