@@ -1748,7 +1748,7 @@
           "engrams"
         ],
         "summary": "One domain's engrams, filtered by frontmatter and paged.",
-        "description": "A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way.\n\n`path` scopes the listing to one folder, the folder and everything below it, and it is a folder rather than a string prefix: `notes` takes `notes/deep/y.md` and never `notes-misc/z.md`. The total stays exact under it, so a folder holding thousands of engrams costs one page rather than the folder.\n\nUnder `path`, `total` counts the folder recursively - every engram below it at any depth - which is the number to show when promising a folder's size. The tree endpoint's `total` counts a single level and is deliberately smaller, because it states a fact about the level it drew rather than a promise about the folder. The tree still owns the navigation view and this one owns the listing.\n\nA domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.",
+        "description": "A filter-only search, so the answer carries the same page envelope a search does and a client pages it the same way.\n\n`path` scopes the listing to one folder, the folder and everything below it, and it is a folder rather than a string prefix: `notes` takes `notes/deep/y.md` and never `notes-misc/z.md`. The total stays exact under it, so a folder holding thousands of engrams costs one page rather than the folder.\n\nUnder `path`, `total` counts the folder recursively - every engram below it at any depth - which is the number to show when promising a folder's size. The tree endpoint's `total` counts a single level and is deliberately smaller, because it states a fact about the level it drew rather than a promise about the folder. The tree still owns the navigation view and this one owns the listing.\n\n`sort` and `dir` order the page: `recorded` (the default) is by the date each engram was recorded, newest first unless `dir=asc`, an undated engram last either way; `path` is by path in byte order, A to Z unless `dir=desc`. Both are pushed into the query beside the filters, so `total` and paging stay exact under them. Any other value is a 400 naming the parameter.\n\nA domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.",
         "operationId": "list_engrams",
         "parameters": [
           {
@@ -1811,6 +1811,26 @@
             "example": "notes"
           },
           {
+            "name": "sort",
+            "in": "query",
+            "description": "The order of the listing: `recorded` (the default) is by the date each\nengram was recorded, an undated one last whichever way it runs; `path`\nis by path in byte order. Anything else is a 400 naming this parameter.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "recorded"
+          },
+          {
+            "name": "dir",
+            "in": "query",
+            "description": "The direction: `asc` or `desc`. Defaults to `desc` for `recorded`\n(newest first) and `asc` for `path` (A to Z). Anything else is a 400\nnaming this parameter.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "desc"
+          },
+          {
             "name": "page",
             "in": "query",
             "description": "One-based page number. Defaults to 1.",
@@ -1867,7 +1887,7 @@
             }
           },
           "400": {
-            "description": "The query string will not parse.",
+            "description": "The query string will not parse, or `sort` or `dir` names an order there is none of.",
             "content": {
               "application/problem+json": {
                 "schema": {

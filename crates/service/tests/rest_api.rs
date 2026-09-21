@@ -2081,6 +2081,85 @@ async fn engram_list_scopes_to_a_folder() {
     assert_eq!(page["count"], 1, "the last page of three: {page}");
 }
 
+/// The listing's order is the client's to name: `sort` is `recorded` (the
+/// default) or `path`, `dir` is `asc` or `desc`, and a value outside those
+/// is a 400 naming the parameter. Every fixture engram was recorded on one
+/// day, so the recorded order falls through to its tie-break, the path in
+/// byte order, where `MANIFEST.md` sorts before `alpha.md` because a capital
+/// is the smaller byte; the reversed name order proves the pair reaches the
+/// store, and the engine test beside `engine_writes.rs` proves the dates do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_list_takes_sort_and_dir() {
+    let fixture = serve_anonymous().await;
+    let by_path = vec![
+        "manifest".to_string(),
+        "alpha".to_string(),
+        "notes/beta".to_string(),
+        "notes/deep/gamma".to_string(),
+    ];
+
+    for query in [
+        "",
+        "?sort=recorded",
+        "?sort=recorded&dir=desc",
+        "?sort=recorded&dir=asc",
+        "?sort=path",
+        "?sort=path&dir=asc",
+    ] {
+        let page: serde_json::Value =
+            get(fixture.addr, &format!("/api/v1/domains/eng/engrams{query}"))
+                .await
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(hit_permalinks(&page), by_path, "query `{query}`: {page}");
+    }
+
+    let reversed: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?sort=path&dir=desc",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let mut expected = by_path.clone();
+    expected.reverse();
+    assert_eq!(hit_permalinks(&reversed), expected, "Z to A: {reversed}");
+
+    // The order decides which rows land on a page, so paging is exact under it.
+    let page: serde_json::Value = get(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams?sort=path&dir=desc&limit=3&page=2",
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        hit_permalinks(&page),
+        vec!["manifest".to_string()],
+        "{page}"
+    );
+    assert_eq!(page["total"], 4, "{page}");
+
+    let bad_sort = get(fixture.addr, "/api/v1/domains/eng/engrams?sort=sideways").await;
+    assert_eq!(bad_sort.status(), 400);
+    let problem: serde_json::Value = bad_sort.json().await.unwrap();
+    assert_eq!(
+        problem["detail"], "`sort` must be `recorded` or `path`, not `sideways`",
+        "{problem}"
+    );
+
+    let bad_dir = get(fixture.addr, "/api/v1/domains/eng/engrams?dir=up").await;
+    assert_eq!(bad_dir.status(), 400);
+    let problem: serde_json::Value = bad_dir.json().await.unwrap();
+    assert_eq!(
+        problem["detail"], "`dir` must be `asc` or `desc`, not `up`",
+        "{problem}"
+    );
+}
+
 /// The tree is a navigation aid, not the listing, so a level it cannot show
 /// whole is cut at `TREE_LEVEL_CAP` and says so.
 ///

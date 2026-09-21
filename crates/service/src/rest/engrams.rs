@@ -44,6 +44,7 @@ use crate::params::{
     DeleteParams, MoveParams, ReadParams, RetireParams, SaveParams, SearchParams, WriteParams,
 };
 use crate::similar::SimilarProbe;
+use crystalline_index::SearchOrder;
 
 /// The query string `GET /domains/{domain}/engrams` takes: the filter side of
 /// [`SearchParams`], minus the domain the path already names and minus the
@@ -80,6 +81,18 @@ pub struct ListQuery {
     #[serde(default)]
     #[param(example = "notes")]
     path: Option<String>,
+    /// The order of the listing: `recorded` (the default) is by the date each
+    /// engram was recorded, an undated one last whichever way it runs; `path`
+    /// is by path in byte order. Anything else is a 400 naming this parameter.
+    #[serde(default)]
+    #[param(example = "recorded")]
+    sort: Option<String>,
+    /// The direction: `asc` or `desc`. Defaults to `desc` for `recorded`
+    /// (newest first) and `asc` for `path` (A to Z). Anything else is a 400
+    /// naming this parameter.
+    #[serde(default)]
+    #[param(example = "desc")]
+    dir: Option<String>,
     /// One-based page number. Defaults to 1.
     #[serde(default)]
     #[param(example = 1)]
@@ -133,7 +146,13 @@ pub struct ListQuery {
                    deliberately smaller, because it states a fact about the \
                    level it drew rather than a promise about the folder. The \
                    tree still owns the navigation view and this one owns the \
-                   listing.\n\nA \
+                   listing.\n\n`sort` and `dir` order the page: `recorded` \
+                   (the default) is by the date each engram was recorded, \
+                   newest first unless `dir=asc`, an undated engram last \
+                   either way; `path` is by path in byte order, A to Z unless \
+                   `dir=desc`. Both are pushed into the query beside the \
+                   filters, so `total` and paging stay exact under them. Any \
+                   other value is a 400 naming the parameter.\n\nA \
                    domain nobody registered is a 404, while filters that match \
                    nothing are an empty page: two states a client can tell \
                    apart.",
@@ -166,7 +185,8 @@ pub struct ListQuery {
         ),
         (
             status = 400,
-            description = "The query string will not parse.",
+            description = "The query string will not parse, or `sort` or \
+                           `dir` names an order there is none of.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -198,6 +218,7 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     let scope = identity.scope();
     state.engine.require_domain(&domain, &scope).await?;
+    let order = listing_order(query.sort.as_deref(), query.dir.as_deref())?;
     let value = state
         .engine
         .search_engrams_under(
@@ -215,10 +236,45 @@ pub async fn list(
                 ..SearchParams::default()
             },
             query.path.as_deref(),
+            order,
             &scope,
         )
         .await?;
     Ok(Json(value))
+}
+
+/// The store order a listing's `sort` and `dir` name, or the 400 that names
+/// the parameter at fault.
+///
+/// `recorded` runs newest first unless told otherwise and `path` runs A to
+/// Z, so a client that names a sort and no direction gets the direction that
+/// sort is read in.
+fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, ApiError> {
+    let by_recorded = match sort {
+        None | Some("recorded") => true,
+        Some("path") => false,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "`sort` must be `recorded` or `path`, not `{other}`"
+            )));
+        }
+    };
+    let descending = match dir {
+        None => by_recorded,
+        Some("asc") => false,
+        Some("desc") => true,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "`dir` must be `asc` or `desc`, not `{other}`"
+            )));
+        }
+    };
+    Ok(match (by_recorded, descending) {
+        (true, true) => SearchOrder::RecordedDesc,
+        (true, false) => SearchOrder::RecordedAsc,
+        (false, true) => SearchOrder::PathDesc,
+        (false, false) => SearchOrder::PathAsc,
+    })
 }
 
 /// `GET /domains/{domain}/engrams/{*permalink}` - one engram in full: its

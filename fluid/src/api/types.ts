@@ -422,6 +422,8 @@ export interface paths {
          *
          *     Under `path`, `total` counts the folder recursively - every engram below it at any depth - which is the number to show when promising a folder's size. The tree endpoint's `total` counts a single level and is deliberately smaller, because it states a fact about the level it drew rather than a promise about the folder. The tree still owns the navigation view and this one owns the listing.
          *
+         *     `sort` and `dir` order the page: `recorded` (the default) is by the date each engram was recorded, newest first unless `dir=asc`, an undated engram last either way; `path` is by path in byte order, A to Z unless `dir=desc`. Both are pushed into the query beside the filters, so `total` and paging stay exact under them. Any other value is a 400 naming the parameter.
+         *
          *     A domain nobody registered is a 404, while filters that match nothing are an empty page: two states a client can tell apart.
          */
         get: operations["list_engrams"];
@@ -4539,6 +4541,20 @@ export interface operations {
                  */
                 path?: string;
                 /**
+                 * @description The order of the listing: `recorded` (the default) is by the date each
+                 *     engram was recorded, an undated one last whichever way it runs; `path`
+                 *     is by path in byte order. Anything else is a 400 naming this parameter.
+                 * @example recorded
+                 */
+                sort?: string;
+                /**
+                 * @description The direction: `asc` or `desc`. Defaults to `desc` for `recorded`
+                 *     (newest first) and `asc` for `path` (A to Z). Anything else is a 400
+                 *     naming this parameter.
+                 * @example desc
+                 */
+                dir?: string;
+                /**
                  * @description One-based page number. Defaults to 1.
                  * @example 1
                  */
@@ -4591,7 +4607,7 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
-            /** @description The query string will not parse. */
+            /** @description The query string will not parse, or `sort` or `dir` names an order there is none of. */
             400: {
                 headers: {
                     [name: string]: unknown;

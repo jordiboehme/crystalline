@@ -5,11 +5,12 @@
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
+use crystalline_index::SearchOrder;
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
 use crystalline_service::params::{
-    DeleteParams, ReadParams, RetireParams, SaveParams, SplitParams,
+    DeleteParams, ReadParams, RetireParams, SaveParams, SearchParams, SplitParams,
 };
 use tokio::sync::Mutex;
 
@@ -446,6 +447,66 @@ async fn retirement_sets_status_and_wires_the_supersede_pair() {
     assert!(alpha.contains("- superseded_by [[beta]]"), "{alpha}");
     let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
     assert!(beta.contains("- supersedes [[alpha]]"), "{beta}");
+}
+
+/// The order the listing route names reaches the store: three dates and an
+/// undated engram come back newest first, oldest first, and by name, with
+/// the undated one last in both recorded directions.
+#[tokio::test]
+async fn a_listing_order_reaches_the_store() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/beta.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Beta\n\nLater.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("eng/undated.md"),
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - eng\nstatus: stable\n---\n\n# Undated\n\nNo date.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    async fn listed(engine: &Engine, order: SearchOrder) -> Vec<String> {
+        let page = engine
+            .search_engrams_under(
+                &SearchParams {
+                    domains: vec!["eng".to_string()],
+                    limit: Some(10),
+                    ..SearchParams::default()
+                },
+                None,
+                order,
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        page["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["permalink"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // MANIFEST.md and alpha.md share 2026-01-01 and tie on the path, where
+    // the capital sorts first.
+    assert_eq!(
+        listed(&engine, SearchOrder::RecordedDesc).await,
+        ["beta", "manifest", "alpha", "undated"]
+    );
+    assert_eq!(
+        listed(&engine, SearchOrder::RecordedAsc).await,
+        ["manifest", "alpha", "beta", "undated"]
+    );
+    assert_eq!(
+        listed(&engine, SearchOrder::PathAsc).await,
+        ["manifest", "alpha", "beta", "undated"]
+    );
+    assert_eq!(
+        listed(&engine, SearchOrder::PathDesc).await,
+        ["undated", "beta", "alpha", "manifest"]
+    );
 }
 
 /// Issue #65: an engram whose title's own first word ends in a colon.
