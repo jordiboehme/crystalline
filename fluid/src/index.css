@@ -220,33 +220,35 @@
     main[data-width="full"] .measured > :not(.breakout) {
       max-width: none;
     }
+  }
+}
 
-    /*
-     * Large text: three Safari zoom steps, for a shared screen. Only the
-     * rendered document and the editor grow; the frame around them does not.
-     * The document's own size tokens are redefined in this scope so headings,
-     * code blocks, tables and chips scale with the prose, and the editor's
-     * root scales everything inside it because every size there is relative.
-     * Diagrams are left alone on purpose: mermaid sets its own size inside
-     * the drawing and a fitted diagram fills the same column either way,
-     * which is what browser zoom gets wrong.
-     */
-    main[data-text="large"] .measured {
-      font-size: 1.5rem;
-      --text-2xl: 2.25rem;
-      --text-2xl--line-height: 3rem;
-      --text-xl: 1.875rem;
-      --text-xl--line-height: 2.625rem;
-      --text-lg: 1.6875rem;
-      --text-lg--line-height: 2.625rem;
-      --text-sm: 1.3125rem;
-      --text-sm--line-height: 1.875rem;
-      --text-xs: 1.125rem;
-      --text-xs--line-height: 1.5rem;
-    }
-    main[data-text="large"] .cm-editor {
-      font-size: 1.40625rem;
-    }
+@media screen {
+  /*
+   * Large text: three Safari zoom steps, for a shared screen. Only the
+   * rendered document and the editor grow; the frame around them does not.
+   * The document's own size tokens are redefined in this scope so headings,
+   * code blocks, tables and chips scale with the prose, and the editor's
+   * root scales everything inside it because every size there is relative.
+   * Diagrams are left alone on purpose: mermaid sets its own size inside
+   * the drawing and a fitted diagram fills the same column either way,
+   * which is what browser zoom gets wrong.
+   */
+  main[data-text="large"] .measured {
+    font-size: 1.5rem;
+    --text-2xl: 2.25rem;
+    --text-2xl--line-height: 3rem;
+    --text-xl: 1.875rem;
+    --text-xl--line-height: 2.625rem;
+    --text-lg: 1.6875rem;
+    --text-lg--line-height: 2.625rem;
+    --text-sm: 1.3125rem;
+    --text-sm--line-height: 1.875rem;
+    --text-xs: 1.125rem;
+    --text-xs--line-height: 1.5rem;
+  }
+  main[data-text="large"] .cm-editor {
+    font-size: 1.40625rem;
   }
 }
 
