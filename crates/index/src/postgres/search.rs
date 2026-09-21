@@ -19,8 +19,8 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     CURRENT_STATUS_CLASS, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind,
     EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
-    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery, is_current_status, link_frontier_sql,
-    relation_frontier_sql, retired_factor, salience_prior,
+    MetadataFilter, Page, SearchHit, SearchMode, SearchOrder, SearchQuery, is_current_status,
+    link_frontier_sql, relation_frontier_sql, retired_factor, salience_prior,
 };
 
 use super::{
@@ -170,7 +170,16 @@ async fn run_lexical(
             format!("AND {}", clauses.join(" AND "))
         };
         let actor_screen = actor_screen(query.actor.as_deref(), &mut params, &mut n);
-        return filter_only(conn, &actor_screen, &and_filters, params, limit, page).await;
+        return filter_only(
+            conn,
+            &actor_screen,
+            &and_filters,
+            params,
+            query.order,
+            limit,
+            page,
+        )
+        .await;
     }
 
     let mut scored = scored_lexical(conn, query, &terms, aliases, candidate_cap).await?;
@@ -343,6 +352,7 @@ async fn filter_only(
     actor_screen: &str,
     and_filters: &str,
     params: Vec<Param>,
+    order: SearchOrder,
     limit: usize,
     page: usize,
 ) -> Result<Page<SearchHit>> {
@@ -358,24 +368,7 @@ async fn filter_only(
     .max(0) as usize;
 
     let offset = (page - 1) * limit;
-    // This one sorts, but with a `LIMIT` and no `GROUP BY` Postgres runs a
-    // bounded top-N heapsort, so the wide projection costs one page of bodies
-    // rather than the whole match set. Both sort keys are TEXT and pinned to
-    // `COLLATE "C"` to match Turso's byte order: the sort decides which rows land
-    // on the requested page, so an unpinned key would page differently here.
-    //
-    // `NULLS LAST` for the same reason, and it is not cosmetic: Postgres puts a
-    // NULL first under `DESC` where SQLite puts it last, so an engram carrying
-    // no `recorded_at` led every filter-only listing here and ended one on
-    // Turso. A listing that opens on the newest engrams must not lead with the
-    // one nobody dated.
-    let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} \
-         ORDER BY e.recorded_at COLLATE \"C\" DESC NULLS LAST, \
-         e.permalink COLLATE \"C\" ASC \
-         LIMIT {limit} OFFSET {offset}"
-    );
+    let sql = filter_only_sql(actor_screen, and_filters, order, limit, offset);
     let rows = query_all(conn, &sql, params).await?;
     let items: Vec<(i64, SearchHit)> = rows
         .iter()
@@ -582,6 +575,47 @@ async fn run_hybrid(
 const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, e.description, e.content, \
      CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' \
      THEN (e.metadata ->> 'salience')::double precision END";
+
+/// The `ORDER BY` of a filter-only page, one spelling per [`SearchOrder`].
+///
+/// Every key is TEXT and pinned to `COLLATE "C"` to match turso's byte
+/// order: the sort decides which rows land on the requested page, so an
+/// unpinned key would page differently here. `NULLS LAST` for the same
+/// reason, and it is not cosmetic: postgres puts a NULL first under `DESC`
+/// and last under `ASC`, so without it the undated engram would lead one
+/// direction and end the other. One whole clause per line, because the
+/// collation guard in `postgres/mod.rs` reads the keys off an `ORDER BY `
+/// line of this file.
+fn order_clause(order: SearchOrder) -> &'static str {
+    match order {
+        SearchOrder::RecordedDesc => {
+            "ORDER BY e.recorded_at COLLATE \"C\" DESC NULLS LAST, e.path COLLATE \"C\" ASC"
+        }
+        SearchOrder::RecordedAsc => {
+            "ORDER BY e.recorded_at COLLATE \"C\" ASC NULLS LAST, e.path COLLATE \"C\" ASC"
+        }
+        SearchOrder::PathAsc => "ORDER BY e.path COLLATE \"C\" ASC",
+        SearchOrder::PathDesc => "ORDER BY e.path COLLATE \"C\" DESC",
+    }
+}
+
+/// The filter-only page, the postgres twin of the turso builder: with a
+/// `LIMIT` and no `GROUP BY` postgres runs a bounded top-N heapsort, so the
+/// wide projection costs one page of bodies rather than the whole match set.
+#[doc(hidden)]
+pub fn filter_only_sql(
+    actor_screen: &str,
+    and_filters: &str,
+    order: SearchOrder,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let order_by = order_clause(order);
+    format!(
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE {actor_screen} {and_filters} {order_by} LIMIT {limit} OFFSET {offset}"
+    )
+}
 
 /// The lexical candidate prefilter: every row matching the reader's terms and
 /// filters, capped, ranked afterwards in Rust.

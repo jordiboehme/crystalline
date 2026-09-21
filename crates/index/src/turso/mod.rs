@@ -27,7 +27,8 @@ mod search;
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
 #[doc(hidden)]
 pub use search::{
-    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
+    filter_only_sql, lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql,
+    semantic_phase1_sql,
 };
 
 use std::collections::HashMap;

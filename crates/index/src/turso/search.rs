@@ -16,8 +16,8 @@ use crate::error::{IndexError, Result};
 use crate::store::{
     CURRENT_STATUS_CLASS, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind,
     EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
-    MetadataFilter, Page, SearchHit, SearchMode, SearchQuery, is_current_status, link_frontier_sql,
-    relation_frontier_sql, retired_factor, salience_prior,
+    MetadataFilter, Page, SearchHit, SearchMode, SearchOrder, SearchQuery, is_current_status,
+    link_frontier_sql, relation_frontier_sql, retired_factor, salience_prior,
 };
 
 use super::{
@@ -231,7 +231,16 @@ async fn run_lexical(
             format!("AND {}", clauses.join(" AND "))
         };
         let actor_screen = actor_screen(query.actor.as_deref(), &mut params, &mut n);
-        return filter_only(conn, &actor_screen, &and_filters, params, limit, page).await;
+        return filter_only(
+            conn,
+            &actor_screen,
+            &and_filters,
+            params,
+            query.order,
+            limit,
+            page,
+        )
+        .await;
     }
 
     let mut scored = scored_lexical(conn, query, &terms, aliases, candidate_cap).await?;
@@ -331,6 +340,7 @@ async fn filter_only(
     actor_screen: &str,
     and_filters: &str,
     params: Vec<Value>,
+    order: SearchOrder,
     limit: usize,
     page: usize,
 ) -> Result<Page<SearchHit>> {
@@ -346,22 +356,7 @@ async fn filter_only(
     .max(0) as usize;
 
     let offset = (page - 1) * limit;
-    // This one does open a sorter, but with a `LIMIT` and no `GROUP BY` turso
-    // applies its bounded-sorter optimization and holds only `limit + offset`
-    // records, so the wide projection costs one page of bodies rather than the
-    // whole match set. Adding a `GROUP BY` here would remove that bound.
-    //
-    // The undated engram sorts last, said out loud rather than inherited from
-    // the dialect: SQLite already puts a NULL last under `DESC` and Postgres
-    // puts it first, so the twin statement has to spell `NULLS LAST` and this
-    // one spells the same rule with the key SQLite would apply anyway. A
-    // listing that opens on the newest engrams must not lead with the one
-    // nobody dated, and the sort decides which rows land on a page at all.
-    let sql = format!(
-        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
-         WHERE {actor_screen} {and_filters} \
-         ORDER BY e.recorded_at IS NULL, e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
-    );
+    let sql = filter_only_sql(actor_screen, and_filters, order, limit, offset);
     let rows = query_all(conn, &sql, params).await?;
     let items: Vec<(i64, SearchHit)> = rows
         .iter()
@@ -606,6 +601,50 @@ const CANDIDATE_COLUMNS: &str = "e.id, d.name, e.permalink, e.title, e.engram_ty
 /// order, which decides arbitrarily which of them survives the `LIMIT` cut. The
 /// `c.engram_id ASC` tiebreak makes that cut deterministic (the lower id wins)
 /// and costs nothing: it is the grouping key, already in the sorter record.
+/// The sort keys of a filter-only page, one spelling per [`SearchOrder`].
+///
+/// The undated engram sorts last, said out loud rather than inherited from
+/// the dialect: SQLite puts a NULL last under `DESC` and first under `ASC`,
+/// so the leading `IS NULL` key spells the same rule for both directions,
+/// and the postgres twin spells it `NULLS LAST`. The path is the tie-break
+/// everywhere and the whole key under a name order; both are byte order
+/// here, which is what the postgres twin pins with `COLLATE "C"`.
+fn order_keys(order: SearchOrder) -> &'static str {
+    match order {
+        SearchOrder::RecordedDesc => "e.recorded_at IS NULL, e.recorded_at DESC, e.path ASC",
+        SearchOrder::RecordedAsc => "e.recorded_at IS NULL, e.recorded_at ASC, e.path ASC",
+        SearchOrder::PathAsc => "e.path ASC",
+        SearchOrder::PathDesc => "e.path DESC",
+    }
+}
+
+/// The filter-only page: the statement behind a listing with no query text,
+/// which is what the domain page and every folder view page through.
+///
+/// It opens a sorter, but with a `LIMIT` and no `GROUP BY` turso applies its
+/// bounded-sorter optimization and holds only `limit + offset` records, so
+/// the wide projection costs one page of bodies rather than the whole match
+/// set. Adding a `GROUP BY` here would remove that bound, and
+/// `tests/turso_only.rs` scans this statement for exactly that, which is why
+/// the `ORDER BY` and the `LIMIT` share one line. Built here rather than
+/// inline so the plan registry explains the statement this store issues
+/// rather than a copy of it.
+#[doc(hidden)]
+pub fn filter_only_sql(
+    actor_screen: &str,
+    and_filters: &str,
+    order: SearchOrder,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let order_keys = order_keys(order);
+    format!(
+        "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE {actor_screen} {and_filters} \
+         ORDER BY {order_keys} LIMIT {limit} OFFSET {offset}"
+    )
+}
+
 /// The lexical candidate prefilter: every row matching the reader's terms and
 /// filters, capped, ranked afterwards in Rust.
 ///
