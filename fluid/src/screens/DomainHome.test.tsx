@@ -48,6 +48,20 @@ const MANIFEST = [
   "",
 ].join("\n");
 
+/** The sections a server reads out of `MANIFEST`, in the wire shape. */
+function sectionsResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    scope: [],
+    when_to_use: ["Route here for eng questions."],
+    routing: "when_to_use",
+    missing: ["Scope"],
+    provisioning: null,
+    tag_aliases: null,
+    generated_indexes: { declared: null, effective: "local" },
+    ...overrides,
+  };
+}
+
 /** The tree, which answers with the folder that was asked for. */
 function treeResponse(path: string) {
   if (path.includes("path=notes")) {
@@ -193,7 +207,11 @@ function serve(
     answersFor({
       "/auth/me": probe,
       "/domains": domainsResponse,
-      "/domains/eng/manifest": () => ({ domain: "eng", markdown: MANIFEST }),
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse(),
+      }),
       "/domains/eng/tree": treeResponse,
       "/domains/eng/engrams": engramsResponse,
       "/vocabulary": vocabularyResponse,
@@ -319,6 +337,211 @@ describe("the domain screen", () => {
     expect(
       within(section).queryByRole("link", { name: "Edit MANIFEST" }),
     ).toBeNull();
+  });
+  it("shows the manifest's features when every section is there", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          scope: ["Everything about eng"],
+          missing: [],
+          provisioning: {
+            decls: [
+              { kind: "skills", path: "skills" },
+              { kind: "agents", path: "../agents" },
+            ],
+            problems: [],
+          },
+          tag_aliases: {
+            decls: [{ alias: "Multi_Word", canonical: "multi-word" }],
+            problems: [],
+          },
+          generated_indexes: { declared: "shared", effective: "shared" },
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const routing = await screen.findByRole("region", { name: "Routing" });
+    expect(
+      within(routing).getByRole("heading", { name: "When to Use" }),
+    ).toBeVisible();
+    expect(
+      within(routing).getByText("Route here for eng questions."),
+    ).toBeVisible();
+    expect(
+      within(routing).getByRole("heading", { name: "Scope" }),
+    ).toBeVisible();
+    expect(within(routing).getByText("Everything about eng")).toBeVisible();
+    expect(
+      within(routing).getByText("Agents route by When to Use."),
+    ).toBeVisible();
+
+    const provisioning = screen.getByRole("region", { name: "Provisioning" });
+    expect(within(provisioning).getByText("skills: skills")).toBeVisible();
+    expect(within(provisioning).getByText("agents: ../agents")).toBeVisible();
+    expect(within(provisioning).queryByText("Nothing declared")).toBeNull();
+
+    const aliases = screen.getByRole("region", { name: "Tag aliases" });
+    expect(within(aliases).getByText("Multi_Word -> multi-word")).toBeVisible();
+    expect(within(aliases).queryByText("No aliases")).toBeNull();
+
+    const configuration = screen.getByRole("region", {
+      name: "Configuration",
+    });
+    expect(
+      within(configuration).getByText("generated_indexes: shared"),
+    ).toBeVisible();
+    expect(
+      within(configuration).getByText(
+        "Effective: shared. The generated directory indexes travel with the domain.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("names what a MANIFEST lacks, panel by panel", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          scope: ["Everything about eng"],
+          when_to_use: [],
+          routing: "scope",
+          missing: ["When to Use"],
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const routing = await screen.findByRole("region", { name: "Routing" });
+    expect(within(routing).getByText("No When to Use section")).toBeVisible();
+    expect(within(routing).queryByText("No Scope section")).toBeNull();
+    expect(
+      within(routing).getByText(
+        "Agents route by Scope, because When to Use is absent or empty.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(screen.getByRole("region", { name: "Provisioning" })).getByText(
+        "Nothing declared",
+      ),
+    ).toBeVisible();
+    expect(
+      within(screen.getByRole("region", { name: "Tag aliases" })).getByText(
+        "No aliases",
+      ),
+    ).toBeVisible();
+    const configuration = screen.getByRole("region", {
+      name: "Configuration",
+    });
+    expect(
+      within(configuration).getByText("generated_indexes: not declared"),
+    ).toBeVisible();
+    expect(
+      within(configuration).getByText(
+        "Effective: local. The generated directory indexes stay on this machine.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("says when no agent can route here", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          when_to_use: [],
+          routing: "none",
+          missing: ["Scope", "When to Use"],
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const routing = await screen.findByRole("region", { name: "Routing" });
+    expect(within(routing).getByText("No Scope section")).toBeVisible();
+    expect(within(routing).getByText("No When to Use section")).toBeVisible();
+    expect(
+      within(routing).getByText(
+        "Agents cannot route here until When to Use has a bullet.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("lists every problem bullet with its reason", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          provisioning: {
+            decls: [{ kind: "skills", path: "skills" }],
+            problems: [
+              {
+                kind: "unknown_type",
+                bullet: "widgets: w",
+                reason:
+                  "unknown provisioning type `widgets`, expected one of skills, commands, agents or mcps",
+              },
+            ],
+          },
+          tag_aliases: {
+            decls: [{ alias: "foo", canonical: "bar" }],
+            problems: [
+              {
+                kind: "chained_alias",
+                bullet: "foo -> bar",
+                reason:
+                  "canonical `bar` is itself an alias, resolution stays a single hop",
+              },
+            ],
+          },
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const provisioning = await screen.findByRole("region", {
+      name: "Provisioning",
+    });
+    expect(within(provisioning).getByText("widgets: w")).toBeVisible();
+    expect(
+      within(provisioning).getByText(
+        "unknown provisioning type `widgets`, expected one of skills, commands, agents or mcps",
+      ),
+    ).toBeVisible();
+    const aliases = screen.getByRole("region", { name: "Tag aliases" });
+    // A chained alias is a declaration AND a problem, so the bullet stands
+    // twice in the panel: once in the list the MANIFEST declares, once above
+    // the reason it was flagged for.
+    expect(within(aliases).getAllByText("foo -> bar")).toHaveLength(2);
+    expect(
+      within(aliases).getByText(
+        "canonical `bar` is itself an alias, resolution stays a single hop",
+      ),
+    ).toBeVisible();
+  });
+
+  it("draws no panels for a server that sends no sections", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({ domain: "eng", markdown: MANIFEST }),
+    });
+
+    renderApp("/d/eng");
+
+    // An older daemon answers the markdown alone. The document is still
+    // read; the panels, which would say nothing true, are not drawn.
+    expect(
+      await screen.findByText("What this domain is for, in one paragraph."),
+    ).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Routing" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Configuration" })).toBeNull();
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {

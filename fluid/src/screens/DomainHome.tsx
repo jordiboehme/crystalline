@@ -40,6 +40,11 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { archiveDownloadUrl, unregisterDomain } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
+import type {
+  ManifestProblem,
+  ManifestSections,
+  ManifestView,
+} from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramFilters, EngramPage, ListingOrder } from "../api/engrams";
 import {
@@ -387,7 +392,7 @@ function DomainPage({
         </div>
         <ManifestPanel
           domain={domain}
-          markdown={manifest.data}
+          manifest={manifest.data}
           pending={manifest.isPending}
           error={manifest.error}
         />
@@ -910,12 +915,12 @@ function UnregisterDomain({
  */
 function ManifestPanel({
   domain,
-  markdown,
+  manifest,
   pending,
   error,
 }: {
   domain: string;
-  markdown: string | undefined;
+  manifest: ManifestView | undefined;
   pending: boolean;
   error: Error | null;
 }) {
@@ -939,7 +944,11 @@ function ManifestPanel({
   // A missing MANIFEST is a gap in the domain rather than a failure of the
   // screen, and it is the one thing every domain is supposed to have, so it is
   // said plainly rather than announced as an error.
-  if (isMissing(error) || markdown === undefined || markdown.trim() === "") {
+  if (
+    isMissing(error) ||
+    manifest === undefined ||
+    manifest.markdown.trim() === ""
+  ) {
     return (
       <p className="text-sm text-slate-500 dark:text-slate-400">
         This domain has no MANIFEST yet, so nothing tells an agent what it is
@@ -948,13 +957,171 @@ function ManifestPanel({
     );
   }
   return (
-    <article className="measured">
-      {/*
-        The domain's own attachments live at its root, so a MANIFEST that
-        references one resolves it exactly the way an engram does.
-      */}
-      <Markdown source={markdown} domain={domain} foldTitle={domain} />
-    </article>
+    <div className="flex flex-col gap-4">
+      {manifest.sections !== null && (
+        <ManifestFacets sections={manifest.sections} />
+      )}
+      <article className="measured">
+        {/*
+          The domain's own attachments live at its root, so a MANIFEST that
+          references one resolves it exactly the way an engram does.
+        */}
+        <Markdown
+          source={manifest.markdown}
+          domain={domain}
+          foldTitle={domain}
+        />
+      </article>
+    </div>
+  );
+}
+
+/**
+ * The four panels: what the core crate reads out of the MANIFEST, as it
+ * reads it.
+ *
+ * Read-only on purpose. A switch here would be a second place to change the
+ * document, and the document is the source: the editor is where a change
+ * goes, and these say what it currently says. Whether provisioning was
+ * allowed or denied on this machine is not here either; that decision lives
+ * with the `provision` tool, not with the domain's own description.
+ */
+function ManifestFacets({ sections }: { sections: ManifestSections }) {
+  const missingScope = sections.missing.includes("Scope");
+  const missingWhenToUse = sections.missing.includes("When to Use");
+  return (
+    <div className="grid gap-4 sm:grid-cols-2">
+      <Facet title="Routing">
+        <h4 className="text-caption font-semibold text-slate-500 dark:text-slate-400">
+          When to Use
+        </h4>
+        {missingWhenToUse ? (
+          <p>No When to Use section</p>
+        ) : (
+          <Bullets items={sections.whenToUse} />
+        )}
+        <h4 className="text-caption mt-2 font-semibold text-slate-500 dark:text-slate-400">
+          Scope
+        </h4>
+        {missingScope ? (
+          <p>No Scope section</p>
+        ) : (
+          <Bullets items={sections.scope} />
+        )}
+        <p className="mt-2 text-slate-500 dark:text-slate-400">
+          {sections.routing === "when_to_use"
+            ? "Agents route by When to Use."
+            : sections.routing === "scope"
+              ? "Agents route by Scope, because When to Use is absent or empty."
+              : "Agents cannot route here until When to Use has a bullet."}
+        </p>
+      </Facet>
+      <Facet title="Provisioning">
+        {sections.provisioning === null ||
+        sections.provisioning.decls.length === 0 ? (
+          <p>Nothing declared</p>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {sections.provisioning.decls.map((decl) => (
+              <li key={decl.kind} className="font-mono">
+                {`${decl.kind}: ${decl.path}`}
+              </li>
+            ))}
+          </ul>
+        )}
+        {sections.provisioning !== null && (
+          <Problems items={sections.provisioning.problems} />
+        )}
+      </Facet>
+      <Facet title="Tag aliases">
+        {sections.tagAliases === null ||
+        sections.tagAliases.decls.length === 0 ? (
+          <p>No aliases</p>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {sections.tagAliases.decls.map((decl) => (
+              <li key={decl.alias} className="font-mono">
+                {`${decl.alias} -> ${decl.canonical}`}
+              </li>
+            ))}
+          </ul>
+        )}
+        {sections.tagAliases !== null && (
+          <Problems items={sections.tagAliases.problems} />
+        )}
+      </Facet>
+      <Facet title="Configuration">
+        {/*
+          The frontmatter switches. One today; any switch added later joins
+          this panel rather than growing a fifth.
+        */}
+        <p className="font-mono">
+          {`generated_indexes: ${sections.generatedIndexes.declared ?? "not declared"}`}
+        </p>
+        <p className="mt-1 text-slate-500 dark:text-slate-400">
+          {sections.generatedIndexes.effective === "local"
+            ? "Effective: local. The generated directory indexes stay on this machine."
+            : "Effective: shared. The generated directory indexes travel with the domain."}
+        </p>
+      </Facet>
+    </div>
+  );
+}
+
+/** One panel: a labelled region, so each is reachable by its name. */
+function Facet({ title, children }: { title: string; children: ReactNode }) {
+  const id = `manifest-facet-${title.toLowerCase().replace(/\s+/g, "-")}`;
+  return (
+    <section
+      aria-labelledby={id}
+      className="rounded border border-slate-200 p-3 text-sm dark:border-slate-800"
+    >
+      <h3 id={id} className="mb-2 font-medium">
+        {title}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+/** A section's bullets, as the MANIFEST lists them. Nothing for none. */
+function Bullets({ items }: { items: string[] }) {
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <ul className="list-disc pl-5">
+      {items.map((item) => (
+        <li key={item}>{item}</li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The bullets the core crate flagged, each with its reason in the crate's
+ * own words. The bullet in monospace, because it is quoted from the file.
+ */
+function Problems({ items }: { items: ManifestProblem[] }) {
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mt-2">
+      <h4 className="text-caption font-semibold text-red-700 dark:text-red-300">
+        Problems
+      </h4>
+      <ul className="flex flex-col gap-1">
+        {items.map((item) => (
+          <li key={`${item.kind}:${item.bullet}`}>
+            <span className="font-mono">{item.bullet}</span>
+            <span className="block text-slate-500 dark:text-slate-400">
+              {item.reason}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
