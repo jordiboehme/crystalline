@@ -291,11 +291,20 @@ describe("the domain screen", () => {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
+    // The count and the order menu sit together on the row above the list,
+    // not under the heading, and the old caption is gone.
+    const body = await screenBody();
+    const count = within(body).getByText("2 engrams in this domain");
+    expect(count).toBeVisible();
+    expect(count.parentElement).not.toBeNull();
     expect(
-      within(await screenBody()).getByText(
-        "Newest first, by the date they were recorded.",
-      ),
+      within(count.parentElement as HTMLElement).getByRole("button", {
+        name: "Order: Newest first",
+      }),
     ).toBeVisible();
+    expect(
+      within(body).queryByText(/, by the date they were recorded\.$/),
+    ).toBeNull();
     await waitFor(() => {
       expect(
         requested().some(
@@ -862,9 +871,6 @@ describe("the domain screen", () => {
       await within(body).findByText("620 engrams in this folder"),
     ).toBeVisible();
     expect(
-      within(body).getByText("Newest first, by the date they were recorded."),
-    ).toBeVisible();
-    expect(
       within(body).getByText(/Browsing notes, subfolders included/),
     ).toBeVisible();
     // What a folder page carries: New engram and the order menu.
@@ -952,11 +958,10 @@ describe("the domain screen", () => {
       await screen.findByRole("menuitemradio", { name: "Name A to Z" }),
     );
 
-    // The caption says the order in words, the trigger wears the choice,
-    // the request carries it, and the browser keeps it.
-    expect(await within(body).findByText("By name, A to Z.")).toBeVisible();
+    // The trigger wears the choice, the request carries it, and the browser
+    // keeps it.
     expect(
-      within(body).getByRole("button", { name: "Order: Name A to Z" }),
+      await within(body).findByRole("button", { name: "Order: Name A to Z" }),
     ).toBeVisible();
     await waitFor(() => {
       expect(
@@ -979,9 +984,7 @@ describe("the domain screen", () => {
     const body = await screenBody();
 
     expect(
-      await within(body).findByText(
-        "Oldest first, by the date they were recorded.",
-      ),
+      await within(body).findByRole("button", { name: "Order: Oldest first" }),
     ).toBeVisible();
     await waitFor(() => {
       expect(
@@ -1003,7 +1006,9 @@ describe("the domain screen", () => {
     const body = await screenBody();
     await screen.findByRole("link", { name: /Gamma/ });
 
-    expect(within(body).getByText("By name, Z to A.")).toBeVisible();
+    expect(
+      within(body).getByRole("button", { name: "Order: Name Z to A" }),
+    ).toBeVisible();
     const filtered = requested().filter(
       (path) =>
         path.startsWith("/domains/eng/engrams?") && path.includes("tags=eng"),

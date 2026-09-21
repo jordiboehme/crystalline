@@ -68,8 +68,7 @@ import { ReviewModeCard } from "../components/ReviewModeCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
-import { orderCaption, orderQuery, useEngramsOrder } from "../engramsOrder";
-import type { EngramsOrder } from "../engramsOrder";
+import { orderQuery, useEngramsOrder } from "../engramsOrder";
 import { frontmatterFilters } from "../filters";
 import { plural } from "../format";
 import { domainRoute, folderRoute, manifestEditRoute } from "../paths";
@@ -152,7 +151,7 @@ function useListingState() {
     }
     setParams(updated);
   }
-  return { path, filters, browse, filtering, order, listingOrder, apply };
+  return { path, filters, browse, filtering, listingOrder, apply };
 }
 
 /**
@@ -167,7 +166,7 @@ function DomainPage({
 }) {
   const { capabilities } = useAuth();
   const navigate = useNavigate();
-  const { path, filters, browse, filtering, order, listingOrder, apply } =
+  const { path, filters, browse, filtering, listingOrder, apply } =
     useListingState();
   const [creating, setCreating] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -370,7 +369,6 @@ function DomainPage({
         filters={filters}
         browse={browse}
         filtering={filtering}
-        order={order}
         listingOrder={listingOrder}
         folders={folders}
         tags={tags.data ?? []}
@@ -449,7 +447,7 @@ function FolderPage({
   folders: string[];
 }) {
   const { capabilities } = useAuth();
-  const { filters, browse, filtering, order, listingOrder, apply } =
+  const { filters, browse, filtering, listingOrder, apply } =
     useListingState();
   const [creating, setCreating] = useState(false);
   const tags = useQuery({
@@ -505,7 +503,6 @@ function FolderPage({
         filters={filters}
         browse={browse}
         filtering={filtering}
-        order={order}
         listingOrder={listingOrder}
         folders={folders}
         tags={tags.data ?? []}
@@ -560,17 +557,18 @@ function FolderHeading({ domain, path }: { domain: string; path: string }) {
 }
 
 /**
- * The engrams of a domain or of a folder: the heading with the order under
- * it, the subfolders, the filters, and the list.
+ * The engrams of a domain or of a folder: the heading, the subfolders, the
+ * filters, and the list with its own row above it.
  *
  * Shared by both pages so a folder lists exactly the way its domain does.
  * Nothing administrative is drawn here any more: the archive round trip and
  * unregistering have cards of their own at the foot of the domain page, so
- * this heading carries New engram and the order menu on both pages.
+ * this heading carries New engram only. The order menu sits on the row
+ * directly above the list instead, beside whatever that row says the list
+ * is a list of - the count at the root, the scope in a folder or under a
+ * filter - so it reads as the list's own header rather than the heading's.
  * The create dialog's open state is the page's rather than this section's,
- * because the page's palette row opens the same dialog. The order arrives as
- * a prop too, derived once by `useListingState`, so the caption, the key and
- * the request cannot say three different things.
+ * because the page's palette row opens the same dialog.
  */
 function EngramsSection({
   domain,
@@ -578,7 +576,6 @@ function EngramsSection({
   filters,
   browse,
   filtering,
-  order,
   listingOrder,
   folders,
   tags,
@@ -592,8 +589,6 @@ function EngramsSection({
   filters: EngramFilters;
   browse: EngramFilters;
   filtering: boolean;
-  /** The order that is on, for the caption under the heading. */
-  order: EngramsOrder;
   /** The same order as the listing request and the cache key carry it. */
   listingOrder: ListingOrder;
   /** The subfolders of `path`, from the tree. */
@@ -609,35 +604,23 @@ function EngramsSection({
   return (
     <section aria-labelledby="domain-engrams">
       <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3">
-        <div>
-          <h2 id="domain-engrams" className="text-section">
-            Engrams
-          </h2>
-          {/*
-            The order in words, on every listing: the rows carry no date, so
-            nothing else on screen says which way they run.
-          */}
-          <p className="text-caption mt-1 text-slate-500 dark:text-slate-400">
-            {orderCaption(order)}
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <EngramsOrderMenu />
-          {capabilities.canWrite && (
-            <button
-              type="button"
-              onClick={() => {
-                onCreatingChange(true);
-              }}
-              // Primary: writing an engram is what a writer opens a domain to
-              // do. The sidebar's launcher hides on these screens, so the two
-              // never sit on one page competing for the same attention.
-              className={BUTTON.primary}
-            >
-              New engram
-            </button>
-          )}
-        </div>
+        <h2 id="domain-engrams" className="text-section">
+          Engrams
+        </h2>
+        {capabilities.canWrite && (
+          <button
+            type="button"
+            onClick={() => {
+              onCreatingChange(true);
+            }}
+            // Primary: writing an engram is what a writer opens a domain to
+            // do. The sidebar's launcher hides on these screens, so the two
+            // never sit on one page competing for the same attention.
+            className={BUTTON.primary}
+          >
+            New engram
+          </button>
+        )}
       </div>
       {creating && (
         <CreateEngramDialog
@@ -672,17 +655,24 @@ function EngramsSection({
       />
 
       {/*
-        What the list below is a list of, where that is not the whole domain:
-        a folder and everything under it, which is what the endpoint's `path`
-        means, or a filter across every folder. At the root the caption under
-        the heading has already said everything.
+        The row directly above the list, carrying what the list below is a
+        list of and the order it is in. At the root that is the count, read
+        off the list's own first page through `summary` below, so the total
+        has exactly one source. In a folder or under a filter the scope is
+        named here instead, because a folder or a filter is a fact about the
+        request rather than about any page it answers - it holds even on an
+        empty first page - and the list is handed a `summary` that draws
+        nothing, so the row is said once.
       */}
       {(filtering || path !== "") && (
-        <p className="py-3 text-sm text-slate-500 dark:text-slate-400">
-          {filtering
-            ? "Filtered across the whole domain, every folder included."
-            : `Browsing ${path}, subfolders included.`}
-        </p>
+        <div className="flex flex-wrap items-center justify-between gap-3 py-3">
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            {filtering
+              ? "Filtered across the whole domain, every folder included."
+              : `Browsing ${path}, subfolders included.`}
+          </p>
+          <EngramsOrderMenu />
+        </div>
       )}
 
       {filtering ? (
@@ -693,6 +683,7 @@ function EngramsSection({
           }
           label={`Engrams in ${domain}`}
           emptyMessage="No engram matches these filters."
+          summary={() => null}
         />
       ) : (
         <EngramList
@@ -705,21 +696,21 @@ function EngramsSection({
             fetchDomainEngrams(domain, browse, page, listingOrder)
           }
           label={`Engrams in ${domain}`}
-          // At the root the count this list would draw on its own is "50 of
-          // 620 shown", which says nothing about where those 620 are, so the
-          // scope is named. In a folder the heading has the count already,
-          // and the list keeps its own line. Spread rather than handed over
-          // as `undefined`, which under `exactOptionalPropertyTypes` is a
-          // value rather than an absence.
-          {...(path === ""
-            ? {
-                summary: (page: EngramPage) => (
-                  <p className="text-caption pb-2 text-slate-500 tabular-nums dark:text-slate-400">
-                    {plural(page.total, "engram", "engrams")} in this domain
-                  </p>
-                ),
-              }
-            : {})}
+          // At the root this list draws the whole row above itself: the
+          // count left, the order menu right. In a folder the row above is
+          // already drawn by this section, so the list says nothing.
+          summary={
+            path === ""
+              ? (page: EngramPage) => (
+                  <div className="flex flex-wrap items-center justify-between gap-3 pb-2">
+                    <p className="text-caption text-slate-500 tabular-nums dark:text-slate-400">
+                      {plural(page.total, "engram", "engrams")} in this domain
+                    </p>
+                    <EngramsOrderMenu />
+                  </div>
+                )
+              : () => null
+          }
           emptyMessage={
             path === ""
               ? "This domain has no engrams yet."

@@ -98,20 +98,6 @@ export function orderLabel(order: EngramsOrder): string {
   }
 }
 
-/** The caption under the Engrams heading: the order, in words, on every listing. */
-export function orderCaption(order: EngramsOrder): string {
-  switch (order) {
-    case "newest":
-      return "Newest first, by the date they were recorded.";
-    case "oldest":
-      return "Oldest first, by the date they were recorded.";
-    case "name-asc":
-      return "By name, A to Z.";
-    case "name-desc":
-      return "By name, Z to A.";
-  }
-}
-
 /** What the listing request carries for an order. Name means the path. */
 export function orderQuery(order: EngramsOrder): ListingOrder {
   switch (order) {
