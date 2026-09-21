@@ -495,21 +495,21 @@ impl OriginRule {
         // this instance is called, ahead of the callback address: one of them
         // is the public address stated outright, the other is a callback that
         // happens to carry one.
+        // The same validator the key is set through, so the last reader of a
+        // value that reached a config some other way - hand-built, hand-edited
+        // past the load that drops it - refuses it too rather than publishing
+        // an address nothing can open.
         let public_url = config.service_public_url().and_then(|value| {
-            match openidconnect::url::Url::parse(value) {
-                Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {
-                    Some(super::auth_store::normalize_resource(
-                        &url.origin().ascii_serialization(),
-                    ))
-                }
-                _ => {
-                    tracing::warn!(
-                        "service.public_url is not an absolute http or https url, so it is ignored: \
-                         the OAuth resource identifier and every web_url are derived per caller instead"
-                    );
-                    None
-                }
+            if let Some(warning) = crate::settings::unusable_public_url_warning(value) {
+                tracing::warn!("{warning}");
+                return None;
             }
+            Some(super::auth_store::normalize_resource(
+                &openidconnect::url::Url::parse(value)
+                    .expect("the validator above parsed it")
+                    .origin()
+                    .ascii_serialization(),
+            ))
         });
         let configured = config
             .auth_oidc()

@@ -17,6 +17,15 @@
 //! newer image reading an older binary's environment degrades gracefully
 //! rather than refusing to start.
 //!
+//! One variable is deliberately not fatal: `CRYSTALLINE_SERVICE_PUBLIC_URL` is
+//! dropped with a warning naming the key, the value and the reason, and the
+//! address people open the web UI at is derived per caller as an unset key
+//! already is. An address a browser opens is not worth refusing to start a
+//! daemon over, and the container image binds `0.0.0.0`, which this key
+//! refuses, so an operator who copied that bind across would otherwise have an
+//! instance that never comes up. The same drop runs over the file layer in
+//! [`EnvOverlay::apply`], for a value hand-edited past every validator.
+//!
 //! Precedence, highest to lowest: command-line flags, then this overlay, then
 //! the config file, then the built-in defaults.
 //!
@@ -279,6 +288,18 @@ impl EnvOverlay {
                 if value.is_empty() {
                     continue;
                 }
+                // The one key whose bad value is dropped rather than refused.
+                // An address people open in a browser is not worth refusing to
+                // start over, and the container image binds `0.0.0.0`, so an
+                // operator who copied that bind into this variable would have
+                // a daemon that never comes up. Said once, here, where the
+                // value arrived; an unset key derives one per caller.
+                if spec.key == settings::PUBLIC_URL_KEY
+                    && let Some(warning) = settings::unusable_public_url_warning(&value)
+                {
+                    tracing::warn!("{warning}");
+                    continue;
+                }
                 settings::apply(&mut scratch, spec.key, &value).map_err(|e| {
                     OverlayError(format!("invalid environment variable {name}: {e}"))
                 })?;
@@ -373,6 +394,11 @@ impl EnvOverlay {
                 .domains
                 .insert(name.clone(), env_domain.entry.clone());
         }
+        // A `service.public_url` no validator ever saw - hand-edited into the
+        // config file - is dropped here, so no reader of the effective config
+        // can hand out an address a browser cannot open. Silent, because
+        // `apply` runs on every re-read: the line is said once, at load.
+        settings::drop_unusable_public_url(&mut effective);
         effective
     }
 
@@ -632,6 +658,14 @@ pub fn load(flag: Option<&Path>) -> anyhow::Result<LoadedConfig> {
     let overlay = EnvOverlay::from_process_env()?;
     let path = resolve_config_path(flag, overlay.config_path())?;
     let file = load_file(&path)?;
+    // The file's own copy of the key, which no validator saw on its way in.
+    // `apply` drops it below; this is where it is said, once per load.
+    if let Some(warning) = file
+        .service_public_url()
+        .and_then(settings::unusable_public_url_warning)
+    {
+        tracing::warn!("{warning}");
+    }
     let effective = overlay.apply(&file);
     Ok(LoadedConfig {
         path,
@@ -682,6 +716,63 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// A public url that cannot work never takes the instance down. The key
+    /// is loaded as unset and the address is derived per caller, exactly as an
+    /// absent key is: the container image binds `0.0.0.0`, so an operator who
+    /// copies that bind into this variable would otherwise have a daemon that
+    /// never starts.
+    #[test]
+    fn a_public_url_that_cannot_work_loads_as_unset_rather_than_failing() {
+        for bad in [
+            "http://0.0.0.0:7411",
+            "http://[::]:7411",
+            "kb.example.com",
+            "https://kb.example.com/crystalline",
+        ] {
+            let ov = overlay(&[("CRYSTALLINE_SERVICE_PUBLIC_URL", bad)])
+                .unwrap_or_else(|e| panic!("'{bad}' must not fail the load: {e}"));
+            assert!(
+                !ov.overrides_key("service.public_url"),
+                "'{bad}' is not an override, it is a value that was dropped"
+            );
+            assert_eq!(
+                ov.apply(&GlobalConfig::default()).service_public_url(),
+                None,
+                "'{bad}' loads as unset"
+            );
+        }
+
+        // A value that works is untouched by any of this.
+        let good =
+            overlay(&[("CRYSTALLINE_SERVICE_PUBLIC_URL", "https://kb.example.com")]).unwrap();
+        assert!(good.overrides_key("service.public_url"));
+        assert_eq!(
+            good.apply(&GlobalConfig::default()).service_public_url(),
+            Some("https://kb.example.com")
+        );
+    }
+
+    /// The same rule for a value hand-edited into the config file, which no
+    /// validator ever saw: the effective config never carries an address a
+    /// browser cannot open, whichever layer it came from.
+    #[test]
+    fn a_hand_edited_public_url_that_cannot_work_is_dropped_from_the_effective_config() {
+        let file = GlobalConfig {
+            service: Some(crystalline_core::config::ServiceConfig {
+                public_url: Some("http://0.0.0.0:7411".to_string()),
+                ..Default::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        let effective = EnvOverlay::default().apply(&file);
+        assert_eq!(effective.service_public_url(), None);
+        assert_eq!(
+            file.service_public_url(),
+            Some("http://0.0.0.0:7411"),
+            "and the file itself is left exactly as the operator wrote it"
+        );
     }
 
     #[test]

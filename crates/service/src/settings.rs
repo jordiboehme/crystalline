@@ -1174,6 +1174,36 @@ pub fn service_public_url_problem(value: &str) -> Option<String> {
     None
 }
 
+/// The one sentence said about a `service.public_url` that cannot be the
+/// address people open the web UI at, or `None` when the value can.
+///
+/// Writing the key through `configure` or `config set` is refused outright,
+/// because somebody is standing there to read the refusal. A value that
+/// arrives with no one watching - an environment variable in a compose file, a
+/// hand-edited `config.yaml` - is dropped with this line instead, and the
+/// address falls back to being derived per caller: an address a browser opens
+/// is not worth refusing to start a daemon over, and a container whose
+/// operator copied the bind into this key would otherwise never come up.
+pub fn unusable_public_url_warning(value: &str) -> Option<String> {
+    service_public_url_problem(value).map(|problem| {
+        format!(
+            "{problem}; ignoring '{value}', so the address people open Fluid at is derived per caller instead"
+        )
+    })
+}
+
+/// Drop a `service.public_url` the validator refuses, so an unusable value
+/// never reaches a reader. Silent: the line is said once, where the value
+/// arrived, rather than on every re-read of the effective config.
+pub fn drop_unusable_public_url(config: &mut GlobalConfig) {
+    let unusable = config
+        .service_public_url()
+        .is_some_and(|value| service_public_url_problem(value).is_some());
+    if unusable {
+        clear_service_public_url(config);
+    }
+}
+
 fn set_service_public_url(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
     if let Some(problem) = service_public_url_problem(value) {
         return Err(SettingsError(problem));
