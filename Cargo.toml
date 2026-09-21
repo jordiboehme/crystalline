@@ -25,7 +25,7 @@ crystalline-index = { path = "crates/index", default-features = false }
 crystalline-remote = { path = "crates/remote" }
 crystalline-service = { path = "crates/service" }
 
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
 rmcp = "3.4.0"
 turso = "0.7.2"
@@ -40,7 +40,7 @@ hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
 # Pure-Rust regex backend (fancy-regex) instead of the onig C library, and no
 # esaxx C++ trainer or progress bar; keeps musl static builds clean. Only the
 # JSON tokenizer load and encode paths are used.
-tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 pulldown-cmark = "0.13.4"
 # The PostgreSQL backend. `tls-rustls` shares reqwest's rustls (ring provider)
 # rather than pulling OpenSSL, so the musl static release binaries stay
@@ -57,13 +57,13 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 ] }
 pgvector = { version = "0.4.2", default-features = false, features = ["sqlx"] }
 notify = "8.2.0"
-interprocess = "2.4.3"
+interprocess = "2.4.4"
 sha2 = "0.11.0"
 chrono = "0.4.45"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-indexmap = "2.14.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+indexmap = "2.14.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
 axum = { version = "0.8.9", features = ["ws"] }
 # The yrs `sync` feature makes observer callbacks Send + Sync for the
@@ -94,9 +94,9 @@ time = { version = "0.3.55", default-features = false }
 tower-service = "0.3.3"
 libc = "0.2.189"
 serde_yaml_ng = "0.10.0"
-toml = "1.1.4"
+toml = "1.1.6"
 async-trait = "0.1.92"
-uuid = { version = "1.26.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 thiserror = "2.0.20"
 anyhow = "1.0.104"
 etcetera = "0.11.0"
@@ -198,7 +198,7 @@ assert_cmd = "2.2.2"
 # against (crates/service). `rust_crypto` rather than `aws_lc_rs`: every crate
 # it names - rsa, sha2 0.10, p256, p384, ed25519-dalek - is already in the
 # graph through openidconnect, so the backend adds no new C or assembly build.
-jsonwebtoken = { version = "11.0.0", default-features = false, features = [
+jsonwebtoken = { version = "11.1.0", default-features = false, features = [
     "use_pem",
     "rust_crypto",
 ] }
