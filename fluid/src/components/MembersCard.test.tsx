@@ -1,6 +1,7 @@
 /**
- * The members card: who owns a domain, who is invited into it while it is
- * private, and the one control that decides whether it is private at all.
+ * The members card: who owns a domain and who is invited into it while it is
+ * private. Whether it is private at all is the danger zone's question, one
+ * card further down the page, and the tests for it live beside that card.
  *
  * Mounted through the domain screen, the way `ProposalsCard` and the sync
  * card are, because what is under test is compositional: what the card draws
@@ -113,7 +114,7 @@ beforeEach(() => {
 });
 
 describe("the members card", () => {
-  it("gives the owner the visibility control, the owner row, the member table and the invite form", async () => {
+  it("gives the owner the owner row, the member table and the invite form", async () => {
     serve(
       {
         "/domains/eng/members": () =>
@@ -135,9 +136,11 @@ describe("the members card", () => {
     expect(
       within(card).getByRole("button", { name: "Transfer ownership" }),
     ).toBeVisible();
+    // Whether the domain is private at all is decided in the danger zone at
+    // the foot of the page, not here: this card administers a team.
     expect(
-      within(card).getByRole("button", { name: "Share with everyone" }),
-    ).toBeVisible();
+      within(card).queryByRole("button", { name: "Share with everyone" }),
+    ).toBeNull();
     expect(within(card).getByText("mem")).toBeVisible();
     expect(
       within(card).getByRole("combobox", { name: "Level for mem" }),
@@ -168,8 +171,8 @@ describe("the members card", () => {
     renderApp("/d/eng");
     const card = await membersCard();
 
-    // Neither direction: a manager invites and changes levels, and never
-    // changes visibility.
+    // Neither direction, here or anywhere else on the page: a manager invites
+    // and changes levels, and never changes visibility.
     expect(
       within(card).queryByRole("button", { name: "Share with everyone" }),
     ).toBeNull();
@@ -262,10 +265,6 @@ describe("the members card", () => {
     expect(within(card).getByRole("combobox", { name: "Level" })).toHaveValue(
       "manager",
     );
-    // The admin may still open it back up: `own` from the admin flag alone.
-    expect(
-      within(card).getByRole("button", { name: "Share with everyone" }),
-    ).toBeVisible();
   });
 
   it("gives a manager on an ownerless domain neither owner control", async () => {
@@ -293,45 +292,6 @@ describe("the members card", () => {
     ).toBeNull();
     // It still invites at an ordinary level, the manage right in full.
     expect(within(card).getByRole("button", { name: "Invite" })).toBeVisible();
-  });
-
-  it("offers an admin the way to close a shared domain, with the disk-truth caption", async () => {
-    serve(
-      {
-        "/domains/eng/visibility": (_path, init) => {
-          if (init?.method === "PUT") {
-            return undefined;
-          }
-          throw new ApiProblem(405, "method not allowed", "unexpected method");
-        },
-      },
-      "boss",
-      "admin",
-    );
-
-    renderApp("/d/eng");
-    const card = await membersCard();
-
-    expect(within(card).getByText("Shared with everyone")).toBeVisible();
-    expect(
-      within(card).getByText(
-        "Private domains protect from other users of this instance, not from whoever operates the machine.",
-      ),
-    ).toBeVisible();
-    const trigger = within(card).getByRole("button", { name: "Make private" });
-    await userEvent.click(trigger);
-    await userEvent.click(
-      within(card).getByRole("button", { name: "Confirm make private" }),
-    );
-
-    await waitFor(() => {
-      expect(sentBody("/domains/eng/visibility", "PUT")).toEqual({
-        private: true,
-      });
-    });
-    expect(
-      await within(card).findByText("This domain is private now."),
-    ).toBeVisible();
   });
 
   it("offers a non-admin nothing but the plain shared state", async () => {
@@ -550,7 +510,7 @@ describe("the members card", () => {
     );
 
     // Nowhere to stay: this account no longer sees a private domain it just
-    // left, the same way `UnregisterDomain`'s own domain becomes a wrong
+    // left, the same way an unregistered domain's own page becomes a wrong
     // address for a caller who just unregistered it.
     expect(await screen.findByRole("heading", { name: "Home" })).toBeVisible();
   });
@@ -697,7 +657,7 @@ describe("the members card", () => {
     ).toBeNull();
   });
 
-  it("keeps its five disabled controls in the tab order and inert, rather than removed from it, on a read-only instance", async () => {
+  it("keeps its four disabled controls in the tab order and inert, rather than removed from it, on a read-only instance", async () => {
     // `aria-disabled`, not the native `disabled` attribute: a control taken
     // fully out of the tab order can never be landed on by a keyboard user,
     // so the reason `aria-describedby` attaches to it could never be heard.
@@ -726,9 +686,6 @@ describe("the members card", () => {
 
     const reason =
       "This instance is read only, so nothing here can be changed.";
-    const visibility = within(card).getByRole("button", {
-      name: "Share with everyone",
-    });
     const transfer = within(card).getByRole("button", {
       name: "Transfer ownership",
     });
@@ -737,7 +694,7 @@ describe("the members card", () => {
     });
     const remove = within(card).getByRole("button", { name: "Remove mem" });
     const invite = within(card).getByRole("button", { name: "Invite" });
-    for (const control of [visibility, transfer, relevel, remove, invite]) {
+    for (const control of [transfer, relevel, remove, invite]) {
       expect(control).not.toBeDisabled();
       expect(control).toHaveAttribute("aria-disabled", "true");
       expect(control).toHaveAccessibleDescription(reason);
@@ -768,20 +725,14 @@ describe("the members card", () => {
     expect(account).toHaveValue("newbie");
 
     const before = apiMock.mock.calls.length;
-    await userEvent.click(visibility);
     await userEvent.click(transfer);
     await userEvent.selectOptions(relevel, "manager");
     await userEvent.click(remove);
     await userEvent.click(invite);
-    // A guarded press is a press that does nothing: none of the five reached
+    // A guarded press is a press that does nothing: none of the four reached
     // the network, and the two confirm-pattern controls never even opened
     // their second step.
     expect(apiMock.mock.calls.length).toBe(before);
-    expect(
-      within(card).queryByRole("button", {
-        name: "Confirm share with everyone",
-      }),
-    ).toBeNull();
     expect(
       within(card).queryByRole("button", { name: "Confirm transfer" }),
     ).toBeNull();

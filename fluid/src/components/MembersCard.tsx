@@ -1,6 +1,12 @@
 /**
- * Who owns this domain and who is invited into it, while it is private - and
- * the one control that decides whether it is private at all.
+ * Who owns this domain and who is invited into it, while it is private.
+ *
+ * Whether it is private at all is decided one card further down the page, in
+ * the danger zone beside unregistering it: both are losses that ask for the
+ * domain's name to be typed, and this card is where a team is administered
+ * rather than where one is taken apart. The state itself is still said here,
+ * in the caption beside the heading, because everything below it reads
+ * differently depending on the answer.
  *
  * `GET /domains/{domain}/members` carries no "what may I do here" field, and
  * none is coming: the capability probe idiom this app already uses elsewhere
@@ -22,41 +28,33 @@
  *
  * A domain that is SHARED has no owner and no members to administer - the
  * server's own words, "membership only decides anything while a domain is
- * private" - so the card draws that state plainly instead of an empty table,
- * and offers only the one control a shared domain still has: an admin's way
- * to close it.
+ * private" - so the card draws that state plainly instead of an empty table.
  *
- * Three actions here are destructive enough to ask twice, in the confirm
- * pattern this app uses everywhere else (`Profile.tsx`'s `TokenRow`,
- * `DomainHome.tsx`'s own `UnregisterDomain`): removing a member (or leaving,
- * which is the same call naming yourself), handing the domain to somebody
- * else, and closing it. A fourth ships beside them though the brief names
- * only three: re-sharing a domain also throws its membership list away
- * ("making a domain shared again forgets its membership list" - the server's
- * own description), which is exactly the shape of loss the other three ask
- * about, so it gets the same second press.
+ * Two actions here are destructive enough to ask twice, in the confirm
+ * pattern this app uses everywhere else (`DestructiveAction`, `Profile.tsx`'s
+ * `TokenRow`): removing a member (or leaving, which is the same call naming
+ * yourself) and handing the domain to somebody else.
  *
  * Leaving, or handing the domain away while you were the one holding it, ends
  * this account's own reach into it - the page under this card is about to be
- * a wrong address for whoever just acted, the same way `UnregisterDomain`'s
- * own domain becomes one. Both follow that precedent: invalidate the listing
- * every sidebar and switcher draws from, and leave for `/` rather than sit on
- * a page that is about to refuse to load. Two callers keep the page instead,
- * because neither actually lost anything: an admin who leaves its own
- * membership row still holds `Own` on every domain regardless (`decide`
+ * a wrong address for whoever just acted, the same way an unregistered
+ * domain's own page becomes one. Both follow that precedent: invalidate the
+ * listing every sidebar and switcher draws from, and leave for `/` rather
+ * than sit on a page that is about to refuse to load. Two callers keep the
+ * page instead, because neither actually lost anything: an admin who leaves
+ * its own membership row still holds `Own` on every domain regardless (`decide`
  * answers `Own` for any admin before it ever looks at the acl), and an owner
  * who "transfers" the domain to itself changed nothing.
  *
  * `capabilities.readOnly` is a certainty this side already holds, unlike a
- * per-domain right - so the five mutations below are disabled rather than
+ * per-domain right - so the four mutations below are disabled rather than
  * offered-then-refused, each with the read-only reason as its own accessible
  * description (`READ_ONLY_REASON`), the same shape `Profile.tsx` gives a
  * verb a read-only instance will not run.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ReactElement, ReactNode } from "react";
-import { useId, useRef, useState } from "react";
+import { useId, useState } from "react";
 import { useNavigate } from "react-router";
 
 import { problemDetail } from "../api/client";
@@ -67,27 +65,15 @@ import {
   removeMember,
   setMember,
   setOwner,
-  setVisibility,
 } from "../api/members";
 import type { DomainMember, MemberLevel } from "../api/model";
 import { useAuth } from "../auth/AuthContext";
 import { formatDay } from "../format";
+import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
 import { BUTTON, FIELD, Field } from "./primitives";
 
 /** Every level a member can be invited at, or moved to. */
 const LEVELS: MemberLevel[] = ["viewer", "editor", "manager"];
-
-/**
- * `readOnly` is a certainty this side already holds, straight off the
- * capability probe - unlike a per-domain right, nothing is gained by
- * offering a control the client can prove is refused. The five mutations
- * below are disabled rather than removed, though, and this sentence rides
- * along as each one's accessible description: a door that will not open is
- * still the door, shown as one, not vanished the way a merely *derived*
- * right's absence is.
- */
-const READ_ONLY_REASON =
-  "This instance is read only, so nothing here can be changed.";
 
 /** Login names are folded to lowercase and trimmed on the way in; compare the same way. */
 function sameAccount(a: string, b: string): boolean {
@@ -96,7 +82,7 @@ function sameAccount(a: string, b: string): boolean {
 
 /** What this caller may do here, derived from the one read every render makes. */
 interface MyStanding {
-  /** Owner or admin: may transfer, may change visibility either direction. */
+  /** Owner or admin: may transfer, and may reach the visibility control the danger zone draws. */
   own: boolean;
   /** Manage right or above: may invite, change a level, remove another member. */
   manage: boolean;
@@ -126,7 +112,6 @@ export function MembersCard({ domain }: { domain: string }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [problem, setProblem] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
 
   const query = useQuery({
     queryKey: membersKey(domain),
@@ -224,22 +209,6 @@ export function MembersCard({ domain }: { domain: string }) {
     },
   });
 
-  const visibility = useMutation({
-    mutationFn: (makePrivate: boolean) => setVisibility(domain, makePrivate),
-    onSuccess: (_void, makePrivate) => {
-      setProblem(null);
-      setNotice(
-        makePrivate
-          ? "This domain is private now."
-          : "This domain is shared with everyone again.",
-      );
-      void invalidate();
-    },
-    onError: (error: Error) => {
-      setProblem(problemDetail(error));
-    },
-  });
-
   // Drawn only once the read behind it has landed, the way every other card
   // on this page is (`ProposalsCard`, the sync card): a read still in flight
   // is not a state worth a heading, and a read that was refused draws
@@ -291,27 +260,6 @@ export function MembersCard({ domain }: { domain: string }) {
           {problem}
         </p>
       )}
-      {notice !== null && (
-        <p
-          role="status"
-          className="rounded bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300"
-        >
-          {notice}
-        </p>
-      )}
-
-      <VisibilitySection
-        isPrivate={isPrivate}
-        standing={standing}
-        pending={visibility.isPending}
-        disabledReason={disabledReason}
-        onChange={(makePrivate) => {
-          setProblem(null);
-          setNotice(null);
-          visibility.mutate(makePrivate);
-        }}
-      />
-
       {isPrivate ? (
         <>
           <OwnerRow
@@ -321,7 +269,6 @@ export function MembersCard({ domain }: { domain: string }) {
             disabledReason={disabledReason}
             onTransfer={(owner) => {
               setProblem(null);
-              setNotice(null);
               transfer.mutate(owner);
             }}
           />
@@ -340,7 +287,6 @@ export function MembersCard({ domain }: { domain: string }) {
             }}
             onRemove={(principal) => {
               setProblem(null);
-              setNotice(null);
               remove.mutate(principal);
             }}
           />
@@ -363,64 +309,6 @@ export function MembersCard({ domain }: { domain: string }) {
         </p>
       )}
     </section>
-  );
-}
-
-/**
- * The one control that decides whether this domain is private, in whichever
- * of its two shapes the caller may reach.
- *
- * A manager sees neither direction: deciding who may see a domain at all is
- * not one domain's administration to settle, the same reason it may not
- * transfer ownership. The caption is the spec's own honest disk-truth
- * sentence, shown beside the control rather than always on the card, because
- * it is only worth reading at the moment somebody can act on it.
- */
-function VisibilitySection({
-  isPrivate,
-  standing,
-  pending,
-  disabledReason,
-  onChange,
-}: {
-  isPrivate: boolean;
-  standing: MyStanding;
-  pending: boolean;
-  disabledReason?: string | undefined;
-  onChange: (makePrivate: boolean) => void;
-}) {
-  // `standing.own` alone, on both directions: closing a shared domain is
-  // admin only, and a shared domain never has an owner for the owner clause
-  // of `own` to match, so on that side `standing.own` already reduces to
-  // exactly "is an admin". Opening a private one is the owner's or an
-  // admin's, which is `standing.own` in full.
-  if (!standing.own) {
-    return null;
-  }
-  const label = isPrivate ? "Share with everyone" : "Make private";
-  return (
-    <div className="flex flex-col gap-1">
-      <DestructiveAction
-        label={label}
-        confirmLabel={`Confirm ${label.toLowerCase()}`}
-        pending={pending}
-        disabledReason={disabledReason}
-        onConfirm={() => {
-          onChange(!isPrivate);
-        }}
-      />
-      {/*
-        The spec's own honest disk-truth sentence, shown whenever a caller
-        can act on the private direction: a caller who can only re-share
-        already knows a shared domain protects nothing, so the sentence
-        earns its place beside the control that would close one instead.
-      */}
-      <p className="text-caption text-slate-500 dark:text-slate-400">
-        {isPrivate
-          ? "Opening this domain forgets who was invited into it."
-          : "Private domains protect from other users of this instance, not from whoever operates the machine."}
-      </p>
-    </div>
   );
 }
 
@@ -807,151 +695,5 @@ function InviteForm({
         </span>
       )}
     </form>
-  );
-}
-
-/**
- * The two-step confirm this app uses for every destructive control: a trigger
- * that asks, a second press that means it, focus handed back to the trigger
- * on Escape or on losing the confirm without pressing it.
- *
- * The pattern this repeats to the letter is `Profile.tsx`'s `TokenRow` and
- * `DomainHome.tsx`'s own `UnregisterDomain` - a dialog the browser owns
- * cannot be reached by a test, styled, or dismissed by keyboard the way this
- * can. `TransferOwnership` is built on this one rather than hand-rolling the
- * same machinery a third time in this file: `children` is the one thing it
- * needs beyond a plain confirm, an extra control rendered between trigger and
- * confirm that carries its own value through to `onConfirm`.
- */
-function DestructiveAction({
-  label,
-  confirmLabel,
-  ariaLabel,
-  confirmAriaLabel,
-  pending,
-  disabledReason,
-  requireValue = false,
-  children,
-  onConfirm,
-}: {
-  label: string;
-  confirmLabel: string;
-  /**
-   * The trigger's accessible name, when the visible `label` alone would not
-   * be unique on the page - a row's "Remove" beside every other row's own.
-   * Defaults to `label`.
-   */
-  ariaLabel?: string;
-  /** Same reason, for the confirm press. Defaults to `confirmLabel`. */
-  confirmAriaLabel?: string;
-  pending: boolean;
-  /**
-   * When set, the trigger is disabled and this is exposed as its accessible
-   * description - a certainty already held, not a right this side is merely
-   * guessing at, so the door is shown shut rather than removed.
-   */
-  disabledReason?: string | undefined;
-  /** Whether the confirm press needs a non-empty `value` before it may fire. */
-  requireValue?: boolean;
-  /** An extra control rendered between trigger and confirm, e.g. a text field. */
-  children?: (value: string, setValue: (value: string) => void) => ReactNode;
-  onConfirm: (value: string) => void;
-}): ReactElement {
-  const [confirming, setConfirming] = useState(false);
-  const [value, setValue] = useState("");
-  const trigger = useRef<HTMLButtonElement>(null);
-  const name = ariaLabel ?? label;
-  const confirmName = confirmAriaLabel ?? confirmLabel;
-  const reasonId = useId();
-  // `aria-disabled`, not `disabled`, on both buttons below: `disabled` takes
-  // a control out of the tab order entirely, so a keyboard user could never
-  // land on it, let alone hear the reason `aria-describedby` attaches to it.
-  // This repo already ruled on exactly this trade in `Layout.tsx`'s own
-  // `ShareChanges` - reachable by pointer and by keyboard, says it will not
-  // act, and does not, because the press is guarded as well as the face.
-  const disabled = pending || disabledReason !== undefined;
-  const confirmDisabled =
-    pending ||
-    disabledReason !== undefined ||
-    (requireValue && value.trim() === "");
-
-  function abandon() {
-    setConfirming(false);
-    setValue("");
-    trigger.current?.focus();
-  }
-
-  return (
-    <span
-      className="inline-flex flex-wrap items-center gap-2"
-      onKeyDown={(event) => {
-        if (event.key === "Escape" && confirming) {
-          event.stopPropagation();
-          abandon();
-        }
-      }}
-      onBlur={(event) => {
-        const next = event.relatedTarget;
-        if (
-          confirming &&
-          next instanceof Node &&
-          !event.currentTarget.contains(next)
-        ) {
-          setConfirming(false);
-        }
-      }}
-    >
-      <button
-        ref={trigger}
-        type="button"
-        aria-label={name}
-        aria-expanded={confirming}
-        aria-describedby={disabledReason !== undefined ? reasonId : undefined}
-        aria-disabled={disabled}
-        onClick={() => {
-          if (disabled) {
-            return;
-          }
-          setConfirming(true);
-        }}
-        className={`${BUTTON.destructive} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
-      >
-        {label}
-      </button>
-      {disabledReason !== undefined && (
-        <span id={reasonId} className="sr-only">
-          {disabledReason}
-        </span>
-      )}
-      {confirming && (
-        <>
-          {children?.(value, setValue)}
-          <button
-            type="button"
-            autoFocus={children === undefined}
-            aria-label={confirmName}
-            aria-describedby={
-              disabledReason !== undefined ? reasonId : undefined
-            }
-            aria-disabled={confirmDisabled}
-            onClick={() => {
-              if (confirmDisabled) {
-                return;
-              }
-              setConfirming(false);
-              const confirmed = value;
-              setValue("");
-              onConfirm(confirmed);
-            }}
-            className={`${BUTTON.destructive} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
-          >
-            {confirmLabel}
-          </button>
-          <button type="button" onClick={abandon} className={BUTTON.secondary}>
-            Keep
-          </button>
-        </>
-      )}
-    </span>
   );
 }
