@@ -193,10 +193,15 @@ test("an invitation is what makes a private domain visible", async ({
   await expect(homeCard(stranger)).toHaveCount(0);
   await expect(sidebarLink(stranger)).toHaveCount(0);
 
-  // Opened again, from the same card. This is the one-way step: the domain
-  // forgets who was invited, and every account on the instance can read it.
-  await members.getByRole("button", { name: "Share with everyone" }).click();
-  await members
+  // Opened again, from the danger zone rather than the members card: this is
+  // the one-way step, the domain forgets who was invited, and every account
+  // on the instance can read it.
+  const dangerZone = owner.getByRole("region", { name: "Danger zone" });
+  await dangerZone.getByRole("button", { name: "Share with everyone" }).click();
+  await dangerZone
+    .getByLabel(new RegExp(`Type ${DOMAIN} to confirm`))
+    .fill(DOMAIN);
+  await dangerZone
     .getByRole("button", { name: "Confirm share with everyone" })
     .click();
   // Exactly, so the card's own caption is what is read rather than the notice
