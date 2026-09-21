@@ -20,10 +20,11 @@ Cargo workspace, Rust edition 2024, pinned toolchain in rust-toolchain.toml.
 
 - `crates/core` (crystalline-core) - format layer: parser, emitter, schema, verify, prompt. Must never depend on async runtimes, databases or ML crates
 - `crates/index` (crystalline-index) - Store trait, embedded database backend, sync engine, search, embeddings
+- `crates/remote` (crystalline-remote) - GitHub-backed team collaboration plumbing: the forge-neutral Provider trait, the plain-text merge engine and the on-disk origin state. Git is never invoked; everything goes through the GitHub APIs
 - `crates/service` (crystalline-service) - single-instance daemon, MCP server, control protocol
 - `crates/cli` (crystalline) - the single user-facing binary
 
-Dependency direction: core <- index <- service <- cli.
+Dependency direction: core <- index <- service <- cli, with remote beside index (it depends on core and is used by service and cli).
 
 ## Commands
 
@@ -32,6 +33,7 @@ Dependency direction: core <- index <- service <- cli.
 - Test (canonical fallback): `cargo test --workspace`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
 - Style check: `bash scripts/style-lint.sh`
+- Fluid (from `fluid/`): `npm run build`, `npm test -- --run`, `npm run lint`, `pnpm run format:check`, `pnpm typecheck`; CI runs all five, so a change that skips the format check or the typecheck goes red on main. A change that adds, moves or renames a control also runs the browser smoke, `bash fluid/e2e/run-smoke.sh` (needs `pnpm build`, `cargo build -p crystalline` and the chromium install; on a mac export `CRYSTALLINE_TEST_NO_KEYCHAIN=1` first), and greps `fluid/e2e/*.spec.ts` for the accessible names it changed
 
 ## Toolchain
 
