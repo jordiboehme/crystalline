@@ -293,6 +293,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The page-URL template is a string with braces in it, and braces are
+    /// structural in TOON: the emitter has to quote the line or a reader
+    /// would take the placeholders for a nested shape. Alphabetical key order
+    /// puts it last, after the tabular hits block it belongs to.
+    #[test]
+    fn a_template_line_is_quoted_because_of_its_braces() {
+        let value = json!({
+            "count": 1,
+            "hits": [{ "domain": "eng", "permalink": "alpha", "title": "Alpha" }],
+            "web_url_template": "http://127.0.0.1:7411/d/{domain}/e/{permalink}",
+        });
+        assert_eq!(
+            render(&value),
+            "count: 1\nhits[1]{domain,permalink,title}:\n  eng,alpha,Alpha\nweb_url_template: \"http://127.0.0.1:7411/d/{domain}/e/{permalink}\""
+        );
+    }
+
     #[test]
     fn ragged_rows_are_filled_to_the_union_of_keys() {
         let v = json!({ "hits": [ {"a": 1}, {"a": 2, "b": 3} ] });

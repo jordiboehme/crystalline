@@ -59,11 +59,22 @@ struct Harness {
 }
 
 impl Harness {
-    /// A real temp-directory domain per name (files are the source of truth)
-    /// synced into an in-memory store, with the response format pinned to
-    /// plain JSON so the assertions stay on the payload rather than on TOON
-    /// framing. Copied from `mcp_tools.rs`, minus the knobs no test here turns.
+    /// A harness whose responses are plain JSON, so an assertion lands on the
+    /// payload rather than on TOON framing.
     async fn new(domains: &[&str]) -> Harness {
+        Harness::build(domains, true).await
+    }
+
+    /// The same harness under the DEFAULT response format, TOON, which is
+    /// where a template has to survive the rendering as well as the payload.
+    async fn new_toon(domains: &[&str]) -> Harness {
+        Harness::build(domains, false).await
+    }
+
+    /// A real temp-directory domain per name (files are the source of truth)
+    /// synced into an in-memory store. Copied from `mcp_tools.rs`, minus the
+    /// knobs no test here turns.
+    async fn build(domains: &[&str], pin_json: bool) -> Harness {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig::default();
@@ -79,10 +90,12 @@ impl Harness {
             .unwrap();
             cfg.domains.insert(d.to_string(), DomainEntry::file(dir));
         }
-        cfg.service = Some(ServiceConfig {
-            response_format: Some(ResponseFormat::Json),
-            ..ServiceConfig::default()
-        });
+        if pin_json {
+            cfg.service = Some(ServiceConfig {
+                response_format: Some(ResponseFormat::Json),
+                ..ServiceConfig::default()
+            });
+        }
         let config_path = root.join("config.yaml");
         crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
         // Nothing here may reach the developer's real OS keychain.
@@ -173,6 +186,18 @@ fn payload_of(result: &rmcp::model::CallToolResult) -> Value {
 /// Call a tool and return its JSON payload.
 async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Value {
     payload_of(&call_result(peer, tool, args).await)
+}
+
+/// The text block a tool result leads with, exactly as the agent reads it:
+/// TOON under the default format, JSON under `json`.
+async fn call_text(peer: &Peer<RoleClient>, tool: &str, args: Value) -> String {
+    let result = call_result(peer, tool, args).await;
+    let whole = serde_json::to_value(&result).unwrap();
+    whole
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{tool} answers a text block: {whole}"))
+        .to_string()
 }
 
 /// The resource links a tool result carries, in order.
@@ -530,5 +555,178 @@ async fn an_http_server_built_outside_the_transport_says_it_cannot_tell() {
     assert!(
         read.get("web_url").is_none(),
         "no address is better than a wrong one: {read}"
+    );
+}
+
+/// The word only the engram body carries, so a text search over it answers
+/// exactly one hit: a domain's own MANIFEST is an indexed engram too, and a
+/// query it also matches would put a second row in the table the TOON pin
+/// reads.
+const ONLY_IN_THE_BODY: &str = "zorbulating";
+
+/// Write the one engram every list test here searches for.
+async fn seed_one(peer: &Peer<RoleClient>) {
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Alpha",
+            "content": format!("Alpha knowledge, {ONLY_IN_THE_BODY}.")
+        }),
+    )
+    .await;
+}
+
+/// **A list says the shape once and says nothing per row.** A hit already
+/// carries its domain and its permalink, so a URL on every row would be the
+/// same sentence repeated as many times as the page is long; the template is
+/// that sentence said once, for an agent to fill in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_carries_one_template_and_nothing_per_hit() {
+    record_intent();
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    seed_one(peer).await;
+
+    let found = call_result(
+        peer,
+        "search_engrams",
+        json!({ "query": ONLY_IN_THE_BODY, "search_type": "text" }),
+    )
+    .await;
+    let payload = payload_of(&found);
+    assert_eq!(
+        payload["web_url_template"],
+        json!(format!("{LOCAL_BASE}/d/{{domain}}/e/{{permalink}}")),
+        "one template, at the top level: {payload}"
+    );
+    let hits = payload["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a search answers hits: {payload}"));
+    assert!(!hits.is_empty(), "the seeded engram is found: {payload}");
+    for hit in hits {
+        assert!(
+            hit.get("web_url").is_none() && hit.get("web_url_note").is_none(),
+            "a row says nothing about a page: {hit}"
+        );
+    }
+
+    let links = resource_links(&found);
+    assert_eq!(
+        links.len(),
+        hits.len(),
+        "one link per hit, as before the template: {links:?}"
+    );
+    for link in &links {
+        assert!(
+            link.get("_meta").is_none(),
+            "a search link carries no page of its own: {link}"
+        );
+    }
+}
+
+/// **The template survives the default rendering.** Its braces are structural
+/// characters in TOON, so the line has to come back quoted, and the hits block
+/// beside it has to stay the tabular shape the whole format exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_toon_search_ends_with_the_quoted_template_line() {
+    record_intent();
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    seed_one(peer).await;
+
+    let text = call_text(
+        peer,
+        "search_engrams",
+        json!({ "query": ONLY_IN_THE_BODY, "search_type": "text" }),
+    )
+    .await;
+    assert!(
+        text.contains(&format!(
+            "web_url_template: \"{LOCAL_BASE}/d/{{domain}}/e/{{permalink}}\""
+        )),
+        "the quoted template line, as the TOON pin renders it: {text}"
+    );
+    assert!(
+        text.contains("hits[1]{"),
+        "and the hits block is still one tabular row: {text}"
+    );
+}
+
+/// **All four list verbs say it, not only the search.** Each answers a
+/// different shape - nodes, engrams by recency, a folder level - and every one
+/// of them has a domain and a permalink on every row, which is exactly what
+/// the one template needs and why no row changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_recent_activity_and_browse_domain_carry_the_template() {
+    record_intent();
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    seed_one(peer).await;
+    let expected = json!(format!("{LOCAL_BASE}/d/{{domain}}/e/{{permalink}}"));
+
+    let context = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/alpha" }),
+    )
+    .await;
+    assert_eq!(context["web_url_template"], expected, "{context}");
+
+    let recent = call(peer, "recent_activity", json!({ "timeframe": "7d" })).await;
+    assert_eq!(recent["web_url_template"], expected, "{recent}");
+
+    let browsed = call(peer, "browse_domain", json!({ "domain": "eng" })).await;
+    assert_eq!(browsed["web_url_template"], expected, "{browsed}");
+    assert_eq!(
+        browsed["domain"],
+        json!("eng"),
+        "the domain half of the template is the result's own key: {browsed}"
+    );
+    let engrams = browsed["engrams"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a browse answers engrams: {browsed}"));
+    assert!(
+        engrams.iter().all(|row| row.get("permalink").is_some()),
+        "and the permalink half is on every row: {browsed}"
+    );
+}
+
+/// **A list with no derivable address says so once.** The note is a fact about
+/// the caller, not about a row, so a page of twenty hits carries one sentence
+/// rather than twenty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_http_list_built_outside_the_transport_carries_the_note_once() {
+    record_intent();
+    let h = Harness::new(&["eng"]).await;
+    let (writer, _w) = h.connect().await;
+    seed_one(writer.peer()).await;
+
+    let (client, _server) = h.connect_http().await;
+    let found = call_result(
+        client.peer(),
+        "search_engrams",
+        json!({ "query": ONLY_IN_THE_BODY, "search_type": "text" }),
+    )
+    .await;
+    let payload = payload_of(&found);
+    assert_eq!(
+        payload["web_url_note"],
+        json!(UNRESOLVED_NOTE),
+        "the one sentence, naming the setting: {payload}"
+    );
+    assert!(
+        payload.get("web_url_template").is_none(),
+        "no address is better than a wrong one: {payload}"
+    );
+    let whole = serde_json::to_string(&payload).unwrap();
+    assert_eq!(
+        whole.matches(UNRESOLVED_NOTE).count(),
+        1,
+        "said once at the top and never on a row: {payload}"
     );
 }

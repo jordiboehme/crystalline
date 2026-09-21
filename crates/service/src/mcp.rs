@@ -2482,7 +2482,7 @@ impl McpServer {
     #[tool(
         name = "search_engrams",
         title = "Search engrams",
-        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded. Every hit on the returned page also comes back as a resource_link block beside the text, in hit order: follow the crystalline:// handle with resources/read instead of assembling the address out of the row's domain and permalink.",
+        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded. Every hit on the returned page also comes back as a resource_link block beside the text, in hit order: follow the crystalline:// handle with resources/read instead of assembling the address out of the row's domain and permalink. The result carries one web_url_template; fill in a hit's domain and permalink to hand a person that engram's page.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_engrams(
@@ -2494,6 +2494,10 @@ impl McpServer {
             .search_engrams(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
+            .map(|mut v| {
+                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
+                v
+            })
             .and_then(|v| self.ok_found(v))
     }
 
@@ -2512,6 +2516,10 @@ impl McpServer {
             .build_context(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
+            .map(|mut v| {
+                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
+                v
+            })
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2530,6 +2538,10 @@ impl McpServer {
             .recent_activity(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
+            .map(|mut v| {
+                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
+                v
+            })
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2566,6 +2578,10 @@ impl McpServer {
             .browse_domain(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
+            .map(|mut v| {
+                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
+                v
+            })
             .and_then(|v| self.ok_list(v))
     }
 
