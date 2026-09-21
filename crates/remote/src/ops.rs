@@ -1009,7 +1009,7 @@ pub async fn status(
 
     // After the probe, not before: a layer the forge just reported declined
     // hands its files back to this count.
-    let local = detect_local_changes(domain_root, &status_base(&state))?;
+    let local = detect_local_changes(domain_root, &unshared_base(&state))?;
 
     let open_proposals = state
         .proposals
@@ -1326,7 +1326,7 @@ fn tip_files_over(
     tip
 }
 
-/// The base a status counts unshared work against.
+/// The base an unshared-work walk counts against.
 ///
 /// On the stacked path a share detects against the chain tip, so a status
 /// must too, or the badge, the CLI status line and both share nudges say
@@ -1340,7 +1340,14 @@ fn tip_files_over(
 /// is not, so its files read as work again. Off the stacked path the amend
 /// flow re-proposes everything against the trunk, and the trunk count is
 /// right there.
-fn status_base(state: &OriginState) -> BTreeMap<String, BaseStamp> {
+///
+/// Public because a status is not the only walk: every unshared-work walk in
+/// the service crate reads this base too - the change detail behind the CLI's
+/// ahead line and its `--files` list, and the `unshared_work` the session
+/// hook's share nudge, the write-receipt trailer and the owned-changes count
+/// are all computed from - so no surface can disagree with the badge beside
+/// it.
+pub fn unshared_base(state: &OriginState) -> BTreeMap<String, BaseStamp> {
     if state.stacks_available != Some(true) || !chain_is_stacked(state) {
         return state.files.clone();
     }

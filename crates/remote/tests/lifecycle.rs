@@ -8587,6 +8587,77 @@ async fn a_status_on_a_stacked_chain_counts_only_the_work_above_the_tip() {
 }
 
 #[tokio::test]
+async fn a_merged_layer_nobody_pulled_yet_is_carried_not_unshared() {
+    // Why a Merged record belongs in the base a count is taken against: the
+    // share plan pulls before it detects, and that pull consumes the merged
+    // layer into the trunk, so the plan has nothing to offer for its files. A
+    // status cannot pull, so the only way it agrees with the plan is to count
+    // the merged layer as carried.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let options = || ShareOptions {
+        title: None,
+        description: None,
+        proposal: None,
+        stacks_allowed: true,
+        author_login: None,
+        files: None,
+    };
+
+    // The forge merges the layer and the trunk moves onto a commit carrying
+    // its file. One probing status learns that and records it; nothing pulls,
+    // so the record stands here merged and unconsumed, and the trunk snapshot
+    // this machine holds still predates the merge.
+    merge_the_bottom(&mock, &sub, first.number).await;
+    let learned = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock), true)
+        .await
+        .unwrap();
+    assert_eq!(learned.merged_unconsumed, vec![first.number]);
+
+    // The tree is what the merged layer carries, so there is nothing unshared
+    // about it - offline, with no probe and no pull.
+    let quiet = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        quiet.local_changes, 0,
+        "a merged layer's own files are upstream already"
+    );
+
+    // Editing one of those files is work again: the count is against the
+    // layer's recorded digest, not a blanket exemption for its paths.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let edited = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        edited.local_changes, 1,
+        "editing a merged layer's file is unshared work"
+    );
+
+    // Back to the tree the count of zero was taken over, so the plan is asked
+    // the same question: it pulls, the pull consumes the merged layer, and it
+    // offers nothing. The two agree.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::NothingToShare),
+        "{:?}",
+        plan.action
+    );
+}
+
+#[tokio::test]
 async fn a_generated_index_replays_with_its_layer_like_any_other_file() {
     let mock = MockProvider::new();
     mock.enable_stacks();
