@@ -42,6 +42,9 @@ const panzoom = vi.mocked(Panzoom);
 const DIAGRAM =
   '<svg viewBox="0 0 600 400" width="100%" style="max-width: 600px;"><g id="drawing"/></svg>';
 
+/** The fence the fixture was drawn from, which is what a download hands back. */
+const SOURCE = "graph TD; A-->B;";
+
 /**
  * A diagram with a link in it. Mermaid writes one wherever a node carries a
  * `click` directive or a `href`, so the hosted markup can bring its own focus
@@ -112,7 +115,7 @@ function sizeStage(width: number, height: number) {
 }
 
 async function open(
-  content: OverlayContent = { kind: "diagram", svg: DIAGRAM },
+  content: OverlayContent = { kind: "diagram", svg: DIAGRAM, source: SOURCE },
 ) {
   render(<Harness content={content} />);
   await userEvent.click(
@@ -151,6 +154,7 @@ describe("DiagramOverlay", () => {
       kind: "image",
       src: "/api/v1/files/eng/assets/map.png",
       alt: "The map",
+      filename: "map.png",
     });
     const dialog = screen.getByRole("dialog");
     const image = dialog.querySelector("img");
@@ -264,7 +268,7 @@ describe("DiagramOverlay", () => {
   });
 
   it("keeps the keys working when focus is on a link inside the diagram", async () => {
-    await open({ kind: "diagram", svg: LINKED });
+    await open({ kind: "diagram", svg: LINKED, source: SOURCE });
     const link = screen.getByRole("link");
     link.focus();
     expect(document.activeElement).toBe(link);
@@ -275,13 +279,13 @@ describe("DiagramOverlay", () => {
   });
 
   it("wraps Tab around the layer, the diagram's own links included", async () => {
-    await open({ kind: "diagram", svg: LINKED });
+    await open({ kind: "diagram", svg: LINKED, source: SOURCE });
     const link = screen.getByRole("link");
     // The link is the last stop in document order, after the bar's buttons.
     link.focus();
     await userEvent.tab();
     expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "Zoom in" }),
+      screen.getByRole("button", { name: "Copy source" }),
     );
     await userEvent.tab({ shift: true });
     expect(document.activeElement).toBe(link);
@@ -296,7 +300,7 @@ describe("DiagramOverlay", () => {
     expect(document.activeElement).toBe(dialog);
     await userEvent.tab();
     expect(document.activeElement).toBe(
-      screen.getByRole("button", { name: "Zoom in" }),
+      screen.getByRole("button", { name: "Copy source" }),
     );
     // And the keys still reach the handler from there.
     dialog.focus();
@@ -371,5 +375,149 @@ describe("DiagramOverlay", () => {
     expect(
       screen.getByRole("button", { name: "Enter fullscreen" }),
     ).toBeInTheDocument();
+  });
+  /**
+   * What the full window is for once the reader has seen the picture: keeping
+   * it. A diagram leaves as the fence that made it and as a drawing anything
+   * opens; an image leaves as the file it already is.
+   */
+  describe("downloads", () => {
+    let saved: { name: string; blob: Blob | null; href: string }[];
+    // Held here rather than read back off `URL`: a method taken off an object
+    // is a method without its own `this`, and the lint that says so is right
+    // often enough to be worth one variable.
+    let madeUrl: ReturnType<typeof vi.fn<(blob: Blob) => string>>;
+    beforeEach(() => {
+      saved = [];
+      // jsdom implements neither half of the object-URL pair, so both are
+      // defined here rather than spied on.
+      madeUrl = vi.fn<(blob: Blob) => string>(() => "blob:fake");
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: madeUrl,
+      });
+      Object.defineProperty(URL, "revokeObjectURL", {
+        configurable: true,
+        value: vi.fn(),
+      });
+      vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+        function (this: HTMLAnchorElement) {
+          saved.push({
+            name: this.download,
+            blob: madeUrl.mock.calls.at(-1)?.[0] ?? null,
+            href: this.href,
+          });
+        },
+      );
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("hands over a diagram's source as .mmd, named by document and hash", async () => {
+      await open({
+        kind: "diagram",
+        svg: DIAGRAM,
+        source: "graph TD; A-->B;",
+        name: "alpha",
+      });
+      await userEvent.click(
+        screen.getByRole("button", { name: "Download source (.mmd)" }),
+      );
+      expect(saved).toHaveLength(1);
+      expect(saved[0]?.name).toMatch(/^alpha-diagram-[0-9a-f]{4}\.mmd$/);
+      expect(saved[0]?.blob?.type).toBe("text/plain");
+      expect(await saved[0]?.blob?.text()).toBe("graph TD; A-->B;");
+    });
+
+    it("hands over the drawing as a standalone SVG", async () => {
+      await open({
+        kind: "diagram",
+        svg: DIAGRAM,
+        source: "graph TD; A-->B;",
+        name: "alpha",
+      });
+      await userEvent.click(
+        screen.getByRole("button", { name: "Download SVG" }),
+      );
+      const text = await saved[0]?.blob?.text();
+      expect(saved[0]?.name).toMatch(/^alpha-diagram-[0-9a-f]{4}\.svg$/);
+      expect(saved[0]?.blob?.type).toBe("image/svg+xml");
+      expect(
+        text?.startsWith('<?xml version="1.0" encoding="UTF-8"?>\n<svg'),
+      ).toBe(true);
+      expect(text).toContain('xmlns="http://www.w3.org/2000/svg"');
+    });
+
+    it("puts a diagram's source on the clipboard and says so", async () => {
+      const writeText = vi.fn(() => Promise.resolve());
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText },
+      });
+      await open({
+        kind: "diagram",
+        svg: DIAGRAM,
+        source: "graph TD; A-->B;",
+        name: "alpha",
+      });
+      await userEvent.click(
+        screen.getByRole("button", { name: "Copy source" }),
+      );
+      expect(writeText).toHaveBeenCalledWith("graph TD; A-->B;");
+      expect(await screen.findByRole("status")).toHaveTextContent("Copied");
+    });
+
+    it("says when the clipboard refused", async () => {
+      // Absent rather than rejecting: on an insecure context there is no
+      // `clipboard` to read `writeText` off, and the read itself throws.
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: undefined,
+      });
+      await open({ kind: "diagram", svg: DIAGRAM, source: "graph TD; A-->B;" });
+      await userEvent.click(
+        screen.getByRole("button", { name: "Copy source" }),
+      );
+      expect(await screen.findByRole("status")).toHaveTextContent(
+        "Copy refused",
+      );
+    });
+
+    it("names a nameless diagram plainly", async () => {
+      await open({ kind: "diagram", svg: DIAGRAM, source: "graph TD; A-->B;" });
+      await userEvent.click(
+        screen.getByRole("button", { name: "Download source (.mmd)" }),
+      );
+      expect(saved[0]?.name).toMatch(/^diagram-[0-9a-f]{4}\.mmd$/);
+    });
+
+    /**
+     * The image download is the browser's own, so what is asserted is the
+     * anchor rather than a click on it: `userEvent.click` dispatches the
+     * pointer and mouse events rather than calling the element's `click`, so
+     * the spy above never sees one - and jsdom answers the default action of
+     * a real click with "not implemented: navigation" rather than a download.
+     * The attributes ARE the contract here: the name the file lands under and
+     * the address it comes from, with nothing of the picture in this page's
+     * memory.
+     */
+    it("hands over an image by its own name from its own address", async () => {
+      await open({
+        kind: "image",
+        src: "/api/v1/files/eng/assets/map.png",
+        alt: "The map",
+        filename: "map.png",
+      });
+      expect(
+        screen.queryByRole("button", { name: /Download source|Download SVG/ }),
+      ).toBeNull();
+      const link = screen.getByRole("button", { name: "Download image" });
+      expect(link.getAttribute("download")).toBe("map.png");
+      expect(link.getAttribute("href")).toBe(
+        "/api/v1/files/eng/assets/map.png",
+      );
+      expect(madeUrl).not.toHaveBeenCalled();
+    });
   });
 });

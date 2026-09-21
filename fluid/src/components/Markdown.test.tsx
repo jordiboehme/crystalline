@@ -12,12 +12,40 @@
  */
 
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
 import type { WikilinkResolver } from "../wikilinks";
 import { Markdown } from "./Markdown";
+
+// Mermaid draws nothing under jsdom - it measures text through layout this
+// environment does not do - so a fence would always fall back to its source
+// and the diagram's own controls would never exist. A stub drawing is what
+// lets this file follow a fence all the way to the download it offers. The
+// pan-and-zoom library is stubbed for the same reason the overlay's own test
+// stubs it: what is asserted here is the name on the file, not the geometry.
+vi.mock("mermaid", () => ({
+  default: {
+    initialize: vi.fn(),
+    render: vi.fn(() =>
+      Promise.resolve({ svg: '<svg viewBox="0 0 600 400"><g/></svg>' }),
+    ),
+  },
+}));
+
+vi.mock("@panzoom/panzoom", () => ({
+  default: vi.fn(() => ({
+    zoomIn: vi.fn(),
+    zoomOut: vi.fn(),
+    zoom: vi.fn(),
+    pan: vi.fn(),
+    reset: vi.fn(),
+    zoomWithWheel: vi.fn(),
+    destroy: vi.fn(),
+  })),
+}));
 
 /**
  * Render and wait for the renderer's own chunk to arrive: `Markdown` is a lazy
@@ -32,6 +60,7 @@ async function renderMarkdown(
   source: string,
   wikilinks?: WikilinkResolver,
   foldTitle?: string,
+  documentName?: string,
 ) {
   const result = render(
     <MemoryRouter>
@@ -40,6 +69,7 @@ async function renderMarkdown(
           source={source}
           {...(wikilinks ? { wikilinks } : {})}
           {...(foldTitle === undefined ? {} : { foldTitle })}
+          {...(documentName === undefined ? {} : { documentName })}
         />
       </ThemeProvider>
     </MemoryRouter>,
@@ -368,5 +398,45 @@ describe("the markdown renderer", () => {
     );
 
     expect(screen.queryByRole("link")).toBeNull();
+  });
+
+  it("carries the document's name down to a diagram's download", async () => {
+    // The whole thread in one test: the page names the document, the renderer
+    // hands the name to the fence, and the fence's full window puts it on the
+    // file. jsdom implements neither half of the object-URL pair, so both are
+    // defined rather than spied on.
+    const saved: string[] = [];
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:fake"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    const clicked = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(function (this: HTMLAnchorElement) {
+        saved.push(this.download);
+      });
+    try {
+      await renderMarkdown(
+        ["```mermaid", "graph TD;", "  A-->B;", "```", ""].join("\n"),
+        undefined,
+        undefined,
+        "alpha",
+      );
+      // The diagram and the overlay each arrive through a lazy import, so
+      // both buttons are waited for rather than looked up.
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Open in full window" }),
+      );
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Download source (.mmd)" }),
+      );
+      expect(saved[0]).toMatch(/^alpha-diagram-[0-9a-f]{4}\.mmd$/);
+    } finally {
+      clicked.mockRestore();
+    }
   });
 });

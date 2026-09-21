@@ -49,7 +49,18 @@ const SCROLLER =
 const SCROLLABLE =
   "[mask-image:linear-gradient(to_right,black_calc(100%_-_1.5rem),transparent)] focus-visible:ring-2 focus-visible:ring-accent-600 focus-visible:outline-none dark:focus-visible:ring-accent-400";
 
-export default function MermaidDiagram({ source }: { source: string }) {
+export default function MermaidDiagram({
+  source,
+  name,
+}: {
+  source: string;
+  /**
+   * The document this diagram sits in, which is what a file taken out of the
+   * full window is named after. Absent - a preview with no document behind
+   * it, say - the download is named after the drawing alone.
+   */
+  name?: string;
+}) {
   const { resolved } = useTheme();
   // `useId` is stable across renders and unique per instance, which is what
   // mermaid wants for the element it names its definitions after. Its colons
@@ -198,7 +209,14 @@ export default function MermaidDiagram({ source }: { source: string }) {
         // overlay sizes the root itself, and a width this page forced on it
         // would be one scale factor too many.
         <DiagramOverlay
-          content={{ kind: "diagram", svg: drawn.svg }}
+          content={{
+            kind: "diagram",
+            svg: drawn.svg,
+            // The fence as the author wrote it, which is what a reader who
+            // asks for the source gets back.
+            source,
+            ...(name === undefined ? {} : { name }),
+          }}
           returnFocusTo={fullWindowRef}
           onClose={() => {
             setFullWindow(false);

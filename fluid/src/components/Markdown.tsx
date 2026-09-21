@@ -42,6 +42,13 @@ export interface MarkdownProps {
    * such targets as the text they were written as.
    */
   domain?: string;
+  /**
+   * What this document is called, for the name on a file a reader takes out
+   * of it: a diagram or an image saved from the full window is named after
+   * the document it came from. Absent, such a download is named after the
+   * picture alone.
+   */
+  documentName?: string;
 }
 
 export function Markdown({
@@ -49,6 +56,7 @@ export function Markdown({
   wikilinks,
   foldTitle,
   domain,
+  documentName,
 }: MarkdownProps) {
   return (
     <Suspense
@@ -85,6 +93,7 @@ export function Markdown({
         {...(wikilinks ? { wikilinks } : {})}
         {...(foldTitle === undefined ? {} : { foldTitle })}
         {...(domain === undefined ? {} : { domain })}
+        {...(documentName === undefined ? {} : { documentName })}
       />
     </Suspense>
   );

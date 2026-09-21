@@ -56,6 +56,7 @@ import { WIKILINK, referenceState } from "../wikilinks";
 import type { WikilinkResolution, WikilinkResolver } from "../wikilinks";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
+import { imageFileName } from "./downloads";
 import { Chip } from "./primitives";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
@@ -435,7 +436,19 @@ const components: Components = {
       </code>
     );
   },
-  pre: ({ children, node }) => {
+};
+
+/**
+ * The fenced block, which is a diagram wherever the fence says mermaid.
+ *
+ * It takes the document's name rather than reading it from anywhere, because
+ * a diagram a reader takes out of the full window is named after the document
+ * it came from and only the caller knows which document that is.
+ */
+function preFor(
+  documentName: string | undefined,
+): NonNullable<Components["pre"]> {
+  return ({ children, node }) => {
     const fence = (node as HastNode | undefined)?.children?.[0];
     const source = textOf(fence);
     if (languageOf(fence) === "mermaid" && source.trim() !== "") {
@@ -445,7 +458,10 @@ const components: Components = {
           className="breakout my-4 rounded border border-slate-200 p-3 dark:border-slate-800"
         >
           <Suspense fallback={<DiagramSource source={source} />}>
-            <MermaidDiagram source={source} />
+            <MermaidDiagram
+              source={source}
+              {...(documentName === undefined ? {} : { name: documentName })}
+            />
           </Suspense>
         </figure>
       );
@@ -455,8 +471,8 @@ const components: Components = {
         {children}
       </pre>
     );
-  },
-};
+  };
+}
 
 /**
  * The files-route URL a target names, or null when it names no file of this
@@ -574,7 +590,8 @@ function MarkdownImage({
   // The directives are read off the decoded target for the same reason the
   // path is: micromark hands `w=50%` over as `w=50%25`, which is no width at
   // all. Decoding happens once, here and in `assetPath`, never in sequence.
-  const { format } = parseImageFragment(decodeTarget(written));
+  const decoded = decodeTarget(written);
+  const { format } = parseImageFragment(decoded);
   const wrapperRef = useRef<HTMLSpanElement>(null);
   const fullWindowRef = useRef<HTMLButtonElement>(null);
   const [fullWindow, setFullWindow] = useState(false);
@@ -635,7 +652,15 @@ function MarkdownImage({
       )}
       {fullWindow && (
         <DiagramOverlay
-          content={{ kind: "image", src: shown, alt: alt ?? "" }}
+          content={{
+            kind: "image",
+            src: shown,
+            alt: alt ?? "",
+            // The name the author wrote, not the address this app built: a
+            // file saved out of the full window keeps the name it has in the
+            // document rather than a route's last segment.
+            filename: imageFileName(decoded),
+          }}
           returnFocusTo={fullWindowRef}
           onClose={() => {
             setFullWindow(false);
@@ -647,12 +672,18 @@ function MarkdownImage({
 }
 
 /**
- * The component map for one domain: everything above, plus the two elements
- * that need to know which domain a relative `assets/` target belongs to.
+ * The component map for one domain: everything above, plus the three elements
+ * that need to know more than the markdown says - which domain a relative
+ * `assets/` target belongs to, and which document a picture taken out of the
+ * full window is named after.
  */
-function componentsFor(domain: string | undefined): Components {
+function componentsFor(
+  domain: string | undefined,
+  documentName: string | undefined,
+): Components {
   return {
     ...components,
+    pre: preFor(documentName),
     a: ({ children, href, node }) => (
       <MarkdownAnchor
         href={href}
@@ -686,6 +717,7 @@ export default function MarkdownBody({
   wikilinks,
   foldTitle,
   domain,
+  documentName,
 }: {
   source: string;
   wikilinks?: WikilinkResolver;
@@ -696,8 +728,16 @@ export default function MarkdownBody({
    * attachment path means nothing without the domain holding it.
    */
   domain?: string;
+  /**
+   * What this document is called, for the name on a file a reader takes out
+   * of it. Absent, a diagram's download is named after the drawing alone.
+   */
+  documentName?: string;
 }) {
-  const componentMap = useMemo(() => componentsFor(domain), [domain]);
+  const componentMap = useMemo(
+    () => componentsFor(domain, documentName),
+    [domain, documentName],
+  );
   const rehypePlugins = useMemo<RehypePlugins>(
     () => [
       // `plainText` keeps the highlighter's hands off a mermaid fence, whose

@@ -23,6 +23,9 @@
  */
 
 import {
+  Copy,
+  Download,
+  FileCode,
   Maximize2,
   Minimize2,
   RotateCcw,
@@ -35,6 +38,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactElement, RefObject } from "react";
 import { createPortal } from "react-dom";
 
+import { diagramFileName, saveBlob } from "./downloads";
 import { FOCUS_RING } from "./primitives";
 
 /**
@@ -45,6 +49,9 @@ const FOCUS_STOPS = 'button, a[href], [tabindex]:not([tabindex="-1"])';
 
 /** How far an arrow key moves the drawing, in pixels of the stage. */
 const ARROW_STEP_PX = 40;
+
+/** How long the copy confirmation stays up, matching `EngramActions`. */
+const CONFIRMED_FOR_MS = 2000;
 
 /**
  * Whether the browser is showing something fullscreen right now.
@@ -76,8 +83,8 @@ const BAR_BUTTON = `inline-flex h-8 w-8 shrink-0 items-center justify-center rou
  * them for its own size in its own way.
  */
 export type OverlayContent =
-  | { kind: "diagram"; svg: string }
-  | { kind: "image"; src: string; alt: string };
+  | { kind: "diagram"; svg: string; source: string; name?: string }
+  | { kind: "image"; src: string; alt: string; filename: string };
 
 export interface DiagramOverlayProps {
   content: OverlayContent;
@@ -150,6 +157,10 @@ export default function DiagramOverlay({
   const instanceRef = useRef<PanzoomObject | null>(null);
   const pressedAt = useRef<{ x: number; y: number } | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  // What the copy control has to say for itself, and nothing else: a clipboard
+  // write is the one action in this bar with an outcome the screen does not
+  // already show.
+  const [said, setSaid] = useState<string | null>(null);
 
   // Read at render rather than remembered: a browser that has no element
   // fullscreen must not be offered a button that would do nothing, and jsdom
@@ -263,6 +274,20 @@ export default function DiagramOverlay({
     // which both callers build inline on every render and which would
     // otherwise rebuild the instance under a reader mid-zoom.
   }, [fit, shown]);
+
+  // The confirmation clears itself, the same two seconds the engram page's
+  // own copy gives its announcement.
+  useEffect(() => {
+    if (said === null) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setSaid(null);
+    }, CONFIRMED_FOR_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [said]);
 
   // The keyboard comes in here and goes back where it came from, and the page
   // behind holds still while this is open. The previous overflow is restored
@@ -445,6 +470,103 @@ export default function DiagramOverlay({
       onKeyDown={onKeyDown}
     >
       <div className="flex shrink-0 items-center justify-end gap-1 border-b border-slate-200 px-2 py-1 dark:border-slate-800">
+        {/*
+          In the document from the start and empty, so the text arriving in it
+          is what gets read out, and first in the bar so the buttons this bar
+          right-aligns keep their places while it says something.
+        */}
+        <span
+          role="status"
+          aria-live="polite"
+          className="text-caption text-slate-500 dark:text-slate-400"
+        >
+          {said ?? ""}
+        </span>
+        {content.kind === "diagram" ? (
+          <>
+            <button
+              type="button"
+              aria-label="Copy source"
+              title="Copy source"
+              className={BAR_BUTTON}
+              onClick={() => {
+                void (async () => {
+                  // Wrapped, not chained: `navigator.clipboard` is absent on
+                  // an insecure context and reading `.writeText` off it
+                  // throws synchronously, the same reason the address copy
+                  // control wraps its call.
+                  try {
+                    await navigator.clipboard.writeText(content.source);
+                    setSaid("Copied");
+                  } catch {
+                    setSaid("Copy refused");
+                  }
+                })();
+              }}
+            >
+              <Copy size={16} strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="Download source (.mmd)"
+              title="Download source (.mmd)"
+              className={BAR_BUTTON}
+              onClick={() => {
+                saveBlob(
+                  new Blob([content.source], { type: "text/plain" }),
+                  diagramFileName(content.name, content.source, "mmd"),
+                );
+              }}
+            >
+              <FileCode size={16} strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="Download SVG"
+              title="Download SVG"
+              className={BAR_BUTTON}
+              onClick={() => {
+                // The drawing as shown, not as mermaid handed it over: by now
+                // the host's pass has given the root its own pixel size, so
+                // the file opens at that size instead of stretching to a
+                // viewer's width. The declaration is what makes it a file
+                // rather than a fragment.
+                const drawing = hostRef.current?.querySelector("svg");
+                const markup =
+                  drawing === null || drawing === undefined
+                    ? content.svg
+                    : new XMLSerializer().serializeToString(drawing);
+                saveBlob(
+                  new Blob(
+                    [`<?xml version="1.0" encoding="UTF-8"?>\n${markup}`],
+                    {
+                      type: "image/svg+xml",
+                    },
+                  ),
+                  diagramFileName(content.name, content.source, "svg"),
+                );
+              }}
+            >
+              <Download size={16} strokeWidth={1.75} />
+            </button>
+          </>
+        ) : (
+          <a
+            href={content.src}
+            download={content.filename}
+            aria-label="Download image"
+            title="Download image"
+            className={BAR_BUTTON}
+            // A real anchor rather than a button with a handler: the browser
+            // fetches and saves the file itself, with no copy of it in this
+            // page's memory. A same-origin attachment downloads under its own
+            // name; a remote image is best effort, since a browser ignores
+            // the name across origins and opens the picture instead.
+            role="button"
+          >
+            <Download size={16} strokeWidth={1.75} />
+          </a>
+        )}
         <button
           type="button"
           aria-label="Zoom in"

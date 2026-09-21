@@ -20,12 +20,17 @@ import { useCallback, useEffect, useImperativeHandle, useState } from "react";
 
 import type { EngramDetail } from "../api/engram";
 import { engramRoute } from "../paths";
+import { saveBlob } from "./downloads";
 
 /** How long the confirmations stay up, matching CopyAddressButton. */
 const CONFIRMED_FOR_MS = 2000;
 
 /**
- * The download filename: the permalink's last segment plus .md.
+ * The document's own name: the permalink's last segment.
+ *
+ * It names more than this file's download now - a diagram or an image a
+ * reader takes out of the document is named after the document it came from,
+ * and this is where that name is decided.
  *
  * Exported alongside the component rather than split into a second file:
  * splitting one small pure helper out for a lint rule alone would scatter
@@ -33,9 +38,14 @@ const CONFIRMED_FOR_MS = 2000;
  * `editor/FindingsPanel.tsx`).
  */
 // eslint-disable-next-line react-refresh/only-export-components
+export function documentSlug(permalink: string): string {
+  return permalink.split("/").at(-1) ?? permalink;
+}
+
+/** The download filename: the document's own name plus .md. */
+// eslint-disable-next-line react-refresh/only-export-components
 export function downloadName(permalink: string): string {
-  const slug = permalink.split("/").at(-1) ?? permalink;
-  return `${slug}.md`;
+  return `${documentSlug(permalink)}.md`;
 }
 
 /** The three, handed out so the menu and the palette can run them. */
@@ -76,13 +86,12 @@ export function EngramActions({
   }, [said]);
 
   const download = useCallback(() => {
-    const blob = new Blob([engram.content], { type: "text/markdown" });
-    const href = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = href;
-    anchor.download = downloadName(engram.permalink);
-    anchor.click();
-    URL.revokeObjectURL(href);
+    // The same hand-over the full window's downloads use, so there is one
+    // copy of the object-URL dance in this app rather than three.
+    saveBlob(
+      new Blob([engram.content], { type: "text/markdown" }),
+      downloadName(engram.permalink),
+    );
   }, [engram.content, engram.permalink]);
 
   const share = useCallback(() => {
