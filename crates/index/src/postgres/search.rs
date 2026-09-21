@@ -363,10 +363,17 @@ async fn filter_only(
     // rather than the whole match set. Both sort keys are TEXT and pinned to
     // `COLLATE "C"` to match Turso's byte order: the sort decides which rows land
     // on the requested page, so an unpinned key would page differently here.
+    //
+    // `NULLS LAST` for the same reason, and it is not cosmetic: Postgres puts a
+    // NULL first under `DESC` where SQLite puts it last, so an engram carrying
+    // no `recorded_at` led every filter-only listing here and ended one on
+    // Turso. A listing that opens on the newest engrams must not lead with the
+    // one nobody dated.
     let sql = format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
          WHERE {actor_screen} {and_filters} \
-         ORDER BY e.recorded_at COLLATE \"C\" DESC, e.permalink COLLATE \"C\" ASC \
+         ORDER BY e.recorded_at COLLATE \"C\" DESC NULLS LAST, \
+         e.permalink COLLATE \"C\" ASC \
          LIMIT {limit} OFFSET {offset}"
     );
     let rows = query_all(conn, &sql, params).await?;

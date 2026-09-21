@@ -350,10 +350,17 @@ async fn filter_only(
     // applies its bounded-sorter optimization and holds only `limit + offset`
     // records, so the wide projection costs one page of bodies rather than the
     // whole match set. Adding a `GROUP BY` here would remove that bound.
+    //
+    // The undated engram sorts last, said out loud rather than inherited from
+    // the dialect: SQLite already puts a NULL last under `DESC` and Postgres
+    // puts it first, so the twin statement has to spell `NULLS LAST` and this
+    // one spells the same rule with the key SQLite would apply anyway. A
+    // listing that opens on the newest engrams must not lead with the one
+    // nobody dated, and the sort decides which rows land on a page at all.
     let sql = format!(
         "SELECT {CANDIDATE_COLUMNS} FROM engram e JOIN domain d ON d.id=e.domain_id \
          WHERE {actor_screen} {and_filters} \
-         ORDER BY e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
+         ORDER BY e.recorded_at IS NULL, e.recorded_at DESC, e.permalink ASC LIMIT {limit} OFFSET {offset}"
     );
     let rows = query_all(conn, &sql, params).await?;
     let items: Vec<(i64, SearchHit)> = rows

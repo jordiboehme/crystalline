@@ -2657,6 +2657,90 @@ async fn search_pages(store: &dyn Store) {
 }
 parity!(search_paginates, search_pages);
 
+/// A filter-only listing - the one the domain page and every folder view page
+/// through - comes back newest recorded first, and an engram carrying no
+/// `recorded_at` comes LAST on either backend.
+///
+/// The date is the sort key and a missing one is a real state on disk: the
+/// field is required of a written engram, and a file may still be missing it.
+/// The two backends disagree about a NULL sort key by default - SQLite puts it
+/// last under `DESC`, Postgres puts it first - so a domain page opening on the
+/// newest engrams would lead with the one engram nobody dated on Postgres and
+/// end with it on Turso. The order is pinned in the statement rather than
+/// inherited from the dialect, and it is pinned across the page boundary too,
+/// because the sort decides which rows land on a page at all.
+async fn filter_only_orders_undated_last(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Written out of date order, so nothing about the answer can come from the
+    // order the files were indexed in.
+    write(
+        root,
+        "jan.md",
+        "---\ntype: engram\ntitle: Jan\npermalink: jan\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "mar.md",
+        "---\ntype: engram\ntitle: Mar\npermalink: mar\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-03-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "feb.md",
+        "---\ntype: engram\ntitle: Feb\npermalink: feb\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-02-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
+    sync_domain(store, "eng", root).await.unwrap();
+
+    let page = store
+        .search(&SearchQuery {
+            domains: Some(vec!["eng".to_string()]),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, 4);
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mar", "feb", "jan", "undated"],
+        "newest recorded first, and the undated engram last"
+    );
+
+    // The same order across a page boundary: the undated engram is on the last
+    // page rather than on the first.
+    let second = store
+        .search(&SearchQuery {
+            domains: Some(vec!["eng".to_string()]),
+            limit: 2,
+            page: 2,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["jan", "undated"],
+        "page two of two"
+    );
+}
+parity!(
+    a_filter_only_listing_orders_undated_last,
+    filter_only_orders_undated_last
+);
+
 async fn neighbors_cross_domain(store: &dyn Store) {
     // domain2 holds the cross-domain target C.
     let d2 = tempfile::tempdir().unwrap();
