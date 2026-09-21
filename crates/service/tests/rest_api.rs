@@ -2522,6 +2522,34 @@ async fn engram_detail_carries_the_source_and_a_strong_etag() {
     );
 }
 
+/// **The detail payload names the page this caller opens the engram at**,
+/// worked out from the request's own `Host` rather than from the bind: an
+/// answer served to a browser has to carry the address that browser is at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_detail_payload_carries_the_page_url_for_the_host_it_was_asked_at() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/engrams/alpha").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    let web = body["web_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the detail payload carries a page address: {body}"));
+    assert_eq!(
+        web,
+        format!("http://{}/d/eng/e/alpha", fixture.addr),
+        "the origin the request arrived at, port and all: {web}"
+    );
+    assert_eq!(
+        body["url"], "crystalline://eng/alpha",
+        "the agent's own address is untouched: {body}"
+    );
+    assert!(
+        body.get("web_url_note").is_none(),
+        "a resolved address says nothing about the setting: {body}"
+    );
+}
+
 /// A client that already holds the engram's checksum is answered 304 with no
 /// body, and a stale token still serves the full engram. Both statuses carry
 /// `Cache-Control: no-cache`, the same pairing the attachment reads ship.

@@ -1593,6 +1593,28 @@ impl McpServer {
         }
     }
 
+    /// Where this caller opens a page.
+    ///
+    /// The same question [`holder_of`](Self::holder_of) answers about identity,
+    /// asked about an address: a stdio client is a process on this machine, so
+    /// the daemon's own bind is what it can reach; an HTTP client reached this
+    /// server at an origin of its own, and that origin is the only address a
+    /// browser on the other side of it can open.
+    ///
+    /// `Unresolved` when an HTTP call carries no request parts at all, which
+    /// is a server object built outside the transport (an in-process duplex).
+    /// There is a page, nothing here knows this caller's address for it, and
+    /// saying so names the setting that ends the guessing.
+    fn web_base(&self, ctx: &RequestContext<RoleServer>) -> crate::web_url::WebBase {
+        match self.transport {
+            Transport::Stdio => self.engine.local_web_base(),
+            Transport::Http => match ctx.extensions.get::<axum::http::request::Parts>() {
+                Some(parts) => self.engine.request_web_base(&parts.headers),
+                None => crate::web_url::WebBase::Unresolved,
+            },
+        }
+    }
+
     /// Present a share-link: bind it to this account, open the draft it names
     /// for THIS session, and answer the join the verb routes through.
     ///
@@ -2088,7 +2110,10 @@ impl McpServer {
                     let receipt = self
                         .with_similar(receipt, SimilarProbe::for_write(&confirmed_write), &scope)
                         .await;
-                    return Ok(self.nudged(ok_written(receipt)?, &ctx).await.into());
+                    return Ok(self
+                        .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
+                        .await
+                        .into());
                 }
             }
         }
@@ -2123,7 +2148,10 @@ impl McpServer {
             let receipt = self
                 .with_similar(receipt, SimilarProbe::for_write(&p), &scope)
                 .await;
-            return Ok(self.nudged(ok_written(receipt)?, &ctx).await.into());
+            return Ok(self
+                .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
+                .await
+                .into());
         };
 
         match resolved_overwrite(&responses.0) {
@@ -2159,7 +2187,10 @@ impl McpServer {
                 let receipt = self
                     .with_similar(receipt, SimilarProbe::for_write(&retry), &scope)
                     .await;
-                Ok(self.nudged(ok_written(receipt)?, &ctx).await.into())
+                Ok(self
+                    .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
+                    .await
+                    .into())
             }
         }
     }
@@ -2167,7 +2198,7 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. The reply carries web_url, the engram's page in the web UI, to hand to a person who wants to see it; add # and a heading's slug to open it at a section.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
@@ -2202,11 +2233,14 @@ impl McpServer {
         // Reading somebody's open document is being in the room with them,
         // for as long as the claim stands: the strip names this agent while
         // it works, exactly as it names a person who has the page open.
-        let value = self
+        let mut value = self
             .engine
             .read_engram_present(&p, &scope, agent_peer(&ctx, &scope).as_ref())
             .await
             .map_err(to_error)?;
+        // The page this caller opens the engram at, worked out here because
+        // the base is a fact about the caller rather than about the engram.
+        crate::web_url::attach_engram_url(&mut value, &self.web_base(&ctx));
         let links = self.attachment_links(&value, &scope).await;
         let mut result = ok(value)?;
         result.content.extend(links);
@@ -2302,7 +2336,10 @@ impl McpServer {
             Some(probe) => self.with_similar(receipt, probe, &scope).await,
             None => receipt,
         };
-        Ok(self.nudged(ok_written(receipt)?, &ctx).await.into())
+        Ok(self
+            .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
+            .await
+            .into())
     }
 
     #[tool(
@@ -2349,7 +2386,9 @@ impl McpServer {
             Ok(receipt) => receipt,
             Err(e) => return overlay_write_error(e),
         };
-        Ok(self.nudged(ok_moved(receipt)?, &ctx).await)
+        Ok(self
+            .nudged(ok_moved(receipt, &self.web_base(&ctx))?, &ctx)
+            .await)
     }
 
     #[tool(
@@ -3486,7 +3525,7 @@ impl McpServer {
                     .get("title")
                     .and_then(Value::as_str)
                     .unwrap_or(permalink);
-                Some(engram_link(domain, permalink, title))
+                Some(engram_link(domain, permalink, title, None))
             })
             .collect();
         let mut result = self.ok_list(value)?;
@@ -4223,14 +4262,23 @@ fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
 /// an era-aware client can follow the handle instead of rebuilding the address
 /// out of two payload fields. Same unconditional policy as `read_engram`'s
 /// attachment links: a link, never bytes.
-fn engram_link(domain: &str, permalink: &str, title: &str) -> ContentBlock {
-    ContentBlock::resource_link(
-        Resource::new(
-            format!("crystalline://{domain}/{permalink}"),
-            title.to_string(),
-        )
-        .with_mime_type("text/markdown"),
+///
+/// `web_url` rides in the block's `_meta` when the caller's page address is
+/// known: the handle a client follows and the page a person opens name one
+/// engram, so a client that kept the link kept both. Absent when there is no
+/// page for this caller, rather than present and empty.
+fn engram_link(domain: &str, permalink: &str, title: &str, web_url: Option<&str>) -> ContentBlock {
+    let mut resource = Resource::new(
+        format!("crystalline://{domain}/{permalink}"),
+        title.to_string(),
     )
+    .with_mime_type("text/markdown");
+    if let Some(url) = web_url {
+        let mut meta = serde_json::Map::new();
+        meta.insert("web_url".to_string(), Value::String(url.to_string()));
+        resource = resource.with_meta(rmcp::model::MetaObject(meta));
+    }
+    ContentBlock::resource_link(resource)
 }
 
 /// [`ok`] for a `write_engram` or `edit_engram` result, with the link to the
@@ -4241,7 +4289,16 @@ fn engram_link(domain: &str, permalink: &str, title: &str) -> ContentBlock {
 /// different spelling costs a client one lookup it was doing anyway; a link
 /// built from half a shape would send it somewhere else entirely, and no
 /// engine result is worth a panic in the layer that only reports it.
-fn ok_written(value: Value) -> Result<CallToolResult, ErrorData> {
+///
+/// `base` is where this caller opens the page, so the receipt gains `web_url`
+/// and the link gains the same address in its `_meta`. The payload is written
+/// first and the link reads the URL back off it, which is what keeps the two
+/// from ever naming different pages.
+fn ok_written(
+    mut value: Value,
+    base: &crate::web_url::WebBase,
+) -> Result<CallToolResult, ErrorData> {
+    crate::web_url::attach_engram_url(&mut value, base);
     let link = (|| {
         let domain = value.get("domain").and_then(Value::as_str)?;
         let permalink = value.get("permalink").and_then(Value::as_str)?;
@@ -4249,7 +4306,8 @@ fn ok_written(value: Value) -> Result<CallToolResult, ErrorData> {
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or(permalink);
-        Some(engram_link(domain, permalink, title))
+        let web_url = value.get("web_url").and_then(Value::as_str);
+        Some(engram_link(domain, permalink, title, web_url))
     })();
     let mut result = ok(value)?;
     result.content.extend(link);
@@ -4260,12 +4318,20 @@ fn ok_written(value: Value) -> Result<CallToolResult, ErrorData> {
 /// landed: the destination is the point of the call, so the handle names the
 /// address the engram answers to now, off the result's own `to` block. Same
 /// tolerance as [`ok_written`] for a shape that is not there.
-fn ok_moved(value: Value) -> Result<CallToolResult, ErrorData> {
+///
+/// The page address lands on `to` and nowhere else: `from` is the address the
+/// engram stopped answering to, which is the one page a person following the
+/// receipt must not be sent to.
+fn ok_moved(mut value: Value, base: &crate::web_url::WebBase) -> Result<CallToolResult, ErrorData> {
+    if let Some(to) = value.get_mut("to") {
+        crate::web_url::attach_engram_url(to, base);
+    }
     let link = (|| {
         let to = value.get("to")?;
         let domain = to.get("domain").and_then(Value::as_str)?;
         let permalink = to.get("permalink").and_then(Value::as_str)?;
-        Some(engram_link(domain, permalink, permalink))
+        let web_url = to.get("web_url").and_then(Value::as_str);
+        Some(engram_link(domain, permalink, permalink, web_url))
     })();
     let mut result = ok(value)?;
     result.content.extend(link);
@@ -4283,7 +4349,7 @@ fn ok_split(value: Value) -> Result<CallToolResult, ErrorData> {
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or(permalink);
-        Some(engram_link(domain, permalink, title))
+        Some(engram_link(domain, permalink, title, None))
     })();
     let mut result = ok(value)?;
     result.content.extend(link);
