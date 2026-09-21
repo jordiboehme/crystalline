@@ -16,6 +16,18 @@
 import { api, encodeSegment } from "./client";
 import type { MemberLevel, MembersResponse } from "./model";
 
+/**
+ * Whether two login names are the same account.
+ *
+ * Names are folded to lowercase and trimmed on the way in, so every reader
+ * of this payload compares them the same way - the members card deriving
+ * what a caller may do here, and the danger zone deciding whether the caller
+ * owns the domain it is about to change the visibility of.
+ */
+export function sameAccount(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
 /** The cache key of one domain's membership. */
 export function membersKey(domain: string): readonly unknown[] {
   return ["domain-members", domain];

@@ -16,10 +16,13 @@
  * exactly that reason: administering a team is one thing, and deciding who
  * may see everything in a domain is another.
  *
- * The whole card is drawn under `canAdminister` by the screen that mounts it,
- * which is the right both verbs need: unregistering is admin-only, making a
- * domain private is admin-only, and re-sharing one needs `Own`, which an
- * admin holds on every domain before the acl is ever read.
+ * Who sees what follows the server's own gates rather than one flag for the
+ * card. Unregistering is admin-only (`DELETE /domains/{domain}`), so its
+ * trigger is drawn for an admin alone. The visibility control needs `Own`,
+ * which is the owner or an admin - the same derivation the members card
+ * makes off the same read, and the reason an owner who administers nothing
+ * can still open its own domain back up. A caller with neither right is
+ * drawn no card at all, rather than an empty box headed "Danger zone".
  *
  * `confirming` is the screen's rather than the control's, because the command
  * palette offers the same unregister row: the keyboard route arms this exact
@@ -35,7 +38,12 @@ import { useNavigate } from "react-router";
 import { unregisterDomain } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
-import { fetchMembers, membersKey, setVisibility } from "../api/members";
+import {
+  fetchMembers,
+  membersKey,
+  sameAccount,
+  setVisibility,
+} from "../api/members";
 import { useAuth } from "../auth/AuthContext";
 import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
 
@@ -51,8 +59,8 @@ export function DangerZoneCard({
   /** Whether the unregister confirmation is armed; the palette arms it too. */
   confirming: boolean;
   onConfirmingChange: (confirming: boolean) => void;
-}): ReactElement {
-  const { capabilities } = useAuth();
+}): ReactElement | null {
+  const { user, capabilities } = useAuth();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const headingId = useId();
@@ -115,12 +123,27 @@ export function DangerZoneCard({
     wasConfirming.current = confirming;
   }, [confirming]);
 
+  const owner = members.data?.owner ?? null;
+  // `Own`, exactly as the members card derives it and as `set_visibility`
+  // reads it: an instance admin holds it on every domain before the acl is
+  // ever looked at, and a domain's owner holds it on that one domain. A
+  // shared domain has no owner, so on that side this reduces to "is an
+  // admin", which is what making a domain private asks for anyway.
+  const own =
+    capabilities.canAdminister ||
+    (user !== null && owner !== null && sameAccount(owner, user.name));
   const isPrivate = members.data?.visibility === "private";
   // `readOnly` is a certainty this side already holds, unlike a per-domain
   // right: the control is shown shut, with the reason as its accessible
   // description, rather than removed. See `READ_ONLY_REASON` itself.
   const disabledReason = capabilities.readOnly ? READ_ONLY_REASON : undefined;
   const visibilityLabel = isPrivate ? "Share with everyone" : "Make private";
+
+  // Nothing to offer, nothing to draw: a member or a manager administers the
+  // team from the card above and reaches neither verb here.
+  if (!capabilities.canAdminister && !own) {
+    return null;
+  }
 
   return (
     <section
@@ -149,48 +172,55 @@ export function DangerZoneCard({
         </p>
       )}
 
-      <div className="flex flex-col gap-1">
-        <DestructiveAction
-          label="Unregister domain"
-          confirmLabel="Confirm unregister"
-          pending={unregister.isPending}
-          requireMatch={domain}
-          confirming={confirming}
-          onConfirmingChange={onConfirmingChange}
-          onConfirm={() => {
-            setProblem(null);
-            setNotice(null);
-            unregister.mutate();
-          }}
-        />
-        {/*
-          What the second step says is not one sentence but two, and which one
-          it is is a fact about the domain rather than a softening: a file
-          domain keeps its markdown on disk and can be registered again from
-          it, while a virtual domain's engrams are the database's and go with
-          it. Saying "the files stay" over a virtual domain would be the app
-          telling somebody their engrams are safe on the way to deleting them.
+      {/*
+        Admin only, the way `DELETE /domains/{domain}` is: an owner owns the
+        domain and does not administer the instance this one is registered on.
+      */}
+      {capabilities.canAdminister && (
+        <div className="flex flex-col gap-1">
+          <DestructiveAction
+            label="Unregister domain"
+            confirmLabel="Confirm unregister"
+            pending={unregister.isPending}
+            requireMatch={domain}
+            confirming={confirming}
+            onConfirmingChange={onConfirmingChange}
+            onConfirm={() => {
+              setProblem(null);
+              setNotice(null);
+              unregister.mutate();
+            }}
+          />
+          {/*
+            What the second step says is not one sentence but two, and which one
+            it is is a fact about the domain rather than a softening: a file
+            domain keeps its markdown on disk and can be registered again from
+            it, while a virtual domain's engrams are the database's and go with
+            it. Saying "the files stay" over a virtual domain would be the app
+            telling somebody their engrams are safe on the way to deleting them.
 
-          A `kind` of null - a listing that has not landed - falls back to the
-          file sentence, because virtual is the kind that has to be declared
-          and every domain this app has ever registered from a folder answers
-          `file`.
-        */}
-        {confirming && (
-          <p className="text-caption text-slate-500 dark:text-slate-400">
-            {kind === "virtual"
-              ? "This domain's engrams live in the database and will be deleted with it; this cannot be undone, so download the archive first if you need a copy."
-              : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
-          </p>
-        )}
-      </div>
+            A `kind` of null - a listing that has not landed - falls back to the
+            file sentence, because virtual is the kind that has to be declared
+            and every domain this app has ever registered from a folder answers
+            `file`.
+          */}
+          {confirming && (
+            <p className="text-caption text-slate-500 dark:text-slate-400">
+              {kind === "virtual"
+                ? "This domain's engrams live in the database and will be deleted with it; this cannot be undone, so download the archive first if you need a copy."
+                : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
+            </p>
+          )}
+        </div>
+      )}
 
       {/*
-        Drawn once the members read has landed, because which way this control
-        points is that read's answer: offering "Make private" over a domain
-        that already is one would be the card guessing in place of asking.
+        For a caller the server would let through, and drawn once the members
+        read has landed, because which way this control points is that read's
+        answer: offering "Make private" over a domain that already is one
+        would be the card guessing in place of asking.
       */}
-      {members.data !== undefined && (
+      {own && members.data !== undefined && (
         <div className="flex flex-col gap-1">
           <DestructiveAction
             label={visibilityLabel}

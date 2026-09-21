@@ -63,6 +63,7 @@ import {
   fetchMembers,
   membersKey,
   removeMember,
+  sameAccount,
   setMember,
   setOwner,
 } from "../api/members";
@@ -74,11 +75,6 @@ import { BUTTON, FIELD, Field } from "./primitives";
 
 /** Every level a member can be invited at, or moved to. */
 const LEVELS: MemberLevel[] = ["viewer", "editor", "manager"];
-
-/** Login names are folded to lowercase and trimmed on the way in; compare the same way. */
-function sameAccount(a: string, b: string): boolean {
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
-}
 
 /** What this caller may do here, derived from the one read every render makes. */
 interface MyStanding {

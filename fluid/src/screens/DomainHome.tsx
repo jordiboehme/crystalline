@@ -404,28 +404,30 @@ function DomainPage({
       )}
 
       {/*
-        Last on the page, and only for an admin, because every endpoint behind
-        them is admin-only: a copy of the domain, and the two ways of taking it
-        away from the people who read it. The unregister confirmation is the
-        screen's state rather than the card's, because the palette row above
-        asks the same question and must arm this exact control.
+        Last on the page: a copy of the domain, and the two ways of taking it
+        away from the people who read it. Both halves of the archive round
+        trip are admin-only endpoints, so that card is gated here. The danger
+        zone gates itself, because one of its two verbs is the owner's as well
+        as an admin's and only the members read says who the owner is; it
+        draws nothing for a caller who may reach neither. The unregister
+        confirmation is the screen's state rather than the card's, because the
+        palette row above asks the same question and must arm that exact
+        control.
       */}
       {capabilities.canAdminister && (
-        <>
-          <BackupCard
-            domain={domain}
-            onImport={() => {
-              setImporting(true);
-            }}
-          />
-          <DangerZoneCard
-            domain={domain}
-            kind={summary?.kind ?? null}
-            confirming={confirmingUnregister}
-            onConfirmingChange={setConfirmingUnregister}
-          />
-        </>
+        <BackupCard
+          domain={domain}
+          onImport={() => {
+            setImporting(true);
+          }}
+        />
       )}
+      <DangerZoneCard
+        domain={domain}
+        kind={summary?.kind ?? null}
+        confirming={confirmingUnregister}
+        onConfirmingChange={setConfirmingUnregister}
+      />
     </div>
   );
 }

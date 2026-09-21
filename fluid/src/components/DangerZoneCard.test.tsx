@@ -192,6 +192,83 @@ describe("the danger zone", () => {
     expect(screen.queryByRole("button", { name: "Make private" })).toBeNull();
   });
 
+  it("gives a non-admin owner the control that opens its domain back up", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private" }),
+        "/domains/eng/visibility": (_path, init) => {
+          if (init?.method === "PUT") {
+            return undefined;
+          }
+          throw new ApiProblem(405, "method not allowed", "unexpected method");
+        },
+      },
+      "editor",
+      "ada",
+    );
+
+    renderApp("/d/eng");
+    const card = await dangerZone();
+
+    // `set_visibility` asks for `Own` on this direction, which the owner has
+    // without being an instance admin: the card is drawn for the one control
+    // this caller may actually reach.
+    await arm(card, "Share with everyone");
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Confirm share with everyone" }),
+    );
+
+    await waitFor(() => {
+      expect(sentBody("/domains/eng/visibility", "PUT")).toEqual({
+        private: false,
+      });
+    });
+  });
+
+  it("gives a non-admin owner no way to unregister the domain", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private" }),
+      },
+      "editor",
+      "ada",
+    );
+
+    renderApp("/d/eng");
+    const card = await dangerZone();
+
+    // Owning a domain is not administering the instance: `DELETE /domains`
+    // is admin-only, so the trigger for it is not drawn beside a control the
+    // same caller may use.
+    await within(card).findByRole("button", { name: "Share with everyone" });
+    expect(
+      within(card).queryByRole("button", { name: "Unregister domain" }),
+    ).toBeNull();
+  });
+
+  it("gives an admin the same control on an ownerless private domain", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: null, visibility: "private" }),
+      },
+      "admin",
+      "boss",
+    );
+
+    renderApp("/d/eng");
+    const card = await dangerZone();
+
+    // Nobody owns it, so the owner clause has nothing to match and the right
+    // comes from the admin flag alone - which is what gives an ownerless
+    // private domain a way back out of private.
+    expect(
+      await within(card).findByRole("button", { name: "Share with everyone" }),
+    ).toBeVisible();
+  });
+
   it("gives a manager of a private domain no visibility control", async () => {
     serve(
       {
