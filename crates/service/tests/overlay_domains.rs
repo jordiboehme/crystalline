@@ -7286,10 +7286,13 @@ async fn a_pinned_direct_share_whose_branch_moved_is_refused_before_any_commit()
         )
         .await
         .unwrap_err();
+    // The words unique to `SHARE_HEAD_MOVED` (the constant itself is
+    // `pub(crate)`, so it cannot be named from here): the remote crate's
+    // `NotFastForward` text carries "moved while this share was prepared" too,
+    // and that one would mean the refusal came a whole layer later.
     assert!(
-        err.to_string()
-            .contains("moved while this share was prepared"),
-        "{err}"
+        err.to_string().contains("the team's copy moved"),
+        "the pinned head refused this, not the branch write: {err}"
     );
     assert_eq!(
         mock.calls()
