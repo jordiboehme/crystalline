@@ -2463,6 +2463,10 @@ async fn read_engram_reports_reference_resolution() {
 
     // Nothing points at Source, so no inbound summary is emitted.
     assert!(out.get("inbound").is_none(), "no inbound expected: {out}");
+    assert!(
+        out.get("local_change").is_none(),
+        "a direct domain never carries the key: {out}"
+    );
     // But resolving outbound references earn the build_context hint.
     let related = out["related"].as_str().expect("related hint present");
     assert!(

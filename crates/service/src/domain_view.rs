@@ -523,8 +523,10 @@ impl<'a> DomainView<'a> {
     /// **This is also where a draft's share-links and joins end**, and it is
     /// the one place they can be ended once rather than at each verb. Every
     /// way an overlay row is taken away passes through here or through
-    /// [`DomainView::drop_mid_move`] beside it - the discard, the fold, a
-    /// withdrawal ([`Engine::revert_into_overlay`]), a conflict resolution
+    /// [`DomainView::drop_mid_move`] beside it - the discard of a domain's
+    /// drafts on leaving review mode, the per-path discard of local changes
+    /// ([`Engine::discard_local_changes`]), the fold, a withdrawal
+    /// ([`Engine::revert_into_overlay`]), a conflict resolution
     /// ([`Engine::resolve_in_overlay`]), a settled convergence and the rename
     /// convergence performs when the base carried the draft along
     /// ([`Engine::move_draft_with_the_base`]), which never touches the move

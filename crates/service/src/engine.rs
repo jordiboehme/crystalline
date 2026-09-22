@@ -46,7 +46,8 @@ use crystalline_index::{
     reindex_domains, resolve_forward_refs, retired_factor, rule_info, salience_prior, scan_domain,
     scan_paths,
 };
-use crystalline_remote::ops;
+use crystalline_remote::changes::{LocalChange, LocalChanges};
+use crystalline_remote::ops::{self, DiscardTarget};
 use crystalline_remote::{
     GitHubProvider, OriginSpec, Provider, RemoteError, StoredToken, TokenIdentity, TokenStore,
 };
@@ -452,6 +453,59 @@ fn refuse_not_an_engram(content: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// The word one detected change is reported by, everywhere this feature
+/// names a kind.
+fn change_kind(change: &LocalChange) -> &'static str {
+    match change {
+        LocalChange::Added { .. } => "added",
+        LocalChange::Modified { .. } => "modified",
+        LocalChange::Deleted { .. } => "deleted",
+    }
+}
+
+/// The targets a team discard actually runs, with every digest the caller left
+/// out filled in from the change the list shows now.
+///
+/// `discard_local_files` guards each target against the digest the caller
+/// looked at, so an addition or a modification with no digest would refuse as
+/// `changed_since` and never be discardable at all. A caller that names no
+/// digest is not skipping the guard by accident: it is saying "discard what
+/// the list shows", which is what an agent calling without `expected` means.
+/// So the digest is read off the detected change itself. A deletion keeps
+/// `None`, which is the absence its own guard checks for, and a path that
+/// resolves to no change is passed through untouched so the loop refuses it in
+/// its own words.
+fn fill_unguarded(targets: &[DiscardTarget], local: &LocalChanges) -> Vec<DiscardTarget> {
+    targets
+        .iter()
+        .map(|target| {
+            if target.sha256.is_some() {
+                return target.clone();
+            }
+            let filled = match ops::resolve_local_change(local, &target.path) {
+                Some(LocalChange::Added { sha256, .. })
+                | Some(LocalChange::Modified { sha256, .. }) => Some(sha256.clone()),
+                _ => None,
+            };
+            DiscardTarget {
+                path: target.path.clone(),
+                sha256: filled,
+            }
+        })
+        .collect()
+}
+
+/// What one offline read of a team domain's unshared delta needs: the domain
+/// root, its origin state directory, the base every comparison is made
+/// against and the delta detection found. What
+/// [`Engine::team_local_changes`] hands its three callers.
+type TeamChanges = (
+    PathBuf,
+    PathBuf,
+    BTreeMap<String, crystalline_remote::state::BaseStamp>,
+    LocalChanges,
+);
 
 /// Renders one side of a conflict for [`Engine::origin_conflict_detail`]: an
 /// absent side is `null`, a UTF-8 one is a JSON string, and a side that
@@ -7293,6 +7347,31 @@ impl Engine {
             obj.insert("draft".to_string(), json!(true));
         }
 
+        // One word saying how this page differs from what the team has, for
+        // a team domain that takes changes directly. A reviewing domain says
+        // `draft` instead; a domain with no origin says nothing; a listing or
+        // the log is never compared. Costs one parse of `state.json` and one
+        // map lookup, never a file read: the checksum above is of the bytes
+        // the page is about to show.
+        if overlay.is_none()
+            && origin::takes_part_in_local_change(&desc.path)
+            && !self.reviews_changes(&desc.domain)
+            && self.domain_has_origin(&desc.domain).unwrap_or(false)
+            && let Ok((_, _, state_dir)) = self.origin_spec_for_domain(&desc.domain)
+            && let Ok(Some(state)) = crystalline_remote::state::OriginState::load(&state_dir)
+        {
+            let base = ops::unshared_base(&state);
+            match base.get(&desc.path) {
+                None => {
+                    obj.insert("local_change".to_string(), json!("added"));
+                }
+                Some(stamp) if stamp.sha256 != checksum => {
+                    obj.insert("local_change".to_string(), json!("modified"));
+                }
+                Some(_) => {}
+            }
+        }
+
         // Two lines saying the bytes above are somebody's unsaved work and who
         // is holding them. Emitted only when a room is actually open, so every
         // other read on this instance answers exactly what it always did.
@@ -12847,9 +12926,9 @@ impl Engine {
     /// body - claim the host, snapshot the stamps and release the lock, run the
     /// lock-free path scan, then re-lock to apply through the same [`apply_scan`]
     /// with its TOCTOU guards - so a targeted pass never holds the store mutex
-    /// across the scan either. Only the watcher calls this; it is intentionally
-    /// not exposed over MCP or the control socket, where a full sync is always
-    /// wanted. A domain hosted by another live instance in collaboration mode is
+    /// across the scan either. The watcher, the archive import and a discard of
+    /// local changes call this; it is intentionally not exposed over MCP or the
+    /// control socket, where a full sync is always wanted. A domain hosted by another live instance in collaboration mode is
     /// skipped silently, exactly as the watcher's full-sync path skips it today,
     /// so a non-host never writes the host's rows. A missed or mis-targeted event
     /// is caught by the full fallback, the startup sync or a manual sync, so the
@@ -17713,6 +17792,420 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// What one actor holds in a reviewing domain, rows and files, at the
+    /// spelling and in the order the change list reports: `(path, kind,
+    /// current bytes)` with `None` bytes for a tombstone, sorted by path.
+    ///
+    /// The kind is the folder's answer: `deleted` for a tombstone, `modified`
+    /// where the folder holds the path, `added` where it does not. That is
+    /// exactly the set a review-mode share stages
+    /// ([`crate::share_staging`]), so the list and the share agree.
+    async fn overlay_local_changes(
+        &self,
+        domain: &str,
+        root: &Path,
+        actor: &str,
+    ) -> Result<Vec<(String, &'static str, Option<Vec<u8>>)>> {
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(domain).await?
+        };
+        let mut out: Vec<(String, &'static str, Option<Vec<u8>>)> = Vec::new();
+        if let Some(domain_id) = domain_id {
+            let rows = {
+                let store = self.store.lock().await;
+                store.overlay_entries(domain_id, actor).await?
+            };
+            for row in rows {
+                if !origin::takes_part_in_local_change(&row.path) {
+                    continue;
+                }
+                let kind = if row.tombstone {
+                    "deleted"
+                } else if root.join(&row.path).is_file() {
+                    "modified"
+                } else {
+                    "added"
+                };
+                let bytes = (!row.tombstone).then(|| row.content.into_bytes());
+                out.push((row.path, kind, bytes));
+            }
+        }
+        let state_dir = self.journal_state_dir()?;
+        for entry in crate::overlay_files::entries(&state_dir, domain, actor).entries {
+            if !origin::takes_part_in_local_change(&entry.path) {
+                continue;
+            }
+            let kind = if entry.tombstone {
+                "deleted"
+            } else if root.join(&entry.path).is_file() {
+                "modified"
+            } else {
+                "added"
+            };
+            let bytes = if entry.tombstone {
+                None
+            } else {
+                crate::overlay_files::read(&state_dir, domain, actor, &entry.path).map_err(
+                    |source| EngineError::Io {
+                        path: entry.path.clone(),
+                        source,
+                    },
+                )?
+            };
+            out.push((entry.path, kind, bytes));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// The folder's own bytes at a review-mode draft's path, or `None` where
+    /// the folder holds nothing there. Only ever asked for a path the actor's
+    /// overlay already names, which is what keeps the join off the raw
+    /// request: every such path was validated by the verb that wrote it.
+    fn folder_side(root: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+        match std::fs::read(root.join(path)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(EngineError::Io {
+                path: path.to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// The team-domain walk every method below shares: the origin state, the
+    /// base it detects against and the detected delta. Under no lock; a read
+    /// a beat stale is the promise every offline read here makes.
+    fn team_local_changes(&self, domain: &str) -> Result<TeamChanges> {
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let state = crystalline_remote::state::OriginState::load(&state_dir)?.ok_or_else(|| {
+            EngineError::Invalid(format!("domain '{domain}' has no origin state"))
+        })?;
+        let base = ops::unshared_base(&state);
+        let local = crystalline_remote::changes::detect_local_changes(&root, &base)?;
+        Ok((root, state_dir, base, local))
+    }
+
+    /// The domain's own refusal for a caller that asked about local changes
+    /// where there are none to have: a domain with no team origin shares
+    /// nothing, so nothing of it is unshared.
+    fn local_changes_need_an_origin(&self, domain: &str) -> Result<()> {
+        if !self.domain_has_origin(domain)? {
+            return Err(EngineError::Invalid(format!(
+                "domain '{domain}' has no team origin; only a team domain has local changes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Every unshared change of `domain`, offline: `{ domain, mode, changes,
+    /// skipped_large }`. A team domain answers the working tree against
+    /// `unshared_base`, the comparison a share makes; a reviewing domain
+    /// answers the acting actor's own drafts against the folder, and an
+    /// anonymous HTTP agent, who holds no draft there, an empty list. Never
+    /// pulls, never probes, never resolves a provider.
+    pub async fn local_changes(&self, domain: &str, actor: &ShareActor) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        self.local_changes_need_an_origin(domain)?;
+        if self.reviews_changes(domain) {
+            let Ok(who) = share_staging::overlay_share_actor(actor) else {
+                return Ok(
+                    json!({ "domain": domain, "mode": "review", "changes": [], "skipped_large": [] }),
+                );
+            };
+            let (_, root, _) = self.origin_spec_for_domain(domain)?;
+            let mut changes = Vec::new();
+            for (path, kind, current) in self.overlay_local_changes(domain, &root, &who).await? {
+                let base = Self::folder_side(&root, &path)?;
+                changes.push(origin::change_entry_json(
+                    &path,
+                    kind,
+                    base.as_deref(),
+                    current.as_deref(),
+                ));
+            }
+            return Ok(
+                json!({ "domain": domain, "mode": "review", "changes": changes, "skipped_large": [] }),
+            );
+        }
+        let (root, state_dir, _, local) = self.team_local_changes(domain)?;
+        let mut changes = Vec::new();
+        for change in local.substantive() {
+            let Some(sides) = ops::local_change_sides(&root, &state_dir, &local, change.path())?
+            else {
+                continue;
+            };
+            changes.push(origin::change_entry_json(
+                change.path(),
+                change_kind(change),
+                sides.base.as_deref(),
+                sides.current.as_deref(),
+            ));
+        }
+        let skipped: Vec<Value> = local
+            .skipped_large
+            .iter()
+            .map(|(path, size)| json!({ "path": path, "size": size }))
+            .collect();
+        Ok(
+            json!({ "domain": domain, "mode": "team", "changes": changes, "skipped_large": skipped }),
+        )
+    }
+
+    /// Both sides of one unshared change, or `NotFound` in the words
+    /// `select_share_files` refuses an unknown path in. `cap` bounds a text
+    /// side; `None` answers every text.
+    pub async fn local_change(
+        &self,
+        domain: &str,
+        path: &str,
+        actor: &ShareActor,
+        cap: Option<usize>,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        self.local_changes_need_an_origin(domain)?;
+        let not_a_change = || {
+            EngineError::NotFound(format!(
+                "not among this domain's unshared changes: {path}; take the paths from the change list, which names every file that differs"
+            ))
+        };
+        if self.reviews_changes(domain) {
+            let who = share_staging::overlay_share_actor(actor)?;
+            let (_, root, _) = self.origin_spec_for_domain(domain)?;
+            let found = self
+                .overlay_local_changes(domain, &root, &who)
+                .await?
+                .into_iter()
+                .find(|(p, _, _)| p == path)
+                .ok_or_else(not_a_change)?;
+            let (path, kind, current) = found;
+            let base = Self::folder_side(&root, &path)?;
+            let mut value =
+                origin::change_detail_json(&path, kind, base.as_deref(), current.as_deref(), cap);
+            value["domain"] = json!(domain);
+            return Ok(value);
+        }
+        let (root, state_dir, _, local) = self.team_local_changes(domain)?;
+        let sides =
+            ops::local_change_sides(&root, &state_dir, &local, path)?.ok_or_else(not_a_change)?;
+        let mut value = origin::change_detail_json(
+            sides.change.path(),
+            change_kind(&sides.change),
+            sides.base.as_deref(),
+            sides.current.as_deref(),
+            cap,
+        );
+        value["domain"] = json!(domain);
+        Ok(value)
+    }
+
+    /// Put the named paths back the way the team has them: `{ domain,
+    /// restored, deleted, cleared: [{ path, kind }], refused: [{ path, reason }],
+    /// reindexed }`. Under the domain's origin lock like a withdrawal, so it
+    /// never interleaves with a share's pull; refuses on a read-only instance.
+    /// A team domain restores from the base copy and re-indexes exactly the
+    /// touched paths; a reviewing domain clears the acting actor's own drafts
+    /// through [`DomainView::drop`] and `overlay_files::clear` and moves
+    /// nothing in the folder. One refused path never stops the others.
+    pub async fn discard_local_changes(
+        &self,
+        domain: &str,
+        targets: &[DiscardTarget],
+        actor: &ShareActor,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        self.local_changes_need_an_origin(domain)?;
+        let lock = self.origin_lock_registered(domain)?;
+        let _guard = lock.lock().await;
+        let drafting = self.overlay_share_identity(domain, actor)?;
+        if let Some(who) = drafting {
+            return self.discard_into_overlay(domain, &who, targets).await;
+        }
+        let (root, state_dir, base, local) = self.team_local_changes(domain)?;
+        let targets = fill_unguarded(targets, &local);
+        let report = ops::discard_local_files(&root, &state_dir, &base, &local, &targets)?;
+        let touched: Vec<String> = report
+            .restored
+            .iter()
+            .chain(report.deleted.iter())
+            .map(|p| local.disk_path(p).to_string())
+            .collect();
+        let reindexed = touched.len();
+        if !touched.is_empty() {
+            // The targeted pass the import already takes: exactly these paths,
+            // which is also what rebuilds a folder's listing beside a discarded
+            // engram in a domain that shares its listings.
+            self.sync_paths(domain, touched).await?;
+            if !self.request_embed()
+                && let Err(e) = self.embed_pending().await
+            {
+                tracing::warn!("embedding after discarding changes in '{domain}' failed: {e}");
+            }
+        }
+        let refused: Vec<Value> = report
+            .refused
+            .iter()
+            .map(|(path, reason)| json!({ "path": path, "reason": reason.code() }))
+            .collect();
+        Ok(json!({
+            "domain": domain,
+            "restored": report.restored,
+            "deleted": report.deleted,
+            "cleared": [],
+            "refused": refused,
+            "reindexed": reindexed,
+        }))
+    }
+
+    /// The review-mode half of [`Engine::discard_local_changes`]: a clear and
+    /// never a write, for the reason [`Engine::revert_into_overlay`] gives.
+    /// A draft somebody has open in a live editor is refused rather than
+    /// closed under them, since the room's own save would write it straight
+    /// back.
+    async fn discard_into_overlay(
+        &self,
+        domain: &str,
+        actor: &str,
+        targets: &[DiscardTarget],
+    ) -> Result<Value> {
+        let (_, root, _) = self.origin_spec_for_domain(domain)?;
+        let state_dir = self.journal_state_dir()?;
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(domain).await?
+        };
+        let mut cleared: Vec<Value> = Vec::new();
+        let mut refused: Vec<Value> = Vec::new();
+        for target in targets {
+            let path = target
+                .path
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
+            let row = match domain_id {
+                Some(domain_id) => {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, actor, &path).await?
+                }
+                None => None,
+            };
+            if let (Some(domain_id), Some(held)) = (domain_id, row) {
+                // No digest is "discard what the list showed me", the way an
+                // agent calling without `expected` means it; a digest is the
+                // guard that newer work is never dropped.
+                // The digest is of the row's own content, the way
+                // [`Engine::revert_into_overlay`] takes it and the way the
+                // change list reports it: a row's stamp column carries
+                // whatever the write recorded there, which is a fact about a
+                // file the draft may not have.
+                let unchanged = match target.sha256.as_deref() {
+                    Some(expected) => {
+                        !held.tombstone && sha256_hex(held.content.as_bytes()) == expected
+                    }
+                    None => true,
+                };
+                if !unchanged {
+                    refused.push(json!({ "path": path, "reason": "changed_since" }));
+                    continue;
+                }
+                let open = match self.collab_rooms() {
+                    Some(rooms) => {
+                        rooms
+                            .has_live_room(domain, &held.permalink, Some(actor))
+                            .await
+                    }
+                    None => false,
+                };
+                if open {
+                    refused.push(json!({ "path": path, "reason": "open_in_editor" }));
+                    continue;
+                }
+                let kind = if held.tombstone {
+                    "deleted"
+                } else if root.join(&path).is_file() {
+                    "modified"
+                } else {
+                    "added"
+                };
+                DomainView::for_actor(self, domain, &HashSet::new(), actor)?
+                    .drop(domain_id, &path)
+                    .await?;
+                cleared.push(json!({ "path": path, "kind": kind }));
+                continue;
+            }
+            let io = |source: std::io::Error| EngineError::Io {
+                path: path.clone(),
+                source,
+            };
+            // A path the files overlay will not even address holds nothing
+            // there, which is the same answer as an empty folder: the caller
+            // named something this domain has no change at. A refusal to
+            // address is not a filesystem failure, so it is answered rather
+            // than raised.
+            let held = match crate::overlay_files::held(&state_dir, domain, actor, &path) {
+                Ok(held) => held,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    refused.push(json!({ "path": path, "reason": "unknown_path" }));
+                    continue;
+                }
+                Err(e) => return Err(io(e)),
+            };
+            match held {
+                crate::overlay_files::Held::Nothing => {
+                    refused.push(json!({ "path": path, "reason": "unknown_path" }));
+                }
+                crate::overlay_files::Held::Bytes => {
+                    let bytes = crate::overlay_files::read(&state_dir, domain, actor, &path)
+                        .map_err(io)?
+                        .unwrap_or_default();
+                    if target
+                        .sha256
+                        .as_deref()
+                        .is_some_and(|expected| expected != sha256_hex(&bytes))
+                    {
+                        refused.push(json!({ "path": path, "reason": "changed_since" }));
+                        continue;
+                    }
+                    crate::overlay_files::clear(&state_dir, domain, actor, &path).map_err(io)?;
+                    let kind = if root.join(&path).is_file() {
+                        "modified"
+                    } else {
+                        "added"
+                    };
+                    cleared.push(json!({ "path": path, "kind": kind }));
+                }
+                crate::overlay_files::Held::Tombstone => {
+                    // A deletion's current side is absence, so a caller that
+                    // looked at bytes was looking at something else.
+                    if target.sha256.is_some() {
+                        refused.push(json!({ "path": path, "reason": "changed_since" }));
+                        continue;
+                    }
+                    crate::overlay_files::clear(&state_dir, domain, actor, &path).map_err(io)?;
+                    cleared.push(json!({ "path": path, "kind": "deleted" }));
+                }
+            }
+        }
+        Ok(json!({
+            "domain": domain,
+            "restored": [],
+            "deleted": [],
+            "cleared": cleared,
+            "refused": refused,
+            "reindexed": 0,
+        }))
     }
 
     /// One conflict's full detail: both recorded sides plus the current local

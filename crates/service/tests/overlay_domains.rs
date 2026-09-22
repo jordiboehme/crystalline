@@ -23,6 +23,8 @@ use crystalline_core::config::{
 };
 use crystalline_core::parse_engram;
 use crystalline_index::{DomainKind, EngramRecord, FileStamp, Store, TursoStore};
+use crystalline_remote::ops::DiscardTarget;
+use crystalline_service::collab::session::CollabSessions;
 use crystalline_service::daemon::http_router;
 use crystalline_service::engine::ConfigureAction;
 use crystalline_service::overlay_journal;
@@ -4855,6 +4857,380 @@ async fn a_discard_drops_without_touching_disk() {
     );
 }
 
+// --- the local-changes feature: list, diff and discard ---------------------
+
+/// The list a member reads of a reviewing domain is exactly their own drafts,
+/// rows and files alike, and never the keeper's.
+#[tokio::test]
+async fn a_review_mode_change_list_names_exactly_the_callers_own_drafts() {
+    let f = reviewed_origin_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    f.tombstone("team", "alice", "MANIFEST.md").await;
+    f.file("team", "alice", "assets/logo.png", b"\x89PNG\r\n\x1a\n")
+        .await;
+    f.draft("team", "bob", "bob.md", ALICE_NEW).await;
+
+    let mine = f
+        .engine
+        .local_changes("team", &ShareActor::Account("alice".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(mine["mode"], "review", "{mine}");
+    let rows: Vec<(String, String)> = mine["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["path"].as_str().unwrap().to_string(),
+                c["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("MANIFEST.md".to_string(), "deleted".to_string()),
+            ("assets/logo.png".to_string(), "added".to_string()),
+            ("fresh.md".to_string(), "added".to_string()),
+            ("plan.md".to_string(), "modified".to_string()),
+        ],
+        "{mine}"
+    );
+    let plan = &mine["changes"][3];
+    assert_eq!(
+        plan["sha"],
+        support::sha256_hex(ALICE_DRAFT.as_bytes()),
+        "{plan}"
+    );
+    assert_eq!(plan["size_before"], PLAN.len(), "{plan}");
+    assert_eq!(plan["size_after"], ALICE_DRAFT.len(), "{plan}");
+    assert_eq!(plan["engram"]["permalink"], "plan");
+    assert_eq!(
+        mine["changes"][0]["sha"],
+        serde_json::Value::Null,
+        "a deletion has no current side"
+    );
+    assert_eq!(mine["changes"][1]["binary"], true, "{mine}");
+    assert_eq!(mine["skipped_large"], serde_json::json!([]));
+    assert!(
+        !mine.to_string().contains("bob.md"),
+        "never another actor's draft: {mine}"
+    );
+
+    let bobs = f
+        .engine
+        .local_changes("team", &ShareActor::Account("bob".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(bobs["changes"].as_array().unwrap().len(), 1, "{bobs}");
+    assert_eq!(bobs["changes"][0]["path"], "bob.md");
+
+    let detail = f
+        .engine
+        .local_change(
+            "team",
+            "plan.md",
+            &ShareActor::Account("alice".to_string()),
+            Some(1024 * 1024),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["base"], PLAN,
+        "the folder's copy is the base side: {detail}"
+    );
+    assert_eq!(detail["current"], ALICE_DRAFT);
+    assert_eq!(detail["too_large"], false);
+}
+
+/// A discard clears one draft and leaves the other, ends the cleared draft's
+/// grants, refuses a stale digest and a draft somebody has open, and never
+/// moves a byte of the folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_review_mode_discard_clears_exactly_the_named_drafts() {
+    let f = reviewed_origin_fixture().await;
+    let sessions = CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    f.draft(
+        "team",
+        "alice",
+        "open.md",
+        ALICE_NEW
+            .replace("permalink: fresh", "permalink: open")
+            .as_str(),
+    )
+    .await;
+    f.file("team", "alice", "assets/logo.png", b"png").await;
+    let before = f.tree("team");
+    let _joined = sessions.join("team", "open", Some("alice")).await.unwrap();
+    let alice = ShareActor::Account("alice".to_string());
+
+    let report = f
+        .engine
+        .discard_local_changes(
+            "team",
+            &[
+                DiscardTarget {
+                    path: "plan.md".to_string(),
+                    sha256: Some(support::sha256_hex(ALICE_DRAFT.as_bytes())),
+                },
+                DiscardTarget {
+                    path: "fresh.md".to_string(),
+                    sha256: Some("0".repeat(64)),
+                },
+                DiscardTarget {
+                    path: "open.md".to_string(),
+                    sha256: None,
+                },
+                DiscardTarget {
+                    path: "assets/logo.png".to_string(),
+                    sha256: Some(support::sha256_hex(b"png")),
+                },
+                DiscardTarget {
+                    path: "nowhere.md".to_string(),
+                    sha256: None,
+                },
+            ],
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report["cleared"],
+        serde_json::json!([
+            { "path": "plan.md", "kind": "modified" },
+            { "path": "assets/logo.png", "kind": "added" },
+        ]),
+        "{report}"
+    );
+    assert_eq!(
+        report["refused"],
+        serde_json::json!([
+            { "path": "fresh.md", "reason": "changed_since" },
+            { "path": "open.md", "reason": "open_in_editor" },
+            { "path": "nowhere.md", "reason": "unknown_path" },
+        ]),
+        "{report}"
+    );
+    assert_eq!(report["restored"], serde_json::json!([]));
+    assert_eq!(report["deleted"], serde_json::json!([]));
+    assert_eq!(report["reindexed"], 0);
+
+    let held: Vec<String> = f
+        .held("team", "alice")
+        .await
+        .into_iter()
+        .map(|(p, _, _)| p)
+        .collect();
+    assert_eq!(
+        held,
+        vec!["fresh.md".to_string(), "open.md".to_string()],
+        "one cleared, two left"
+    );
+    assert!(
+        !attachment_paths(&f)
+            .await
+            .contains(&"assets/logo.png".to_string()),
+        "her draft file went with it"
+    );
+    assert_eq!(
+        f.tree("team"),
+        before,
+        "the folder is byte for byte as it was"
+    );
+    // The cleared path is nobody's draft any more, so the reader's own view
+    // of it is the base again.
+    let read = f
+        .engine
+        .read_engram(&read("plan"), &scope_of("alice"))
+        .await
+        .unwrap();
+    assert!(read.get("draft").is_none(), "{read}");
+}
+
+/// A team domain lists the working tree against its base, diffs one path and
+/// puts it back, re-indexing exactly what moved.
+#[tokio::test]
+async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
+    let f = origin_fixture().await;
+    let root = f.domain_root("team");
+    // The base tree a first pull writes, beside the stamps the fixture wrote.
+    for rel in ["MANIFEST.md", "plan.md"] {
+        crystalline_remote::state::write_base_file(
+            &f.origins.join("team"),
+            rel,
+            &std::fs::read(root.join(rel)).unwrap(),
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("plan.md"), ALICE_DRAFT).unwrap();
+    std::fs::write(root.join("fresh.md"), ALICE_NEW).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let owner = ShareActor::Owner;
+
+    let list = f.engine.local_changes("team", &owner).await.unwrap();
+    assert_eq!(list["mode"], "team");
+    let paths: Vec<&str> = list["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["fresh.md", "plan.md"], "{list}");
+    assert_eq!(list["changes"][1]["kind"], "modified");
+    assert_eq!(list["changes"][1]["size_before"], PLAN.len());
+
+    let detail = f
+        .engine
+        .local_change("team", "plan.md", &owner, Some(4))
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["too_large"], true,
+        "a four-byte cap withholds both texts: {detail}"
+    );
+    assert!(detail["base"].is_null() && detail["current"].is_null());
+    let detail = f
+        .engine
+        .local_change("team", "plan.md", &owner, None)
+        .await
+        .unwrap();
+    assert_eq!(detail["base"], PLAN);
+    assert_eq!(detail["current"], ALICE_DRAFT);
+    let missing = f
+        .engine
+        .local_change("team", "nowhere.md", &owner, None)
+        .await
+        .unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("not among this domain's unshared changes"),
+        "{missing}"
+    );
+
+    let report = f
+        .engine
+        .discard_local_changes(
+            "team",
+            &[
+                DiscardTarget {
+                    path: "plan.md".to_string(),
+                    sha256: Some(support::sha256_hex(ALICE_DRAFT.as_bytes())),
+                },
+                DiscardTarget {
+                    path: "fresh.md".to_string(),
+                    sha256: Some("0".repeat(64)),
+                },
+            ],
+            &owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["plan.md"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["refused"],
+        serde_json::json!([{ "path": "fresh.md", "reason": "changed_since" }])
+    );
+    assert_eq!(report["reindexed"], 1);
+    assert_eq!(std::fs::read_to_string(root.join("plan.md")).unwrap(), PLAN);
+    assert!(root.join("fresh.md").exists());
+    // The index followed the file: the team's line is back, alice's is gone.
+    let read = f
+        .engine
+        .read_engram(&read("plan"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap()
+            .contains("as the team has it"),
+        "{read}"
+    );
+    assert!(
+        read.get("local_change").is_none(),
+        "matches the base again: {read}"
+    );
+
+    // A target that names no digest discards what the list shows now, which is
+    // what an agent calling without `expected` means (spec J1).
+    let report = f
+        .engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "fresh.md".to_string(),
+                sha256: None,
+            }],
+            &owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report["deleted"],
+        serde_json::json!(["fresh.md"]),
+        "{report}"
+    );
+    assert!(
+        !root.join("fresh.md").exists(),
+        "the page only alice had is gone"
+    );
+}
+
+/// The detail payload says how a team page differs from the base, and says
+/// nothing on a direct domain or in review mode.
+#[tokio::test]
+async fn the_detail_payload_carries_local_change_for_a_team_page_only() {
+    let f = origin_fixture().await;
+    let root = f.domain_root("team");
+    let plain = f
+        .engine
+        .read_engram(&read("plan"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        plain.get("local_change").is_none(),
+        "matches the base: {plain}"
+    );
+    std::fs::write(root.join("plan.md"), ALICE_DRAFT).unwrap();
+    std::fs::write(root.join("fresh.md"), ALICE_NEW).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let edited = f
+        .engine
+        .read_engram(&read("plan"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(edited["local_change"], "modified", "{edited}");
+    let added = f
+        .engine
+        .read_engram(&read("fresh"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(added["local_change"], "added", "{added}");
+
+    let r = reviewed_origin_fixture().await;
+    r.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    let draft = r
+        .engine
+        .read_engram(&read("plan"), &scope_of("alice"))
+        .await
+        .unwrap();
+    assert_eq!(draft["draft"], true);
+    assert!(
+        draft.get("local_change").is_none(),
+        "a reviewing domain says draft instead: {draft}"
+    );
+}
+
 /// Leaving review mode decides the fate of somebody's unshared work, so it is
 /// never decided by omission: a confirm that does not say what to do with an
 /// actor's drafts refuses and names them.
@@ -5991,6 +6367,10 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         ("engine.rs", "leave_review_mode"),
         // A withdrawal, which takes back what one actor proposed.
         ("engine.rs", "revert_into_overlay"),
+        // The per-path discard of local changes, whose actor is the acting
+        // `ShareActor` resolved through `overlay_share_identity` - the caller's
+        // own identity, never a name a request carried.
+        ("engine.rs", "discard_into_overlay"),
         // A conflict resolution inside one actor's own draft.
         ("engine.rs", "resolve_in_overlay"),
         // A share resolved through `ShareActor`.
