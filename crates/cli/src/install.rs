@@ -2,9 +2,10 @@
 //! wires a coding harness up to Crystalline, and its exact reverse.
 //!
 //! A full setup is three parts: register the MCP server, install the
-//! `SessionStart` routing hook and the `Stop` capture-nudge hook and copy the
-//! four topical skills into the harness's skill folder. `install` does all
-//! three (each skippable with `--skip-mcp`/`--skip-hooks`/`--skip-skills`);
+//! `SessionStart` routing hook, the `Stop` capture-nudge hook and the
+//! `UserPromptSubmit` recall hook, and copy the four topical skills into the
+//! harness's skill folder. `install` does all three (each skippable with
+//! `--skip-mcp`/`--skip-hooks`/`--skip-skills`);
 //! `uninstall` takes them back out. Both are static: no database, service or
 //! daemon connection, and no Tokio runtime, exactly like `verify`, `prompt`
 //! and `hook`.
@@ -73,6 +74,10 @@ pub(crate) const SESSION_START_COMMAND: &str = "crystalline prompt system";
 /// decided by [`crate::hook`].
 pub(crate) const STOP_COMMAND: &str = "crystalline hook stop";
 
+/// The command the `UserPromptSubmit` hook runs: the per-prompt recall
+/// decided by [`crate::recall`].
+pub(crate) const PROMPT_COMMAND: &str = "crystalline hook prompt";
+
 /// The `SessionStart` command for the GitHub Copilot CLI, which parses a
 /// hook's stdout as one JSON document and drops plain text: the copilot
 /// format wraps the routing prompt in an `additionalContext` envelope and
@@ -111,6 +116,23 @@ pub(crate) fn managed_hook_commands(harness: HarnessKind) -> [String; 2] {
     ]
 }
 
+/// The `UserPromptSubmit` command a harness's managed hook runs: the base
+/// spelling plus `--harness <id>`, exactly as [`managed_hook_commands`]
+/// builds the other two, so the hook knows at run time which harness's
+/// payload shape it is reading.
+///
+/// Written for every harness, Copilot included, as forward compatibility
+/// (ruled 2026-09-21): a config-file `UserPromptSubmit` hook's output is
+/// dropped by Copilot today, so its copy of this hook runs and produces
+/// nothing a person ever sees - `crystalline doctor` is what reports that
+/// fact rather than this function refusing to write the entry. The `Option`
+/// return stays for the day a harness that cannot run this hook at all (no
+/// `UserPromptSubmit`-shaped event, rather than merely a dropped-output one)
+/// needs `None`.
+pub(crate) fn prompt_hook_command(harness: HarnessKind) -> Option<String> {
+    Some(format!("{PROMPT_COMMAND} --harness {}", harness.id()))
+}
+
 /// The `SessionStart` matcher: re-route on a fresh start, after `/clear` and
 /// after a compaction. `resume` is deliberately excluded, since a resumed
 /// transcript already carries the earlier routing block.
@@ -120,6 +142,12 @@ const SESSION_START_MATCHER: &str = "startup|clear|compact";
 /// giving up on it. Both hooks finish in tens of milliseconds, so ten seconds
 /// is generous headroom, not a real budget.
 const HOOK_TIMEOUT_SECS: u64 = 10;
+
+/// The `UserPromptSubmit` hook's own timeout, in seconds: it blocks the
+/// person's prompt, and the hook bounds its own work at one second (Part G),
+/// so five is headroom for a slow machine, not a budget - narrower than
+/// [`HOOK_TIMEOUT_SECS`] on purpose.
+const PROMPT_HOOK_TIMEOUT_SECS: u64 = 5;
 
 /// The topical skills copied into every harness's skills folder, each as
 /// `(folder name, embedded SKILL.md)`, derived from the shipped skill assets
@@ -185,7 +213,7 @@ pub struct InstallOptions {
     pub project: bool,
     /// Skip the MCP registration.
     pub skip_mcp: bool,
-    /// Skip the `SessionStart` and `Stop` hooks.
+    /// Skip the `SessionStart`, `Stop` and `UserPromptSubmit` hooks.
     pub skip_hooks: bool,
     /// Skip copying the topical skills.
     pub skip_skills: bool,
@@ -210,6 +238,15 @@ fn stop_group(command: &str) -> Value {
     })
 }
 
+/// The managed `UserPromptSubmit` group: the recall command with the hook's
+/// own, narrower timeout. No matcher, like the `Stop` group - neither
+/// harness reads one on this event.
+fn prompt_group(command: &str) -> Value {
+    json!({
+        "hooks": [ { "type": "command", "command": command, "timeout": PROMPT_HOOK_TIMEOUT_SECS } ],
+    })
+}
+
 // --- pure merge / remove algorithm -------------------------------------------
 
 /// Which of the two managed commands a stored command string is, decided on
@@ -225,17 +262,20 @@ fn managed_command_kind(command: &str) -> Option<ManagedCommand> {
         Some(ManagedCommand::SessionStart)
     } else if extends_command(command, STOP_COMMAND) {
         Some(ManagedCommand::Stop)
+    } else if extends_command(command, PROMPT_COMMAND) {
+        Some(ManagedCommand::Prompt)
     } else {
         None
     }
 }
 
-/// The two lifecycle commands `install` writes, as the identity a stored
+/// The three lifecycle commands `install` writes, as the identity a stored
 /// command string is matched to.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum ManagedCommand {
     SessionStart,
     Stop,
+    Prompt,
 }
 
 /// Whether `command` is `base` itself or `base` followed by arguments: a
@@ -265,6 +305,7 @@ fn is_own_spelling(command: &str) -> bool {
         SESSION_START_COMMAND_COPILOT,
         SESSION_START_COMMAND,
         STOP_COMMAND,
+        PROMPT_COMMAND,
     ]
     .iter()
     .any(|base| match command.strip_prefix(base) {
@@ -414,14 +455,17 @@ fn ensure_group(
     changed
 }
 
-/// Merge both managed hook groups into the settings root, returning whether
-/// anything changed. Idempotent: a root that already carries both commands in
+/// Merge every managed hook group into the settings root, returning whether
+/// anything changed. Idempotent: a root that already carries every command in
 /// this harness's current spelling (under any matcher) is returned unchanged.
 pub(crate) fn add_managed_hooks(root: &mut Map<String, Value>, harness: HarnessKind) -> bool {
     let [session_start, stop] = managed_hook_commands(harness);
     let mut changed = false;
     changed |= ensure_group(root, "SessionStart", &session_start, session_start_group);
     changed |= ensure_group(root, "Stop", &stop, stop_group);
+    if let Some(prompt) = prompt_hook_command(harness) {
+        changed |= ensure_group(root, "UserPromptSubmit", &prompt, prompt_group);
+    }
     changed
 }
 
@@ -485,9 +529,12 @@ pub(crate) fn remove_managed_hooks(root: &mut Map<String, Value>) -> bool {
 /// reads all three harnesses' payloads with one parser (what it answers with
 /// is the part that varies, and the `--harness` flag on the command is what
 /// tells it which). `command` is Copilot's
-/// cross-platform field and `timeoutSec` its spelling of the shared timeout.
-fn owned_entry(command: &str) -> Value {
-    json!({ "type": "command", "command": command, "timeoutSec": HOOK_TIMEOUT_SECS })
+/// cross-platform field and `timeoutSec` its spelling of the shared timeout,
+/// which the caller supplies so the `UserPromptSubmit` entry can carry its
+/// own, narrower [`PROMPT_HOOK_TIMEOUT_SECS`] instead of
+/// [`HOOK_TIMEOUT_SECS`].
+fn owned_entry(command: &str, timeout: u64) -> Value {
+    json!({ "type": "command", "command": command, "timeoutSec": timeout })
 }
 
 /// Whether a flat entry is one Crystalline manages, by its `command` string,
@@ -560,7 +607,12 @@ pub(crate) fn owned_hook_present(root: &Map<String, Value>, event: &str, command
 /// live. Only spellings we wrote are dropped, never a hand-written variant
 /// carrying somebody's own flags, which is counted present and left exactly
 /// as it is.
-fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str) -> bool {
+fn ensure_owned_entry(
+    root: &mut Map<String, Value>,
+    event: &str,
+    command: &str,
+    timeout: u64,
+) -> bool {
     let Some(kind) = managed_command_kind(command) else {
         return false;
     };
@@ -626,7 +678,7 @@ fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str)
         }
     }
     if !present {
-        entries.push(owned_entry(command));
+        entries.push(owned_entry(command, timeout));
         changed = true;
     }
     changed
@@ -643,8 +695,11 @@ pub(crate) fn add_owned_hooks(root: &mut Map<String, Value>, harness: HarnessKin
         root.insert("version".to_string(), json!(1));
         changed = true;
     }
-    changed |= ensure_owned_entry(root, "SessionStart", &session_start);
-    changed |= ensure_owned_entry(root, "Stop", &stop);
+    changed |= ensure_owned_entry(root, "SessionStart", &session_start, HOOK_TIMEOUT_SECS);
+    changed |= ensure_owned_entry(root, "Stop", &stop, HOOK_TIMEOUT_SECS);
+    if let Some(prompt) = prompt_hook_command(harness) {
+        changed |= ensure_owned_entry(root, "UserPromptSubmit", &prompt, PROMPT_HOOK_TIMEOUT_SECS);
+    }
     changed
 }
 
@@ -1201,6 +1256,7 @@ fn install_merged_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hoo
     // changes is how it is spelled, not whether it is there.
     let had_session_start = hook_present(&root, "SessionStart", SESSION_START_COMMAND);
     let had_stop = hook_present(&root, "Stop", STOP_COMMAND);
+    let had_prompt = hook_present(&root, "UserPromptSubmit", PROMPT_COMMAND);
     let changed = add_managed_hooks(&mut root, harness);
     if changed {
         write_settings(path, &root)?;
@@ -1213,6 +1269,13 @@ fn install_merged_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hoo
             "added"
         },
         stop: if had_stop { "already-present" } else { "added" },
+        prompt: prompt_hook_command(harness).map(|_| {
+            if had_prompt {
+                "already-present"
+            } else {
+                "added"
+            }
+        }),
         written: changed,
     })
 }
@@ -1223,6 +1286,7 @@ fn uninstall_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
     let mut root = read_settings(path)?;
     let had_session_start = hook_present(&root, "SessionStart", SESSION_START_COMMAND);
     let had_stop = hook_present(&root, "Stop", STOP_COMMAND);
+    let had_prompt = hook_present(&root, "UserPromptSubmit", PROMPT_COMMAND);
     let changed = remove_managed_hooks(&mut root);
     if changed {
         write_settings(path, &root)?;
@@ -1235,6 +1299,10 @@ fn uninstall_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
             "absent"
         },
         stop: if had_stop { "removed" } else { "absent" },
+        // No harness argument here, but every merged-style harness (Claude
+        // Code, Codex) supports the prompt hook today, so this is `Some`
+        // whenever the merged path runs at all.
+        prompt: Some(if had_prompt { "removed" } else { "absent" }),
         written: changed,
     })
 }
@@ -1248,6 +1316,7 @@ fn install_owned_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hook
     let had_session_start =
         owned_hook_present(&root, "SessionStart", SESSION_START_COMMAND_COPILOT);
     let had_stop = owned_hook_present(&root, "Stop", STOP_COMMAND);
+    let had_prompt = owned_hook_present(&root, "UserPromptSubmit", PROMPT_COMMAND);
     let changed = add_owned_hooks(&mut root, harness);
     if changed {
         write_settings(path, &root)?;
@@ -1260,6 +1329,13 @@ fn install_owned_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hook
             "added"
         },
         stop: if had_stop { "already-present" } else { "added" },
+        prompt: prompt_hook_command(harness).map(|_| {
+            if had_prompt {
+                "already-present"
+            } else {
+                "added"
+            }
+        }),
         written: changed,
     })
 }
@@ -1275,6 +1351,7 @@ fn uninstall_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
     let had_session_start =
         owned_hook_present(&root, "SessionStart", SESSION_START_COMMAND_COPILOT);
     let had_stop = owned_hook_present(&root, "Stop", STOP_COMMAND);
+    let had_prompt = owned_hook_present(&root, "UserPromptSubmit", PROMPT_COMMAND);
     let changed = remove_owned_hooks(&mut root);
     if changed {
         if root.keys().all(|k| k == "version") {
@@ -1303,6 +1380,9 @@ fn uninstall_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
             "absent"
         },
         stop: if had_stop { "removed" } else { "absent" },
+        // The owned style is Copilot's alone, and it supports the prompt
+        // hook (written, inert) like the other two, so this is always `Some`.
+        prompt: Some(if had_prompt { "removed" } else { "absent" }),
         written: changed,
     })
 }
@@ -1628,6 +1708,10 @@ struct HooksReport {
     path: String,
     session_start: &'static str,
     stop: &'static str,
+    /// What happened to the `UserPromptSubmit` hook, `None` for a harness
+    /// [`prompt_hook_command`] answers `None` for (none today: every harness
+    /// gets an entry, Copilot's inert).
+    prompt: Option<&'static str>,
     written: bool,
 }
 
@@ -1758,6 +1842,12 @@ fn render_human(
                 hook_label(h.session_start)
             ));
             out.push_str(&format!("  Stop hook: {}\n", hook_label(h.stop)));
+            if let Some(prompt) = h.prompt {
+                out.push_str(&format!(
+                    "  UserPromptSubmit hook: {}\n",
+                    hook_label(prompt)
+                ));
+            }
             out.push_str(&format!("  Settings file: {}\n", h.path));
         }
     }
@@ -2548,6 +2638,32 @@ mod tests {
         }
     }
 
+    /// The prompt command's own rewrite-eligibility case: the bare spelling
+    /// and every known harness's `--harness <id>` form are ours to rewrite,
+    /// but a harness id this binary does not know, or a trailing flag we
+    /// never wrote, is not.
+    #[test]
+    fn is_own_spelling_accepts_the_prompt_command_with_a_known_harness_only() {
+        for ours in [
+            PROMPT_COMMAND,
+            "crystalline hook prompt --harness claude-code",
+            "crystalline hook prompt --harness codex",
+            "crystalline hook prompt --harness copilot",
+        ] {
+            assert!(is_own_spelling(ours), "we wrote this spelling: {ours}");
+        }
+        for theirs in [
+            "crystalline hook prompt --harness from-a-future-release",
+            "crystalline hook prompt --workspace /repo",
+            "crystalline hook prompt --harness claude-code --quiet",
+        ] {
+            assert!(
+                !is_own_spelling(theirs),
+                "never rewritten out from under its author: {theirs}"
+            );
+        }
+    }
+
     /// Each harness's pair carries its own id, and the Copilot routing form
     /// keeps `--format copilot` beside the new flag rather than folding into
     /// it.
@@ -2588,9 +2704,34 @@ mod tests {
         }
     }
 
+    /// Ruled 2026-09-21: Copilot's prompt hook is written too, in the same
+    /// shape as the other two harnesses, as forward compatibility - only
+    /// `crystalline doctor` marks its copy inert, never `prompt_hook_command`
+    /// itself.
     #[test]
-    fn add_creates_both_groups_and_is_idempotent() {
+    fn prompt_hook_command_is_some_for_copilot_too() {
+        assert_eq!(
+            prompt_hook_command(HarnessKind::Copilot),
+            Some("crystalline hook prompt --harness copilot".to_string())
+        );
+        for harness in [
+            HarnessKind::ClaudeCode,
+            HarnessKind::Codex,
+            HarnessKind::Copilot,
+        ] {
+            let command = prompt_hook_command(harness).unwrap();
+            assert!(
+                command.ends_with(&format!("--harness {}", harness.id())),
+                "every harness gets the same shape: {command}"
+            );
+            assert!(is_own_spelling(&command));
+        }
+    }
+
+    #[test]
+    fn add_creates_every_group_and_is_idempotent() {
         let [start, stop] = cc();
+        let prompt = prompt_hook_command(HarnessKind::ClaudeCode).unwrap();
         let mut root = Map::new();
         assert!(
             add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
@@ -2598,6 +2739,7 @@ mod tests {
         );
         assert!(hook_present(&root, "SessionStart", SESSION_START_COMMAND));
         assert!(hook_present(&root, "Stop", STOP_COMMAND));
+        assert!(hook_present(&root, "UserPromptSubmit", PROMPT_COMMAND));
         // The exact managed shape, matcher, harness flag and timeout included.
         assert_eq!(
             root["hooks"]["SessionStart"][0]["matcher"],
@@ -2614,6 +2756,20 @@ mod tests {
         );
         // A Stop group carries no matcher.
         assert!(root["hooks"]["Stop"][0].get("matcher").is_none());
+        // The prompt group: no matcher, its own narrower timeout.
+        assert!(
+            root["hooks"]["UserPromptSubmit"][0]
+                .get("matcher")
+                .is_none()
+        );
+        assert_eq!(
+            root["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            prompt.as_str()
+        );
+        assert_eq!(
+            root["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"],
+            5
+        );
         // Second add is a no-op: the rewrite compares before it assigns.
         assert!(
             !add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
@@ -2624,10 +2780,15 @@ mod tests {
     /// The upgrade case, and the whole point of the parametrized command: a
     /// settings file written before `--harness` existed ends with exactly one
     /// hook per event, carrying the current spelling, under whatever matcher
-    /// it already had.
+    /// it already had. A file from before the prompt hook existed at all
+    /// carries neither group nor event for it, so the healed file gains a
+    /// brand new `UserPromptSubmit` group rather than rewriting one in
+    /// place - `a_bare_prompt_command_is_rewritten_in_place_too` below is
+    /// the rewrite-in-place case for that hook specifically.
     #[test]
     fn a_bare_command_from_an_older_release_is_rewritten_in_place() {
         let [start, stop] = cc();
+        let prompt = prompt_hook_command(HarnessKind::ClaudeCode).unwrap();
         let mut root = root(json!({
             "hooks": {
                 "SessionStart": [
@@ -2648,7 +2809,36 @@ mod tests {
         let stop_groups = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop_groups.len(), 1, "no second Stop group");
         assert_eq!(stop_groups[0]["hooks"][0]["command"], stop.as_str());
+        // The third group is entirely new for this file, gained on the same pass.
+        let prompt_groups = root["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(prompt_groups.len(), 1, "exactly one UserPromptSubmit group");
+        assert_eq!(prompt_groups[0]["hooks"][0]["command"], prompt.as_str());
         // And the healed file is stable: a second pass changes nothing.
+        assert!(!add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+    }
+
+    /// The prompt hook's own rewrite-in-place case, symmetric to the
+    /// SessionStart/Stop one above: a bare `crystalline hook prompt` group
+    /// under the harness's current spelling gains the `--harness` flag in
+    /// place, never a second group appended beside it.
+    #[test]
+    fn a_bare_prompt_command_is_rewritten_in_place_too() {
+        let prompt = prompt_hook_command(HarnessKind::ClaudeCode).unwrap();
+        let mut root = root(json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "hooks": [ { "type": "command", "command": PROMPT_COMMAND, "timeout": 5 } ] }
+                ]
+            }
+        }));
+        assert!(
+            add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
+            "an older spelling is a change"
+        );
+        let prompt_groups = root["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(prompt_groups.len(), 1, "no second UserPromptSubmit group");
+        assert_eq!(prompt_groups[0]["hooks"][0]["command"], prompt.as_str());
+        // Stable on a second pass.
         assert!(!add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
     }
 
@@ -2744,6 +2934,22 @@ mod tests {
         assert!(
             !root.contains_key("hooks"),
             "a hooks object holding only managed groups is pruned entirely"
+        );
+    }
+
+    #[test]
+    fn remove_managed_hooks_strips_the_prompt_group_and_prunes_the_event() {
+        let mut root = root(json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "hooks": [ { "type": "command", "command": PROMPT_COMMAND } ] }
+                ]
+            }
+        }));
+        assert!(remove_managed_hooks(&mut root));
+        assert!(
+            !root.contains_key("hooks"),
+            "the emptied UserPromptSubmit event is pruned along with the hooks object"
         );
     }
 
@@ -3039,13 +3245,14 @@ mod tests {
     #[test]
     fn add_owned_hooks_creates_the_exact_file_shape_and_is_idempotent() {
         let [copilot_start, copilot_stop] = managed_hook_commands(HarnessKind::Copilot);
+        let copilot_prompt = prompt_hook_command(HarnessKind::Copilot).unwrap();
         let mut root = Map::new();
         assert!(
             add_owned_hooks(&mut root, HarnessKind::Copilot),
             "first add changes the root"
         );
-        // The exact managed shape: the version marker, both PascalCase
-        // events, flat command entries with Copilot's field spellings, the
+        // The exact managed shape: the version marker, every PascalCase
+        // event, flat command entries with Copilot's field spellings, the
         // harness flag beside the format flag and no matcher anywhere.
         assert_eq!(root["version"], 1);
         let session_start = &root["hooks"]["SessionStart"][0];
@@ -3058,12 +3265,25 @@ mod tests {
         assert_eq!(stop["type"], "command");
         assert_eq!(stop["command"], copilot_stop.as_str());
         assert_eq!(stop["timeoutSec"], 10);
+        // Ruled 2026-09-21: the prompt hook is written for Copilot too,
+        // in the same flat shape, with its own narrower timeout - inert on
+        // Copilot (its output is dropped) but present on disk regardless.
+        let prompt = &root["hooks"]["UserPromptSubmit"][0];
+        assert_eq!(prompt["type"], "command");
+        assert_eq!(prompt["command"], copilot_prompt.as_str());
+        assert_eq!(prompt["timeoutSec"], 5);
+        assert!(prompt.get("matcher").is_none());
         assert!(owned_hook_present(
             &root,
             "SessionStart",
             SESSION_START_COMMAND_COPILOT
         ));
         assert!(owned_hook_present(&root, "Stop", STOP_COMMAND));
+        assert!(owned_hook_present(
+            &root,
+            "UserPromptSubmit",
+            PROMPT_COMMAND
+        ));
         assert!(
             !add_owned_hooks(&mut root, HarnessKind::Copilot),
             "second add must not change the root"
@@ -3332,17 +3552,19 @@ mod tests {
     }
 
     /// An owned file carrying only hand-written variants of ours is counted
-    /// present on both events: nothing is appended beside them and not a
-    /// character of them is rewritten.
+    /// present on all three events: nothing is appended beside them and not
+    /// a character of them is rewritten.
     #[test]
     fn an_owned_file_of_hand_written_variants_alone_is_left_untouched() {
         let hand_written = "crystalline prompt system --workspace /repo";
         let hand_written_stop = "crystalline hook stop --quiet";
+        let hand_written_prompt = "crystalline hook prompt --workspace /repo";
         let mut root = root(json!({
             "version": 1,
             "hooks": {
                 "SessionStart": [ { "type": "command", "command": hand_written } ],
-                "Stop": [ { "type": "command", "command": hand_written_stop } ]
+                "Stop": [ { "type": "command", "command": hand_written_stop } ],
+                "UserPromptSubmit": [ { "type": "command", "command": hand_written_prompt } ]
             }
         }));
         assert!(
@@ -3353,6 +3575,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], hand_written);
         assert_eq!(root["hooks"]["Stop"][0]["command"], hand_written_stop);
+        assert_eq!(
+            root["hooks"]["UserPromptSubmit"][0]["command"],
+            hand_written_prompt
+        );
     }
 
     /// The merged path holds the same rewrite rule and deliberately not the

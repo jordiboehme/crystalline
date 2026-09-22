@@ -120,13 +120,14 @@ enum Command {
         command: ConnectCommand,
     },
     /// Wire a coding harness up to Crystalline in one idempotent step:
-    /// register the MCP server, install the SessionStart routing hook and the
-    /// Stop capture-nudge hook and copy the four topical skills into place.
-    /// Safe to re-run; a second run that finds everything already in place
-    /// writes nothing and reports it as already present. Static like `verify`
-    /// and `prompt`: no database, service or network connection. A missing or
-    /// failing harness CLI is never fatal - the MCP command to run by hand is
-    /// printed and the hooks and skills still install.
+    /// register the MCP server, install the SessionStart routing hook, the
+    /// Stop capture-nudge hook and the UserPromptSubmit recall hook, and
+    /// copy the four topical skills into place. Safe to re-run; a second run
+    /// that finds everything already in place writes nothing and reports it
+    /// as already present. Static like `verify` and `prompt`: no database,
+    /// service or network connection. A missing or failing harness CLI is
+    /// never fatal - the MCP command to run by hand is printed and the hooks
+    /// and skills still install.
     Install {
         /// Which harness to wire up.
         #[arg(value_enum)]
@@ -140,7 +141,7 @@ enum Command {
         /// Skip registering the MCP server.
         #[arg(long)]
         skip_mcp: bool,
-        /// Skip installing the SessionStart and Stop hooks.
+        /// Skip installing the SessionStart, Stop and UserPromptSubmit hooks.
         #[arg(long)]
         skip_hooks: bool,
         /// Skip copying the topical skills.

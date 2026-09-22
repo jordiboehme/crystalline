@@ -1082,6 +1082,7 @@ fn harnesses_section_reports_both_hooks_present_after_install() {
     assert_eq!(claude["settings_parse_error"], serde_json::Value::Null);
     assert_eq!(claude["session_start_hook"], serde_json::json!(true));
     assert_eq!(claude["stop_hook"], serde_json::json!(true));
+    assert_eq!(claude["prompt_hook"], serde_json::json!(true));
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1169,6 +1170,10 @@ fn harnesses_section_reports_copilot_hooks_present_after_install() {
     assert_eq!(copilot["settings_parse_error"], serde_json::Value::Null);
     assert_eq!(copilot["session_start_hook"], serde_json::json!(true));
     assert_eq!(copilot["stop_hook"], serde_json::json!(true));
+    // Ruled 2026-09-21: Copilot's prompt hook is written too, in the same
+    // shape as Claude Code and Codex - present, not the `null` a harness
+    // with no output channel at all would report.
+    assert_eq!(copilot["prompt_hook"], serde_json::json!(true));
 
     let _ = std::fs::remove_dir_all(&home);
 }

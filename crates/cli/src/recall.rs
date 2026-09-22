@@ -1,6 +1,8 @@
 //! `crystalline hook prompt`: the per-prompt recall of engrams that may apply.
 //!
-//! A harness (Claude Code, Codex) wires this to its `UserPromptSubmit`
+//! A harness (Claude Code, Codex and Copilot, though Copilot's copy is
+//! written and left inert - a config-file prompt hook's output is dropped
+//! there) wires this to its `UserPromptSubmit`
 //! lifecycle event, feeding it a small JSON payload over stdin. On a prompt
 //! that carries a subject, and only when a daemon is already running, it asks
 //! that daemon for exactly the hybrid search an agent would have run and
