@@ -1,0 +1,666 @@
+//! ModernBERT, vendored from candle-transformers.
+//!
+//! This file is `candle-transformers` 0.11.0's `src/models/modernbert.rs`
+//! (504 lines), copied whole on 2026-09-21 and keeping its own upstream
+//! licence: `MIT OR Apache-2.0`, copyright the candle authors. The rest of this
+//! crate is AGPL-3.0-or-later; both upstream licences permit the inclusion and
+//! this file stays under its own terms.
+//!
+//! It is vendored because candle 0.11.0's own module cannot run
+//! `ibm-granite/granite-embedding-97m-multilingual-r2`, the default local
+//! embedding model: it hardcodes the gated MLP's activation as GeGLU (granite's
+//! is SwiGLU) and a `model.` tensor prefix (granite ships a bare
+//! `ModernBertModel` export). The first defect does not error, it returns
+//! embeddings at cosine 0.78 to 0.88 against the truth, which is why this copy
+//! exists at all and why the parity test guards it.
+//!
+//! Exactly three changes against the upstream file, and nothing else:
+//!
+//! 1. The activation is read from the config (`Config::hidden_activation`, a
+//!    `candle_nn::Activation` with a serde default of `gelu`, stored on
+//!    `ModernBertMLP` and applied to the gate half), so a SwiGLU checkpoint runs.
+//! 2. `ModernBert::load` roots itself at the backbone, descending into `model`
+//!    only when the checkpoint carries that prefix, so a bare `ModernBertModel`
+//!    export loads and a masked-LM or classification export still does.
+//! 3. `use candle::{...}` became `use candle_core::{...}`: candle-transformers
+//!    depends on candle-core under the alias `candle` and this crate does not.
+//!
+//! Both code changes are upstream pull requests, and this file goes the day a
+//! candle release carries them: huggingface/candle#3991 for the activation and
+//! huggingface/candle#3992 for the prefix (local branches
+//! `modernbert-hidden-activation` and `modernbert-bare-checkpoint` until they
+//! merge). Three mechanical differences come on top of the two patches: the
+//! file was run through this workspace's rustfmt (style edition 2024), which
+//! reorders the two `use` lists and nothing else; `ClassifierPooling` carries an
+//! `#[allow(clippy::upper_case_acronyms)]` because this workspace's clippy pin
+//! rejects upstream's variant names under `-D warnings`; and the granite config
+//! test at the bottom is ours rather than the pull request's.
+//!
+//! The trap, from the spike that produced this file: never add
+//! `#[serde(alias = "norm_eps")]` to `Config::layer_norm_eps`. Granite's
+//! `config.json` carries the epsilon under both keys and serde then rejects the
+//! whole document as a duplicate field. `a_granite_config_with_both_eps_keys_parses`
+//! below is what keeps the alias out.
+//!
+//! Removal condition: the day a candle release carries both pull requests,
+//! delete this file and its `mod` line, point `local.rs` at
+//! `candle_transformers::models::modernbert::{Config, ModernBert}` and run the
+//! parity test in `crates/index/tests/embed_model.rs` by hand to confirm the
+//! vectors did not move.
+//!
+//! Upstream documentation, unchanged:
+//!
+//! ModernBERT is a modernized bidirectional encoder-only Transformer model.
+//! - [Arxiv](https://arxiv.org/abs/2412.13663) "Smarter, Better, Faster, Longer: A Modern Bidirectional Encoder for Fast, Memory Efficient, and Long Context Finetuning and Inference"
+//! - Upstream [GitHub repo](https://github.com/AnswerDotAI/ModernBERT).
+//! - See modernbert in [candle-examples](https://github.com/huggingface/candle/tree/main/candle-examples/) for runnable code
+
+// The masked-LM and sequence-classification heads are unused here: the provider
+// runs the backbone only. They are kept so the diff against upstream is exactly
+// the two pull requests above and the file can be deleted in one move.
+#![allow(dead_code)]
+
+use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
+use candle_nn::{
+    Activation, Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm_no_bias,
+    linear, linear_no_bias, ops::softmax,
+};
+use serde::Deserialize;
+
+use core::f32;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Config {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub intermediate_size: usize,
+    pub max_position_embeddings: usize,
+    pub layer_norm_eps: f64,
+    pub pad_token_id: u32,
+    pub global_attn_every_n_layers: usize,
+    pub global_rope_theta: f64,
+    pub local_attention: usize,
+    pub local_rope_theta: f64,
+    /// Activation used in the gated MLP, defaults to `gelu` as in the reference implementation.
+    #[serde(default)]
+    pub hidden_activation: Activation,
+    #[serde(default)]
+    #[serde(flatten)]
+    pub classifier_config: Option<ClassifierConfig>,
+}
+
+// Ours, not upstream's: this workspace pins clippy at 1.98.0 under -D warnings
+// and it rejects these variant names, which are upstream's and stay as they are.
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassifierPooling {
+    #[default]
+    CLS,
+    MEAN,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ClassifierConfig {
+    pub id2label: HashMap<String, String>,
+    pub label2id: HashMap<String, String>,
+    pub classifier_pooling: ClassifierPooling,
+}
+
+#[derive(Debug, Clone)]
+struct RotaryEmbedding {
+    sin: Tensor,
+    cos: Tensor,
+}
+
+impl RotaryEmbedding {
+    fn new(dtype: DType, config: &Config, rope_theta: f64, dev: &Device) -> Result<Self> {
+        let dim = config.hidden_size / config.num_attention_heads;
+        let inv_freq: Vec<_> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(dtype)?;
+        let max_seq_len = config.max_position_embeddings;
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(dtype)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        Ok(Self {
+            sin: freqs.sin()?,
+            cos: freqs.cos()?,
+        })
+    }
+
+    fn apply_rotary_emb_qkv(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &self.cos, &self.sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &self.cos, &self.sin)?;
+        Ok((q_embed, k_embed))
+    }
+}
+
+#[derive(Clone)]
+struct ModernBertAttention {
+    qkv: Linear,
+    proj: Linear,
+    num_attention_heads: usize,
+    attention_head_size: usize,
+    rotary_emb: Arc<RotaryEmbedding>,
+}
+
+impl ModernBertAttention {
+    fn load(vb: VarBuilder, config: &Config, rotary_emb: Arc<RotaryEmbedding>) -> Result<Self> {
+        let num_attention_heads = config.num_attention_heads;
+        let attention_head_size = config.hidden_size / config.num_attention_heads;
+
+        let qkv = linear_no_bias(config.hidden_size, config.hidden_size * 3, vb.pp("Wqkv"))?;
+        let proj = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("Wo"))?;
+
+        Ok(Self {
+            qkv,
+            proj,
+            num_attention_heads,
+            attention_head_size,
+            rotary_emb,
+        })
+    }
+
+    fn forward(&self, hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+        let xs = hidden_states.clone();
+        let (b, seq_len, d) = xs.dims3()?;
+        let qkv = xs
+            .apply(&self.qkv)?
+            .reshape((
+                b,
+                seq_len,
+                3,
+                self.num_attention_heads,
+                self.attention_head_size,
+            ))?
+            .permute((2, 0, 3, 1, 4))?;
+
+        let q = qkv.get(0)?;
+        let k = qkv.get(1)?;
+        let v = qkv.get(2)?;
+
+        let (q, k) = self.rotary_emb.apply_rotary_emb_qkv(&q, &k)?;
+
+        let scale = (self.attention_head_size as f64).powf(-0.5);
+        let q = (q * scale)?;
+
+        let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+
+        let att = att.broadcast_add(attention_mask)?;
+        let att = softmax(&att, D::Minus1)?;
+
+        let xs = att.matmul(&v)?;
+
+        let xs = xs.transpose(1, 2)?.reshape((b, seq_len, d))?;
+        let xs = xs.apply(&self.proj)?;
+        let xs = xs.reshape((b, seq_len, d))?;
+
+        Ok(xs)
+    }
+}
+
+#[derive(Clone)]
+pub struct ModernBertMLP {
+    wi: Linear,
+    wo: Linear,
+    act: Activation,
+}
+
+impl ModernBertMLP {
+    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        let wi = linear_no_bias(
+            config.hidden_size,
+            config.intermediate_size * 2,
+            vb.pp("Wi"),
+        )?;
+        let wo = linear_no_bias(config.intermediate_size, config.hidden_size, vb.pp("Wo"))?;
+        Ok(Self {
+            wi,
+            wo,
+            act: config.hidden_activation,
+        })
+    }
+}
+
+impl Module for ModernBertMLP {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = xs.apply(&self.wi)?;
+        let xs = xs.chunk(2, D::Minus1)?;
+        let xs = (&xs[0].apply(&self.act)? * &xs[1])?.apply(&self.wo)?; // GeGLU, SwiGLU when silu
+        Ok(xs)
+    }
+}
+
+#[derive(Clone)]
+pub struct ModernBertLayer {
+    attn: ModernBertAttention,
+    mlp: ModernBertMLP,
+    attn_norm: Option<LayerNorm>,
+    mlp_norm: LayerNorm,
+    uses_local_attention: bool,
+}
+
+impl ModernBertLayer {
+    fn load(
+        vb: VarBuilder,
+        config: &Config,
+        rotary_emb: Arc<RotaryEmbedding>,
+        uses_local_attention: bool,
+    ) -> Result<Self> {
+        let attn = ModernBertAttention::load(vb.pp("attn"), config, rotary_emb)?;
+        let mlp = ModernBertMLP::load(vb.pp("mlp"), config)?;
+        let attn_norm = layer_norm_no_bias(
+            config.hidden_size,
+            config.layer_norm_eps,
+            vb.pp("attn_norm"),
+        )
+        .ok();
+        let mlp_norm =
+            layer_norm_no_bias(config.hidden_size, config.layer_norm_eps, vb.pp("mlp_norm"))?;
+        Ok(Self {
+            attn,
+            mlp,
+            attn_norm,
+            mlp_norm,
+            uses_local_attention,
+        })
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor,
+        global_attention_mask: &Tensor,
+        local_attention_mask: &Tensor,
+    ) -> Result<Tensor> {
+        let residual = xs.clone();
+        let mut xs = xs.clone();
+        if let Some(norm) = &self.attn_norm {
+            xs = xs.apply(norm)?;
+        }
+
+        let attention_mask = if self.uses_local_attention {
+            &global_attention_mask.broadcast_add(local_attention_mask)?
+        } else {
+            global_attention_mask
+        };
+        let xs = self.attn.forward(&xs, attention_mask)?;
+        let xs = (xs + residual)?;
+        let mlp_out = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
+        let xs = (xs + mlp_out)?;
+        Ok(xs)
+    }
+}
+
+#[derive(Clone)]
+pub struct ModernBertHead {
+    dense: Linear,
+    norm: LayerNorm,
+}
+
+impl ModernBertHead {
+    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        let dense = linear_no_bias(config.hidden_size, config.hidden_size, vb.pp("dense"))?;
+        let norm = layer_norm_no_bias(config.hidden_size, config.layer_norm_eps, vb.pp("norm"))?;
+        Ok(Self { dense, norm })
+    }
+}
+
+impl Module for ModernBertHead {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = xs.apply(&self.dense)?.gelu_erf()?.apply(&self.norm)?;
+        Ok(xs)
+    }
+}
+
+#[derive(Clone)]
+pub struct ModernBertDecoder {
+    decoder: Linear,
+}
+
+impl ModernBertDecoder {
+    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        // The decoder weights are tied with the embeddings layer weights
+        let decoder_weights = vb.get(
+            (config.vocab_size, config.hidden_size),
+            "model.embeddings.tok_embeddings.weight",
+        )?;
+        let decoder_bias = vb.get(config.vocab_size, "decoder.bias")?;
+        let decoder = Linear::new(decoder_weights, Some(decoder_bias));
+        Ok(Self { decoder })
+    }
+}
+
+impl Module for ModernBertDecoder {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = xs.apply(&self.decoder)?;
+        Ok(xs)
+    }
+}
+
+// Global attention mask calculated from padded token inputs
+fn prepare_4d_attention_mask(
+    mask: &Tensor,
+    dtype: DType,
+    tgt_len: Option<usize>,
+) -> Result<Tensor> {
+    let bsz = mask.dim(0)?;
+    let src_len = mask.dim(1)?;
+    let tgt_len = tgt_len.unwrap_or(src_len);
+
+    let expanded_mask = mask
+        .unsqueeze(1)?
+        .unsqueeze(2)?
+        .expand((bsz, 1, tgt_len, src_len))?
+        .to_dtype(dtype)?;
+
+    let inverted_mask = (1.0 - expanded_mask)?;
+
+    (inverted_mask * f32::MIN as f64)?.to_dtype(dtype)
+}
+
+// Attention mask caused by the sliding window
+fn get_local_attention_mask(
+    seq_len: usize,
+    max_distance: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mask: Vec<_> = (0..seq_len)
+        .flat_map(|i| {
+            (0..seq_len).map(move |j| {
+                if (j as i32 - i as i32).abs() > max_distance as i32 {
+                    f32::NEG_INFINITY
+                } else {
+                    0.
+                }
+            })
+        })
+        .collect();
+    Tensor::from_slice(&mask, (seq_len, seq_len), device)
+}
+
+// ModernBERT backbone
+#[derive(Clone)]
+pub struct ModernBert {
+    word_embeddings: Embedding,
+    norm: LayerNorm,
+    layers: Vec<ModernBertLayer>,
+    final_norm: LayerNorm,
+    local_attention_size: usize,
+}
+
+impl ModernBert {
+    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        // A ModernBertForMaskedLM or ModernBertForSequenceClassification export keeps the
+        // backbone under a `model.` prefix, a bare ModernBertModel export does not.
+        let vb = if vb.contains_tensor("model.embeddings.tok_embeddings.weight") {
+            vb.pp("model")
+        } else {
+            vb
+        };
+        let word_embeddings = embedding(
+            config.vocab_size,
+            config.hidden_size,
+            vb.pp("embeddings.tok_embeddings"),
+        )?;
+        let norm = layer_norm_no_bias(
+            config.hidden_size,
+            config.layer_norm_eps,
+            vb.pp("embeddings.norm"),
+        )?;
+        let global_rotary_emb = Arc::new(RotaryEmbedding::new(
+            vb.dtype(),
+            config,
+            config.global_rope_theta,
+            vb.device(),
+        )?);
+        let local_rotary_emb = Arc::new(RotaryEmbedding::new(
+            vb.dtype(),
+            config,
+            config.local_rope_theta,
+            vb.device(),
+        )?);
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer_id in 0..config.num_hidden_layers {
+            let layer_uses_local_attention = layer_id % config.global_attn_every_n_layers != 0;
+            layers.push(ModernBertLayer::load(
+                vb.pp(format!("layers.{layer_id}")),
+                config,
+                if layer_uses_local_attention {
+                    local_rotary_emb.clone()
+                } else {
+                    global_rotary_emb.clone()
+                },
+                layer_uses_local_attention,
+            )?);
+        }
+
+        let final_norm = layer_norm_no_bias(
+            config.hidden_size,
+            config.layer_norm_eps,
+            vb.pp("final_norm"),
+        )?;
+
+        Ok(Self {
+            word_embeddings,
+            norm,
+            layers,
+            final_norm,
+            local_attention_size: config.local_attention,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let seq_len = xs.shape().dims()[1];
+        let global_attention_mask =
+            prepare_4d_attention_mask(mask, DType::F32, None)?.to_device(xs.device())?;
+        let local_attention_mask =
+            get_local_attention_mask(seq_len, self.local_attention_size / 2, xs.device())?;
+        let mut xs = xs.apply(&self.word_embeddings)?.apply(&self.norm)?;
+        for layer in self.layers.iter() {
+            xs = layer.forward(&xs, &global_attention_mask, &local_attention_mask)?;
+        }
+        let xs = xs.apply(&self.final_norm)?;
+        Ok(xs)
+    }
+}
+
+// ModernBERT for the fill-mask task
+#[derive(Clone)]
+pub struct ModernBertForMaskedLM {
+    model: ModernBert,
+    decoder: ModernBertDecoder,
+    head: ModernBertHead,
+}
+
+impl ModernBertForMaskedLM {
+    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        let model = ModernBert::load(vb.clone(), config)?;
+        let decoder = ModernBertDecoder::load(vb.clone(), config)?;
+        let head = ModernBertHead::load(vb.pp("head"), config)?;
+        Ok(Self {
+            model,
+            decoder,
+            head,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let xs = self
+            .model
+            .forward(xs, mask)?
+            .apply(&self.head)?
+            .apply(&self.decoder)?;
+        Ok(xs)
+    }
+}
+
+#[derive(Clone)]
+pub struct ModernBertClassifier {
+    classifier: Linear,
+}
+
+impl ModernBertClassifier {
+    fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        // The decoder weights are tied with the embeddings layer weights
+        let classifier = linear(
+            config.hidden_size,
+            config
+                .classifier_config
+                .as_ref()
+                .map(|cc| cc.id2label.len())
+                .unwrap_or_default(),
+            vb.pp("classifier"),
+        )?;
+        Ok(Self { classifier })
+    }
+}
+
+impl Module for ModernBertClassifier {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = xs.apply(&self.classifier)?;
+        softmax(&xs, D::Minus1)
+    }
+}
+
+#[derive(Clone)]
+pub struct ModernBertForSequenceClassification {
+    model: ModernBert,
+    head: ModernBertHead,
+    classifier: ModernBertClassifier,
+    classifier_pooling: ClassifierPooling,
+}
+
+impl ModernBertForSequenceClassification {
+    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
+        let model = ModernBert::load(vb.clone(), config)?;
+        let classifier = ModernBertClassifier::load(vb.clone(), config)?;
+        let head = ModernBertHead::load(vb.pp("head"), config)?;
+        Ok(Self {
+            model,
+            head,
+            classifier,
+            classifier_pooling: config
+                .classifier_config
+                .as_ref()
+                .map(|cc| cc.classifier_pooling)
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let output = self.model.forward(xs, mask)?;
+        let last_hidden_state = match self.classifier_pooling {
+            ClassifierPooling::CLS => output.i((.., 0, ..))?.contiguous()?,
+            ClassifierPooling::MEAN => {
+                let unsqueezed_mask = &mask.unsqueeze(D::Minus1)?.to_dtype(DType::F32)?;
+                let sum_output = output.broadcast_mul(unsqueezed_mask)?.sum(1)?;
+                sum_output.broadcast_div(&mask.sum_keepdim(1)?.to_dtype(DType::F32)?)?
+            }
+        };
+        let xs = self
+            .head
+            .forward(&last_hidden_state)?
+            .apply(&self.classifier)?;
+        Ok(xs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    fn config_json(hidden_activation: Option<&str>) -> String {
+        let hidden_activation = match hidden_activation {
+            Some(activation) => format!("\"hidden_activation\": \"{activation}\","),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+            "architectures": [
+              "ModernBertForMaskedLM"
+            ],
+            "attention_bias": false,
+            "global_attn_every_n_layers": 3,
+            "global_rope_theta": 160000.0,
+            {hidden_activation}
+            "hidden_size": 768,
+            "intermediate_size": 1152,
+            "layer_norm_eps": 1e-05,
+            "local_attention": 128,
+            "local_rope_theta": 10000.0,
+            "max_position_embeddings": 8192,
+            "model_type": "modernbert",
+            "norm_bias": false,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 22,
+            "pad_token_id": 50283,
+            "vocab_size": 50368
+          }}"#
+        )
+    }
+
+    #[test]
+    fn test_config_json_load() {
+        let config: Config = serde_json::from_str(&config_json(Some("gelu"))).unwrap();
+        assert_eq!(Activation::Gelu, config.hidden_activation);
+        assert_eq!(1e-5, config.layer_norm_eps);
+    }
+
+    #[test]
+    fn test_config_json_load_silu_activation() {
+        let config: Config = serde_json::from_str(&config_json(Some("silu"))).unwrap();
+        assert_eq!(Activation::Silu, config.hidden_activation);
+    }
+
+    #[test]
+    fn test_config_json_load_default_activation() {
+        let config: Config = serde_json::from_str(&config_json(None)).unwrap();
+        assert_eq!(Activation::Gelu, config.hidden_activation);
+    }
+
+    /// Ours, not the pull request's: granite's own config, which carries the
+    /// epsilon under BOTH `layer_norm_eps` and `norm_eps`. It parses because
+    /// `layer_norm_eps` has no `#[serde(alias = "norm_eps")]`; adding one makes
+    /// serde reject the whole document as a duplicate field. This test is what
+    /// keeps the alias out.
+    #[test]
+    fn a_granite_config_with_both_eps_keys_parses() {
+        let config: Config = serde_json::from_str(
+            r#"{
+            "architectures": ["ModernBertModel"],
+            "classifier_pooling": "cls",
+            "global_attn_every_n_layers": 3,
+            "global_rope_theta": 150000.0,
+            "hidden_activation": "silu",
+            "hidden_size": 384,
+            "intermediate_size": 1536,
+            "layer_norm_eps": 1e-05,
+            "local_attention": 128,
+            "local_rope_theta": 160000.0,
+            "max_position_embeddings": 32768,
+            "model_type": "modernbert",
+            "norm_eps": 1e-05,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "pad_token_id": 179935,
+            "vocab_size": 180000
+          }"#,
+        )
+        .unwrap();
+        assert_eq!(Activation::Silu, config.hidden_activation);
+        assert_eq!(1e-5, config.layer_norm_eps);
+        assert_eq!(179935, config.pad_token_id);
+        assert_eq!(180000, config.vocab_size);
+    }
+}

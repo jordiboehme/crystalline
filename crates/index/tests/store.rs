@@ -2010,6 +2010,17 @@ parity!(
     search_applies_filters
 );
 
+/// The two backends' semantic-search floors are re-derived together
+/// (`research/2026-09-22-granite-thresholds.md`) and must never drift apart.
+#[cfg(feature = "postgres")]
+#[test]
+fn both_backends_default_the_same_minimum_similarity() {
+    assert_eq!(
+        crystalline_index::turso::DEFAULT_MIN_SIMILARITY,
+        crystalline_index::postgres::DEFAULT_MIN_SIMILARITY
+    );
+}
+
 // --- tag alias map -----------------------------------------------------------
 
 /// A minimal engram carrying an explicit tag set on its frontmatter.
@@ -4540,6 +4551,170 @@ async fn stale_embeddings_names_stored_model(store: &dyn Store) {
 parity!(
     stale_embeddings_reports_stored_model_on_swap,
     stale_embeddings_names_stored_model
+);
+
+/// Clearing the vectors of every model but the active one. Seeded directly:
+/// an ordinary pass overwrites an old vector in place, so this state is
+/// reached by a scoped pass or a half-finished swap rather than by a full one.
+async fn prune_embeddings_keeps_only_the_active_model(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta"),
+    );
+    write(
+        root,
+        "c.md",
+        &engram("C", "c", "engram", "", "gamma gamma gamma"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // Every chunk under the old model.
+    let jobs = store
+        .chunks_needing_embedding("bge-small-en-v1.5", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert!(jobs.len() >= 3, "each engram chunked");
+    let total = jobs.len();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 384),
+            dims: 384,
+        })
+        .collect();
+    store
+        .store_embeddings(&rows, "bge-small-en-v1.5")
+        .await
+        .unwrap();
+    // One of them re-embedded under the new model, so the index holds both.
+    store
+        .store_embeddings(&rows[..1], "granite-embedding-97m-multilingual-r2")
+        .await
+        .unwrap();
+    let before = store.embedding_coverage().await.unwrap();
+    assert_eq!(before.embedded_for("bge-small-en-v1.5"), total - 1);
+    assert_eq!(
+        before.embedded_for("granite-embedding-97m-multilingual-r2"),
+        1
+    );
+
+    let pruned = store
+        .prune_embeddings_except("granite-embedding-97m-multilingual-r2")
+        .await
+        .unwrap();
+    assert_eq!(pruned, total - 1, "every chunk of another model is cleared");
+
+    let after = store.embedding_coverage().await.unwrap();
+    assert_eq!(after.embedded_for("bge-small-en-v1.5"), 0);
+    assert_eq!(
+        after.embedded_for("granite-embedding-97m-multilingual-r2"),
+        1
+    );
+    assert_eq!(
+        after.total_chunks, before.total_chunks,
+        "no chunk row was deleted"
+    );
+    assert_eq!(
+        after.models.len(),
+        1,
+        "the old model is gone from the breakdown: {:?}",
+        after.models
+    );
+    // The cleared chunks are back in the backlog rather than lost.
+    let pending = store
+        .chunks_needing_embedding(
+            "granite-embedding-97m-multilingual-r2",
+            None,
+            EMBED_PAGE_SIZE,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), total - 1);
+
+    // Idempotent, and a model with nothing else beside it prunes nothing.
+    assert_eq!(
+        store
+            .prune_embeddings_except("granite-embedding-97m-multilingual-r2")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// The lead vectors a receipt's neighbours and `V301` read are per model, so
+/// an index holding only the old model's vectors has none for the new one.
+async fn lead_vectors_are_empty_for_a_model_with_no_vectors(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let jobs = store
+        .chunks_needing_embedding("bge-small-en-v1.5", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 384),
+            dims: 384,
+        })
+        .collect();
+    store
+        .store_embeddings(&rows, "bge-small-en-v1.5")
+        .await
+        .unwrap();
+
+    // `domain_id` rather than `upsert_domain`: a read that is answering a
+    // question must not register a domain on the way (store.rs:1681).
+    let domain = store.domain_id("d").await.unwrap().expect("synced above");
+    // `lead_vectors` takes the actor dimension as its third argument since the
+    // identity wave (store.rs:2079-2084); `None` is the base rows alone, which
+    // is what this pins.
+    assert_eq!(
+        store
+            .lead_vectors(domain, "bge-small-en-v1.5", None)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the old model has a lead vector per engram"
+    );
+    assert!(
+        store
+            .lead_vectors(domain, "granite-embedding-97m-multilingual-r2", None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the model the install just moved to has none until it re-embeds"
+    );
+}
+parity!(
+    prune_embeddings_clears_every_other_model,
+    prune_embeddings_keeps_only_the_active_model
+);
+parity!(
+    lead_vectors_follow_the_active_model,
+    lead_vectors_are_empty_for_a_model_with_no_vectors
 );
 
 /// Models routinely double-encode nested tool arguments, sending the

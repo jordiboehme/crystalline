@@ -454,6 +454,16 @@ pub async fn run_serve(
             e.bootstrap_env_origins().await;
             if let Some(provider) = crate::engine::build_provider(&cfg).await {
                 e.set_provider(provider);
+                // Only now, with the active model loaded and working, are the
+                // other weights in the cache dead: a failed download must never
+                // be the reason the only working model is deleted. The engine
+                // decides whether this instance prunes at all (it does not when
+                // it is read-only, when the provider is a remote one, or when
+                // the active model is not one this build knows).
+                match crystalline_core::config::models_dir() {
+                    Ok(dir) => e.prune_model_cache(dir).await,
+                    Err(err) => tracing::warn!("could not locate the model cache: {err}"),
+                }
                 // Schedule on the worker, like every other caller: an inline
                 // pass here runs beside the worker's, and two passes walk one
                 // backlog with separate cursors, each re-embedding what the

@@ -592,8 +592,13 @@ async fn embed_onto_response(engine: &Engine, embed: bool, data: &mut Value) {
         return;
     };
     match outcome {
-        Ok(EmbedOutcome::Embedded(n)) => {
-            map.insert("embedded_chunks".to_string(), json!(n));
+        Ok(EmbedOutcome::Embedded { chunks, pruned }) => {
+            map.insert("embedded_chunks".to_string(), json!(chunks));
+            // Only when there was something to clear, so a report from an
+            // install that never changed model stays byte-identical.
+            if pruned > 0 {
+                map.insert("pruned_stale_embeddings".to_string(), json!(pruned));
+            }
         }
         Ok(EmbedOutcome::AlreadyRunning) => {
             map.insert("embed_scheduled".to_string(), json!(true));

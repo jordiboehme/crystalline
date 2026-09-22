@@ -8,7 +8,10 @@
 //! dead pid or a socket file left behind by a killed daemon; (e) config
 //! sanity, a registered domain whose path is missing or lacks a
 //! `MANIFEST.md`; (f) an embedding staleness summary, the stored model
-//! against the configured one; (g) when `github.enabled`, whether this
+//! against the configured one, plus the cached model directories with sizes,
+//! marking any the config does not use as stale (visible between a config
+//! change and the next daemon start, which prunes them on a writable
+//! instance running a local model); (g) when `github.enabled`, whether this
 //! machine is connected to GitHub and, per team domain, whether its local
 //! origin state is present and its base snapshot still matches what was
 //! recorded (`verify_base`); (h) which `CRYSTALLINE_*` environment variables
@@ -53,7 +56,8 @@ use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
 use crystalline_index::{
-    FileStamp, Store, TagCluster, configured_model_id, tag_clusters_with_aliases,
+    FileStamp, Store, TagCluster, cached_model_dirs, configured_model_id, local_model,
+    tag_clusters_with_aliases,
 };
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
@@ -1845,13 +1849,46 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
         .filter(|m| m.model != configured)
         .map(|m| m.count)
         .sum();
+    // The repo behind the id, when the table recognizes it, and what the
+    // cache actually holds. `local_model` matches by id or by repo whatever
+    // the provider, so a remote config that happens to name a known repo
+    // (the local text-embeddings-inference case Task 2 flagged) still
+    // resolves here; an id the table has never heard of leaves both absent
+    // rather than wrong.
+    let entry = local_model(&configured);
+    let cached = config::models_dir()
+        .map(|dir| cached_model_dirs(&dir))
+        .unwrap_or_default();
+    let configured_repo = entry.map(|m| m.repo);
+    let configured_model_bytes =
+        configured_repo.and_then(|repo| cached.iter().find(|(r, _)| r == repo).map(|(_, b)| *b));
+    let cached_models: Vec<serde_json::Value> = cached
+        .iter()
+        .map(|(repo, bytes)| {
+            serde_json::json!({
+                "repo": repo,
+                "bytes": bytes,
+                "stale": Some(repo.as_str()) != configured_repo,
+            })
+        })
+        .collect();
     Ok(serde_json::json!({
         "configured_model": configured,
+        "configured_repo": configured_repo,
+        "configured_model_bytes": configured_model_bytes,
         "total_chunks": coverage.total_chunks,
         "embedded_with_configured_model": embedded_with_configured,
         "stale_chunks": stale_chunks,
         "models": coverage.models,
+        "cached_models": cached_models,
     }))
+}
+
+/// Whole megabytes, decimal (the unit every other surface names a model's
+/// size in: the release notes, deployment.md's image table), for a size
+/// beside a model id.
+fn mb(bytes: u64) -> String {
+    format!("{} MB", bytes / 1_000_000)
 }
 
 /// The `SessionStart`/`Stop`/`UserPromptSubmit` hook lines and the trailing
@@ -2266,14 +2303,43 @@ pub fn render_human(report: &DoctorReport) -> String {
     }
 
     if let Some(e) = &report.embeddings {
+        let repo = e["configured_repo"].as_str();
+        let size = e["configured_model_bytes"].as_u64();
+        let named = match (repo, size) {
+            (Some(r), Some(b)) => format!(" ({r}, {} on disk)", mb(b)),
+            (Some(r), None) => format!(" ({r}, not downloaded)"),
+            _ => String::new(),
+        };
         let _ = writeln!(
             out,
-            "embeddings: {}/{} chunks embedded with '{}' ({} stale chunk(s) from a different model)",
+            "embeddings: {}/{} chunks embedded with '{}'{named} ({} stale chunk(s) from a different model)",
             e["embedded_with_configured_model"],
             e["total_chunks"],
             e["configured_model"].as_str().unwrap_or_default(),
             e["stale_chunks"]
         );
+        if let Some(cached) = e["cached_models"].as_array().filter(|c| !c.is_empty()) {
+            let listed: Vec<String> = cached
+                .iter()
+                .map(|m| {
+                    let mark = if m["stale"] == serde_json::Value::Bool(true) {
+                        " [stale]"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{} {}{mark}",
+                        m["repo"].as_str().unwrap_or_default(),
+                        mb(m["bytes"].as_u64().unwrap_or(0))
+                    )
+                })
+                .collect();
+            // Weights this install no longer uses: on a writable instance
+            // running a local model, the next daemon start removes them;
+            // a read-only instance or a remote provider never prunes, so
+            // there they stay marked stale until someone clears them by hand.
+            let _ = writeln!(out, "  cached models: {}", listed.join("; "));
+        }
         // The coverage figure never goes out bare while a rebuild is
         // unfinished: the incident was a coverage number read as normal when it
         // was the middle of something. Coverage can only ever rise across a
@@ -2776,6 +2842,61 @@ mod tests {
         assert!(!clean.contains("has not finished"), "{clean}");
         assert!(!clean.contains("unfinished rebuild"), "{clean}");
         assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// Doctor names the repo and size behind the configured model id, and
+    /// lists what else is sitting in the model cache so a person can see the
+    /// old weights before the next daemon start removes them.
+    #[test]
+    fn the_embeddings_section_names_the_repo_and_the_cached_models() {
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.embeddings = Some(serde_json::json!({
+            "embedded_with_configured_model": 23598,
+            "total_chunks": 23598,
+            "configured_model": "granite-embedding-97m-multilingual-r2",
+            "configured_repo": "ibm-granite/granite-embedding-97m-multilingual-r2",
+            "configured_model_bytes": 220_206_187u64,
+            "stale_chunks": 0,
+            "cached_models": [
+                { "repo": "BAAI/bge-small-en-v1.5", "bytes": 133_169_152u64, "stale": true },
+                { "repo": "ibm-granite/granite-embedding-97m-multilingual-r2", "bytes": 220_206_187u64, "stale": false },
+            ],
+        }));
+
+        let out = render_human(&report);
+        assert!(
+            out.contains("ibm-granite/granite-embedding-97m-multilingual-r2"),
+            "{out}"
+        );
+        assert!(
+            out.contains("220 MB"),
+            "the configured model's size is beside its id: {out}"
+        );
+        assert!(out.contains("cached models:"), "{out}");
+        assert!(
+            out.contains("BAAI/bge-small-en-v1.5 133 MB [stale]"),
+            "a cached model the config does not use is marked: {out}"
+        );
+        assert!(
+            !out.contains("ibm-granite/granite-embedding-97m-multilingual-r2 220 MB [stale]"),
+            "the model in use is not marked stale: {out}"
+        );
+    }
+
+    /// The pre-existing shape, with none of the new keys, still renders: the
+    /// report comes from a daemon that may be older than this binary.
+    #[test]
+    fn an_embeddings_section_without_the_new_keys_still_renders() {
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.embeddings = Some(serde_json::json!({
+            "embedded_with_configured_model": 10,
+            "total_chunks": 20,
+            "configured_model": "m",
+            "stale_chunks": 0,
+        }));
+        let out = render_human(&report);
+        assert!(out.contains("10/20 chunks embedded with 'm'"), "{out}");
+        assert!(!out.contains("cached models:"), "{out}");
     }
 
     /// Over a daemon the doctor reads the index through a read verb, so

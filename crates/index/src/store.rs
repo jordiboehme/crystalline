@@ -654,7 +654,7 @@ pub struct SearchQuery {
     /// a ranked search has its own order.
     pub order: SearchOrder,
     /// Minimum cosine similarity for a semantic hit, `None` uses the store
-    /// default (`0.55`). Ignored by the text, title and permalink modes.
+    /// default (`0.78`). Ignored by the text, title and permalink modes.
     pub min_similarity: Option<f32>,
     /// The salience-prior weight for hybrid ranking; `None` uses the store
     /// default (`DEFAULT_SALIENCE_WEIGHT`). The maximum lift a fully-salient
@@ -2033,6 +2033,18 @@ pub trait Store: Send + Sync {
 
     /// Store a batch of embeddings against their chunks for the given model.
     async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()>;
+
+    /// Clear the vectors of every model other than `model`, returning how many
+    /// chunks were cleared.
+    ///
+    /// The embedding lives in columns on `chunk` (`embedding`, `dims`,
+    /// `model`), so this nulls those three and never removes a chunk row: the
+    /// text stays, and every cleared chunk is back in
+    /// [`Store::chunks_needing_embedding`] for the active model. Called once
+    /// by an embed pass that finds the active model covering every chunk, to
+    /// reclaim the space an install's previous model left behind. A user who
+    /// switches back simply re-embeds; nothing is kept for a return trip.
+    async fn prune_embeddings_except(&self, model: &str) -> Result<usize>;
 
     /// Embedding coverage across the index: total chunks, embedded chunks and a
     /// per-model breakdown. Drives `status` reporting and the interactive

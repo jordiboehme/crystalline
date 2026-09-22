@@ -1,18 +1,22 @@
 //! The embedding pipeline: the provider trait, its local and remote
 //! implementations, chunking and the batch executor that fills the index.
 //!
-//! A provider turns text into unit-normalized vectors. The default is a local
-//! bge model run on CPU with candle (behind the `local-embeddings` feature); the
-//! alternative is any OpenAI-compatible `/embeddings` endpoint. The [`Store`]
-//! itself never depends on a provider: callers embed the query and hand the
-//! vector to [`crate::SearchQuery`], and the batch executor embeds chunk text and
-//! writes it back through [`Store::store_embeddings`].
+//! A provider turns text into unit-normalized vectors. The default is one of
+//! the models in [`models`] run on CPU with candle (behind the
+//! `local-embeddings` feature); the alternative is any OpenAI-compatible
+//! `/embeddings` endpoint. The [`Store`] itself never depends on a provider:
+//! callers embed the query and hand the vector to [`crate::SearchQuery`], and
+//! the batch executor embeds chunk text and writes it back through
+//! [`Store::store_embeddings`].
 
 pub mod chunk;
+pub mod models;
 mod remote;
 
 #[cfg(feature = "local-embeddings")]
 mod local;
+#[cfg(feature = "local-embeddings")]
+mod modernbert;
 
 use std::path::PathBuf;
 
@@ -26,11 +30,10 @@ pub use chunk::{
     ChunkParams, DEFAULT_MAX_TOKENS, DEFAULT_MODEL_ID, chunk_engram, chunk_engram_with,
     estimate_tokens, fingerprint,
 };
-
-/// The bge query instruction prefix. bge embeds documents bare but expects a
-/// short instruction in front of a search query; the provider applies it in
-/// [`EmbeddingProvider::embed_queries`].
-pub const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
+pub use models::{
+    Architecture, LOCAL_MODELS, LocalModel, cached_model_dirs, hub_dir_name, local_model,
+    lookup_local_model, prune_model_cache,
+};
 
 /// How many chunks are embedded per provider call.
 pub const EMBED_BATCH_SIZE: usize = 16;
@@ -44,8 +47,8 @@ pub const EMBED_PAGE_SIZE: usize = 512;
 /// Turns text into unit-normalized embedding vectors.
 ///
 /// `embed` is for documents (chunk text, embedded bare). `embed_queries` is for
-/// search queries; its default just calls `embed`, and a model that wants a
-/// query instruction prefix (bge) overrides it.
+/// search queries; its default just calls `embed`, and a model whose table
+/// entry carries a query instruction prefix overrides it.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Embed document texts, returning one unit-normalized vector per input in
@@ -63,8 +66,9 @@ pub trait EmbeddingProvider: Send + Sync {
     /// The maximum input length in tokens, used to size chunk packing.
     fn max_input_tokens(&self) -> usize;
 
-    /// Embed search-query texts. The default falls back to [`Self::embed`]; bge
-    /// overrides it to add the query instruction prefix.
+    /// Embed search-query texts. The default falls back to [`Self::embed`]; a
+    /// provider whose model carries a query instruction prefix overrides it to
+    /// apply that prefix.
     async fn embed_queries(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed(texts).await
     }
@@ -73,9 +77,22 @@ pub trait EmbeddingProvider: Send + Sync {
 /// The model id implied by a config, defaulting to the local model when none is
 /// configured. The chunker and the provider must agree on this string so
 /// fingerprints computed at sync time match the model that later embeds them.
+///
+/// Under the `local` provider a value [`models`] recognises resolves to that
+/// entry's canonical short id, so the three legal spellings of one local model
+/// (the short id, the repository id, either of them padded) key their vectors
+/// the same way and agree with what [`EmbeddingProvider::model_id`] reports.
+/// Every other provider's id is passed through as written, trimmed of nothing,
+/// and that includes an id this table happens to know: an endpoint may serve
+/// one of these models under the repository id it names it by, and the remote
+/// provider echoes the configured string, so resolving it here would key the
+/// vectors one way in the daemon and another in the standalone fill.
 pub fn configured_model_id(cfg: Option<&EmbeddingsConfig>) -> String {
     match cfg {
-        Some(c) if !c.model.trim().is_empty() => c.model.clone(),
+        Some(c) if !c.model.trim().is_empty() => match local_model(&c.model) {
+            Some(m) if c.provider.trim() == "local" => m.id.to_string(),
+            _ => c.model.clone(),
+        },
         _ => DEFAULT_MODEL_ID.to_string(),
     }
 }
@@ -254,4 +271,73 @@ pub async fn run_embedding_pass_with_page(
         chunks: done,
         batches,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(model: &str) -> EmbeddingsConfig {
+        EmbeddingsConfig {
+            provider: "local".to_string(),
+            model: model.to_string(),
+            endpoint: None,
+            api_key_env: None,
+        }
+    }
+
+    fn remote_cfg(model: &str) -> EmbeddingsConfig {
+        EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: model.to_string(),
+            endpoint: Some("https://example.invalid/v1".to_string()),
+            api_key_env: None,
+        }
+    }
+
+    #[test]
+    fn a_configured_model_the_table_knows_resolves_to_its_canonical_id() {
+        // The three spellings of one model. Each has to key vectors the same
+        // way, because the id the config implies is what the daemon stores
+        // against every vector while the provider reports the table's id.
+        for spelling in [
+            "bge-small-en-v1.5",
+            "BAAI/bge-small-en-v1.5",
+            "  BAAI/bge-small-en-v1.5  ",
+        ] {
+            assert_eq!(
+                configured_model_id(Some(&cfg(spelling))),
+                "bge-small-en-v1.5",
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_the_table_does_not_know_is_passed_through_unchanged() {
+        // An openai-compatible endpoint names its own ids, and nothing here
+        // knows better than the config what one of those means.
+        assert_eq!(
+            configured_model_id(Some(&cfg("text-embedding-3-small"))),
+            "text-embedding-3-small"
+        );
+    }
+
+    #[test]
+    fn a_remote_model_keeps_its_raw_id_even_when_the_table_knows_it() {
+        // An endpoint may well serve one of the models the table knows, under
+        // the repo id that endpoint names it by. `RemoteProvider::model_id`
+        // echoes the configured string, so canonicalizing it here would key
+        // the vectors one way in the daemon and another in `sync --embed`.
+        assert_eq!(
+            configured_model_id(Some(&remote_cfg("BAAI/bge-small-en-v1.5"))),
+            "BAAI/bge-small-en-v1.5"
+        );
+    }
+
+    #[test]
+    fn no_model_and_a_blank_model_both_mean_the_default() {
+        assert_eq!(configured_model_id(None), DEFAULT_MODEL_ID);
+        assert_eq!(configured_model_id(Some(&cfg("   "))), DEFAULT_MODEL_ID);
+    }
 }

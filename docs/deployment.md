@@ -242,9 +242,11 @@ Two image variants ship under the same name, tag-selected:
 | Tag | Size | Embedding model | Best for |
 |---|---|---|---|
 | `latest` (or a pinned `vX.Y.Z`) | ~15 MB | Downloads in the background on first daemon start (needs egress to huggingface.co once) | The common case: a host with normal internet access, where a short model download on first start is fine |
-| `with-model` (or a pinned `vX.Y.Z-with-model`) | ~145 MB | Baked into the image, no download | Air-gapped or otherwise offline hosts, or anywhere semantic search must work from the very first `search` call with no warm-up delay |
+| `with-model` (or a pinned `vX.Y.Z-with-model`) | ~235 MB | Baked into the image, no download | Air-gapped or otherwise offline hosts, or anywhere semantic search must work from the very first `search` call with no warm-up delay |
 
 Pick `with-model` whenever the host has no outbound network access or the first-start download delay is unwanted; pick the slim `latest` otherwise, since it is the smaller image to pull and update.
+
+A Raspberry Pi 5 is a fine `arm64` host for either variant: the daemon holds about 390 MB of model weights once loaded, an 8 GB board carries the idle daemon and a bulk re-embed of a corpus in the ten-thousand-engram class with room to spare, and a 4 GB board carries the idle daemon comfortably and that same bulk embed with little else running, so the 8 GB board is the one to pick for a corpus that size; a laptop or a desktop notices none of this.
 
 ```sh
 docker pull ghcr.io/jordiboehme/crystalline:latest
@@ -280,7 +282,9 @@ sudo chown 65532:65532 ./crystalline-data
 
 The same applies to the bind-mounted knowledge folder whenever the daemon writes into it (an agent's `write_engram`, or the generated `index.md` files), which includes the case where `docker run` creates a missing bind-mount source itself: Docker creates it root-owned. A named volume put in that folder's place is no different, because the ownership Docker copies into a fresh volume is the mount point's in the image and the image ships no `/knowledge`: it comes up root-owned exactly like a bind-mount source Docker created, so give it to the daemon's uid once - `docker run --rm -v crystalline-knowledge:/knowledge alpine chown -R 65532:65532 /knowledge`, from an image that has a shell, since Crystalline's is distroless - before `domain init` writes anything into it. A knowledge folder mounted read-only, as in `compose.git-sync.yaml`, needs nothing.
 
-The `with-model` variant sets `CRYSTALLINE_MODELS_DIR` (also settable directly, on any install, to relocate the model cache anywhere else) to a path outside `/data` so the baked model is never shadowed by the `/data` volume mount. The bundled model is [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), MIT licensed.
+The `with-model` variant sets `CRYSTALLINE_MODELS_DIR` (also settable directly, on any install, to relocate the model cache anywhere else) to a path outside `/data` so the baked model is never shadowed by the `/data` volume mount. The bundled model is [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2), Apache-2.0 licensed.
+
+A daemon prunes the model directories its configured embedding model does not use right after that model loads, but only among the models Crystalline itself can download; a directory for anything else in `CRYSTALLINE_MODELS_DIR`, including one another Hugging Face tool put there, is never touched. So a shared cache is safe to point Crystalline at, with one exception: two daemons sharing one host's `CRYSTALLINE_MODELS_DIR` but configured with different `embeddings.model` values would each delete the other's weights and re-download them on every start, because both models are ones Crystalline knows; give such hosts separate `CRYSTALLINE_MODELS_DIR` values. A read-only instance never prunes, and neither does one configured for a remote embedding provider.
 
 Both variants ship a built-in Docker `HEALTHCHECK` that probes `GET /health` with no shell involved (the image is distroless), so `docker ps` reports health directly and a Compose service can gate on `condition: service_healthy`. External monitors (a Kubernetes `httpGet` probe, an uptime checker such as Gatus, a load balancer) can probe the same `/health` endpoint directly rather than going through Docker's own health state.
 

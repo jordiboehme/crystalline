@@ -752,7 +752,7 @@ jobs:
             type=raw,value=with-model
           labels: |
             org.opencontainers.image.title=Crystalline (with model)
-            org.opencontainers.image.description=Local-first knowledge management for humans and AI agents, with the BAAI/bge-small-en-v1.5 embedding model (MIT licensed) baked in so semantic search is ready immediately with no runtime download.
+            org.opencontainers.image.description=Local-first knowledge management for humans and AI agents, with the ibm-granite/granite-embedding-97m-multilingual-r2 embedding model (Apache-2.0 licensed) baked in so semantic search is ready immediately with no runtime download.
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
       # Builds the variant for one platform and loads it into the local

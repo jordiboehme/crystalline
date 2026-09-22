@@ -29,9 +29,10 @@ pub mod vocab;
 
 pub use alias::AliasMap;
 pub use embed::{
-    ChunkParams, EMBED_PAGE_SIZE, EmbedReport, EmbeddingProvider, ModelDownload, chunk_engram,
-    configured_model_id, download_local_model, order_jobs_for_batching, provider_from_config,
-    run_embedding_pass, run_embedding_pass_with_page,
+    Architecture, ChunkParams, EMBED_PAGE_SIZE, EmbedReport, EmbeddingProvider, LocalModel,
+    ModelDownload, cached_model_dirs, chunk_engram, configured_model_id, download_local_model,
+    hub_dir_name, local_model, lookup_local_model, order_jobs_for_batching, provider_from_config,
+    prune_model_cache, run_embedding_pass, run_embedding_pass_with_page,
 };
 pub use error::{IndexError, Result};
 pub use factory::open_store;

@@ -2,16 +2,16 @@
 //!
 //! An engram body is split into embedding chunks on blank-line paragraph
 //! boundaries, then consecutive paragraphs are greedily packed up to a token
-//! budget (bge accepts 512 tokens; the default budget of 450 leaves room for the
-//! special tokens and the title prepended to the first chunk). A fenced code
-//! block is kept intact as a single unit even when it contains blank lines, so a
-//! code sample is never cut in half. A paragraph that exceeds the budget on its
-//! own is the one exception: it is hard-split into budget-sized pieces (a fence
-//! included, kept whole only up to the budget), because a body with no blank
-//! line would otherwise become a single chunk of unbounded size and every
-//! consumer downstream, the tokenizer first, would pay for it. The first chunk
-//! gets the engram title and description prepended so a short engram still
-//! carries its heading into the vector space.
+//! budget (the tokenizer accepts 512 tokens; the default budget of 450 leaves
+//! room for the special tokens and the title prepended to the first chunk). A
+//! fenced code block is kept intact as a single unit even when it contains
+//! blank lines, so a code sample is never cut in half. A paragraph that exceeds
+//! the budget on its own is the one exception: it is hard-split into
+//! budget-sized pieces (a fence included, kept whole only up to the budget),
+//! because a body with no blank line would otherwise become a single chunk of
+//! unbounded size and every consumer downstream, the tokenizer first, would
+//! pay for it. The first chunk gets the engram title and description prepended
+//! so a short engram still carries its heading into the vector space.
 //!
 //! Each chunk carries a fingerprint `sha256(model_id + ":" + text)`. The sync
 //! engine hands the fingerprints to [`crate::Store::replace_chunks`], which
@@ -23,15 +23,17 @@ use sha2::{Digest, Sha256};
 
 use crate::store::NewChunk;
 
-/// The default token budget per chunk. Below bge's 512-token input limit, with
-/// headroom for the special tokens and the first chunk's title prepend.
+/// The default token budget per chunk. Below the tokenizer's 512-token cap,
+/// with headroom for the special tokens and the first chunk's title prepend.
 pub const DEFAULT_MAX_TOKENS: usize = 450;
 
 /// The default local model id, used as the chunk-fingerprint namespace when no
 /// embeddings provider is configured. Kept in step with the local provider's
 /// reported model id so fingerprints computed at sync time match the model that
-/// later embeds them.
-pub const DEFAULT_MODEL_ID: &str = "bge-small-en-v1.5";
+/// later embeds them. It is [`crate::embed::LOCAL_MODELS`]`[0].id`: the table is
+/// the authority on what the local provider can run, and a default it does not
+/// hold would refuse to load at all.
+pub const DEFAULT_MODEL_ID: &str = "granite-embedding-97m-multilingual-r2";
 
 /// Parameters for chunking one engram.
 #[derive(Debug, Clone, PartialEq, Eq)]
