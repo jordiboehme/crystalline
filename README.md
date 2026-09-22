@@ -32,9 +32,7 @@
 
 **Crystalline intelligence for AI agents. Plain markdown underneath.**
 
-Psychology splits intelligence in two. Fluid intelligence reasons about novel problems in the moment; crystallized intelligence is everything learning has deposited - the vocabulary, the judgment, the lessons experience already paid for. A large language model is fluid intelligence in its purest form: brilliant in the moment, and the moment is all it has. Every session it starts as a stranger - yesterday's decisions forgotten, the team's conventions unknown, everything re-derived or re-explained.
-
-Crystalline is the other half: the crystalline intelligence an agent accumulates and keeps. Onboarded at session start, taught curated knowledge organized into domains, capturing what it learns as engrams while it works - session by session it stops being a stranger and becomes a peer.
+Psychology splits intelligence in two: fluid intelligence reasons about a new problem in the moment, crystallized intelligence is what learning left behind, the vocabulary, the judgment and the lessons already paid for. A language model is fluid intelligence in its purest form, brilliant in the moment and a stranger at the start of every session. Crystalline is the other half: the crystalline intelligence an agent builds up and keeps, session by session, until it stops being a stranger and becomes a peer.
 
 The difference it makes, in one exchange:
 
@@ -52,74 +50,27 @@ Eight months later, a fresh session
           about a liter of water comes out.
 ```
 
-Crystalline is a single Rust binary: a CLI for people, an MCP server for agents and a local search index on top of plain markdown files.
-
-The name is borrowed from psychology: crystallized intelligence is the knowledge a mind accumulates through experience, the counterpart of fluid, in-the-moment reasoning. Models have the fluid kind in abundance; Crystalline gives them the other half.
-
-[Handbook](#handbook) · [Why Crystalline](#why-crystalline) · [How it works](#how-it-works) · [Get started](#get-started) · [Session onboarding](#session-onboarding) · [The learning loop](#the-learning-loop) · [Teach and learn](#teach-and-learn) · [Skills](#skills) · [Share with a team](#share-knowledge-with-a-team) · [Deployment](#deployment) · [FAQ](#faq)
-
-## Handbook
-
-The Crystalline Handbook is the book-length guide to Crystalline and Fluid: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from.
-
-- Read it online: https://jordiboehme.github.io/crystalline/
-- Download: [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf), [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub) and a single-file [Markdown](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.md) edition
-
-## Why Crystalline
-
-Crystalline is the evolution of approaches that many teams have walked through in the same order. Giving an agent a single markdown file of instructions works, until it grows past what fits in context. Splitting it into a folder of markdown files works, until nobody can tell which file to read for a given task. Adding index files that point at folders and other files works, until maintaining the pointers becomes its own job and every lookup still means walking a tree by hand. Each step scales further than the last, and each one quietly breaks somewhere in the hundreds of files.
-
-Once knowledge grows into the thousands or tens of thousands of units, reading and pointer-walking stop being viable at all. What is needed at that scale is what any large knowledge system needs: real indexes. Crystalline keeps the plain markdown files - they remain the source of truth, readable and diffable - and adds domain routing, full-text and semantic search, a knowledge graph and temporal filtering on top, so the ten-thousandth engram is exactly as findable as the tenth.
-
-## How it works
-
-- **Domains** are folders of knowledge. Each one carries a `MANIFEST.md` describing its scope and when an agent should route a task there.
-- **Engrams** are the unit of knowledge: one markdown file with YAML frontmatter, holding prose, observations (`- [category] a captured fact or lesson`) and relations (`- rel_type [[Other Engram]]`) to other engrams.
-- **Built on an open format.** The engram format extends [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf): plain markdown with YAML frontmatter, readable by any OKF tooling, with no lock-in. Unknown keys are always preserved, and every engram records who wrote it and when, and an agent's capture records which model it was. Crystalline layers its routing, temporal and knowledge-graph conventions on top, so OKF documents drop straight into a domain and your knowledge stays portable, diffable files whatever tools come next.
-- **Knowledge retires, it does not disappear.** When a fact stops holding, the old engram is superseded rather than overwritten: its `status` marks it as no longer current, `valid_from`/`valid_to` keep the past addressable by date ("what applied last June") and the lessons it taught carry forward as unbounded knowledge - the way a person still draws on a past job without mistaking it for the present. A retired engram stays in every search; it is only softly faded in ranking, so current knowledge surfaces first without the past ever going missing.
-- **MANIFEST routing** lets an agent (or a person) figure out which domain owns a task without reading every file: `crystalline prompt system` turns each domain's `## When to Use` bullets into a compact session-start briefing.
-- **Hello · Hallo · Hola · Bonjour · Ciao · Olá · Hoi · Ahoj · مرحبا · こんにちは · 안녕하세요 · 你好.** Search is multilingual: the built-in embedding model reads more than 200 languages, 52 of them with retrieval training, so a German engram answers an English question and the other way round, and a domain that mixes languages needs no translation.
-- **Fluid** is the browser UI for an instance, and it is the half of this that is for people: Crystalline stores what was learned, [Fluid](#fluid-the-web-ui) is where you read, edit and think with it.
-
-## Fluid, the web UI
-
-The primary author in Crystalline is the agent: it captures and refines engrams as it works. Fluid is how you take part directly - read what was learned, correct a fact, add knowledge of your own - in the browser, without going through the LLM or spending a token on it. What you write does not sit unreviewed: the agent's next maintenance pass verifies it, aligns the tags and wires it into the graph. Fluid is built into the binary and on by default at `http://localhost:7411`, so the daemon your agents already talk to serves people and agents on one port: nothing to deploy, and the first visit creates your admin account right in the browser.
-
-![An engram in Fluid: frontmatter details, observations, typed relations and the agent's-eye view](assets/fluid-engram.jpg)
-
-- **Read what was learned.** An engram is a page: frontmatter as a details rail, observations and relations as labelled chips, backlinks, and the `crystalline://` address one click from the clipboard. Domains down the side, Cmd+K to jump anywhere by name, and a full width toggle (`\`) that folds the details rail away and gives the prose the page's full column.
-- **Edit in place.** A live-preview markdown editor with table editing, a frontmatter form, mermaid previews and wikilink completion across every domain. The file on disk stays the source of truth.
-- **Attach what you teach with.** Paste, drag or upload a screenshot, a diagram, a slide deck, a PDF or a data file straight onto an engram; agents read those attachments back over MCP and evolve keeps the knowledge extracted from them current. An attachment always belongs to some engram's teaching, and a file nothing references is flagged for cleanup rather than left to accumulate. Image references take an optional formatting fragment - a single `#` carrying comma-separated options, `left`, `right`, `center`, `full` and `w=50%` or `w=320`, as in `![Chart](assets/chart.png#right,w=50%)` - that Fluid honors and every other markdown renderer simply ignores.
-- **Collaborate in real time.** Everyone in the same engram sees everyone else's cursors and edits live; changes merge conflict-free and land as one save.
-- **Search it all.** Faceted search across the whole instance, backed by the same hybrid text-plus-semantic ranking the agents use.
-- **See what the knowledge needs next.** A maintenance page with the ranked queue of everything due - stale dates, half-finished retirements, unreviewed human captures - the same queue the agent works.
-- **Take part in the team loop.** A team domain shows its proposals in the browser: where each one stands, what the review said, a share dialog for the changes waiting to go out and a withdraw that closes a proposal on GitHub (optionally restoring the files it shared). A conflict opens a dialog with both sides next to each other, so keeping yours, taking theirs or hand-merging is a decision you make with the wording in front of you.
-- **See the shape of it.** An interactive graph of any engram's neighborhood, and an agent's-eye view showing exactly what the tools serve an agent for that page.
-- **Accounts when you need them, none when you don't.** Admin, editor and viewer roles managed in the UI or with `crystalline users`; an anonymous read-only mode for a published archive; a trusted-header mode behind an SSO proxy. See [deployment](docs/deployment.md) for the container and team-server variants.
-
 ## Get started
 
-Sixty seconds on a Mac with [Homebrew](https://brew.sh) and Claude Code:
+Crystalline is one binary. Two commands on a Mac with [Homebrew](https://brew.sh) and Claude Code:
 
 ```sh
 brew install jordiboehme/tap/crystalline
 crystalline install claude-code
-mkdir -p ~/knowledge/engineering
-crystalline domain init ~/knowledge/engineering --name engineering
-crystalline domain add engineering ~/knowledge/engineering
 ```
 
-Start a session - the agent onboards itself and starts remembering. Then open `http://localhost:7411`: the daemon that session started serves the web UI there by default, and the first visit creates your admin account in the browser, so there is nothing to deploy and nothing to configure to read what your agent is learning. Everything below is the same three steps on other platforms and harnesses: install the binary, wire the harness, give the agent a domain. Claude Desktop skips the binary entirely - jump straight to [its subsection](#claude-desktop). Semantic search wants the local embedding model fetched once with `crystalline model download`; plain text search works before that.
+Start Claude Code and say:
 
-### Install the binary
+> Add two domains: books for what I read, and work for this repository. Here is my reading log from the last three years - work out what I actually like. Then capture what this repository is about.
 
-macOS, via [Homebrew](https://brew.sh):
+The agent creates both domains with its `add_domain` tool, a folder with a starter MANIFEST each, captures what it learns from the log and from the repository as engrams, and the next session starts from them.
 
-```sh
-brew install jordiboehme/tap/crystalline
-```
+Fluid, the web UI, is at http://localhost:7411 and the first visit creates your admin account. What the install command wired, and how to undo it: [Claude Code setup](docs/setup/claude-code.md).
 
-Linux, via `.deb` package (Debian, Ubuntu and derivatives, amd64 or arm64):
+<details>
+<summary>Linux</summary>
+
+Via `.deb` package (Debian, Ubuntu and derivatives, amd64 or arm64):
 
 ```sh
 version=$(curl -fsSL https://api.github.com/repos/jordiboehme/crystalline/releases/latest | grep -m1 '"tag_name"' | cut -d '"' -f4)
@@ -129,373 +80,50 @@ sudo dpkg -i "crystalline_${version#v}_${arch}.deb"
 crystalline --version
 ```
 
-The package also ships a systemd unit, installed disabled - see [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) to run the daemon as a managed service.
+The package ships a systemd unit, installed disabled: see [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) to run the daemon as a service. Then `crystalline install claude-code` and the prompt above.
 
-Windows, via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Windows releases are not code signed yet, so verify against `SHA256SUMS` and confirm any SmartScreen prompt (More info > Run anyway).
+</details>
 
-Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file for verification - or build from a clone with `cargo build --release`. The macOS binaries are code signed and notarized with an Apple Developer ID, so Gatekeeper runs them without a prompt.
+<details>
+<summary>Windows</summary>
 
-### Claude Code
+Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Windows releases are not code signed yet, so verify against `SHA256SUMS` and confirm the SmartScreen prompt (More info > Run anyway).
 
-```sh
-crystalline install claude-code
-```
+</details>
 
-One command wires the whole integration: MCP registration, the `SessionStart` onboarding hook, the `Stop` capture nudge, the `UserPromptSubmit` recall hook (see [The learning loop](#the-learning-loop)) and the four topical skills. It is idempotent - rerun it any time and whatever is already correct is left untouched - and each part is skippable with `--skip-mcp`, `--skip-hooks` or `--skip-skills`; `--project` writes into the current repository's config instead of your global one, and `crystalline uninstall claude-code` reverses everything `install` did, leaving any hook, key or locally edited skill that is not Crystalline's own in place.
+<details>
+<summary>Other harnesses and clients</summary>
 
-The quick start above is exactly this path end to end; give the agent its first domain the same way and start a session.
+| Client | Setup |
+|---|---|
+| Claude Desktop | [A one-click extension, no terminal](docs/setup/claude-desktop.md) |
+| Codex CLI | [`crystalline install codex`](docs/setup/codex.md) |
+| GitHub Copilot CLI | [`crystalline install copilot`](docs/setup/copilot.md) |
+| Any MCP harness | [`crystalline mcp` over stdio, wired by hand](docs/setup/mcp-harness.md) |
+| Remote clients | [A standing instruction for chat surfaces and the Messages API](docs/setup/remote-clients.md) |
+| From the terminal | [The CLI mirrors everything an agent can do](docs/setup/terminal.md) |
 
-### Claude Desktop
+</details>
 
-No terminal needed:
+Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file, or build from a clone with `cargo build --release`. The macOS binaries are code signed and notarized, so Gatekeeper runs them without a prompt.
 
-1. Download `crystalline-v<version>.mcpb` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) - one universal bundle covering Apple Silicon Macs and Windows (per-arch bundles remain for Intel Macs and native windows-arm64).
-2. In Claude Desktop, open Settings > Extensions > Advanced settings > Install Extension... and pick the file.
+## Why not a memory feature
 
-It starts with no domains: the agent creates one with the `add_domain` tool whenever it needs somewhere to capture knowledge - a folder of markdown files under your `Documents/Crystalline` folder, a database-backed domain or a GitHub team domain. Onboarding is automatic on every connection (see [Session onboarding](#session-onboarding)). The extension gets you the browser half too: the daemon it spawns serves the web UI at `http://localhost:7411` by default, where the first visit creates your admin account - it is there while Desktop is open and goes away five seconds after Desktop quits. The optional companion skill adds capture and collaboration best practices (see [Skills](#skills)); the [Claude Desktop extension scenario](docs/deployment.md#claude-desktop-extension) shows how it works underneath.
+A chat memory is a hidden blob. One vendor owns it, it is tied to one model, and nobody around the agent can see it, review it, version it or share it. Crystalline is files you own: plain markdown, read by every agent and every person on the team, reviewed like code and kept in your own repositories. Change the model and the knowledge stays.
 
-### Codex CLI
+## What sets it apart
 
-The same integration, one command (Codex keeps MCP registration user-level even with `--project`; the installer says so when it applies):
+- **Plain markdown, an open format.** An engram is a markdown file with YAML frontmatter in [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf). Any tool reads it, nothing locks you in and the index is disposable: `crystalline reindex --full` rebuilds it from the files.
+- **Scales past a folder of files.** Domains with MANIFEST routing, hybrid text-plus-semantic search, a knowledge graph and temporal filtering: the ten-thousandth engram is as findable as the tenth.
+- **Knowledge retires, it does not disappear.** A fact that stopped holding is superseded, not overwritten. The old engram stays addressable by date ("what applied last June"), retired knowledge fades in ranking instead of vanishing and `crystalline evolve` tells you what the archive needs next.
+- **Agents and people share one intelligence.** Agents work over MCP, people work in Fluid, and a team shares through GitHub pull requests, with review mode and private drafts for a domain that wants a gate.
+- **Hello · Hallo · Hola · Bonjour · Ciao · Olá · Hoi · Ahoj · مرحبا · こんにちは · 안녕하세요 · 你好.** Search is multilingual: the built-in embedding model reads more than 200 languages, 52 of them with retrieval training, so a German engram answers an English question and the other way round, and a domain that mixes languages needs no translation.
 
-```sh
-crystalline install codex
-```
+## Fluid
 
-Then give the agent its first domain as in the quick start.
+The primary author in Crystalline is the agent. Fluid is how you take part: read what was learned, correct a fact, add knowledge of your own, in the browser, without spending a token. It is built into the binary and on by default at `http://localhost:7411`. An engram is a page, the editor previews live, everyone in the same engram sees each other's cursors, search is the same hybrid ranking the agents use and a maintenance page shows what the knowledge needs next. The full tour: [Fluid, the web UI](docs/fluid.md).
 
-### GitHub Copilot CLI
-
-The same integration for the agentic Copilot CLI, one command (Copilot too keeps MCP registration user-level even with `--project`). The installer drives the `copilot` binary and falls back to `gh copilot` when only the GitHub CLI form is installed:
-
-```sh
-crystalline install copilot
-```
-
-Hooks land in a dedicated `~/.copilot/hooks/crystalline.json` and skills in `~/.copilot/skills` (both honor `COPILOT_HOME`); with `--project` they go to `.github/hooks` and `.github/skills` instead, which Copilot loads once you trust the folder. Then give the agent its first domain as in the quick start.
-
-### Any MCP harness
-
-Crystalline runs as an MCP server over stdio; the server command is always `crystalline mcp`. Everything the installer does can also be done by hand:
-
-```sh
-claude mcp add crystalline --scope user -- crystalline mcp --harness claude-code
-codex mcp add crystalline -- crystalline mcp --harness codex
-copilot mcp add crystalline -- crystalline mcp --harness copilot
-```
-
-`--harness` is optional and tells the server which harness spawned it, so a harness that already has the skills installed as files is not served them a second time over MCP (see [Skills over MCP](#skills-over-mcp)). Leave it out and the full surface is served. The `--` matters on the Claude Code line: without it, `claude mcp add` reads the server's own flags as its options.
-
-The first agent to connect starts a background daemon that loads the embedding model once and watches every registered domain; every later connection - other agents, other terminals, other harnesses - attaches to that same daemon, so there is always one shared instance and one consistent view of the index. The Claude Desktop extension is the one exception: its daemon runs from inside Desktop's extension folder and leaves on its own shortly after Desktop does (see [Personal workstation](docs/deployment.md#personal-workstation)). A daemon running in a container is reached over HTTP instead of stdio - see [Run in a container](docs/deployment.md#run-in-a-container).
-
-### From the terminal
-
-The CLI mirrors everything an agent can do. This runs verbatim, start to finish, on a clean machine:
-
-```sh
-# 1. Create a domain: a folder of knowledge with a MANIFEST.md at its root.
-#    domain add indexes whatever is already there (the manifest, for now)
-#    right away, no separate sync step needed.
-mkdir -p ~/knowledge/engineering
-crystalline domain init ~/knowledge/engineering --name engineering
-crystalline domain add engineering ~/knowledge/engineering
-
-# 2. Capture an engram: a unit of knowledge, with an observation bullet.
-crystalline write engineering "Retry queue gotcha" \
-  --content "- [gotcha] The retry queue drops jobs older than 24h #payments" \
-  --tags gotcha,payments
-
-# 3. Search it back (plain text, since no embeddings exist yet).
-crystalline search "retry queue"
-
-# 4. Fetch the local embedding model once, then re-sync with embeddings.
-crystalline model download
-crystalline sync --embed
-
-# 5. Search again: hybrid text-plus-semantic ranking now finds the engram
-#    from a differently worded description of the same problem.
-crystalline search "why does the payments queue lose jobs"
-
-# 6. See what got indexed.
-crystalline status
-```
-
-Engrams written through Crystalline are indexed immediately; `crystalline sync` only picks up files created outside it (an editor, a `git pull`) when no daemon is watching them. Edit the domain's `MANIFEST.md` `## Scope` and `## When to Use` sections so routing describes it accurately - that file is what the session prompt and an agent's routing decisions read (see [Session onboarding](#session-onboarding)).
-
-[The Crystalline Playbook](docs/playbook.md) teaches the whole workflow by example, a use-case course over one running dataset through recording, querying, ingesting, reconciling, retiring and sharing knowledge.
-
-## Session onboarding
-
-Every MCP client is onboarded automatically: the crystalline server's instructions, returned when a client connects, carry a live routing block - one line per registered domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The block names the exact crystalline tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows which tool on which server to call.
-
-Domain lists and file-domain MANIFESTs are read fresh for every new connection; virtual-domain routing lines follow the daemon's latest snapshot, refreshed on every stdio connection and on every local virtual write. Claude Desktop and any harness that shows the model its MCP server instructions need no further setup. A harness installed on this machine with `crystalline install` is the one exception, and it needs no setup either: its own session hook delivers the block, so the server recognizes it at connect time and hands it a one-line pointer instead of a second copy (see [Skills over MCP](#skills-over-mcp)).
-
-The block is sized for clients that truncate server instructions: the intro and the behavior rules come first and always fit, and the domain lines that follow shrink to one bullet each, then to a single count line, rather than pushing the rules out of view. Nothing is lost either way, since `list_domains` with `include_routing=true` returns the whole index on demand.
-
-The same routing block is available outside MCP: `crystalline prompt system` renders it to stdout from every registered domain's `MANIFEST.md`, to feed to an agent as session context. Over MCP there is no workspace, so `prompt.rules` filters and repo-local `preferred_domains` apply only on this path - `crystalline prompt system --workspace .` scopes it to the current repository. `--domain <name>`, repeatable, renders only the domains you name, in the same order, in every output format. `prompt` takes a subcommand naming the kind of prompt to generate: `system` for hook-driven harnesses, `connector` for the snippet below.
-
-The generic harness recipe: run `crystalline prompt system` at session start and inject its stdout as context before the agent does anything else. In Claude Code that is a `SessionStart` hook in `settings.json`, matched on `startup|clear|compact` so the routing block is re-injected after `/clear` and after a compaction as well as on a fresh start (a resumed session is deliberately excluded, since its transcript already carries the earlier routing block). [Get started](#get-started) covers `crystalline install`, which writes this hook for you; by hand it is:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|clear|compact",
-        "hooks": [
-          { "type": "command", "command": "crystalline prompt system" }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Any harness with an equivalent session-start hook can run the same command the same way.
-
-### Remote clients
-
-A remote service or a chat harness runs no session hooks, and most of them never show the model an MCP server's instructions, so neither onboarding path above reaches the agent. Give it a standing instruction instead: paste this into the client's custom instructions and the agent onboards itself with one tool call at the start of every session.
-
-```text
-This environment includes Crystalline, your crystallized intelligence across sessions, over MCP. At the start of every session call its list_domains tool with include_routing set to true; the result is your onboarding: one routing line per domain plus the behavior rules for this server's tools. Follow it, search those domains before answering from memory and re-fetch it mid-session with the same call whenever you need it again.
-```
-
-`crystalline prompt connector` prints the same snippet, ready to copy. The same text is also available in-client, with no copy-paste, as the `connector` MCP prompt; a harness that shows the model MCP prompts can insert the `onboarding` prompt directly instead, which carries the live routing block itself rather than the instruction to fetch it (see [Skills over MCP](#skills-over-mcp)).
-
-An agent built on the Messages API MCP connector can keep its context lean by deferring most of the tool surface: with `defer_loading` on, a tool is declared but its description and schema load only when the model searches for it. Defer everything by default and pin the three tools an agent needs before it can search for anything - `search_engrams`, `read_engram` and `list_domains`, the trio that carries session onboarding and recall:
-
-```json
-{
-  "mcp_toolset": {
-    "type": "mcp_toolset",
-    "mcp_server_name": "crystalline",
-    "default_config": { "defer_loading": true },
-    "configs": {
-      "search_engrams": { "defer_loading": false },
-      "read_engram": { "defer_loading": false },
-      "list_domains": { "defer_loading": false }
-    }
-  }
-}
-```
-
-Claude Code does this for you: it turns tool search on automatically once a session's MCP tool descriptions grow large, loading tool names plus each server's instructions up front and the rest on demand. The routing block is sized to survive that mode intact (see [Session onboarding](#session-onboarding)).
-
-## The learning loop
-
-Experience only compounds when capture actually happens. The loop has three beats: the agent recalls what is known at session start, works with it and captures what it learned before the session ends. The last beat is the one agents skip when nothing reminds them - so `crystalline install` wires the reminder.
-
-It is a `Stop` hook running `crystalline hook stop`: a once-per-session, late nudge that fires on the first stop after a session gains real substance and stays silent otherwise - below the substance threshold, once it has already fired, in read-only mode or with no domain registered. When it fires, it asks the agent to review the conversation for durable learnings, propose capturing each one into the fitting domain (the same propose-first, wait-for-a-yes shape the capture skill follows) and raise the salience of any recalled engram that proved key to the task. Where a team domain holds work the team has not seen, one more line counts it and asks the agent to propose sharing it with `share_changes` - still a proposal to say yes to, since sharing publishes somebody's work for review.
-
-The reminder costs about 120 tokens, at most once per session. Remove it with `crystalline uninstall <harness>`, or leave it out from the start with `--skip-hooks`.
-
-There is a third hook: a `UserPromptSubmit` hook running `crystalline hook prompt`, installed for Claude Code, Codex and Copilot alike, so what an earlier session learned meets the agent when it is relevant, without it having to decide to search first. In Claude Code and Codex each prompt arrives with at most three engrams, named by `crystalline://` address, one line each - a head start to read with `read_engram`, not the answer itself. A given engram is named once per session, and again after `/clear` or a compaction. It costs about 200 tokens when it has something to say, and nothing when it does not: it stays silent without a running daemon, before the index has embeddings, or once `recall.enabled` is turned off; `recall.limit` and `recall.min_score` are its cap and its floor (3 and 0.69 by default). Copilot gets the same hook entry but has no channel yet for what it would say, so it stays installed and inert there.
-
-## Teach and learn
-
-The MCP server exposes 20 tools on a default writable instance - 19 in a harness whose install already carries the skills as files, 10 serving read-only - and the six collaboration tools appear beside them once `github.enabled` is turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)), which takes a read-only instance to 12 rather than 16, since only `update_domain` and `origin_status` read without writing; the list is the same for every client connected at that moment; capturing knowledge as a byproduct of work is the core loop:
-
-- **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you. The receipt may name the three existing engrams closest in meaning to what was written, so the write is also a search.
-- **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
-- **`edit_engram`** - refine an engram in place (`append`, `prepend`, `find_replace`, `replace_section`, `insert_before_section`, `insert_after_section`, `set_frontmatter`) instead of creating a duplicate for the same topic. `set_frontmatter` assigns one lifecycle field by name - `status`, `valid_from`, `valid_to`, `stale_after`, `source_date`, `salience` or `verified` - so retiring an engram or recording a re-check is a field assignment rather than a text substitution.
-- **`split_engram`** - move part of an engram into a new engram of its own, in one step. Validity is set per engram rather than per bullet, so when one fact in a bundle stops holding while the rest still does, split before you retire: name the observation lines or the section headings that move, and the call writes the new engram with the source's tags and a `stable` status and links the pair with `derived_from` and `split_into`, leaving the source holding exactly what expired and the facts that still hold addressable on their own.
-- **`build_context`** - given a `crystalline://domain/permalink` anchor, follow its relations and links (across domains too) to assemble the neighbourhood around a task before diving in - the neighbourhood comes back ranked by how strongly each engram connects to the anchor, salience-aware, so `max_related` keeps the most relevant.
-- **`vocabulary`** - list the tags, observation categories, relation types and engram types and statuses already in use, with counts, and reuse an existing term before coining a near-duplicate.
-- **`remove_domain`** - unregister a domain the agent should stop learning from, the counterpart to `add_domain`. The registration and the search index rows go and the knowledge does not: a folder domain's markdown stays on disk (point `add_domain` at the folder again and it is re-adopted) and a team domain's GitHub repository is never touched. A team domain is reconnected with its repository rather than with its folder, which is what the confirmation says. A virtual domain is the exception, since its engrams live in the database and are deleted with it, so every surface refuses until the removal says `purge`. On your own machine you may remove any domain; on a shared instance it takes an instance admin, or a private domain's owner.
-- **`evolve_engrams`** - ask what the archive needs instead of waiting to trip over it: a read-only sweep of one domain or all of them that returns a ranked maintenance queue, every finding carrying the evidence it fired on and the exact next action. It sees temporal and lifecycle debt (a `valid_to` that elapsed while the status still reads current, a `stale_after` past due, a replacement that landed while the retirement was never finished), structural gaps (unresolved `[[links]]`, one-sided relation pairs, orphans, oversized engrams and stubs), the still-valid observations a retirement is about to take down with it, and redundancy (near-duplicate clusters, semantic twins - the same knowledge in different words - and drifted tags). A finding marked `mechanical` completes intent the archive already records; one marked `judgment` changes what the archive claims and wants a yes first. It is the tool behind `crystalline evolve` below.
-
-Attachments run the same loop in the other direction: files enter through Fluid (or a domain archive), never through an agent write, and reach an agent as resource links on `read_engram` that `resources/read` fetches by URI - so the slide deck a person drops onto an engram is something the next session reads and learns from rather than an opaque blob, and `evolve_engrams` raises a finding whenever a fresh or changed file still needs capturing.
-
-Observations are the atomic unit of an engram's body: top-level bullets like `- [decision] we chose Postgres for the write path #database`. Categories are free text; useful ones include `decision`, `fact`, `pattern`, `gotcha`, `convention`, `lesson`, `risk` and `idea`. Relations connect engrams: `- depends_on [[Other Engram]]`, or `- "relates to" [[Other Engram]]` for a multi-word relation type.
-
-Temporal fields are plain and easy to get wrong by overthinking them: an absent `valid_from` means the engram has always been valid, an absent `valid_to` means it is valid forever. When set, the fields are plain ISO dates (YYYY-MM-DD) at day granularity, and the write drops a sentinel far-future value outright, since absence already means forever. Set them only when a fact is genuinely time-bounded (a policy that changes on a known date, a temporary workaround). `status` and `type` have recommended value sets stated in the tool descriptions themselves (status: `stable`, `draft`, `idea`, `deprecated`, `superseded`, and so on; type: `engram`, `guide`, `decision`, `architecture`, `runbook`, `reference`) - they exist so an agent can tell an idea apart from current fact, and they are guidance, never a global enum a write is rejected for.
-
-Exceptionally valuable knowledge can carry a numeric `salience` key (0 to 10) in `metadata`, the way a memory formed during an exceptional event encodes more strongly: hybrid search adds a small bounded lift for it, so a salient engram ranks above equally relevant unmarked ones while relevance keeps the upper hand and nothing is ever filtered out by it. An agent raises it later on an engram that proved to be the key to a task; the lift's strength is the `search.salience_weight` setting (0.0 to 1.0, default 0.15, 0 disables it). The counterpart on the way out is `search.retired_weight` (0.0 to 1.0, default 0.6, 1.0 disables it): an engram whose `status` is `deprecated`, `superseded`, `archived` or `legacy` is softly faded by it in ranking, never filtered out.
-
-The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `split`, `delete`, `search`, `context`, `recent` and `vocabulary` take the same parameters as their MCP counterparts.
-
-Tag identity is case-folded, so `Foo` and `foo` are the same tag; the files keep whatever case you wrote. For the rest of tag drift - a separator swap or a plural - `crystalline vocabulary` and `crystalline doctor` surface near-duplicate clusters, and two CLI-only commands consolidate them: `crystalline tags rename <old> <new>` and `crystalline tags merge <old> <into>`. Both rewrite only the tag tokens, preview before writing and take `--dry-run`, `--yes` and `--domain`; a merge also records the fold in the MANIFEST's `## Tag Aliases` section, so a search for the old name keeps resolving forever. Bulk rewrites are deliberate maintenance, which is why these live on the CLI rather than as MCP tools.
-
-## Skills
-
-The `skills/` folder ships four harness-agnostic agent skills plus one consolidated skill, teaching an agent how to use Crystalline well:
-
-- **`crystalline-routing`** - which domain(s) to search for a task, when to sweep every domain instead, temporal filtering for "what is true now", and when to fall back to reading a MANIFEST directly.
-- **`crystalline-capture`** - when captured knowledge is worth writing down, searching before writing to avoid duplicates, editing an existing engram instead of forking the topic, and the observation-category and temporal-field conventions that keep engrams useful later.
-- **`crystalline-schema`** - authoring a Picoschema schema engram for a domain that wants structure, inferring one from what is already captured, and validating conformance.
-- **`crystalline-collaboration`** - working in a domain that has a team origin: checking status at session start, updating before deep work, sharing a coherent unit of knowledge as a proposal and relaying its review URL, conflict etiquette and connecting a new teammate end to end.
-- **`crystalline-intelligence`** - a single consolidated skill for Claude Desktop and other harnesses that install one skill at a time: recall, capture, read-only stand-down and team sharing essentials in one file.
-
-`crystalline install claude-code` (or `codex` or `copilot`) copies these same four skills into place automatically - `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex, `~/.copilot/skills` for the Copilot CLI - and leaves `crystalline-intelligence` alone, since it is Claude Desktop's own consolidated skill. Each is a plain folder with a `SKILL.md`; to do it by hand instead, copy the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
-
-```sh
-cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema skills/crystalline-collaboration ~/.claude/skills/
-```
-
-Installed skills stay current on their own: each install is recorded in a local receipt and when a new crystalline version first runs it refreshes the installed skills at session start - updating changed ones (an edited copy is kept beside the new one as `SKILL.md.bak`) and removing ones the new version no longer ships.
-
-Installing from a release instead of a clone: download `crystalline-agent-skills-v<version>.zip` from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and unpack it into `~/.claude/skills/`. Zip installs are not tracked by the receipt, so re-unpack the zip after upgrading crystalline (or run `crystalline install` once to switch to managed skills).
-
-Claude Desktop: download `crystalline-claude-desktop-skill-v<version>.zip` from the latest release, then open Settings > Capabilities > Skills (enable the Skills capability there if it is off) and upload the zip as-is (it contains the `crystalline-intelligence` folder; do not unpack it). If you uploaded an earlier release's skill, delete the old `crystalline-memory` entry there once the new one is up - Desktop keeps uploaded skills side by side, and the two teach the same lessons twice. Routing itself needs no skill - the server's instructions deliver it automatically; the skill adds capture and collaboration best practices.
-
-Other harnesses that support a similar skill or instruction-file convention can point at the same folders directly; the content only assumes the MCP tools documented in [Teach and learn](#teach-and-learn), never a specific harness.
-
-### Skills over MCP
-
-Installing the folders is not the only way in: every server also serves the same five skills to remote clients that never run the CLI at all. A chat surface calls the `skills` tool - with no arguments it lists all five, by name it returns one skill's full `SKILL.md`. A harness whose agents read MCP resources instead reaches the same content at `skill://<name>/SKILL.md`. And a harness that shows the model MCP prompts can insert the `onboarding` or `connector` prompt directly, the same text described in [Remote clients](#remote-clients) below. All three are governed by the one `skills.serve` setting. Its default, `auto`, serves them to every client except a session spawned by a harness this machine has already onboarded: `crystalline install` registers the MCP server as `crystalline mcp --harness <name>`, and a session started that way asks the local install receipt whether that harness has its session hooks wired. If it has, it already carries the five skills as files and gets its routing block from its own hook, so it is served neither the skill surface nor a second copy of the onboarding block. Everything else is served in full, including a registration made before that flag existed, a harness the receipt does not know and every HTTP client - a remote client never ran the CLI here, so nothing on this machine says what it has.
-
-`claude mcp get crystalline` (and the Codex and Copilot equivalents) shows whether a registration carries the flag, which is how to tell which answer a stdio session will get. Set `skills.serve` to `true` to serve everything to everyone regardless, or to `false` to serve the skills to nobody, for an operator who would rather ship them only as zips; either explicit value overrides the resolved answer and makes every client identical, on both transports. The value is read once when the daemon starts, so changing it with `configure` applies from the next start.
-
-After upgrading from a version before this flag existed, an existing registration still reads plain `crystalline mcp` and the skill surface simply stays on, exactly as it was. To pick the flag up:
-
-- **Claude Code:** rerun `crystalline install claude-code`. It reads the existing entry back and re-registers it in place. It only does that for an entry it recognizes as its own, in the scope it would write, carrying no environment block of yours; anything else it leaves untouched and prints the command you can run yourself.
-- **Codex and Copilot:** rerun `crystalline install` does *not* repair those, because their `mcp get` output format has not been verified and an install that cannot read what it is repairing must not touch it. Replace the entry yourself: `codex mcp remove crystalline && codex mcp add crystalline -- crystalline mcp --harness codex`, and the same shape for `copilot`.
-
-Either way this is an optimisation, not a fix: leaving it alone costs a duplicated routing block and six listed entries, nothing more. Setting `skills.serve` explicitly to `true` or `false` sidesteps it entirely.
-
-## Ship tools with a domain
-
-Teaching an agent what a domain knows is half the story - the other half is the working tools that knowledge depends on to act on it: skills, slash commands, subagent definitions and MCP server configs. A domain's `MANIFEST.md` can declare a `## Provisioning` section naming the folders it ships, one bullet per kind:
-
-```
-## Provisioning
-
-- skills: skills
-- commands: commands
-- agents: agents
-- mcps: mcps
-```
-
-Each bullet is `type: path`, one of `skills`, `commands`, `agents` or `mcps` (a folder of JSON configs for `mcps`); `path` is relative to the MANIFEST itself and may climb out of the domain root with `../` to point at a folder that lives beside it. The starter MANIFEST `crystalline domain init` scaffolds does not include this section - add it by hand once a domain actually ships something. Every artifact is authored once and translated into whichever harnesses' formats allow it, a markdown agent becoming Codex's TOML dialect and back again.
-
-Nothing ships until a person decides to: an undecided domain surfaces at session start so the agent can raise it with the person at the keyboard, then applies the answer with the `provision` MCP tool or from the terminal:
-
-```sh
-crystalline provision allow engineering   # opt in, then reconcile
-crystalline provision deny engineering    # opt out, removing anything already shipped
-crystalline provision status              # every domain's decision, every harness's installed state
-```
-
-Bare `crystalline provision` reconciles every opted-in domain into every harness this machine has onboarded. It is idempotent and safe to rerun - installing what is missing, updating what changed and retiring what a domain no longer ships. A provisioned file you edited by hand is still brought current on the next reconcile, with your edited version kept beside it as a `.bak` copy rather than lost; a foreign file Crystalline never wrote is adopted when it already matches byte for byte and otherwise left untouched, never overwritten.
-
-## Share knowledge with a team
-
-A team domain is an ordinary domain whose files also live in a GitHub repository: local markdown stays the source of truth on this machine, and an origin records which repository, subfolder and branch it tracks.
-
-Connect this machine to GitHub once:
-
-```sh
-crystalline config set github.enabled true
-crystalline connect github
-```
-
-`connect github` opens a short code to confirm at github.com/login/device, or takes a personal access token via `--token` for someone who would rather skip the browser; either way there is no git and no SSH key involved, since connecting only establishes this machine's GitHub identity. An agent does the same through the `configure` MCP tool, passing `connect: "github"` and relaying the code to the person at the keyboard.
-
-Bring a team repository in as a domain:
-
-```sh
-crystalline domain add design --origin acme/design-knowledge --branch main
-```
-
-`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository; the local folder defaults to `<domains_root>/<name>` (the domains root is `~/Documents/Crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`) and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool.
-
-From there, `crystalline origin` covers the team domain lifecycle:
-
-- **`origin status [--domain <name>] [--files]`** - where a team domain stands: ahead (by change kind, so deletions never read as new notes), behind, open and declined proposals, unresolved conflicts, and which GitHub identity this machine reads and shares as. `--files` names the unshared paths under each domain instead of only counting them.
-- **`origin update [--domain <name>]`** - bring a team domain (or every one) up to date with what the team has merged.
-- **`origin share <name> [--title <t>] [--message <m>] [--proposal <n>] [--file <path>]`** - share local changes as a proposal the team reviews on GitHub; refuses while a conflict is unresolved so the team always reviews a clean proposal. Sharing again while a proposal is open stacks a new proposal on top of it, `--proposal <n>` amends that layer instead, and `--file` (repeatable) shares only the paths you name; on a domain whose MANIFEST declares `sharing: direct` the share commits straight to the branch instead.
-- **`origin resolve <name> <path> --keep mine|theirs`** (or `--content-file <f>` for a hand-merged result) - settle a flagged conflict.
-- **`origin withdraw <name> [--proposal <n>] [--revert]`** - close a proposal on GitHub and clear its record; withdrawing a layer that is not the top one lifts its content out of the layers above and repairs the chain, and `--revert` also restores shared files that were not touched since sharing.
-- **`origin diff <name> [--path <p>]`** - see what changed in each unshared file as a unified diff of the team's copy against yours, offline; `--path` narrows it to one file and `--json` returns both sides per file.
-- **`origin discard <name> --path <p> [--path ...] [--yes]`** - put chosen unshared files back the way the team has them, offline: a modified engram gets the team's copy back, an added file is deleted, a deleted file is restored, and in a domain that reviews changes your own drafts of them are cleared. It previews first and asks; a file that changed since you looked is refused rather than overwritten, and nothing reaches GitHub.
-
-Where the forge serves stacked pull requests - github.com does, and Crystalline probes for it once per origin - a domain builds a stack rather than one long-running proposal: each share is its own focused review unit sitting on the one below, and reviewers merge bottom-up, so merging the top proposal lands the whole chain in a single click. Answering a review means amending the layer it belongs to (`--proposal <n>`, or `proposal` on the `share_changes` tool), which re-bases every layer above it automatically; withdrawing a middle layer repairs the chain the same way, and a chain wedged by a declined layer heals on the next share or withdraw. On a forge without stacked pull requests, or with `github.stacks` turned off, a domain keeps a single living proposal that sharing updates in place instead - same number, same URL.
-
-A share carries the domain's whole unshared delta by default, and can be narrowed to a subset of it: `--file <path>` on the CLI, repeated for several; a `files` array on the `share_changes` tool; per-file checkboxes in Fluid's share dialog. Where the domain shares its generated listings (see below), the `index.md` of each chosen file's own folder rides along so the repository stays browsable and no listing disagrees with the folder it describes, while a folder with nothing selected keeps its refresh for a later share; a path that is not among the domain's unshared changes refuses and names itself rather than being quietly dropped. Whatever you leave out simply stays an unshared local change. On an instance several people work in, Fluid's dialog opens with your own changes ticked, matched by the last writer each file's frontmatter records - a correctable heuristic rather than authorship enforcement, so anyone may tick or untick anything - and the line beneath the list counts what it left out, with unattributed changes and deletions counted as somebody else's; the share button carries the same count as a badge, its tooltip spelling it out as "2 of 5 unshared changes are yours" where that attribution exists. Be clear-eyed about what scoping is for on such an instance: a local edit is visible to everyone using the instance the moment it is written, because the working tree is what they all read, so choosing files decides what the team is asked to review on GitHub, not what colleagues can see. Before you share, both sides of every unshared file are one press away: in Fluid's share dialog a path opens a diff pane and a row's menu discards it, an engram page that differs from the team's copy wears an `Added` or `Changed` chip (`Draft` in a domain that reviews changes) whose menu shows the change, shares just that file or discards it, and `crystalline origin diff` and `origin discard` do the same from a terminal. Discarding never touches GitHub.
-
-Whether those listings travel at all is the domain's own choice, declared once in the MANIFEST every member holds, as frontmatter rather than a section, since it is a switch and not a list:
-
-```yaml
-generated_indexes: shared
-```
-
-A folder's `index.md` is derived from the files beside it, so either answer is defensible and the domain picks one for everybody. `local` is the default, including for a MANIFEST that says nothing: the listings are generated on each machine and stay there, never travelling with a share, never counting as unshared work and never proposed in either direction. That is what a busy team wants, because two proposals touching the same folder both regenerate that folder's listing, and without this the second one conflicts the moment the first merges. `shared` is the deliberate opposite, and the choice to make when anything other than Crystalline reads the repository: the listings travel as ordinary files, every folder stays browsable on the forge, and the repository keeps the index files an OKF bundle is expected to carry. A value that is neither word is read as `local`, never as `shared`, and `crystalline verify` reports it as `M006`.
-
-A repository that already carries committed index files keeps them when its domain moves to `local`. A share proposes nothing about them in either direction, on purpose: a file sitting right there on disk is never something to offer to delete. Clear them out of the repository by hand if you want them gone.
-
-Whether a share is reviewed at all is the domain's choice too, declared the same way:
-
-```yaml
-sharing: direct
-```
-
-`proposal` is the default, including for a MANIFEST that says nothing: every share opens a proposal the team reviews and merges on GitHub, exactly as before. `direct` commits the selected files straight onto the connected branch in one commit, authored by the identity the share goes out on (the sharer's own under `github.share_identity = personal`, the instance credential otherwise) - no branch of its own, no proposal - and refuses while any proposal is still open, since that proposal is waiting to land on the very branch. A branch whose rules refuse direct commits answers with the way out: set `sharing: proposal` again, or ask a repository admin. A value that is neither word is read as `proposal`, never as `direct`, and `crystalline verify` reports it as `M007`. The policy is read from the MANIFEST at share time, off the domain's own folder, not cached from an earlier read. A policy change that a share pulls in applies to the next share. Both switches sit on the domain page in Fluid as the "Domain policies" card, where the domain's owner changes them without opening the editor.
-
-By default every share, amend and withdrawal goes out on the one GitHub credential this machine is connected with. Set `github.share_identity` to `personal` and each of those writes goes out on the identity of the person doing it instead: proposals carry their GitHub name, so an approval is never an approval of your own identity's work, while pulls and every other read stay on the instance credential. Each person connects once, on the surface they share from: Fluid's profile card under GitHub identity for shares made in Fluid, or `crystalline connect github --personal` for the machine owner's shares from the CLI and locally attached agents (`--token <PAT>` skips the browser sign-in, and an admin sets up a bot account with `--as <account>`); until they do, sharing and withdrawing refuse with that instruction instead of falling back to the instance credential. An agent reaching the instance over HTTP MCP shares as the account it authenticated as, so where agents authenticate (`auth.mcp`) each agent's proposals carry the name of the person whose token it holds. Where they do not, the agent belongs to nobody, so it shares as the account `github.agent_identity` names - usually that bot - and its shares are refused while the setting is unset. Personal mode asks one thing of the repository: every sharer needs write access to it, since proposals are branches in the same repository and never forks, so a maintainer adds each person as a collaborator once.
-
-The same actions are MCP tools an agent calls directly: `update_domain`, `origin_status`, `share_changes`, `resolve_conflict`, `withdraw_proposal` and `discard_changes`, plus `configure` for settings and connecting. Review feedback flows back through `update_domain`, which returns each open proposal's review state and the reviewers' comments, so the agent can refine the engrams and share again into the layer that feedback belongs to, or relay the commit on a direct domain. These six need `github.enabled` turned on: while it is off they are not listed at all, so an install that never uses team domains carries none of them in its context. Turning the setting on makes them appear - from the tool, from `crystalline config set` or from Fluid's Connect button, all the same - and a client subscribed to change notifications is told the list moved. The setting is one shared switch rather than a per-client one, so every client connected at any given moment sees the same list. A client holding a list cached from before the switch went off still gets taught rather than confused: calling one of the six answers with the reason and the `configure` call that turns collaboration back on. `add_domain` is not among them: it creates domains of every kind (local, virtual, team) and is always available, though its team-domain branch still needs `github.enabled`. Sharing always ends with the agent relaying a URL to the person it is working with. On a domain that opens proposals it relays the review URL and a person merges it on GitHub; on a direct domain it relays the commit URL and nothing waits for a merge.
-
-`crystalline config show`, `set <key> <value>` and `unset <key>` read and write the same settings registry the `configure` MCP tool exposes, today `domains_root` plus the `github.*`, `service.*`, `skills.*`, `database.*` and `search.*` blocks. Every settings key also maps to a `CRYSTALLINE_*` environment variable, so a container never needs to mount this file at all - see [Configure through environment variables](docs/deployment.md#configure-through-environment-variables) for the full list. A domain's origin and the global `github` block look like this in `config.yaml`:
-
-```yaml
-domains:
-  design:
-    path: ~/Documents/Crystalline/design
-    origin:
-      repo: acme/design-knowledge   # the GitHub repository, owner/name
-      path: knowledge               # optional subfolder; absent means the repository root
-      branch: main                  # optional; absent means main
-      poll_secs: 600                # optional per-domain poll interval override
-github:
-  enabled: true                     # turns team domains on; absent means off
-  stacks: true                      # stack each share on the open proposal where the forge supports it; absent means on
-  share_identity: personal          # instance (default) shares on this machine's credential; personal shares on each person's own
-  agent_identity: share-bot         # the account whose connected identity unauthenticated HTTP agents share as in personal mode; absent refuses those shares
-  poll_secs: 300                    # background poll interval in seconds; minimum 60
-  api_url: https://github.example.com/api/v3   # GitHub Enterprise Server only
-  oauth_client_id: abc123                       # a self-hosted OAuth App, GitHub Enterprise Server only
-```
-
-### Private domains
-
-A domain does not have to be shared with the whole team to exist on a team instance. Make one private - from its Members card in Fluid, or `crystalline domain visibility <domain> private --owner <account>` from the CLI - and only its owner, the accounts invited into it and instance admins can see it at all; everyone else gets the same answer a domain nobody registered gets. Be honest about what that protects: private is a wall between accounts, not from whoever operates the machine - the CLI, running on the host, administers every domain, invited or not, exactly the way a GitHub organization owner sees every repository in it. See [Private domains](docs/deployment.md#private-domains) for membership levels and the full command set.
-
-### Review mode
-
-A domain can go a step further than shared: `review: overlay` turns its folder into reviewed truth, changed only by a merge that lands from GitHub, so the tree everyone reads stops moving the moment somebody saves. Every write in a domain like that - yours or an agent's - joins its author's own private draft instead of the file: search, read, `browse_domain`, `evolve_engrams` and the routing prompt all show your own drafts stitched into what the domain already shares, and nobody else's are visible to you. A `[[link]]` inside a draft still resolves against the shared tree only, never against another author's unshared words, so the graph an outsider walks never dead-ends into somebody's draft by accident. `share_changes` proposes exactly your own drafts, through the same review flow above; a receipt marked `draft` means the tree did not move, and only a merged proposal changes it. A reviewing domain also allows only one open proposal at a time, even where the instance's `github.stacks` setting is on: a second author's first share waits for the open one to merge, or is told to ask its author to withdraw it, rather than stacking a proposal beside it.
-
-Turn review on with `crystalline domain review <name> overlay` (or Fluid's domain card, or the `CRYSTALLINE_DOMAIN_<NAME>_REVIEW` variable below): it needs a GitHub origin, since review with nothing to propose into is a gate with no door, and a clean folder, refusing and naming the paths to share or revert first otherwise. Turn it off with `crystalline domain review <name> direct`, naming what happens to every actor's drafts - `--fold <actor>` writes theirs into the folder, `--discard <actor>` drops them - because disabling review ends every private draft in the domain, and the command prints that plan before it asks anyone to confirm it.
-
-None of this needs a second person to be worth using. A one-person instance may put a domain in review mode too: with the agent authenticating as its own person, agent and person share the same draft and the same GitHub identity, so an owner-and-agent pair gates nothing extra by default - review mode is simply the pause the owner already wanted before their own and their agent's work lands, made structural instead of a habit. Be honest about the one thing it does not stop: a file dropped straight into the folder by hand, outside any draft, still lands there - the folder is still the operator's - and `origin_status` names it under `out_of_band` rather than pretending review caught it.
-
-A draft stays private to its author, with one deliberate door out: hand somebody a draft share-link (`dl_...`) and they pass it as `share_link` on `read_engram` or `edit_engram` to open that one draft of that one engram instead of a copy of their own - a grant scoped to a single page, revocable by the author, and the only way anyone but the author sees inside a draft before it is shared. Opening the same engram in Fluid, or reading it through a share-link, may land you in a live document instead: when somebody has that page open in the editor, an agent's read and its edits go through what they are looking at rather than the file behind it, landing under their cursor and naming the agent in the participant strip for a minute after each call (a colour chip over HTTP, "owner (agent: <client>)" when the agent is a local stdio session acting as the machine owner). That holds from the CLI too - `crystalline write --overwrite` onto a page somebody has open lands in their live document rather than replacing the file behind the room, and a retirement (delete or supersede) composes into it the same quiet way. A wholesale replace through the agent tools asks first rather than landing over unsaved work, and a client that cannot be asked is refused outright instead of overwriting silently.
-
-## Keep knowledge honest
-
-`crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
-
-```yaml
-- uses: jordiboehme/crystalline/action@v0.18.4
-  with:
-    paths: knowledge/       # space-separated domain roots, default '.'
-    strict: 'false'         # promote Warning rules to Error
-    version: v0.18.4        # crystalline binary tag to download, or 'latest'
-```
-
-The action ref (`@v0.18.4`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
-
-Verify is one of three checks, and each asks a different question. `crystalline verify` asks whether the format holds. `crystalline doctor` asks whether the machinery around it - the index, the registered domains, the service - is healthy. `crystalline evolve` asks the question neither of the other two can: is the knowledge itself still true, and is it still well organized? A fourth command, the importer, brings an existing knowledge base under Crystalline in the first place:
-
-- **`crystalline evolve`** sweeps one domain or every domain for the maintenance the knowledge needs and prints a ranked queue, each finding naming the engram, the evidence it fired on and the exact next action. It sees temporal and lifecycle debt (a `valid_to` that elapsed while the status still reads current, a `stale_after` past due, long-unverified knowledge, a retirement whose replacement landed but whose old engram was never flipped, substantive work that has sat unshared in a team domain for a week), structural gaps (unresolved `[[links]]`, one-sided relation pairs, orphans, oversized engrams and stubs), the still-valid observations a retirement is about to take down with it, and redundancy (near-duplicate clusters, semantic twins - the same knowledge in different words - and drifted tags). Narrow it with `--domain`, `--family`, `--rule` or `--min-priority`, and pass `--today` to evaluate the temporal rules as of a fixed date so a run reproduces. It is read-only and detects by dates, links, graph shape and embedding similarity, never confirming a contradiction, so it hands over work to do rather than rewriting knowledge on its own - the same sweep the `evolve_engrams` tool gives an agent.
-- **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact. When a domain ships provisioned artifacts, it reports every declaring domain's decision and shipped counts and every installed harness's drift, locally edited and orphaned counts against what was last reconciled - that part, like the GitHub checks, is always report-only, `--fix` never reconciles a harness.
-- **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and records write provenance where a file carries none - all as a pure file transformation, with `--dry-run` to preview first.
-
-### Browse a domain without Crystalline
-
-Every folder of a file domain carries a generated `index.md`: a plain markdown listing of the engrams in that folder (title plus description, linked relatively) and of the subfolders below it. It is written after every write, edit, move, delete and sync, so a domain browsed in an editor, on a git forge or by any other tool navigates itself, with nothing running. The listing at the domain root additionally declares the knowledge format version with `okf_version: "0.2"`.
-
-`index.md` and `log.md` are reserved filenames: Crystalline never indexes them, never searches them, never verifies them and refuses to file an engram under either name. The log is reserved only, never generated. Turn the generated listings off with `crystalline config set index.files false`; existing files stay where they are and stay out of the index.
+![An engram in Fluid: frontmatter details, observations, typed relations and the agent's-eye view](assets/fluid-engram.jpg)
 
 ## Deployment
 
@@ -518,89 +146,12 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in |
 | [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet |
 
-## Virtual domains
-
-Most domains are folders of files. A virtual domain is the other option: its engrams live in the database, with no filesystem root. Reach for one where a filesystem is baggage rather than a feature - a container with no writable volume, a PostgreSQL backend shared across machines, or a domain you would rather not mirror to disk at all.
-
-```sh
-# Register a database-backed domain and scaffold its MANIFEST into the index.
-crystalline domain add decisions --virtual
-
-# It works with the same tools as any domain.
-crystalline write decisions "First decision" --content "captured straight into the database"
-crystalline search "captured"
-```
-
-Unregistering one is the one removal that deletes knowledge, since there is no folder left behind: `crystalline domain remove decisions --purge`, `?purge=true` on the JSON API and `purge: true` on the `remove_domain` tool all say the same thing, and without it the removal refuses and says so. Export first if you want a copy.
-
-Two commands move engrams between the two kinds of truth:
-
-- `crystalline domain import <path> --domain <name>` loads already-well-formed engram files into a virtual domain, verbatim. It is distinct from `crystalline import`, which converts a legacy tree into a *file* domain's directory.
-- `crystalline domain export <path> --domain <name>` writes any domain's engrams back out as a normal markdown folder. This is how you take a virtual domain's data out to run `crystalline verify` on it, or convert it back to files whenever you change your mind.
-
-Concurrent edits to the same virtual engram are guarded: `read_engram` returns a checksum, and passing it back as `expected_checksum` on `edit_engram` refuses the edit if the engram changed since you read it, so a stale write conflicts instead of clobbering. Omit it for last-write-wins.
-
-## Architecture
-
-```
-crystalline-core     format layer: parser, emitter, Picoschema, verify, prompt
-       |              (no async runtime, no database, no ML - stays static)
-       v
-crystalline-index    Store trait, embedded database, sync engine, search, embeddings
-       |
-       v
-crystalline-service  single-instance daemon, MCP tool router, control protocol
-       |
-       v
-crystalline (cli)    the one user-facing binary
-```
-
-Exactly one process ever holds the database open: the first `crystalline mcp` or `crystalline serve` takes an advisory lock and becomes the daemon; every later CLI command or MCP connection attaches to it over a local socket, or opens the database directly for a brief operation when no daemon is running.
-
-One principle runs through the whole stack: every domain has exactly one source of truth - markdown files on disk by default, the database itself for a [virtual domain](#virtual-domains) - and the search index is always a derived, disposable layer. `crystalline reindex --full` re-reads every file and rebuilds it at any time, and `crystalline reindex --wipe` sets a database that will not open aside and starts over, so for a file domain index corruption or a schema change is never a data-loss event. A virtual domain has no files behind it, so nothing can rebuild one: `--wipe` refuses while either your configuration or the index names a virtual domain and points at `crystalline domain export` first.
-
-## FAQ
-
-**Why not just a folder of markdown files?**
-
-It is one - that is the point. Your knowledge stays plain markdown you can read, diff and back up with anything. Crystalline adds what a folder cannot: domain routing, hybrid text-plus-semantic search, a knowledge graph and temporal filtering, so the ten-thousandth engram is exactly as findable as the tenth. [Why Crystalline](#why-crystalline) walks the ladder that leads here.
-
-**Why not a vector database or a RAG framework?**
-
-Retrieval is the easy half. A vector index finds similar text, but it does not know which domain owns a task, that a fact was superseded in March, who verified a claim or when something new is worth capturing. Crystalline treats embeddings as one ranking signal inside a knowledge system - routing, temporal semantics, provenance and a capture workflow on top of files you own, with no pipeline to operate.
-
-**Where does the name come from?**
-
-From psychology. Crystallized intelligence is the knowledge and skill a person accumulates through education and experience; its counterpart, fluid intelligence, is the on-the-spot reasoning applied to problems never seen before. A model ships with fluid intelligence in abundance and none of your crystallized kind - every session starts as a brilliant stranger. Crystalline is the crystallized half: the store of what an agent has learned, so experience compounds instead of evaporating. (An engram, fittingly, is neuroscience's word for the physical trace a memory leaves.)
-
-**When does the daemon start?**
-
-Two ways. Explicitly: `crystalline serve` runs it in the foreground, `crystalline serve --daemon` in the background. Implicitly: the first agent that connects through `crystalline mcp` attaches to a running daemon or starts one on the spot. Either way an advisory lock guarantees a single instance; every later agent, terminal or CLI command attaches to that one.
-
-**When does the daemon stop?**
-
-Only when told to. It does not exit when the last agent disconnects or on idle - watching, embedding and origin polling keep running so the index stays warm for the next session. It shuts down cleanly on `crystalline ctl shutdown`, on Ctrl-C in a foreground `serve` and on SIGTERM (which is how the container image stops). On the way out it releases its host locks and removes its socket and lock files.
-
-**How do I stop it manually?**
-
-`crystalline ctl shutdown` from any terminal asks the running daemon to stop cleanly over the local socket. If a crash ever leaves a stale lock or socket file behind, `crystalline doctor --fix` cleans them up. A daemon that is still alive but has stopped answering is replaced automatically by the next client that connects, and `crystalline doctor --fix` forces the same replacement on the spot.
-
-**Is the HTTP endpoint authenticated?**
-
-Not yet - the MCP transport over HTTP is unauthenticated regardless of bind address, and that endpoint is now on by default at `127.0.0.1:7411`, so on a shared machine any local process can reach MCP there; `crystalline config set service.http false` (or `CRYSTALLINE_SERVICE_HTTP=false`) turns the endpoint off. The web UI and the JSON API on that same port are a separate surface with accounts of their own: the browser shell is served to anyone who connects, while every request for knowledge needs a session, and the first visit to an instance with no accounts is what creates the first one, see [Web UI from the daemon](docs/deployment.md#web-ui-from-the-daemon). That is the trade on the `127.0.0.1` default; the container image binds `0.0.0.0` (see [Run in a container](docs/deployment.md#run-in-a-container)) so agents on the host can reach it, so treat the network boundary around the container (a private network, a reverse proxy, firewall rules) as the access control until built-in authentication ships. It does validate the request `Host` header to block DNS rebinding: loopback is accepted by default, and any other hostname (a reverse proxy, a LAN name, a compose service-name) must be added with `crystalline config set service.allowed_hosts <host>` (or `CRYSTALLINE_SERVICE_ALLOWED_HOSTS`) so every daemon on the machine accepts it, however it was started; `serve --allowed-host` is the per-invocation override, for that one process only (see [Configure through environment variables](docs/deployment.md#configure-through-environment-variables)).
-
-**Where does my knowledge actually live?**
-
-In your domain folders, as plain markdown you can read, edit and back up with anything. By default those folders sit under `~/Documents/Crystalline`, one per domain, which is where a domain lands when nobody names a path; a folder you registered yourself lives where you put it, and the `domains_root` setting moves the default. Everything Crystalline derives from it is disposable: the search index lives in the state directory and `crystalline reindex --full` rebuilds it from the files at any time. The config file, the index and the model cache live in the platform config, state and cache directories (`~/.config/crystalline`, `~/.local/state/crystalline` and `~/.cache/crystalline` on Linux and macOS).
-
-**Do I need git to share knowledge with a team?**
-
-No. Team domains talk to GitHub directly over its API - no git, no gh, no local clones. Members connect once with a browser code and Crystalline handles the rest.
-
 ## Go deeper
 
-- [The Crystalline Playbook](docs/playbook.md) - the whole workflow by example: one running dataset from first capture through querying, reconciling, retiring and team sharing.
-- [Deployment](docs/deployment.md) - every scenario from a laptop to an air-gapped server, one diagram each.
+- The Crystalline Handbook is the book-length guide: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from. Read it online at https://jordiboehme.github.io/crystalline/, or download the [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf), the [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub) or the single-file [Markdown](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.md) edition.
+- [The docs](docs/README.md): setup per harness, how an agent learns, teams, verify and evolve, virtual domains, architecture.
+- [FAQ](docs/faq.md): the short answers, and why not just a folder of files.
+- [Deployment](docs/deployment.md): every scenario from a laptop to an air-gapped server, one diagram each.
 - Found a rough edge or a missing piece? [Open an issue](https://github.com/jordiboehme/crystalline/issues) - and if Crystalline made your agent a better peer, a star helps others find it.
 
 ## Support
