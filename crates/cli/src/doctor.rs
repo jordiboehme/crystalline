@@ -349,10 +349,14 @@ pub struct HarnessDoctor {
     /// Whether the `UserPromptSubmit` recall hook is present. Every harness
     /// has a prompt hook entry to check for as of the 2026-09-21 ruling
     /// (Copilot's copy included, though inert - see
-    /// [`crate::install::prompt_hook_command`]), so this is `Some` whenever
-    /// the settings file parses; `None` only when it does not, mirroring how
-    /// `session_start_hook` and `stop_hook` answer `false` for that same
-    /// case.
+    /// [`crate::install::prompt_hook_command`] and
+    /// [`crate::install::prompt_hook_output_is_honoured`]), so `None` is
+    /// reserved for a harness [`crate::install::prompt_hook_command`]
+    /// answers `None` for (none today); a settings file that fails to parse
+    /// reads as `Some(false)`, exactly like `session_start_hook` and
+    /// `stop_hook` answer plain `false` for that same case, rather than as
+    /// `None` - a corrupt file is "checked, found absent (we could not read
+    /// it)", not "nothing to check here".
     pub prompt_hook: Option<bool>,
     /// How many of the four managed skills have a `SKILL.md` at this
     /// harness's skills folder, whether or not its content still matches the
@@ -1519,7 +1523,7 @@ fn check_one_harness(
                 }),
                 None,
             ),
-            Err(e) => (false, false, None, Some(e.to_string())),
+            Err(e) => (false, false, Some(false), Some(e.to_string())),
         };
 
     let recorded_hash: std::collections::HashMap<&str, &str> = entry
@@ -1860,7 +1864,10 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
 /// never enters the "partial setup" count: Copilot's copy is permanently
 /// inert rather than merely not yet installed, so neither its presence nor
 /// its absence should ever nudge a person to "fix" a setup that already is
-/// what it can be.
+/// what it can be. Which harness that is comes from
+/// [`install::prompt_hook_output_is_honoured`], never a string compare on
+/// `h.name` here - the fact belongs beside `prompt_hook_command`, not
+/// duplicated in the renderer.
 fn hook_lines(h: &HarnessDoctor) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -1875,10 +1882,15 @@ fn hook_lines(h: &HarnessDoctor) -> String {
         "    Stop hook: {}\n",
         if h.stop_hook { "present" } else { "absent" }
     ));
-    let is_copilot = h.name == "copilot";
+    // Unrecognized names never reach doctor (every entry comes from
+    // `check_harnesses`'s fixed `HarnessKind` list), so this defaults to
+    // "honoured" only as a defensive fallback for a hand-built fixture.
+    let honoured = HarnessKind::from_id(&h.name)
+        .map(install::prompt_hook_output_is_honoured)
+        .unwrap_or(true);
     match h.prompt_hook {
         Some(present) => {
-            let note = if present && is_copilot {
+            let note = if present && !honoured {
                 " (Copilot does not honour a config-file prompt hook's output today)"
             } else {
                 ""
@@ -1889,15 +1901,24 @@ fn hook_lines(h: &HarnessDoctor) -> String {
             ));
         }
         None => {
+            // Unreachable today: every harness `check_one_harness` builds a
+            // report for gets a prompt hook command
+            // ([`install::prompt_hook_command`] is `Some` for all three),
+            // and a parse error reads as `Some(false)`, not `None` - see
+            // `HarnessDoctor::prompt_hook`'s doc. Kept as a real match arm
+            // rather than a `.unwrap_or(...)`, so a future harness with no
+            // `UserPromptSubmit`-shaped event at all (a `None` from
+            // `prompt_hook_command` itself) renders honestly instead of
+            // panicking.
             out.push_str(
-                "    UserPromptSubmit hook: not available (this harness drops a prompt hook's output)\n",
+                "    UserPromptSubmit hook: not available (this harness has no UserPromptSubmit output channel)\n",
             );
         }
     }
-    let applicable: [Option<bool>; 3] = if is_copilot {
-        [Some(h.session_start_hook), Some(h.stop_hook), None]
-    } else {
+    let applicable: [Option<bool>; 3] = if honoured {
         [Some(h.session_start_hook), Some(h.stop_hook), h.prompt_hook]
+    } else {
+        [Some(h.session_start_hook), Some(h.stop_hook), None]
     };
     let present = applicable.iter().flatten().filter(|p| **p).count();
     let expected = applicable.iter().flatten().count();

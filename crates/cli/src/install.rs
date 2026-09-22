@@ -133,6 +133,18 @@ pub(crate) fn prompt_hook_command(harness: HarnessKind) -> Option<String> {
     Some(format!("{PROMPT_COMMAND} --harness {}", harness.id()))
 }
 
+/// Whether a harness actually surfaces the `UserPromptSubmit` hook's stdout
+/// to the person it runs for - the one fact `crystalline doctor` needs to
+/// decide whether to add the "inert" note beside a present prompt hook and
+/// whether that hook counts toward its "partial setup" hint. `false` only
+/// for Copilot today, for the reason [`prompt_hook_command`]'s doc gives;
+/// kept as its own predicate (rather than a string compare on a harness id
+/// scattered across call sites) so the single fact lives in one place next
+/// to the function that already carries it.
+pub(crate) fn prompt_hook_output_is_honoured(harness: HarnessKind) -> bool {
+    !matches!(harness, HarnessKind::Copilot)
+}
+
 /// The `SessionStart` matcher: re-route on a fresh start, after `/clear` and
 /// after a compaction. `resume` is deliberately excluded, since a resumed
 /// transcript already carries the earlier routing block.
@@ -2726,6 +2738,19 @@ mod tests {
             );
             assert!(is_own_spelling(&command));
         }
+    }
+
+    /// The one predicate `doctor` reads to decide whether a present prompt
+    /// hook is worth an "inert" note and whether it counts toward "partial
+    /// setup": Copilot alone answers `false` today, whether or not it also
+    /// answers `Some` from `prompt_hook_command` (the two questions are
+    /// separate - a harness could in principle get an entry written and
+    /// still not have that entry do anything).
+    #[test]
+    fn prompt_hook_output_is_honoured_is_false_for_copilot_alone() {
+        assert!(prompt_hook_output_is_honoured(HarnessKind::ClaudeCode));
+        assert!(prompt_hook_output_is_honoured(HarnessKind::Codex));
+        assert!(!prompt_hook_output_is_honoured(HarnessKind::Copilot));
     }
 
     #[test]

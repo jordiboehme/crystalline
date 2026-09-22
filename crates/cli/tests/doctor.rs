@@ -1116,6 +1116,12 @@ fn harnesses_section_counts_a_corrupt_settings_file_as_a_problem() {
         claude["settings_parse_error"].is_string(),
         "a corrupt settings file must report a parse error: {report}"
     );
+    // A parse error reads as `Some(false)`, exactly like `session_start_hook`
+    // and `stop_hook` answer plain `false` - "checked, could not read it",
+    // never the `null` reserved for a harness with no prompt-hook channel.
+    assert_eq!(claude["session_start_hook"], serde_json::json!(false));
+    assert_eq!(claude["stop_hook"], serde_json::json!(false));
+    assert_eq!(claude["prompt_hook"], serde_json::json!(false));
 
     let human = {
         let mut cmd = bin();
@@ -1207,6 +1213,10 @@ fn harnesses_section_counts_a_corrupt_copilot_file_as_a_problem() {
         copilot["settings_parse_error"].is_string(),
         "a corrupt owned hooks file must report a parse error: {report}"
     );
+    // Copilot's prompt hook being permanently inert is a separate fact from
+    // "could this file be read" - a parse error still reads as `Some(false)`,
+    // never `null`.
+    assert_eq!(copilot["prompt_hook"], serde_json::json!(false));
 
     let _ = std::fs::remove_dir_all(&home);
 }
