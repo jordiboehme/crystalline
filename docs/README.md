@@ -19,3 +19,30 @@ The [Crystalline Handbook](https://jordiboehme.github.io/crystalline/) is the lo
 | [Architecture](architecture.md) | The crates, the daemon and the one source of truth |
 | [Deployment](deployment.md) | Every scenario with a diagram, the container image and the environment variables |
 | [FAQ](faq.md) | Short answers, and why not just a folder of files |
+
+## What to say
+
+Every step is a conversation. The rows use the two domains from the README's Get started, `books` and `work`.
+
+| To do this | Say to your agent |
+|---|---|
+| Commission a domain | "Create a new Crystalline domain called books for what I read." |
+| Retire a whole domain | "We are done with the work domain - unregister it, the files can stay." |
+| Capture a fact | "Learn this: the deploy script needs the staging flag first." |
+| Recall, scoped | "What do I like in a novel, going by books?" |
+| Recall, everywhere | "Any single points of failure we should worry about?" |
+| Walk the graph | "Walk out from the deploy decision and show what connects." |
+| Recall what was true then | "Which deploy setup applied last June?" |
+| Catch up | "What changed while I was away?" |
+| Ingest a source | "Read this release page and capture only what affects us." |
+| Correct a fact | "Update the timeout value, do not start a new engram." |
+| Retire a fact | "The old queue setup is retired - supersede it, keep why." |
+| Split before retiring | "That routine is over, but the backup step still holds - split it out first." |
+| Tidy vocabulary | "Have our database tags drifted?" |
+| Ask what needs work | "Sweep work and tell me what the archive needs." |
+| Share with the team | "Share the deploy findings as a proposal for review." |
+| Share part of it | "Share only the deploy engram to work and keep the rest local." |
+| Answer a review | "Spell out the timeout value and update proposal 1." |
+| Withdraw a proposal | "Withdraw the work proposal and keep my local edits." |
+| Turn on review mode | "Put work in review mode - every write should land as a private draft." |
+| Turn off review mode | "Take work out of review mode, fold Bob's draft and drop mine." |

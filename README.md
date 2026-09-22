@@ -222,8 +222,6 @@ crystalline status
 
 Engrams written through Crystalline are indexed immediately; `crystalline sync` only picks up files created outside it (an editor, a `git pull`) when no daemon is watching them. Edit the domain's `MANIFEST.md` `## Scope` and `## When to Use` sections so routing describes it accurately - that file is what the session prompt and an agent's routing decisions read (see [Session onboarding](#session-onboarding)).
 
-[The Crystalline Playbook](docs/playbook.md) teaches the whole workflow by example, a use-case course over one running dataset through recording, querying, ingesting, reconciling, retiring and sharing knowledge.
-
 ## Session onboarding
 
 Every MCP client is onboarded automatically: the crystalline server's instructions, returned when a client connects, carry a live routing block - one line per registered domain summarizing when to use it, plus the behavior rules (narrow question -> search that domain; broad question -> sweep all of them; writes always name a domain explicitly). The block names the exact crystalline tools each rule refers to (`search_engrams`, `write_engram` and the rest), so an agent with several MCP servers connected knows which tool on which server to call.
@@ -599,7 +597,7 @@ No. Team domains talk to GitHub directly over its API - no git, no gh, no local 
 
 ## Go deeper
 
-- [The Crystalline Playbook](docs/playbook.md) - the whole workflow by example: one running dataset from first capture through querying, reconciling, retiring and team sharing.
+- [The docs](docs/README.md): setup per harness, how an agent learns, teams, verify and evolve, virtual domains, architecture.
 - [Deployment](docs/deployment.md) - every scenario from a laptop to an air-gapped server, one diagram each.
 - Found a rough edge or a missing piece? [Open an issue](https://github.com/jordiboehme/crystalline/issues) - and if Crystalline made your agent a better peer, a star helps others find it.
 
