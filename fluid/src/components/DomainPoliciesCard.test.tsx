@@ -188,6 +188,23 @@ describe("the domain policies card", () => {
     ).toBeVisible();
   });
 
+  it("says nothing about a declaration the registry knows, whatever holds", async () => {
+    serve({
+      "/domains/eng/manifest": () =>
+        manifestWith({
+          sharing: { declared: "direct", effective: "proposal" },
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await policiesCard();
+
+    // A known word is a known word: whether it is also what holds is the
+    // server's business, and saying "not a known value" about it would be a
+    // lie the caller cannot check.
+    expect(within(card).queryByText(/is not a known value/)).toBeNull();
+  });
+
   it("posts a generated_indexes change at once and takes the answer into the manifest query", async () => {
     const patched = vi.fn(() =>
       manifestWith({
@@ -220,7 +237,7 @@ describe("the domain policies card", () => {
     ).toBeVisible();
   });
 
-  it("arms an inline confirmation for sharing: direct, posts on confirm and reverts with focus on Keep", async () => {
+  it("arms an inline confirmation for sharing: direct, posts on confirm and hands the focus back either way", async () => {
     const patched = vi.fn(() =>
       manifestWith({ sharing: { declared: "direct", effective: "direct" } }),
     );
@@ -250,6 +267,13 @@ describe("the domain policies card", () => {
     expect(select).toHaveFocus();
 
     await userEvent.selectOptions(select, "direct");
+    // The press itself is what is watched rather than the resting
+    // `document.activeElement`: this path takes the confirm button out and
+    // then disables the select while the write is in flight, and jsdom lands
+    // the focus back on the select either way, so only the call the handler
+    // makes tells the two apart. A browser does not: there the focus falls to
+    // the document unless the handler hands it back.
+    const handedBack = vi.spyOn(select, "focus");
     await userEvent.click(
       within(card).getByRole("button", { name: "Turn on direct sharing" }),
     );
@@ -259,6 +283,7 @@ describe("the domain policies card", () => {
     expect(sentBody("/domains/eng/manifest", "PATCH")).toEqual({
       sharing: "direct",
     });
+    expect(handedBack).toHaveBeenCalled();
   });
 
   it("says when the write landed in a draft, and shows a refusal and reverts", async () => {

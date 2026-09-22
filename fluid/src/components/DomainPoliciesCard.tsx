@@ -18,7 +18,8 @@
  *
  * One key asks before it changes: `sharing: direct` removes the review step
  * for everybody, so it arms the two-step confirmation and the select goes
- * back to the held value on Keep with focus back on it. Every other change
+ * back to the held value on Keep. Either press ends the question, so either
+ * press hands the focus back to the select it came from. Every other change
  * posts at once. After a write the answer's `policies` go straight into the
  * manifest query, so the card holds the new values without a second read.
  */
@@ -156,9 +157,12 @@ export function DomainPoliciesCard({
             const rowId = `${HEADING_ID}-${row.key}`;
             // A value the frontmatter carries that the registry does not
             // know: the server reads it as the default and says both words,
-            // so the row can say what the domain is actually doing.
+            // so the row can say what the domain is actually doing. The
+            // registry's own values are what decides that, never "declared
+            // differs from effective" - a known word the server reads
+            // differently is the server's business, not a typo to report.
             const unrecognized =
-              row.declared !== null && row.declared !== row.effective;
+              row.declared !== null && !row.values.includes(row.declared);
             const shown = arming === row.key ? "direct" : row.effective;
             return (
               // The roles are spelled out because the row stacks below `sm`:
