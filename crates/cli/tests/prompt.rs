@@ -689,3 +689,34 @@ fn prompt_system_domain_flag_cannot_undo_a_workspace_exclusion() {
         "the --domain help states the guarantee this test proves: {help}"
     );
 }
+
+/// The text format reads the SessionStart payload too now (it is what resets
+/// the per-prompt recall list on a clear or a compaction), so its stdin read
+/// has to be exactly as tolerant as the copilot one: garbage on stdin still
+/// prints the routing block, byte for byte what the snapshot holds.
+#[test]
+fn prompt_system_text_format_tolerates_garbage_stdin() {
+    let output = Command::cargo_bin("crystalline")
+        .unwrap()
+        .current_dir(fixtures_dir().join("prompt-fixture"))
+        .args([
+            "prompt",
+            "system",
+            "--workspace",
+            "workspace",
+            "--config",
+            "config.yaml",
+        ])
+        .write_stdin("{ not json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).unwrap();
+    // The same stored snapshot `prompt_text_matches_snapshot` asserts, named
+    // explicitly so this is byte-identity with that expectation rather than a
+    // second snapshot that could drift away from it.
+    insta::assert_snapshot!("prompt_text_matches_snapshot", text);
+}

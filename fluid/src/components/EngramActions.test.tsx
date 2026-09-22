@@ -18,6 +18,9 @@ const ENGRAM = {
   permalink: "notes/deep/gamma",
   title: "Gamma",
   url: "crystalline://eng/notes/deep/gamma",
+  // No page address from the server here, so Share falls back to this
+  // browser's own origin, which is what it always did.
+  webUrl: null,
   path: "notes/deep/gamma.md",
   content: "---\ntitle: Gamma\n---\n\nBody.\n",
   checksum: "abc",

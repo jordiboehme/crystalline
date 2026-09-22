@@ -1082,6 +1082,7 @@ fn harnesses_section_reports_both_hooks_present_after_install() {
     assert_eq!(claude["settings_parse_error"], serde_json::Value::Null);
     assert_eq!(claude["session_start_hook"], serde_json::json!(true));
     assert_eq!(claude["stop_hook"], serde_json::json!(true));
+    assert_eq!(claude["prompt_hook"], serde_json::json!(true));
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1115,6 +1116,12 @@ fn harnesses_section_counts_a_corrupt_settings_file_as_a_problem() {
         claude["settings_parse_error"].is_string(),
         "a corrupt settings file must report a parse error: {report}"
     );
+    // A parse error reads as `Some(false)`, exactly like `session_start_hook`
+    // and `stop_hook` answer plain `false` - "checked, could not read it",
+    // never the `null` reserved for a harness with no prompt-hook channel.
+    assert_eq!(claude["session_start_hook"], serde_json::json!(false));
+    assert_eq!(claude["stop_hook"], serde_json::json!(false));
+    assert_eq!(claude["prompt_hook"], serde_json::json!(false));
 
     let human = {
         let mut cmd = bin();
@@ -1169,6 +1176,10 @@ fn harnesses_section_reports_copilot_hooks_present_after_install() {
     assert_eq!(copilot["settings_parse_error"], serde_json::Value::Null);
     assert_eq!(copilot["session_start_hook"], serde_json::json!(true));
     assert_eq!(copilot["stop_hook"], serde_json::json!(true));
+    // Ruled 2026-09-21: Copilot's prompt hook is written too, in the same
+    // shape as Claude Code and Codex - present, not the `null` a harness
+    // with no output channel at all would report.
+    assert_eq!(copilot["prompt_hook"], serde_json::json!(true));
 
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1202,6 +1213,10 @@ fn harnesses_section_counts_a_corrupt_copilot_file_as_a_problem() {
         copilot["settings_parse_error"].is_string(),
         "a corrupt owned hooks file must report a parse error: {report}"
     );
+    // Copilot's prompt hook being permanently inert is a separate fact from
+    // "could this file be read" - a parse error still reads as `Some(false)`,
+    // never `null`.
+    assert_eq!(copilot["prompt_hook"], serde_json::json!(false));
 
     let _ = std::fs::remove_dir_all(&home);
 }

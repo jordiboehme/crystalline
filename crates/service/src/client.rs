@@ -1559,36 +1559,53 @@ pub(crate) async fn dispatch_engine(
     tool: &str,
     args: Value,
 ) -> anyhow::Result<Value> {
+    // Where a caller on this machine opens a page: the CLI and the control
+    // socket are both same-machine, so the daemon's own bind is the answer and
+    // there is no request to derive one from. Read once, because every arm
+    // below that hands back one engram hands back the same base with it.
+    let base = engine.local_web_base();
     let v = match tool {
         // A CLI-driven write is not an MCP client, so it identifies itself as
         // the CLI process; `identity.actor` still wins when it is set.
         "write_engram" => {
-            engine
+            let mut v = engine
                 .write_engram_as(
                     &decode::<WriteParams>(args)?,
                     Some(CLI_ACTOR),
                     &Scope::Unrestricted,
                 )
-                .await?
+                .await?;
+            crate::web_url::attach_engram_url(&mut v, &base);
+            v
         }
         "read_engram" => {
-            engine
+            let mut v = engine
                 .read_engram(&decode::<ReadParams>(args)?, &Scope::Unrestricted)
-                .await?
+                .await?;
+            crate::web_url::attach_engram_url(&mut v, &base);
+            v
         }
         "edit_engram" => {
-            engine
+            let mut v = engine
                 .edit_engram_as(
                     &decode::<EditParams>(args)?,
                     Some(CLI_ACTOR),
                     &Scope::Unrestricted,
                 )
-                .await?
+                .await?;
+            crate::web_url::attach_engram_url(&mut v, &base);
+            v
         }
         "move_engram" => {
-            engine
+            let mut v = engine
                 .move_engram(&decode::<MoveParams>(args)?, &Scope::Unrestricted)
-                .await?
+                .await?;
+            // The destination and nowhere else: `from` is the address the
+            // engram stopped answering to.
+            if let Some(to) = v.get_mut("to") {
+                crate::web_url::attach_engram_url(to, &base);
+            }
+            v
         }
         "split_engram" => {
             engine
@@ -1669,6 +1686,17 @@ fn decode<T: DeserializeOwned>(args: Value) -> anyhow::Result<T> {
 /// Send a ctl command if a daemon is running, else `None`.
 pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
     match try_attach().await {
+        Some(conn) => Ok(Some(ctl_exchange(conn, cmd).await?)),
+        None => Ok(None),
+    }
+}
+
+/// [`ctl_if_running`] over a passive attach: the answer of a daemon that is
+/// already there, `None` when none is, and never a displacement on the way.
+/// For callers on a latency budget that must not pay for a takeover - the
+/// per-prompt recall hook is the one today.
+pub async fn ctl_if_running_passive(cmd: Value) -> anyhow::Result<Option<Value>> {
+    match crate::instance::try_attach_passive().await {
         Some(conn) => Ok(Some(ctl_exchange(conn, cmd).await?)),
         None => Ok(None),
     }

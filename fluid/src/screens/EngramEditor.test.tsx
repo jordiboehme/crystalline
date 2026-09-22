@@ -368,6 +368,21 @@ describe("the engram editor", () => {
     expect(copy.parentElement?.parentElement?.textContent).toContain("alpha");
   });
 
+  it("draws no section links in the buffer", async () => {
+    serveEditor();
+
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByRole("heading", { name: "Editing Alpha" });
+
+    // The editor is a buffer with its own preview decorations and never
+    // mounts the reading renderer at all, so there is nothing here to link
+    // into: an anchor names a heading on a page, and this is the text before
+    // it is one.
+    expect(
+      screen.queryByRole("button", { name: "Link to this section" }),
+    ).toBeNull();
+  });
+
   it("wears the Raw switch as a glyph, named rather than lettered", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");

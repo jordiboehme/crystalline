@@ -881,6 +881,11 @@ pub struct Engine {
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The origin rule the HTTP surface was built with, installed once by
+    // `http_base`. It answers what this instance is called, for a local caller
+    // and an HTTP one alike; absent in every process that serves no HTTP
+    // surface, which is the same set that never had one to disagree with.
+    web_origin: std::sync::OnceLock<Arc<crate::rest::OriginRule>>,
     // The sessions currently working inside somebody else's draft. Always
     // present rather than a `OnceLock` like the resolver above: it is a plain
     // in-memory registry with no store behind it, so an engine that nobody
@@ -1564,6 +1569,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
         }
     }
@@ -1715,6 +1721,44 @@ impl Engine {
     /// possibly different, store.
     pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
         let _ = self.domain_access.set(access);
+    }
+
+    /// The origin rule the HTTP surface was built with, installed once by
+    /// `http_base`. It is what answers a local caller's `service.public_url`
+    /// (the value the daemon STARTED with, so a runtime configure of the key
+    /// changes nothing until the next start, on every surface at once) and an
+    /// HTTP caller's derived origin.
+    pub fn set_web_origin(&self, rule: Arc<crate::rest::OriginRule>) {
+        let _ = self.web_origin.set(rule);
+    }
+
+    /// Where this instance's pages are, for a caller on this machine: the
+    /// stdio bridge, the daemon's own socket, the CLI through the control
+    /// socket.
+    pub fn local_web_base(&self) -> crate::web_url::WebBase {
+        let config = self.config.read().unwrap();
+        // With a rule installed its snapshot is the answer; without one (a
+        // standalone CLI run, the embedded stack) there is no HTTP surface to
+        // disagree with, so the live config is read.
+        let public_url = match self.web_origin.get() {
+            Some(rule) => rule.public_url().map(str::to_string),
+            None => config.service_public_url().map(str::to_string),
+        };
+        crate::web_url::local_base(
+            public_url.as_deref(),
+            crate::instance::serve_intent().map(|intent| &intent.http),
+            config.ui_enabled(),
+        )
+    }
+
+    /// Where this instance's pages are, for the HTTP caller these headers came
+    /// from.
+    pub fn request_web_base(&self, headers: &axum::http::HeaderMap) -> crate::web_url::WebBase {
+        let ui_enabled = self.config.read().unwrap().ui_enabled();
+        match self.web_origin.get() {
+            Some(rule) => crate::web_url::request_base(rule, headers, ui_enabled),
+            None => crate::web_url::WebBase::Unresolved,
+        }
     }
 
     /// The private domains `scope` may not see, or `None` for no filtering at

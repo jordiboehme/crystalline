@@ -15,11 +15,13 @@
 //! machine is connected to GitHub and, per team domain, whether its local
 //! origin state is present and its base snapshot still matches what was
 //! recorded (`verify_base`); (h) which `CRYSTALLINE_*` environment variables
-//! are active, purely informational; (i) for Claude Code and Codex, whether
-//! either coding-harness integration `crystalline install` wires up leaves
-//! any trace on disk and, when it does, whether its settings/hooks file
-//! parses and carries the `SessionStart` and `Stop` hooks and how many of
-//! the four managed skills are installed or locally modified (against the
+//! are active, purely informational; (i) for Claude Code, Codex and Copilot,
+//! whether the coding-harness integration `crystalline install` wires up
+//! leaves any trace on disk and, when it does, whether its settings/hooks
+//! file parses and carries the `SessionStart`, `Stop` and `UserPromptSubmit`
+//! hooks (Copilot's `UserPromptSubmit` copy is reported present but noted
+//! inert - a config-file prompt hook's output is dropped there) and how
+//! many of the four managed skills are installed or locally modified (against the
 //! install receipt when one exists) and whether a receipt version skew or
 //! retired leftovers await the next session-start refresh - filesystem
 //! only, with no shell-out to the harness's own CLI, so this check stays
@@ -319,17 +321,17 @@ pub struct EnvironmentDoctor {
 }
 
 /// One coding harness's onboarding trace: whether its settings/hooks file
-/// exists, parses, carries our two managed hooks and how many of the four
+/// exists, parses, carries our three managed hooks and how many of the four
 /// managed skills are installed at its skills folder. Checked purely from
 /// the filesystem, reusing `install`'s own presence predicate and skill
-/// list, with no shell-out to the harness's own CLI (`claude` or `codex`),
-/// so this stays fast and works offline; user scope only, since doctor
-/// reports on the ambient environment rather than any one repository's
-/// `--project` setup.
+/// list, with no shell-out to the harness's own CLI (`claude`, `codex` or
+/// `copilot`), so this stays fast and works offline; user scope only, since
+/// doctor reports on the ambient environment rather than any one
+/// repository's `--project` setup.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HarnessDoctor {
-    /// The harness's stable identifier, `"claude-code"` or `"codex"` - the
-    /// same spelling `crystalline install <name>` takes.
+    /// The harness's stable identifier, `"claude-code"`, `"codex"` or
+    /// `"copilot"` - the same spelling `crystalline install <name>` takes.
     pub name: String,
     /// The settings/hooks file this harness reads (`settings.json` for
     /// Claude Code, `hooks.json` for Codex).
@@ -348,6 +350,18 @@ pub struct HarnessDoctor {
     pub session_start_hook: bool,
     /// Whether the `Stop` capture-nudge hook is present.
     pub stop_hook: bool,
+    /// Whether the `UserPromptSubmit` recall hook is present. Every harness
+    /// has a prompt hook entry to check for as of the 2026-09-21 ruling
+    /// (Copilot's copy included, though inert - see
+    /// [`crate::install::prompt_hook_command`] and
+    /// [`crate::install::prompt_hook_output_is_honoured`]), so `None` is
+    /// reserved for a harness [`crate::install::prompt_hook_command`]
+    /// answers `None` for (none today); a settings file that fails to parse
+    /// reads as `Some(false)`, exactly like `session_start_hook` and
+    /// `stop_hook` answer plain `false` for that same case, rather than as
+    /// `None` - a corrupt file is "checked, found absent (we could not read
+    /// it)", not "nothing to check here".
+    pub prompt_hook: Option<bool>,
     /// How many of the four managed skills have a `SKILL.md` at this
     /// harness's skills folder, whether or not its content still matches the
     /// embedded copy.
@@ -1479,12 +1493,13 @@ fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
 }
 
 /// One harness's diagnostics: read its settings/hooks file read-only, check
-/// both managed hooks via [`install::harness_hook_present`] (which knows
-/// each harness's file shape and session start command) and count how many
-/// of [`install::managed_skills`] are present (and, of those, how many were
-/// locally modified against either the embedded copy or `entry`'s recorded
-/// hash) at its skills folder. `entry` is this harness's user-scope install
-/// receipt record, `None` when it was never installed or predates receipts.
+/// the three managed hooks via [`install::harness_hook_present`] (which
+/// knows each harness's file shape and session start command) and count how
+/// many of [`install::managed_skills`] are present (and, of those, how many
+/// were locally modified against either the embedded copy or `entry`'s
+/// recorded hash) at its skills folder. `entry` is this harness's user-scope
+/// install receipt record, `None` when it was never installed or predates
+/// receipts.
 fn check_one_harness(
     harness: HarnessKind,
     entry: Option<&receipt::InstallRecord>,
@@ -1492,7 +1507,7 @@ fn check_one_harness(
     let paths = harness_paths(harness, false);
     let settings_present = paths.settings.is_file();
 
-    let (session_start_hook, stop_hook, settings_parse_error) =
+    let (session_start_hook, stop_hook, prompt_hook, settings_parse_error) =
         match install::read_settings(&paths.settings) {
             Ok(root) => (
                 install::harness_hook_present(
@@ -1502,9 +1517,17 @@ fn check_one_harness(
                     install::session_start_command(harness),
                 ),
                 install::harness_hook_present(harness, &root, "Stop", install::STOP_COMMAND),
+                install::prompt_hook_command(harness).map(|_| {
+                    install::harness_hook_present(
+                        harness,
+                        &root,
+                        "UserPromptSubmit",
+                        install::PROMPT_COMMAND,
+                    )
+                }),
                 None,
             ),
-            Err(e) => (false, false, Some(e.to_string())),
+            Err(e) => (false, false, Some(false), Some(e.to_string())),
         };
 
     let recorded_hash: std::collections::HashMap<&str, &str> = entry
@@ -1567,6 +1590,7 @@ fn check_one_harness(
         settings_parse_error,
         session_start_hook,
         stop_hook,
+        prompt_hook,
         skills_installed,
         skills_modified,
         receipt_version: entry.map(|e| e.version.clone()),
@@ -1865,6 +1889,85 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
 /// beside a model id.
 fn mb(bytes: u64) -> String {
     format!("{} MB", bytes / 1_000_000)
+}
+
+/// The `SessionStart`/`Stop`/`UserPromptSubmit` hook lines and the trailing
+/// "partial setup" notice, exactly as [`render_human`] prints them under a
+/// harness's settings-file line. Factored out so a test can exercise the
+/// rendering without building a whole [`DoctorReport`].
+///
+/// Copilot's `UserPromptSubmit` hook renders like the other two harnesses'
+/// present/absent line, but carries a trailing note on why it does nothing
+/// today whether the entry is present or absent (a hand-deleted entry is
+/// exactly as inert as a present one, so the note stays), and it never
+/// enters the "partial setup" count: Copilot's copy is permanently inert
+/// rather than merely not yet installed, so neither its presence nor its
+/// absence should ever nudge a person to "fix" a setup that already is what
+/// it can be. Which harness that is comes from
+/// [`install::prompt_hook_output_is_honoured`], never a string compare on
+/// `h.name` here - the fact belongs beside `prompt_hook_command`, not
+/// duplicated in the renderer.
+fn hook_lines(h: &HarnessDoctor) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "    SessionStart hook: {}\n",
+        if h.session_start_hook {
+            "present"
+        } else {
+            "absent"
+        }
+    ));
+    out.push_str(&format!(
+        "    Stop hook: {}\n",
+        if h.stop_hook { "present" } else { "absent" }
+    ));
+    // Unrecognized names never reach doctor (every entry comes from
+    // `check_harnesses`'s fixed `HarnessKind` list), so this defaults to
+    // "honoured" only as a defensive fallback for a hand-built fixture.
+    let honoured = HarnessKind::from_id(&h.name)
+        .map(install::prompt_hook_output_is_honoured)
+        .unwrap_or(true);
+    match h.prompt_hook {
+        Some(present) => {
+            let note = if !honoured {
+                " (Copilot does not honour a config-file prompt hook's output today)"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "    UserPromptSubmit hook: {}{note}\n",
+                if present { "present" } else { "absent" }
+            ));
+        }
+        None => {
+            // Unreachable today: every harness `check_one_harness` builds a
+            // report for gets a prompt hook command
+            // ([`install::prompt_hook_command`] is `Some` for all three),
+            // and a parse error reads as `Some(false)`, not `None` - see
+            // `HarnessDoctor::prompt_hook`'s doc. Kept as a real match arm
+            // rather than a `.unwrap_or(...)`, so a future harness with no
+            // `UserPromptSubmit`-shaped event at all (a `None` from
+            // `prompt_hook_command` itself) renders honestly instead of
+            // panicking.
+            out.push_str(
+                "    UserPromptSubmit hook: not available (this harness has no UserPromptSubmit output channel)\n",
+            );
+        }
+    }
+    let applicable: [Option<bool>; 3] = if honoured {
+        [Some(h.session_start_hook), Some(h.stop_hook), h.prompt_hook]
+    } else {
+        [Some(h.session_start_hook), Some(h.stop_hook), None]
+    };
+    let present = applicable.iter().flatten().filter(|p| **p).count();
+    let expected = applicable.iter().flatten().count();
+    if present > 0 && present < expected {
+        out.push_str(&format!(
+            "    partial setup - run: crystalline install {}\n",
+            h.name
+        ));
+    }
+    out
 }
 
 /// Render a report for a human.
@@ -2299,27 +2402,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             } else if !h.settings_present {
                 let _ = writeln!(out, "    not installed (no settings/hooks file yet)");
             } else {
-                let _ = writeln!(
-                    out,
-                    "    SessionStart hook: {}",
-                    if h.session_start_hook {
-                        "present"
-                    } else {
-                        "absent"
-                    }
-                );
-                let _ = writeln!(
-                    out,
-                    "    Stop hook: {}",
-                    if h.stop_hook { "present" } else { "absent" }
-                );
-                if h.session_start_hook != h.stop_hook {
-                    let _ = writeln!(
-                        out,
-                        "    partial setup - run: crystalline install {}",
-                        h.name
-                    );
-                }
+                out.push_str(&hook_lines(h));
             }
             if h.skills_installed > 0 {
                 let modified = if h.skills_modified > 0 {
@@ -2504,6 +2587,83 @@ fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
 mod tests {
     use super::*;
     use crystalline_index::{TursoStore, sync_domain};
+
+    /// A minimal harness fixture: only the fields [`hook_lines`] reads are
+    /// worth setting, everything else keeps its `Default`.
+    fn harness(
+        name: &str,
+        session_start_hook: bool,
+        stop_hook: bool,
+        prompt_hook: Option<bool>,
+    ) -> HarnessDoctor {
+        HarnessDoctor {
+            name: name.to_string(),
+            session_start_hook,
+            stop_hook,
+            prompt_hook,
+            ..Default::default()
+        }
+    }
+
+    /// The "partial setup" line fires whenever some but not all of a
+    /// harness's applicable hooks are present, across all three hooks now -
+    /// and Copilot's `UserPromptSubmit` hook, permanently inert rather than
+    /// merely not-yet-installed, never enters that count: a Copilot entry
+    /// with the prompt hook missing (or present) alongside two present hooks
+    /// must never read as a partial setup, while the same shape for Claude
+    /// Code or Codex must.
+    #[test]
+    fn partial_setup_fires_across_three_hooks_and_not_for_copilot_missing_a_prompt_hook() {
+        // Claude Code: all three present, no partial-setup line.
+        let complete = harness("claude-code", true, true, Some(true));
+        assert!(!hook_lines(&complete).contains("partial setup"));
+
+        // Claude Code: the prompt hook alone is missing - a partial setup.
+        let missing_prompt = harness("claude-code", true, true, Some(false));
+        let lines = hook_lines(&missing_prompt);
+        assert!(lines.contains("UserPromptSubmit hook: absent"));
+        assert!(
+            lines.contains("partial setup - run: crystalline install claude-code"),
+            "{lines}"
+        );
+
+        // Codex: the SessionStart hook alone is missing - still a partial
+        // setup, the prompt hook counts toward the total for a non-Copilot
+        // harness.
+        let missing_session_start = harness("codex", false, true, Some(true));
+        assert!(hook_lines(&missing_session_start).contains("partial setup"));
+
+        // Copilot with both real hooks but no prompt hook: the inert note
+        // still prints on the absent line too (a hand-deleted entry is
+        // exactly as inert as a present one), and it is still not a partial
+        // setup, since Copilot's prompt hook never enters the count.
+        let copilot_no_prompt = harness("copilot", true, true, Some(false));
+        let lines = hook_lines(&copilot_no_prompt);
+        assert!(
+            lines.contains(
+                "UserPromptSubmit hook: absent (Copilot does not honour a config-file prompt hook's output today)"
+            ),
+            "{lines}"
+        );
+        assert!(!lines.contains("partial setup"), "{lines}");
+
+        // Copilot with the prompt hook present carries the inert note and
+        // still never trips partial setup.
+        let copilot_with_prompt = harness("copilot", true, true, Some(true));
+        let lines = hook_lines(&copilot_with_prompt);
+        assert!(
+            lines.contains(
+                "UserPromptSubmit hook: present (Copilot does not honour a config-file prompt hook's output today)"
+            ),
+            "{lines}"
+        );
+        assert!(!lines.contains("partial setup"), "{lines}");
+
+        // Copilot missing one of its two counted hooks is still a partial
+        // setup, whatever its prompt hook says.
+        let copilot_missing_stop = harness("copilot", true, false, Some(true));
+        assert!(hook_lines(&copilot_missing_stop).contains("partial setup"));
+    }
 
     /// Sync a temp file domain holding a MANIFEST (whose tail is `manifest_tail`,
     /// so a test can add a `## Tag Aliases` section) plus two engrams whose tags

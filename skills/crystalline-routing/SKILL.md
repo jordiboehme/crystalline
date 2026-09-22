@@ -11,7 +11,7 @@ Crystalline organizes what you have been taught into Domains, each with a `MANIF
 
 At session start you are handed a routing block - injected as a session prompt in some harnesses, served as the MCP server's own instructions in others - with one routing line per registered domain summarizing when to use it, built from its `MANIFEST.md` `## When to Use` bullets, plus the crystalline MCP tool names (`search_engrams`, `write_engram` and the rest) those domains route through. Treat each routing line as a targeting aid, not a complete catalog - a domain that looks unrelated at a glance may still hold the answer.
 
-Either way, `list_domains` with `include_routing: true` re-fetches the same index mid-session.
+Either way, `list_domains` with `include_routing: true` re-fetches the same index mid-session. In a harness with the per-prompt hook, a prompt may arrive with a short "Knowledge that may apply" block naming engrams by `crystalline://` address: read the ones that fit with `read_engram` (the address is the identifier), and treat the block as a head start, not as the search you would otherwise run - a topic it does not name is still searched.
 
 A line naming a domain that "ships artifacts to provision" with no decision yet is a pending provisioning decision, not routine routing information: summarize in one sentence what the domain would ship, ask the user whether to allow it and only then apply their answer with the `provision` tool or `crystalline provision allow <domain>` / `deny <domain>` - never decide on the user's behalf.
 
@@ -40,7 +40,7 @@ When the question is also about the present-day state, put `domains` and `status
 }
 ```
 
-A hit's `snippet` is a window of roughly 200 characters around the match, often `...`-truncated - a targeting aid, never the engram. Answering straight from it is acceptable only for a single atomic fact that is completely visible in the snippet ("the retry limit is 5"). Anything that summarizes, characterizes, compares or quotes an engram's content requires `read_engram` first - pass the hit's permalink as `identifier` (bare or as a `crystalline://domain/permalink` URL); there is no `permalink` argument on `read_engram`.
+A hit's `snippet` is a window of roughly 200 characters around the match, often `...`-truncated - a targeting aid, never the engram. Answering straight from it is acceptable only for a single atomic fact that is completely visible in the snippet ("the retry limit is 5"). Anything that summarizes, characterizes, compares or quotes an engram's content requires `read_engram` first - pass the hit's permalink as `identifier` (bare or as a `crystalline://domain/permalink` URL); there is no `permalink` argument on `read_engram`. Where this instance serves the web UI the read also carries `web_url`, the page a person opens in the browser; hand that over rather than the `crystalline://` address when somebody wants to look at the engram, with `#` and the heading's slug when they want one section.
 
 ### Broad: sweep, then narrow
 

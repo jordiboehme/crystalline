@@ -2692,7 +2692,7 @@ pub(crate) fn healthcheck(addr: &str) -> Result<()> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + HEALTHCHECK_DEADLINE;
-    let connect_addr = loopback_connect_addr(addr);
+    let connect_addr = crystalline_service::instance::loopback_connect_addr(addr);
 
     // The one thing standing in for a real aggregate deadline: recompute the
     // time left before every blocking step and refuse to arm a timeout once
@@ -2777,19 +2777,6 @@ pub(crate) fn healthcheck(addr: &str) -> Result<()> {
     })?;
     println!("{}", body.trim());
     Ok(())
-}
-
-/// Rewrite an unroutable bind address to its loopback equivalent: `0.0.0.0`
-/// and `[::]` are addresses a server can listen on but a client can never
-/// dial, and people naturally paste the same address they gave `serve --http`.
-fn loopback_connect_addr(addr: &str) -> String {
-    if let Some(port) = addr.strip_prefix("0.0.0.0:") {
-        format!("127.0.0.1:{port}")
-    } else if let Some(port) = addr.strip_prefix("[::]:") {
-        format!("127.0.0.1:{port}")
-    } else {
-        addr.to_string()
-    }
 }
 
 // --- shared helpers ----------------------------------------------------------

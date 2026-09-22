@@ -4924,7 +4924,8 @@ export interface operations {
                      *       "status": "stable",
                      *       "title": "Alpha",
                      *       "type": "engram",
-                     *       "url": "crystalline://eng/alpha"
+                     *       "url": "crystalline://eng/alpha",
+                     *       "web_url": "http://127.0.0.1:7411/d/eng/e/alpha"
                      *     }
                      */
                     "application/json": Record<string, never>;

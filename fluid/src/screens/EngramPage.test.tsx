@@ -17,6 +17,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import { LAYOUT_WIDTH_KEY } from "../layoutWidth";
 import {
   answersFor,
   domainsResponse,
@@ -951,5 +952,124 @@ describe("the engram page at full width", () => {
     expect(
       screen.getAllByRole("button", { name: "Copy crystalline:// address" }),
     ).toHaveLength(1);
+  });
+
+  /**
+   * Section anchors on the page they exist for.
+   *
+   * The renderer's own test pins the slug rule and the control; what is held
+   * here is the part only this screen knows: which base the copied URL is
+   * built on. It is the address the server spelled for this caller, so the
+   * link a reader hands over and the link an agent hands over are the same
+   * string, and the browser's own origin only where the server could not say.
+   */
+  describe("the section a URL names", () => {
+    const SECTIONED = [
+      "---",
+      "title: Alpha",
+      "---",
+      "",
+      "## Auth",
+      "",
+      "Prose.",
+      "",
+    ].join("\n");
+    const PAGE = "https://kb.example.com/d/eng/e/alpha";
+
+    function serveSectioned(overrides: Record<string, unknown> = {}) {
+      serve({
+        "/domains/eng/engrams/alpha": () =>
+          detailResponse({ content: SECTIONED, ...overrides }),
+      });
+    }
+
+    function clipboard() {
+      const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+        Promise.resolve(),
+      );
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText },
+        configurable: true,
+      });
+      return writeText;
+    }
+
+    it("arrives at the section a handed url names", async () => {
+      const scrolled = vi
+        .spyOn(Element.prototype, "scrollIntoView")
+        .mockImplementation(() => undefined);
+      try {
+        serveSectioned({ web_url: PAGE });
+
+        renderApp("/d/eng/e/alpha#auth");
+        await screen.findByRole("heading", { name: "Alpha" });
+
+        await waitFor(() => {
+          expect(document.getElementById("auth")).not.toBeNull();
+        });
+        const section = document.getElementById("auth");
+        await waitFor(() => {
+          expect(scrolled.mock.instances).toContain(section);
+        });
+        expect(section).toHaveClass("section-flash");
+      } finally {
+        scrolled.mockRestore();
+      }
+    });
+
+    it("copies the section url built from the server's web_url", async () => {
+      const writeText = clipboard();
+      serveSectioned({ web_url: PAGE });
+
+      renderApp("/d/eng/e/alpha");
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Link to this section" }),
+      );
+
+      expect(writeText).toHaveBeenCalledWith(`${PAGE}#auth`);
+    });
+
+    it("falls back to the browser's origin when the server gave no web_url", async () => {
+      const writeText = clipboard();
+      serveSectioned();
+
+      renderApp("/d/eng/e/alpha");
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Link to this section" }),
+      );
+
+      expect(writeText).toHaveBeenCalledWith(
+        `${window.location.origin}/d/eng/e/alpha#auth`,
+      );
+    });
+
+    it("share link copies the server's web_url when there is one", async () => {
+      const writeText = clipboard();
+      serveSectioned({ web_url: PAGE });
+
+      renderApp("/d/eng/e/alpha");
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Share link" }),
+      );
+
+      expect(writeText).toHaveBeenCalledWith(PAGE);
+    });
+
+    it("draws the section links at full width too", async () => {
+      const writeText = clipboard();
+      localStorage.setItem(LAYOUT_WIDTH_KEY, "full");
+      serveSectioned({ web_url: PAGE });
+
+      renderApp("/d/eng/e/alpha");
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Link to this section" }),
+      );
+
+      expect(writeText).toHaveBeenCalledWith(`${PAGE}#auth`);
+    });
   });
 });

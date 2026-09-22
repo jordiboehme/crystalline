@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use crystalline_core::config::{
     AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig,
-    HttpSetting, IdentityConfig, IndexConfig, OidcConfig, ResponseFormat, SearchConfig,
-    ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
+    HttpSetting, IdentityConfig, IndexConfig, OidcConfig, RecallConfig, ResponseFormat,
+    SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -277,6 +277,16 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: allowed_hosts_effective,
         },
         SettingSpec {
+            key: "service.public_url",
+            doc: "The address people open the Fluid web UI at, for example https://knowledge.example.com; used verbatim as the base of every web_url the tools hand back, and as the OAuth resource identifier. Unset (default) derives the address per caller: from the request for an HTTP client, from the bound port for a local one. Set it where a proxy rewrites the Host, where the instance runs in a container, or where a separate Fluid deployment fronts an API-only daemon. An instance served over plain http on a non-loopback address still derives an https address it does not serve, so set this key there (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_service_public_url,
+            clear: clear_service_public_url,
+            effective: service_public_url_effective,
+        },
+        SettingSpec {
             key: "service.response_format",
             doc: "How list-shaped MCP tool results are encoded: toon (token-efficient, default) or json",
             kind: SettingKind::String,
@@ -355,6 +365,36 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_capture_similar,
             clear: clear_capture_similar,
             effective: capture_similar_effective,
+        },
+        SettingSpec {
+            key: "recall.enabled",
+            doc: "Whether the per-prompt hook crystalline install wires hands the agent the engrams that may apply to each prompt (default true; it works in Claude Code and Codex, Copilot has no channel for its output yet); false keeps the hook installed but silent, without touching the harness settings file",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            secret: false,
+            apply: set_recall_enabled,
+            clear: clear_recall_enabled,
+            effective: recall_enabled_effective,
+        },
+        SettingSpec {
+            key: "recall.limit",
+            doc: "How many engrams the per-prompt hook may name at once, 1 to 5 (default 3); the rest wait for a later prompt on the same topic",
+            kind: SettingKind::U64,
+            startup_effective: false,
+            secret: false,
+            apply: set_recall_limit,
+            clear: clear_recall_limit,
+            effective: recall_limit_effective,
+        },
+        SettingSpec {
+            key: "recall.min_score",
+            doc: "The hybrid score an engram must reach before the per-prompt hook names it, 0.0 to 1.0 (default 0.69); higher keeps the hook quieter, lower names weaker matches",
+            kind: SettingKind::F64,
+            startup_effective: false,
+            secret: false,
+            apply: set_recall_min_score,
+            clear: clear_recall_min_score,
+            effective: recall_min_score_effective,
         },
         SettingSpec {
             key: "identity.actor",
@@ -666,6 +706,15 @@ fn drop_index_if_empty(config: &mut GlobalConfig) {
 fn drop_capture_if_empty(config: &mut GlobalConfig) {
     if config.capture.as_ref() == Some(&CaptureConfig::default()) {
         config.capture = None;
+    }
+}
+
+/// Drop the `recall` block once every field in it has been cleared, so an
+/// unset config round-trips to exactly the pre-feature shape (no empty
+/// `recall: {}` line).
+fn drop_recall_if_empty(config: &mut GlobalConfig) {
+    if config.recall.as_ref() == Some(&RecallConfig::default()) {
+        config.recall = None;
     }
 }
 
@@ -1118,6 +1167,131 @@ fn allowed_hosts_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- service.public_url --------------------------------------------------------
+
+/// The key, spelled once so every message about it reads the same.
+pub const PUBLIC_URL_KEY: &str = "service.public_url";
+
+/// Why `value` cannot be the address people open the web UI at, or `None`
+/// when it can. One function for both arrivals of the key - the registry and
+/// the environment overlay - so the two cannot drift.
+pub fn service_public_url_problem(value: &str) -> Option<String> {
+    let key = PUBLIC_URL_KEY;
+    let Ok(url) = openidconnect::url::Url::parse(value.trim()) else {
+        return Some(format!(
+            "{key} must be an absolute url, for example https://knowledge.example.com, got '{value}'"
+        ));
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return Some(format!(
+            "{key} must be an http or https url; a browser opens nothing else"
+        ));
+    }
+    let Some(host) = url.host() else {
+        return Some(format!(
+            "{key} must name the host people reach this instance at"
+        ));
+    };
+    let unspecified = match host {
+        openidconnect::url::Host::Ipv4(ip) => ip.is_unspecified(),
+        openidconnect::url::Host::Ipv6(ip) => ip.is_unspecified(),
+        openidconnect::url::Host::Domain(_) => false,
+    };
+    if unspecified {
+        return Some(format!(
+            "{key} must be an address a browser can open: 0.0.0.0 and :: are bind wildcards, not addresses - name the host people reach this instance at"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some(format!("{key} must carry no user name or password"));
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Some(format!(
+            "{key} must be the origin alone - scheme, host and optional port, no path, query or fragment - because the web UI is served at the root"
+        ));
+    }
+    None
+}
+
+/// The one sentence said about a `service.public_url` that cannot be the
+/// address people open the web UI at, or `None` when the value can.
+///
+/// Writing the key through `configure` or `config set` is refused outright,
+/// because somebody is standing there to read the refusal. A value that
+/// arrives with no one watching - an environment variable in a compose file, a
+/// hand-edited `config.yaml` - is dropped with this line instead, and the
+/// address falls back to being derived per caller: an address a browser opens
+/// is not worth refusing to start a daemon over, and a container whose
+/// operator copied the bind into this key would otherwise never come up.
+pub fn unusable_public_url_warning(value: &str) -> Option<String> {
+    service_public_url_problem(value).map(|problem| {
+        format!(
+            "{problem}; ignoring '{value}', so the address people open Fluid at is derived per caller instead"
+        )
+    })
+}
+
+/// Canonicalise a `service.public_url` that came straight from the config
+/// file, which no setter has seen, the same way `set_service_public_url`
+/// does, so every reader compares the same spelling whichever layer the
+/// value arrived through; drop it instead when the validator refuses it, so
+/// an unusable value never reaches a reader. An environment-sourced value is
+/// already canonical by the time `apply` calls this (it went through
+/// `set_service_public_url` in the loop above), so re-running the same
+/// canonicalisation on it here is a no-op. Silent: the line is said once,
+/// where the value arrived, rather than on every re-read of the effective
+/// config.
+pub fn drop_unusable_public_url(config: &mut GlobalConfig) {
+    let Some(value) = config.service_public_url().map(str::to_string) else {
+        return;
+    };
+    match service_public_url_problem(&value) {
+        Some(_) => clear_service_public_url(config),
+        None => {
+            let origin = openidconnect::url::Url::parse(value.trim())
+                .expect("validated above")
+                .origin()
+                .ascii_serialization();
+            config
+                .service
+                .get_or_insert_with(ServiceConfig::default)
+                .public_url = Some(origin);
+        }
+    }
+}
+
+fn set_service_public_url(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    if let Some(problem) = service_public_url_problem(value) {
+        return Err(SettingsError(problem));
+    }
+    // Stored as its origin: the trailing slash gone, the host in its ascii
+    // spelling, a default port dropped - the one spelling every reader of the
+    // key compares, the same way the OAuth identifier is stored.
+    let origin = openidconnect::url::Url::parse(value.trim())
+        .expect("validated above")
+        .origin()
+        .ascii_serialization();
+    config
+        .service
+        .get_or_insert_with(ServiceConfig::default)
+        .public_url = Some(origin);
+    Ok(())
+}
+
+fn clear_service_public_url(config: &mut GlobalConfig) {
+    if let Some(s) = config.service.as_mut() {
+        s.public_url = None;
+    }
+    drop_service_if_empty(config);
+}
+
+fn service_public_url_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.service_public_url() {
+        Some(url) => (url.to_string(), false),
+        None => (String::new(), true),
+    }
+}
+
 // --- skills.serve -------------------------------------------------------------
 
 /// Accepts the tri-state `auto`, `true` and `false`. The two booleans are the
@@ -1363,6 +1537,97 @@ fn clear_capture_similar(config: &mut GlobalConfig) {
 fn capture_similar_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.capture.as_ref().and_then(|c| c.similar).is_none();
     (config.capture_similar().to_string(), is_default)
+}
+
+// --- recall.enabled ----------------------------------------------------------
+
+fn set_recall_enabled(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "recall.enabled must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .recall
+        .get_or_insert_with(RecallConfig::default)
+        .enabled = Some(parsed);
+    Ok(())
+}
+
+fn clear_recall_enabled(config: &mut GlobalConfig) {
+    if let Some(r) = config.recall.as_mut() {
+        r.enabled = None;
+    }
+    drop_recall_if_empty(config);
+}
+
+fn recall_enabled_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.recall.as_ref().and_then(|r| r.enabled).is_none();
+    (config.recall_enabled().to_string(), is_default)
+}
+
+// --- recall.limit --------------------------------------------------------
+
+fn set_recall_limit(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: u64 = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "recall.limit must be between 1 and 5, got '{value}'"
+        ))
+    })?;
+    if !(1..=5).contains(&parsed) {
+        return Err(SettingsError(format!(
+            "recall.limit must be between 1 and 5, got '{value}'"
+        )));
+    }
+    config
+        .recall
+        .get_or_insert_with(RecallConfig::default)
+        .limit = Some(parsed);
+    Ok(())
+}
+
+fn clear_recall_limit(config: &mut GlobalConfig) {
+    if let Some(r) = config.recall.as_mut() {
+        r.limit = None;
+    }
+    drop_recall_if_empty(config);
+}
+
+fn recall_limit_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.recall.as_ref().and_then(|r| r.limit).is_none();
+    (config.recall_limit().to_string(), is_default)
+}
+
+// --- recall.min_score ------------------------------------------------------
+
+fn set_recall_min_score(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: f64 = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "recall.min_score must be between 0.0 and 1.0, got '{value}'"
+        ))
+    })?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err(SettingsError(format!(
+            "recall.min_score must be between 0.0 and 1.0, got '{value}'"
+        )));
+    }
+    config
+        .recall
+        .get_or_insert_with(RecallConfig::default)
+        .min_score = Some(parsed);
+    Ok(())
+}
+
+fn clear_recall_min_score(config: &mut GlobalConfig) {
+    if let Some(r) = config.recall.as_mut() {
+        r.min_score = None;
+    }
+    drop_recall_if_empty(config);
+}
+
+fn recall_min_score_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.recall.as_ref().and_then(|r| r.min_score).is_none();
+    (config.recall_min_score().to_string(), is_default)
 }
 
 // --- identity.actor ---------------------------------------------------------
@@ -1891,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_thirty_five_keys_in_order() {
+    fn registry_lists_exactly_the_thirty_nine_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1908,6 +2173,7 @@ mod tests {
                 "service.ui",
                 "service.api",
                 "service.allowed_hosts",
+                "service.public_url",
                 "service.response_format",
                 "skills.serve",
                 "database.backend",
@@ -1916,6 +2182,9 @@ mod tests {
                 "search.retired_weight",
                 "index.files",
                 "capture.similar",
+                "recall.enabled",
+                "recall.limit",
+                "recall.min_score",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -1973,6 +2242,10 @@ mod tests {
                     "CRYSTALLINE_SERVICE_ALLOWED_HOSTS".to_string()
                 ),
                 (
+                    "service.public_url",
+                    "CRYSTALLINE_SERVICE_PUBLIC_URL".to_string()
+                ),
+                (
                     "service.response_format",
                     "CRYSTALLINE_SERVICE_RESPONSE_FORMAT".to_string()
                 ),
@@ -1992,6 +2265,12 @@ mod tests {
                 ),
                 ("index.files", "CRYSTALLINE_INDEX_FILES".to_string()),
                 ("capture.similar", "CRYSTALLINE_CAPTURE_SIMILAR".to_string()),
+                ("recall.enabled", "CRYSTALLINE_RECALL_ENABLED".to_string()),
+                ("recall.limit", "CRYSTALLINE_RECALL_LIMIT".to_string()),
+                (
+                    "recall.min_score",
+                    "CRYSTALLINE_RECALL_MIN_SCORE".to_string()
+                ),
                 ("identity.actor", "CRYSTALLINE_IDENTITY_ACTOR".to_string()),
                 (
                     "auth.trusted_header",
@@ -2047,6 +2326,7 @@ mod tests {
         assert!(change_note("service.ui", &no_env).is_some());
         assert!(change_note("service.api", &no_env).is_some());
         assert!(change_note("service.allowed_hosts", &no_env).is_some());
+        assert!(change_note("service.public_url", &no_env).is_some());
         assert!(change_note("service.response_format", &no_env).is_none());
         assert!(change_note("database.backend", &no_env).is_some());
         assert!(change_note("database.url", &no_env).is_some());
@@ -2054,6 +2334,7 @@ mod tests {
         assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("index.files", &no_env).is_none());
         assert!(change_note("capture.similar", &no_env).is_none());
+        assert!(change_note("recall.enabled", &no_env).is_none());
         assert!(change_note("identity.actor", &no_env).is_none());
         // The effective value is snapshotted at engine construction
         // (`Engine::skills_serve`), so a write really does wait for the next
@@ -2522,7 +2803,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 35);
+        assert_eq!(views.len(), 39);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2539,6 +2820,7 @@ mod tests {
                 "service.ui",
                 "service.api",
                 "service.allowed_hosts",
+                "service.public_url",
                 "service.response_format",
                 "skills.serve",
                 "database.backend",
@@ -2547,6 +2829,9 @@ mod tests {
                 "search.retired_weight",
                 "index.files",
                 "capture.similar",
+                "recall.enabled",
+                "recall.limit",
+                "recall.min_score",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -2629,47 +2914,63 @@ mod tests {
         assert_eq!(allowed_hosts.value, "");
         assert_eq!(allowed_hosts.source, SettingSource::Default);
 
-        let response_format = &views[13];
+        let public_url = &views[13];
+        assert_eq!(public_url.value, "");
+        assert_eq!(public_url.source, SettingSource::Default);
+
+        let response_format = &views[14];
         assert_eq!(response_format.value, "toon");
         assert_eq!(response_format.source, SettingSource::Default);
 
-        let skills_serve = &views[14];
+        let skills_serve = &views[15];
         assert_eq!(skills_serve.value, "auto");
         assert_eq!(skills_serve.source, SettingSource::Default);
 
-        let backend = &views[15];
+        let backend = &views[16];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[16];
+        let url = &views[17];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[17];
+        let salience_weight = &views[18];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[18];
+        let retired_weight = &views[19];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
 
-        let index_files = &views[19];
+        let index_files = &views[20];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let capture_similar = &views[20];
+        let capture_similar = &views[21];
         assert_eq!(capture_similar.value, "true");
         assert_eq!(capture_similar.source, SettingSource::Default);
 
-        let identity_actor = &views[21];
+        let recall_enabled = &views[22];
+        assert_eq!(recall_enabled.value, "true");
+        assert_eq!(recall_enabled.source, SettingSource::Default);
+
+        let recall_limit = &views[23];
+        assert_eq!(recall_limit.value, "3");
+        assert_eq!(recall_limit.source, SettingSource::Default);
+
+        let recall_min_score = &views[24];
+        assert_eq!(recall_min_score.value, "0.69");
+        assert_eq!(recall_min_score.source, SettingSource::Default);
+
+        let identity_actor = &views[25];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[22];
+        let trusted_header = &views[26];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[23];
+        let anonymous = &views[27];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -2896,6 +3197,74 @@ mod tests {
         assert!(cfg.read_only());
     }
 
+    // --- service.public_url --------------------------------------------------------
+
+    #[test]
+    fn service_public_url_round_trips_and_unsets_back_to_nothing() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "service.public_url", "https://kb.example.com/").unwrap();
+        assert_eq!(
+            service_public_url_effective(&cfg),
+            ("https://kb.example.com".to_string(), false),
+            "the stored value is the origin, so the trailing slash is gone"
+        );
+        assert_eq!(cfg.service_public_url(), Some("https://kb.example.com"));
+
+        unset(&mut cfg, "service.public_url").unwrap();
+        assert_eq!(service_public_url_effective(&cfg), (String::new(), true));
+        assert!(
+            cfg.service.is_none(),
+            "the block it was the only member of goes with it"
+        );
+    }
+
+    /// One spelling reaches every reader of the key, because the OAuth
+    /// resource identifier, the startup banner and every web_url compare it
+    /// and a second spelling is a mismatch nobody can see.
+    #[test]
+    fn service_public_url_is_stored_as_its_origin() {
+        for (written, stored) in [
+            ("https://KB.Example.com:443/", "https://kb.example.com"),
+            ("http://127.0.0.1:7411", "http://127.0.0.1:7411"),
+            ("http://[::1]:7411/", "http://[::1]:7411"),
+        ] {
+            let mut cfg = GlobalConfig::default();
+            apply(&mut cfg, "service.public_url", written).unwrap();
+            assert_eq!(
+                cfg.service_public_url(),
+                Some(stored),
+                "{written} is stored as {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_public_url_refuses_what_a_browser_cannot_open() {
+        for bad in [
+            "kb.example.com",
+            "ftp://kb.example.com",
+            "http://0.0.0.0:7411",
+            "http://[::]:7411",
+            "https://user:pw@kb.example.com",
+            "https://kb.example.com/crystalline",
+            "https://kb.example.com/?x=1",
+            "https://kb.example.com/#top",
+        ] {
+            let mut cfg = GlobalConfig::default();
+            let err = apply(&mut cfg, "service.public_url", bad)
+                .expect_err("expected '{bad}' to be refused");
+            assert!(
+                err.to_string().contains("service.public_url"),
+                "the refusal names the key it is about: {err}"
+            );
+            assert_eq!(
+                cfg.service_public_url(),
+                None,
+                "and nothing is stored when it is refused"
+            );
+        }
+    }
+
     // --- database.backend ----------------------------------------------------------
 
     #[test]
@@ -2984,6 +3353,47 @@ mod tests {
         unset(&mut cfg, "capture.similar").unwrap();
         assert!(cfg.capture.is_none(), "an unset block is dropped whole");
         assert!(cfg.capture_similar());
+    }
+
+    // --- recall.* ----------------------------------------------------------
+
+    #[test]
+    fn recall_keys_round_trip_and_unset_back_to_defaults() {
+        let mut cfg = GlobalConfig::default();
+
+        apply(&mut cfg, "recall.enabled", "false").unwrap();
+        apply(&mut cfg, "recall.limit", "4").unwrap();
+        apply(&mut cfg, "recall.min_score", "0.7").unwrap();
+
+        assert_eq!(recall_enabled_effective(&cfg), ("false".to_string(), false));
+        assert_eq!(recall_limit_effective(&cfg), ("4".to_string(), false));
+        assert_eq!(recall_min_score_effective(&cfg), ("0.7".to_string(), false));
+
+        unset(&mut cfg, "recall.enabled").unwrap();
+        unset(&mut cfg, "recall.limit").unwrap();
+        unset(&mut cfg, "recall.min_score").unwrap();
+
+        assert_eq!(recall_enabled_effective(&cfg), ("true".to_string(), true));
+        assert_eq!(recall_limit_effective(&cfg), ("3".to_string(), true));
+        assert_eq!(recall_min_score_effective(&cfg), ("0.69".to_string(), true));
+        assert!(cfg.recall.is_none(), "an unset block is dropped whole");
+    }
+
+    #[test]
+    fn recall_limit_and_min_score_refuse_out_of_range() {
+        let mut cfg = GlobalConfig::default();
+
+        for value in ["0", "6", "x"] {
+            let err = apply(&mut cfg, "recall.limit", value).unwrap_err();
+            assert!(err.to_string().contains("recall.limit"), "{err}");
+        }
+        assert!(cfg.recall.is_none(), "every rejected value must not write");
+
+        for value in ["-0.1", "1.5", "nan"] {
+            let err = apply(&mut cfg, "recall.min_score", value).unwrap_err();
+            assert!(err.to_string().contains("recall.min_score"), "{err}");
+        }
+        assert!(cfg.recall.is_none(), "every rejected value must not write");
     }
 
     // --- domains_root ----------------------------------------------------------

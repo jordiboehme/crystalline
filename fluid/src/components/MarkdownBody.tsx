@@ -28,12 +28,17 @@
  * reason to list the same lines a second time somewhere else.
  */
 
+import { Link as LinkIcon } from "lucide-react";
 import {
   Children,
   Suspense,
+  createContext,
   isValidElement,
   lazy,
+  useCallback,
+  useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -42,9 +47,15 @@ import type { ComponentProps, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
-import { Link } from "react-router";
+import { Link, useLocation, useNavigate } from "react-router";
 import remarkGfm from "remark-gfm";
 
+import {
+  SECTION_FLASH_CLASS,
+  SECTION_FLASH_MS,
+  headingIds,
+  sectionUrl,
+} from "../anchors";
 import { attachmentUrl } from "../api/files";
 import {
   assetPath,
@@ -57,7 +68,8 @@ import type { WikilinkResolution, WikilinkResolver } from "../wikilinks";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
 import { imageFileName } from "./downloads";
-import { Chip } from "./primitives";
+import { Chip, FOCUS_RING } from "./primitives";
+import { useSaid } from "./useSaid";
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
 
@@ -343,20 +355,12 @@ function structuredBullet(children: ReactNode): ReactNode {
  * Written out rather than pulled from a typography plugin: the app owns a
  * handful of colors and one dark variant, and a plugin would bring a second
  * opinion about all of them.
+ *
+ * The six heading levels are not here: they are built per document by the
+ * factory below, because whether a heading carries a link symbol is a fact
+ * about the surface rather than about the tag.
  */
 const components: Components = {
-  h1: ({ children }) => (
-    <h1 className="mt-6 mb-3 text-2xl font-semibold first:mt-0">{children}</h1>
-  ),
-  h2: ({ children }) => (
-    <h2 className="mt-6 mb-3 text-xl font-semibold first:mt-0">{children}</h2>
-  ),
-  h3: ({ children }) => (
-    <h3 className="mt-5 mb-2 text-lg font-semibold first:mt-0">{children}</h3>
-  ),
-  h4: ({ children }) => (
-    <h4 className="mt-4 mb-2 font-semibold first:mt-0">{children}</h4>
-  ),
   p: ({ children }) => <p className="my-3 leading-relaxed">{children}</p>,
   ul: ({ children }) => (
     <ul className="my-3 list-disc pl-6 leading-relaxed">{children}</ul>
@@ -673,6 +677,220 @@ function MarkdownImage({
 }
 
 /**
+ * What a section URL in this document is built from.
+ *
+ * One page URL, because a section is the page plus a fragment. Absent, the
+ * document has no anchors at all: no ids on its headings, no link symbol
+ * beside them and no reaction to a fragment in the location. A surface that is
+ * not addressable should not pretend to be.
+ */
+export interface MarkdownAnchors {
+  /** The page's own URL, as the server spelled it for this reader. */
+  pageUrl: string;
+}
+
+/**
+ * What a link symbol needs to know, which is more than the component map can
+ * carry.
+ *
+ * It rides a context rather than the component map on purpose. The map decides
+ * which element each tag becomes, and react-markdown remounts a heading when
+ * the component behind its tag changes identity - so a map rebuilt every time
+ * somebody copies a link would take the focus off the very button they just
+ * pressed. The map therefore knows one unchanging thing (whether this document
+ * has anchors at all) and everything that moves arrives here.
+ */
+interface SectionAnchorState {
+  pageUrl: string;
+  /** What the document is saying right now, or null for silence. */
+  said: string | null;
+  /** Which heading said it, so the text is drawn beside that one. */
+  activeId: string | null;
+  activate: (id: string) => void;
+}
+
+const SectionAnchors = createContext<SectionAnchorState | null>(null);
+
+/**
+ * The state behind every link symbol in one document.
+ *
+ * A component of its own, wrapped around the rendered document rather than
+ * holding it: the document arrives as `children`, so saying something
+ * re-renders this component and the announcement, and leaves the whole parsed
+ * document exactly where it was.
+ */
+function SectionAnchorProvider({
+  pageUrl,
+  children,
+}: {
+  pageUrl: string;
+  children: ReactNode;
+}) {
+  const [said, say] = useSaid();
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const navigate = useNavigate();
+  const { search } = useLocation();
+  const activate = useCallback(
+    (id: string) => {
+      setActiveId(id);
+      // Replace rather than push: a reader pointing at sections of the page
+      // they are already on is not walking a history, and a Back that stepped
+      // through every heading they glanced at would be useless. The hash
+      // landing in the location is what runs the arrival behaviour, so the
+      // highlight on a click is the very same highlight as on arrival.
+      //
+      // The query string is carried along rather than left out: a partial
+      // destination REPLACES the parts it does not name, so naming only the
+      // hash would drop whatever the page was opened with.
+      void navigate({ search, hash: `#${id}` }, { replace: true });
+      void (async () => {
+        try {
+          // `navigator.clipboard` is absent on an insecure or older context
+          // and reading `.writeText` off it throws synchronously, which is
+          // why this is a try/catch rather than a `.catch` off the promise.
+          await navigator.clipboard.writeText(sectionUrl(pageUrl, id));
+          say("Link copied");
+        } catch {
+          say("Copy refused");
+        }
+      })();
+    },
+    [navigate, pageUrl, say, search],
+  );
+  const state = useMemo(
+    () => ({ pageUrl, said, activeId, activate }),
+    [pageUrl, said, activeId, activate],
+  );
+  return (
+    <SectionAnchors.Provider value={state}>{children}</SectionAnchors.Provider>
+  );
+}
+
+/**
+ * The link symbol beside one heading.
+ *
+ * Quiet until the heading is hovered or the button itself has keyboard focus,
+ * but never `aria-hidden` and never out of the tab order: a control that hides
+ * from a pointer is a courtesy, one that hides from a keyboard or a screen
+ * reader is a control that is not there. Its name says what it does rather
+ * than naming the icon.
+ */
+function SectionLink({ id }: { id: string }) {
+  const anchors = useContext(SectionAnchors);
+  if (!anchors) {
+    return null;
+  }
+  return (
+    <>
+      <button
+        type="button"
+        aria-label="Link to this section"
+        className={`ml-2 inline-flex align-middle opacity-0 group-hover:opacity-100 focus-visible:opacity-100 print:hidden ${FOCUS_RING}`}
+        onClick={() => {
+          anchors.activate(id);
+        }}
+      >
+        <LinkIcon size={14} />
+      </button>
+      {anchors.said !== null && anchors.activeId === id && (
+        <span className="ml-1 text-caption text-slate-500 print:hidden dark:text-slate-400">
+          {anchors.said}
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * The one live region for the whole document.
+ *
+ * In the document from the start and empty, so the text arriving in it is what
+ * gets read out; one of them rather than one per heading, because a document
+ * with forty headings would otherwise carry forty regions announcing nothing.
+ */
+function SectionLinkStatus() {
+  const anchors = useContext(SectionAnchors);
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      aria-label="Section link result"
+      className="text-caption text-slate-500 print:hidden dark:text-slate-400"
+    >
+      {anchors?.said ?? ""}
+    </span>
+  );
+}
+
+/**
+ * One heading level, drawn.
+ *
+ * All six are built here, including the two that had no component before:
+ * ids land on every heading either way, but a link symbol needs somewhere to
+ * be drawn. The fifth and sixth level are given no size, weight or margin of
+ * their own, which is exactly what the framework's own reset leaves them at,
+ * so they read as they always have.
+ *
+ * `group` and the scroll margin are on every level: the margin clears the
+ * sticky top bar when a section is scrolled to, and the group is what lets the
+ * link symbol appear on hover without a hover state of its own.
+ */
+function heading(
+  level: 1 | 2 | 3 | 4 | 5 | 6,
+  sizes: string,
+  anchored: boolean,
+) {
+  const Tag = `h${level}` as const;
+  const className = `group scroll-mt-16 ${sizes}`.trimEnd();
+  return function Heading({
+    children,
+    id,
+  }: {
+    children?: ReactNode | undefined;
+    id?: string | undefined;
+  }) {
+    // Generated rather than derived from the slug: a heading literally called
+    // "Auth text" would collide with a `${slug}-text` spelling, and two
+    // elements sharing an id is a reference pointing at whichever came first.
+    const textId = useId();
+    if (!anchored || id === undefined) {
+      return (
+        <Tag id={id} className={className}>
+          {children}
+        </Tag>
+      );
+    }
+    return (
+      // The link symbol is a real button inside the heading, so without this
+      // the heading's own name would end in "Link to this section" - in the
+      // document outline and in every entry of a screen reader's heading
+      // list. Naming the heading by the span around its text leaves the
+      // button its own name and the tab order untouched.
+      <Tag id={id} className={className} aria-labelledby={textId}>
+        <span id={textId}>{children}</span>
+        <SectionLink id={id} />
+      </Tag>
+    );
+  };
+}
+
+/**
+ * What each level is drawn at, beside the two rules every level carries.
+ *
+ * The last two are empty on purpose: the fifth and sixth level were never in
+ * the component map and so were never styled, and the reset leaves them at the
+ * body's own size, weight and spacing. Nothing about them moves here.
+ */
+const HEADING_SIZES = [
+  "mt-6 mb-3 text-2xl font-semibold first:mt-0",
+  "mt-6 mb-3 text-xl font-semibold first:mt-0",
+  "mt-5 mb-2 text-lg font-semibold first:mt-0",
+  "mt-4 mb-2 font-semibold first:mt-0",
+  "",
+  "",
+] as const;
+
+/**
  * The component map for one domain: everything above, plus the three elements
  * that need to know more than the markdown says - which domain a relative
  * `assets/` target belongs to, and which document a picture taken out of the
@@ -681,9 +899,16 @@ function MarkdownImage({
 function componentsFor(
   domain: string | undefined,
   documentName: string | undefined,
+  anchored: boolean,
 ): Components {
   return {
     ...components,
+    h1: heading(1, HEADING_SIZES[0], anchored),
+    h2: heading(2, HEADING_SIZES[1], anchored),
+    h3: heading(3, HEADING_SIZES[2], anchored),
+    h4: heading(4, HEADING_SIZES[3], anchored),
+    h5: heading(5, HEADING_SIZES[4], anchored),
+    h6: heading(6, HEADING_SIZES[5], anchored),
     pre: preFor(documentName),
     a: ({ children, href, node }) => (
       <MarkdownAnchor
@@ -719,6 +944,7 @@ export default function MarkdownBody({
   foldTitle,
   domain,
   documentName,
+  anchors,
 }: {
   source: string;
   wikilinks?: WikilinkResolver;
@@ -734,21 +960,90 @@ export default function MarkdownBody({
    * of it. Absent, a diagram's download is named after the drawing alone.
    */
   documentName?: string;
+  /**
+   * The page this document is read at, which makes its headings addressable:
+   * each one gets an id, a link symbol that copies the page URL plus that id,
+   * and a fragment in the location scrolls to the heading it names. Absent,
+   * the document is drawn exactly as it always was.
+   */
+  anchors?: MarkdownAnchors;
 }) {
+  const anchored = anchors !== undefined;
+  const rootRef = useRef<HTMLDivElement>(null);
+  const { hash } = useLocation();
   const componentMap = useMemo(
-    () => componentsFor(domain, documentName),
-    [domain, documentName],
+    () => componentsFor(domain, documentName, anchored),
+    [domain, documentName, anchored],
   );
   const rehypePlugins = useMemo<RehypePlugins>(
     () => [
       // `plainText` keeps the highlighter's hands off a mermaid fence, whose
       // text this file reads back out to draw the diagram from.
       [rehypeHighlight, { plainText: ["mermaid"] }],
+      // After the highlighter, so the headings it may have rewritten are
+      // already in place, and before the wikilink rewrite, so a heading's id
+      // is taken from the text as written rather than from whatever a
+      // resolved `[[Target]]` turned into.
+      ...(anchored ? [headingIds()] : []),
       // After the highlighter, so what it built is already in place. The
       // rewrite skips code either way.
       ...(wikilinks ? [wikilinkRewrite(wikilinks)] : []),
     ],
-    [wikilinks],
+    [anchored, wikilinks],
+  );
+  // Arriving at a section: scroll it into view and point it out for a moment.
+  // It runs on the hash rather than on a navigation, which is what makes a
+  // click on a link symbol behave exactly like opening the URL it copied, and
+  // on the source too, because a document that just changed underneath a
+  // reader has different headings.
+  useEffect(() => {
+    if (!anchored || hash.length < 2) {
+      return;
+    }
+    let id = hash.slice(1);
+    try {
+      id = decodeURIComponent(id);
+    } catch {
+      // A hash that is not encoded stays as it is.
+    }
+    // `getElementById` rather than a selector: a slug keeps the letters the
+    // heading was written with, and a selector would need those escaped
+    // through a `CSS.escape` this app cannot assume.
+    const target = document.getElementById(id);
+    if (!target || !rootRef.current?.contains(target)) {
+      // A fragment naming nothing in this document does nothing at all: no
+      // scroll, no message, the page opens where it always did.
+      return;
+    }
+    target.scrollIntoView({ block: "start" });
+    target.classList.remove(SECTION_FLASH_CLASS);
+    // Reading a layout value between the two is what restarts the animation
+    // when this effect points the same heading out twice, which happens when
+    // the same fragment arrives again from outside. A second click on the
+    // same link symbol leaves the hash where it already was, so it copies and
+    // announces again without re-flashing what the reader is already at.
+    void target.offsetWidth;
+    target.classList.add(SECTION_FLASH_CLASS);
+    const timer = setTimeout(() => {
+      target.classList.remove(SECTION_FLASH_CLASS);
+    }, SECTION_FLASH_MS);
+    return () => {
+      clearTimeout(timer);
+      // And take the wash off the heading being left. Under reduced motion the
+      // class IS a static background rather than a fade, so a second fragment
+      // arriving inside the window would otherwise leave the first heading
+      // highlighted for as long as the page stays open.
+      target.classList.remove(SECTION_FLASH_CLASS);
+    };
+  }, [anchored, hash, source]);
+  const rendered = (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={rehypePlugins}
+      components={componentMap}
+    >
+      {foldLeadingTitle(source.replace(FRONTMATTER, ""), foldTitle)}
+    </ReactMarkdown>
   );
   return (
     // `measured` here rather than on a page wrapper: the rule is
@@ -757,14 +1052,15 @@ export default function MarkdownBody({
     // this renderer would see a single child - this div - and cap the tables
     // and diagrams inside it along with the prose. Hardcoded rather than a
     // prop, because every markdown surface is a reading surface.
-    <div className="measured text-[0.95rem]">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={rehypePlugins}
-        components={componentMap}
-      >
-        {foldLeadingTitle(source.replace(FRONTMATTER, ""), foldTitle)}
-      </ReactMarkdown>
+    <div ref={rootRef} className="measured text-[0.95rem]">
+      {anchors ? (
+        <SectionAnchorProvider pageUrl={anchors.pageUrl}>
+          {rendered}
+          <SectionLinkStatus />
+        </SectionAnchorProvider>
+      ) : (
+        rendered
+      )}
     </div>
   );
 }

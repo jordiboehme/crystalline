@@ -1201,6 +1201,11 @@ async fn a_write_and_an_edit_link_the_engram_they_touched() {
         "named by the title a person would recognize"
     );
     assert_eq!(links[0]["mimeType"], json!("text/markdown"));
+    assert!(
+        links[0].get("_meta").is_none(),
+        "no serve intent in this binary, so no page and no meta: {:?}",
+        links[0]
+    );
     // The payload still leads, so every client that reads the first block
     // reads exactly what it always did.
     assert_eq!(
@@ -2411,6 +2416,14 @@ async fn read_engram_reports_reference_resolution() {
     )
     .await
     .unwrap();
+
+    // Nothing in this binary ever served HTTP, so there is no page to point a
+    // person at: no address, and no note telling anybody to configure one.
+    // The resolved outcomes live in `web_url.rs`, which records an intent.
+    assert!(
+        out.get("web_url").is_none() && out.get("web_url_note").is_none(),
+        "no HTTP surface means neither key: {out}"
+    );
 
     // Relations gained a resolved flag, keyed by relation type.
     let relations = out["relations"].as_array().unwrap();

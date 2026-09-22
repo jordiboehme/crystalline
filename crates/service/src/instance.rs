@@ -145,6 +145,19 @@ impl HttpBinding {
     }
 }
 
+/// Rewrite an unroutable bind address to its loopback equivalent: `0.0.0.0`
+/// and `[::]` are addresses a server can listen on but a client can never
+/// dial, and people naturally paste the same address they gave `serve --http`.
+pub fn loopback_connect_addr(addr: &str) -> String {
+    if let Some(port) = addr.strip_prefix("0.0.0.0:") {
+        format!("127.0.0.1:{port}")
+    } else if let Some(port) = addr.strip_prefix("[::]:") {
+        format!("127.0.0.1:{port}")
+    } else {
+        addr.to_string()
+    }
+}
+
 /// What this process asked to serve, recorded by `run_serve` before it takes
 /// the lock.
 ///
@@ -450,6 +463,26 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
         }
     }
     (connect_socket().await, false)
+}
+
+/// Attach to a running daemon exactly as it is: read the lock record, check
+/// the pid, connect. Unlike [`try_attach`] it never displaces an older daemon
+/// and never waits on one leaving, so the whole call is a file read, a pid
+/// check and a connect - microseconds when no daemon runs, and never the six
+/// seconds a graceful takeover can cost.
+///
+/// That is what a per-prompt hook needs: it runs in front of a person's
+/// prompt, it has a one-second budget for the whole exchange, and a takeover
+/// is `crystalline mcp`'s to do at the next session start, where seconds are
+/// affordable and a respawn follows. A daemon older than this binary answers
+/// `tool search_engrams` the same way, so attaching as-is costs nothing but
+/// the version's own behaviour.
+pub async fn try_attach_passive() -> Option<Connection> {
+    let info = read_lock_info()?;
+    if !process_alive(info.pid) {
+        return None;
+    }
+    connect_socket().await
 }
 
 /// Connect to the daemon socket at its configured path.
@@ -1536,6 +1569,25 @@ pub fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the two bind wildcards are rewritten. Every other spelling is an
+    /// address something can really dial, and rewriting one would send a
+    /// client somewhere it was never pointed at.
+    #[test]
+    fn loopback_connect_addr_rewrites_only_the_wildcards() {
+        assert_eq!(loopback_connect_addr("0.0.0.0:7411"), "127.0.0.1:7411");
+        assert_eq!(loopback_connect_addr("[::]:7411"), "127.0.0.1:7411");
+        assert_eq!(loopback_connect_addr("127.0.0.1:7411"), "127.0.0.1:7411");
+        assert_eq!(loopback_connect_addr("[::1]:7411"), "[::1]:7411");
+        assert_eq!(
+            loopback_connect_addr("192.168.1.5:7411"),
+            "192.168.1.5:7411"
+        );
+        assert_eq!(
+            loopback_connect_addr("fluid.example:7411"),
+            "fluid.example:7411"
+        );
+    }
 
     /// The spawned daemon's command line: `serve --daemon --autostarted` always,
     /// `--db` ahead of the subcommand and `--config` after it when given, and

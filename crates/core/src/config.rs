@@ -87,6 +87,10 @@ pub struct GlobalConfig {
     /// every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CaptureConfig>,
+    /// Per-prompt recall settings. Absent means the hook is on with its
+    /// defaults, so every existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<RecallConfig>,
     /// Write-provenance settings. Absent means the actor recorded on a write
     /// is derived from the connected client, so every existing config keeps
     /// working untouched.
@@ -126,6 +130,18 @@ impl GlobalConfig {
     /// surface starts.
     pub fn ui_enabled(&self) -> bool {
         self.api_enabled() && self.service.as_ref().and_then(|s| s.ui).unwrap_or(true)
+    }
+
+    /// The address people open the Fluid web UI at, from
+    /// `service.public_url`, trimmed. `None` when the key is unset or holds
+    /// nothing but blanks, which means the address is derived per caller
+    /// instead.
+    pub fn service_public_url(&self) -> Option<&str> {
+        self.service
+            .as_ref()
+            .and_then(|s| s.public_url.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// How the MCP server encodes list-shaped tool results, from
@@ -251,6 +267,31 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|c| c.similar)
             .unwrap_or(true)
+    }
+
+    /// Whether the per-prompt hook speaks at all, from `recall.enabled`.
+    /// Absent config or an absent key means on (true).
+    pub fn recall_enabled(&self) -> bool {
+        self.recall.as_ref().and_then(|r| r.enabled).unwrap_or(true)
+    }
+
+    /// How many engrams the per-prompt hook may hand the agent at once, from
+    /// `recall.limit`, clamped to 1 to 5. Absent means 3.
+    pub fn recall_limit(&self) -> usize {
+        self.recall
+            .as_ref()
+            .and_then(|r| r.limit)
+            .unwrap_or(DEFAULT_RECALL_LIMIT)
+            .clamp(1, 5) as usize
+    }
+
+    /// The hybrid score an engram must reach before the per-prompt hook names
+    /// it, from `recall.min_score`. Absent means 0.69.
+    pub fn recall_min_score(&self) -> f64 {
+        self.recall
+            .as_ref()
+            .and_then(|r| r.min_score)
+            .unwrap_or(DEFAULT_RECALL_MIN_SCORE)
     }
 
     /// The configured actor recorded as `generated.by` on every write, from
@@ -731,6 +772,35 @@ pub struct CaptureConfig {
     pub similar: Option<bool>,
 }
 
+/// The `recall` block: what the per-prompt hook hands the agent. Reads like a
+/// settings-page section - see the `configure` tool, which exposes exactly
+/// these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecallConfig {
+    /// Whether the per-prompt hook speaks at all. Absent means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// How many engrams one prompt may be handed, 1 to 5. Absent means 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// The hybrid score an engram must reach, 0.0 to 1.0. Absent means 0.69.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f64>,
+}
+
+/// `recall.limit`'s default: how many engrams the per-prompt hook may hand
+/// the agent at once when the setting is absent.
+pub const DEFAULT_RECALL_LIMIT: u64 = 3;
+
+/// `recall.min_score`'s default: the hybrid score an engram must reach before
+/// the per-prompt hook names it when the setting is absent. Derived, not
+/// measured, for the granite embedding model: search's own semantic floor
+/// moved from 0.55 to 0.78 under granite, and this floor is
+/// `0.85 * (0.78 + 0.04) = 0.697`, rounded down to 0.69 the way the spec
+/// rounds its own bge-era `0.5015` down to `0.50`. See
+/// `research/2026-09-22-granite-thresholds.md`.
+pub const DEFAULT_RECALL_MIN_SCORE: f64 = 0.69;
+
 /// The `identity` block: who Crystalline records as the writer of an engram.
 /// Reads like a settings-page section - see the `configure` tool, which
 /// exposes exactly these keys.
@@ -905,6 +975,11 @@ pub struct ServiceConfig {
     /// Absent means loopback-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<String>>,
+    /// The address people open the Fluid web UI at, used verbatim as the base
+    /// of every `web_url` and as the OAuth resource identifier. Absent means
+    /// derive it per caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     /// How the MCP server encodes list-shaped tool results. Absent means
     /// TOON, the token-efficient default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1556,6 +1631,33 @@ mod tests {
             serde_yaml_ng::from_str("service:\n  ui: true\n  api: true\n").unwrap();
         assert!(both_on.ui_enabled());
         assert!(both_on.api_enabled());
+    }
+
+    /// The address people open the web UI at is read trimmed, and every
+    /// spelling of "nothing was written here" answers `None`: an absent
+    /// `service` block, an absent key, an empty string and a string of blanks
+    /// all mean the address is derived per caller instead.
+    #[test]
+    fn service_public_url_is_none_when_unset_or_blank() {
+        assert_eq!(GlobalConfig::default().service_public_url(), None);
+
+        let absent_key: GlobalConfig = serde_yaml_ng::from_str("service: {}\n").unwrap();
+        assert_eq!(absent_key.service_public_url(), None);
+
+        let with = |value: &str| GlobalConfig {
+            service: Some(ServiceConfig {
+                public_url: Some(value.to_string()),
+                ..ServiceConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        assert_eq!(with("").service_public_url(), None);
+        assert_eq!(with("  ").service_public_url(), None);
+        assert_eq!(
+            with(" https://kb.example.com ").service_public_url(),
+            Some("https://kb.example.com"),
+            "a value written with stray blanks is read as the address it names"
+        );
     }
 
     #[test]
