@@ -80,6 +80,7 @@ function detailOf(content: string): EngramDetail {
     guidance: null,
     draft: false,
     draftOwner: null,
+    localChange: null,
   };
 }
 

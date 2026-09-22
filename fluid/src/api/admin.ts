@@ -15,7 +15,7 @@
  * listing. Everything a screen sees is camelCase; the snake_case stops here.
  */
 
-import { API_BASE, api, encodeSegment } from "./client";
+import { API_BASE, api, encodePermalink, encodeSegment } from "./client";
 import {
   asArray,
   asNumber,
@@ -900,6 +900,11 @@ export interface ShareChange {
   path: string;
   kind: string;
   lastAuthor: string | null;
+  /**
+   * The SHA-256 of the file's current content, the digest a discard is
+   * guarded by; null for a deletion and on an older server.
+   */
+  sha: string | null;
 }
 
 /** What a share would do, before anybody commits to doing it. */
@@ -1012,6 +1017,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
               // A server that names nobody reads exactly like a file nobody
               // is named for, which is the same thing to every reader of it.
               lastAuthor: asString(change?.last_author),
+              sha: asString(change?.sha),
             };
       })
       .filter((change): change is ShareChange => change !== null),
@@ -1174,6 +1180,213 @@ export async function resolveConflict(
     `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}/resolve`,
     { method: "POST", body: JSON.stringify({ resolution, content }) },
   );
+}
+
+/** The engram a changed file holds, when it holds one and it parses. */
+export interface LocalChangeEngram {
+  permalink: string;
+  title: string;
+}
+
+/**
+ * One unshared change, as the offline list reports it: the path, what
+ * happened to it, the digest of its current content (null for a deletion),
+ * both sizes (null where a side is absent), whether either side is binary,
+ * and the engram behind it.
+ */
+export interface LocalChange {
+  path: string;
+  kind: string;
+  sha: string | null;
+  sizeBefore: number | null;
+  sizeAfter: number | null;
+  binary: boolean;
+  engram: LocalChangeEngram | null;
+}
+
+/** Every unshared change of one domain, and the files too large to share. */
+export interface LocalChangeList {
+  domain: string;
+  /** `team` or `review`: what the changes are measured against. */
+  mode: string;
+  changes: LocalChange[];
+  skippedLarge: { path: string; size: number }[];
+}
+
+/** One change with both sides, as the detail route answers. */
+export interface ChangeDetail extends LocalChange {
+  /** The team's copy; null for an addition, a binary file or a withheld side. */
+  base: string | null;
+  /** This copy; null for a deletion, a binary file or a withheld side. */
+  current: string | null;
+  /** A text side above the server's cap was withheld; the sizes still say how big. */
+  tooLarge: boolean;
+}
+
+/** What a discard did, path by path. */
+export interface DiscardReceipt {
+  restored: string[];
+  deleted: string[];
+  cleared: { path: string; kind: string }[];
+  refused: { path: string; reason: string }[];
+  reindexed: number;
+}
+
+/**
+ * The cache key of one domain's offline change list. Under the domain's own
+ * prefix: a read with no side effect.
+ */
+export function localChangesKey(domain: string): readonly unknown[] {
+  return ["domains", domain, "changes"];
+}
+
+/** The cache key of one change's two sides, for the same reason. */
+export function localChangeKey(
+  domain: string,
+  path: string,
+): readonly unknown[] {
+  return ["domains", domain, "change", path];
+}
+
+/** One change off the list, or null for an entry with no path to address it by. */
+export function readLocalChange(value: unknown): LocalChange | null {
+  const record = asObject(value);
+  const path = asString(record?.path);
+  if (path === null) {
+    return null;
+  }
+  const engram = asObject(record?.engram);
+  const permalink = asString(engram?.permalink);
+  return {
+    path,
+    kind: asString(record?.kind) ?? "",
+    sha: asString(record?.sha),
+    sizeBefore: asNumber(record?.size_before),
+    sizeAfter: asNumber(record?.size_after),
+    binary: record?.binary === true,
+    engram:
+      permalink === null
+        ? null
+        : { permalink, title: asString(engram?.title) ?? permalink },
+  };
+}
+
+/** Every unshared change of a team domain, offline: never pulls, served read-only. */
+export async function fetchLocalChanges(
+  domain: string,
+): Promise<LocalChangeList> {
+  const record = asObject(
+    await api<unknown>(`/domains/${encodeSegment(domain)}/changes`),
+  );
+  return {
+    domain: asString(record?.domain) ?? domain,
+    mode: asString(record?.mode) ?? "team",
+    changes: asArray(record?.changes)
+      .map(readLocalChange)
+      .filter((change): change is LocalChange => change !== null),
+    skippedLarge: asArray(record?.skipped_large)
+      .map((entry) => {
+        const item = asObject(entry);
+        const path = asString(item?.path);
+        return path === null ? null : { path, size: asNumber(item?.size) ?? 0 };
+      })
+      .filter(
+        (entry): entry is { path: string; size: number } => entry !== null,
+      ),
+  };
+}
+
+/** Both sides of one change. The path is encoded per segment, the way an engram's permalink is. */
+export async function fetchChange(
+  domain: string,
+  path: string,
+): Promise<ChangeDetail> {
+  const payload = await api<unknown>(
+    `/domains/${encodeSegment(domain)}/changes/${encodePermalink(path)}`,
+  );
+  const record = asObject(payload);
+  // The path that was asked for, when the answer did not repeat it: it is the
+  // handle a discard is addressed by, and a detail that lost it is a pane
+  // nothing can be done about.
+  const change = readLocalChange(payload) ?? {
+    path,
+    kind: asString(record?.kind) ?? "",
+    sha: null,
+    sizeBefore: null,
+    sizeAfter: null,
+    binary: false,
+    engram: null,
+  };
+  return {
+    ...change,
+    base: asString(record?.base),
+    current: asString(record?.current),
+    tooLarge: record?.too_large === true,
+  };
+}
+
+/** A discard receipt, tolerant of an answer that carries none of it. */
+export function readDiscardReceipt(value: unknown): DiscardReceipt {
+  const record = asObject(value);
+  const pathsOf = (key: string) => asStrings(record?.[key]);
+  return {
+    restored: pathsOf("restored"),
+    deleted: pathsOf("deleted"),
+    cleared: asArray(record?.cleared)
+      .map((entry) => {
+        const item = asObject(entry);
+        const path = asString(item?.path);
+        return path === null
+          ? null
+          : { path, kind: asString(item?.kind) ?? "" };
+      })
+      .filter(
+        (entry): entry is { path: string; kind: string } => entry !== null,
+      ),
+    refused: asArray(record?.refused)
+      .map((entry) => {
+        const item = asObject(entry);
+        const path = asString(item?.path);
+        return path === null
+          ? null
+          : { path, reason: asString(item?.reason) ?? "" };
+      })
+      .filter(
+        (entry): entry is { path: string; reason: string } => entry !== null,
+      ),
+    reindexed: asNumber(record?.reindexed) ?? 0,
+  };
+}
+
+/** Put chosen paths back the way the team has them, guarded by the digests the caller looked at. */
+export async function discardChanges(
+  domain: string,
+  targets: { path: string; sha: string | null }[],
+): Promise<DiscardReceipt> {
+  return readDiscardReceipt(
+    await api<unknown>(`/domains/${encodeSegment(domain)}/changes/discard`, {
+      method: "POST",
+      body: JSON.stringify({ paths: targets }),
+    }),
+  );
+}
+
+/** The sentence a refused path wears, per reason, in the server's own terms. */
+export function refusalSentence(reason: string): string {
+  switch (reason) {
+    case "changed_since":
+      return "Changed since you looked.";
+    case "not_a_change":
+      return "Already matches the team's copy.";
+    case "no_base_copy":
+      return "Its earlier content is in an open proposal below this one; withdraw that layer to get it back.";
+    case "unknown_path":
+      return "Not among this domain's unshared changes.";
+    case "open_in_editor":
+      return "Close the editor first.";
+    default:
+      return `Refused: ${reason}.`;
+  }
 }
 
 /** One verify finding raised over an archived entry's markdown. */

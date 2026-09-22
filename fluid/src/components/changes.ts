@@ -1,12 +1,11 @@
 /**
  * What a share would carry, reasoned about rather than drawn.
  *
- * Three questions live here because two components ask them and neither owns
+ * Two questions live here because two components ask them and neither owns
  * the answer: which paths are generated folder listings rather than knowledge
- * somebody wrote, which listings a chosen set of files would drag along with
- * it, and which files to tick for somebody the moment the dialog opens. The
- * list draws them and the dialog posts them, so the rules sit beside both
- * instead of inside either.
+ * somebody wrote, and which files to tick for somebody the moment the dialog
+ * opens. The list draws them and the dialog posts them, so the rules sit
+ * beside both instead of inside either.
  *
  * A module of its own also keeps the list a component module again: a file
  * that exports a component may export nothing else if fast refresh is to work
@@ -24,46 +23,9 @@ export function isFolderIndex(path: string): boolean {
   return path === "index.md" || path.endsWith("/index.md");
 }
 
-/** The folder a domain-relative path lives in; the empty string at the root. */
-export function folderOf(path: string): string {
-  const at = path.lastIndexOf("/");
-  return at < 0 ? "" : path.slice(0, at);
-}
-
 /** The changes a reader is actually deciding about: everything but a listing. */
 export function substantive(changes: ShareChange[]): ShareChange[] {
   return changes.filter((change) => !isFolderIndex(change.path));
-}
-
-/**
- * How many generated folder listings the current selection would carry along.
- *
- * Recomputed rather than counted off the plan, because the plan counts the
- * whole delta's listings and unticking the last file of a folder takes that
- * folder's listing out of the share. It follows what actually goes over the
- * wire, in both of that wire's shapes. A share of everything sends no file
- * list, so every listing in the delta rides - a listing of a folder whose
- * files were all left alone included, since the delta holds it because the
- * folder really did change. A share of some of it sends the chosen paths, and
- * the engine adds the listing of each chosen file's own folder and no others.
- */
-export function ridingIndexes(
-  changes: ShareChange[],
-  selected: ReadonlySet<string>,
-): number {
-  const real = substantive(changes);
-  const listings = changes.filter((change) => isFolderIndex(change.path));
-  if (real.every((change) => selected.has(change.path))) {
-    return listings.length;
-  }
-  const folders = new Set(
-    real
-      .filter((change) => selected.has(change.path))
-      .map((change) => folderOf(change.path)),
-  );
-  return listings.filter(
-    (change) => selected.has(change.path) || folders.has(folderOf(change.path)),
-  ).length;
 }
 
 /**

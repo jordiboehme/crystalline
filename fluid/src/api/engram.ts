@@ -167,6 +167,13 @@ export interface EngramDetail {
    * not offer to share a page the reader does not own.
    */
   draftOwner: string | null;
+  /**
+   * How this page differs from what the team has, on a team domain that
+   * takes changes directly: `added` (the team has no such page) or
+   * `modified` (the team's copy differs). Null everywhere else, a reviewing
+   * domain included, where `draft` is the answer instead.
+   */
+  localChange: "added" | "modified" | null;
 }
 
 /** One neighbour a write or save found itself close to. */
@@ -383,6 +390,10 @@ export function readEngramDetail(
     guidance: asString(record?.guidance),
     draft: record?.draft === true,
     draftOwner: asString(record?.draft_owner),
+    localChange:
+      record?.local_change === "added" || record?.local_change === "modified"
+        ? record.local_change
+        : null,
   };
 }
 

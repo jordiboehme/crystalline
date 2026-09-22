@@ -12,10 +12,12 @@
  * drawn from, and nothing else.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import App from "../App";
 import { ApiProblem, api } from "../api/client";
 import { defined } from "../test/assert";
 import type { Answer } from "../test/harness";
@@ -1117,6 +1119,31 @@ describe("the domain screen", () => {
     // And the screen says which view is on screen, so the switch is not a
     // silent one.
     expect(screen.getByText(/whole domain/i)).toBeVisible();
+  });
+
+  it("draws the status line a discard arrives with", async () => {
+    serve();
+
+    // Where a discarded addition lands: the engram page it was standing on
+    // is gone, so the page it came back to is the one that says what
+    // happened to it.
+    render(
+      <MemoryRouter
+        initialEntries={[
+          { pathname: "/d/eng", state: { discarded: "alpha.md" } },
+        ]}
+      >
+        <App />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("heading", { level: 1, name: "eng" });
+    // Named by its text rather than by its role alone: a screen that is still
+    // loading a panel carries a busy region of the same role.
+    expect(await screen.findByText("Discarded alpha.md.")).toHaveAttribute(
+      "role",
+      "status",
+    );
   });
 });
 

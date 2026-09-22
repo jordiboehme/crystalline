@@ -131,6 +131,9 @@ use crate::scope::{DomainAccess, DomainRight};
         domains_admin::withdraw_proposal,
         domains_admin::conflict_detail,
         domains_admin::resolve_conflict,
+        domains_admin::list_domain_changes,
+        domains_admin::get_domain_change,
+        domains_admin::discard_domain_changes,
         archive::download,
         archive::preview,
         archive::import,
@@ -658,6 +661,22 @@ pub fn router(state: RestState) -> Router {
         .route(
             "/domains/{domain}/sync/conflicts/{id}/resolve",
             post(domains_admin::resolve_conflict),
+        )
+        // The offline change surface: the list and the detail need domain
+        // read alone and never pull, so they are served read-only; the
+        // discard writes the working tree and is not. The literal `discard`
+        // segment is registered first so it wins over the catch-all.
+        .route(
+            "/domains/{domain}/changes",
+            get(domains_admin::list_domain_changes),
+        )
+        .route(
+            "/domains/{domain}/changes/discard",
+            post(domains_admin::discard_domain_changes),
+        )
+        .route(
+            "/domains/{domain}/changes/{*path}",
+            get(domains_admin::get_domain_change),
         )
         // Admin only as well, and a pure read: the archive download is the
         // backup story of a read-only mirror, so it stays served there.

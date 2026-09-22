@@ -1535,6 +1535,298 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/changes": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "List a team domain's unshared changes, offline.",
+        "description": "Any caller who may read the domain. Compares the working tree with the base snapshot this machine holds - or, in a domain that reviews changes, the caller's own drafts with the folder - and names every file that differs with its kind (`added`, `modified`, `deleted`), the SHA-256 of its current content (`sha`, null for a deletion), both sizes, whether either side is binary, and the engram it holds. Generated folder listings never appear. Never pulls and never contacts GitHub, so it is served on a read-only instance and with no connection; `mode` says `team` or `review`, and an anonymous reader of a reviewing domain gets an empty list.",
+        "operationId": "list_domain_changes",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered team domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The changes, sorted by path, and the files too large to share.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "changes": [
+                    {
+                      "binary": false,
+                      "engram": {
+                        "permalink": "notes/a",
+                        "title": "A sharper rule"
+                      },
+                      "kind": "modified",
+                      "path": "notes/a.md",
+                      "sha": "9f2c",
+                      "size_after": 1388,
+                      "size_before": 1204
+                    },
+                    {
+                      "binary": false,
+                      "engram": {
+                        "permalink": "notes/old",
+                        "title": "Old"
+                      },
+                      "kind": "deleted",
+                      "path": "notes/old.md",
+                      "sha": null,
+                      "size_after": null,
+                      "size_before": 880
+                    }
+                  ],
+                  "domain": "kb",
+                  "mode": "team",
+                  "skipped_large": []
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, none this caller may see, or one with no team origin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "GitHub is switched off on this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/changes/discard": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Discard chosen unshared changes.",
+        "description": "An editor or an admin with write access to the domain. Each named path is put back the way the team has it: a modification gets the team's copy back, an addition is deleted, a deletion is restored, and in a domain that reviews changes the caller's own draft of the path is cleared. The index is updated at once. Always 200 once the body parses: refusals are per path, under `refused` with a reason - `changed_since` (the file moved since the digest was read), `not_a_change`, `no_base_copy` (an open proposal below the top layer holds the earlier content; withdraw that layer), `unknown_path`, `open_in_editor` (a draft somebody has open). Never contacts GitHub; refused on a read-only instance.",
+        "operationId": "discard_domain_changes",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered team domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscardBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What happened to each path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "cleared": [],
+                  "deleted": [
+                    "notes/new.md"
+                  ],
+                  "domain": "kb",
+                  "refused": [
+                    {
+                      "path": "notes/b.md",
+                      "reason": "changed_since"
+                    }
+                  ],
+                  "reindexed": 2,
+                  "restored": [
+                    "notes/a.md"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A viewer, a membership below editor, or a read-only instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not a team domain, or GitHub is switched off on this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An empty path list.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/changes/{path}": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Both sides of one unshared change.",
+        "description": "Any caller who may read the domain. The team's copy (`base`, null for an addition) and this machine's or the caller's draft (`current`, null for a deletion) as text, beside the row the list reports. A binary file carries null texts and its sizes; a text side above 1 MiB is withheld with `too_large` true. 404 for a path that is not among the domain's unshared changes.",
+        "operationId": "get_domain_change",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered team domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The domain-relative path, as the list reported it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The change with both texts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "base": "---\ntitle: A\n---\n\nthe old rule\n",
+                  "binary": false,
+                  "current": "---\ntitle: A\n---\n\nthe sharper rule\n",
+                  "domain": "kb",
+                  "engram": {
+                    "permalink": "notes/a",
+                    "title": "A"
+                  },
+                  "kind": "modified",
+                  "path": "notes/a.md",
+                  "sha": "9f2c",
+                  "size_after": 1388,
+                  "size_before": 1204,
+                  "too_large": false
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or a path that is not among its unshared changes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "GitHub is switched off on this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/draft-links": {
       "get": {
         "tags": [
@@ -8665,6 +8957,43 @@
             "type": "string",
             "description": "The client's redirect uri with the answer on it: `code`, `state` and\n`iss` on an allow, `error=access_denied`, `state` and `iss` on a deny.",
             "example": "https://claude.ai/api/mcp/auth_callback?code=...&state=...&iss=https://kb.example"
+          }
+        }
+      },
+      "DiscardBody": {
+        "type": "object",
+        "description": "The paths to put back the way the team has them, each with the digest the caller looked at. Must name at least one.",
+        "required": [
+          "paths"
+        ],
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiscardTargetBody"
+            }
+          }
+        }
+      },
+      "DiscardTargetBody": {
+        "type": "object",
+        "description": "One path a discard names, with the digest the caller looked at.",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The domain-relative path, as the list reported it.",
+            "example": "notes/a.md"
+          },
+          "sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The `sha` the list reported for it: the current content's digest for\nan addition or a modification, null for a deletion. A file that no\nlonger hashes to it is refused as `changed_since`.",
+            "example": "9f2c"
           }
         }
       },

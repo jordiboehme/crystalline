@@ -30,10 +30,19 @@
  * The files are grouped by kind rather than listed flat, in {@link ChangeList}:
  * an evolve pass or an ingest shares hundreds at once, and the shape of that -
  * three added, a hundred and twenty-one modified - is what a reader decides on.
- * The generated folder listings a share carries alongside them, where the
- * domain shares its listings at all, are counted into one line there rather
- * than grouped, for the same reason: they are what keeps the team repository
- * browsable, never what somebody is deciding about.
+ * The generated folder listings a share carries alongside them are not drawn
+ * at all: an `index.md` is rebuilt from the engrams beside it and follows the
+ * domain's own configuration, so it is never what somebody is deciding about.
+ *
+ * Deciding also means being able to look first, and to change your mind. A
+ * press on a path replaces the form with that file's diff until Escape or
+ * "Back to the list" brings the form back with every tick where it was; the
+ * menu on a row discards that one file, and "Discard selected" discards the
+ * ticked set. Both ask first, in a strip under the list naming what goes -
+ * never a typed confirmation, because the files name themselves - and both
+ * post the digest each file wore when the question was asked, so a file
+ * somebody has edited since is refused instead of being thrown away. A refusal lands on its own row, and
+ * the plan is read again afterwards, so the list says what is actually left.
  *
  * Which of those files travel is a choice too, and on a shared instance it is
  * the choice that matters most: the delta in front of somebody may be half
@@ -68,12 +77,16 @@ import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 import { useEffect, useId, useMemo, useState } from "react";
 
-import type { SharePlan } from "../api/admin";
+import type { DiscardReceipt, SharePlan } from "../api/admin";
 import {
   SYNC_SUMMARY_KEY,
+  discardChanges,
   fetchShareChanges,
   fetchSyncStatus,
+  localChangeKey,
+  localChangesKey,
   readStackPlacement,
+  refusalSentence,
   shareDomain,
   sharePlanKey,
   syncStatusKey,
@@ -86,6 +99,8 @@ import { asNumber, asObject, asString } from "../api/json";
 import { useAuth } from "../auth/AuthContext";
 import { isWebAddress, plural } from "../format";
 import { ChangeList } from "./ChangeList";
+import { DiffPane } from "./DiffPaneLazy";
+import { DiscardConfirm } from "./DiscardConfirm";
 import type { ShareDialogProps } from "./ShareDialog";
 import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
 import { preselect, substantive } from "./changes";
@@ -102,13 +117,22 @@ const ALERT_CLASSES =
 export default function ShareDialogBody({
   domain,
   onClose,
+  only,
 }: ShareDialogProps): ReactElement {
   const queryClient = useQueryClient();
   // Whose work the boxes open ticked for. The session's own account, which is
   // what the engine records as `human:<name>` when this person writes an
   // engram through it; an anonymous reader has none, and everything opens
   // ticked for them exactly as it always did.
-  const account = useAuth().user?.name ?? null;
+  const { user, capabilities } = useAuth();
+  const account = user?.name ?? null;
+  /**
+   * Whether this session may put a file back the way the team has it. The
+   * capability the provider already resolved, never re-derived here: a
+   * read-only instance refuses every content write whoever is asking, and a
+   * reader who may not write is offered no control that would be refused.
+   */
+  const mayDiscard = capabilities.canWrite && !capabilities.readOnly;
   const titleField = useId();
   const descriptionField = useId();
   const proposalField = useId();
@@ -124,7 +148,38 @@ export default function ShareDialogBody({
   // `null` is "nobody has touched a box", which is what lets the preselection
   // below stay in charge while the plan is still arriving and re-arriving. A
   // set - empty included - is a choice somebody made.
-  const [picked, setPicked] = useState<ReadonlySet<string> | null>(null);
+  // A caller that opened this about one file hands its path in, and that is a
+  // choice rather than an absence: `only` seeds the ticks, so the preselection
+  // below never gets a say. An empty list is still a choice - exactly these,
+  // and there are none - which is what leaves the Share button disabled.
+  const [picked, setPicked] = useState<ReadonlySet<string> | null>(() =>
+    only === undefined ? null : new Set(only),
+  );
+  /** The path whose diff is up, or null while the form is. */
+  const [pane, setPane] = useState<string | null>(null);
+  /**
+   * What a confirmed discard would take, and where to put the keyboard back.
+   *
+   * The digests are captured here, when the question is asked, rather than
+   * read off the plan when it is answered. The plan is refetched behind this
+   * strip - by a window coming back, by the card behind it, by this dialog's
+   * own invalidation - and a file edited while the question was on the screen
+   * would otherwise be discarded against its new digest, which is exactly the
+   * edit the guard exists to refuse.
+   */
+  const [arming, setArming] = useState<{
+    targets: { path: string; sha: string | null }[];
+    from: HTMLElement | null;
+  } | null>(null);
+  /** Why the server refused a path last time, drawn on that path's own row. */
+  const [refusals, setRefusals] = useState<ReadonlyMap<string, string>>(
+    new Map(),
+  );
+  /** What the last discard did, said in one line above the list. */
+  const [receipt, setReceipt] = useState<DiscardReceipt | null>(null);
+  /** A discard that failed outright, said inside the strip that asked. */
+  const [discardProblem, setDiscardProblem] = useState<string | null>(null);
+  const paneHeading = useId();
 
   // Always fresh, and never retried: the plan is the whole point of opening
   // this, a cached one would describe a share somebody else's session already
@@ -252,6 +307,58 @@ export default function ShareDialogBody({
     },
   });
 
+  /**
+   * Putting the ticked files back the way the team has them.
+   *
+   * Every target carries the digest its row wore when the strip armed, so a
+   * file somebody has edited since is refused by name rather than having that
+   * edit thrown away. The rows leave the held plan the moment the receipt
+   * says they are gone, and the refetch the effect below fires is what confirms
+   * it against the engine.
+   */
+  const discard = useMutation({
+    mutationFn: (targets: { path: string; sha: string | null }[]) =>
+      discardChanges(domain, targets),
+    onSuccess: (result) => {
+      const gone = new Set([
+        ...result.restored,
+        ...result.deleted,
+        ...result.cleared.map((entry) => entry.path),
+      ]);
+      // The rows leave the held plan at once; the refetch below confirms it.
+      queryClient.setQueryData<SharePlan>(sharePlanKey(domain), (held) =>
+        held
+          ? { ...held, changes: held.changes.filter((c) => !gone.has(c.path)) }
+          : held,
+      );
+      setPicked((current) => {
+        if (current === null) return current;
+        const now = new Set(current);
+        for (const path of gone) now.delete(path);
+        return now;
+      });
+      setRefusals(
+        new Map(result.refused.map((r) => [r.path, refusalSentence(r.reason)])),
+      );
+      // A file the open pane is showing was refused because it moved under
+      // this reader: the two sides they are looking at are the old ones.
+      if (
+        result.refused.some(
+          (r) => r.path === pane && r.reason === "changed_since",
+        )
+      ) {
+        void queryClient.invalidateQueries({
+          queryKey: localChangeKey(domain, pane ?? ""),
+        });
+      }
+      setArming(null);
+      setReceipt(result);
+    },
+    onError: (error: Error) => {
+      setDiscardProblem(problemDetail(error));
+    },
+  });
+
   // All three of the things a share can have changed: the status the card that
   // opened this is drawn from, the listing every sidebar, card and switcher
   // counts engrams in - a share pulls the origin first, and a pull that applied
@@ -297,6 +404,24 @@ export default function ShareDialogBody({
     }
   }, [outcome, domain, queryClient]);
 
+  // What a discard can have changed, keyed on its receipt for the reason the
+  // share's is keyed on the outcome: the plan this dialog is drawn from, the
+  // sync status the card behind it reads, the listing every surface counts
+  // engrams in, the instance-wide summary the frame's share action is drawn
+  // from, and the offline change list a page outside this dialog reads. Fired
+  // from here rather than from the mutation's own handler, so the plan query
+  // answers the invalidation on a render that already knows what is gone.
+  useEffect(() => {
+    if (receipt === null) {
+      return;
+    }
+    void queryClient.invalidateQueries({ queryKey: sharePlanKey(domain) });
+    void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
+    void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+    void queryClient.invalidateQueries({ queryKey: SYNC_SUMMARY_KEY });
+    void queryClient.invalidateQueries({ queryKey: localChangesKey(domain) });
+  }, [receipt, domain, queryClient]);
+
   const action = plan.data?.action ?? null;
   const shareable =
     action === "create" ||
@@ -320,7 +445,34 @@ export default function ShareDialogBody({
     >
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-slate-900/40" />
-        <Dialog.Content className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+        {/* Wider while a diff is up, because a diff is two columns of text
+            and the form is a column of fields; back to the form's own width
+            the moment the pane closes. */}
+        <Dialog.Content
+          className={`fixed top-1/2 left-1/2 z-50 ${
+            pane === null
+              ? "w-[min(28rem,calc(100vw-2rem))]"
+              : "w-[min(64rem,calc(100vw-2rem))]"
+          } -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900`}
+          onEscapeKeyDown={(event) => {
+            // Escape closes the one thing the reader opened last, and only
+            // leaves the dialog when that is all there is. Answered here
+            // rather than inside the pane or the strip, because Radix listens
+            // for Escape on the document in the capture phase: an event
+            // stopped further in has already been seen and acted on.
+            if (pane !== null) {
+              event.preventDefault();
+              setPane(null);
+              return;
+            }
+            if (arming !== null) {
+              event.preventDefault();
+              const from = arming.from;
+              setArming(null);
+              from?.focus();
+            }
+          }}
+        >
           <Dialog.Title className="text-lg font-semibold">
             Share changes
           </Dialog.Title>
@@ -344,7 +496,56 @@ export default function ShareDialogBody({
               Done.
             </Dialog.Description>
           )}
-          {outcome === null ? (
+          {outcome !== null ? (
+            <div className="mt-3 flex flex-col gap-3">
+              <p className="text-sm">
+                {outcome.before}
+                {outcome.link !== null && (
+                  <a
+                    href={outcome.link.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-medium underline underline-offset-2 hover:no-underline"
+                  >
+                    {outcome.link.label}
+                  </a>
+                )}
+                {outcome.after}
+              </p>
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  autoFocus
+                  onClick={onClose}
+                  className={BUTTON.primary}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          ) : pane !== null ? (
+            // One file, both sides, in place of the form: the ticks and the
+            // fields are held in state, so coming back costs nothing and
+            // changes nothing.
+            <div className="mt-3 flex flex-col gap-3">
+              <h2 id={paneHeading} className="font-mono text-sm break-all">
+                {pane}
+              </h2>
+              <DiffPane domain={domain} path={pane} headingId={paneHeading} />
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  autoFocus
+                  onClick={() => {
+                    setPane(null);
+                  }}
+                  className={BUTTON.secondary}
+                >
+                  Back to the list
+                </button>
+              </div>
+            </div>
+          ) : (
             <form
               className="mt-3 flex flex-col gap-3"
               onSubmit={(event) => {
@@ -367,6 +568,19 @@ export default function ShareDialogBody({
               {(problem ?? planProblem) !== null && (
                 <p role="alert" className={ALERT_CLASSES}>
                   {problem ?? planProblem}
+                </p>
+              )}
+              {/* What the last discard did, once, above the list it changed.
+                  Announced rather than merely drawn: the rows it took away
+                  are gone from under the reader's pointer, and the count is
+                  what says so. Why a path stayed is said on that path's own
+                  row instead, where the reader is already looking. */}
+              {receipt !== null && (
+                <p
+                  role="status"
+                  className="text-caption text-slate-500 dark:text-slate-400"
+                >
+                  {receiptLine(receipt)}
                 </p>
               )}
               {/* No layer to choose on a direct domain: a proposal is never
@@ -455,7 +669,47 @@ export default function ShareDialogBody({
                     return now;
                   });
                 }}
+                onOpen={setPane}
+                refusals={refusals}
+                onDiscard={
+                  mayDiscard
+                    ? (path, from) => {
+                        setDiscardProblem(null);
+                        setArming({
+                          targets: [
+                            {
+                              path,
+                              sha:
+                                changes.find((c) => c.path === path)?.sha ??
+                                null,
+                            },
+                          ],
+                          from,
+                        });
+                      }
+                    : undefined
+                }
               />
+              {arming !== null && (
+                <DiscardConfirm
+                  question={
+                    arming.targets.length === 1
+                      ? `Discard ${arming.targets[0]?.path ?? ""}?`
+                      : `Discard ${plural(arming.targets.length, "file", "files")}?`
+                  }
+                  pending={discard.isPending}
+                  problem={discardProblem}
+                  onConfirm={() => {
+                    setDiscardProblem(null);
+                    discard.mutate(arming.targets);
+                  }}
+                  onCancel={() => {
+                    const from = arming.from;
+                    setArming(null);
+                    from?.focus();
+                  }}
+                />
+              )}
               <Field
                 id={titleField}
                 label="Title"
@@ -506,6 +760,32 @@ export default function ShareDialogBody({
                 {identity.sharingAs !== null && (
                   <SharingAs login={identity.sharingAs} />
                 )}
+                {/* Destructive and secondary at once: it is not what this
+                    dialog is for, and it is the only way back out of work
+                    somebody does not want to share at all. */}
+                {mayDiscard && (
+                  <button
+                    type="button"
+                    disabled={
+                      nothingPicked || real.length === 0 || discard.isPending
+                    }
+                    onClick={(event) => {
+                      setDiscardProblem(null);
+                      setArming({
+                        targets: real
+                          .filter((change) => selected.has(change.path))
+                          .map((change) => ({
+                            path: change.path,
+                            sha: change.sha,
+                          })),
+                        from: event.currentTarget,
+                      });
+                    }}
+                    className={`${BUTTON.secondary} text-red-700 dark:text-red-300`}
+                  >
+                    Discard selected
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={onClose}
@@ -540,38 +820,27 @@ export default function ShareDialogBody({
                 )}
               </div>
             </form>
-          ) : (
-            <div className="mt-3 flex flex-col gap-3">
-              <p className="text-sm">
-                {outcome.before}
-                {outcome.link !== null && (
-                  <a
-                    href={outcome.link.href}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-medium underline underline-offset-2 hover:no-underline"
-                  >
-                    {outcome.link.label}
-                  </a>
-                )}
-                {outcome.after}
-              </p>
-              <div className="flex justify-end">
-                <button
-                  type="button"
-                  autoFocus
-                  onClick={onClose}
-                  className={BUTTON.primary}
-                >
-                  Close
-                </button>
-              </div>
-            </div>
           )}
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
   );
+}
+
+/**
+ * What a discard did, in one line.
+ *
+ * The count rather than the paths: the rows those paths were on have just left
+ * the list, and naming them again would be a second list of things that are no
+ * longer there. A path that stayed says why on its own row, so a discard where
+ * everything was refused has nothing left to report but that.
+ */
+function receiptLine(receipt: DiscardReceipt): string {
+  const gone =
+    receipt.restored.length + receipt.deleted.length + receipt.cleared.length;
+  return gone === 0
+    ? "Nothing was discarded."
+    : `Discarded ${plural(gone, "file", "files")}.`;
 }
 
 /**

@@ -29,23 +29,27 @@
  * indeterminate while some of its group is ticked, so a reader can see at a
  * glance that a group is partly in.
  *
- * Generated folder listings are the one thing kept out of the groups, and the
- * one thing with no box. An `index.md` is rebuilt from the engrams beside it,
- * and travels with a share only where the domain's MANIFEST declares
- * `generated_indexes: shared`: a sweep that touched forty folders would
- * otherwise put forty derived paths in front of a reader looking for the three
- * engrams they wrote.
- * So they are counted rather than listed, in one muted line under the groups,
- * and the count follows the ticks - the listing of a folder nothing was chosen
- * from stays behind with it.
+ * Every row is also the way into what actually changed in it: the path is a
+ * button that opens the diff, and a menu beside it offers that same thing by
+ * name plus the one destructive verb a row has, which is discarding the file
+ * back to the team's copy. A discard that was refused says so under its own
+ * row rather than in a line above the list, because the reason belongs to the
+ * file and nothing else on the screen is about it.
+ *
+ * Generated folder listings are the one thing kept out of the groups and never
+ * drawn: an `index.md` is rebuilt from the engrams beside it and follows the
+ * domain's own configuration, so the list says nothing about it at all.
  */
 
+import { MoreHorizontal } from "lucide-react";
+import { DropdownMenu } from "radix-ui";
 import type { ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
 
 import type { ShareChange } from "../api/admin";
-import { isFolderIndex, ridingIndexes, substantive } from "./changes";
-import { CHIP_VARIANTS } from "./primitives";
+import { substantive } from "./changes";
+import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
+import { CHIP_VARIANTS, FOCUS_RING, IconButton } from "./primitives";
 
 /**
  * How many paths a group draws before it starts counting the rest.
@@ -189,6 +193,109 @@ function GroupCheckbox({
   );
 }
 
+/**
+ * One file: whether it goes, what happened to it, the way into its diff, and
+ * the menu holding the verbs that do not fit on a row.
+ *
+ * The trigger's own element is handed to `onDiscard` rather than left to the
+ * caller to read off `document.activeElement`. Radix fires `onSelect` while
+ * the menu item still holds the keyboard and returns focus to the trigger
+ * afterwards, so the active element at that moment is a row the browser is
+ * about to unmount - and the confirmation strip needs somewhere real to put
+ * the keyboard back when somebody changes their mind.
+ */
+function ChangeRow({
+  path,
+  kind,
+  checked,
+  refusal,
+  onToggle,
+  onOpen,
+  onDiscard,
+}: {
+  path: string;
+  kind: string;
+  checked: boolean;
+  refusal: string | null;
+  onToggle: (path: string, next: boolean) => void;
+  onOpen: (path: string) => void;
+  onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
+}): ReactElement {
+  const trigger = useRef<HTMLButtonElement>(null);
+  return (
+    <li className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          aria-label={path}
+          checked={checked}
+          onChange={(event) => {
+            onToggle(path, event.target.checked);
+          }}
+          className="size-3.5 shrink-0 accent-accent-600 dark:accent-accent-400"
+        />
+        <ChangeKindBadge kind={kind} />
+        {/* The path is the way into the diff: a button named by it, in
+            the same face the text wore, so a row reads as it did and
+            a press on it says what changed. */}
+        <button
+          type="button"
+          onClick={() => {
+            onOpen(path);
+          }}
+          className={`min-w-0 truncate rounded px-0.5 text-left font-mono text-xs break-all underline-offset-2 hover:underline ${FOCUS_RING}`}
+        >
+          {path}
+        </button>
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <IconButton
+              ref={trigger}
+              label={`Actions for ${path}`}
+              icon={MoreHorizontal}
+              className="ml-auto h-6 w-6"
+            />
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content
+              align="end"
+              sideOffset={6}
+              className={MENU_CLASSES}
+            >
+              <DropdownMenu.Item
+                className={ITEM_CLASSES}
+                onSelect={() => {
+                  onOpen(path);
+                }}
+              >
+                What changed
+              </DropdownMenu.Item>
+              {onDiscard !== undefined && (
+                <>
+                  <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                  <DropdownMenu.Item
+                    className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
+                    onSelect={() => {
+                      onDiscard(path, trigger.current);
+                    }}
+                  >
+                    Discard
+                  </DropdownMenu.Item>
+                </>
+              )}
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
+      </div>
+      {refusal !== null && (
+        <p className="pl-10 text-caption text-red-700 dark:text-red-300">
+          {refusal}
+        </p>
+      )}
+    </li>
+  );
+}
+
 /** One kind's heading, its first few paths, and the rest behind a press. */
 function ChangeGroup({
   kind,
@@ -196,12 +303,18 @@ function ChangeGroup({
   selected,
   onToggle,
   onToggleGroup,
+  onOpen,
+  onDiscard,
+  refusals,
 }: {
   kind: string;
   paths: string[];
   selected: ReadonlySet<string>;
   onToggle: (path: string, next: boolean) => void;
   onToggleGroup: (paths: string[], next: boolean) => void;
+  onOpen: (path: string) => void;
+  onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
+  refusals: ReadonlyMap<string, string>;
 }): ReactElement {
   const [expanded, setExpanded] = useState(false);
   const face = faceFor(kind);
@@ -226,19 +339,16 @@ function ChangeGroup({
       </p>
       <ul className="flex flex-col gap-0.5">
         {shown.map((path) => (
-          <li key={path} className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              aria-label={path}
-              checked={selected.has(path)}
-              onChange={(event) => {
-                onToggle(path, event.target.checked);
-              }}
-              className="size-3.5 shrink-0 accent-accent-600 dark:accent-accent-400"
-            />
-            <ChangeKindBadge kind={kind} />
-            <span className="font-mono text-xs break-all">{path}</span>
-          </li>
+          <ChangeRow
+            key={path}
+            path={path}
+            kind={kind}
+            checked={selected.has(path)}
+            refusal={refusals.get(path) ?? null}
+            onToggle={onToggle}
+            onOpen={onOpen}
+            onDiscard={onDiscard}
+          />
         ))}
       </ul>
       {rest > 0 && (
@@ -269,7 +379,8 @@ function ChangeGroup({
 
 /**
  * Every file a share would carry, by kind, inside a box that cannot grow past
- * the dialog it sits in, with the folder listings counted beneath them.
+ * the dialog it sits in, with nothing beneath them about the listings a share
+ * carries along.
  *
  * `selected` is the caller's, not this component's: the dialog posts it, so it
  * holds it. What is drawn here is that set and the two ways to change it, one
@@ -281,6 +392,9 @@ export function ChangeList({
   onToggle,
   onToggleGroup,
   hint,
+  onOpen,
+  onDiscard,
+  refusals,
 }: {
   changes: ShareChange[];
   selected: ReadonlySet<string>;
@@ -288,13 +402,15 @@ export function ChangeList({
   onToggleGroup: (paths: string[], next: boolean) => void;
   /** Why the boxes opened the way they did, when that needs saying. */
   hint?: string | null;
+  /** Open the diff pane for a path. */
+  onOpen: (path: string) => void;
+  /** Arm the discard strip for one path; absent when the caller may not discard. */
+  onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
+  /** The reason a path's last discard was refused, drawn under it. */
+  refusals: ReadonlyMap<string, string>;
 }): ReactElement | null {
-  const indexes = ridingIndexes(changes, selected);
   const groups = groupChanges(substantive(changes));
-  const listings = changes.filter((change) =>
-    isFolderIndex(change.path),
-  ).length;
-  if (groups.length === 0 && listings === 0) {
+  if (groups.length === 0) {
     return null;
   }
   return (
@@ -310,19 +426,14 @@ export function ChangeList({
           selected={selected}
           onToggle={onToggle}
           onToggleGroup={onToggleGroup}
+          onOpen={onOpen}
+          onDiscard={onDiscard}
+          refusals={refusals}
         />
       ))}
       {(hint ?? null) !== null && (
         <p className="text-caption text-slate-500 dark:text-slate-400">
           {hint}
-        </p>
-      )}
-      {indexes > 0 && (
-        // Under the groups and quieter than them, because that is exactly the
-        // weight it carries: something the share does, not something the
-        // reader has to decide about.
-        <p className="text-caption text-slate-500 dark:text-slate-400">
-          {`Also refreshes ${String(indexes)} folder ${indexes === 1 ? "index" : "indexes"}`}
         </p>
       )}
     </div>

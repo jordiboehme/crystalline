@@ -142,4 +142,19 @@ describe("the page address a detail payload carries", () => {
     );
     expect(unresolved.webUrl).toBeNull();
   });
+
+  it("reads local_change and tolerates its absence", () => {
+    expect(
+      readEngramDetail({ local_change: "modified" }, "eng", "alpha")
+        .localChange,
+    ).toBe("modified");
+    expect(
+      readEngramDetail({ local_change: "added" }, "eng", "alpha").localChange,
+    ).toBe("added");
+    expect(readEngramDetail({}, "eng", "alpha").localChange).toBeNull();
+    // Any other word is not a claim this side knows how to draw.
+    expect(
+      readEngramDetail({ local_change: "renamed" }, "eng", "alpha").localChange,
+    ).toBeNull();
+  });
 });

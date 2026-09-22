@@ -649,7 +649,7 @@ async fn a_request_missing_its_required_meta_is_refused_with_invalid_params() {
 /// (`Engine::skills_serve`), so the write applies at the next daemon start and
 /// nothing on this connection moves. `github.enabled` is deliberately not this
 /// test's subject - that one does move the list, on purpose, and
-/// `enabling_github_through_configure_makes_the_five_appear_on_the_next_list`
+/// `enabling_github_through_configure_makes_the_six_appear_on_the_next_list`
 /// below is where it is pinned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tool_list_does_not_move_across_a_configure_for_a_modern_client() {
@@ -3265,7 +3265,12 @@ async fn a_non_eliciting_resolve_without_a_resolution_refuses_naming_the_three()
     // And the conflict is still open.
     let status = h
         .engine
-        .origin_status(Some("kb"), false, &crystalline_service::Scope::Unrestricted)
+        .origin_status(
+            Some("kb"),
+            false,
+            false,
+            &crystalline_service::Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -3473,6 +3478,202 @@ async fn an_eliciting_withdrawal_of_an_unknown_number_is_refused_rather_than_ask
         mock.calls()
     );
 }
+// --- discard_changes, and its own confirmation round -------------------------
+//
+// A discard rewrites the working tree, so the eliciting peer is asked the way
+// a delete asks; the gate is the same two-sided one, and a peer that declared
+// no elicitation is served one round.
+
+/// A discard call's params, optionally carrying a round 2 answer.
+fn discard_kb(paths: &[&str], responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "discard_changes",
+        "arguments": { "domain": "kb", "paths": paths },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The team's own copy of the edited engram, which is what a discard restores.
+fn kb_base_alpha(h: &Harness) -> Vec<u8> {
+    std::fs::read(h.root.join("origins/kb/base/notes/a.md")).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modern_peer_without_elicitation_discards_in_one_round() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let done = wire
+        .open(modern(1, "tools/call", discard_kb(&["notes/a.md"], None)))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["restored"], json!(["notes/a.md"]), "{body}");
+    assert_eq!(
+        std::fs::read(h.root.join("kb/notes/a.md")).unwrap(),
+        kb_base_alpha(&h)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_discard_is_asked_first_and_round_two_decides() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let asked = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            discard_kb(&["notes/a.md"], None),
+        ))
+        .await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("Discard 1 change in 'kb'?"), "{message}");
+    assert!(
+        message.contains("notes/a.md (modified: the team's copy comes back)"),
+        "{message}"
+    );
+    assert!(
+        std::fs::read_to_string(h.root.join("kb/notes/a.md"))
+            .unwrap()
+            .contains("alpha, refined"),
+        "round one discards nothing"
+    );
+
+    let declined = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            discard_kb(&["notes/a.md"], Some(answer("accept", false))),
+        ))
+        .await;
+    assert_eq!(declined["result"]["isError"], json!(true), "{declined}");
+    assert!(
+        declined["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was discarded")
+    );
+    assert!(
+        std::fs::read_to_string(h.root.join("kb/notes/a.md"))
+            .unwrap()
+            .contains("alpha, refined")
+    );
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            discard_kb(&["notes/a.md"], Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    assert_eq!(
+        std::fs::read(h.root.join("kb/notes/a.md")).unwrap(),
+        kb_base_alpha(&h),
+        "round two puts the team's copy back"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_discard_of_an_unknown_path_refuses_in_round_one() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let refused = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            discard_kb(&["notes/a.md", "nowhere.md"], None),
+        ))
+        .await;
+    assert_ne!(
+        refused["result"]["resultType"],
+        json!("input_required"),
+        "no question about an action that would refuse: {refused}"
+    );
+    assert_eq!(refused["result"]["isError"], json!(true));
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not among this domain's unshared changes: nowhere.md")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_peer_discards_immediately_with_no_input_required() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    // The legacy handshake, copied from
+    // `a_legacy_peer_deletes_immediately_with_no_input_required`.
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-era-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
+
+    let done = wire
+        .call(request(2, "tools/call", discard_kb(&["notes/a.md"], None)))
+        .await;
+    assert!(
+        !done["result"]
+            .as_object()
+            .unwrap()
+            .contains_key("resultType"),
+        "a legacy result carries no discriminator: {done}"
+    );
+    assert_eq!(
+        std::fs::read(h.root.join("kb/notes/a.md")).unwrap(),
+        kb_base_alpha(&h)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_peer_gets_the_discard_question_over_http() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let addr = h.http().await;
+    let raw = eliciting_post(addr, 1, "tools/call", discard_kb(&["notes/a.md"], None)).await;
+    assert!(raw.starts_with("HTTP/1.1 200 OK"), "{}", head_of(&raw));
+    let asked = payload(&raw);
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    assert!(
+        std::fs::read_to_string(h.root.join("kb/notes/a.md"))
+            .unwrap()
+            .contains("alpha, refined")
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn withdraw_proposal_is_gated_exactly_like_share_changes() {
@@ -3570,13 +3771,14 @@ async fn origin_status_is_lean_and_update_domain_carries_the_bodies() {
 
 // --- the collaboration surface appears when it is enabled -------------------
 
-/// The five GitHub-gated tool names, in the order the listing carries them.
-const COLLAB_GATED: [&str; 5] = [
+/// The six GitHub-gated tool names, in the order the listing carries them.
+const COLLAB_GATED: [&str; 6] = [
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
     "withdraw_proposal",
+    "discard_changes",
 ];
 
 fn listed_names(answer: &Value) -> Vec<String> {
@@ -3590,7 +3792,7 @@ fn listed_names(answer: &Value) -> Vec<String> {
 
 /// **A default install does not list the collaboration tools at all.**
 ///
-/// `github.enabled` is off out of the box, and five of the six collaboration
+/// `github.enabled` is off out of the box, and six of the seven collaboration
 /// tools do nothing but talk to a forge nobody connected. They are withheld
 /// from the listing rather than listed-and-refusing, so a default install
 /// spends no context on a surface it cannot use. `configure` is the one that
@@ -3614,7 +3816,7 @@ async fn a_default_install_lists_configure_but_none_of_the_gated_collaboration_t
     }
 }
 
-/// **Turning the setting on through the tool makes the five appear.**
+/// **Turning the setting on through the tool makes the six appear.**
 ///
 /// The listing gate reads `github.enabled` live, exactly as the call-time
 /// refusal does, so the very connection that flipped the setting sees the
@@ -3622,7 +3824,7 @@ async fn a_default_install_lists_configure_but_none_of_the_gated_collaboration_t
 /// is per-instant: every client listing at the same moment gets the same
 /// answer, and the change is announced to whoever subscribed for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enabling_github_through_configure_makes_the_five_appear_on_the_next_list() {
+async fn enabling_github_through_configure_makes_the_six_appear_on_the_next_list() {
     let h = Harness::new().await;
     let mut wire = h.stdio().await;
 
@@ -3653,7 +3855,7 @@ async fn enabling_github_through_configure_makes_the_five_appear_on_the_next_lis
     assert_eq!(
         after.len(),
         before.len() + COLLAB_GATED.len(),
-        "exactly the five arrived: {before:?} -> {after:?}"
+        "exactly the six arrived: {before:?} -> {after:?}"
     );
 }
 

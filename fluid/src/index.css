@@ -61,11 +61,26 @@
      * the reading view's stay the same color for the same text.
      */
     --color-code-string: #45388c;
+
+    /*
+     * The diff pane's three faces. CodeMirror's merge classes are styled from
+     * a theme inside the editor (`components/DiffPane.tsx`), which is the same
+     * place the highlight style sits and has the same problem: one rule set
+     * for both schemes, and nowhere to read a per-scheme color from but a
+     * custom property. These are the palette's own emerald, red and amber,
+     * the colors a change badge already wears.
+     */
+    --color-diff-added: var(--color-emerald-100);
+    --color-diff-removed: var(--color-red-100);
+    --color-diff-word: var(--color-amber-200);
   }
 
   [data-theme="dark"] {
     color-scheme: dark;
     --color-code-string: #b9afe6;
+    --color-diff-added: var(--color-emerald-950);
+    --color-diff-removed: var(--color-red-950);
+    --color-diff-word: var(--color-amber-900);
   }
 
   body {

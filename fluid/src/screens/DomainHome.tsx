@@ -30,7 +30,13 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Fragment, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router";
 
 import {
   archiveDownloadUrl,
@@ -171,6 +177,13 @@ function DomainPage({
 }) {
   const { capabilities } = useAuth();
   const navigate = useNavigate();
+  /**
+   * What the page the reader came from did before it stopped existing: the
+   * engram screen hands a discarded path over in the navigation state, since
+   * there is nothing left at that address to read it back from.
+   */
+  const arrived =
+    (useLocation().state as { discarded?: string } | null)?.discarded ?? null;
   const { path, filters, browse, filtering, listingOrder, apply } =
     useListingState();
   const [creating, setCreating] = useState(false);
@@ -295,6 +308,21 @@ function DomainPage({
           */}
           {summary?.private === true && <Chip variant="accent">private</Chip>}
         </div>
+        {/*
+          What the page somebody came from did before it stopped existing. A
+          discarded addition or a discarded draft takes its own page with it,
+          so the engram screen sends the reader here and hands the sentence
+          over in the navigation itself; there is nothing to read back from
+          the server about a file that is gone.
+        */}
+        {arrived !== null && (
+          <p
+            role="status"
+            className="text-sm text-slate-600 dark:text-slate-300"
+          >
+            {`Discarded ${arrived}.`}
+          </p>
+        )}
         {summary && (
           <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
             {summary.engrams !== null && (

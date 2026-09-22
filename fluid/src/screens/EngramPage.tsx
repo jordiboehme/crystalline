@@ -27,9 +27,17 @@
  * The observation and relation bullets render once, in the body, in chip
  * form: the written line and its indexed reading are the same line drawn
  * one way, and the details panel deliberately repeats none of it.
+ *
+ * One thing here is about the file rather than about the engram: what this
+ * copy holds that the team's copy does not. It is a chip beside the title
+ * carrying the server's own word for it - Added or Changed against the shared
+ * base, Draft for work standing in the reader's own overlay - and a menu on
+ * that chip for looking at both sides, sharing this one file, or putting it
+ * back the way the team has it. Absent on every page the team already has,
+ * which is nearly every page.
  */
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronRight,
   Download,
@@ -41,10 +49,13 @@ import { DropdownMenu } from "radix-ui";
 import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 
+import { discardChanges, refusalSentence } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
+import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
+import { domainEngramsRoot } from "../api/engrams";
 import type { Backlink } from "../api/graph";
 import {
   NEIGHBORHOOD_DEPTH,
@@ -59,7 +70,9 @@ import { AgentsEye } from "../components/AgentsEye";
 import { AttachmentsSection } from "../components/AttachmentsSection";
 import { BacklinksPanel } from "../components/BacklinksPanel";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
+import { ChangeDialog } from "../components/ChangeDialog";
 import { CopyAddress, DetailsPanel } from "../components/DetailsPanel";
+import { DiscardConfirm } from "../components/DiscardConfirm";
 import { EngramActions, documentSlug } from "../components/EngramActions";
 import type { EngramActionHandlers } from "../components/EngramActions";
 import { LifecycleBanner } from "../components/LifecycleBanner";
@@ -68,8 +81,14 @@ import { Markdown } from "../components/Markdown";
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { MoveDialog } from "../components/MoveDialog";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
-import { BUTTON, IconButton } from "../components/primitives";
+import {
+  BUTTON,
+  CHIP_VARIANTS,
+  FOCUS_RING,
+  IconButton,
+} from "../components/primitives";
 import { RetireDialog } from "../components/RetireDialog";
+import { ShareDialog } from "../components/ShareDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
 import { useFullWidth } from "../layoutWidth";
@@ -91,6 +110,23 @@ export default function EngramPage() {
   const navigate = useNavigate();
   const [retiring, setRetiring] = useState(false);
   const [moving, setMoving] = useState(false);
+  // What the chip beside the title opened: the diff, the share dialog about
+  // this one file, and the strip asking before anything is put back.
+  const [viewingChange, setViewingChange] = useState(false);
+  const [sharingThis, setSharingThis] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
+  /** Why the last discard was refused, said inside the strip that asked. */
+  const [discardProblem, setDiscardProblem] = useState<string | null>(null);
+  /**
+   * Where the keyboard goes when the question is dropped.
+   *
+   * A ref on the chip rather than the element the menu item handed over:
+   * Radix fires `onSelect` while that item still holds the keyboard and
+   * unmounts it a tick later, so focusing it back would be a no-op. The chip
+   * is what opened the menu and it is what is still on the screen.
+   */
+  const chip = useRef<HTMLButtonElement>(null);
+  const queryClient = useQueryClient();
   // The utility three, as `EngramActions` runs them: the palette rows below
   // reach through this rather than repeating the clipboard and blob calls.
   const utilities = useRef<EngramActionHandlers | null>(null);
@@ -138,6 +174,29 @@ export default function EngramPage() {
    * is an engram for the actions to act on.
    */
   const loaded = detail.data;
+  /*
+   * What this copy holds that the team's copy does not, in the server's own
+   * word. The detail payload carries it for a team domain, computed there
+   * against the shared base; a review-mode draft is not a file the origin
+   * compares at all - it stands in the reader's own overlay - so `draft` is
+   * the third word. Nothing about it is worked out here.
+   */
+  const change = loaded
+    ? (loaded.localChange ?? (loaded.draft ? "draft" : null))
+    : null;
+  const chipWord =
+    change === "added"
+      ? "Added"
+      : change === "modified"
+        ? "Changed"
+        : change === "draft"
+          ? "Draft"
+          : null;
+  /**
+   * The file the change routes address, which is the path the payload carries
+   * and, for a payload that names none, the permalink's own file.
+   */
+  const changePath = loaded?.path ?? `${permalink}.md`;
   const commands = useMemo<readonly PaletteCommand[]>(() => {
     if (!loaded) {
       return NO_COMMANDS;
@@ -169,8 +228,23 @@ export default function EngramPage() {
           },
         ]
       : [];
+    // Looking at what changed is a palette row; discarding it is not. A loss
+    // belongs behind a menu and a question, not behind a typed prefix.
+    const looking: PaletteCommand[] =
+      chipWord === null
+        ? []
+        : [
+            {
+              id: "what-changed",
+              title: "What changed on this page",
+              run: () => {
+                setViewingChange(true);
+              },
+            },
+          ];
     return [
       ...writes,
+      ...looking,
       {
         id: "download",
         title: "Download this engram as Markdown",
@@ -193,8 +267,62 @@ export default function EngramPage() {
         },
       },
     ];
-  }, [capabilities.canWrite, loaded, navigate]);
+  }, [capabilities.canWrite, chipWord, loaded, navigate]);
   useRegisterCommands(commands);
+
+  /*
+   * Putting this one file back the way the team has it.
+   *
+   * The digest posted with it is the one this page is holding, so a copy that
+   * moved on since it was read is refused rather than thrown away; a refusal
+   * stays in the strip and the page is read again, so what it says next is
+   * what is actually there. Where the file itself goes - a discarded addition,
+   * a discarded draft - there is no page left to return to, so the reader
+   * lands on the domain and the landing says what happened.
+   */
+  const discard = useMutation({
+    mutationFn: () =>
+      discardChanges(domain, [
+        { path: changePath, sha: loaded?.checksum ?? null },
+      ]),
+    onSuccess: (receipt) => {
+      const refusal = receipt.refused.find(
+        (entry) => entry.path === changePath,
+      );
+      if (refusal) {
+        setDiscardProblem(refusalSentence(refusal.reason));
+        void queryClient.invalidateQueries({
+          queryKey: engramDetailKey(domain, permalink),
+        });
+        return;
+      }
+      setDiscarding(false);
+      const gone =
+        receipt.deleted.includes(changePath) ||
+        receipt.cleared.some(
+          (entry) => entry.path === changePath && entry.kind === "added",
+        );
+      void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
+      if (gone) {
+        queryClient.removeQueries({
+          queryKey: engramDetailKey(domain, permalink),
+        });
+        void queryClient.invalidateQueries({
+          queryKey: domainEngramsRoot(domain),
+        });
+        void navigate(domainRoute(domain), {
+          state: { discarded: changePath },
+        });
+        return;
+      }
+      void queryClient.invalidateQueries({
+        queryKey: engramDetailKey(domain, permalink),
+      });
+    },
+    onError: (error: Error) => {
+      setDiscardProblem(problemDetail(error));
+    },
+  });
 
   if (isMissing(detail.error)) {
     return <EngramNotFound domain={domain} permalink={permalink} />;
@@ -327,9 +455,92 @@ export default function EngramPage() {
             <EngramActions engram={engram} handlers={utilities} />
           </div>
         </div>
-        <h1 id="engram-title" className="text-display">
-          {engram.title}
-        </h1>
+        {/*
+          The title, and beside it the one word for what this copy holds that
+          the team's copy does not. Beside rather than inside: the heading's
+          accessible name is the engram's name and nothing else, and the chip
+          is a control of its own with its own name. It is a menu button
+          because every act about a change - looking, sharing it alone, taking
+          it back - hangs off the same fact, and that fact is the chip.
+        */}
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 id="engram-title" className="text-display">
+            {engram.title}
+          </h1>
+          {chipWord !== null && (
+            <DropdownMenu.Root>
+              <DropdownMenu.Trigger asChild>
+                <button
+                  ref={chip}
+                  type="button"
+                  aria-haspopup="menu"
+                  className={`inline-flex items-center rounded px-2 py-0.5 text-caption font-medium ${
+                    change === "added"
+                      ? CHIP_VARIANTS.positive
+                      : CHIP_VARIANTS.caution
+                  } ${FOCUS_RING}`}
+                >
+                  {chipWord}
+                </button>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal>
+                <DropdownMenu.Content
+                  align="start"
+                  sideOffset={6}
+                  className={MENU_CLASSES}
+                >
+                  <DropdownMenu.Item
+                    className={ITEM_CLASSES}
+                    onSelect={() => {
+                      setViewingChange(true);
+                    }}
+                  >
+                    What changed
+                  </DropdownMenu.Item>
+                  {capabilities.canShare && (
+                    <DropdownMenu.Item
+                      className={ITEM_CLASSES}
+                      onSelect={() => {
+                        setSharingThis(true);
+                      }}
+                    >
+                      Share this change
+                    </DropdownMenu.Item>
+                  )}
+                  {capabilities.canWrite && !capabilities.readOnly && (
+                    <>
+                      <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+                      <DropdownMenu.Item
+                        className={`${ITEM_CLASSES} text-red-700 dark:text-red-300`}
+                        onSelect={() => {
+                          setDiscarding(true);
+                        }}
+                      >
+                        Discard
+                      </DropdownMenu.Item>
+                    </>
+                  )}
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
+          )}
+        </div>
+        {discarding && (
+          <DiscardConfirm
+            question={`Discard the changes to ${changePath}?`}
+            pending={discard.isPending}
+            problem={discardProblem}
+            onConfirm={() => {
+              setDiscardProblem(null);
+              discard.mutate();
+            }}
+            onCancel={() => {
+              setDiscarding(false);
+              setDiscardProblem(null);
+              chip.current?.focus();
+            }}
+          />
+        )}
       </header>
 
       {/*
@@ -479,6 +690,24 @@ export default function EngramPage() {
           domains={(domains.data?.domains ?? []).map((entry) => entry.name)}
           onClose={() => {
             setMoving(false);
+          }}
+        />
+      )}
+      {viewingChange && (
+        <ChangeDialog
+          domain={engram.domain}
+          path={changePath}
+          onClose={() => {
+            setViewingChange(false);
+          }}
+        />
+      )}
+      {sharingThis && (
+        <ShareDialog
+          domain={engram.domain}
+          only={[changePath]}
+          onClose={() => {
+            setSharingThis(false);
           }}
         />
       )}

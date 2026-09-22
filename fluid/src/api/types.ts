@@ -363,6 +363,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a team domain's unshared changes, offline.
+         * @description Any caller who may read the domain. Compares the working tree with the base snapshot this machine holds - or, in a domain that reviews changes, the caller's own drafts with the folder - and names every file that differs with its kind (`added`, `modified`, `deleted`), the SHA-256 of its current content (`sha`, null for a deletion), both sizes, whether either side is binary, and the engram it holds. Generated folder listings never appear. Never pulls and never contacts GitHub, so it is served on a read-only instance and with no connection; `mode` says `team` or `review`, and an anonymous reader of a reviewing domain gets an empty list.
+         */
+        get: operations["list_domain_changes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/changes/discard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discard chosen unshared changes.
+         * @description An editor or an admin with write access to the domain. Each named path is put back the way the team has it: a modification gets the team's copy back, an addition is deleted, a deletion is restored, and in a domain that reviews changes the caller's own draft of the path is cleared. The index is updated at once. Always 200 once the body parses: refusals are per path, under `refused` with a reason - `changed_since` (the file moved since the digest was read), `not_a_change`, `no_base_copy` (an open proposal below the top layer holds the earlier content; withdraw that layer), `unknown_path`, `open_in_editor` (a draft somebody has open). Never contacts GitHub; refused on a read-only instance.
+         */
+        post: operations["discard_domain_changes"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/changes/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Both sides of one unshared change.
+         * @description Any caller who may read the domain. The team's copy (`base`, null for an addition) and this machine's or the caller's draft (`current`, null for a deletion) as text, beside the row the list reports. A binary file carries null texts and its sizes; a text side above 1 MiB is withheld with `too_large` true. 404 for a path that is not among the domain's unshared changes.
+         */
+        get: operations["get_domain_change"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/draft-links": {
         parameters: {
             query?: never;
@@ -2028,6 +2088,25 @@ export interface components {
              * @example https://claude.ai/api/mcp/auth_callback?code=...&state=...&iss=https://kb.example
              */
             location: string;
+        };
+        /** @description The paths to put back the way the team has them, each with the digest the caller looked at. Must name at least one. */
+        DiscardBody: {
+            paths: components["schemas"]["DiscardTargetBody"][];
+        };
+        /** @description One path a discard names, with the digest the caller looked at. */
+        DiscardTargetBody: {
+            /**
+             * @description The domain-relative path, as the list reported it.
+             * @example notes/a.md
+             */
+            path: string;
+            /**
+             * @description The `sha` the list reported for it: the current content's digest for
+             *     an addition or a modification, null for a deletion. A file that no
+             *     longer hashes to it is refused as `changed_since`.
+             * @example 9f2c
+             */
+            sha?: string | null;
         };
         /**
          * @description One membership row: who was invited to a private domain, at what level, by
@@ -4489,6 +4568,250 @@ export interface operations {
             };
             /** @description No such domain. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_domain_changes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The changes, sorted by path, and the files too large to share. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "changes": [
+                     *         {
+                     *           "binary": false,
+                     *           "engram": {
+                     *             "permalink": "notes/a",
+                     *             "title": "A sharper rule"
+                     *           },
+                     *           "kind": "modified",
+                     *           "path": "notes/a.md",
+                     *           "sha": "9f2c",
+                     *           "size_after": 1388,
+                     *           "size_before": 1204
+                     *         },
+                     *         {
+                     *           "binary": false,
+                     *           "engram": {
+                     *             "permalink": "notes/old",
+                     *             "title": "Old"
+                     *           },
+                     *           "kind": "deleted",
+                     *           "path": "notes/old.md",
+                     *           "sha": null,
+                     *           "size_after": null,
+                     *           "size_before": 880
+                     *         }
+                     *       ],
+                     *       "domain": "kb",
+                     *       "mode": "team",
+                     *       "skipped_large": []
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, none this caller may see, or one with no team origin. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is switched off on this instance. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    discard_domain_changes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DiscardBody"];
+            };
+        };
+        responses: {
+            /** @description What happened to each path. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "cleared": [],
+                     *       "deleted": [
+                     *         "notes/new.md"
+                     *       ],
+                     *       "domain": "kb",
+                     *       "refused": [
+                     *         {
+                     *           "path": "notes/b.md",
+                     *           "reason": "changed_since"
+                     *         }
+                     *       ],
+                     *       "reindexed": 2,
+                     *       "restored": [
+                     *         "notes/a.md"
+                     *       ]
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A viewer, a membership below editor, or a read-only instance. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Not a team domain, or GitHub is switched off on this instance. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description An empty path list. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_domain_change: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+                /** @description The domain-relative path, as the list reported it. */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The change with both texts. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "base": "---\ntitle: A\n---\n\nthe old rule\n",
+                     *       "binary": false,
+                     *       "current": "---\ntitle: A\n---\n\nthe sharper rule\n",
+                     *       "domain": "kb",
+                     *       "engram": {
+                     *         "permalink": "notes/a",
+                     *         "title": "A"
+                     *       },
+                     *       "kind": "modified",
+                     *       "path": "notes/a.md",
+                     *       "sha": "9f2c",
+                     *       "size_after": 1388,
+                     *       "size_before": 1204,
+                     *       "too_large": false
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or a path that is not among its unshared changes. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is switched off on this instance. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -70,21 +70,22 @@
 //! guard and gets a clean error. That gate is legitimate on the listing
 //! because the mode is fixed for the engine's lifetime.
 //!
-//! The six collaboration tools (`configure`, `share_changes`, `update_domain`,
-//! `origin_status`, `resolve_conflict`, `withdraw_proposal`) carry two gates
-//! that compose. `configure`, `share_changes`, `resolve_conflict` and
-//! `withdraw_proposal` disappear read-only. `add_domain` is deliberately not
-//! one of the six: it creates domains of every kind, so it is write-gated like
-//! any other writer (see `WRITE_TOOLS`) and only its team-domain branch needs
-//! `github.enabled`, enforced in the engine rather than on the listing.
+//! The seven collaboration tools (`configure`, `share_changes`,
+//! `update_domain`, `origin_status`, `resolve_conflict`, `withdraw_proposal`,
+//! `discard_changes`) carry two gates that compose. `configure`,
+//! `share_changes`, `resolve_conflict`, `withdraw_proposal` and
+//! `discard_changes` disappear read-only. `add_domain` is deliberately not
+//! one of the seven: it creates domains of every kind, so it is write-gated
+//! like any other writer (see `WRITE_TOOLS`) and only its team-domain branch
+//! needs `github.enabled`, enforced in the engine rather than on the listing.
 //! `github.enabled` is needed by every collaboration tool but `configure`, and
-//! while it is off the five that need it are hidden from
+//! while it is off the six that need it are hidden from
 //! the listing too, so a default install spends no context on a forge surface
 //! nobody connected; `configure` is never hidden by it, since it is the only
 //! way to turn the rest on. Calling a hidden one still answers with
 //! `RemoteError::NotEnabled`'s message, which names the setting and both ways
 //! to change it, so a stale cached list teaches rather than dead-ends. Turning
-//! the setting on makes all five appear on the next list and announces the
+//! the setting on makes all six appear on the next list and announces the
 //! change to every open subscription. See `COLLAB_TOOLS`,
 //! `COLLAB_WRITE_TOOLS`, `hidden_collab_tool` and `refused_collab_tool`.
 //!
@@ -170,7 +171,7 @@
 //!
 //! # One list can change, and it is announced to subscribers only
 //!
-//! `configure` flipping `github.enabled` moves the tool list, because the five
+//! `configure` flipping `github.enabled` moves the tool list, because the six
 //! GitHub-gated collaboration tools are listed only while it is on. That is
 //! the single mover on this server: `resources/list` and `prompts/list` read
 //! `skills.serve` and `harness_onboarded`, both fixed before the first request
@@ -721,39 +722,41 @@ impl_cache_hinted!(
     ReadResourceResult,
 );
 
-/// The six GitHub collaboration tools, gated on the engine's live
+/// The seven GitHub collaboration tools, gated on the engine's live
 /// `github.enabled` setting (all but `configure`) and `read_only` flag (see
 /// `COLLAB_WRITE_TOOLS`). `add_domain` is not among them: it creates domains of
 /// every kind, so it is a write-gated tool (see `WRITE_TOOLS`), and only its
 /// team-domain branch needs `github.enabled`, enforced in the engine.
-const COLLAB_TOOLS: [&str; 6] = [
+const COLLAB_TOOLS: [&str; 7] = [
     "configure",
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
     "withdraw_proposal",
+    "discard_changes",
 ];
 
-/// Of the six collaboration tools, the four also hidden in read-only mode:
+/// Of the seven collaboration tools, the five also hidden in read-only mode:
 /// `configure` (settings and this machine's GitHub identity are frozen the
-/// same way content is), `share_changes`, `resolve_conflict` and
-/// `withdraw_proposal` (each writes a proposal or config). `update_domain` and
-/// `origin_status` stay visible read-only, mirroring their engine-level
-/// exemption (a pull is a derived-truth update like sync; status is a pure
-/// read).
-const COLLAB_WRITE_TOOLS: [&str; 4] = [
+/// same way content is), `share_changes`, `resolve_conflict`,
+/// `withdraw_proposal` and `discard_changes` (each writes a proposal, config
+/// or the working tree). `update_domain` and `origin_status` stay visible
+/// read-only, mirroring their engine-level exemption (a pull is a
+/// derived-truth update like sync; status is a pure read).
+const COLLAB_WRITE_TOOLS: [&str; 5] = [
     "configure",
     "share_changes",
     "resolve_conflict",
     "withdraw_proposal",
+    "discard_changes",
 ];
 
 /// Appended to the initialize instructions while TOON responses are active,
 /// so a client model reads list results as structured data rather than prose.
 const TOON_INSTRUCTIONS_NOTE: &str = "\n\nList-shaped tool results (search hits, activity, listings and status reports) arrive TOON-encoded rather than as JSON: indentation nests objects, `name[N]{field1,field2}:` heads a uniform array with one comma-separated row per record and a tags cell joins its values with commas. Read them as data with exactly those fields.";
 
-/// Whether `name` is one of the six collaboration tools.
+/// Whether `name` is one of the seven collaboration tools.
 fn is_collab_tool(name: &str) -> bool {
     COLLAB_TOOLS.contains(&name)
 }
@@ -912,11 +915,11 @@ fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> b
 ///
 /// The net matrix, and the two gates compose rather than override:
 ///
-/// - `github.enabled` off hides all five gated tools whatever the mode is, and
+/// - `github.enabled` off hides all six gated tools whatever the mode is, and
 ///   never hides `configure`, which is the only way to turn them on.
 /// - read-only additionally hides the [`COLLAB_WRITE_TOOLS`] set, so a
 ///   read-only instance with collaboration on lists `update_domain` and
-///   `origin_status` and nothing else of the six.
+///   `origin_status` and nothing else of the seven.
 ///
 /// # Invariance is per instant, not per process
 ///
@@ -964,6 +967,7 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
+use crate::DiscardTarget;
 use crate::collab::session::AgentPeer;
 use crate::domain_view::DomainView;
 use crate::engine::{
@@ -2710,7 +2714,7 @@ impl McpServer {
             return result.map_err(to_error).and_then(ok);
         }
 
-        // `github.enabled` gates the listing of five collaboration tools
+        // `github.enabled` gates the listing of six collaboration tools
         // ([`hidden_collab_tool`]), so a call that flips it moves this
         // server's tool list and owes subscribers an announcement. That does
         // not live here: it lives on `Engine::configure`, which every key in
@@ -3024,7 +3028,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -3042,7 +3046,7 @@ impl McpServer {
                 .map_err(to_error)?;
         }
         self.engine
-            .origin_status(p.domain.as_deref(), p.detail, &self.scope_of(&ctx))
+            .origin_status(p.domain.as_deref(), p.detail, p.diff, &self.scope_of(&ctx))
             .await
             .map(lean_origin_status)
             .map_err(to_error)
@@ -3201,6 +3205,95 @@ impl McpServer {
             .await
         {
             Ok(withdrawn) => ok(withdrawn).map(CallToolResponse::from),
+            Err(e) => overlay_write_error(e).map(CallToolResponse::from),
+        }
+    }
+
+    #[tool(
+        name = "discard_changes",
+        title = "Discard changes",
+        description = "Discard, revert, undo or throw away unshared local changes in a team domain, file by file, before they are shared: each named path is put back the way the team has it - a modified engram gets the team's copy back, an added file is deleted, a deleted file is restored - and the index is updated at once. In a domain in review mode (review: overlay) it clears your own drafts of those paths and never anybody else's. Use it when a change turned out wrong, when an edit should not go into the next proposal, or when the user asks to drop a change; pass the paths from origin_status with detail: true, which is also where diff: true shows what each change is before you decide. Pass expected, a map of path to the sha origin_status reported with diff: true, to have a file that moved since you read that list refused as changed_since instead of overwritten; without it there is no guard and each path is discarded as it stands when the call runs. Refuses by name a path that is not among the domain's unshared changes, refuses a path whose earlier content only an open proposal below the top layer holds (withdraw that layer instead), and refuses a draft somebody has open in a live editor. Never touches GitHub, never closes a proposal (that is withdraw_proposal) and never deletes knowledge the team already has. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call discards nothing and answers input_required instead: a confirmation question naming the domain, the paths and their kinds, answered by re-sending the same call with the confirmation; anything but a yes discards nothing.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn discard_changes(
+        &self,
+        Parameters(p): Parameters<DiscardChangesParams>,
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if refused_collab_tool("discard_changes", self.engine.github_enabled()) {
+            return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
+        }
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        self.engine
+            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
+        let actor = self.share_actor(&ctx);
+        let expected = p.expected.unwrap_or_default();
+        let targets: Vec<DiscardTarget> = p
+            .paths
+            .iter()
+            .map(|path| DiscardTarget {
+                path: path.clone(),
+                sha256: expected.get(path).cloned(),
+            })
+            .collect();
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    // The preview is the list narrowed to the named paths, and
+                    // a path the list does not carry refuses here, by name:
+                    // never a question about an action that would refuse
+                    // anyway (the rule `remove_domain` states).
+                    let listed = match self.engine.local_changes(&p.domain, &actor).await {
+                        Ok(listed) => listed,
+                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                    };
+                    let known: Vec<Value> =
+                        listed["changes"].as_array().cloned().unwrap_or_default();
+                    let mut chosen = Vec::new();
+                    let mut unknown = Vec::new();
+                    for path in &p.paths {
+                        match known.iter().find(|c| c["path"] == json!(path)) {
+                            Some(change) => chosen.push(change.clone()),
+                            None => unknown.push(path.clone()),
+                        }
+                    }
+                    if !unknown.is_empty() {
+                        return refuse(format!(
+                            "not among this domain's unshared changes: {}; take the paths from origin_status with detail: true, which lists every file that differs",
+                            unknown.join(", ")
+                        ))
+                        .map(CallToolResponse::from);
+                    }
+                    // Guarded only where the caller actually named a digest
+                    // for one of these paths: an `expected` map that names
+                    // none of them guards nothing.
+                    let guarded = p.paths.iter().any(|path| expected.contains_key(path));
+                    return Ok(
+                        confirm_question(discard_question(&p.domain, &chosen, guarded)).into(),
+                    );
+                }
+                Some(false) => {
+                    return refuse(DISCARD_REFUSAL).map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
+        }
+        match self
+            .engine
+            .discard_local_changes(&p.domain, &targets, &actor)
+            .await
+        {
+            Ok(report) => ok(report).map(CallToolResponse::from),
             Err(e) => overlay_write_error(e).map(CallToolResponse::from),
         }
     }
@@ -3895,7 +3988,7 @@ impl ServerHandler for McpServer {
     /// # What can move, and what cannot
     ///
     /// One thing this server can be asked to do moves a list: `configure` can
-    /// flip `github.enabled`, and five collaboration tools appear or disappear
+    /// flip `github.enabled`, and six collaboration tools appear or disappear
     /// with it (see [`hidden_collab_tool`]). That is the only mover.
     /// `resources/list` and `prompts/list` read `skills.serve` and
     /// `harness_onboarded`, both fixed before the first request arrives, so
@@ -4764,6 +4857,10 @@ const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared.
 /// rather than what failed.
 const WITHDRAW_REFUSAL: &str = "The withdrawal was not confirmed, so the proposal is still open. Call withdraw_proposal again if the user asks for it.";
 
+/// What an unconfirmed discard tells the model, naming what is still true
+/// rather than what failed.
+const DISCARD_REFUSAL: &str = "The discard was not confirmed, so nothing was discarded. Call discard_changes again if the user asks for it.";
+
 /// The sentence `withdraw_proposal` asks before it closes anything, rendered
 /// from [`crate::engine::Engine::origin_withdraw_preview`]'s plan: the layer
 /// it would take out, the layers that move because of it, and the working-tree
@@ -4803,6 +4900,52 @@ fn withdraw_question(preview: &Value) -> String {
     if preview["reverting"] == json!(true) {
         question.push_str(" The shared files are restored locally where a copy is reachable.");
     }
+    question
+}
+
+/// The sentence `discard_changes` asks before it touches anything: how many
+/// paths, each with its kind and what a discard does to it, capped at ten
+/// the way `share_question` caps its list, and the two facts a person
+/// deciding needs - a reviewing domain clears their own drafts, and nothing
+/// reaches GitHub.
+///
+/// `guarded` is whether the caller named an `expected` digest for any of these
+/// paths, and the last sentence turns on it because the guard is the caller's
+/// to ask for. With digests, a file edited between this question and the yes
+/// is refused rather than overwritten. Without them the engine fills every
+/// digest at discard time, so what is discarded is whatever the file holds by
+/// then - which is what the question says, rather than promising a guard
+/// nobody asked for.
+fn discard_question(domain: &str, changes: &[Value], guarded: bool) -> String {
+    let count = changes.len();
+    let noun = if count == 1 { "change" } else { "changes" };
+    let lines: Vec<String> = changes
+        .iter()
+        .take(10)
+        .map(|c| {
+            let path = c["path"].as_str().unwrap_or_default();
+            let what = match c["kind"].as_str().unwrap_or_default() {
+                "added" => "added: the file is deleted",
+                "modified" => "modified: the team's copy comes back",
+                "deleted" => "deleted: the team's copy is restored",
+                other => other,
+            };
+            format!("{path} ({what})")
+        })
+        .collect();
+    let mut question = format!("Discard {count} {noun} in '{domain}'? {}", lines.join(", "));
+    if count > 10 {
+        question.push_str(&format!(" and {} more", count - 10));
+    }
+    question.push_str(
+        ". In a domain that reviews changes this clears your own drafts of these paths. ",
+    );
+    question.push_str(if guarded {
+        "A file edited since you looked is refused rather than overwritten. "
+    } else {
+        "Each file is discarded as it stands now, edits since you looked included. "
+    });
+    question.push_str("Nothing reaches GitHub.");
     question
 }
 
@@ -6142,6 +6285,70 @@ mod tests {
         assert!(!amended.contains("Title: '"), "{amended}");
     }
 
+    /// The discard question names every path and what a discard does to it,
+    /// capped the way the share question caps its list.
+    #[test]
+    fn discard_question_names_every_path_and_its_kind() {
+        let changes: Vec<Value> = (0..12)
+            .map(|i| {
+                json!({
+                    "path": format!("notes/{i}.md"),
+                    "kind": if i % 3 == 0 {
+                        "added"
+                    } else if i % 3 == 1 {
+                        "modified"
+                    } else {
+                        "deleted"
+                    },
+                })
+            })
+            .collect();
+        let question = discard_question("kb", &changes, false);
+        assert!(
+            question.starts_with("Discard 12 changes in 'kb'? "),
+            "{question}"
+        );
+        assert!(
+            question.contains("notes/0.md (added: the file is deleted)"),
+            "{question}"
+        );
+        assert!(
+            question.contains("notes/1.md (modified: the team's copy comes back)"),
+            "{question}"
+        );
+        assert!(
+            question.contains("notes/2.md (deleted: the team's copy is restored)"),
+            "{question}"
+        );
+        assert!(question.contains("and 2 more"), "capped at ten: {question}");
+        assert!(!question.contains("notes/10.md"));
+        assert!(question.ends_with("Nothing reaches GitHub."), "{question}");
+        // Unguarded, which is the default call: the question promises no
+        // guard, it says what will actually be discarded.
+        assert!(
+            question.contains(
+                "Each file is discarded as it stands now, edits since you looked included."
+            ),
+            "{question}"
+        );
+        assert!(
+            !question.contains("refused rather than overwritten"),
+            "{question}"
+        );
+
+        // With a digest named, the guard is real and the question says so.
+        let guarded = discard_question("kb", &changes, true);
+        assert!(
+            guarded.contains("A file edited since you looked is refused rather than overwritten."),
+            "{guarded}"
+        );
+        assert!(!guarded.contains("as it stands now"), "{guarded}");
+        assert!(guarded.ends_with("Nothing reaches GitHub."), "{guarded}");
+
+        let one = discard_question("kb", &changes[..1], false);
+        assert!(one.starts_with("Discard 1 change in 'kb'? "), "{one}");
+    }
+
     /// The generated folder listings, in the three shapes the question can
     /// meet them: none at all, some beside real work, and a share that is
     /// nothing but listings.
@@ -6398,7 +6605,7 @@ mod tests {
     }
 
     #[test]
-    fn is_collab_tool_recognizes_exactly_the_six() {
+    fn is_collab_tool_recognizes_exactly_the_seven() {
         for name in COLLAB_TOOLS {
             assert!(is_collab_tool(name), "{name}");
         }
@@ -6713,12 +6920,12 @@ mod tests {
     }
 
     /// The listing gate's full matrix, both inputs. `github.enabled` off hides
-    /// the five whatever the mode is and never hides `configure`; on top of
+    /// the six whatever the mode is and never hides `configure`; on top of
     /// that read-only hides the write set, so an enabled read-only instance
     /// shows the two collaboration tools it still exempts and nothing else.
     #[test]
     fn hidden_collab_tool_matches_the_locked_matrix() {
-        // github off: the five are hidden whatever the mode is.
+        // github off: the six are hidden whatever the mode is.
         for read_only in [false, true] {
             for name in COLLAB_TOOLS.iter().filter(|n| **n != "configure") {
                 assert!(hidden_collab_tool(name, read_only, false), "{name}");
@@ -6733,7 +6940,7 @@ mod tests {
             "read-only hides configure on its own gate, unchanged"
         );
 
-        // github on, writable: all six.
+        // github on, writable: all seven.
         for name in COLLAB_TOOLS {
             assert!(!hidden_collab_tool(name, false, true), "{name}");
         }
@@ -6773,6 +6980,7 @@ mod tests {
             "origin_status",
             "resolve_conflict",
             "withdraw_proposal",
+            "discard_changes",
         ] {
             assert!(refused_collab_tool(name, false), "{name}");
         }

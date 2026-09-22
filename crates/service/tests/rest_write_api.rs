@@ -2072,6 +2072,16 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // `eng` has no origin either, so the allowed leg is a 409 the same
+        // way the sync/withdraw/resolve rows above are: "anything but
+        // 401/403", proving the gate without a team fixture.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/changes/discard",
+            body: Some(serde_json::json!({"paths": [{"path": "alpha.md", "sha": null}]})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
         // Both archive uploads: admin-only writes, and their allowed legs
         // answer 422 (an empty body is not a zip), which passes this matrix's
         // "anything but 401/403" contract while mutating nothing.
