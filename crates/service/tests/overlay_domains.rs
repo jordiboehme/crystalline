@@ -4966,6 +4966,10 @@ async fn a_review_mode_discard_clears_exactly_the_named_drafts() {
     .await;
     f.file("team", "alice", "assets/logo.png", b"png").await;
     let before = f.tree("team");
+    assert!(
+        f.domain_root("team").join("index.md").is_file(),
+        "the listing the discard below names is a file that is really there"
+    );
     let _joined = sessions.join("team", "open", Some("alice")).await.unwrap();
     let alice = ShareActor::Account("alice".to_string());
 
@@ -4994,6 +4998,10 @@ async fn a_review_mode_discard_clears_exactly_the_named_drafts() {
                     path: "nowhere.md".to_string(),
                     sha256: None,
                 },
+                DiscardTarget {
+                    path: "index.md".to_string(),
+                    sha256: None,
+                },
             ],
             &alice,
         )
@@ -5013,8 +5021,9 @@ async fn a_review_mode_discard_clears_exactly_the_named_drafts() {
             { "path": "fresh.md", "reason": "changed_since" },
             { "path": "open.md", "reason": "open_in_editor" },
             { "path": "nowhere.md", "reason": "unknown_path" },
+            { "path": "index.md", "reason": "unknown_path" },
         ]),
-        "{report}"
+        "the folder's own listing is refused by name: {report}"
     );
     assert_eq!(report["restored"], serde_json::json!([]));
     assert_eq!(report["deleted"], serde_json::json!([]));
@@ -5058,8 +5067,26 @@ async fn a_review_mode_discard_clears_exactly_the_named_drafts() {
 async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
     let f = origin_fixture().await;
     let root = f.domain_root("team");
+    // This domain shares its folder listings, so its own `index.md` is a file
+    // detection looks at rather than one it never sees. That is what makes the
+    // refusal below a fact about the name: the listing is there, it differs
+    // from the base as soon as `fresh.md` lands beside it, and it is still
+    // named by no list and discardable by nobody.
+    std::fs::write(
+        root.join("MANIFEST.md"),
+        MANIFEST.replace(
+            "status: stable\n",
+            "status: stable\ngenerated_indexes: shared\n",
+        ),
+    )
+    .unwrap();
+    assert!(
+        root.join("index.md").is_file(),
+        "the fixture's own sync generated the listing"
+    );
+    f.snapshot_origin("team");
     // The base tree a first pull writes, beside the stamps the fixture wrote.
-    for rel in ["MANIFEST.md", "plan.md"] {
+    for rel in ["MANIFEST.md", "plan.md", "index.md"] {
         crystalline_remote::state::write_base_file(
             &f.origins.join("team"),
             rel,
@@ -5070,6 +5097,12 @@ async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
     std::fs::write(root.join("plan.md"), ALICE_DRAFT).unwrap();
     std::fs::write(root.join("fresh.md"), ALICE_NEW).unwrap();
     f.engine.sync(None).await.unwrap();
+    assert!(
+        std::fs::read_to_string(root.join("index.md"))
+            .unwrap()
+            .contains("Fresh"),
+        "the listing itself moved when the new engram landed, so detection sees it too"
+    );
     let owner = ShareActor::Owner;
 
     let list = f.engine.local_changes("team", &owner).await.unwrap();
@@ -5080,7 +5113,11 @@ async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
         .iter()
         .map(|c| c["path"].as_str().unwrap())
         .collect();
-    assert_eq!(paths, vec!["fresh.md", "plan.md"], "{list}");
+    assert_eq!(
+        paths,
+        vec!["fresh.md", "plan.md"],
+        "the refreshed listing is never named: {list}"
+    );
     assert_eq!(list["changes"][1]["kind"], "modified");
     assert_eq!(list["changes"][1]["size_before"], PLAN.len());
 
@@ -5126,6 +5163,10 @@ async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
                     path: "fresh.md".to_string(),
                     sha256: Some("0".repeat(64)),
                 },
+                DiscardTarget {
+                    path: "index.md".to_string(),
+                    sha256: None,
+                },
             ],
             &owner,
         )
@@ -5138,7 +5179,11 @@ async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
     );
     assert_eq!(
         report["refused"],
-        serde_json::json!([{ "path": "fresh.md", "reason": "changed_since" }])
+        serde_json::json!([
+            { "path": "fresh.md", "reason": "changed_since" },
+            { "path": "index.md", "reason": "unknown_path" },
+        ]),
+        "a listing is refused by name while the batch beside it proceeds: {report}"
     );
     assert_eq!(report["reindexed"], 1);
     assert_eq!(std::fs::read_to_string(root.join("plan.md")).unwrap(), PLAN);
