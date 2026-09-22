@@ -1229,8 +1229,37 @@ fn take_request(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
 /// The domain the daemon tests teach: one engram whose every word the
 /// positive prompt names, so the lexical half of hybrid ranking matches it on
 /// its own and the block never depends on the stub's geometry alone.
-const VENT_TITLE: &str = "How the vent driver retry works";
-const VENT_BODY: &str = "The vent driver retry budget is three attempts. How the retry backs off: 200 ms, then 400 ms, then 800 ms. A write that still fails does not retry again; the driver reports the fault and the vent stays closed.";
+///
+/// The wording is chosen against the stub's exact bag-of-words geometry, not
+/// left to read naturally: `PLAIN_PROMPT` reaches the engram on the lexical
+/// half alone (a sole, fully-matched lexical candidate scores `1.0`, scaled by
+/// `SINGLE_SOURCE_PENALTY` to `0.85`), but `MESSAGE_PROMPT` never does - its
+/// wrapper tokens (`cross`, `session`, `message`, `from`, `x`) keep the
+/// AND-matched lexical half empty, so it reaches the engram through cosine
+/// similarity alone and must clear `DEFAULT_MIN_SIMILARITY`
+/// (`crates/index/src/turso/search.rs`, re-derived to 0.78 for the granite
+/// model) before the floor even gets to weigh it. The body is mostly the
+/// positive prompt's own words, repeated across short sentences, because the
+/// stub is a literal word-occurrence count: repetition is what moves cosine.
+///
+/// Cosines against this fixture, recomputed with a Python reimplementation of
+/// `stub_hash`/`stub_vector` (FNV-1a over lowercased alphanumeric runs, one
+/// 32-dim bucket per word, L2-normalised) and confirmed by the passing tests:
+///
+/// | prompt | old engram (pre-granite) | new engram |
+/// | --- | --- | --- |
+/// | `PLAIN_PROMPT` | 0.729 | 0.876 |
+/// | the negative prompt (`what colour is the sky today`) | 0.497 | 0.535 |
+/// | the loop text (`check the build again and report`) | 0.397 | 0.357 |
+/// | `MESSAGE_PROMPT` | 0.735 | 0.851 |
+///
+/// Both prompt-bearing cases now clear 0.78 with margin (`PLAIN_PROMPT` by
+/// 0.096, `MESSAGE_PROMPT` by 0.071, and `MESSAGE_PROMPT` is the binding one:
+/// it is the semantic-only case, scored `0.851 * 0.85 = 0.723` against the
+/// `recall.min_score` floor of 0.5 pinned below); the negative prompt and the
+/// loop text stay well clear of 0.78 on the other side.
+const VENT_TITLE: &str = "How does the vent driver retry";
+const VENT_BODY: &str = "How does the vent driver retry? How does the vent driver retry when the write fails. How does the vent driver retry when the write fails again. The vent driver retry answers how the vent driver retry works: the budget is three attempts, backing off 200 ms, then 400 ms, then 800 ms. A write that still fails does not retry again; the vent driver reports the fault and the vent stays closed until the driver retries.";
 /// The address the block must name.
 const VENT_ADDRESS: &str = "crystalline://vents/vent-driver-retry";
 
