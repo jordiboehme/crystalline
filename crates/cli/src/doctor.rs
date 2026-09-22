@@ -326,8 +326,8 @@ pub struct EnvironmentDoctor {
 /// repository's `--project` setup.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HarnessDoctor {
-    /// The harness's stable identifier, `"claude-code"` or `"codex"` - the
-    /// same spelling `crystalline install <name>` takes.
+    /// The harness's stable identifier, `"claude-code"`, `"codex"` or
+    /// `"copilot"` - the same spelling `crystalline install <name>` takes.
     pub name: String,
     /// The settings/hooks file this harness reads (`settings.json` for
     /// Claude Code, `hooks.json` for Codex).

@@ -368,7 +368,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "recall.enabled",
-            doc: "Whether the per-prompt hook crystalline install wires for Claude Code and Codex hands the agent the engrams that may apply to each prompt (default true); false keeps the hook installed but silent, without touching the harness settings file",
+            doc: "Whether the per-prompt hook crystalline install wires hands the agent the engrams that may apply to each prompt (default true; it works in Claude Code and Codex, Copilot has no channel for its output yet); false keeps the hook installed but silent, without touching the harness settings file",
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
