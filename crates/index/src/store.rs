@@ -654,7 +654,7 @@ pub struct SearchQuery {
     /// a ranked search has its own order.
     pub order: SearchOrder,
     /// Minimum cosine similarity for a semantic hit, `None` uses the store
-    /// default (`0.55`). Ignored by the text, title and permalink modes.
+    /// default (`0.78`). Ignored by the text, title and permalink modes.
     pub min_similarity: Option<f32>,
     /// The salience-prior weight for hybrid ranking; `None` uses the store
     /// default (`DEFAULT_SALIENCE_WEIGHT`). The maximum lift a fully-salient

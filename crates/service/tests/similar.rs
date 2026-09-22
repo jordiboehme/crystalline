@@ -927,8 +927,9 @@ async fn a_drafts_receipt_never_lists_its_own_base_row() {
 #[tokio::test]
 async fn an_authors_own_drafts_can_fill_the_advisory_and_the_cut_stands() {
     // The one base engram on the topic is deliberately further away than any
-    // draft: it mixes the docking markers into the retry ones, so its lead
-    // vector sits off the axis every draft below is exactly on. A base row at
+    // draft: a few docking markers among its retry ones tilt its lead vector
+    // off the axis every draft below is exactly on, while it still clears the
+    // search floor (the split is 7:2, about cosine 0.96). A base row at
     // the same distance would make which four rows reach the page a tie rather
     // than a fact.
     let (_tmp, engine) = review_engine(&[(

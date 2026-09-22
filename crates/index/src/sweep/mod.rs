@@ -91,8 +91,9 @@ pub const DUP_THRESHOLD: f64 = 0.80;
 /// those quantiles, and the higher, rounded to two decimals, is this value.
 /// All twelve hand-written rewrites clear it, the weakest at 0.9416; on
 /// Jordi's domains granite puts ordinary related neighbours at median
-/// 0.8740, p95 0.9422 (bge: median 0.84, p95 0.90), so a twin is still a
-/// strong claim above that band. The finding is judgment class and
+/// 0.8740, p95 0.9422 (bge: median 0.84, p95 0.90), so the line sits at the
+/// top of that band, not above it: rounding down from 0.9422 doubles the
+/// twin pairs there (three to six). The finding is judgment class and
 /// pair-scoped, so a wrong one costs one acknowledgment.
 pub const TWIN_THRESHOLD: f64 = 0.94;
 
