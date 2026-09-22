@@ -269,6 +269,8 @@ Local domains created from Fluid land under the server's domains root, which def
 
 The maintenance pending state lives in the daemon's state directory, so a containerized daemon paired with a host-side Stop hook never arms the pending ask: the two processes see different state directories, and the domains one records a human writing to are not the ones the other reads before it nudges. The hook still asks on its weekly arm, from its own clock on the host.
 
+The per-prompt recall hook has the same split: it looks for the daemon's socket in the host's state directory, finds none beside a containerized daemon and stays silent.
+
 The image runs as the non-root user `65532:65532` and ships `/data` owned by it, so an empty named volume mounted there is writable from the first start: Docker copies the image directory's ownership into the volume when it initializes it. A bind mount never inherits that - the host directory keeps its own ownership - so a host folder mounted at `/data` instead of a named volume has to be made writable by that uid first, or the daemon cannot create its state directory and the container restarts in a loop:
 
 ```sh
@@ -314,7 +316,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_IDENTITY_ACTOR` | `identity.actor` | who is recorded as the writer of an engram (`generated.by`), for example `team-bot/1.0` or `human:jordi`; unset means the connected MCP client identifies itself |
 | `CRYSTALLINE_INDEX_FILES` | `index.files` | `true` (default) keeps a generated `index.md` in every folder of a file domain |
 | `CRYSTALLINE_CAPTURE_SIMILAR` | `capture.similar` | attach the nearest existing engrams to every `write_engram` and content `edit_engram` receipt as a `similar` list with guidance to merge, supersede, link or ignore them (default `true`); `false` switches the advisory off everywhere, MCP and Fluid alike |
-| `CRYSTALLINE_RECALL_ENABLED` | `recall.enabled` | `true` (default) lets the per-prompt hook `crystalline install` wires for Claude Code and Codex hand the agent the engrams that may apply to each prompt; `false` keeps the hook installed but silent |
+| `CRYSTALLINE_RECALL_ENABLED` | `recall.enabled` | `true` (default) lets the per-prompt hook `crystalline install` wires hand the agent the engrams that may apply to each prompt, working today in Claude Code and Codex (Copilot gets the same hook entry but has no channel yet for its output); `false` keeps the hook installed but silent |
 | `CRYSTALLINE_RECALL_LIMIT` | `recall.limit` | 1 to 5 (default 3); how many engrams the per-prompt hook may name at once |
 | `CRYSTALLINE_RECALL_MIN_SCORE` | `recall.min_score` | 0.0 to 1.0 (default 0.5); the hybrid score an engram must reach before the per-prompt hook names it |
 | `CRYSTALLINE_AUTH_TRUSTED_HEADER` | `auth.trusted_header` | the request header a trusted reverse proxy sets to name the already-authenticated user, for example `remote-user`. Unset (default) means no header is believed, whatever a client sends; an account named by a configured header is created at viewer role the first time it is seen. Only safe when the proxy in front of Crystalline strips the header from client requests and sets it itself. Read once when the HTTP surface starts, like `service.read_only` |

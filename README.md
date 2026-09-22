@@ -140,7 +140,7 @@ Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also
 crystalline install claude-code
 ```
 
-One command wires the whole integration: MCP registration, the `SessionStart` onboarding hook, the `Stop` capture nudge (see [The learning loop](#the-learning-loop)) and the four topical skills. It is idempotent - rerun it any time and whatever is already correct is left untouched - and each part is skippable with `--skip-mcp`, `--skip-hooks` or `--skip-skills`; `--project` writes into the current repository's config instead of your global one, and `crystalline uninstall claude-code` reverses everything `install` did, leaving any hook, key or locally edited skill that is not Crystalline's own in place.
+One command wires the whole integration: MCP registration, the `SessionStart` onboarding hook, the `Stop` capture nudge, the `UserPromptSubmit` recall hook (see [The learning loop](#the-learning-loop)) and the four topical skills. It is idempotent - rerun it any time and whatever is already correct is left untouched - and each part is skippable with `--skip-mcp`, `--skip-hooks` or `--skip-skills`; `--project` writes into the current repository's config instead of your global one, and `crystalline uninstall claude-code` reverses everything `install` did, leaving any hook, key or locally edited skill that is not Crystalline's own in place.
 
 The quick start above is exactly this path end to end; give the agent its first domain the same way and start a session.
 
@@ -288,6 +288,8 @@ Experience only compounds when capture actually happens. The loop has three beat
 It is a `Stop` hook running `crystalline hook stop`: a once-per-session, late nudge that fires on the first stop after a session gains real substance and stays silent otherwise - below the substance threshold, once it has already fired, in read-only mode or with no domain registered. When it fires, it asks the agent to review the conversation for durable learnings, propose capturing each one into the fitting domain (the same propose-first, wait-for-a-yes shape the capture skill follows) and raise the salience of any recalled engram that proved key to the task. Where a team domain holds work the team has not seen, one more line counts it and asks the agent to propose sharing it with `share_changes` - still a proposal to say yes to, since sharing publishes somebody's work for review.
 
 The reminder costs about 120 tokens, at most once per session. Remove it with `crystalline uninstall <harness>`, or leave it out from the start with `--skip-hooks`.
+
+There is a third hook: a `UserPromptSubmit` hook running `crystalline hook prompt`, installed for Claude Code, Codex and Copilot alike, so what an earlier session learned meets the agent when it is relevant, without it having to decide to search first. In Claude Code and Codex each prompt arrives with at most three engrams, named by `crystalline://` address, one line each - a head start to read with `read_engram`, not the answer itself. A given engram is named once per session, and again after `/clear` or a compaction. It costs about 200 tokens when it has something to say, and nothing when it does not: it stays silent without a running daemon, before the index has embeddings, or once `recall.enabled` is turned off; `recall.limit` and `recall.min_score` are its cap and its floor. Copilot gets the same hook entry but has no channel yet for what it would say, so it stays installed and inert there.
 
 ## Teach and learn
 

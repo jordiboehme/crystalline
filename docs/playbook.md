@@ -35,8 +35,10 @@ crystalline install claude-code
 ```
 
 That single step registers the MCP server, the `SessionStart` routing hook, the
-`Stop` capture nudge and the four skills. Think of it as the agent loading a
-program: next session it wakes already knowing how to route, capture and share.
+`Stop` capture nudge, the `UserPromptSubmit` recall hook and the four skills.
+Think of it as the agent loading a
+program: next session it wakes already knowing how to route, capture and
+share.
 The same command takes `codex` or `copilot`. This is the last time you need a
 terminal. Claude Desktop skips even this: install the `.mcpb` extension from the
 latest release, upload the `crystalline-intelligence` skill zip and never open a
