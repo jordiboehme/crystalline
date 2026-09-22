@@ -967,6 +967,11 @@ async fn the_write_routes_refuse_viewers_the_anonymous_and_the_tokenless() {
                 serde_json::json!({"markdown": "no"}),
             ),
             (
+                reqwest::Method::PATCH,
+                "/api/v1/domains/eng/manifest",
+                serde_json::json!({"generated_indexes": "local"}),
+            ),
+            (
                 reqwest::Method::POST,
                 "/api/v1/validate",
                 serde_json::json!({"content": ALPHA}),
@@ -1940,6 +1945,15 @@ fn write_ops() -> Vec<WriteOp> {
             // Domain management, not content editing (spec section 5:
             // MANIFEST editing sits among the admin-only domain screens,
             // alongside creating and unregistering a domain).
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PATCH,
+            path: "/api/v1/domains/eng/manifest",
+            body: Some(serde_json::json!({"generated_indexes": "local"})),
+            // Domain write plus the owner right: on the shared `eng` there is
+            // no owner, so only an admin gets past authorization.
             min_role: Role::Admin,
             read_only_exempt: false,
         },

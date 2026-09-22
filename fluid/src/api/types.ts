@@ -572,7 +572,7 @@ export interface paths {
          *
          *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
          *
-         *     `sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and the `generated_indexes` switch. `null` for `provisioning` or `tag_aliases` means the section is absent.
+         *     `sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.
          */
         get: operations["get_domain_manifest"];
         /**
@@ -584,7 +584,11 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Set one or more MANIFEST policy keys.
+         * @description The domain's owner (or an instance admin) changes the MANIFEST's configuration keys - `generated_indexes`, `sharing` - without editing the document: each key becomes one frontmatter line, every other line stands, and the `generated` block is stamped as on any edit. On a team domain the MANIFEST becomes an unshared local change the next share carries; in a domain that reviews changes the write lands in the caller's own draft of the MANIFEST and the response says `draft: true`, the domain's policy changing only when that draft lands. An unknown key, a value the key does not take, or an empty object is 422 and writes nothing, even beside a good key.
+         */
+        patch: operations["set_domain_policies"];
         trace?: never;
     };
     "/api/v1/domains/{domain}/members": {
@@ -762,7 +766,7 @@ export interface paths {
         };
         /**
          * Preview what sharing this team domain would do.
-         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree. Where this instance shares with personal GitHub identities, a caller who has connected none of their own still gets the plan - reading it needs nobody's personal credential - while `POST /domains/{domain}/sync/share` refuses until they connect.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`, `commit` with the branch a direct domain would commit onto, `proposal_open` with the number, url and title of the proposal that blocks a direct share), the effective title and the changed files. The plan also carries `sharing` (`proposal` or `direct`, the domain's MANIFEST policy) and `repo`, so a client knows what kind of domain it is looking at before the action is read. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree. Where this instance shares with personal GitHub identities, a caller who has connected none of their own still gets the plan - reading it needs nobody's personal credential - while `POST /domains/{domain}/sync/share` refuses until they connect.
          */
         get: operations["get_domain_share_changes"];
         put?: never;
@@ -844,7 +848,7 @@ export interface paths {
         put?: never;
         /**
          * Share a team domain's local changes as a proposal.
-         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. On a domain whose MANIFEST declares `sharing: direct` the share commits the selected files straight onto the connected branch instead and answers `committed` with the commit's sha and url; it answers `proposal_open` while any proposal is still open, `branch_protected` when the branch's rules refuse a direct commit and `branch_moved` when the branch moved twice while the share was prepared, each with guidance. A `proposal` in the body on a direct domain is a 422. Refused on a read-only instance.
          */
         post: operations["share_domain"];
         delete?: never;
@@ -2048,20 +2052,6 @@ export interface components {
          * @enum {string}
          */
         FoldArg: "fold" | "discard";
-        /** @description The `generated_indexes` switch: declared, and effective. */
-        GeneratedIndexesView: {
-            /**
-             * @description The value as the frontmatter writes it, or `null` when the key is
-             *     absent.
-             * @example shared
-             */
-            declared?: string | null;
-            /**
-             * @description `local` or `shared`. Absent and unrecognized both fall to `local`.
-             * @example local
-             */
-            effective: string;
-        };
         /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
         GithubIdentityResponse: {
             /**
@@ -2283,7 +2273,7 @@ export interface components {
             /** @description Why it was flagged, in the crate's words. */
             reason: string;
         };
-        /** @description The MANIFEST source beside the domain it belongs to, its checksum, and the features parsed out of it: what an agent routes by, what the domain provisions, which tags fold into which, and the one frontmatter switch. */
+        /** @description The MANIFEST source beside the domain it belongs to, its checksum, and the features parsed out of it: what an agent routes by, what the domain provisions, which tags fold into which, and every frontmatter policy key with what it declares and what holds. */
         ManifestResponse: {
             /**
              * @description sha256 of the markdown, the token a later `PUT` carries in `If-Match`.
@@ -2307,15 +2297,18 @@ export interface components {
          */
         ManifestSections: {
             /**
-             * @description The `generated_indexes` frontmatter switch: what is declared and what
-             *     holds.
-             */
-            generated_indexes: components["schemas"]["GeneratedIndexesView"];
-            /**
              * @description The required sections the MANIFEST lacks, by name: `Scope`, `When to
              *     Use`. Empty when both are there.
              */
             missing: string[];
+            /**
+             * @description Every MANIFEST configuration key the core crate knows, with what the
+             *     frontmatter declares and what holds. Drawn from the policy registry, so
+             *     a key added there appears here without a line of this file changing.
+             *     Empty for a MANIFEST that did not parse: a document nobody can read
+             *     declares nothing.
+             */
+            policies: components["schemas"]["PolicyView"][];
             provisioning?: null | components["schemas"]["ProvisioningView"];
             /**
              * @description Which of the two an agent reads: `when_to_use`, or `scope` when When
@@ -2646,6 +2639,38 @@ export interface components {
             display?: string | null;
             role?: null | components["schemas"]["Role"];
         };
+        /** @description One MANIFEST policy key: the registry row beside what this MANIFEST says. */
+        PolicyView: {
+            /**
+             * @description Who may change it: `owner` (the domain's owner or an instance admin) or `admin`.
+             * @example owner
+             */
+            changed_by: string;
+            /**
+             * @description The value as the frontmatter writes it, or `null` when the key is absent.
+             * @example direct
+             */
+            declared?: string | null;
+            /**
+             * @description What an absent or unrecognized declaration is read as.
+             * @example proposal
+             */
+            default: string;
+            /**
+             * @description The value that holds: absent and unrecognized both fall to `default`.
+             * @example direct
+             */
+            effective: string;
+            /**
+             * @description The frontmatter key.
+             * @example sharing
+             */
+            key: string;
+            /** @description One line, present tense. */
+            meaning: string;
+            /** @description The values the key takes, in display order. */
+            values: string[];
+        };
         /** @description An RFC 9457 problem detail, sent as `application/problem+json`. Every failure on this surface has this shape, so a client can branch on `status` alone. */
         ProblemDetail: {
             /**
@@ -2900,6 +2925,10 @@ export interface components {
              *     - Route here for eng questions.
              */
             markdown: string;
+        };
+        /** @description One or more MANIFEST policy keys to the value each should hold, for example {"sharing": "direct"}. Every key is validated before the first is written. */
+        SetPoliciesBody: {
+            [key: string]: string;
         };
         /** @description The first admin. `display` is the name as typed; no email is asked for, since that is a users-screen concern. `token` is the one-time setup token `serve` prints for a non-loopback bind, and is not needed when the request comes from the machine that serves this instance. */
         SetupBody: {
@@ -5735,11 +5764,33 @@ export interface operations {
                      *       "domain": "eng",
                      *       "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
                      *       "sections": {
-                     *         "generated_indexes": {
-                     *           "declared": null,
-                     *           "effective": "local"
-                     *         },
                      *         "missing": [],
+                     *         "policies": [
+                     *           {
+                     *             "changed_by": "owner",
+                     *             "declared": null,
+                     *             "default": "local",
+                     *             "effective": "local",
+                     *             "key": "generated_indexes",
+                     *             "meaning": "Whether the generated folder listings travel with a share.",
+                     *             "values": [
+                     *               "local",
+                     *               "shared"
+                     *             ]
+                     *           },
+                     *           {
+                     *             "changed_by": "owner",
+                     *             "declared": null,
+                     *             "default": "proposal",
+                     *             "effective": "proposal",
+                     *             "key": "sharing",
+                     *             "meaning": "Whether a share opens a proposal for review or commits straight to the branch.",
+                     *             "values": [
+                     *               "proposal",
+                     *               "direct"
+                     *             ]
+                     *           }
+                     *         ],
                      *         "provisioning": null,
                      *         "routing": "when_to_use",
                      *         "scope": [
@@ -5827,11 +5878,33 @@ export interface operations {
                      *       "domain": "eng",
                      *       "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
                      *       "sections": {
-                     *         "generated_indexes": {
-                     *           "declared": null,
-                     *           "effective": "local"
-                     *         },
                      *         "missing": [],
+                     *         "policies": [
+                     *           {
+                     *             "changed_by": "owner",
+                     *             "declared": null,
+                     *             "default": "local",
+                     *             "effective": "local",
+                     *             "key": "generated_indexes",
+                     *             "meaning": "Whether the generated folder listings travel with a share.",
+                     *             "values": [
+                     *               "local",
+                     *               "shared"
+                     *             ]
+                     *           },
+                     *           {
+                     *             "changed_by": "owner",
+                     *             "declared": null,
+                     *             "default": "proposal",
+                     *             "effective": "proposal",
+                     *             "key": "sharing",
+                     *             "meaning": "Whether a share opens a proposal for review or commits straight to the branch.",
+                     *             "values": [
+                     *               "proposal",
+                     *               "direct"
+                     *             ]
+                     *           }
+                     *         ],
                      *         "provisioning": null,
                      *         "routing": "when_to_use",
                      *         "scope": [
@@ -5921,6 +5994,125 @@ export interface operations {
             };
             /** @description No `If-Match` arrived. The token comes from the manifest read. */
             428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    set_domain_policies: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPoliciesBody"];
+            };
+        };
+        responses: {
+            /** @description The manifest as it now reads for this caller, mirroring the GET shape, plus `draft: true` when it is the caller's draft. */
+            200: {
+                headers: {
+                    /** @description The quoted checksum of the manifest as it now reads. */
+                    etag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "checksum": "3f8a1c05e2",
+                     *       "domain": "kb",
+                     *       "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
+                     *       "sections": {
+                     *         "missing": [],
+                     *         "policies": [
+                     *           {
+                     *             "changed_by": "owner",
+                     *             "declared": null,
+                     *             "default": "local",
+                     *             "effective": "local",
+                     *             "key": "generated_indexes",
+                     *             "meaning": "Whether the generated folder listings travel with a share.",
+                     *             "values": [
+                     *               "local",
+                     *               "shared"
+                     *             ]
+                     *           },
+                     *           {
+                     *             "changed_by": "owner",
+                     *             "declared": "direct",
+                     *             "default": "proposal",
+                     *             "effective": "direct",
+                     *             "key": "sharing",
+                     *             "meaning": "Whether a share opens a proposal for review or commits straight to the branch.",
+                     *             "values": [
+                     *               "proposal",
+                     *               "direct"
+                     *             ]
+                     *           }
+                     *         ],
+                     *         "provisioning": null,
+                     *         "routing": "when_to_use",
+                     *         "scope": [
+                     *           "Everything about kb"
+                     *         ],
+                     *         "tag_aliases": null,
+                     *         "when_to_use": [
+                     *           "Route here for kb questions."
+                     *         ]
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["ManifestResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance is read-only (answered ahead of validation), the caller may write the domain but is neither its owner nor an admin, the key needs an admin, or the request did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description An unknown key (the detail names the registry keys), a value the key does not take (the detail names the allowed values), or an empty object. Nothing was written. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6504,7 +6696,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /**
-             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not.
+             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch.
              *
              *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
              *
@@ -6985,6 +7177,8 @@ export interface operations {
             /**
              * @description The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance.
              *
+             *     A domain that shares directly answers one of four outcomes instead: `committed` with the commit's sha, url and branch beside the three file lists, `proposal_open` with the number, url and title of the proposal that has to land or be withdrawn first, `branch_protected` when the branch's own rules refuse a direct commit, and `branch_moved` when somebody else moved the branch while this share was prepared. Each of the three refusals carries guidance and nothing was written.
+             *
              *     A `proposed` or `updated` outcome also names where the proposal sits in its chain: `stack_number` is the chain's number on the forge and `stack_position` is `[layer, open layers]` with a 1-based layer. Both are null off the stacked path - an unstacked forge, a lone proposal - rather than absent, so one reader handles either path. On the stacked path `stack_position` is always set while `stack_number` is null when the call that groups the chain on the forge has not landed yet, so a client keys off `stack_position` to decide whether it is looking at a layer at all and names the stack number only when it has one.
              */
             200: {
@@ -6992,28 +7186,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    /**
-                     * @example {
-                     *       "added": [
-                     *         "notes/b.md"
-                     *       ],
-                     *       "branch": "crystalline/kb-20260821",
-                     *       "deleted": [],
-                     *       "number": 4,
-                     *       "outcome": "proposed",
-                     *       "skipped_large": [],
-                     *       "stack_number": 42,
-                     *       "stack_position": [
-                     *         2,
-                     *         2
-                     *       ],
-                     *       "summary": "Refine 2 engrams in kb",
-                     *       "updated": [
-                     *         "notes/a.md"
-                     *       ],
-                     *       "url": "https://github.com/acme/knowledge/pull/4"
-                     *     }
-                     */
                     "application/json": Record<string, never>;
                 };
             };

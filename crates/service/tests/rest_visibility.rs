@@ -105,6 +105,14 @@ impl SessionClient {
             .unwrap()
     }
 
+    async fn patch_json(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
+        self.request(reqwest::Method::PATCH, path)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn delete(&self, path: &str) -> reqwest::Response {
         self.request(reqwest::Method::DELETE, path)
             .send()
@@ -813,6 +821,37 @@ async fn the_owner_re_shares_and_only_an_admin_closes_a_domain() {
             .owner,
         "boss",
         "closing a domain names the caller as its owner"
+    );
+}
+
+/// A private domain's owner changes its policies without administering the
+/// instance; a manager in the same domain, who may write, may not.
+#[tokio::test]
+async fn a_private_domains_owner_sets_its_policies_and_a_manager_does_not() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "keeper").await;
+    ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
+    let mgr = ctx.as_user("mgr").await;
+    let refused = mgr
+        .patch_json("/api/v1/domains/lab/manifest", json!({"sharing": "direct"}))
+        .await;
+    assert_eq!(refused.status(), 403, "{:?}", refused.text().await);
+    let owner = ctx.as_user("keeper").await;
+    let set = owner
+        .patch_json("/api/v1/domains/lab/manifest", json!({"sharing": "direct"}))
+        .await;
+    assert_eq!(set.status(), 200, "{:?}", set.text().await);
+    let stranger = ctx.as_user("out").await;
+    let hidden = stranger
+        .patch_json(
+            "/api/v1/domains/lab/manifest",
+            json!({"sharing": "proposal"}),
+        )
+        .await;
+    assert_eq!(
+        hidden.status(),
+        404,
+        "a domain the caller may not see is one nobody registered"
     );
 }
 
