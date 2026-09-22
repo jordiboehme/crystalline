@@ -220,4 +220,32 @@ describe("the destructive action", () => {
       screen.getByRole("button", { name: "Confirm unregister" }),
     ).toBeVisible();
   });
+
+  it("draws no trigger of its own where the caller's own control is the trigger", async () => {
+    const onConfirmingChange = vi.fn();
+    render(
+      <DestructiveAction
+        label="Turn on direct sharing"
+        confirmLabel="Turn on direct sharing"
+        pending={false}
+        hideTrigger
+        confirming
+        onConfirmingChange={onConfirmingChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    // The confirmation is already up, because the thing that armed it - the
+    // policies card's own select - is outside this control. A trigger beside
+    // it would be a second way of asking the same question.
+    const buttons = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent);
+    expect(buttons).toEqual(["Turn on direct sharing", "Keep"]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Keep" }));
+    // Giving up is the caller's to hear about: it owns the control that
+    // armed this, and the focus that goes back to it.
+    expect(onConfirmingChange).toHaveBeenCalledWith(false);
+  });
 });

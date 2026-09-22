@@ -41,6 +41,11 @@
  * linking call has not landed carries real positions with no number, and
  * "stack #null" would be worse than saying nothing about the number at all.
  *
+ * A direct domain (`sharing: direct` in its MANIFEST) keeps the heading, the
+ * Share button and every row with its Withdraw - a leftover proposal is
+ * exactly what blocks a direct share - and loses the rail, the layer positions
+ * and the trunk: there is no chain to draw.
+ *
  * What is wrong with the chain is said where it can be acted on. A wedged layer
  * wears a badge on its own row, so a reader looking at the rail sees which node
  * is holding it up rather than matching a number in a sentence against a list;
@@ -97,6 +102,9 @@ export function ProposalsCard({
   const stacked = chained && answered.stackNumber !== null;
   const linkPending =
     answered.stackLinkPending || (chained && answered.stackNumber === null);
+  // What the MANIFEST says this domain does with a share. A domain that
+  // commits has no chain, so everything the chain is drawn with goes.
+  const direct = answered.sharing === "direct";
 
   return (
     <section
@@ -127,14 +135,24 @@ export function ProposalsCard({
           Share changes
         </button>
       </div>
-      <ChainNotices
-        wedged={answered.stackWedged}
-        repairPending={answered.repairPending}
-        linkPending={linkPending}
-      />
+      {direct && (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          {`Sharing is direct on this domain: changes go straight to ${answered.branch ?? "the branch"} without a proposal.`}
+        </p>
+      )}
+      {/* A direct domain has no chain to wedge, repair or link. */}
+      {!direct && (
+        <ChainNotices
+          wedged={answered.stackWedged}
+          repairPending={answered.repairPending}
+          linkPending={linkPending}
+        />
+      )}
       {proposals.length === 0 ? (
         <p className="text-sm text-slate-500 dark:text-slate-400">
-          No open proposals.
+          {direct
+            ? `No open proposals; shares commit straight to ${answered.branch ?? "the branch"}.`
+            : "No open proposals."}
         </p>
       ) : (
         <ul className="flex flex-col">
@@ -150,8 +168,11 @@ export function ProposalsCard({
                 proposal={proposal}
                 first={index === 0}
                 wedged={answered.stackWedged.includes(proposal.number)}
+                rail={!direct}
                 position={
-                  chained && layer >= 0 ? [layer + 1, open.length] : null
+                  !direct && chained && layer >= 0
+                    ? [layer + 1, open.length]
+                    : null
                 }
                 // How much a withdraw would rebuild. Only the open layers
                 // above this one, and only for a layer that is itself open: a
@@ -163,14 +184,17 @@ export function ProposalsCard({
           })}
           {/* What the whole rail stands on. The tracked branch is where
               merging the top of the chain lands, and a report that did not
-              name one still has an origin the work goes to. */}
-          <li className="flex items-center gap-3 py-1 text-sm">
-            <Rail last node="trunk" />
-            <Chip mono>
-              <span className="sr-only">{"Trunk branch "}</span>
-              {answered.branch ?? "origin"}
-            </Chip>
-          </li>
+              name one still has an origin the work goes to. Drawn only where
+              there is a rail to stand on. */}
+          {!direct && (
+            <li className="flex items-center gap-3 py-1 text-sm">
+              <Rail last node="trunk" />
+              <Chip mono>
+                <span className="sr-only">{"Trunk branch "}</span>
+                {answered.branch ?? "origin"}
+              </Chip>
+            </li>
+          )}
         </ul>
       )}
       {sharing && (
@@ -329,6 +353,7 @@ function ProposalRow({
   domain,
   proposal,
   first,
+  rail,
   wedged,
   position,
   layersAbove,
@@ -337,6 +362,8 @@ function ProposalRow({
   proposal: SyncProposal;
   /** Whether this is the head of the rail, which has no line above its node. */
   first: boolean;
+  /** Whether there is a chain to draw at all: a direct domain has none. */
+  rail: boolean;
   /** Whether the chain is stuck behind this one. */
   wedged: boolean;
   /** `[layer, open layers]`, 1-based, or null when there is no chain to name. */
@@ -350,11 +377,13 @@ function ProposalRow({
   const [notice, setNotice] = useState<string | null>(null);
 
   return (
-    <li className="flex gap-3 py-1 text-sm">
-      <Rail
-        first={first}
-        node={proposal.status === "open" ? "open" : "closed"}
-      />
+    <li className={`flex py-1 text-sm ${rail ? "gap-3" : ""}`}>
+      {rail && (
+        <Rail
+          first={first}
+          node={proposal.status === "open" ? "open" : "closed"}
+        />
+      )}
       <div className="flex min-w-0 flex-1 flex-col gap-1">
         <div className="flex flex-wrap items-center gap-2">
           {/* The number first, the way a proposal is referred to everywhere

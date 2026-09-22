@@ -8,7 +8,10 @@
  * and the other three - nothing to share, conflicts waiting, a proposal a
  * reviewer moved - are states where a share would do nothing or something
  * surprising. Each of them says so in a sentence instead of leaving a live
- * button that fails.
+ * button that fails. On a domain whose MANIFEST says `sharing: direct` the
+ * same plan reads `commit`, the sentence says the change goes straight to the
+ * branch with no review, the button says which branch, and `proposal_open` is
+ * the one state a direct domain adds: a leftover proposal in the way.
  *
  * Where a chain is open, which layer the share lands on is a choice rather than
  * a verdict, and it is the one choice this dialog adds. Stacking a new layer on
@@ -76,7 +79,9 @@ import {
   syncStatusKey,
 } from "../api/admin";
 import { problemDetail } from "../api/client";
+import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
+import { domainEngramsRoot } from "../api/engrams";
 import { asNumber, asObject, asString } from "../api/json";
 import { useAuth } from "../auth/AuthContext";
 import { isWebAddress, plural } from "../format";
@@ -275,6 +280,21 @@ export default function ShareDialogBody({
     void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
     void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
     void queryClient.invalidateQueries({ queryKey: SYNC_SUMMARY_KEY });
+    // The plan too, which nothing refetches while this dialog is up - the
+    // query above is switched off by the outcome - and which is exactly why
+    // it is invalidated here: the next opening reads a fresh plan rather than
+    // the one describing the share that just landed.
+    void queryClient.invalidateQueries({ queryKey: sharePlanKey(domain) });
+    // A direct commit in a reviewing domain folds the caller's own drafts
+    // into the branch on its way out, which moves files under every list on
+    // the screen. The same pair a withdraw's revert invalidates, for the
+    // same reason: this is the working tree moving, not a count.
+    if (outcome.folded) {
+      void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
+      void queryClient.invalidateQueries({
+        queryKey: domainEngramsRoot(domain),
+      });
+    }
   }, [outcome, domain, queryClient]);
 
   const action = plan.data?.action ?? null;
@@ -282,7 +302,8 @@ export default function ShareDialogBody({
     action === "create" ||
     action === "update" ||
     action === "stack" ||
-    action === "amend";
+    action === "amend" ||
+    action === "commit";
   const planProblem = plan.error === null ? null : problemDetail(plan.error);
 
   return (
@@ -348,7 +369,9 @@ export default function ShareDialogBody({
                   {problem ?? planProblem}
                 </p>
               )}
-              {openLayers.length > 0 && (
+              {/* No layer to choose on a direct domain: a proposal is never
+                  the target. */}
+              {openLayers.length > 0 && plan.data?.sharing !== "direct" && (
                 <Field id={proposalField} label="Proposal">
                   <select
                     id={proposalField}
@@ -462,7 +485,11 @@ export default function ShareDialogBody({
                 // rewritten on every update whether or not anybody typed
                 // here, so the title's "left alone, it keeps what it has" must
                 // not be generalized into a description that survives.
-                helper="Optional. The engine writes a summary when this is empty; on an update it replaces the proposal's previous description either way."
+                helper={
+                  plan.data?.sharing === "direct"
+                    ? "Optional. Becomes the body of the commit message."
+                    : "Optional. The engine writes a summary when this is empty; on an update it replaces the proposal's previous description either way."
+                }
               >
                 <textarea
                   id={descriptionField}
@@ -506,7 +533,9 @@ export default function ShareDialogBody({
                     }
                     className={BUTTON.primary}
                   >
-                    Share
+                    {action === "commit"
+                      ? `Commit to ${plan.data?.branch ?? "the branch"}`
+                      : "Share"}
                   </button>
                 )}
               </div>
@@ -578,6 +607,8 @@ function actionLine(plan: SharePlan | null): string {
     count = null,
     topNumber = null,
     layersAbove = null,
+    branch = null,
+    title = null,
   } = plan ?? {};
   const named =
     number === null ? "the proposal" : `proposal #${String(number)}`;
@@ -606,6 +637,14 @@ function actionLine(plan: SharePlan | null): string {
         : `${plural(count, "conflict needs", "conflicts need")} settling before sharing.`;
     case "proposal_diverged":
       return `A reviewer amended ${named}; withdraw it or let the review finish.`;
+    case "commit":
+      return `Sharing commits straight to ${branch ?? "the branch"}, with no review.`;
+    case "proposal_open":
+      // The one state a direct domain adds: the branch this share would
+      // commit onto is the one a proposal is still waiting to land on.
+      return number === null
+        ? "A proposal is still open; merge or withdraw it before sharing directly."
+        : `Proposal #${String(number)} (${title ?? "untitled"}) is still open; merge or withdraw it before sharing directly.`;
     default:
       return "Working out what a share would do...";
   }
@@ -650,11 +689,35 @@ interface OutcomeSentence {
   before: string;
   link: { label: string; href: string } | null;
   after: string;
+  /**
+   * Whether the share folded the caller's own drafts into the domain, which
+   * is a direct commit in a reviewing domain and nothing else. It moves files
+   * on disk rather than counts, so the caller invalidates the lists that draw
+   * them; every other outcome leaves the working tree where it was.
+   */
+  folded?: boolean;
 }
 
 /** A sentence with nothing to link. */
 function plainSentence(text: string): OutcomeSentence {
   return { before: text, link: null, after: "" };
+}
+
+/**
+ * A sentence with one segment worth a click: `${before}${label}${after}`, the
+ * label an anchor when `url` passes the same address screen the proposals
+ * card links a title through, and plain text otherwise.
+ */
+function linkedSentence(
+  before: string,
+  label: string,
+  after: string,
+  url: string | null,
+): OutcomeSentence {
+  if (url !== null && isWebAddress(url)) {
+    return { before, link: { label, href: url }, after };
+  }
+  return plainSentence(`${before}${label}${after}`);
 }
 
 /**
@@ -673,15 +736,12 @@ function numberSentence(
   if (number === null) {
     return plainSentence(`${prefix}the proposal${suffix}`);
   }
-  const label = `#${String(number)}`;
-  if (url !== null && isWebAddress(url)) {
-    return {
-      before: `${prefix}proposal `,
-      link: { label, href: url },
-      after: suffix,
-    };
-  }
-  return plainSentence(`${prefix}proposal ${label}${suffix}`);
+  return linkedSentence(
+    `${prefix}proposal `,
+    `#${String(number)}`,
+    suffix,
+    url,
+  );
 }
 
 /**
@@ -734,6 +794,32 @@ function describeOutcome(result: unknown): OutcomeSentence {
       return plainSentence(
         "Conflicts need settling before sharing. Nothing was shared.",
       );
+    case "committed": {
+      // The commit itself is what a reader follows, by the short sha every
+      // forge names one by; a report that carried none says what it did
+      // without inventing an address for it.
+      const sha = asString(record?.sha) ?? "";
+      const short = sha.slice(0, 7);
+      const branch = asString(record?.branch) ?? "the branch";
+      const folded = asNumber(record?.drafts_folded) !== null;
+      const sentence =
+        short === ""
+          ? plainSentence(`Committed to ${branch}.`)
+          : linkedSentence(
+              "Committed ",
+              short,
+              ` to ${branch}.`,
+              asString(record?.url),
+            );
+      return { ...sentence, folded };
+    }
+    // The three a direct domain refuses with. Each carries the server's own
+    // guidance, which names the verb that settles it, so nothing is
+    // paraphrased here.
+    case "proposal_open":
+    case "branch_protected":
+    case "branch_moved":
+      return plainSentence(asString(record?.guidance) ?? "Nothing was shared.");
     case "proposal_diverged":
       return number === null
         ? plainSentence(

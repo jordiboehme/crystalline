@@ -460,6 +460,9 @@ describe("the admin client layer", () => {
       stackWedged: [],
       repairPending: false,
       stackLinkPending: false,
+      // A report that does not name the policy is a report from before there
+      // were two of them, which is the one every domain shared under.
+      sharing: "proposal",
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
   });
@@ -972,6 +975,12 @@ describe("the admin client layer", () => {
       topNumber: null,
       topTitle: null,
       layersAbove: null,
+      // The policy a report that predates it is read under, which is the
+      // behaviour that has always held, and the two fields only a direct
+      // domain's plan fills in.
+      sharing: "proposal",
+      branch: null,
+      title: null,
     });
     // And the key it is cached under, which is deliberately not one of the
     // `["domains", ...]` keys every other read of a domain is filed under:
@@ -1024,6 +1033,67 @@ describe("the admin client layer", () => {
     // between amending the top layer and amending one under it.
     expect(amend.number).toBe(4);
     expect(amend.layersAbove).toBe(2);
+  });
+
+  it("reads a direct domain's plan: the policy, the branch and a blocking proposal's title", async () => {
+    apiMock.mockResolvedValueOnce({
+      action: "commit",
+      branch: "main",
+      sharing: "direct",
+      effective_title: "t",
+      changes: [],
+    });
+    const commit = await fetchShareChanges("eng");
+
+    expect(commit.sharing).toBe("direct");
+    expect(commit.branch).toBe("main");
+
+    apiMock.mockResolvedValueOnce({
+      action: "proposal_open",
+      number: 4,
+      url: "https://github.com/acme/knowledge/pull/4",
+      title: "Refine",
+      sharing: "direct",
+      effective_title: "",
+      changes: [],
+    });
+    const blocked = await fetchShareChanges("eng");
+
+    // The proposal in the way, named: a direct domain cannot share past one.
+    expect(blocked.title).toBe("Refine");
+    expect(blocked.number).toBe(4);
+
+    apiMock.mockResolvedValueOnce({
+      action: "create",
+      effective_title: "t",
+      changes: [],
+    });
+    const older = await fetchShareChanges("eng");
+
+    // A server that predates the policy shares the way it always did.
+    expect(older.sharing).toBe("proposal");
+    expect(older.branch).toBeNull();
+  });
+
+  it("reads the sync status's sharing policy and defaults an older report to proposal", async () => {
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/knowledge",
+      branch: "main",
+      sharing: "direct",
+      open_proposals: [],
+      declined_proposals: [],
+      conflicts: [],
+    });
+    expect((await fetchSyncStatus("eng")).sharing).toBe("direct");
+
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/knowledge",
+      branch: "main",
+      open_proposals: [],
+      declined_proposals: [],
+      conflicts: [],
+    });
+    expect((await fetchSyncStatus("eng")).sharing).toBe("proposal");
   });
 
   it("shares a domain with the title and description it was given", async () => {

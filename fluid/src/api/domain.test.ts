@@ -12,7 +12,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { api } from "./client";
-import { fetchManifestDetail, readTree, saveManifest } from "./domain";
+import {
+  fetchManifestDetail,
+  readManifestSections,
+  readTree,
+  saveManifest,
+  setDomainPolicies,
+} from "./domain";
 import { defined } from "../test/assert";
 
 vi.mock("./client", async (importOriginal) => {
@@ -122,5 +128,106 @@ describe("a manifest detail", () => {
       }),
     );
     expect(saved.checksum).toBe("def456");
+  });
+});
+
+describe("the manifest policies", () => {
+  const row = {
+    key: "sharing",
+    declared: "direct",
+    effective: "direct",
+    values: ["proposal", "direct"],
+    default: "proposal",
+    meaning:
+      "Whether a share opens a proposal for review or commits straight to the branch.",
+    changed_by: "owner",
+  };
+
+  it("reads every registry row and drops one without a key or an effective value", () => {
+    const sections = readManifestSections({
+      scope: [],
+      when_to_use: [],
+      routing: "none",
+      missing: [],
+      provisioning: null,
+      tag_aliases: null,
+      policies: [
+        row,
+        // A row the registry sent without the three describing fields: the
+        // key and what holds are what a card draws, and the rest has
+        // defaults of its own.
+        { key: "generated_indexes", effective: "local" },
+        // Neither of these is a row anything could be drawn from.
+        { declared: "x", effective: "y" },
+        { key: "orphan" },
+      ],
+    });
+
+    expect(sections?.policies).toEqual([
+      {
+        key: "sharing",
+        declared: "direct",
+        effective: "direct",
+        values: ["proposal", "direct"],
+        default: "proposal",
+        meaning: row.meaning,
+        changedBy: "owner",
+      },
+      {
+        key: "generated_indexes",
+        declared: null,
+        effective: "local",
+        values: [],
+        // No default on the wire reads as "what holds is the default", which
+        // is true of every key nobody declared.
+        default: "local",
+        meaning: "",
+        changedBy: "owner",
+      },
+    ]);
+    expect(sections).not.toHaveProperty("generatedIndexes");
+  });
+
+  it("reads an older payload with no policies as an empty list", () => {
+    expect(
+      readManifestSections({
+        scope: [],
+        when_to_use: [],
+        routing: "none",
+        missing: [],
+      })?.policies,
+    ).toEqual([]);
+  });
+
+  it("patches the policies and reads the answer back, draft flag included", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      markdown: "---\nsharing: direct\n---\n",
+      checksum: "def456",
+      draft: true,
+      sections: {
+        scope: [],
+        when_to_use: [],
+        routing: "none",
+        missing: [],
+        provisioning: null,
+        tag_aliases: null,
+        policies: [row],
+      },
+    });
+    const written = await setDomainPolicies("eng", { sharing: "direct" });
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/manifest",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ sharing: "direct" }),
+      }),
+    );
+    // The write landed in the caller's own draft, which is a different
+    // sentence from the write landing in the domain.
+    expect(written.draft).toBe(true);
+    expect(written.checksum).toBe("def456");
+    expect(written.sections?.policies[0]?.declared).toBe("direct");
   });
 });

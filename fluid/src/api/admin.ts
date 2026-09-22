@@ -558,6 +558,12 @@ export interface SyncStatus {
    * drew.
    */
   shareIdentity: string | null;
+  /**
+   * How the domain shares, from its MANIFEST: `direct` commits straight to
+   * the branch, `proposal` opens one for review. Anything else - an older
+   * server - reads as `proposal`, today's behaviour.
+   */
+  sharing: "proposal" | "direct";
 }
 // The report also carries `owner_identity` in personal mode - the MACHINE
 // owner's slot, what a CLI or local stdio share would resolve. It is not read
@@ -814,6 +820,9 @@ function readSyncStatus(payload: unknown): SyncStatus {
     // that is not a word is "this report does not say", which every reader
     // treats as the default mode rather than as personal.
     shareIdentity: asString(connection?.share_identity),
+    // Read off the report the way the engine writes it, and anything that is
+    // not the one word is the policy every domain had before there were two.
+    sharing: asString(record?.sharing) === "direct" ? "direct" : "proposal",
   };
 }
 
@@ -897,9 +906,10 @@ export interface ShareChange {
 export interface SharePlan {
   /**
    * `create`, `update`, `stack`, `amend`, `nothing_to_share`,
-   * `conflicts_pending` or `proposal_diverged` - the server's own word for
-   * what the button would do, which is also what decides whether there is a
-   * button at all.
+   * `conflicts_pending`, `proposal_diverged`, or, on a domain that shares
+   * directly, `commit` and `proposal_open` - the server's own word for what
+   * the button would do, which is also what decides whether there is a button
+   * at all.
    */
   action: string;
   /** The title the proposal would carry, the server's own if none was given. */
@@ -930,6 +940,19 @@ export interface SharePlan {
    * the second re-bases work that is already in front of reviewers.
    */
   layersAbove: number | null;
+  /**
+   * How the domain shares, from its MANIFEST: `direct` commits straight to
+   * the branch, `proposal` opens one for review. Anything else - an older
+   * server - reads as `proposal`, today's behaviour.
+   */
+  sharing: "proposal" | "direct";
+  /** The branch a `commit` plan would commit onto; null on every other action. */
+  branch: string | null;
+  /**
+   * The title of the proposal an `amend` would land on, or of the one that
+   * blocks a `proposal_open` plan; null elsewhere.
+   */
+  title: string | null;
 }
 
 /**
@@ -998,6 +1021,12 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     topNumber: asNumber(record?.top_number),
     topTitle: asString(record?.top_title),
     layersAbove: asNumber(record?.layers_above),
+    // The same tolerant read the status makes of the same word: a plan from a
+    // server that predates the policy is a proposal plan, which is what it
+    // has always been.
+    sharing: asString(record?.sharing) === "direct" ? "direct" : "proposal",
+    branch: asString(record?.branch),
+    title: asString(record?.title),
   };
 }
 

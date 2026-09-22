@@ -32,7 +32,11 @@ import { Fragment, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
-import { archiveDownloadUrl } from "../api/admin";
+import {
+  archiveDownloadUrl,
+  fetchSyncStatus,
+  syncStatusKey,
+} from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { fetchManifest, manifestKey, treeQuery } from "../api/domain";
 import type {
@@ -57,6 +61,7 @@ import type { PaletteCommand } from "../commands";
 import { BackupCard } from "../components/BackupCard";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { DangerZoneCard } from "../components/DangerZoneCard";
+import { DomainPoliciesCard } from "../components/DomainPoliciesCard";
 import { EngramList } from "../components/EngramList";
 import { EngramsOrderMenu } from "../components/EngramsOrderMenu";
 import { FilterFields, TagChips } from "../components/FilterControls";
@@ -184,6 +189,17 @@ function DomainPage({
   const tags = useQuery({
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
+  });
+  // The same query the sync card makes, under the same key, and under the
+  // same gate: a session that may not share must knock on nothing the server
+  // would refuse it. One fact off it is what the policies card needs - the
+  // branch a direct share would commit onto - and a domain with no origin,
+  // or a session that may not ask, simply names no branch.
+  const syncStatus = useQuery({
+    queryKey: syncStatusKey(domain),
+    queryFn: () => fetchSyncStatus(domain),
+    retry: false,
+    enabled: capabilities.canShare,
   });
   // Off the listing every screen already reads, and deliberately not off the
   // domain's sync status, which carries the same count: that route is gated
@@ -353,6 +369,22 @@ function DomainPage({
           error={manifest.error}
         />
       </section>
+
+      {/*
+        The MANIFEST's switches, as controls rather than as a panel of prose.
+        Drawn off the server's registry and only when it sent rows: a MANIFEST
+        that did not parse declares nothing and can declare nothing until it
+        is repaired, which the panel above is where somebody does.
+      */}
+      {manifest.data?.sections !== null &&
+        manifest.data?.sections !== undefined &&
+        manifest.data.sections.policies.length > 0 && (
+          <DomainPoliciesCard
+            domain={domain}
+            policies={manifest.data.sections.policies}
+            branch={syncStatus.data?.branch ?? null}
+          />
+        )}
 
       {importing && (
         <ImportArchiveDialog
@@ -793,14 +825,16 @@ function ManifestPanel({
 }
 
 /**
- * The four panels: what the core crate reads out of the MANIFEST, as it
+ * The three panels: what the core crate reads out of the MANIFEST, as it
  * reads it.
  *
  * Read-only on purpose. A switch here would be a second place to change the
  * document, and the document is the source: the editor is where a change
- * goes, and these say what it currently says. Whether provisioning was
- * allowed or denied on this machine is not here either; that decision lives
- * with the `provision` tool, not with the domain's own description.
+ * goes, and these say what it currently says. The frontmatter switches are
+ * the exception, and they are not here: they are controls, so they have a
+ * card of their own below this section. Whether provisioning was allowed or
+ * denied on this machine is not here either; that decision lives with the
+ * `provision` tool, not with the domain's own description.
  */
 function ManifestFacets({ sections }: { sections: ManifestSections }) {
   const missingScope = sections.missing.includes("Scope");
@@ -865,20 +899,6 @@ function ManifestFacets({ sections }: { sections: ManifestSections }) {
         {sections.tagAliases !== null && (
           <Problems items={sections.tagAliases.problems} />
         )}
-      </Facet>
-      <Facet title="Configuration">
-        {/*
-          The frontmatter switches. One today; any switch added later joins
-          this panel rather than growing a fifth.
-        */}
-        <p className="font-mono">
-          {`generated_indexes: ${sections.generatedIndexes.declared ?? "not declared"}`}
-        </p>
-        <p className="mt-1 text-slate-500 dark:text-slate-400">
-          {sections.generatedIndexes.effective === "local"
-            ? "Effective: local. The generated directory indexes stay on this machine."
-            : "Effective: shared. The generated directory indexes travel with the domain."}
-        </p>
       </Facet>
     </div>
   );
