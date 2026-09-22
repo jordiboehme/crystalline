@@ -625,14 +625,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
 /// the engine's own not-found), and with `Engine::local_change`'s two texts
 /// inlined per entry when `sides` is asked for. Uncapped: this is the CLI's
 /// surface, and a pager is where a megabyte of prose belongs.
+///
+/// The inlined form is read through `Engine::local_changes_detailed` rather
+/// than asked for per path, so the whole answer costs one detection walk
+/// however many files differ.
 pub(crate) async fn origin_changes_inline(
     engine: &Engine,
     domain: &str,
     path: Option<&str>,
     sides: bool,
 ) -> crate::engine::Result<Value> {
-    let mut listed = engine.local_changes(domain, &ShareActor::Owner).await?;
     if let Some(path) = path {
+        let mut listed = engine.local_changes(domain, &ShareActor::Owner).await?;
         // Resolved through the detail, which is what refuses an unknown path
         // by name; the list is then exactly that one entry.
         let one = engine
@@ -642,18 +646,11 @@ pub(crate) async fn origin_changes_inline(
         return Ok(listed);
     }
     if sides {
-        let mut inlined = Vec::new();
-        for change in listed["changes"].as_array().into_iter().flatten() {
-            let p = change["path"].as_str().unwrap_or_default();
-            inlined.push(
-                engine
-                    .local_change(domain, p, &ShareActor::Owner, None)
-                    .await?,
-            );
-        }
-        listed["changes"] = json!(inlined);
+        return engine
+            .local_changes_detailed(domain, &ShareActor::Owner)
+            .await;
     }
-    Ok(listed)
+    engine.local_changes(domain, &ShareActor::Owner).await
 }
 
 /// Run a background-equivalent embed pass and record the count on the response.

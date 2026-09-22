@@ -5231,6 +5231,75 @@ async fn a_team_domain_lists_diffs_and_discards_its_local_changes() {
     );
 }
 
+/// The diff block is built from one detection walk however many files differ,
+/// and every entry in it says exactly what asking for that one path says.
+///
+/// A walk reads and hashes every file of the domain, so a block built by
+/// asking per path cost one walk per changed file. That is invisible in the
+/// answer, which is byte for byte the same either way, so this test counts the
+/// walks as well as comparing the two forms.
+#[tokio::test]
+async fn a_diff_block_walks_the_domain_once_and_matches_the_single_path_form() {
+    let f = origin_fixture().await;
+    let root = f.domain_root("team");
+    f.snapshot_origin("team");
+    // The base tree a first pull writes, beside the stamps the fixture wrote.
+    for rel in ["MANIFEST.md", "plan.md", "index.md"] {
+        if !root.join(rel).is_file() {
+            continue;
+        }
+        crystalline_remote::state::write_base_file(
+            &f.origins.join("team"),
+            rel,
+            &std::fs::read(root.join(rel)).unwrap(),
+        )
+        .unwrap();
+    }
+    let second = ALICE_NEW
+        .replace("title: Fresh", "title: Second")
+        .replace("permalink: fresh", "permalink: second")
+        .replace("# Fresh", "# Second");
+    std::fs::write(root.join("plan.md"), ALICE_DRAFT).unwrap();
+    std::fs::write(root.join("fresh.md"), ALICE_NEW).unwrap();
+    std::fs::write(root.join("second.md"), &second).unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    let before = f.engine.detection_walks();
+    let status = f
+        .engine
+        .origin_status(Some("team"), true, true, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let walks = f.engine.detection_walks() - before;
+    let diff = status["domains"][0]["detail"]["diff"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let paths: Vec<&str> = diff.iter().map(|d| d["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        paths,
+        vec!["fresh.md", "plan.md", "second.md"],
+        "three files differ: {status}"
+    );
+    assert_eq!(
+        walks, 1,
+        "three changed files and one walk for the whole block: {status}"
+    );
+
+    for entry in &diff {
+        let path = entry["path"].as_str().unwrap();
+        let one = f
+            .engine
+            .local_change("team", path, &ShareActor::Owner, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *entry, one,
+            "the block's entry for {path} is the detail of that path"
+        );
+    }
+}
+
 /// The detail payload says how a team page differs from the base, and says
 /// nothing on a direct domain or in review mode.
 #[tokio::test]
