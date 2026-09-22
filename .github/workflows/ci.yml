@@ -9,8 +9,142 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Documentation-only changes skip the heavy jobs. The filter is per job and
+  # deliberately NOT a `paths-ignore:` on the trigger above. Two reasons, and
+  # the first is the one that matters:
+  #
+  # 1. A markdown change CAN break a real check. The three version pins a user
+  #    copies into their own workflow live in docs/evolve.md, and
+  #    scripts/version-pins.sh reads them there; the `style` job runs that
+  #    script. A trigger-level ignore would silently disable the pin check on
+  #    exactly the changes most likely to break it.
+  # 2. A workflow that does not run reports nothing, not success. Per job, the
+  #    skipped jobs report as skipped and `style` still reports green.
+  #
+  # So `style` carries no gate at all and runs for every change, and the jobs
+  # that only ever exercise code are gated on this one.
+  #
+  # Documentation is the repository's prose, narrowly: root-level *.md, docs/**,
+  # assets/**, LICENSE (with an optional .md or .txt) and markdown under
+  # .github/ outside the workflows.
+  # Everything else is code, including Cargo.toml, Cargo.lock, fluid/package.json,
+  # scripts/** and .github/workflows/** itself, because a workflow change has to
+  # exercise itself. Markdown deeper in the tree is code too: skills/*/SKILL.md is
+  # include_str!'d into crystalline-core, and the fixture engrams under tests/ and
+  # evals/ are what the suites and `verify-action` read.
+  #
+  # The classifier fails safe in every direction: an unknown event, a missing,
+  # zeroed or unreachable base, a force push, a git error or an empty file list
+  # all set code=true. The gate below reads `!cancelled() && ... != 'false'`, so
+  # a `changes` job that fails outright runs everything instead of skipping it.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The classifier diffs against a base commit, which the default
+          # shallow clone does not have. Only this job pays for the history,
+          # and the pack is a few dozen megabytes.
+          fetch-depth: 0
+
+      - name: Classify the changed paths
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_FORCED: ${{ github.event.forced }}
+        run: |
+          # The runner starts this shell with -e. Turn it off on purpose: every
+          # failure in here has to end in code=true, never in a non-zero exit,
+          # which would skip the gated jobs instead of running them.
+          set +e
+          set -u
+
+          run_everything() {
+            echo "changes: $1, so every job runs."
+            echo "code=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          case "$EVENT_NAME" in
+            pull_request)
+              # Three dots: what this side added since the merge base, so a base
+              # branch that moved on does not leak into the list.
+              base="$PR_BASE_SHA"
+              range="${base}...HEAD"
+              ;;
+            push)
+              if [ "$PUSH_FORCED" = "true" ]; then
+                run_everything "a force push leaves no usable base"
+              fi
+              base="$PUSH_BEFORE_SHA"
+              range="${base}..HEAD"
+              ;;
+            *)
+              run_everything "the event $EVENT_NAME has no base to compare against"
+              ;;
+          esac
+
+          case "$base" in
+            '')             run_everything "there is no base commit (a first push or a new branch)" ;;
+            *[!0-9a-fA-F]*) run_everything "the base is not a commit sha ($base)" ;;
+            *[!0]*)         ;;
+            *)              run_everything "the base commit is all zeros (a first push or a new branch)" ;;
+          esac
+
+          git cat-file -e "${base}^{commit}" 2>/dev/null
+          if [ $? -ne 0 ]; then
+            run_everything "the base commit $base is not in this clone"
+          fi
+
+          # --no-renames so a file that moves shows up on both sides: a rename
+          # out of code into docs must not read as a documentation change.
+          files=$(git diff --name-only --no-renames "$range")
+          if [ $? -ne 0 ]; then
+            run_everything "git diff $range failed"
+          fi
+          if [ -z "$files" ]; then
+            run_everything "the diff against $base is empty, which is not a diff we understand"
+          fi
+
+          code=false
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              # A workflow change exercises itself. This comes first, so a
+              # README.md under .github/workflows/ still counts as code.
+              .github/workflows/*) verdict=code ;;
+              docs/*|assets/*)     verdict=docs ;;
+              # LICENSE and LICENSE.md and LICENSE.txt only. A bare LICENSE*
+              # would read a root file like LICENSE_KEYS.rs as prose.
+              LICENSE|LICENSE.md|LICENSE.txt) verdict=docs ;;
+              .github/*.md)        verdict=docs ;;
+              # Anything else in a subdirectory, markdown included.
+              */*)                 verdict=code ;;
+              *.md)                verdict=docs ;;
+              *)                   verdict=code ;;
+            esac
+            echo "  $verdict  $f"
+            if [ "$verdict" = code ]; then
+              code=true
+            fi
+          done <<<"$files"
+
+          echo "code=$code" >>"$GITHUB_OUTPUT"
+          if [ "$code" = true ]; then
+            echo "changes: this diff touches code, so every job runs."
+          else
+            echo "changes: documentation only, so the heavy jobs are skipped. style still runs."
+          fi
+
   test:
     name: test (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -52,6 +186,8 @@ jobs:
 
   postgres-parity:
     name: postgres-parity
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -90,6 +226,8 @@ jobs:
   # nor hold it up.
   fluid:
     name: fluid
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     env:
       # Corepack fetches the pinned pnpm on first use, and the confirmation it
@@ -172,6 +310,8 @@ jobs:
   # own because it needs the Rust toolchain as well as Node.
   fluid-smoke:
     name: fluid-smoke
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     env:
       # See the fluid job: corepack must not stop to ask before fetching pnpm.
@@ -246,6 +386,8 @@ jobs:
   # the entrypoint renders is one nginx accepts.
   fluid-image:
     name: fluid-image
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -293,6 +435,8 @@ jobs:
 
   musl-spike:
     name: musl-spike
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -319,6 +463,8 @@ jobs:
   # this job guards against) would fail at the download step.
   verify-action:
     name: verify-action
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
