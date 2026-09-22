@@ -611,6 +611,21 @@ pub struct ShareChangesParams {
     pub files: Option<Vec<String>>,
 }
 
+/// Parameters for `discard_changes`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DiscardChangesParams {
+    /// The team domain the changes belong to.
+    pub domain: String,
+    /// The domain-relative paths to put back the way the team has them.
+    pub paths: Vec<String>,
+    /// Optional guard, path to the SHA-256 hex of the current content you
+    /// looked at (the `sha` origin_status reports with detail). A path whose
+    /// content moved since is refused as changed_since. Omit it to discard
+    /// each named path unconditionally.
+    #[serde(default)]
+    pub expected: Option<std::collections::BTreeMap<String, String>>,
+}
+
 /// Parameters for `update_domain`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct UpdateDomainParams {
@@ -633,6 +648,11 @@ pub struct OriginStatusParams {
     /// leave it off when the count is all you need.
     #[serde(default)]
     pub detail: bool,
+    /// With detail, also return both sides of every unshared file: the
+    /// team's copy and yours, so you can say what changed before sharing or
+    /// discarding. Requires domain, and implies detail.
+    #[serde(default)]
+    pub diff: bool,
 }
 
 /// Parameters for `resolve_conflict`.

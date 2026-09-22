@@ -424,9 +424,13 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             // Absent reads as false: a client from before detail existed asks
             // for the counts it already knew how to render.
             let detail = req.get("detail").and_then(Value::as_bool).unwrap_or(false);
+            // And the same for `diff`, which is newer still: absent reads as
+            // false, so a client from before both sides were readable asks for
+            // exactly what it always asked for.
+            let diff = req.get("diff").and_then(Value::as_bool).unwrap_or(false);
             match shared
                 .engine
-                .origin_status(domain, detail, &crate::scope::Scope::Unrestricted)
+                .origin_status(domain, detail, diff, &crate::scope::Scope::Unrestricted)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),

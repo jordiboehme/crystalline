@@ -169,7 +169,7 @@ async fn github_disabled_refuses_all_three_origin_operations() {
     );
 
     let status_err = eng
-        .origin_status(None, false, &Scope::Unrestricted)
+        .origin_status(None, false, false, &Scope::Unrestricted)
         .await
         .unwrap_err();
     assert!(
@@ -212,7 +212,7 @@ async fn read_only_refuses_add_but_allows_update_and_status() {
     assert_eq!(update["errors"].as_array().unwrap().len(), 0);
 
     let status = eng
-        .origin_status(None, false, &Scope::Unrestricted)
+        .origin_status(None, false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(status["domains"].as_array().unwrap().len(), 0);
@@ -1307,7 +1307,7 @@ async fn origin_status_reports_behind_and_connection() {
     .unwrap();
 
     let status = eng
-        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(status["connection"]["connected"], true);
@@ -1327,7 +1327,7 @@ async fn origin_status_reports_behind_and_connection() {
     )
     .unwrap();
     let status_local = eng
-        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(status_local["domains"][0]["local_changes"], 1);
@@ -1339,7 +1339,7 @@ async fn origin_status_reports_behind_and_connection() {
     mock.set_branch("main", &c2);
 
     let status2 = eng
-        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domains2 = status2["domains"].as_array().unwrap();
@@ -1417,7 +1417,7 @@ async fn origin_status_detail_names_the_changes_and_the_default_still_only_count
     std::fs::write(root.join("notes/index.md"), b"# listing\n").unwrap();
 
     let counted = eng
-        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let entry = &counted["domains"][0];
@@ -1435,7 +1435,7 @@ async fn origin_status_detail_names_the_changes_and_the_default_still_only_count
     );
 
     let named = eng
-        .origin_status(Some("brand"), true, &Scope::Unrestricted)
+        .origin_status(Some("brand"), true, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let entry = &named["domains"][0];
@@ -1497,7 +1497,7 @@ async fn origin_status_detail_survives_an_offline_probe() {
     mock.fail_branch_head_offline("main");
 
     let status = eng
-        .origin_status(Some("brand"), true, &Scope::Unrestricted)
+        .origin_status(Some("brand"), true, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let entry = &status["domains"][0];
@@ -1534,7 +1534,7 @@ async fn origin_status_with_no_domain_reports_every_origin_domain() {
     .unwrap();
 
     let status = eng
-        .origin_status(None, false, &Scope::Unrestricted)
+        .origin_status(None, false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domains = status["domains"].as_array().unwrap();
@@ -1578,7 +1578,7 @@ async fn origin_status_survives_a_live_offline_probe_for_a_connected_domain() {
     mock.fail_branch_head_offline("main");
 
     let status = eng
-        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -1637,7 +1637,7 @@ async fn origin_status_offline_probe_on_one_domain_still_reports_both_domains() 
     mock.fail_branch_head_offline("bad-branch");
 
     let status = eng
-        .origin_status(None, false, &Scope::Unrestricted)
+        .origin_status(None, false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(status["errors"].as_array().unwrap().len(), 0, "{status}");
@@ -1702,7 +1702,7 @@ async fn origin_status_one_domain_genuinely_failing_does_not_abort_the_others() 
     std::fs::remove_file(origins_dir.join("bad").join("state.json")).unwrap();
 
     let status = eng
-        .origin_status(None, false, &Scope::Unrestricted)
+        .origin_status(None, false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domains = status["domains"].as_array().unwrap();
@@ -2235,7 +2235,7 @@ async fn a_personal_mode_status_leaves_an_owed_stack_link_for_the_next_write() {
 
     let before = mock.calls().len();
     let status = eng
-        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .origin_status(Some("kb"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let delta = mock.calls().split_off(before);
@@ -2296,7 +2296,7 @@ async fn an_instance_mode_status_still_settles_an_owed_stack_link() {
 
     let before = mock.calls().len();
     let status = eng
-        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .origin_status(Some("kb"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let delta = mock.calls().split_off(before);
@@ -2527,7 +2527,7 @@ async fn origin_status_json_names_wedge_and_pending_flags() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, _mock, _root, _number) = shared_team_engine(&tmp).await;
     let v = eng
-        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .origin_status(Some("kb"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domain = &v["domains"][0];
@@ -2610,7 +2610,7 @@ async fn origin_status_flags_an_amended_open_proposal() {
     mock.set_branch(&branch, &amended);
 
     let v = eng
-        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .origin_status(Some("kb"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let open = &v["domains"][0]["open_proposals"][0];
@@ -2644,7 +2644,7 @@ async fn conflicted_team_engine(tmp: &tempfile::TempDir) -> (Engine, std::path::
         .unwrap();
 
     let status = eng
-        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .origin_status(Some("kb"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let id = status["domains"][0]["conflicts"][0]["id"]
@@ -4137,7 +4137,7 @@ async fn a_merged_and_pulled_draft_converges_out_of_the_overlay() {
     );
 
     let status = eng
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domain = &status["domains"][0];
@@ -4226,7 +4226,7 @@ async fn a_pull_converges_a_byte_equal_file_and_a_sidecar_of_a_gone_base_file() 
         "the folder says what she said, so she is drafting neither of them now"
     );
     let status = eng
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domain = &status["domains"][0];
@@ -4270,7 +4270,7 @@ async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
     );
 
     let hers = eng
-        .origin_status(Some("team"), false, &scope_of("alice"))
+        .origin_status(Some("team"), false, false, &scope_of("alice"))
         .await
         .unwrap();
     assert_eq!(
@@ -4279,7 +4279,7 @@ async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
         "her own conflict, named beside the pages: {hers}"
     );
     let his = eng
-        .origin_status(Some("team"), false, &scope_of("bob"))
+        .origin_status(Some("team"), false, false, &scope_of("bob"))
         .await
         .unwrap();
     assert_eq!(
@@ -4309,7 +4309,7 @@ async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
     // Her next write of the same path is what settles it.
     file(&eng, "alice", "assets/deck.png", b"a third deck").await;
     let hers = eng
-        .origin_status(Some("team"), false, &scope_of("alice"))
+        .origin_status(Some("team"), false, false, &scope_of("alice"))
         .await
         .unwrap();
     // Nothing converged on that pass and nothing conflicts any more, which is
@@ -4369,6 +4369,7 @@ async fn a_diverged_draft_is_its_authors_conflict_only() {
         .origin_status(
             Some("team"),
             false,
+            false,
             &Scope::User {
                 account: "alice".to_string(),
                 admin: false,
@@ -4397,6 +4398,7 @@ async fn a_diverged_draft_is_its_authors_conflict_only() {
         .origin_status(
             Some("team"),
             false,
+            false,
             &Scope::User {
                 account: "bob".to_string(),
                 admin: false,
@@ -4412,7 +4414,7 @@ async fn a_diverged_draft_is_its_authors_conflict_only() {
 
     // Whoever owns the domain sees the counts, and no content at all.
     let owners = eng
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domain = &owners["domains"][0];
@@ -4510,7 +4512,7 @@ async fn a_pulled_address_collision_is_the_drafters_divergence() {
     );
 
     let status = eng
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -4694,7 +4696,7 @@ async fn a_pull_into_a_domain_that_takes_changes_directly_converges_nothing() {
         .unwrap();
 
     let status = eng
-        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .origin_status(Some("kb"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let domain = &status["domains"][0];
@@ -4888,7 +4890,10 @@ async fn an_unrelated_pull_leaves_a_standing_conflict_alone() {
         account: "ada".to_string(),
         admin: false,
     };
-    let status = eng.origin_status(Some("team"), false, &ada).await.unwrap();
+    let status = eng
+        .origin_status(Some("team"), false, false, &ada)
+        .await
+        .unwrap();
     assert_eq!(
         status["domains"][0]["converged"]["mine"],
         serde_json::json!(["notes/plan.md"]),
@@ -4912,7 +4917,10 @@ async fn an_unrelated_pull_leaves_a_standing_conflict_alone() {
         .await
         .unwrap();
 
-    let status = eng.origin_status(Some("team"), false, &ada).await.unwrap();
+    let status = eng
+        .origin_status(Some("team"), false, false, &ada)
+        .await
+        .unwrap();
     assert_eq!(
         status["domains"][0]["converged"]["mine"],
         serde_json::json!(["notes/plan.md"]),
@@ -4970,6 +4978,7 @@ async fn the_clear_only_pass_leaves_the_conflicts_it_did_not_settle() {
         .origin_status(
             Some("team"),
             false,
+            false,
             &Scope::User {
                 account: "ada".to_string(),
                 admin: false,
@@ -5025,6 +5034,7 @@ async fn a_restart_still_names_the_conflicts_the_last_pull_found() {
     let status = restarted
         .origin_status(
             Some("team"),
+            false,
             false,
             &Scope::User {
                 account: "ada".to_string(),

@@ -377,7 +377,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    // GitHub collaboration is off in this harness, so the five tools that need
+    // GitHub collaboration is off in this harness, so the six tools that need
     // it are withheld rather than listed-and-refusing. Calling one by name
     // still reaches the handler and says how to turn it on
     // (`hidden_collab_tools_refuse_at_call_time_when_github_is_disabled` in
@@ -388,6 +388,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
         "origin_status",
         "resolve_conflict",
         "withdraw_proposal",
+        "discard_changes",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -452,7 +453,7 @@ async fn no_tool_administers_a_domains_membership() {
 /// carries is the announcement, and `tests/mcp_subscriptions.rs` pins who
 /// receives it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flipping_github_enabled_moves_the_tool_list_by_exactly_the_five() {
+async fn flipping_github_enabled_moves_the_tool_list_by_exactly_the_six() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();
@@ -495,6 +496,7 @@ async fn flipping_github_enabled_moves_the_tool_list_by_exactly_the_five() {
         "origin_status",
         "resolve_conflict",
         "withdraw_proposal",
+        "discard_changes",
     ];
     for tool in gated {
         assert!(
@@ -509,7 +511,7 @@ async fn flipping_github_enabled_moves_the_tool_list_by_exactly_the_five() {
     assert_eq!(
         after.len(),
         before.len() + gated.len(),
-        "exactly the five arrived and nothing else moved: {before:?} -> {after:?}"
+        "exactly the six arrived and nothing else moved: {before:?} -> {after:?}"
     );
 
     // And back again: the gate reads the live setting rather than latching on
@@ -599,7 +601,7 @@ async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
     let (client, _server) = h.connect().await;
     let peer = client.peer();
 
-    let cases: [(&str, Value); 5] = [
+    let cases: [(&str, Value); 6] = [
         ("share_changes", json!({ "domain": "eng" })),
         ("update_domain", json!({})),
         ("origin_status", json!({})),
@@ -608,6 +610,10 @@ async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
             json!({ "domain": "eng", "path": "a.md", "resolution": "mine" }),
         ),
         ("withdraw_proposal", json!({ "domain": "eng" })),
+        (
+            "discard_changes",
+            json!({ "domain": "eng", "paths": ["a.md"] }),
+        ),
     ];
     for (tool, args) in cases {
         let result = call_result(peer, tool, args).await;
@@ -663,6 +669,7 @@ async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
         "origin_status",
         "resolve_conflict",
         "withdraw_proposal",
+        "discard_changes",
     ] {
         let text = description(name);
         assert!(
@@ -1075,7 +1082,7 @@ async fn read_only_hides_the_write_gated_tools() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    // Read-only hides the four write-shaped collaboration tools and
+    // Read-only hides the five write-shaped collaboration tools and
     // `provision` (the full gating matrix lives in tests/mcp_collab.rs).
     // `evolve_engrams` is hidden on its own gate: it is a read, but every
     // finding it returns prescribes a mutation, so the queue is noise where
@@ -1085,6 +1092,7 @@ async fn read_only_hides_the_write_gated_tools() {
         "share_changes",
         "resolve_conflict",
         "withdraw_proposal",
+        "discard_changes",
         "evolve_engrams",
         "provision",
     ] {
@@ -1097,7 +1105,7 @@ async fn read_only_hides_the_write_gated_tools() {
     // read-only exempts (a pull is a derived-truth update, status is a pure
     // read) - but the two gates compose, and GitHub is off in this harness, so
     // they are withheld here too. On a read-only instance with collaboration
-    // on they are the only two of the six that show.
+    // on they are the only two of the seven that show.
     for hidden in ["update_domain", "origin_status"] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -3844,7 +3852,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 22] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 23] = [
     (
         "write_engram",
         "Capture engram",
@@ -4028,12 +4036,20 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 22] = [
         Some(false),
         Some(false),
     ),
+    (
+        "discard_changes",
+        "Discard changes",
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+    ),
 ];
 
 /// A GitHub-enabled server with no domains, built solely to inspect the tool
 /// surface and its annotations. Read-write makes every tool visible through
 /// `get_tool`; read-only narrows it to the read tools plus `update_domain` and
-/// `origin_status`. The 20 rows below are every tool except `skills` and
+/// `origin_status`. The 23 rows below are every tool except `skills` and
 /// `provision`, which carry their own dedicated tests.
 async fn annotation_server(read_only: bool) -> McpServer {
     let cfg = GlobalConfig {
@@ -4708,9 +4724,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 22 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 23 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 22 are visible and on the read-only one where
+/// read-write server where all 23 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.

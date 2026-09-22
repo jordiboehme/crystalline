@@ -1,5 +1,5 @@
-//! MCP-layer tests for the six GitHub collaboration tools: the runtime
-//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the five
+//! MCP-layer tests for the seven GitHub collaboration tools: the runtime
+//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the six
 //! GitHub-gated ones still give when called while withheld from the listing,
 //! the `configure` tool's snapshot, set
 //! flow and GitHub connect state machine, and wiring smoke tests for the
@@ -182,24 +182,25 @@ where
     panic!("condition was not met within two seconds");
 }
 
-/// The six collaboration tool names. `add_domain` is deliberately not here:
+/// The seven collaboration tool names. `add_domain` is deliberately not here:
 /// it is write-gated, not collaboration-gated (see `add_domain_*` tests below).
-const ALL_SIX: [&str; 6] = [
+const ALL_SEVEN: [&str; 7] = [
     "configure",
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
     "withdraw_proposal",
+    "discard_changes",
 ];
 
 // --- gating matrix -----------------------------------------------------------
 
 /// The locked matrix, on both gates, which compose rather than override.
 ///
-/// `github.enabled` off withholds the five tools that need it and never
+/// `github.enabled` off withholds the six tools that need it and never
 /// withholds `configure`, whatever the mode - so a default install lists the
-/// enable path and nothing else of the six. On top of that, read-only hides
+/// enable path and nothing else of the seven. On top of that, read-only hides
 /// the write-shaped ones, leaving `update_domain` and `origin_status` on an
 /// enabled read-only instance and `configure` alone on a disabled writable
 /// one.
@@ -214,7 +215,7 @@ async fn gating_matrix_over_list_tools() {
     let cases: [(bool, bool, &[&str]); 4] = [
         (false, false, &["configure"]),
         (false, true, &[]),
-        (true, false, &ALL_SIX),
+        (true, false, &ALL_SEVEN),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -224,7 +225,7 @@ async fn gating_matrix_over_list_tools() {
         let (client, _server) = connect(eng).await;
         let tools = client.peer().list_tools(Default::default()).await.unwrap();
         let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
-        for name in ALL_SIX {
+        for name in ALL_SEVEN {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 names.contains(&name.to_string()),
@@ -244,7 +245,7 @@ async fn gating_matrix_over_get_tool() {
     let cases: [(bool, bool, &[&str]); 4] = [
         (false, false, &["configure"]),
         (false, true, &[]),
-        (true, false, &ALL_SIX),
+        (true, false, &ALL_SEVEN),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -252,7 +253,7 @@ async fn gating_matrix_over_get_tool() {
         let eng =
             Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
         let server = McpServer::new(eng);
-        for name in ALL_SIX {
+        for name in ALL_SEVEN {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 server.get_tool(name).is_some(),
@@ -354,7 +355,7 @@ async fn flipping_github_enabled_mid_session_moves_both_the_listing_and_the_refu
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    for name in ALL_SIX {
+    for name in ALL_SEVEN {
         assert!(
             after.contains(&name.to_string()),
             "{name} is listed once collaboration is on: {after:?}"
@@ -362,8 +363,8 @@ async fn flipping_github_enabled_mid_session_moves_both_the_listing_and_the_refu
     }
     assert_eq!(
         after.len(),
-        before.len() + 5,
-        "exactly the five gated tools arrived: {before:?} -> {after:?}"
+        before.len() + 6,
+        "exactly the six gated tools arrived: {before:?} -> {after:?}"
     );
 
     // And now the same call reaches the engine instead of the gate.
@@ -380,7 +381,7 @@ async fn flipping_github_enabled_mid_session_moves_both_the_listing_and_the_refu
 
 // --- hidden tools still refuse at call time ----------------------------------
 
-/// Hidden is not disabled: the five GitHub-gated tools keep their routes while
+/// Hidden is not disabled: the six GitHub-gated tools keep their routes while
 /// they are withheld from the listing, and each refuses with the message that
 /// names the setting.
 ///
@@ -394,7 +395,7 @@ async fn hidden_collab_tools_refuse_at_call_time_when_github_is_disabled() {
     let (client, _server) = connect(eng).await;
     let peer = client.peer();
 
-    let cases: [(&str, Value); 5] = [
+    let cases: [(&str, Value); 6] = [
         ("share_changes", json!({"domain": "eng"})),
         ("update_domain", json!({})),
         ("origin_status", json!({})),
@@ -403,6 +404,10 @@ async fn hidden_collab_tools_refuse_at_call_time_when_github_is_disabled() {
             json!({"domain": "eng", "path": "a.md", "resolution": "mine"}),
         ),
         ("withdraw_proposal", json!({"domain": "eng"})),
+        (
+            "discard_changes",
+            json!({"domain": "eng", "paths": ["a.md"]}),
+        ),
     ];
     for (tool, args) in cases {
         let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
@@ -487,6 +492,15 @@ async fn hidden_write_collab_tools_route_to_read_only_when_enabled_and_read_only
     let err = call(peer, "withdraw_proposal", json!({"domain": "eng"}))
         .await
         .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+
+    let err = call(
+        peer,
+        "discard_changes",
+        json!({"domain": "eng", "paths": ["a.md"]}),
+    )
+    .await
+    .unwrap_err();
     assert!(err.contains("read-only"), "{err}");
 }
 
@@ -1948,6 +1962,314 @@ async fn share_changes_tool_wires_through_to_origin_share() {
     // folder listing stays on this machine.
     assert_eq!(out["added"], json!(["notes/new.md"]));
     assert!(out["url"].as_str().unwrap().starts_with("https://"));
+}
+
+/// A team-domain engine with one engram edited beside the base copy and one
+/// new file, ready for a discard: returns the engine, the domain root and the
+/// base bytes of the edited engram.
+async fn edited_team_engine(tmp: &tempfile::TempDir) -> (Arc<Engine>, std::path::PathBuf, Vec<u8>) {
+    let mock = Arc::new(MockProvider::new());
+    let base = engram("Alpha", "notes/a", "alpha as the team has it");
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", base.clone()),
+    ]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha, edited"),
+    )
+    .unwrap();
+    std::fs::write(root.join("notes/new.md"), engram("New", "notes/new", "new")).unwrap();
+    eng.sync(Some("brand")).await.unwrap();
+    (eng, root, base)
+}
+
+/// The tool reaches the engine's discard, and `expected` is the guard it
+/// says it is: a stale digest refuses the path and leaves the file alone,
+/// the digest the status reports unlocks it, and a path nobody's change list
+/// carries is refused by name rather than acted on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_changes_wires_through_and_honours_the_expected_digests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, root, base) = edited_team_engine(&tmp).await;
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    // Without `expected` a path is discarded as it stands.
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({ "domain": "brand", "paths": ["notes/new.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["deleted"], json!(["notes/new.md"]), "{out}");
+    assert!(!root.join("notes/new.md").exists());
+
+    // With `expected` a stale digest is refused and the file left alone.
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({
+            "domain": "brand",
+            "paths": ["notes/a.md"],
+            "expected": { "notes/a.md": "0".repeat(64) },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["refused"],
+        json!([{ "path": "notes/a.md", "reason": "changed_since" }]),
+        "{out}"
+    );
+    assert_eq!(out["restored"], json!([]));
+
+    // The digest the status reports is the one that unlocks it.
+    let status = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "detail": true, "diff": true }),
+    )
+    .await
+    .unwrap();
+    let entry = &status["domains"][0]["detail"]["diff"][0];
+    assert_eq!(entry["path"], "notes/a.md", "{status}");
+    assert_eq!(entry["kind"], "modified");
+    assert_eq!(entry["base"].as_str().unwrap().as_bytes(), base.as_slice());
+    assert!(entry["current"].as_str().unwrap().contains("alpha, edited"));
+    let sha = entry["sha"].as_str().unwrap().to_string();
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({
+            "domain": "brand",
+            "paths": ["notes/a.md"],
+            "expected": { "notes/a.md": sha },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["restored"], json!(["notes/a.md"]), "{out}");
+    assert_eq!(out["reindexed"], 1);
+    assert_eq!(std::fs::read(root.join("notes/a.md")).unwrap(), base);
+
+    // An unknown path refuses by name, and a listing is unknown too.
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({ "domain": "brand", "paths": ["nowhere.md", "index.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["refused"],
+        json!([
+            { "path": "nowhere.md", "reason": "unknown_path" },
+            { "path": "index.md", "reason": "unknown_path" },
+        ]),
+        "{out}"
+    );
+}
+
+/// `diff` needs a domain, implies `detail`, and carries both sides of every
+/// unshared file - a deletion, a binary addition and a text addition
+/// included - with no cap on this surface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_status_diff_needs_a_domain_and_carries_every_side() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, root, _) = edited_team_engine(&tmp).await;
+    std::fs::write(root.join("logo.png"), b"\x89PNG\r\n\x1a\n\x00").unwrap();
+    std::fs::remove_file(root.join("MANIFEST.md")).unwrap();
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+
+    let err = call(peer, "origin_status", json!({ "diff": true }))
+        .await
+        .unwrap_err();
+    assert!(err.contains("diff needs a domain"), "{err}");
+
+    let status = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "diff": true }),
+    )
+    .await
+    .unwrap();
+    let detail = &status["domains"][0]["detail"];
+    assert_eq!(
+        detail["added"],
+        json!(["logo.png", "notes/new.md"]),
+        "diff implies detail: {status}"
+    );
+    let diff = detail["diff"].as_array().unwrap();
+    let paths: Vec<&str> = diff.iter().map(|d| d["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        paths,
+        vec!["MANIFEST.md", "logo.png", "notes/a.md", "notes/new.md"],
+        "path order: {status}"
+    );
+    assert!(
+        diff[0]["current"].is_null() && diff[0]["base"].as_str().is_some(),
+        "a deletion: {status}"
+    );
+    assert_eq!(diff[1]["binary"], true);
+    assert!(diff[1]["current"].is_null() && diff[1]["base"].is_null());
+    assert_eq!(diff[1]["size_after"], 9);
+    assert!(diff[3]["base"].is_null(), "an addition: {status}");
+    assert_eq!(diff[3]["too_large"], false);
+
+    // No cap on this surface: a side above a megabyte still arrives.
+    std::fs::write(
+        root.join("notes/big.md"),
+        format!(
+            "---\ntitle: Big\npermalink: notes/big\n---\n\n{}\n",
+            "x".repeat(1024 * 1024 + 10)
+        ),
+    )
+    .unwrap();
+    let status = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "diff": true }),
+    )
+    .await
+    .unwrap();
+    let big = status["domains"][0]["detail"]["diff"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["path"] == "notes/big.md")
+        .cloned()
+        .unwrap();
+    assert_eq!(big["too_large"], false, "{}", big["path"]);
+    assert!(big["current"].as_str().unwrap().len() > 1024 * 1024);
+}
+
+/// In a reviewing domain the tool clears exactly the caller's own draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discard_changes_clears_only_the_callers_draft_in_a_reviewing_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "brand",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &crystalline_service::Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let (client, _server) = connect(eng.clone()).await;
+    let peer = client.peer();
+    let written = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "brand",
+            "title": "Colour rules",
+            "content": "- [decision] the accent is used once per page #brand",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(written["draft"], json!(true), "{written}");
+    let path = written["path"].as_str().unwrap().to_string();
+
+    // Another actor's draft, written the way the overlay tests write one: the
+    // full markdown in the row's own content column, because a draft nobody
+    // put on disk lives nowhere else.
+    let store = eng.store();
+    let id = {
+        let s = store.lock().await;
+        s.domain_id("brand").await.unwrap().unwrap()
+    };
+    let text = "---\ntype: engram\ntitle: Bob\npermalink: bob\ntags:\n  - brand\nstatus: draft\nrecorded_at: 2026-01-03\n---\n\nbob\n";
+    let mut rec = crystalline_index::EngramRecord::from_engram(
+        &crystalline_core::parse_engram(text).unwrap(),
+        "bob.md",
+        crystalline_index::FileStamp {
+            mtime: 0,
+            size: text.len() as u64,
+            sha256: "0".repeat(64),
+        },
+    );
+    rec.content = text.to_string();
+    {
+        let s = store.lock().await;
+        s.upsert_overlay(id, "bob", &rec).await.unwrap();
+    }
+
+    let listed = call(
+        peer,
+        "origin_status",
+        json!({ "domain": "brand", "diff": true }),
+    )
+    .await
+    .unwrap();
+    let diff = listed["domains"][0]["detail"]["diff"].as_array().unwrap();
+    assert_eq!(diff.len(), 1, "the owner's own draft alone: {listed}");
+    assert_eq!(diff[0]["path"], path);
+
+    let out = call(
+        peer,
+        "discard_changes",
+        json!({ "domain": "brand", "paths": [path.clone(), "bob.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out["cleared"],
+        json!([{ "path": path, "kind": "added" }]),
+        "{out}"
+    );
+    assert_eq!(
+        out["refused"],
+        json!([{ "path": "bob.md", "reason": "unknown_path" }]),
+        "bob's row is nobody's business here: {out}"
+    );
+    let s = store.lock().await;
+    assert!(
+        s.overlay_entry(id, "bob", "bob.md")
+            .await
+            .unwrap()
+            .is_some(),
+        "bob's draft stands"
+    );
+    assert!(
+        s.overlay_entry(id, crystalline_service::engine::OWNER_IDENTITY_NAME, &path)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Share one new engram of a fresh team domain and return the tool's answer,

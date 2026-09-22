@@ -982,7 +982,7 @@ pub async fn sync_status(
     require_team_domain(&state, &domain, Refusal::Missing)?;
     let aggregate = state
         .engine
-        .origin_status(Some(&domain), false, &identity.scope())
+        .origin_status(Some(&domain), false, false, &identity.scope())
         .await?;
     // Lifted before `single_domain` takes the per-domain entry, which is all
     // that survives of the aggregate.
@@ -1158,7 +1158,7 @@ pub async fn sync_summary(
     }
     let aggregate = state
         .engine
-        .origin_status(None, false, &identity.scope())
+        .origin_status(None, false, false, &identity.scope())
         .await?;
     // This one route enumerates domains rather than addressing one, and a team
     // domain the caller may not see must be absent from the rows AND from the

@@ -762,7 +762,7 @@ async fn a_members_status_carries_only_its_own_count() {
 
     let mine = f
         .engine
-        .origin_status(Some("team"), false, &account("mem"))
+        .origin_status(Some("team"), false, false, &account("mem"))
         .await
         .unwrap();
     let entry = &mine["domains"][0];
@@ -778,7 +778,7 @@ async fn a_members_status_carries_only_its_own_count() {
 
     let theirs = f
         .engine
-        .origin_status(Some("team"), false, &account("keeper"))
+        .origin_status(Some("team"), false, false, &account("keeper"))
         .await
         .unwrap();
     let entry = &theirs["domains"][0];
@@ -814,7 +814,7 @@ async fn a_direct_domains_status_says_nothing_about_drafts() {
     let f = origin_fixture().await;
     let status = f
         .engine
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     let entry = &status["domains"][0];
@@ -5584,7 +5584,7 @@ async fn a_review_domain_reports_its_out_of_band_tree_edits() {
     // directly" rather than as "nothing has gone round review".
     let status = f
         .engine
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -5602,7 +5602,7 @@ async fn a_review_domain_reports_its_out_of_band_tree_edits() {
 
     let status = f
         .engine
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(
@@ -5620,7 +5620,7 @@ async fn a_review_domain_reports_its_out_of_band_tree_edits() {
     .unwrap();
     let status = g
         .engine
-        .origin_status(Some("team"), false, &Scope::Unrestricted)
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
         .await
         .unwrap();
     assert!(

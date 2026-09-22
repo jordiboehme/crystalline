@@ -16660,20 +16660,39 @@ impl Engine {
     /// costs a second walk of every domain's working tree, so `local_changes`
     /// stays the bare count for every caller that only wants to know whether
     /// there is anything to share.
+    ///
+    /// `diff` goes one step further and puts both sides of every unshared file
+    /// in the detail block, under `diff`: the team's copy and this machine's,
+    /// so a caller can say what changed before sharing or discarding it. It
+    /// needs a domain, because reading every side of every domain at once is a
+    /// walk nobody asked for, and it implies `detail`, since a diff with no
+    /// file list beside it would be half an answer.
     pub async fn origin_status(
         &self,
         domain: Option<&str>,
         detail: bool,
+        diff: bool,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
+        if diff && domain.is_none() {
+            return Err(EngineError::Invalid("diff needs a domain".to_string()));
+        }
+        let detail = detail || diff;
         let hidden = self.hidden_for(scope).await?;
         let targets = self.origin_targets(domain, &hidden)?;
         let connection = self.origin_status_connection().await?;
 
         let actor = crate::scope::overlay_actor(scope);
+        // Whose changes a `diff` answers: the acting identity, the way every
+        // other surface of this feature resolves one.
+        let diff_actor = diff.then(|| match scope {
+            crate::scope::Scope::Unrestricted => ShareActor::Owner,
+            crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
+            crate::scope::Scope::Anonymous => ShareActor::HttpAgent,
+        });
         let mut domains = Vec::new();
         let mut errors = Vec::new();
         for (name, entry) in targets {
@@ -16732,8 +16751,32 @@ impl Engine {
                     None,
                 )
             };
+            // Read out here for the reason the counts above are, and it is the
+            // same reason: the per-domain body runs under that domain's origin
+            // lock, and a reviewing domain's change list takes the store lock,
+            // which would be exactly the lock pair this loop exists to keep
+            // out of the body. The sides are read under no lock at all, which
+            // is the promise `team_local_changes` already makes of every
+            // offline read on this path.
+            let diff_block = match diff_actor.as_ref() {
+                Some(who) => match self.local_change_sides(&name, who).await {
+                    Ok(sides) => Some(sides),
+                    Err(e) => {
+                        errors.push(json!({ "domain": name, "error": e.to_string() }));
+                        continue;
+                    }
+                },
+                None => None,
+            };
             match self
-                .origin_status_one(&name, &entry, detail, &view, converged.as_ref())
+                .origin_status_one(
+                    &name,
+                    &entry,
+                    detail,
+                    diff_block.as_ref(),
+                    &view,
+                    converged.as_ref(),
+                )
                 .await
             {
                 Ok(v) => domains.push(v),
@@ -16777,6 +16820,7 @@ impl Engine {
         name: &str,
         entry: &DomainEntry,
         detail: bool,
+        diff: Option<&Value>,
         drafts: &crate::review::DraftView,
         converged: Option<&Value>,
     ) -> Result<Value> {
@@ -16791,9 +16835,18 @@ impl Engine {
             config.github_stacks() && config.github_share_identity() == ShareIdentityMode::Instance
         };
         let change_detail = || {
-            detail
+            let mut block = detail
                 .then(|| origin::local_change_detail(&root, &state_dir))
-                .flatten()
+                .flatten();
+            // Both sides ride inside the same block the paths do, so a caller
+            // that asked for them reads one thing rather than two. In a
+            // reviewing domain the block's own buckets name the working tree's
+            // out-of-band files and this is what names the acting actor's
+            // drafts, which is the only list a discard there can act on.
+            if let (Some(block), Some(sides)) = (block.as_mut(), diff) {
+                block["diff"] = sides.clone();
+            }
+            block
         };
         // In review mode every legitimate change joins its author's draft, so
         // anything the working tree holds that the origin does not got there
@@ -17955,6 +18008,20 @@ impl Engine {
         Ok(
             json!({ "domain": domain, "mode": "team", "changes": changes, "skipped_large": skipped }),
         )
+    }
+
+    /// Both sides of every unshared change of `domain`, in the order
+    /// [`Engine::local_changes`] reports them: what `origin_status`'s `diff`
+    /// block carries. No cap, because a caller deciding what to discard reads
+    /// the whole file rather than a preview of it.
+    async fn local_change_sides(&self, domain: &str, actor: &ShareActor) -> Result<Value> {
+        let listed = self.local_changes(domain, actor).await?;
+        let mut sides = Vec::new();
+        for change in listed["changes"].as_array().into_iter().flatten() {
+            let path = change["path"].as_str().unwrap_or_default();
+            sides.push(self.local_change(domain, path, actor, None).await?);
+        }
+        Ok(json!(sides))
     }
 
     /// Both sides of one unshared change, or `NotFound` in the words
@@ -24000,7 +24067,7 @@ mod share_actor_tests {
         write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
 
         let status = engine
-            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["share_identity"], "instance");
@@ -24017,7 +24084,7 @@ mod share_actor_tests {
             .await
             .unwrap();
         let status = engine
-            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["share_identity"], "personal");
@@ -24033,7 +24100,7 @@ mod share_actor_tests {
 
         write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
         let status = engine
-            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["owner_identity"]["connected"], true);
@@ -24061,7 +24128,7 @@ mod share_actor_tests {
 
         // Instance mode has no personal slot in play at all, agent or owner.
         let status = engine
-            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert!(
@@ -24077,7 +24144,7 @@ mod share_actor_tests {
             .await
             .unwrap();
         let status = engine
-            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         let agent = &status["connection"]["agent_identity"];
@@ -24090,7 +24157,7 @@ mod share_actor_tests {
 
         write_token(&tokens, &personal("share-bot"), "bot-gh");
         let status = engine
-            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["agent_identity"]["connected"], true);
@@ -24122,7 +24189,7 @@ mod share_actor_tests {
             .unwrap();
 
         let status = engine
-            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert!(

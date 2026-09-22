@@ -36,7 +36,7 @@
 //! fails here instead of in a client's log.
 //!
 //! **What actually travels on the stream.** One setting moves a list:
-//! `github.enabled`, which decides whether the five GitHub collaboration tools
+//! `github.enabled`, which decides whether the six GitHub collaboration tools
 //! are listed at all. A client flips it with `configure`, and so do two
 //! callers with no MCP connection of their own - `crystalline config set` over
 //! the control socket and Fluid's Connect button through the REST API - which
@@ -490,7 +490,7 @@ async fn a_category_this_server_cannot_deliver_is_narrowed_away() {
 /// **A subscriber is told when the tool list moves, and told only on the
 /// stream.**
 ///
-/// `github.enabled` gates the listing of the five collaboration tools, so
+/// `github.enabled` gates the listing of the six collaboration tools, so
 /// flipping it is the one thing a client can ask this server to do that
 /// changes what `tools/list` returns. The notification rides the subscription
 /// - `Recorder` watches the off-stream channel and must stay empty, since from
@@ -517,8 +517,8 @@ async fn a_subscribed_client_is_told_when_the_tool_list_moves() {
     let after = tool_names(client.peer()).await;
     assert_eq!(
         after.len(),
-        before.len() + 5,
-        "the five collaboration tools arrived: {before:?} -> {after:?}"
+        before.len() + 6,
+        "the six collaboration tools arrived: {before:?} -> {after:?}"
     );
 
     let announced = next_within(&mut subscription)
@@ -552,7 +552,7 @@ async fn a_subscribed_client_is_told_when_the_tool_list_moves() {
             next_within(&mut subscription).await,
             Some(ServerNotification::ToolListChangedNotification(_))
         ),
-        "the off direction is announced too: the five tools left the list"
+        "the off direction is announced too: the six tools left the list"
     );
 
     assert!(
@@ -594,7 +594,7 @@ async fn a_flip_from_outside_the_mcp_server_still_reaches_a_subscriber() {
     let after = tool_names(client.peer()).await;
     assert_eq!(
         after.len(),
-        before.len() + 5,
+        before.len() + 6,
         "the list moved for this peer: {before:?} -> {after:?}"
     );
 
@@ -628,7 +628,7 @@ async fn a_modern_client_that_never_subscribed_is_told_nothing() {
     let after = tool_names(client.peer()).await;
     assert_eq!(
         after.len(),
-        before.len() + 5,
+        before.len() + 6,
         "the list really did move for this peer too: {before:?} -> {after:?}"
     );
 
@@ -725,7 +725,7 @@ async fn dropping_a_subscription_leaves_the_session_serving() {
 ///
 /// This is V3 itself. `configure` used to send `notifications/tools/list_changed`
 /// whenever it flipped `github.enabled`, to whoever happened to be connected.
-/// The flip does move the tool list again - the five collaboration tools are
+/// The flip does move the tool list again - the six collaboration tools are
 /// listed only while the setting is on - but from 2026-07-28 an unsolicited
 /// notification has no channel at all, so the announcement rides a
 /// subscription or it does not happen. A legacy peer is the strictest case,
@@ -740,7 +740,7 @@ async fn a_legacy_peer_is_never_pushed_a_list_change_it_did_not_ask_for() {
     let after = tool_names(client.peer()).await;
     assert_eq!(
         after.len(),
-        before.len() + 5,
+        before.len() + 6,
         "its list moved, and it will only learn that by asking again: {before:?} -> {after:?}"
     );
 
@@ -894,8 +894,8 @@ async fn only_the_tool_list_moves_and_only_on_the_setting_that_gates_it() {
     );
     assert_eq!(
         after.0.len(),
-        before.0.len() + 5,
-        "the tool list moved by the five collaboration tools: {:?} -> {:?}",
+        before.0.len() + 6,
+        "the tool list moved by the six collaboration tools: {:?} -> {:?}",
         before.0,
         after.0
     );

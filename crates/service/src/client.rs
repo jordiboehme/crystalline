@@ -1170,18 +1170,24 @@ pub async fn origin_update(
 ///
 /// `detail` asks for each domain's unshared files to be named and grouped by
 /// kind rather than only counted, at the cost of a second walk of the working
-/// tree per domain.
+/// tree per domain. `diff` adds both sides of every one of those files, needs
+/// a domain and implies `detail`.
 pub async fn origin_status(
     domain: Option<&str>,
     detail: bool,
+    diff: bool,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(
-            json!({ "v": 1, "cmd": "origin_status", "domain": domain, "detail": detail }),
-        )
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1,
+            "cmd": "origin_status",
+            "domain": domain,
+            "detail": detail,
+            "diff": diff,
+        }))
         .await?
     {
         return Ok(data);
@@ -1190,7 +1196,7 @@ pub async fn origin_status(
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
-        .origin_status(domain, detail, &Scope::Unrestricted)
+        .origin_status(domain, detail, diff, &Scope::Unrestricted)
         .await?)
 }
 
