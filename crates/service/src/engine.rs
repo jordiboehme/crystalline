@@ -17499,9 +17499,12 @@ impl Engine {
                     // so a local IO or store failure is warned about and the
                     // `committed` receipt stands. The reviewed folder then
                     // differs from its base copies, which `origin_status`
-                    // counts as local changes and `discard_changes` restores,
-                    // and the drafts fold on the next pull that applies
-                    // anything, since convergence asks every entry.
+                    // counts as local changes and `discard_changes` restores.
+                    // A pull does not heal it on its own: after the failure
+                    // the head equals the base, so the pull is up to date and
+                    // runs no convergence; the drafts fold once a later
+                    // upstream write touches those paths, or when the person
+                    // discards them.
                     if let Err(e) = ops::materialise_base_paths(&root, &state_dir, &paths) {
                         tracing::warn!("writing the direct commit's files in '{domain}': {e}");
                     }
