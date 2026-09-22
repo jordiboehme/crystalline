@@ -12937,11 +12937,12 @@ impl Engine {
     /// with its TOCTOU guards - so a targeted pass never holds the store mutex
     /// across the scan either. The watcher, the archive import and a discard of
     /// local changes call this; it is intentionally not exposed over MCP or the
-    /// control socket, where a full sync is always wanted. A domain hosted by another live instance in collaboration mode is
-    /// skipped silently, exactly as the watcher's full-sync path skips it today,
-    /// so a non-host never writes the host's rows. A missed or mis-targeted event
-    /// is caught by the full fallback, the startup sync or a manual sync, so the
-    /// targeted pass only has to be convergent, never perfect.
+    /// control socket, where a full sync is always wanted. A domain hosted by
+    /// another live instance in collaboration mode is skipped silently, exactly
+    /// as the watcher's full-sync path skips it today, so a non-host never
+    /// writes the host's rows. A missed or mis-targeted event is caught by the
+    /// full fallback, the startup sync or a manual sync, so the targeted pass
+    /// only has to be convergent, never perfect.
     pub async fn sync_paths(&self, name: &str, paths: Vec<String>) -> Result<SyncReport> {
         let ContentSource::File { root } = self.content_source(name)? else {
             // A virtual domain has no files on disk; there is nothing to scan.
