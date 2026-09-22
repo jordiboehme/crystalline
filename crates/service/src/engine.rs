@@ -17494,12 +17494,30 @@ impl Engine {
                         .chain(&report.deleted)
                         .cloned()
                         .collect();
-                    ops::materialise_base_paths(&root, &state_dir, &paths)?;
+                    // Nothing here may turn a landed commit into an error:
+                    // the branch already moved and no retry can take it back,
+                    // so a local IO or store failure is warned about and the
+                    // `committed` receipt stands. The reviewed folder then
+                    // differs from its base copies, which `origin_status`
+                    // counts as local changes and `discard_changes` restores,
+                    // and the drafts fold on the next pull that applies
+                    // anything, since convergence asks every entry.
+                    if let Err(e) = ops::materialise_base_paths(&root, &state_dir, &paths) {
+                        tracing::warn!("writing the direct commit's files in '{domain}': {e}");
+                    }
                     if let Err(e) = self.sync_paths(domain, paths.clone()).await {
                         tracing::warn!("indexing the direct commit's files in '{domain}': {e}");
                     }
-                    let folded = self.converge_pulled_overlays(domain, &paths).await?;
-                    receipt["drafts_folded"] = json!(folded.cleared);
+                    match self.converge_pulled_overlays(domain, &paths).await {
+                        Ok(folded) => receipt["drafts_folded"] = json!(folded.cleared),
+                        Err(e) => {
+                            tracing::warn!("folding the shared drafts in '{domain}': {e}");
+                            // The one key that says the commit landed and the
+                            // drafts behind it did not fold, in place of the
+                            // count a fold that ran would have carried.
+                            receipt["fold_error"] = json!(e.to_string());
+                        }
+                    }
                 }
                 self.index_what_the_share_pull_applied(domain, "sharing")
                     .await;
