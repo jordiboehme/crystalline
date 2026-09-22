@@ -825,6 +825,7 @@ mod tests {
             ("CRYSTALLINE_SERVICE_PUBLIC_URL", "https://kb.example.com"),
             ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
             ("CRYSTALLINE_DATABASE_URL", "postgres://u:p@db/crystalline"),
+            ("CRYSTALLINE_RECALL_MIN_SCORE", "0.65"),
         ])
         .unwrap();
 
@@ -845,6 +846,7 @@ mod tests {
             "service.public_url",
             "database.backend",
             "database.url",
+            "recall.min_score",
         ] {
             assert!(ov.overrides_key(key), "expected {key} overridden");
         }
@@ -885,6 +887,7 @@ mod tests {
             effective.database().url.as_deref(),
             Some("postgres://u:p@db/crystalline")
         );
+        assert_eq!(effective.recall_min_score(), 0.65);
     }
 
     /// The env variable carries the whole tri-state value set, booleans

@@ -87,6 +87,10 @@ pub struct GlobalConfig {
     /// every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CaptureConfig>,
+    /// Per-prompt recall settings. Absent means the hook is on with its
+    /// defaults, so every existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<RecallConfig>,
     /// Write-provenance settings. Absent means the actor recorded on a write
     /// is derived from the connected client, so every existing config keeps
     /// working untouched.
@@ -263,6 +267,31 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|c| c.similar)
             .unwrap_or(true)
+    }
+
+    /// Whether the per-prompt hook speaks at all, from `recall.enabled`.
+    /// Absent config or an absent key means on (true).
+    pub fn recall_enabled(&self) -> bool {
+        self.recall.as_ref().and_then(|r| r.enabled).unwrap_or(true)
+    }
+
+    /// How many engrams the per-prompt hook may hand the agent at once, from
+    /// `recall.limit`, clamped to 1 to 5. Absent means 3.
+    pub fn recall_limit(&self) -> usize {
+        self.recall
+            .as_ref()
+            .and_then(|r| r.limit)
+            .unwrap_or(DEFAULT_RECALL_LIMIT)
+            .clamp(1, 5) as usize
+    }
+
+    /// The hybrid score an engram must reach before the per-prompt hook names
+    /// it, from `recall.min_score`. Absent means 0.5.
+    pub fn recall_min_score(&self) -> f64 {
+        self.recall
+            .as_ref()
+            .and_then(|r| r.min_score)
+            .unwrap_or(DEFAULT_RECALL_MIN_SCORE)
     }
 
     /// The configured actor recorded as `generated.by` on every write, from
@@ -742,6 +771,30 @@ pub struct CaptureConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub similar: Option<bool>,
 }
+
+/// The `recall` block: what the per-prompt hook hands the agent. Reads like a
+/// settings-page section - see the `configure` tool, which exposes exactly
+/// these keys.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecallConfig {
+    /// Whether the per-prompt hook speaks at all. Absent means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// How many engrams one prompt may be handed, 1 to 5. Absent means 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// The hybrid score an engram must reach, 0.0 to 1.0. Absent means 0.5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f64>,
+}
+
+/// `recall.limit`'s default: how many engrams the per-prompt hook may hand
+/// the agent at once when the setting is absent.
+pub const DEFAULT_RECALL_LIMIT: u64 = 3;
+
+/// `recall.min_score`'s default: the hybrid score an engram must reach before
+/// the per-prompt hook names it when the setting is absent.
+pub const DEFAULT_RECALL_MIN_SCORE: f64 = 0.5;
 
 /// The `identity` block: who Crystalline records as the writer of an engram.
 /// Reads like a settings-page section - see the `configure` tool, which

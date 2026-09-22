@@ -215,6 +215,38 @@ fn domains_root_round_trips_and_is_absent_by_default() {
 }
 
 #[test]
+fn recall_defaults_are_on_three_and_a_half() {
+    let cfg = GlobalConfig::default();
+    assert!(cfg.recall_enabled(), "absent block means the hook is on");
+    assert_eq!(cfg.recall_limit(), 3);
+    assert_eq!(cfg.recall_min_score(), 0.5);
+}
+
+#[test]
+fn recall_limit_is_clamped_from_the_file() {
+    let over = "\
+recall:
+  limit: 9
+";
+    let cfg: GlobalConfig = serde_yaml_ng::from_str(over).unwrap();
+    assert_eq!(cfg.recall_limit(), 5);
+
+    let under = "\
+recall:
+  limit: 0
+";
+    let cfg: GlobalConfig = serde_yaml_ng::from_str(under).unwrap();
+    assert_eq!(cfg.recall_limit(), 1);
+}
+
+#[test]
+fn an_untouched_config_round_trips_without_a_recall_line() {
+    let cfg = GlobalConfig::default();
+    let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+    assert!(!yaml.contains("recall"), "{yaml}");
+}
+
+#[test]
 fn origin_and_github_config_round_trip() {
     let yaml = "\
 domains:
