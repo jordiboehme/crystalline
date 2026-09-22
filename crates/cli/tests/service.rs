@@ -2075,13 +2075,23 @@ fn wait_lock_released(env: &Env) {
 }
 
 fn wait_port(addr: &str) {
+    wait_port_within(addr, Duration::from_secs(8));
+}
+
+/// Like `wait_port`, but with an explicit budget. Use this at a call site
+/// that has extra, deliberate work to do before the port can open (such as
+/// waiting for a prior daemon on the same state directory to release its
+/// lock), so a slow shared CI runner gets the time it needs without loosening
+/// the budget everyone else relies on to fail fast.
+fn wait_port_within(addr: &str, budget: Duration) {
     let start = Instant::now();
     loop {
         if TcpStream::connect(addr).is_ok() {
             return;
         }
-        if start.elapsed() > Duration::from_secs(8) {
-            panic!("HTTP endpoint did not open on {addr}");
+        let elapsed = start.elapsed();
+        if elapsed > budget {
+            panic!("HTTP endpoint did not open on {addr} within {budget:?} (waited {elapsed:?})");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3043,7 +3053,10 @@ fn the_owner_record_says_how_the_daemon_was_started() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_port(&addr);
+    // The autostarted daemon above only just released the lock (see
+    // `wait_lock_released`), so this second start is racing a shared CI
+    // runner's scheduler rather than a fresh process; give it real room.
+    wait_port_within(&addr, Duration::from_secs(30));
     let record = env.lock_record().expect("the daemon published a record");
     assert_eq!(record["started_by"], "serve", "{record}");
     assert_eq!(
