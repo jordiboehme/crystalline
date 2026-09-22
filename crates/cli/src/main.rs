@@ -2495,20 +2495,15 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             )
             .await?;
             let targets = cmd::print_discard_preview(&listed, &paths, json);
-            // Only short-circuits the human path: `--json` always reaches
-            // the engine even when every named path is unknown, so the
-            // report carries the engine's own per-path refusal reason
-            // (`unknown_path`) instead of this CLI-side message, which a
-            // machine reader would have to special-case on top of the JSON
-            // shape every other refusal already comes back in.
-            if targets.is_empty() && !json {
-                anyhow::bail!(
-                    "nothing to discard: none of the named paths is among this domain's unshared changes"
-                );
-            }
+            // No early exit for a named path the preview did not recognize:
+            // it still rides to the engine below and comes back in the
+            // report as `refused` with `unknown_path`, in both output
+            // modes, exactly like any other refusal. The two modes differ
+            // only in how that refusal is printed, never in whether the
+            // engine is asked.
             if !yes {
                 if std::io::stdin().is_terminal() {
-                    print!("Discard {} file(s)? [y/N] ", targets.len());
+                    print!("Discard {} file(s)? [y/N] ", paths.len());
                     std::io::stdout().flush()?;
                     let mut answer = String::new();
                     std::io::stdin().read_line(&mut answer)?;

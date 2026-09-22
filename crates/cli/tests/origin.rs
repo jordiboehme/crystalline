@@ -589,7 +589,10 @@ fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
         "nowhere.md  refused: not among this domain's unshared changes",
     ))
     .stdout(predicates::str::contains("restored: alpha.md"))
-    .stdout(predicates::str::contains("deleted: new.md"));
+    .stdout(predicates::str::contains("deleted: new.md"))
+    .stdout(predicates::str::contains(
+        "refused: nowhere.md (unknown_path)",
+    ));
     assert!(
         std::fs::read_to_string(root.join("alpha.md"))
             .unwrap()
@@ -616,6 +619,32 @@ fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
     .assert()
     .failure()
     .stdout(predicates::str::contains("\"reason\":\"unknown_path\""));
+
+    // The same case in text mode: the engine is reached exactly as it is in
+    // JSON mode, and the refusal prints the same way it would for any other
+    // discard refusal, not as a special-cased CLI message.
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args([
+        "origin",
+        "discard",
+        "eng",
+        "--path",
+        "nowhere.md",
+        "--yes",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stdout(predicates::str::contains(
+        "nowhere.md  refused: not among this domain's unshared changes",
+    ))
+    .stdout(predicates::str::contains(
+        "refused: nowhere.md (unknown_path)",
+    ));
 }
 
 // --- chain rendering, against a stand-in daemon ------------------------------
