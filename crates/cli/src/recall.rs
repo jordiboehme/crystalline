@@ -383,6 +383,10 @@ mod tests {
             "yes",
             "continue please",
             "ok go on now",
+            // A scheduled wakeup's sentinel: one word, so the word bar
+            // already refuses it and a loop that runs for hours costs no
+            // search until it says something with a subject in it.
+            "<<autonomous-loop>>",
         ] {
             assert_eq!(
                 gate_prompt(prompt),
