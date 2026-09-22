@@ -9,14 +9,16 @@
 //! and wants nothing in front of anything. Both produce a sentence embedding
 //! from the `[CLS]` position followed by L2 normalization, and documents are
 //! embedded bare under either. Inference is CPU only (no metal or cuda
-//! features) so the release binaries stay portable, and it runs on a blocking
-//! thread so it never stalls the async runtime. A load failure from a truncated
-//! or corrupt cache self-heals: the model directory is wiped and fetched once
-//! more before giving up.
+//! features) so the release binaries stay portable, and both it and the weight
+//! load run on a blocking thread so neither stalls the async runtime; the
+//! download itself is async and is awaited before that thread starts. A load
+//! failure from a truncated or corrupt cache self-heals: the model directory is
+//! wiped and fetched once more before giving up.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -24,9 +26,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use crystalline_core::config::{self, EmbeddingsConfig};
-use hf_hub::api::Progress;
-use hf_hub::api::sync::ApiBuilder;
-use hf_hub::{Cache, Repo, RepoType};
+use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
+use hf_hub::{HFClient, HFError};
 use indexmap::IndexMap;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
@@ -68,17 +69,16 @@ enum Loaded {
 }
 
 impl LocalProvider {
-    /// Load the provider, downloading the model on first use. Runs on a blocking
-    /// thread because loading mmaps and parses the weights.
+    /// Load the provider, downloading the model on first use. The fetch is
+    /// awaited; the weight load runs on a blocking thread because it mmaps and
+    /// parses the weights.
     pub async fn load(cfg: &EmbeddingsConfig) -> Result<LocalProvider> {
         // Refused here rather than guessed: a model whose architecture and
         // prefix the code does not know produces vectors that are quietly
         // wrong.
         let model = lookup_local_model(configured_or_default(cfg))?;
         let cache_dir = models_cache_dir()?;
-        let encoder = tokio::task::spawn_blocking(move || load_encoder(&cache_dir, model))
-            .await
-            .map_err(|e| IndexError::Embedding(format!("model load task failed: {e}")))??;
+        let encoder = load_encoder(&cache_dir, model).await?;
         Ok(LocalProvider {
             inner: Arc::new(encoder),
             model,
@@ -148,23 +148,21 @@ fn configured_or_default(cfg: &EmbeddingsConfig) -> &str {
 pub async fn download(cfg: &EmbeddingsConfig) -> Result<super::ModelDownload> {
     let model = lookup_local_model(configured_or_default(cfg))?;
     let cache_dir = models_cache_dir()?;
-    tokio::task::spawn_blocking(move || {
-        let files = ensure_files(&cache_dir, model)?;
-        let bytes = files
-            .paths
-            .values()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .sum();
-        let path = files
-            .weights()?
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or(cache_dir);
-        Ok(super::ModelDownload { path, bytes })
-    })
-    .await
-    .map_err(|e| IndexError::Embedding(format!("model download task failed: {e}")))?
+    let files = ensure_files(&cache_dir, model).await?;
+    // Metadata sizing only: a handful of stat calls, which no blocking task
+    // has to carry now that the fetch itself is async.
+    let bytes = files
+        .paths
+        .values()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let path = files
+        .weights()?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(cache_dir);
+    Ok(super::ModelDownload { path, bytes })
 }
 
 fn models_cache_dir() -> Result<PathBuf> {
@@ -210,68 +208,98 @@ impl ModelFiles {
     }
 }
 
-/// Adapts hf-hub's per-chunk [`Progress`] callbacks (one `update` call per
-/// ~8 KiB read, `std::io::copy`'s default buffer) into a single
-/// carriage-return byte-progress line on stderr, throttled to about ten
-/// renders a second so a fast local connection does not flood the terminal
-/// with one write per chunk. Only ever constructed when stderr is a live
-/// terminal (see [`ensure_files`]), so it never needs to check that itself.
+/// Adapts hf-hub's [`ProgressHandler`] events into a single carriage-return
+/// byte-progress line on stderr, throttled to about ten renders a second so a
+/// fast local connection does not flood the terminal with one write per event.
+/// Only ever constructed when stderr is a live terminal (see [`ensure_files`]),
+/// so it never needs to check that itself.
+///
+/// `on_progress` takes `&self` and may be called from any task, so the counters
+/// are interior-mutable. The file name is not carried by the events - a
+/// download's `Start` reports totals only - so it is set at construction, where
+/// the caller knows which file it asked for.
 struct ByteProgress {
     filename: String,
-    total: usize,
-    downloaded: usize,
-    last_render: Option<Instant>,
+    total: AtomicU64,
+    downloaded: AtomicU64,
+    last_render: Mutex<Option<Instant>>,
 }
 
 impl ByteProgress {
-    fn new() -> Self {
+    fn new(filename: &str) -> Self {
         ByteProgress {
-            filename: String::new(),
-            total: 0,
-            downloaded: 0,
-            last_render: None,
+            filename: filename.to_string(),
+            total: AtomicU64::new(0),
+            downloaded: AtomicU64::new(0),
+            last_render: Mutex::new(None),
         }
     }
 
     fn render(&self) {
-        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         eprint!(
             "\r  {}: {:.1} / {:.1} MB",
             self.filename,
-            mb(self.downloaded),
-            mb(self.total)
+            mb(self.downloaded.load(Ordering::Relaxed)),
+            mb(self.total.load(Ordering::Relaxed))
         );
         let _ = std::io::stderr().flush();
     }
-}
 
-impl Progress for ByteProgress {
-    fn init(&mut self, size: usize, filename: &str) {
-        self.total = size;
-        self.downloaded = 0;
-        self.filename = filename.to_string();
-        self.last_render = Some(Instant::now());
-        self.render();
-    }
-
-    fn update(&mut self, size: usize) {
-        self.downloaded += size;
+    /// The render throttle, as one step: records this instant and answers
+    /// whether the caller should draw. A poisoned lock is no reason to stop
+    /// drawing a progress line.
+    fn render_due(&self) -> bool {
         let now = Instant::now();
-        let due = self
+        let mut last = self
             .last_render
-            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100));
-        if due {
-            self.last_render = Some(now);
-            self.render();
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_none_or(|t| now.duration_since(t) >= Duration::from_millis(100)) {
+            *last = Some(now);
+            true
+        } else {
+            false
         }
     }
+}
 
-    fn finish(&mut self) {
-        // A final render so the line lands on the true total even when the
-        // last chunk landed inside the throttle window, then a newline so
-        // whatever prints next starts clean instead of overwriting this line.
-        self.render();
-        eprintln!();
+impl ProgressHandler for ByteProgress {
+    fn on_progress(&self, event: &ProgressEvent) {
+        match event {
+            ProgressEvent::Download(DownloadEvent::Start { total_bytes, .. }) => {
+                self.total.store(*total_bytes, Ordering::Relaxed);
+                self.downloaded.store(0, Ordering::Relaxed);
+                // Opens the throttle window here, so the first byte event does
+                // not redraw the line it has just drawn.
+                self.render_due();
+                self.render();
+            }
+            ProgressEvent::Download(DownloadEvent::Progress { files }) => {
+                // One handler is attached per `download_file`, so the list is
+                // this one file, and its `bytes_completed` is a running total
+                // rather than a delta: stored, never added. A xet-backed file
+                // (the weights are one) reports that total only when a segment
+                // lands, so the line redraws ten times a second but the number
+                // moves in a few big steps; hf-xet's own aggregate count sits
+                // at zero just as long, so there is nothing finer to read.
+                let Some(file) = files.last() else { return };
+                self.downloaded
+                    .store(file.bytes_completed, Ordering::Relaxed);
+                if self.render_due() {
+                    self.render();
+                }
+            }
+            ProgressEvent::Download(DownloadEvent::Complete) => {
+                // A final render so the line lands on the true total even when
+                // the last event landed inside the throttle window, then a
+                // newline so whatever prints next starts clean instead of
+                // overwriting this line.
+                self.render();
+                eprintln!();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -285,17 +313,16 @@ impl Progress for ByteProgress {
 /// A file already present in the cache is resolved with no network call at
 /// all, so a fully warmed cache - the air-gapped and CI-prefetch paths -
 /// never dials out just to check.
-fn ensure_files(cache_dir: &Path, model: &LocalModel) -> Result<ModelFiles> {
+async fn ensure_files(cache_dir: &Path, model: &LocalModel) -> Result<ModelFiles> {
     std::fs::create_dir_all(cache_dir).map_err(|e| IndexError::Io {
         path: cache_dir.display().to_string(),
         source: e,
     })?;
 
-    let hub_cache = Cache::new(cache_dir.to_path_buf())
-        .repo(Repo::new(model.repo.to_string(), RepoType::Model));
+    let client = hub_client(cache_dir)?;
     // The weights alone decide whether this is a first-use download: they are
     // the file worth a notice and a progress line.
-    let cached = hub_cache.get("model.safetensors").is_some();
+    let cached = is_cached(&client, model).await?;
     if !cached {
         eprintln!(
             "crystalline: downloading embedding model {} to {} (first use, about {} MB)...",
@@ -306,37 +333,85 @@ fn ensure_files(cache_dir: &Path, model: &LocalModel) -> Result<ModelFiles> {
     }
     let show_progress = !cached && std::io::stderr().is_terminal();
 
-    let api = ApiBuilder::new()
-        .with_cache_dir(cache_dir.to_path_buf())
-        // Ours only: a stable, testable byte counter instead of hf-hub's own
-        // default indicatif bar, so exactly one progress mechanism is ever
-        // active and it is the one this module controls and TTY-gates itself.
-        .with_progress(false)
-        .build()
-        .map_err(|e| IndexError::Embedding(format!("hub client: {e}")))?;
-    let repo = api.model(model.repo.to_string());
-    let fetch = |name: &str| -> Result<PathBuf> {
-        if let Some(path) = hub_cache.get(name) {
-            return Ok(path);
-        }
-        if show_progress {
-            repo.download_with_progress(name, ByteProgress::new())
-        } else {
-            repo.download(name)
-        }
-        .map_err(|e| IndexError::Embedding(format!("downloading {name}: {e}")))
-    };
+    let (owner, name) = repo_parts(model)?;
+    let repo = client.model(owner, name);
     let mut paths = IndexMap::with_capacity(model.files.len());
-    for name in model.files {
-        paths.insert((*name).to_string(), fetch(name)?);
+    for file in model.files {
+        let path = match cached_path(&client, model, file).await? {
+            Some(path) => path,
+            None => repo
+                .download_file()
+                .filename(*file)
+                // Progress is opt in in hf-hub: leaving the handler off is the
+                // suppression, so exactly one progress mechanism is ever active
+                // and it is the one this module controls and TTY-gates itself.
+                .maybe_progress(show_progress.then(|| ByteProgress::new(file)))
+                .send()
+                .await
+                .map_err(|e| IndexError::Embedding(format!("downloading {file}: {e}")))?,
+        };
+        paths.insert((*file).to_string(), path);
     }
     Ok(ModelFiles { paths })
 }
 
-/// Load the model, self-healing once from a corrupt cache.
-fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder> {
-    let files = ensure_files(cache_dir, model)?;
-    match build_encoder(&files, model) {
+/// `("BAAI", "bge-small-en-v1.5")` from a table entry's repository id, which is
+/// the pair `HFClient::model` takes. A refusal rather than a guess: hf-hub's own
+/// `split_id` answers an empty owner for a malformed id, which would silently
+/// resolve to a cache directory [`LocalModel::cache_dir_name`] does not spell.
+fn repo_parts(model: &LocalModel) -> Result<(&'static str, &'static str)> {
+    model.repo.split_once('/').ok_or_else(|| {
+        IndexError::Embedding(format!(
+            "the model table's repository id {} is not <owner>/<name>",
+            model.repo
+        ))
+    })
+}
+
+/// The hf-hub client, cache-pinned to Crystalline's own model directory rather
+/// than hf-hub's default location.
+fn hub_client(cache_dir: &Path) -> Result<HFClient> {
+    HFClient::builder()
+        .cache_dir(cache_dir.to_path_buf())
+        .build()
+        .map_err(|e| IndexError::Embedding(format!("hub client: {e}")))
+}
+
+/// The cached path for one of the model's files, or `None` when the cache does
+/// not hold it. `local_files_only` answers from the cache directory alone and
+/// never touches the network, and `LocalEntryNotFound` is the miss; a plain
+/// download would HEAD the repository even on a warm cache, which is what the
+/// air-gapped and CI-prefetch paths must not do.
+async fn cached_path(client: &HFClient, model: &LocalModel, name: &str) -> Result<Option<PathBuf>> {
+    let (owner, repo) = repo_parts(model)?;
+    match client
+        .model(owner, repo)
+        .download_file()
+        .filename(name)
+        .local_files_only(true)
+        .send()
+        .await
+    {
+        Ok(path) => Ok(Some(path)),
+        Err(HFError::LocalEntryNotFound { .. }) => Ok(None),
+        Err(e) => Err(IndexError::Embedding(format!(
+            "reading the model cache for {name}: {e}"
+        ))),
+    }
+}
+
+/// True when the weights are already in the cache, with no network call at all.
+async fn is_cached(client: &HFClient, model: &LocalModel) -> Result<bool> {
+    Ok(cached_path(client, model, "model.safetensors")
+        .await?
+        .is_some())
+}
+
+/// Load the model, self-healing once from a corrupt cache. The fetch is awaited
+/// here; only the weight load goes to a blocking thread.
+async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder> {
+    let files = ensure_files(cache_dir, model).await?;
+    match build_on_blocking(files, model).await {
         Ok(encoder) => Ok(encoder),
         Err(first) => {
             // A truncated or corrupt cache: wipe the model directory and fetch
@@ -345,10 +420,17 @@ fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder>
                 "crystalline: embedding model failed to load ({first}); re-downloading once..."
             );
             wipe_model_dir(cache_dir, model);
-            let files = ensure_files(cache_dir, model)?;
-            build_encoder(&files, model)
+            let files = ensure_files(cache_dir, model).await?;
+            build_on_blocking(files, model).await
         }
     }
+}
+
+/// [`build_encoder`] on a blocking thread: it mmaps and parses the weights.
+async fn build_on_blocking(files: ModelFiles, model: &'static LocalModel) -> Result<Encoder> {
+    tokio::task::spawn_blocking(move || build_encoder(&files, model))
+        .await
+        .map_err(|e| IndexError::Embedding(format!("model load task failed: {e}")))?
 }
 
 fn build_encoder(files: &ModelFiles, model: &LocalModel) -> Result<Encoder> {
