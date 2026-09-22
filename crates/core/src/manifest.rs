@@ -29,6 +29,18 @@ const GENERATED_INDEXES_LOCAL: &str = "local";
 /// The `generated_indexes` value that lets the listings travel.
 const GENERATED_INDEXES_SHARED: &str = "shared";
 
+/// The MANIFEST frontmatter key a domain declares how a share reaches the
+/// team under: a proposal the team reviews, or a commit straight onto the
+/// connected branch. A switch, like [`GENERATED_INDEXES_KEY`], which is why
+/// it lives in the frontmatter rather than beside the H2 sections.
+pub const SHARING_KEY: &str = "sharing";
+
+/// The `sharing` value that opens a proposal for review: the default.
+const SHARING_PROPOSAL: &str = "proposal";
+
+/// The `sharing` value that commits straight onto the connected branch.
+const SHARING_DIRECT: &str = "direct";
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
@@ -71,6 +83,11 @@ pub struct Manifest {
     /// [`Manifest::declared_generated_indexes`] only to report on what the
     /// MANIFEST literally says.
     generated_indexes: Option<String>,
+    /// The [`SHARING_KEY`] frontmatter value as written, or `None` when the
+    /// key is absent. Private for the reason `generated_indexes` is: go
+    /// through [`Manifest::sharing`] for the policy in force and through
+    /// [`Manifest::declared_sharing`] only to report on the text.
+    sharing: Option<String>,
 }
 
 impl Manifest {
@@ -87,6 +104,7 @@ impl Manifest {
             .extra
             .get(GENERATED_INDEXES_KEY)
             .map(scalar_text);
+        let sharing = engram.frontmatter.extra.get(SHARING_KEY).map(scalar_text);
 
         let mut sections: IndexMap<String, Vec<String>> = IndexMap::new();
         let mut current: Option<String> = None;
@@ -122,6 +140,7 @@ impl Manifest {
         Manifest {
             sections,
             generated_indexes,
+            sharing,
         }
     }
 
@@ -312,6 +331,41 @@ impl Manifest {
             _ => GeneratedIndexes::Local,
         }
     }
+
+    /// The `sharing` declaration exactly as the frontmatter writes it, or
+    /// `None` when the key is absent. For reporting only, never for deciding
+    /// behaviour: [`Manifest::sharing`] is what decides.
+    pub fn declared_sharing(&self) -> Option<&str> {
+        self.sharing.as_deref()
+    }
+
+    /// How a share of this domain reaches the team.
+    ///
+    /// [`Sharing::Direct`] only when the frontmatter says `direct` in exactly
+    /// that spelling. An absent key is `proposal`, and so is a value nobody
+    /// recognizes: the safe side is the reviewed one, since a typo must never
+    /// turn a review step off. The unrecognized case is reported by verify
+    /// rule `M007` instead of being obeyed.
+    pub fn sharing(&self) -> Sharing {
+        match self.sharing.as_deref() {
+            Some(SHARING_DIRECT) => Sharing::Direct,
+            _ => Sharing::Proposal,
+        }
+    }
+
+    /// The declared and the effective value of one registry key, or `None`
+    /// for a key the registry does not know. The one dispatch from a key to
+    /// its accessors, which is what the registry guard test walks.
+    pub fn policy(&self, key: &str) -> Option<(Option<&str>, &str)> {
+        match key {
+            GENERATED_INDEXES_KEY => Some((
+                self.declared_generated_indexes(),
+                self.generated_indexes().as_str(),
+            )),
+            SHARING_KEY => Some((self.declared_sharing(), self.sharing().as_str())),
+            _ => None,
+        }
+    }
 }
 
 /// Whether a domain's generated directory indexes (`index.md`, at the root and
@@ -362,6 +416,44 @@ impl GeneratedIndexes {
     }
 }
 
+/// How a share of a domain reaches the team: as a proposal the team reviews
+/// on the forge, or as a commit straight onto the connected branch.
+///
+/// [`Sharing::Proposal`] is the default, including for every MANIFEST that
+/// declares nothing, and it is today's behaviour byte for byte.
+/// [`Sharing::Direct`] is the deliberate choice of a team that wants no
+/// review step in front of its knowledge repository: a share then commits the
+/// selected files onto the branch in one commit, refuses while any proposal
+/// is still open, and answers a protected branch with the way out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sharing {
+    /// A share opens (or stacks, amends, updates) a proposal for review.
+    #[default]
+    Proposal,
+    /// A share commits straight onto the connected branch.
+    Direct,
+}
+
+impl Sharing {
+    /// The value's spelling in the MANIFEST frontmatter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sharing::Proposal => SHARING_PROPOSAL,
+            Sharing::Direct => SHARING_DIRECT,
+        }
+    }
+
+    /// Parse a declared value, `None` when it spells neither policy. Exact
+    /// and case-sensitive, like every other declaration a MANIFEST carries.
+    pub fn parse(value: &str) -> Option<Sharing> {
+        match value {
+            SHARING_PROPOSAL => Some(Sharing::Proposal),
+            SHARING_DIRECT => Some(Sharing::Direct),
+            _ => None,
+        }
+    }
+}
+
 /// The [`GeneratedIndexes`] policy the domain rooted at `root` declares, read
 /// from its `MANIFEST.md`.
 ///
@@ -378,6 +470,83 @@ pub fn generated_indexes_at(root: &Path) -> GeneratedIndexes {
         return GeneratedIndexes::Local;
     };
     Manifest::from_engram(&engram, &source).generated_indexes()
+}
+
+/// The [`Sharing`] policy the domain rooted at `root` declares, read from its
+/// `MANIFEST.md`.
+///
+/// [`Sharing::Proposal`] whenever the MANIFEST is missing, unreadable,
+/// unparseable or declares nothing, so a caller can ask unconditionally and
+/// never has to handle an error - the shape of [`generated_indexes_at`], and
+/// the same reason: a domain that cannot say keeps its review step.
+pub fn sharing_at(root: &Path) -> Sharing {
+    let Ok(source) = std::fs::read_to_string(root.join("MANIFEST.md")) else {
+        return Sharing::Proposal;
+    };
+    let Ok(engram) = parse_engram(&source) else {
+        return Sharing::Proposal;
+    };
+    Manifest::from_engram(&engram, &source).sharing()
+}
+
+/// Who may change a policy key from a surface that asks: the domain's owner
+/// (or an instance admin, who owns every domain), or an instance admin alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRole {
+    /// The domain's owner or an instance admin.
+    Owner,
+    /// An instance admin only. Reserved: no key needs it today.
+    Admin,
+}
+
+impl PolicyRole {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyRole::Owner => "owner",
+            PolicyRole::Admin => "admin",
+        }
+    }
+}
+
+/// One MANIFEST configuration key, as the domain policies card and the doctor
+/// read it. Every policy key has exactly one entry here, and the standing
+/// rule is that a key joins this registry and the card in the same change:
+/// the guard test in crates/core/tests/manifest.rs fails on a `pub const
+/// *_KEY` this list does not name, and the card draws its rows from this
+/// list, so a key never has to be drawn by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyKey {
+    /// The frontmatter key.
+    pub key: &'static str,
+    /// The values the key takes, in display order.
+    pub values: &'static [&'static str],
+    /// What an absent or unrecognized declaration is read as.
+    pub default: &'static str,
+    /// One line, user-facing, present tense.
+    pub meaning: &'static str,
+    /// Who may change it from a surface that asks.
+    pub changed_by: PolicyRole,
+}
+
+/// The registry: every MANIFEST configuration key, in display order.
+pub fn policy_registry() -> &'static [PolicyKey] {
+    &[
+        PolicyKey {
+            key: GENERATED_INDEXES_KEY,
+            values: &[GENERATED_INDEXES_LOCAL, GENERATED_INDEXES_SHARED],
+            default: GENERATED_INDEXES_LOCAL,
+            meaning: "Whether the generated folder listings travel with a share.",
+            changed_by: PolicyRole::Owner,
+        },
+        PolicyKey {
+            key: SHARING_KEY,
+            values: &[SHARING_PROPOSAL, SHARING_DIRECT],
+            default: SHARING_PROPOSAL,
+            meaning: "Whether a share opens a proposal for review or commits straight to the branch.",
+            changed_by: PolicyRole::Owner,
+        },
+    ]
 }
 
 /// A frontmatter scalar rendered as the text a reader wrote, so a declaration

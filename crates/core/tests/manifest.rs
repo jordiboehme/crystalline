@@ -4,8 +4,9 @@ mod common;
 
 use common::{fixtures_dir, read};
 use crystalline_core::manifest::{
-    ArtifactType, GeneratedIndexes, Manifest, ProblemKind, TagAliasProblemKind, append_tag_alias,
-    generated_indexes_at, in_root_artifact_dirs, tag_alias_pairs,
+    ArtifactType, GeneratedIndexes, Manifest, PolicyKey, PolicyRole, ProblemKind, SHARING_KEY,
+    Sharing, TagAliasProblemKind, append_tag_alias, generated_indexes_at, in_root_artifact_dirs,
+    policy_registry, sharing_at, tag_alias_pairs,
 };
 use crystalline_core::parse_engram;
 
@@ -735,4 +736,178 @@ fn generated_indexes_at_reads_the_domain_root_and_falls_back_to_local() {
     // And one that declares the listings travel.
     std::fs::write(root.join("MANIFEST.md"), manifest_declaring(Some("shared"))).unwrap();
     assert_eq!(generated_indexes_at(root), GeneratedIndexes::Shared);
+}
+
+// --- sharing: the frontmatter switch ----------------------------------------
+
+/// A MANIFEST declaring `sharing: <value>`, or nothing, beside the two
+/// required sections.
+fn manifest_declaring_sharing(declared: Option<&str>) -> String {
+    let line = match declared {
+        Some(value) => format!("sharing: {value}\n"),
+        None => String::new(),
+    };
+    format!(
+        "---\ntype: manifest\ntitle: KB\n{line}---\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n"
+    )
+}
+
+#[test]
+fn a_manifest_declaring_nothing_shares_as_a_proposal() {
+    let m = manifest_from_source(&manifest_declaring_sharing(None));
+    assert_eq!(m.declared_sharing(), None);
+    assert_eq!(m.sharing(), Sharing::Proposal);
+    assert_eq!(Sharing::default(), Sharing::Proposal);
+}
+
+#[test]
+fn a_manifest_declaring_direct_commits_straight_to_the_branch() {
+    let m = manifest_from_source(&manifest_declaring_sharing(Some("direct")));
+    assert_eq!(m.declared_sharing(), Some("direct"));
+    assert_eq!(m.sharing(), Sharing::Direct);
+}
+
+#[test]
+fn a_sharing_value_nobody_recognizes_is_never_read_as_direct() {
+    // The safe side is the reviewed one: a typo, the wrong case or a boolean
+    // must never turn a review step off. Every one of these reads as
+    // `proposal` and is reported by verify rule `M007`; the declaration is
+    // still readable verbatim so the finding can quote it back.
+    for value in ["Direct", "DIRECT", "dirct", "true", "yes", "null", "42"] {
+        let m = manifest_from_source(&manifest_declaring_sharing(Some(value)));
+        assert_eq!(
+            m.sharing(),
+            Sharing::Proposal,
+            "`{value}` must not be read as direct"
+        );
+        assert_eq!(m.declared_sharing(), Some(value));
+        assert!(
+            Sharing::parse(value).is_none(),
+            "`{value}` must not parse as a policy"
+        );
+    }
+    let listed = manifest_from_source(&manifest_declaring_sharing(Some("\n  - direct")));
+    assert_eq!(listed.declared_sharing(), Some("a list"));
+    assert_eq!(listed.sharing(), Sharing::Proposal);
+}
+
+#[test]
+fn sharing_spellings_round_trip() {
+    assert_eq!(Sharing::Proposal.as_str(), "proposal");
+    assert_eq!(Sharing::Direct.as_str(), "direct");
+    assert_eq!(Sharing::parse("proposal"), Some(Sharing::Proposal));
+    assert_eq!(Sharing::parse("direct"), Some(Sharing::Direct));
+    assert_eq!(Sharing::parse("review"), None);
+}
+
+#[test]
+fn sharing_at_reads_the_domain_root_and_falls_back_to_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    assert_eq!(sharing_at(root), Sharing::Proposal, "no MANIFEST at all");
+    std::fs::write(root.join("MANIFEST.md"), "---\nnot: [valid\n").unwrap();
+    assert_eq!(sharing_at(root), Sharing::Proposal, "an unparseable one");
+    std::fs::write(root.join("MANIFEST.md"), manifest_declaring_sharing(None)).unwrap();
+    assert_eq!(
+        sharing_at(root),
+        Sharing::Proposal,
+        "one that declares nothing"
+    );
+    std::fs::write(
+        root.join("MANIFEST.md"),
+        manifest_declaring_sharing(Some("direct")),
+    )
+    .unwrap();
+    assert_eq!(sharing_at(root), Sharing::Direct);
+}
+
+// --- The policy registry ----------------------------------------------------
+
+/// Every key the registry names answers through `Manifest::policy`, its
+/// default is one of its own values and an undeclared MANIFEST reads as that
+/// default. A key added to the registry without an accessor fails here.
+#[test]
+fn every_registry_key_answers_through_manifest_policy() {
+    let silent = manifest_from_source(&manifest_declaring_sharing(None));
+    assert_eq!(policy_registry().len(), 2, "generated_indexes and sharing");
+    for spec in policy_registry() {
+        assert!(
+            spec.values.contains(&spec.default),
+            "{}: default is a value",
+            spec.key
+        );
+        assert!(
+            !spec.meaning.is_empty() && !spec.meaning.contains('\n'),
+            "{}: one line",
+            spec.key
+        );
+        let (declared, effective) = silent
+            .policy(spec.key)
+            .unwrap_or_else(|| panic!("`{}` has no accessor behind it", spec.key));
+        assert_eq!(declared, None, "{}", spec.key);
+        assert_eq!(effective, spec.default, "{}", spec.key);
+    }
+    assert_eq!(
+        silent.policy("colour"),
+        None,
+        "a key the registry does not know"
+    );
+    let direct = manifest_from_source(&manifest_declaring_sharing(Some("direct")));
+    assert_eq!(direct.policy(SHARING_KEY), Some((Some("direct"), "direct")));
+    let typo = manifest_from_source(&manifest_declaring_sharing(Some("dirct")));
+    assert_eq!(typo.policy(SHARING_KEY), Some((Some("dirct"), "proposal")));
+}
+
+/// The two rows, as the card and the doctor read them.
+#[test]
+fn the_registry_rows_say_who_changes_what_and_to_which_values() {
+    let by_key = |key: &str| -> PolicyKey {
+        *policy_registry()
+            .iter()
+            .find(|spec| spec.key == key)
+            .unwrap_or_else(|| panic!("{key} is registered"))
+    };
+    let indexes = by_key("generated_indexes");
+    assert_eq!(indexes.values, &["local", "shared"]);
+    assert_eq!(indexes.default, "local");
+    assert_eq!(indexes.changed_by, PolicyRole::Owner);
+    let sharing = by_key(SHARING_KEY);
+    assert_eq!(sharing.values, &["proposal", "direct"]);
+    assert_eq!(sharing.default, "proposal");
+    assert_eq!(sharing.changed_by, PolicyRole::Owner);
+    assert_eq!(PolicyRole::Owner.as_str(), "owner");
+    assert_eq!(PolicyRole::Admin.as_str(), "admin");
+}
+
+/// Every `pub const *_KEY` the parser declares is in the registry, and every
+/// registry key is such a constant: the guard that makes "a key without a
+/// registry entry fails" true at the source rather than by review. The shape
+/// of the collation guard in crates/index.
+#[test]
+fn every_manifest_key_constant_is_in_the_registry_and_back() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/manifest.rs"))
+        .expect("the parser's own source");
+    let declared: Vec<String> = source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("pub const ")?;
+            let (name, value) = rest.split_once(": &str = \"")?;
+            name.ends_with("_KEY")
+                .then(|| value.split('"').next().unwrap_or_default().to_string())
+        })
+        .collect();
+    assert!(!declared.is_empty(), "the scan found the key constants");
+    let registered: Vec<&str> = policy_registry().iter().map(|spec| spec.key).collect();
+    for key in &declared {
+        assert!(
+            registered.contains(&key.as_str()),
+            "`{key}` is declared and not registered"
+        );
+    }
+    for key in &registered {
+        assert!(
+            declared.iter().any(|d| d == key),
+            "`{key}` is registered and not declared"
+        );
+    }
 }

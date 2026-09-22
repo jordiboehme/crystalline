@@ -2,7 +2,7 @@
 //!
 //! `MANIFEST.md` is checked with a hardcoded shape (`## Scope` and
 //! `## When to Use`, `M001`-`M004`, `M101`-`M103`), plus the frontmatter
-//! switches it declares (`M006`). Every entry under a
+//! switches it declares (`M006`, `M007`). Every entry under a
 //! domain's `.crystalline.yaml` `verify.required_files` is checked with the
 //! same rule ids against its own configured sections, so a domain can apply
 //! the identical structural checks to any other file it wants enforced (a
@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 use crate::engram::Heading;
 use crate::manifest::{
     GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, ProblemKind, ProvisioningSection,
-    TagAliasSection, in_root_artifact_dirs,
+    SHARING_KEY, Sharing, TagAliasSection, in_root_artifact_dirs,
 };
 
 use super::scanner::Domain;
@@ -147,6 +147,32 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
                 "read as `{}`, so the generated index files stay on this machine; write `{}` to let them travel with the domain",
                 GeneratedIndexes::Local.as_str(),
                 GeneratedIndexes::Shared.as_str()
+            )),
+        );
+    }
+
+    // `M007`: a `sharing` value that spells neither policy. An error for the
+    // reason `M006` is: the domain is not doing what its MANIFEST says. An
+    // unrecognized value is read as `proposal`, the reviewed side, so a typo
+    // silently keeps the review step rather than silently removing it - and
+    // saying so is the only way the owner finds out.
+    if let Some(declared) = manifest.declared_sharing()
+        && Sharing::parse(declared).is_none()
+    {
+        sink.emit(
+            &file.path,
+            None,
+            "M007",
+            Severity::Error,
+            format!(
+                "`{SHARING_KEY}: {declared}` is neither `{}` nor `{}`",
+                Sharing::Proposal.as_str(),
+                Sharing::Direct.as_str()
+            ),
+            Some(format!(
+                "read as `{}`, so shares still open a proposal for review; write `{}` to commit straight to the branch",
+                Sharing::Proposal.as_str(),
+                Sharing::Direct.as_str()
             )),
         );
     }
