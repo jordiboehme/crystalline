@@ -278,7 +278,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "service.public_url",
-            doc: "The address people open the Fluid web UI at, for example https://knowledge.example.com; used verbatim as the base of every web_url the tools hand back, and as the OAuth resource identifier. Unset (default) derives the address per caller: from the request for an HTTP client, from the bound port for a local one. Set it where a proxy rewrites the Host, where the instance runs in a container, or where a separate Fluid deployment fronts an API-only daemon (applies at the next daemon start)",
+            doc: "The address people open the Fluid web UI at, for example https://knowledge.example.com; used verbatim as the base of every web_url the tools hand back, and as the OAuth resource identifier. Unset (default) derives the address per caller: from the request for an HTTP client, from the bound port for a local one. Set it where a proxy rewrites the Host, where the instance runs in a container, or where a separate Fluid deployment fronts an API-only daemon. An instance served over plain http on a non-loopback address still derives an https address it does not serve, so set this key there (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
@@ -1192,15 +1192,32 @@ pub fn unusable_public_url_warning(value: &str) -> Option<String> {
     })
 }
 
-/// Drop a `service.public_url` the validator refuses, so an unusable value
-/// never reaches a reader. Silent: the line is said once, where the value
-/// arrived, rather than on every re-read of the effective config.
+/// Canonicalise a `service.public_url` that came straight from the config
+/// file, which no setter has seen, the same way `set_service_public_url`
+/// does, so every reader compares the same spelling whichever layer the
+/// value arrived through; drop it instead when the validator refuses it, so
+/// an unusable value never reaches a reader. An environment-sourced value is
+/// already canonical by the time `apply` calls this (it went through
+/// `set_service_public_url` in the loop above), so re-running the same
+/// canonicalisation on it here is a no-op. Silent: the line is said once,
+/// where the value arrived, rather than on every re-read of the effective
+/// config.
 pub fn drop_unusable_public_url(config: &mut GlobalConfig) {
-    let unusable = config
-        .service_public_url()
-        .is_some_and(|value| service_public_url_problem(value).is_some());
-    if unusable {
-        clear_service_public_url(config);
+    let Some(value) = config.service_public_url().map(str::to_string) else {
+        return;
+    };
+    match service_public_url_problem(&value) {
+        Some(_) => clear_service_public_url(config),
+        None => {
+            let origin = openidconnect::url::Url::parse(value.trim())
+                .expect("validated above")
+                .origin()
+                .ascii_serialization();
+            config
+                .service
+                .get_or_insert_with(ServiceConfig::default)
+                .public_url = Some(origin);
+        }
     }
 }
 

@@ -775,6 +775,31 @@ mod tests {
         );
     }
 
+    /// A hand-edited value that DOES validate is not left as the operator
+    /// wrote it either: it is canonicalised the same way `configure set`
+    /// would store it, so every reader compares the same spelling whichever
+    /// layer the value came from.
+    #[test]
+    fn a_hand_edited_public_url_that_validates_is_stored_canonical() {
+        let file = GlobalConfig {
+            service: Some(crystalline_core::config::ServiceConfig {
+                public_url: Some("https://KB.example.com:443/".to_string()),
+                ..Default::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        let effective = EnvOverlay::default().apply(&file);
+        assert_eq!(
+            effective.service_public_url(),
+            Some("https://kb.example.com")
+        );
+        assert_eq!(
+            file.service_public_url(),
+            Some("https://KB.example.com:443/"),
+            "and the file itself is left exactly as the operator wrote it"
+        );
+    }
+
     #[test]
     fn every_setting_variable_is_recognized_and_applied() {
         let ov = overlay(&[
