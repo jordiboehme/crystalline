@@ -890,4 +890,40 @@ describe("the proposals card", () => {
       requested().filter((path) => path.startsWith("/me/github-identity")),
     ).toEqual([]);
   });
+
+  it("says sharing is direct, keeps Share and Withdraw, draws no rail and names the branch when empty", async () => {
+    serve({ "/domains/eng/sync": () => syncResponse({ sharing: "direct" }) });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    expect(
+      within(card).getByText(
+        "Sharing is direct on this domain: changes go straight to main without a proposal.",
+      ),
+    ).toBeVisible();
+    // Both verbs stay: a leftover proposal is exactly what blocks a direct
+    // share, so taking it back is what somebody comes here to do.
+    expect(
+      within(card).getByRole("button", { name: "Share changes" }),
+    ).toBeVisible();
+    expect(
+      within(card).getByRole("button", { name: /withdraw/i }),
+    ).toBeVisible();
+    // There is no chain to draw on a domain that commits.
+    expect(within(card).queryByText(/layer 1 of/)).toBeNull();
+    expect(within(card).queryByText("Trunk branch")).toBeNull();
+
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ sharing: "direct", open_proposals: [] }),
+    });
+    renderApp("/d/eng");
+
+    expect(
+      await screen.findByText(
+        "No open proposals; shares commit straight to main.",
+      ),
+    ).toBeVisible();
+  });
 });

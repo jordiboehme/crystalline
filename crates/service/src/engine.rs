@@ -2871,7 +2871,10 @@ impl Engine {
     /// pull a share of a reviewing domain opens with
     /// ([`Engine::overlay_share_tree`]) - that pull advances the base like any
     /// other, and a draft the team has since merged would otherwise be proposed
-    /// straight back at them.
+    /// straight back at them. And after a direct commit of a reviewing domain
+    /// ([`Engine::origin_share`]'s `Committed` arm): that commit advanced the
+    /// base itself, so no later pull would run this, and the actor's drafts
+    /// have to become the folder the moment the commit lands.
     ///
     /// **What converges.** A draft whose bytes are now the base's own bytes has
     /// become the folder, and a tombstone converges when the path it deletes is
@@ -10530,6 +10533,109 @@ impl Engine {
         }))
     }
 
+    /// Change one or more MANIFEST policy keys - `generated_indexes`,
+    /// `sharing` - through the edit path an engram edit takes: on a file
+    /// domain the file changes under the write lock and the index follows; on
+    /// a virtual domain the row is rewritten through the store's compare and
+    /// swap; in a reviewing domain the write lands in the acting actor's draft
+    /// of the MANIFEST and the folder's policy is unchanged until that draft
+    /// lands; on a team domain the MANIFEST becomes an unshared local change,
+    /// which is how the policy reaches the team.
+    ///
+    /// Every key is validated before the first is written, so a body with one
+    /// bad key writes nothing. A key whose registry row says `Owner` needs
+    /// [`DomainRight::Own`] on this domain; `Admin` keys are the caller's gate
+    /// (the REST layer's `require_admin`), since the engine cannot ask a scope
+    /// whether it administers the instance. No `expected_checksum`: the edit
+    /// is one keyed line, and `apply_source_edit`'s compare-and-write
+    /// serializes it against a concurrent editor save.
+    ///
+    /// The MANIFEST is resolved by its own permalink, `manifest`, the way
+    /// [`Engine::manifest_markdown`] resolves a virtual domain's: the template
+    /// always writes one, and going through the view is what puts the edit in
+    /// the acting actor's draft rather than in the folder the team reviewed.
+    ///
+    /// Answers `{ domain, markdown, draft }`: the MANIFEST as it now reads for
+    /// this caller, and whether that is their draft rather than the domain's.
+    ///
+    /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
+    pub async fn set_manifest_policies(
+        &self,
+        domain: &str,
+        changes: &[(String, String)],
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if changes.is_empty() {
+            return Err(EngineError::Invalid(
+                "no policy named: send an object of at least one MANIFEST policy key to its value"
+                    .to_string(),
+            ));
+        }
+        let registry = crystalline_core::policy_registry();
+        for (key, value) in changes {
+            let Some(spec) = registry.iter().find(|spec| spec.key == key) else {
+                let known: Vec<&str> = registry.iter().map(|spec| spec.key).collect();
+                return Err(EngineError::Invalid(format!(
+                    "`{key}` is not a MANIFEST policy; the policy keys are {}",
+                    known.join(", ")
+                )));
+            };
+            if !spec.values.contains(&value.as_str()) {
+                return Err(EngineError::Invalid(format!(
+                    "`{key}: {value}` is not a value `{key}` takes; write one of {}",
+                    spec.values.join(", ")
+                )));
+            }
+            if spec.changed_by == crystalline_core::PolicyRole::Owner {
+                self.require_domain_owner_refusing(
+                    domain,
+                    scope,
+                    EngineError::Forbidden(format!(
+                        "only the owner of '{domain}' or an instance admin may change `{key}`"
+                    )),
+                )
+                .await?;
+            }
+        }
+        let view = DomainView::for_write(self, domain, scope).await?;
+        let overlay = view.actor().map(str::to_string);
+        let actor = self.actor_for(None, overlay.as_deref());
+        let (desc, source) = view.resolve("manifest").await?;
+        let edits: Vec<(String, String)> = changes.to_vec();
+        self.apply_source_edit(&desc, &source, &view, None, &actor, None, move |current| {
+            let mut out = current.to_string();
+            for (key, value) in &edits {
+                out = set_frontmatter_field(&out, key, value);
+            }
+            Ok(out)
+        })
+        .await?;
+        self.refresh_routing_cache().await;
+        let markdown = match overlay.as_deref() {
+            None => self.manifest_markdown(domain).await?,
+            Some(who) => {
+                let store = self.store.lock().await;
+                store
+                    .overlay_entry(desc.domain_id, who, &desc.path)
+                    .await?
+                    .map(|row| row.content)
+                    .ok_or_else(|| {
+                        EngineError::Internal(
+                            "the MANIFEST draft was written and cannot be read back".to_string(),
+                        )
+                    })?
+            }
+        };
+        Ok(json!({
+            "domain": domain,
+            "markdown": markdown,
+            "draft": overlay.is_some(),
+        }))
+    }
+
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`
     /// engram in the database. Empty when there is no MANIFEST engram yet.
     async fn virtual_routing_bullets_for(&self, name: &str) -> Vec<String> {
@@ -16893,7 +16999,13 @@ impl Engine {
                 .map(|work| work.paths)
                 .unwrap_or_default()
         });
+        let sharing = crystalline_core::sharing_at(&root);
         let with_out_of_band = |mut value: Value| {
+            if let Some(object) = value.as_object_mut() {
+                // Read off the folder like the change detail is, so every
+                // status surface says which kind of domain it is looking at.
+                object.insert("sharing".to_string(), json!(sharing.as_str()));
+            }
             if let Some(paths) = &out_of_band
                 && let Some(object) = value.as_object_mut()
             {
@@ -17151,12 +17263,10 @@ impl Engine {
             };
             let next_due = self.origin_poller.next_due_at(&name);
             let last_result = self.origin_poller.last_result(&name);
-            domains.push(origin::origin_poll_status_json(
-                &name,
-                &report,
-                next_due,
-                last_result.as_ref(),
-            ));
+            let mut entry =
+                origin::origin_poll_status_json(&name, &report, next_due, last_result.as_ref());
+            entry["sharing"] = json!(crystalline_core::sharing_at(&root).as_str());
+            domains.push(entry);
         }
 
         json!({
@@ -17332,6 +17442,11 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        // The policy, read off the REAL folder and never off the tree the
+        // share detects in: in review mode that tree holds the actor's own
+        // draft of the MANIFEST, and a draft must not switch the review step
+        // off for its own author.
+        let sharing = crystalline_core::sharing_at(&root);
         let drafting = self.overlay_share_identity(domain, &actor)?;
         if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
@@ -17381,15 +17496,59 @@ impl Engine {
                 // that credential carries no login (the environment token).
                 author_login: login.as_deref(),
                 files,
+                sharing,
             },
         )
         .await
         .inspect_err(|e| self.drop_github_credential_on_auth(e))
         {
             Ok(outcome) => {
+                let mut receipt = origin::propose_outcome_json(&outcome);
+                // A reviewing domain's direct commit: the folder is written
+                // from the base copies the commit advanced, those paths are
+                // indexed, and the convergence pass a merged proposal's pull
+                // would run runs now - the next pull finds head == base and
+                // would never run it.
+                if let (Some(_), ops::ProposeOutcome::Committed(report)) =
+                    (drafting.as_deref(), &outcome)
+                {
+                    let paths: Vec<String> = report
+                        .added
+                        .iter()
+                        .chain(&report.updated)
+                        .chain(&report.deleted)
+                        .cloned()
+                        .collect();
+                    // Nothing here may turn a landed commit into an error:
+                    // the branch already moved and no retry can take it back,
+                    // so a local IO or store failure is warned about and the
+                    // `committed` receipt stands. The reviewed folder then
+                    // differs from its base copies, which `origin_status`
+                    // counts as local changes and `discard_changes` restores.
+                    // A pull does not heal it on its own: after the failure
+                    // the head equals the base, so the pull is up to date and
+                    // runs no convergence; the drafts fold once a later
+                    // upstream write touches those paths, or when the person
+                    // discards them.
+                    if let Err(e) = ops::materialise_base_paths(&root, &state_dir, &paths) {
+                        tracing::warn!("writing the direct commit's files in '{domain}': {e}");
+                    }
+                    if let Err(e) = self.sync_paths(domain, paths.clone()).await {
+                        tracing::warn!("indexing the direct commit's files in '{domain}': {e}");
+                    }
+                    match self.converge_pulled_overlays(domain, &paths).await {
+                        Ok(folded) => receipt["drafts_folded"] = json!(folded.cleared),
+                        Err(e) => {
+                            tracing::warn!("folding the shared drafts in '{domain}': {e}");
+                            // The one key that says the commit landed and the
+                            // drafts behind it did not fold, in place of the
+                            // count a fold that ran would have carried.
+                            receipt["fold_error"] = json!(e.to_string());
+                        }
+                    }
+                }
                 self.index_what_the_share_pull_applied(domain, "sharing")
                     .await;
-                let receipt = origin::propose_outcome_json(&outcome);
                 // Whose the proposal is, in the sense review mode means it. The
                 // forge record cannot say (see
                 // `Engine::refuse_open_proposal_while_reviewing`), so it is
@@ -17561,6 +17720,10 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        // Read exactly where the share reads it, and for the same reason: off
+        // the folder the team reviewed, never off the tree the preview detects
+        // in (see `Engine::origin_share`).
+        let sharing = crystalline_core::sharing_at(&root);
         let drafting = self.overlay_share_identity(domain, &actor)?;
         if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
             // The preview carries the share's own gates, so nobody is asked to
@@ -17617,6 +17780,7 @@ impl Engine {
                 // resolves exactly what the share would. It records nothing.
                 author_login: login.as_deref(),
                 files,
+                sharing,
             },
         )
         .await
@@ -17629,7 +17793,11 @@ impl Engine {
         // plan is one of this actor's own drafts. So the plan is served without
         // it rather than with a column answering a question nobody asked.
         let provenance = drafting.is_none().then_some(root.as_path());
-        Ok(origin::share_plan_json(&plan, provenance))
+        let mut plan = origin::share_plan_json(&plan, provenance);
+        // The repository beside the branch, so a confirmation question can say
+        // where a commit goes without a second lookup.
+        plan["repo"] = json!(spec.repo);
+        Ok(plan)
     }
 
     /// Previews which proposal a withdrawal would take out, without touching

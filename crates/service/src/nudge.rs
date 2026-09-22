@@ -58,7 +58,7 @@ pub const MCP_NUDGE_PREFIX: &str = "[crystalline] ";
 /// Number-neutral, like the original: [`share_nudge_line`] agrees with itself
 /// in number and then hands off to this sentence, which refers back to the
 /// whole delta as "that work".
-pub const MCP_SHARE_NUDGE_REASON: &str = "If that work is done, propose sharing it with share_changes so the domain owner can review it and the team's archive stays current - and wait for a yes.";
+pub const MCP_SHARE_NUDGE_REASON: &str = "If that work is done, propose sharing it with share_changes so the team has it and the team's archive stays current - and wait for a yes.";
 
 /// The maintenance ask, whole. One line rather than the hook's paragraph: a
 /// receipt is read mid-task, so it names the tool, the two authority classes

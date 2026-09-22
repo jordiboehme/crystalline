@@ -10,7 +10,9 @@
 //! `create_proposal`) against the same in-memory graph for `origin_share`,
 //! plus a minimal stack registry so a stacked share can publish a second
 //! layer here (see [`MockProvider::enable_stacks`] for what that model does
-//! and does not cover). Production code never depends on this; it exists only
+//! and does not cover). The write side also refuses a non-fast-forward
+//! `update_branch` and a protected branch, so a direct share can be driven
+//! through the engine. Production code never depends on this; it exists only
 //! under `tests/`.
 
 #![allow(dead_code)]
@@ -96,6 +98,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/domains/{domain}/tree",
     "GET /api/v1/domains/{domain}/manifest",
     "PUT /api/v1/domains/{domain}/manifest",
+    "PATCH /api/v1/domains/{domain}/manifest",
     "GET /api/v1/domains/{domain}/engrams",
     "POST /api/v1/domains/{domain}/engrams",
     "GET /api/v1/domains/{domain}/engrams/{permalink}",
@@ -154,9 +157,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// A commit in the fake graph: its full tree.
+/// A commit in the fake graph: its full tree, its parent links and the
+/// message it was created with (empty for a commit a test seeded).
 struct Commit {
     files: BTreeMap<String, Vec<u8>>,
+    parents: Vec<String>,
+    message: String,
 }
 
 #[derive(Default)]
@@ -238,6 +244,10 @@ struct Inner {
     close_failures: HashSet<u64>,
     /// Whether `list_open_proposals` answers `RemoteError::Offline`.
     open_list_fails: bool,
+    /// Branches whose `update_branch` answers the forge's protected-branch
+    /// refusal, by the message the rule comes back with. Set through
+    /// `MockProvider::protect_branch`.
+    protected: HashMap<String, String>,
     /// Whether every WRITE to the forge answers GitHub's 403, the shape a
     /// token that authenticates fine but may not push to this repository comes
     /// back as. Set through `MockProvider::forbid_writes`.
@@ -252,6 +262,24 @@ struct Inner {
 }
 
 impl Inner {
+    /// Whether `ancestor` is reachable from `commit` through parent links.
+    fn is_ancestor(&self, ancestor: &str, commit: &str) -> bool {
+        let mut stack = vec![commit.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if id == ancestor {
+                return true;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(c) = self.commits.get(&id) {
+                stack.extend(c.parents.iter().cloned());
+            }
+        }
+        false
+    }
+
     /// One stack as the forge reports it: the stored member order, each
     /// member's state and head sha read live, and `open` true while any member
     /// is still open.
@@ -317,6 +345,14 @@ impl MockProvider {
     /// returns its generated commit id. Every file's content is registered as
     /// a retrievable blob.
     pub fn add_commit(&self, files: BTreeMap<String, Vec<u8>>) -> String {
+        self.add_commit_on(files, None)
+    }
+
+    /// Adds a commit the way [`MockProvider::add_commit`] does and links it
+    /// to `parent`, for a fixture that needs a real history: an update of a
+    /// branch is a fast-forward or it is refused, and only parent links say
+    /// which one a commit is.
+    pub fn add_commit_on(&self, files: BTreeMap<String, Vec<u8>>, parent: Option<&str>) -> String {
         let mut inner = self.inner.lock().unwrap();
         inner.commit_counter += 1;
         let id = format!("commit{}", inner.commit_counter);
@@ -324,8 +360,46 @@ impl MockProvider {
             let sha = sha256_hex(content);
             inner.blobs.insert(sha, content.clone());
         }
-        inner.commits.insert(id.clone(), Commit { files });
+        inner.commits.insert(
+            id.clone(),
+            Commit {
+                files,
+                parents: parent.map(str::to_string).into_iter().collect(),
+                message: String::new(),
+            },
+        );
         id
+    }
+
+    /// Makes `update_branch` on `name` answer the forge's protected-branch
+    /// refusal carrying `message`, whatever commit is offered.
+    pub fn protect_branch(&self, name: &str, message: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .protected
+            .insert(name.to_string(), message.to_string());
+    }
+
+    /// The message `create_commit` was given for `commit`.
+    pub fn commit_message(&self, commit: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .map(|c| c.message.clone())
+    }
+
+    /// The parent commits of `commit`, for asserting what a direct share
+    /// built its commit on.
+    pub fn commit_parents(&self, commit: &str) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .map(|c| c.parents.clone())
     }
 
     /// Points `branch` at `commit`, bumping the branch ETag so the next
@@ -769,9 +843,9 @@ impl Provider for MockProvider {
     async fn create_commit(
         &self,
         origin: &OriginSpec,
-        _message: &str,
+        message: &str,
         tree: &str,
-        _parents: &[String],
+        parents: &[String],
     ) -> Result<String, RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         let files = inner
@@ -783,7 +857,14 @@ impl Provider for MockProvider {
             })?;
         inner.commit_counter += 1;
         let id = format!("commit{}", inner.commit_counter);
-        inner.commits.insert(id.clone(), Commit { files });
+        inner.commits.insert(
+            id.clone(),
+            Commit {
+                files,
+                parents: parents.to_vec(),
+                message: message.to_string(),
+            },
+        );
         inner.calls.push(format!("create_commit:{id}"));
         Ok(id)
     }
@@ -829,15 +910,31 @@ impl Provider for MockProvider {
         force: bool,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
+        // Extends the old `update_branch:{name}:{commit}` with the force flag
+        // rather than rewording it, so `starts_with` assertions keep matching.
+        // Recorded before either refusal below, so a refused update shows in
+        // `calls` too.
+        inner
+            .calls
+            .push(format!("update_branch:{name}:{commit}:force={force}"));
+        if let Some(message) = inner.protected.get(name).cloned() {
+            return Err(RemoteError::BranchProtected {
+                branch: name.to_string(),
+                message,
+            });
+        }
+        if !force
+            && let Some(current) = inner.branches.get(name).cloned()
+            && !inner.is_ancestor(&current, commit)
+        {
+            return Err(RemoteError::NotFastForward {
+                branch: name.to_string(),
+            });
+        }
         inner.etag_counter += 1;
         let etag = format!("etag{}", inner.etag_counter);
         inner.branches.insert(name.to_string(), commit.to_string());
         inner.etags.insert(name.to_string(), etag);
-        // Extends the old `update_branch:{name}:{commit}` with the force flag
-        // rather than rewording it, so `starts_with` assertions keep matching.
-        inner
-            .calls
-            .push(format!("update_branch:{name}:{commit}:force={force}"));
         Ok(())
     }
 
@@ -966,6 +1063,10 @@ impl Provider for MockProvider {
 
     async fn current_user(&self) -> Result<String, RemoteError> {
         Ok(self.inner.lock().unwrap().current_user.clone())
+    }
+
+    fn commit_url(&self, origin: &OriginSpec, sha: &str) -> Option<String> {
+        Some(format!("https://forge.test/{}/commit/{sha}", origin.repo))
     }
 
     /// The capability probe and the chain listing. An enabled forge answers

@@ -1945,7 +1945,10 @@ async fn domain_manifest_carries_every_section_it_declares() {
                 ],
                 "problems": []
             },
-            "generated_indexes": { "declared": "shared", "effective": "shared" }
+            "policies": [
+                { "key": "generated_indexes", "declared": "shared", "effective": "shared", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+            ]
         }),
         "{body}"
     );
@@ -1974,7 +1977,10 @@ async fn domain_manifest_names_what_it_lacks() {
             "missing": [],
             "provisioning": null,
             "tag_aliases": null,
-            "generated_indexes": { "declared": null, "effective": "local" }
+            "policies": [
+                { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+            ]
         }),
         "{body}"
     );
@@ -2008,6 +2014,36 @@ async fn domain_manifest_names_what_it_lacks() {
     assert_eq!(
         body["sections"]["missing"],
         serde_json::json!(["Scope", "When to Use"])
+    );
+}
+
+/// A MANIFEST the format layer will not parse has no policies to report, and
+/// says so with an empty array rather than with the registry's defaults: a
+/// document nobody can read declares nothing, and a card that drew the
+/// defaults from it would be telling a reader what holds when nothing does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unparseable_manifest_declares_no_policies() {
+    let fixture = serve_anonymous().await;
+    // A frontmatter block the YAML layer refuses: the quote is never closed.
+    write_manifest(
+        &fixture,
+        "---\ntitle: \"eng\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n",
+    );
+
+    let body: serde_json::Value = get(fixture.addr, "/api/v1/domains/eng/manifest")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["sections"]["policies"],
+        serde_json::json!([]),
+        "{body}"
+    );
+    assert_eq!(
+        body["sections"]["missing"],
+        serde_json::json!(["Scope", "When to Use"]),
+        "{body}"
     );
 }
 

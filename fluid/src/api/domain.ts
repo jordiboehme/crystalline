@@ -156,11 +156,26 @@ export interface ManifestSections {
     decls: { alias: string; canonical: string }[];
     problems: ManifestProblem[];
   } | null;
-  generatedIndexes: {
-    /** As the frontmatter writes it, or null when the key is absent. */
-    declared: string | null;
-    effective: "local" | "shared";
-  };
+  /**
+   * Every MANIFEST configuration key the server's registry knows, with what
+   * this MANIFEST declares beside it. Empty for a MANIFEST that did not
+   * parse: a document nobody can read declares nothing.
+   */
+  policies: PolicyView[];
+}
+
+/** One MANIFEST policy key, as the registry describes it beside what this MANIFEST says. */
+export interface PolicyView {
+  key: string;
+  /** As the frontmatter writes it, or null when the key is absent. */
+  declared: string | null;
+  /** The value that holds: absent and unrecognized both fall to `default`. */
+  effective: string;
+  values: string[];
+  default: string;
+  meaning: string;
+  /** Who may change it: the domain's owner (or an admin), or an admin alone. */
+  changedBy: "owner" | "admin";
 }
 
 /** A MANIFEST as the domain page reads it. */
@@ -187,6 +202,37 @@ function readProblems(value: unknown): ManifestProblem[] {
   });
 }
 
+/**
+ * The registry rows, dropped one by one where a row says nothing.
+ *
+ * A row is its key and what holds; without either there is no line to draw,
+ * so it goes rather than being drawn as a blank. The three describing fields
+ * have quiet defaults instead: a row that carries no `default` is read as
+ * declaring that what holds IS the default, which is true of every key
+ * nobody wrote in the frontmatter.
+ */
+function readPolicies(value: unknown): PolicyView[] {
+  return asArray(value).flatMap((entry) => {
+    const record = asObject(entry);
+    const key = asString(record?.key);
+    const effective = asString(record?.effective);
+    if (key === null || effective === null) {
+      return [];
+    }
+    return [
+      {
+        key,
+        declared: asString(record?.declared),
+        effective,
+        values: asStrings(record?.values),
+        default: asString(record?.default) ?? effective,
+        meaning: asString(record?.meaning) ?? "",
+        changedBy: asString(record?.changed_by) === "admin" ? "admin" : "owner",
+      },
+    ];
+  });
+}
+
 /** Read the `sections` member of a manifest payload, or null when it is not there. */
 export function readManifestSections(value: unknown): ManifestSections | null {
   const record = asObject(value);
@@ -196,7 +242,6 @@ export function readManifestSections(value: unknown): ManifestSections | null {
   const routing = record.routing;
   const provisioning = asObject(record.provisioning);
   const aliases = asObject(record.tag_aliases);
-  const generated = asObject(record.generated_indexes);
   return {
     scope: asStrings(record.scope),
     whenToUse: asStrings(record.when_to_use),
@@ -229,11 +274,7 @@ export function readManifestSections(value: unknown): ManifestSections | null {
             }),
             problems: readProblems(aliases.problems),
           },
-    generatedIndexes: {
-      declared: asString(generated?.declared),
-      effective:
-        asString(generated?.effective) === "shared" ? "shared" : "local",
-    },
+    policies: readPolicies(record.policies),
   };
 }
 
@@ -307,5 +348,43 @@ export async function saveManifest(
   return {
     markdown: asString(record?.markdown) ?? markdown,
     checksum: asString(record?.checksum),
+  };
+}
+
+/** What a policy write answers: the manifest as it now reads, and whether that is the caller's draft. */
+export interface PolicyWrite {
+  markdown: string;
+  checksum: string | null;
+  sections: ManifestSections | null;
+  /** True in a domain that reviews changes: the write is the caller's draft of the MANIFEST. */
+  draft: boolean;
+}
+
+/**
+ * Set one or more MANIFEST policy keys.
+ *
+ * No `If-Match`: the server rewrites one keyed line under its own
+ * compare-and-write, and a whole-document save from a stale editor afterwards
+ * still gets the PUT's 412.
+ */
+export async function setDomainPolicies(
+  domain: string,
+  changes: Record<string, string>,
+): Promise<PolicyWrite> {
+  const payload = await api<unknown>(
+    `/domains/${encodeSegment(domain)}/manifest`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(changes),
+    },
+  );
+  const record = asObject(payload);
+  return {
+    markdown: asString(record?.markdown) ?? "",
+    checksum: asString(record?.checksum),
+    sections: readManifestSections(record?.sections),
+    // Said only when the server said it: an ordinary domain's answer carries
+    // no such key, and the write landed in the domain itself.
+    draft: record?.draft === true,
   };
 }

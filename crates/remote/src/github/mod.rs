@@ -502,8 +502,22 @@ impl Provider for GitHubProvider {
         let response = self
             .send(self.request(Method::PATCH, &path).json(&body))
             .await?;
+        if !force && response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+            // Read ahead of check(), the way branch_ref reads its 404: the
+            // 422 here is an answer with a next step, not an unexpected one.
+            let message = error_message(response).await;
+            return Err(update_branch_refusal(&message, name, &origin.branch));
+        }
         self.check(response, Some(&origin.repo)).await?;
         Ok(())
+    }
+
+    fn commit_url(&self, origin: &OriginSpec, sha: &str) -> Option<String> {
+        Some(format!(
+            "{}/{}/commit/{sha}",
+            auth::auth_base(Some(&self.api_url)),
+            origin.repo
+        ))
     }
 
     async fn update_proposal(
@@ -733,6 +747,11 @@ fn split_repo(repo: &str) -> Result<(&str, &str), RemoteError> {
 /// token access to this organization."
 const SAML_ENFORCEMENT_MARKER: &str = "saml enforcement";
 
+/// GitHub's own words for a refused fast-forward, matched case-insensitively:
+/// the body of the 422 a `PATCH .../git/refs/heads/{branch}` without `force`
+/// comes back with when the branch has moved on.
+const NOT_FAST_FORWARD_MARKER: &str = "not a fast forward";
+
 /// The lowercased marker GitHub's OAuth App restriction body carries:
 /// "Although you appear to have the correct authorization credentials, the
 /// `<org>` organization has enabled OAuth App access restrictions, meaning
@@ -790,6 +809,36 @@ fn organization_policy_error(
     }
 
     None
+}
+
+/// What a 422 from `PATCH .../git/refs/heads/{branch}` without `force`
+/// means: the branch moved (retryable, [`RemoteError::NotFastForward`]) or a
+/// branch rule refused the push ([`RemoteError::BranchProtected`], carrying
+/// the forge's sentence). Only `update_branch` reads a 422 ahead of `check`;
+/// every other write keeps the generic `Api` answer.
+///
+/// The rule reading is for the connected branch alone. A share branch takes
+/// the same 422 when its own head moved, and that is the fast-forward answer
+/// on every branch; but `BranchProtected` carries the way out "set
+/// `sharing: proposal`", which is wrong advice on a `crystalline/share-*`
+/// branch of a domain that already opens proposals. Any other 422 there stays
+/// the generic `Api` answer `check` would have made of it.
+fn update_branch_refusal(message: &str, branch: &str, connected: &str) -> RemoteError {
+    if message.to_lowercase().contains(NOT_FAST_FORWARD_MARKER) {
+        return RemoteError::NotFastForward {
+            branch: branch.to_string(),
+        };
+    }
+    if branch != connected {
+        return RemoteError::Api {
+            status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            message: message.to_string(),
+        };
+    }
+    RemoteError::BranchProtected {
+        branch: branch.to_string(),
+        message: message.to_string(),
+    }
 }
 
 /// Pulls the `url=` value out of an `X-GitHub-SSO` header. GitHub sends
@@ -1057,6 +1106,100 @@ mod tests {
             "Resource not accessible by personal access token",
         );
         assert!(classified.is_none(), "{classified:?}");
+    }
+
+    /// GitHub's own sentence for a refused fast-forward maps to the retryable
+    /// variant, case-insensitively; every other 422 on the connected branch is
+    /// a branch rule, carried verbatim.
+    #[test]
+    fn a_422_on_update_branch_is_a_fast_forward_refusal_or_a_branch_rule() {
+        match update_branch_refusal("Update is not a fast forward", "main", "main") {
+            RemoteError::NotFastForward { branch } => assert_eq!(branch, "main"),
+            other => panic!("{other:?}"),
+        }
+        match update_branch_refusal("update is NOT A FAST FORWARD", "main", "main") {
+            RemoteError::NotFastForward { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        for rule in [
+            "Required status check \"ci\" is expected.",
+            "At least 1 approving review is required by reviewers with write access.",
+            "Changes must be made through a pull request.",
+            "Repository rule violations found for refs/heads/main.",
+        ] {
+            match update_branch_refusal(rule, "main", "main") {
+                RemoteError::BranchProtected { branch, message } => {
+                    assert_eq!(branch, "main");
+                    assert_eq!(message, rule);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let text = update_branch_refusal(
+            "Changes must be made through a pull request.",
+            "main",
+            "main",
+        )
+        .to_string();
+        assert!(
+            text.starts_with(
+                "The branch main does not accept direct commits (Changes must be made through a pull request.)."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("sharing: proposal"), "{text}");
+    }
+
+    /// A proposal domain's share branch is not the branch the `sharing`
+    /// policy is about: a rules 422 there would tell a domain that already
+    /// opens proposals to set `sharing: proposal`, so it stays the generic
+    /// answer. The fast-forward reading is the same on every branch, since a
+    /// share branch that moved is exactly what it says.
+    #[test]
+    fn a_rules_422_on_a_share_branch_is_not_a_protected_connected_branch() {
+        match update_branch_refusal(
+            "Repository rule violations found for refs/heads/crystalline/share-eng-1.",
+            "crystalline/share-eng-1",
+            "main",
+        ) {
+            RemoteError::Api { status, message } => {
+                assert_eq!(status, 422);
+                assert!(message.contains("Repository rule violations"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match update_branch_refusal(
+            "Update is not a fast forward",
+            "crystalline/share-eng-1",
+            "main",
+        ) {
+            RemoteError::NotFastForward { branch } => {
+                assert_eq!(branch, "crystalline/share-eng-1");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The browser page for a commit sits under the forge's own host, which
+    /// the API base names: github.com for the public API, the server itself
+    /// for a GitHub Enterprise Server `/api/v3` base.
+    #[test]
+    fn commit_url_is_the_browser_page_under_the_api_base() {
+        let origin = OriginSpec {
+            repo: "acme/knowledge".to_string(),
+            subpath: None,
+            branch: "main".to_string(),
+        };
+        let provider = GitHubProvider::new(None, None);
+        assert_eq!(
+            provider.commit_url(&origin, "9f2c1a7"),
+            Some("https://github.com/acme/knowledge/commit/9f2c1a7".to_string())
+        );
+        let ghes = GitHubProvider::new(Some("https://github.example.com/api/v3".to_string()), None);
+        assert_eq!(
+            ghes.commit_url(&origin, "9f2c1a7"),
+            Some("https://github.example.com/acme/knowledge/commit/9f2c1a7".to_string())
+        );
     }
 
     /// Endpoints with no repository in scope (`current_user`) pass `None`,

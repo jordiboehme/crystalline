@@ -21,7 +21,12 @@
  * * `confirming`/`onConfirmingChange`, for a parent that arms the
  *   confirmation from somewhere else entirely, which is what the domain
  *   page's command palette row does. Left out, the control owns the flag
- *   itself and nothing about a caller that never passes it changes.
+ *   itself and nothing about a caller that never passes it changes;
+ * * `hideTrigger`, for a caller whose own control IS the trigger - the domain
+ *   policies card's select, which arms this by being changed. The confirm and
+ *   the Keep press are then the whole control, and the focus that goes back
+ *   when the question is given up is the caller's to hand over, since it owns
+ *   what asked.
  */
 
 import type { ReactElement, ReactNode } from "react";
@@ -53,6 +58,7 @@ export function DestructiveAction({
   disabledReason,
   requireValue = false,
   requireMatch,
+  hideTrigger = false,
   confirming,
   onConfirmingChange,
   children,
@@ -83,6 +89,13 @@ export function DestructiveAction({
    * no case folding, because the point of typing it is to have read it.
    */
   requireMatch?: string;
+  /**
+   * Whether to draw no trigger at all, because the caller's own control is
+   * the one that arms this. Such a caller owns `confirming` too - there is
+   * nothing left here to open the question - and owns the focus that goes
+   * back to its control when the question is given up.
+   */
+  hideTrigger?: boolean;
   /** The confirmation's state, for a parent that arms it from elsewhere. */
   confirming?: boolean;
   /** Told whenever the confirmation opens or closes, controlled or not. */
@@ -187,23 +200,25 @@ export function DestructiveAction({
         }
       }}
     >
-      <button
-        ref={trigger}
-        type="button"
-        aria-label={name}
-        aria-expanded={open}
-        aria-describedby={disabledReason !== undefined ? reasonId : undefined}
-        aria-disabled={disabled}
-        onClick={() => {
-          if (disabled) {
-            return;
-          }
-          setOpen(true);
-        }}
-        className={`${BUTTON.destructive} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
-      >
-        {label}
-      </button>
+      {!hideTrigger && (
+        <button
+          ref={trigger}
+          type="button"
+          aria-label={name}
+          aria-expanded={open}
+          aria-describedby={disabledReason !== undefined ? reasonId : undefined}
+          aria-disabled={disabled}
+          onClick={() => {
+            if (disabled) {
+              return;
+            }
+            setOpen(true);
+          }}
+          className={`${BUTTON.destructive} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
+        >
+          {label}
+        </button>
+      )}
       {disabledReason !== undefined && (
         <span id={reasonId} className="sr-only">
           {disabledReason}

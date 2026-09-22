@@ -164,7 +164,7 @@ pub(crate) fn proposal_transitions_json(
 /// per-domain entry: `{ domain, repo, branch, base_commit, behind,
 /// local_changes, skipped_large, open_proposals, declined_proposals,
 /// merged_unconsumed, conflicts, last_checked, probe_error, stack_number,
-/// stack_wedged, repair_pending, stack_link_pending }`. `probe_error` carries the live
+/// stack_wedged, repair_pending, stack_link_pending, direct_shares }`. `probe_error` carries the live
 /// probe's own error message, verbatim, when the probe failed for a
 /// transport reason (offline, rate limited, an expired connection) and the
 /// report was produced by retrying with no probe at all; `null` when the
@@ -189,6 +189,11 @@ pub(crate) fn proposal_transitions_json(
 /// by sharing or checking status again, `repair_pending` and
 /// `stack_link_pending`. All four are always present, quiet rather than
 /// absent off the stacked path, so one reader handles either path.
+///
+/// `direct_shares` names the commits this machine put straight on the branch,
+/// newest first, without their file lists: a domain that shares directly has
+/// no proposal record to read its own history off, and the file list belongs
+/// to the commit rather than to a status glance.
 ///
 /// `detail` is the one key here that is opt-in: `local_changes` stays the bare
 /// count it has always been, and only a caller that asked for the file list
@@ -228,6 +233,13 @@ pub(crate) fn status_report_json(
         "stack_wedged": report.stack_wedged,
         "repair_pending": report.repair_pending,
         "stack_link_pending": report.stack_link_pending,
+        "direct_shares": report.direct_shares.iter().map(|share| json!({
+            "sha": share.sha,
+            "url": share.url,
+            "title": share.title,
+            "shared_at": share.shared_at,
+            "author_login": share.author_login,
+        })).collect::<Vec<Value>>(),
     });
     if let Some(detail) = detail
         && let Some(object) = value.as_object_mut()
@@ -549,6 +561,35 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             "proposal": { "number": number, "url": url, "branch": branch },
             "guidance": DIVERGED_GUIDANCE,
         }),
+        ProposeOutcome::Committed(report) => json!({
+            "outcome": "committed",
+            "sha": report.sha,
+            "url": report.url,
+            "branch": report.branch,
+            "added": report.added,
+            "updated": report.updated,
+            "deleted": report.deleted,
+            "skipped_large": report.skipped_large,
+            "summary": report.summary,
+        }),
+        ProposeOutcome::ProposalOpen { number, url, title } => json!({
+            "outcome": "proposal_open",
+            "proposal": { "number": number, "url": url, "title": title },
+            "guidance": format!(
+                "merge or withdraw proposal #{number} first; a domain that shares directly commits onto the branch the proposal is waiting to land on"
+            ),
+        }),
+        ProposeOutcome::BranchProtected { branch, message } => json!({
+            "outcome": "branch_protected",
+            "branch": branch,
+            "message": message,
+            "guidance": crystalline_remote::error::branch_protected_guidance(branch, message),
+        }),
+        ProposeOutcome::BranchMoved { branch } => json!({
+            "outcome": "branch_moved",
+            "branch": branch,
+            "guidance": crystalline_remote::error::branch_moved_guidance(branch),
+        }),
     }
 }
 
@@ -706,8 +747,12 @@ pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWor
 /// fields the planned action itself carries - `number` and `url` for an update,
 /// `top_number` and `top_title` for a `stack` (a new layer on an open chain),
 /// `number`, `url`, `title` and `layers_above` for an `amend`, all three of `number`,
-/// `url` and `branch` for a diverged proposal, `count` for pending conflicts
-/// and nothing extra for a create or a no-op.
+/// `url` and `branch` for a diverged proposal, `count` for pending conflicts,
+/// `branch` for a `commit` (a domain that shares directly), `number`, `url`
+/// and `title` for a `proposal_open` (the refusal such a domain answers while
+/// a proposal of its own is still open) and nothing extra for a create or a
+/// no-op. `sharing` carries the domain's policy beside the action, so a
+/// surface can say what a share would do before it reads which action it is.
 ///
 /// `root` is the domain's working tree, which is where `last_author` comes
 /// from: the plan already names every changed file, so saying who last wrote
@@ -755,6 +800,7 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
     let mut v = json!({
         "effective_title": plan.effective_title,
         "changes": changes,
+        "sharing": plan.sharing.as_str(),
     });
     match &plan.action {
         ops::PlannedAction::Create => v["action"] = json!("create"),
@@ -797,6 +843,16 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
             v["number"] = json!(number);
             v["url"] = json!(url);
             v["branch"] = json!(branch);
+        }
+        ops::PlannedAction::Commit { branch } => {
+            v["action"] = json!("commit");
+            v["branch"] = json!(branch);
+        }
+        ops::PlannedAction::ProposalOpen { number, url, title } => {
+            v["action"] = json!("proposal_open");
+            v["number"] = json!(number);
+            v["url"] = json!(url);
+            v["title"] = json!(title);
         }
     }
     v
@@ -1138,6 +1194,7 @@ mod tests {
                     .collect(),
             },
             effective_title: "Share".to_string(),
+            sharing: crystalline_core::Sharing::Proposal,
         };
         let v = share_plan_json(&plan, Some(root));
         assert_eq!(v["changes"][0]["path"], "notes/Alpha.md");
@@ -1694,6 +1751,20 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
+            direct_shares: vec![crystalline_remote::state::DirectShare {
+                sha: "c0ffee".to_string(),
+                url: Some("https://forge.test/acme/brand-knowledge/commit/c0ffee".to_string()),
+                title: "Refine the brand voice".to_string(),
+                shared_at: chrono::Utc::now(),
+                author_login: Some("instance-gh".to_string()),
+                files: vec![crystalline_remote::state::ProposedFile {
+                    path: "notes/new.md".to_string(),
+                    change: crystalline_remote::state::ProposedChange::Added,
+                    sha256: None,
+                    blob_sha: None,
+                    size: None,
+                }],
+            }],
         };
         let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["domain"], "eng");
@@ -1704,6 +1775,12 @@ mod tests {
         // Emitted always, empty rather than absent, so a reader never has to
         // tell "nothing merged" from "this build does not report it".
         assert_eq!(v["merged_unconsumed"], json!([]));
+        // The commits this machine put straight on the branch, named rather
+        // than listed out: a status glance says what landed, not which files
+        // each commit carried.
+        assert_eq!(v["direct_shares"][0]["sha"], "c0ffee", "{v}");
+        assert_eq!(v["direct_shares"][0]["author_login"], "instance-gh", "{v}");
+        assert!(v["direct_shares"][0].get("files").is_none(), "{v}");
     }
 
     /// The merged-but-unpulled numbers ride both status shapes, because both
@@ -1742,6 +1819,7 @@ mod tests {
             stack_wedged: vec![7],
             repair_pending: true,
             stack_link_pending: true,
+            direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["stack_number"], 42);
@@ -1769,6 +1847,7 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
+            direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
         assert!(v["stack_number"].is_null(), "{v}");
@@ -1796,6 +1875,7 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
+            direct_shares: Vec::new(),
         };
         let message = RemoteError::Offline.to_string();
         let v = status_report_json("eng", &report, Some(message.clone()), None);
@@ -1824,6 +1904,7 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
+            direct_shares: Vec::new(),
         }
     }
 
@@ -2057,6 +2138,7 @@ mod tests {
                 ..Default::default()
             },
             effective_title: "Share updates from brand".to_string(),
+            sharing: crystalline_core::Sharing::Proposal,
         };
         let v = share_plan_json(&plan, Some(Path::new("/nowhere")));
         assert_eq!(v["action"], "update");
@@ -2126,6 +2208,7 @@ mod tests {
                 ..Default::default()
             },
             effective_title: "Share".to_string(),
+            sharing: crystalline_core::Sharing::Proposal,
         };
         let v = share_plan_json(&plan, Some(root));
         let authors: Vec<&Value> = v["changes"]
@@ -2158,6 +2241,7 @@ mod tests {
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),
+            sharing: crystalline_core::Sharing::Proposal,
         };
         assert_eq!(
             plan_json(&plan(ops::PlannedAction::Create))["action"],
@@ -2180,6 +2264,97 @@ mod tests {
         assert_eq!(diverged["branch"], "crystalline/share-brand");
     }
 
+    /// A direct share's four answers: what landed, and the three refusals
+    /// that are shaped as outcomes rather than errors because each one names
+    /// what to do next.
+    #[test]
+    fn propose_outcome_json_shapes_a_committed_outcome_and_the_three_direct_refusals() {
+        let v = propose_outcome_json(&ProposeOutcome::Committed(ops::CommitReport {
+            sha: "9f2c".to_string(),
+            url: Some("https://github.com/acme/kb/commit/9f2c".to_string()),
+            branch: "main".to_string(),
+            added: vec!["notes/b.md".to_string()],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Shares 1 new engram.".to_string(),
+        }));
+        assert_eq!(v["outcome"], "committed");
+        assert_eq!(v["sha"], "9f2c");
+        assert_eq!(v["url"], "https://github.com/acme/kb/commit/9f2c");
+        assert_eq!(v["branch"], "main");
+        assert_eq!(v["added"], json!(["notes/b.md"]));
+        assert!(v.get("number").is_none(), "a commit has no proposal number");
+
+        let open = propose_outcome_json(&ProposeOutcome::ProposalOpen {
+            number: 4,
+            url: "https://github.test/pull/4".to_string(),
+            title: "Refine".to_string(),
+        });
+        assert_eq!(open["outcome"], "proposal_open");
+        assert_eq!(open["proposal"]["number"], 4);
+        assert!(
+            open["guidance"]
+                .as_str()
+                .unwrap()
+                .contains("merge or withdraw proposal #4 first")
+        );
+
+        let protected = propose_outcome_json(&ProposeOutcome::BranchProtected {
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+        });
+        assert_eq!(protected["outcome"], "branch_protected");
+        assert_eq!(
+            protected["message"],
+            "Changes must be made through a pull request."
+        );
+        assert!(
+            protected["guidance"]
+                .as_str()
+                .unwrap()
+                .contains("sharing: proposal")
+        );
+
+        let moved = propose_outcome_json(&ProposeOutcome::BranchMoved {
+            branch: "main".to_string(),
+        });
+        assert_eq!(moved["outcome"], "branch_moved");
+        assert!(moved["guidance"].as_str().unwrap().contains("share again"));
+    }
+
+    /// The two actions only a direct domain plans, and the policy every plan
+    /// carries beside its action.
+    #[test]
+    fn share_plan_json_names_the_commit_and_proposal_open_actions_and_the_policy() {
+        use crystalline_remote::changes::LocalChanges;
+        let plan = |action| ops::SharePlan {
+            action,
+            changes: LocalChanges::default(),
+            effective_title: String::new(),
+            sharing: crystalline_core::Sharing::Direct,
+        };
+        let commit = plan_json(&plan(ops::PlannedAction::Commit {
+            branch: "main".to_string(),
+        }));
+        assert_eq!(commit["action"], "commit");
+        assert_eq!(commit["branch"], "main");
+        assert_eq!(commit["sharing"], "direct");
+        let open = plan_json(&plan(ops::PlannedAction::ProposalOpen {
+            number: 4,
+            url: "https://github.test/pull/4".to_string(),
+            title: "Refine".to_string(),
+        }));
+        assert_eq!(open["action"], "proposal_open");
+        assert_eq!(open["number"], 4);
+        assert_eq!(open["title"], "Refine");
+        let proposal = plan_json(&ops::SharePlan {
+            sharing: crystalline_core::Sharing::Proposal,
+            ..plan(ops::PlannedAction::Create)
+        });
+        assert_eq!(proposal["sharing"], "proposal");
+    }
+
     #[test]
     fn share_plan_json_names_the_stack_and_amend_actions() {
         use crystalline_remote::changes::LocalChanges;
@@ -2187,6 +2362,7 @@ mod tests {
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),
+            sharing: crystalline_core::Sharing::Proposal,
         };
         let stack = plan_json(&plan(ops::PlannedAction::StackOnTop {
             top_number: 6,
@@ -2245,6 +2421,7 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
+            direct_shares: Vec::new(),
         }
     }
 
@@ -2433,6 +2610,7 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
+            direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["open_proposals"][0]["number"], 1);
@@ -2474,6 +2652,7 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
+            direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["open_proposals"][0]["author_login"], "alice");

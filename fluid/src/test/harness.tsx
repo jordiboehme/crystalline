@@ -100,6 +100,87 @@ export function domainsResponse() {
   };
 }
 
+/** One policy row of a manifest payload, in the registry's own wire shape. */
+export interface PolicyRowFixture {
+  key: string;
+  declared: string | null;
+  effective: string;
+  values: string[];
+  default: string;
+  meaning: string;
+  changed_by: string;
+}
+
+/** One row of the registry, at whatever this MANIFEST declares for it. */
+export function policyRow(
+  key: string,
+  declared: string | null,
+  effective: string,
+  values: string[],
+  dflt: string,
+  meaning: string,
+): PolicyRowFixture {
+  return {
+    key,
+    declared,
+    effective,
+    values,
+    default: dflt,
+    meaning,
+    changed_by: "owner",
+  };
+}
+
+/**
+ * The registry as the server sends it: every key it knows, in its own order,
+ * none of them declared.
+ *
+ * A function rather than a constant so a test may map over a fresh copy - the
+ * policies card's fixtures change one row's declaration and leave the rest.
+ */
+export function defaultPolicyRows(): PolicyRowFixture[] {
+  return [
+    policyRow(
+      "generated_indexes",
+      null,
+      "local",
+      ["local", "shared"],
+      "local",
+      "Whether the generated folder listings travel with a share.",
+    ),
+    policyRow(
+      "sharing",
+      null,
+      "proposal",
+      ["proposal", "direct"],
+      "proposal",
+      "Whether a share opens a proposal for review or commits straight to the branch.",
+    ),
+  ];
+}
+
+/**
+ * The sections a server reads out of a domain's MANIFEST, in the wire shape.
+ *
+ * Shared rather than spelled per file: the domain screen and the policies
+ * card are two readers of one payload, and a fixture that drifted between
+ * them would let one of the two pass against a shape the server never sends.
+ */
+export function manifestSectionsResponse(
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    scope: [],
+    when_to_use: ["Route here for eng questions."],
+    routing: "when_to_use",
+    missing: ["Scope"],
+    provisioning: null,
+    tag_aliases: null,
+    policies: defaultPolicyRows(),
+    ...overrides,
+  };
+}
+
 /** Mount the app at `entry`, on an in-memory history. */
 export function renderApp(entry = "/"): RenderResult {
   return render(

@@ -93,6 +93,14 @@ fn generated_indexes(root: &std::path::Path) -> Vec<String> {
 
 // --- the engine, and the two wires ------------------------------------------
 
+/// The team domain's MANIFEST: it declares no sharing policy, so a share of it
+/// opens a proposal the team reviews.
+const KB_MANIFEST: &str = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n";
+
+/// The same MANIFEST declaring `sharing: direct`, so a share of it commits
+/// straight onto the connected branch with no review.
+const KB_MANIFEST_DIRECT: &str = "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n";
+
 struct Harness {
     _tmp: tempfile::TempDir,
     root: std::path::PathBuf,
@@ -148,6 +156,13 @@ impl Harness {
     /// and every later edit these tests make is read off disk by the share
     /// path rather than out of the index.
     async fn team() -> (Harness, Arc<MockProvider>) {
+        Harness::team_with_manifest(KB_MANIFEST).await
+    }
+
+    /// [`Harness::team`] with the team domain's MANIFEST chosen, which is what
+    /// decides how a share of it reaches the team: [`KB_MANIFEST`] reviews a
+    /// proposal, [`KB_MANIFEST_DIRECT`] commits straight to the branch.
+    async fn team_with_manifest(manifest: &str) -> (Harness, Arc<MockProvider>) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let cfg = GlobalConfig {
@@ -168,7 +183,7 @@ impl Harness {
 
         let mock = Arc::new(MockProvider::new());
         let mut origin_tree: std::collections::BTreeMap<String, Vec<u8>> = [
-                ("MANIFEST.md".to_string(), b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n".to_vec()),
+                ("MANIFEST.md".to_string(), manifest.as_bytes().to_vec()),
                 ("notes/a.md".to_string(), b"---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha\n".to_vec()),
             ]
             .into_iter()
@@ -3054,6 +3069,192 @@ async fn the_share_round_runs_over_http_too() {
         answered["result"]["resultType"],
         json!("input_required"),
         "{answered}"
+    );
+}
+
+// --- direct domains: the round says the commit goes straight to the branch --
+//
+// A domain whose MANIFEST declares `sharing: direct` publishes with no review
+// at all, so the question has to say so: a yes given to "open a proposal" is
+// not a yes given to "the team sees this on the branch at once". The legs
+// below are the share round's own legs, run against that policy.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_direct_share_is_asked_with_no_review_and_writes_nothing() {
+    let (h, mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    let result = &asked["result"];
+    assert_eq!(result["resultType"], json!("input_required"), "{asked}");
+    let message = result["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.starts_with("Commit straight to branch 'main' of team/knowledge, with no review?"),
+        "{message}"
+    );
+    assert!(message.contains("notes/a.md"), "{message}");
+    assert!(
+        !mock.calls().iter().any(|c| c.starts_with("create_")),
+        "round one commits nothing: {:?}",
+        mock.calls()
+    );
+
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            share_kb(Some(answer("accept", true))),
+        ))
+        .await;
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "committed", "{body}");
+    assert_eq!(mock.branch_commit("main").as_deref(), body["sha"].as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_direct_share_commits_nothing() {
+    let (h, mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let _ = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    let head = mock.branch_commit("main").unwrap();
+    let refused = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            share_kb(Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("create_") || c.starts_with("update_branch")),
+        "{:?}",
+        mock.calls()
+    );
+    assert_eq!(mock.branch_commit("main").unwrap(), head);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_direct_share_answers_round_one_without_a_question() {
+    let (h, mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
+    edit_kb(&h);
+    let state_dir = h.root.join("origins").join("kb");
+    let mut state = crystalline_remote::state::OriginState::load(&state_dir)
+        .unwrap()
+        .unwrap();
+    state.proposals.push(crystalline_remote::state::Proposal {
+        number: 5,
+        url: "https://github.test/pull/5".to_string(),
+        branch: "crystalline/share-kb-x".to_string(),
+        title: "Older".to_string(),
+        created_at: chrono::Utc::now(),
+        status: crystalline_remote::state::ProposalStatus::Open,
+        files: vec![],
+        head_commit: None,
+        pending_head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: vec![],
+        updated_at: None,
+        author_login: None,
+    });
+    state.save(&state_dir).unwrap();
+    // The forge knows it too, so the share's own pull refreshes it rather
+    // than asking after a proposal that exists on this machine alone.
+    mock.set_proposal_state(5, crystalline_remote::ProposalState::Open);
+    let mut wire = h.stdio().await;
+    let done = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "nothing to confirm: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposal_open", "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_direct_share_round_runs_over_http_too() {
+    let (h, _mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
+    edit_kb(&h);
+    let addr = h.http().await;
+    let raw = eliciting_post(addr, 1, "tools/call", share_kb(None)).await;
+    assert!(raw.starts_with("HTTP/1.1 200 OK"), "{}", head_of(&raw));
+    let answered = payload(&raw);
+    assert_eq!(
+        answered["result"]["resultType"],
+        json!("input_required"),
+        "{answered}"
+    );
+    assert!(
+        answered["result"]["inputRequests"]["confirm"]["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("with no review")
+    );
+}
+
+/// A peer that cannot be asked commits in one call, exactly as it proposes in
+/// one call: a modern peer that declared no elicitation capability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_eliciting_modern_direct_share_commits_in_one_call() {
+    let (h, mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let done = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "committed", "{body}");
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("update_branch:main:")),
+        "{:?}",
+        mock.calls()
+    );
+}
+
+/// And so does a legacy peer, which is served the pre-round shape whatever it
+/// declared: the handshake is what puts it there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_direct_share_commits_in_one_call() {
+    let (h, mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-era-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
+
+    let done = wire.call(request(2, "tools/call", share_kb(None))).await;
+    assert!(
+        done["result"]["resultType"].is_null(),
+        "a legacy result carries no discriminator: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "committed", "{body}");
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("update_branch:main:")),
+        "{:?}",
+        mock.calls()
     );
 }
 

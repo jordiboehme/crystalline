@@ -536,6 +536,8 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::NotConnected
         | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::StacksUnsupported
+        | RemoteError::NotFastForward { .. }
+        | RemoteError::BranchProtected { .. }
         | RemoteError::Refused(_)
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }

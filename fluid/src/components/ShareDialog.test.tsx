@@ -1465,6 +1465,176 @@ describe("the share dialog", () => {
       ).toBeDisabled();
     });
   });
+
+  it("on a direct domain hides the layer picker, says the commit sentence, labels the button and sends no proposal", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "committed",
+      sha: "9f2c1a7deadbeef",
+      url: "https://github.com/acme/knowledge/commit/9f2c1a7deadbeef",
+      branch: "main",
+      added: ["notes/a.md"],
+      updated: [],
+      deleted: [],
+      skipped_large: [],
+      summary: "Shares 1 new engram.",
+    }));
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": () => ({
+        action: "commit",
+        branch: "main",
+        sharing: "direct",
+        repo: "acme/knowledge",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // There is no proposal to land on, so there is nothing to choose.
+    expect(
+      within(dialog).queryByRole("combobox", { name: "Proposal" }),
+    ).toBeNull();
+    expect(
+      await within(dialog).findByText(
+        "Sharing commits straight to main, with no review.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByText(
+        "Optional. Becomes the body of the commit message.",
+      ),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalledTimes(1);
+    });
+    // Nothing to land on, so nothing is named: the request is the share of
+    // everything it has always been.
+    expect(sentBody("/domains/eng/sync/share", "POST")).not.toHaveProperty(
+      "proposal",
+    );
+
+    // The commit itself is what a reader follows, by its short sha.
+    const link = await within(dialog).findByRole("link", { name: "9f2c1a7" });
+    expect(link).toHaveAttribute(
+      "href",
+      "https://github.com/acme/knowledge/commit/9f2c1a7deadbeef",
+    );
+    expect(
+      within(dialog).getByText(acrossElements(/^Committed 9f2c1a7 to main\.$/)),
+    ).toBeVisible();
+  });
+
+  it("re-reads the domain's files when a commit folded the drafts in", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": () => ({
+        action: "commit",
+        branch: "main",
+        sharing: "direct",
+        effective_title: "t",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+      "/domains/eng/sync/share": () => ({
+        outcome: "committed",
+        sha: "9f2c1a7",
+        branch: "main",
+        drafts_folded: 2,
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    const treeReads = reads("/domains/eng/tree");
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+
+    // A reviewing domain's direct commit takes the caller's own drafts out of
+    // their overlay and puts them in the domain, so every list that draws its
+    // files has moved - counts are not what changed here.
+    await waitFor(() => {
+      expect(reads("/domains/eng/tree")).toBeGreaterThan(treeReads);
+    });
+  });
+
+  it("names the proposal that blocks a direct share and offers no button to press", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": () => ({
+        action: "proposal_open",
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        title: "Refine 2 engrams in eng",
+        sharing: "direct",
+        effective_title: "",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // A leftover proposal is waiting to land on the very branch a direct
+    // share would commit onto, so it is named rather than committed past.
+    expect(
+      await within(dialog).findByText(
+        "Proposal #4 (Refine 2 engrams in eng) is still open; merge or withdraw it before sharing directly.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByRole("button", { name: "Share" }),
+    ).toBeDisabled();
+  });
+
+  it("shows the guidance of a protected or moved branch", async () => {
+    for (const receipt of [
+      {
+        outcome: "branch_protected",
+        branch: "main",
+        message: "Changes must be made through a pull request.",
+        guidance:
+          "The branch main does not accept direct commits (Changes must be made through a pull request.). Set `sharing: proposal` in this domain's MANIFEST so shares open a proposal the branch's rules can review, or ask a repository admin to allow direct pushes.",
+      },
+      {
+        outcome: "branch_moved",
+        branch: "main",
+        guidance:
+          "the branch main moved again while this share was prepared; run update_domain (or `crystalline origin update`) and share again",
+      },
+    ]) {
+      serve({
+        "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+        "/domains/eng/sync/changes": () => ({
+          action: "commit",
+          branch: "main",
+          sharing: "direct",
+          effective_title: "t",
+          changes: [{ path: "notes/a.md", kind: "added" }],
+        }),
+        "/domains/eng/sync/share": () => receipt,
+      });
+
+      const { unmount } = renderApp("/d/eng");
+      const dialog = await openShareDialog();
+      await userEvent.click(
+        within(dialog).getByRole("button", { name: "Commit to main" }),
+      );
+
+      // Nothing was written, and the server's own words say what to do about
+      // it rather than the dialog inventing a sentence per refusal.
+      expect(await within(dialog).findByText(receipt.guidance)).toBeVisible();
+      unmount();
+    }
+  });
 });
 
 describe("seeing and discarding changes from the dialog", () => {

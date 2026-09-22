@@ -659,3 +659,69 @@ fn both_recognized_generated_indexes_values_are_clean() {
         );
     }
 }
+
+// --- The sharing frontmatter switch (M007) -----------------------------------
+
+fn manifest_declaring_sharing(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_unrecognized_sharing_value_is_m007_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_sharing("dirct"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m007 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M007")
+        .expect("M007 present");
+    assert_eq!(m007.severity, Severity::Error);
+    assert_eq!(
+        m007.message,
+        "`sharing: dirct` is neither `proposal` nor `direct`"
+    );
+    assert_eq!(
+        m007.fix.as_deref(),
+        Some(
+            "read as `proposal`, so shares still open a proposal for review; write `direct` to commit straight to the branch"
+        )
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn both_recognized_sharing_values_and_an_absent_key_are_clean() {
+    for value in ["proposal", "direct"] {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "MANIFEST.md",
+            &manifest_declaring_sharing(value),
+        );
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M007"),
+            "`{value}`: {:?}",
+            report.issues
+        );
+    }
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_indexes("local"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M007"),
+        "absent: {:?}",
+        report.issues
+    );
+}

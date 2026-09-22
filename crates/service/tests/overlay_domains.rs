@@ -39,6 +39,9 @@ use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update};
 
 const MANIFEST: &str = "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
+/// The same MANIFEST, declaring that a share of this domain commits straight
+/// onto the connected branch instead of opening a proposal for review.
+const MANIFEST_DIRECT: &str = "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
 /// The base engram: what the domain's files on disk say exists.
 const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Plan\n\n- [decision] the plan as the team has it #team\n";
 /// Alice's draft of the same path: her private rewrite of it.
@@ -69,6 +72,10 @@ struct Fixture {
     /// Where this engine keeps its per-domain origin state, so a test can
     /// record a base snapshot the way a first pull would have.
     origins: PathBuf,
+    /// The forge this engine shares against, on a fixture that carries an
+    /// origin: the same handle `with_origin_provider` was given, so a test can
+    /// arm it and read back what a share actually called.
+    forge: Option<Arc<support::MockProvider>>,
 }
 
 /// A file domain `team` (MANIFEST + plan.md), synced, with the state directory
@@ -81,7 +88,7 @@ async fn fixture() -> Fixture {
 /// directory is. `false` is only ever used by the test that pins what an engine
 /// without one may do, which is nothing.
 async fn fixture_with_state_dir(pinned: bool) -> Fixture {
-    build_fixture(pinned, false, None, false, false).await
+    build_fixture(MANIFEST, pinned, false, None, false, false).await
 }
 
 /// The same domain, in review mode: every write by every actor joins that
@@ -94,20 +101,25 @@ async fn fixture_with_state_dir(pinned: bool) -> Fixture {
 /// *does* once a domain carries it, so a fixture that had to satisfy the
 /// enabling gates would be testing those gates instead.
 async fn review_fixture() -> Fixture {
-    build_fixture(true, true, None, false, false).await
+    build_fixture(MANIFEST, true, true, None, false, false).await
 }
 
 /// A team domain with a GitHub origin and a base snapshot that says exactly
 /// what is on disk: the state enabling review mode insists on. Not in review
 /// mode yet - turning it on is what the tests built on this do.
 async fn origin_fixture() -> Fixture {
-    build_fixture(true, false, None, false, true).await
+    build_fixture(MANIFEST, true, false, None, false, true).await
 }
 
 /// The same team domain, already in review mode, for the tests that ask what a
 /// domain in review mode reports about its own working tree.
 async fn reviewed_origin_fixture() -> Fixture {
-    build_fixture(true, true, None, false, true).await
+    build_fixture(MANIFEST, true, true, None, false, true).await
+}
+
+/// The reviewed team domain whose MANIFEST declares `sharing: direct`.
+async fn reviewed_direct_origin_fixture() -> Fixture {
+    build_fixture(MANIFEST_DIRECT, true, true, None, false, true).await
 }
 
 /// The review-mode domain with a deterministic embedding provider behind it,
@@ -116,6 +128,7 @@ async fn reviewed_origin_fixture() -> Fixture {
 /// asserting nothing.
 async fn review_fixture_with_provider() -> Fixture {
     build_fixture(
+        MANIFEST,
         true,
         true,
         Some(Arc::new(support::TopicEmbedder)),
@@ -135,7 +148,7 @@ async fn review_fixture_with_provider() -> Fixture {
 /// address and the auth store, so a test can mint a personal token against the
 /// very store the gate reads.
 async fn served_review_instance() -> (Fixture, std::net::SocketAddr, Arc<AuthStore>) {
-    let f = build_fixture(true, true, None, true, false).await;
+    let f = build_fixture(MANIFEST, true, true, None, true, false).await;
     let auth = Arc::new(AuthStore::open(&f.root.join("web-auth.db")).await.unwrap());
     let router = http_router(
         f.engine.clone(),
@@ -159,6 +172,7 @@ async fn served_review_instance() -> (Fixture, std::net::SocketAddr, Arc<AuthSto
 }
 
 async fn build_fixture(
+    manifest: &str,
     pinned: bool,
     review: bool,
     provider: Option<Arc<dyn crystalline_index::EmbeddingProvider>>,
@@ -169,7 +183,7 @@ async fn build_fixture(
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("MANIFEST.md"), MANIFEST).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), manifest).unwrap();
     std::fs::write(dir.join("plan.md"), PLAN).unwrap();
 
     let mut cfg = GlobalConfig {
@@ -227,13 +241,15 @@ async fn build_fixture(
     // The forge is injected wherever this fixture carries an origin, so no
     // status read here ever reaches this machine's own keychain or the network.
     let mut commit = String::new();
+    let mut forge = None;
     if origin {
         let mock = Arc::new(support::MockProvider::new());
         commit = mock.add_commit(std::collections::BTreeMap::from([(
             "MANIFEST.md".to_string(),
-            MANIFEST.as_bytes().to_vec(),
+            manifest.as_bytes().to_vec(),
         )]));
         mock.set_branch("main", &commit);
+        forge = Some(mock.clone());
         engine = engine.with_origin_provider(mock);
     }
     let engine = Arc::new(engine);
@@ -245,6 +261,7 @@ async fn build_fixture(
         store,
         state,
         origins,
+        forge,
     };
     if origin {
         f.snapshot_origin_at("team", &commit);
@@ -274,6 +291,13 @@ impl Fixture {
     /// The domain's own folder, which is also the path its index row carries.
     fn domain_root(&self, domain: &str) -> PathBuf {
         self.root.join(domain)
+    }
+
+    /// The forge behind this fixture's origin.
+    fn mock(&self) -> Arc<support::MockProvider> {
+        self.forge
+            .clone()
+            .expect("this fixture carries an origin and its forge")
     }
 
     /// Resolve a domain id the way every writer here does: with the row's own
@@ -427,12 +451,19 @@ impl Fixture {
                 .to_string_lossy()
                 .replace('\\', "/");
             state.files.insert(
-                rel,
+                rel.clone(),
                 crystalline_remote::state::BaseStamp {
                     sha256: support::sha256_hex(&bytes),
                     size: bytes.len() as u64,
                 },
             );
+            // The copies a pull records beside the stamps, which are the side
+            // a share of a reviewing domain stages its tree from and the side
+            // a direct commit writes the folder back out of. A snapshot with
+            // stamps and no copies is the damaged state a share refuses, so
+            // the fixture records both the way a pull does.
+            crystalline_remote::state::write_base_file(&self.origins.join(domain), &rel, &bytes)
+                .unwrap();
         }
         state.save(&self.origins.join(domain)).unwrap();
     }
@@ -7246,5 +7277,205 @@ async fn the_share_ask_counts_only_the_acting_identitys_drafts() {
             .await
             .is_none(),
         "bob holds nothing, and alice's draft is not his to share"
+    );
+}
+
+/// **A direct share of a reviewing domain commits exactly the acting actor's
+/// drafts and folds them into the folder at once.**
+#[tokio::test]
+async fn a_direct_share_of_a_reviewing_domain_commits_the_drafts_and_folds_them() {
+    let f = reviewed_direct_origin_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "alice", "fresh.md", ALICE_NEW).await;
+    f.draft(
+        "team",
+        "bob",
+        "plan.md",
+        &PLAN.replace("as the team has it", "as bob would have it"),
+    )
+    .await;
+    f.draft(
+        "team",
+        "bob",
+        "notes.md",
+        &PLAN.replace("permalink: plan", "permalink: notes"),
+    )
+    .await;
+
+    let receipt = f
+        .engine
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["outcome"], "committed", "{receipt}");
+    assert_eq!(receipt["drafts_folded"], 2, "{receipt}");
+    let mut carried: Vec<String> = receipt["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(receipt["updated"].as_array().unwrap())
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    carried.sort();
+    assert_eq!(
+        carried,
+        vec!["fresh.md".to_string(), "plan.md".to_string()],
+        "alice's drafts and nobody else's"
+    );
+
+    // The reviewed folder now holds her drafts byte for byte, and her rows are gone.
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap(),
+        ALICE_DRAFT
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("fresh.md")).unwrap(),
+        ALICE_NEW
+    );
+    let store = f.store.lock().await;
+    let id = f.domain_id(&*store, "team").await;
+    assert!(
+        store.overlay_entries(id, "alice").await.unwrap().is_empty(),
+        "alice's drafts became the folder"
+    );
+    // Bob's draft at a shared path stands as his divergence; his other draft stands untouched.
+    let bobs = store.overlay_entries(id, "bob").await.unwrap();
+    assert_eq!(bobs.len(), 2, "{bobs:?}");
+    drop(store);
+    let status = f
+        .engine
+        .origin_status(Some("team"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let d = &status["domains"][0];
+    assert_eq!(d["converged"]["diverged"], 1, "{d}");
+    assert_eq!(d["sharing"], "direct", "{d}");
+    assert_eq!(d["local_changes"], 0, "the folder equals its base: {d}");
+    let pulled = f
+        .engine
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(pulled["domains"][0]["up_to_date"], true, "{pulled}");
+}
+
+/// The pinned head: the team's copy moved between the engine's own pull and
+/// the staged share's inline one, so the share is refused before a single
+/// branch write is attempted.
+#[tokio::test]
+async fn a_pinned_direct_share_whose_branch_moved_is_refused_before_any_commit() {
+    let f = reviewed_direct_origin_fixture().await;
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    let mock = f.mock();
+    let moved = mock.add_commit(std::collections::BTreeMap::from([
+        (
+            "MANIFEST.md".to_string(),
+            MANIFEST_DIRECT.as_bytes().to_vec(),
+        ),
+        (
+            "plan.md".to_string(),
+            PLAN.replace("the team has it", "the team moved it")
+                .into_bytes(),
+        ),
+    ]));
+    // Armed after the engine's own pull (probe 1) and before the staged
+    // share's inline pull, which is the probe `PinnedHead` screens.
+    assert_eq!(
+        mock.branch_head_calls(),
+        0,
+        "nothing has probed this branch yet, so probe 1 is the share's own pull"
+    );
+    mock.move_branch_after_head_probes(1, "main", &moved);
+    let err = f
+        .engine
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap_err();
+    // The words unique to `SHARE_HEAD_MOVED` (the constant itself is
+    // `pub(crate)`, so it cannot be named from here): the remote crate's
+    // `NotFastForward` text carries "moved while this share was prepared" too,
+    // and that one would mean the refusal came a whole layer later.
+    assert!(
+        err.to_string().contains("the team's copy moved"),
+        "the pinned head refused this, not the branch write: {err}"
+    );
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|c| c.starts_with("update_branch:main:"))
+            .count(),
+        0,
+        "the refusal comes from the pull, ahead of any branch write: {:?}",
+        mock.calls()
+    );
+}
+
+/// A policy change in a reviewing domain lands in the acting actor's draft
+/// of the MANIFEST; the folder is byte-stable and the domain still shares as
+/// a proposal until that draft lands.
+#[tokio::test]
+async fn setting_a_policy_in_a_reviewing_domain_is_a_draft_of_the_manifest() {
+    let f = reviewed_origin_fixture().await;
+    let before = std::fs::read_to_string(f.domain_root("team").join("MANIFEST.md")).unwrap();
+    let out = f
+        .engine
+        .set_manifest_policies(
+            "team",
+            &[("sharing".to_string(), "direct".to_string())],
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["draft"], true, "{out}");
+    assert!(
+        out["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("\nsharing: direct\n"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.domain_root("team").join("MANIFEST.md")).unwrap(),
+        before
+    );
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    let plan = f
+        .engine
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            crystalline_service::engine::PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan["sharing"], "proposal",
+        "the folder's MANIFEST decides: {plan}"
+    );
+    assert_eq!(plan["action"], "create");
+    assert!(
+        plan["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "MANIFEST.md"),
+        "the draft MANIFEST is what the share carries: {plan}"
     );
 }

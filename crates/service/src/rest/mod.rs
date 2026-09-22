@@ -144,6 +144,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::tree,
         domains::manifest,
         domains::save_manifest,
+        domains::set_domain_policies,
         engrams::list,
         engrams::detail,
         engrams::inbound,
@@ -210,7 +211,8 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::ManifestProblem,
         domains::TagAliasesView,
         domains::TagAliasDeclView,
-        domains::GeneratedIndexesView,
+        domains::PolicyView,
+        domains::SetPoliciesBody,
         domains_admin::CreateDomainBody,
         domains_admin::FoldArg,
         domains_admin::ReviewBody,
@@ -709,9 +711,12 @@ pub fn router(state: RestState) -> Router {
             get(files::read).put(files::write).delete(files::remove),
         )
         .route("/domains/{domain}/tree", get(domains::tree))
+        // The PATCH is the owner's: see `set_domain_policies`.
         .route(
             "/domains/{domain}/manifest",
-            get(domains::manifest).put(domains::save_manifest),
+            get(domains::manifest)
+                .put(domains::save_manifest)
+                .patch(domains::set_domain_policies),
         )
         .route(
             "/domains/{domain}/engrams",

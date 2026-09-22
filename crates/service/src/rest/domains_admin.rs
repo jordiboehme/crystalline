@@ -882,7 +882,9 @@ fn single_domain(
                            this was recorded and whenever the acting \
                            credential has no login to name, so a client shows \
                            it where it is present and nothing where it is \
-                           not.\n\nFour keys say where the domain's \
+                           not. `sharing` names the domain's policy and \
+                           `direct_shares` the commits this machine put \
+                           straight on the branch.\n\nFour keys say where the domain's \
                            chain of stacked proposals stands. `stack_number` \
                            is the chain's number on the forge, null when \
                            nothing is stacked. `stack_wedged` lists the \
@@ -1406,8 +1408,14 @@ pub async fn sync_now(
                    proposal number and url, `stack` with the layer it would \
                    sit on, `amend` with the layer it would land on, \
                    `nothing_to_share`, `conflicts_pending`, \
-                   `proposal_diverged`), the effective title and the changed \
-                   files. A generated folder listing (`index.md`) is a change \
+                   `proposal_diverged`, `commit` with the branch a direct \
+                   domain would commit onto, `proposal_open` with the number, \
+                   url and title of the proposal that blocks a direct share), \
+                   the effective title and the changed \
+                   files. The plan also carries `sharing` (`proposal` or \
+                   `direct`, the domain's MANIFEST policy) and `repo`, so a \
+                   client knows what kind of domain it is looking at before \
+                   the action is read. A generated folder listing (`index.md`) is a change \
                    like any other here, because a share really carries it, but \
                    it is derived rather than written and is left out of the \
                    domain's `local_changes` count: a renderer counts these \
@@ -1468,6 +1476,22 @@ pub async fn sync_now(
                             "path": "notes/b.md",
                             "kind": "added",
                             "last_author": null
+                        }]
+                    })
+                )),
+                ("commit" = (
+                    summary = "A direct domain would commit onto its branch.",
+                    value = json!({
+                        "action": "commit",
+                        "branch": "main",
+                        "sharing": "direct",
+                        "repo": "acme/knowledge",
+                        "effective_title": "Refine 2 engrams in kb",
+                        "changes": [{
+                            "path": "notes/a.md",
+                            "kind": "modified",
+                            "sha": "9f2c",
+                            "last_author": "human:ada"
                         }]
                     })
                 )),
@@ -1608,8 +1632,16 @@ pub struct ShareBody {
                    team already has everything, `conflicts_pending` with the \
                    conflicts that need resolving first, and \
                    `proposal_diverged` when a reviewer moved the proposal \
-                   branch and nothing was written. Refused on a read-only \
-                   instance.",
+                   branch and nothing was written. On a domain whose MANIFEST \
+                   declares `sharing: direct` the share commits the selected \
+                   files straight onto the connected branch instead and \
+                   answers `committed` with the commit's sha and url; it \
+                   answers `proposal_open` while any proposal is still open, \
+                   `branch_protected` when the branch's rules refuse a direct \
+                   commit and `branch_moved` when the branch moved twice \
+                   while the share was prepared, each with guidance. A \
+                   `proposal` in the body on a direct domain is a 422. \
+                   Refused on a read-only instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = ShareBody,
     responses(
@@ -1619,7 +1651,17 @@ pub struct ShareBody {
                            new proposal's number and url, `updated` carrying \
                            the proposal it refreshed, `nothing_to_share`, \
                            `conflicts_pending` with the conflicts, or \
-                           `proposal_diverged` with guidance.\n\nA `proposed` \
+                           `proposal_diverged` with guidance.\n\nA domain \
+                           that shares directly answers one of four outcomes \
+                           instead: `committed` with the commit's sha, url \
+                           and branch beside the three file lists, \
+                           `proposal_open` with the number, url and title of \
+                           the proposal that has to land or be withdrawn \
+                           first, `branch_protected` when the branch's own \
+                           rules refuse a direct commit, and `branch_moved` \
+                           when somebody else moved the branch while this \
+                           share was prepared. Each of the three refusals \
+                           carries guidance and nothing was written.\n\nA `proposed` \
                            or `updated` outcome also names where the proposal \
                            sits in its chain: `stack_number` is the chain's \
                            number on the forge and `stack_position` is \
@@ -1634,19 +1676,38 @@ pub struct ShareBody {
                            a layer at all and names the stack number only when \
                            it has one.",
             body = Object,
-            example = json!({
-                "outcome": "proposed",
-                "url": "https://github.com/acme/knowledge/pull/4",
-                "number": 4,
-                "branch": "crystalline/kb-20260821",
-                "added": ["notes/b.md"],
-                "updated": ["notes/a.md"],
-                "deleted": [],
-                "skipped_large": [],
-                "summary": "Refine 2 engrams in kb",
-                "stack_number": 42,
-                "stack_position": [2, 2]
-            }),
+            examples(
+                ("proposed" = (
+                    summary = "A reviewed domain opened a proposal.",
+                    value = json!({
+                        "outcome": "proposed",
+                        "url": "https://github.com/acme/knowledge/pull/4",
+                        "number": 4,
+                        "branch": "crystalline/kb-20260821",
+                        "added": ["notes/b.md"],
+                        "updated": ["notes/a.md"],
+                        "deleted": [],
+                        "skipped_large": [],
+                        "summary": "Refine 2 engrams in kb",
+                        "stack_number": 42,
+                        "stack_position": [2, 2]
+                    })
+                )),
+                ("committed" = (
+                    summary = "A direct domain committed onto its branch.",
+                    value = json!({
+                        "outcome": "committed",
+                        "sha": "9f2c1a05e2",
+                        "url": "https://github.com/acme/knowledge/commit/9f2c1a05e2",
+                        "branch": "main",
+                        "added": ["notes/b.md"],
+                        "updated": ["notes/a.md"],
+                        "deleted": [],
+                        "skipped_large": [],
+                        "summary": "Refine 2 engrams in kb"
+                    })
+                )),
+            ),
         ),
         (
             status = 401,

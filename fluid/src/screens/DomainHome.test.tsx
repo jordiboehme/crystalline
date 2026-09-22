@@ -19,11 +19,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
 import { ApiProblem, api } from "../api/client";
+import { defined } from "../test/assert";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
   domainsResponse,
+  manifestSectionsResponse,
   meResponse,
+  policyRow,
   renderApp,
   userFixture,
 } from "../test/harness";
@@ -50,19 +53,11 @@ const MANIFEST = [
   "",
 ].join("\n");
 
-/** The sections a server reads out of `MANIFEST`, in the wire shape. */
-function sectionsResponse(overrides: Record<string, unknown> = {}) {
-  return {
-    scope: [],
-    when_to_use: ["Route here for eng questions."],
-    routing: "when_to_use",
-    missing: ["Scope"],
-    provisioning: null,
-    tag_aliases: null,
-    generated_indexes: { declared: null, effective: "local" },
-    ...overrides,
-  };
-}
+/**
+ * The sections a server reads out of `MANIFEST`, in the wire shape. The
+ * fixture itself is the harness's, shared with the policies card's own suite.
+ */
+const sectionsResponse = manifestSectionsResponse;
 
 /** The tree, which answers with the folder that was asked for. */
 function treeResponse(path: string) {
@@ -362,7 +357,24 @@ describe("the domain screen", () => {
             decls: [{ alias: "Multi_Word", canonical: "multi-word" }],
             problems: [],
           },
-          generated_indexes: { declared: "shared", effective: "shared" },
+          policies: [
+            policyRow(
+              "generated_indexes",
+              "shared",
+              "shared",
+              ["local", "shared"],
+              "local",
+              "Whether the generated folder listings travel with a share.",
+            ),
+            policyRow(
+              "sharing",
+              null,
+              "proposal",
+              ["proposal", "direct"],
+              "proposal",
+              "Whether a share opens a proposal for review or commits straight to the branch.",
+            ),
+          ],
         }),
       }),
     });
@@ -393,16 +405,19 @@ describe("the domain screen", () => {
     expect(within(aliases).getByText("Multi_Word -> multi-word")).toBeVisible();
     expect(within(aliases).queryByText("No aliases")).toBeNull();
 
-    const configuration = screen.getByRole("region", {
-      name: "Configuration",
+    // The switches are their own card now, below the manifest rather than a
+    // fifth panel inside it, and every registry key has a row there.
+    const policies = screen.getByRole("region", { name: "Domain policies" });
+    const generated = within(policies).getByRole("row", {
+      name: /^generated_indexes/,
     });
+    // The declared cell, which is the first: what holds reads `shared` too,
+    // so the row is asked by position rather than by the word.
     expect(
-      within(configuration).getByText("generated_indexes: shared"),
-    ).toBeVisible();
+      defined(within(generated).getAllByRole("cell")[0], "the declared cell"),
+    ).toHaveTextContent("shared");
     expect(
-      within(configuration).getByText(
-        "Effective: shared. The generated directory indexes travel with the domain.",
-      ),
+      within(policies).getByRole("row", { name: /^sharing/ }),
     ).toBeVisible();
   });
 
@@ -440,17 +455,11 @@ describe("the domain screen", () => {
         "No aliases",
       ),
     ).toBeVisible();
-    const configuration = screen.getByRole("region", {
-      name: "Configuration",
+    const policies = screen.getByRole("region", { name: "Domain policies" });
+    const generated = within(policies).getByRole("row", {
+      name: /^generated_indexes/,
     });
-    expect(
-      within(configuration).getByText("generated_indexes: not declared"),
-    ).toBeVisible();
-    expect(
-      within(configuration).getByText(
-        "Effective: local. The generated directory indexes stay on this machine.",
-      ),
-    ).toBeVisible();
+    expect(within(generated).getByText("not declared")).toBeVisible();
   });
 
   it("says when no agent can route here", async () => {
@@ -546,7 +555,32 @@ describe("the domain screen", () => {
       await screen.findByText("What this domain is for, in one paragraph."),
     ).toBeVisible();
     expect(screen.queryByRole("region", { name: "Routing" })).toBeNull();
-    expect(screen.queryByRole("region", { name: "Configuration" })).toBeNull();
+    // No sections, no card.
+    expect(
+      screen.queryByRole("region", { name: "Domain policies" }),
+    ).toBeNull();
+  });
+
+  it("draws no policies card for a MANIFEST the server could not parse", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({ policies: [] }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    // A document nobody can read declares nothing, so the server answers an
+    // empty registry rather than one at its defaults: there is no switch to
+    // offer over a MANIFEST that would have to be repaired first.
+    expect(
+      await screen.findByRole("region", { name: "Routing" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("region", { name: "Domain policies" }),
+    ).toBeNull();
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {

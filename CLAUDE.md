@@ -55,6 +55,7 @@ rustup enforces the `rust-toolchain.toml` pin: inside this repo every proxy reso
 - The Oxford comma is allowed (the ban was lifted on 2026-08-04); existing text was not rewritten, so both list styles appear in the tree
 - Temporal semantics: absent `valid_from` = has always been valid, absent `valid_to` = valid forever. Never write sentinel dates like 9999-12-31
 - `status` and `type` frontmatter fields are required and non-empty but free form - recommended value sets are guidance, never enforced globally
+- Every MANIFEST configuration key gets a registry entry (`policy_registry` in crates/core/src/manifest.rs) and a row in the domain policies card in the same change; a key with no registry entry fails the registry guard test, and the card draws its rows from the registry, so a key never has to be drawn by hand
 - Commit after each completed milestone or task
 - Use the latest stable versions of dependencies and standards; verify on crates.io rather than assuming
 - docs/deployment.md holds the deployment documentation: every scenario (text plus one mermaid chart per scenario), the container guide, the environment variable reference and read-only serving; the README keeps a Deployment section with a one-line-per-scenario table linking into it. Any change that adds or alters a deployment mode (new serve flag, new image variant, new compose example, new transport) must update docs/deployment.md and the README table in the same change

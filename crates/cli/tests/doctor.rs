@@ -544,6 +544,65 @@ fn detects_a_domain_path_that_lost_its_manifest() {
     );
 }
 
+/// A MANIFEST policy value nobody recognizes is named with what it was read
+/// as; `--fix` leaves it alone, since a policy is a decision.
+#[test]
+fn reports_a_manifest_policy_value_nobody_recognizes_and_what_it_reads_as() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(
+        &domain_dir,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\nsharing: dirct\n---\n\n# eng\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n",
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["domains"][0]["policy_problems"],
+        serde_json::json!([{ "key": "sharing", "declared": "dirct", "read_as": "proposal" }]),
+        "{report}"
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    cmd.args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .stdout(predicates::str::contains(
+            "MANIFEST sharing: dirct is not proposal or direct; read as proposal",
+        ));
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    cmd.args(["doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    assert!(
+        std::fs::read_to_string(domain_dir.join("MANIFEST.md"))
+            .unwrap()
+            .contains("sharing: dirct"),
+        "--fix does nothing here"
+    );
+}
+
 #[test]
 fn domain_filter_restricts_checks_to_one_domain() {
     let work = tempfile::tempdir().unwrap();

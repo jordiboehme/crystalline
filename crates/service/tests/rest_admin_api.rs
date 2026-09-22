@@ -430,16 +430,31 @@ async fn serve_team_with_mock() -> (Fixture, Arc<support::MockProvider>) {
     serve_team_with_mock_sharing(false).await
 }
 
+/// The MANIFEST the mock forge serves for `acme/kb`: no policy declared, so
+/// every registry key holds its default.
+const KB_MANIFEST: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
+
+/// The same MANIFEST declaring `sharing: direct`, so a share of this domain
+/// commits straight onto the connected branch.
+const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
+
 /// [`serve_team_with_mock`] with this instance's share-identity mode chosen:
 /// `personal` makes a share run as the acting account's own GitHub identity,
 /// which is the mode the share routes accept an editor in.
 async fn serve_team_with_mock_sharing(personal: bool) -> (Fixture, Arc<support::MockProvider>) {
+    serve_team_with_mock_manifest(personal, KB_MANIFEST).await
+}
+
+/// [`serve_team_with_mock_sharing`] with the MANIFEST the forge serves chosen
+/// too, so a test can register a domain whose policy is already declared
+/// upstream rather than flipping it afterwards.
+async fn serve_team_with_mock_manifest(
+    personal: bool,
+    manifest: &[u8],
+) -> (Fixture, Arc<support::MockProvider>) {
     let mock = Arc::new(support::MockProvider::new());
     let commit = mock.add_commit(std::collections::BTreeMap::from([
-        (
-            "MANIFEST.md".to_string(),
-            b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n".to_vec(),
-        ),
+        ("MANIFEST.md".to_string(), manifest.to_vec()),
         (
             "shared.md".to_string(),
             b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nA rule the team agreed on.\n".to_vec(),
@@ -753,6 +768,331 @@ async fn the_share_routes_walk_the_loop() {
     let withdrawn: serde_json::Value = withdrawn.json().await.unwrap();
     assert_eq!(withdrawn["status"], "withdrawn");
     assert_eq!(withdrawn["closed"], true);
+}
+
+/// A direct domain over REST: the preview says `commit` with the branch, the
+/// share answers `committed` with the sha and url, and the sync status names
+/// the policy and the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_share_routes_commit_on_a_direct_domain() {
+    let (fx, mock) = serve_team_with_mock_manifest(false, KB_MANIFEST_DIRECT).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    write_kb_engram(&kb_root, "notes.md", "Notes", "notes");
+
+    let plan: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(plan["action"], "commit", "{plan}");
+    assert_eq!(plan["branch"], "main");
+    assert_eq!(plan["sharing"], "direct");
+
+    let shared = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({"title": "Notes for everybody", "description": "Straight in."}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(shared.status(), 200, "{}", shared.text().await.unwrap());
+    let shared: serde_json::Value = shared.json().await.unwrap();
+    assert_eq!(shared["outcome"], "committed", "{shared}");
+    let sha = shared["sha"].as_str().unwrap();
+    assert_eq!(
+        shared["url"],
+        format!("https://forge.test/acme/kb/commit/{sha}")
+    );
+    assert_eq!(
+        mock.commit_message(sha).as_deref(),
+        Some("Notes for everybody\n\nStraight in.")
+    );
+
+    let status: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(status["sharing"], "direct", "{status}");
+    assert_eq!(status["direct_shares"][0]["sha"], sha, "{status}");
+    assert_eq!(status["open_proposals"], serde_json::json!([]));
+
+    // A proposal named in the body is the engine's refusal, as a 422.
+    write_kb_engram(&kb_root, "more.md", "More", "more");
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({"proposal": 1}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422);
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("there is no proposal to amend"),
+        "{problem}"
+    );
+}
+
+/// The manifest read carries every registry key, declared and effective, and
+/// nothing else about the switches: the old `generated_indexes` view is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifest_read_carries_the_policies_and_the_patch_writes_one() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/manifest",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let etag_before = read
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: serde_json::Value = read.json().await.unwrap();
+    assert!(
+        body["sections"].get("generated_indexes").is_none(),
+        "{body}"
+    );
+    assert_eq!(
+        body["sections"]["policies"],
+        serde_json::json!([
+            { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+            { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+        ]),
+        "{body}"
+    );
+
+    let patched = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/domains/kb/manifest",
+        &admin,
+    )
+    .json(&serde_json::json!({"sharing": "direct"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(patched.status(), 200, "{}", patched.text().await.unwrap());
+    let etag_after = patched
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(etag_before, etag_after);
+    let body: serde_json::Value = patched.json().await.unwrap();
+    assert!(
+        body["markdown"]
+            .as_str()
+            .unwrap()
+            .contains("\nsharing: direct\n"),
+        "{body}"
+    );
+    assert_eq!(
+        body["sections"]["policies"][1]["declared"], "direct",
+        "{body}"
+    );
+    assert_eq!(body["sections"]["policies"][1]["effective"], "direct");
+    assert!(
+        body.get("draft").is_none(),
+        "not a reviewing domain: {body}"
+    );
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let on_disk = std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap();
+    assert!(on_disk.contains("\nsharing: direct\n"), "{on_disk}");
+    assert!(
+        on_disk.contains("## When to Use"),
+        "every other line stands: {on_disk}"
+    );
+    // It is an unshared local change now: the way the policy reaches the team.
+    let plan: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        plan["sharing"], "direct",
+        "the folder's MANIFEST decides at once: {plan}"
+    );
+    assert!(
+        plan["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["path"] == "MANIFEST.md"),
+        "{plan}"
+    );
+
+    // A whole-document save from a stale editor is the PUT's 412.
+    let stale = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/kb/manifest",
+        &admin,
+    )
+    .header("if-match", etag_before)
+    .json(&serde_json::json!({"markdown": "---\ntitle: kb\n---\n\n## Scope\n\n- s\n\n## When to Use\n\n- w\n"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stale.status(), 412);
+}
+
+/// Every key in the body is judged before the first is written, so a bad key
+/// beside a good one leaves the MANIFEST exactly as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_patch_validates_the_whole_body_before_it_writes() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let before = std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap();
+    for (body, names) in [
+        (
+            serde_json::json!({"colour": "blue"}),
+            "generated_indexes, sharing",
+        ),
+        (serde_json::json!({"sharing": "maybe"}), "proposal, direct"),
+        (serde_json::json!({}), "at least one"),
+        (
+            serde_json::json!({"generated_indexes": "shared", "sharing": "maybe"}),
+            "proposal, direct",
+        ),
+    ] {
+        let resp = as_session(
+            fx.addr,
+            reqwest::Method::PATCH,
+            "/api/v1/domains/kb/manifest",
+            &admin,
+        )
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 422, "{body}");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            problem["detail"].as_str().unwrap().contains(names),
+            "{body}: {problem}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(kb_root.join("MANIFEST.md")).unwrap(),
+        before,
+        "nothing was written"
+    );
+}
+
+/// The policy patch is the domain owner's, and the two refusals that run
+/// around it: no CSRF token, and a read-only instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_patch_is_the_owners_and_refuses_read_only_and_a_missing_csrf_token() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    // An editor on a shared domain is not its owner: past the route's own
+    // write gate, and refused by the engine's owner rule before anything is
+    // written.
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/domains/kb/manifest",
+        &eddy,
+    )
+    .json(&serde_json::json!({"sharing": "direct"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403, "{}", resp.text().await.unwrap());
+    // A viewer never reaches that far: the route's write gate refuses first.
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/domains/kb/manifest",
+        &vera,
+    )
+    .json(&serde_json::json!({"sharing": "direct"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
+    // A session that does not echo its token is refused ahead of the handler.
+    let no_csrf = client()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{}/api/v1/domains/kb/manifest", fx.addr),
+        )
+        .header("cookie", format!("fluid_session={}", admin.0))
+        .json(&serde_json::json!({"sharing": "direct"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_csrf.status(), 403);
+
+    // Read-only: refused ahead of validation, so even garbage is 403.
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::PATCH,
+        "/api/v1/domains/kb/manifest",
+        &admin,
+    )
+    .json(&serde_json::json!({"colour": "blue"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 403);
 }
 
 /// The offline list and detail are served with no GitHub connection and on

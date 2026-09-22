@@ -77,6 +77,12 @@ fn manifest() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
+/// The same MANIFEST, declaring the policy that commits straight to the
+/// branch. Copied from `tests/origin.rs`, which pins the engine side of it.
+fn manifest_sharing_direct() -> Vec<u8> {
+    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+}
+
 fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
     format!(
         "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
@@ -1962,6 +1968,97 @@ async fn share_changes_tool_wires_through_to_origin_share() {
     // folder listing stays on this machine.
     assert_eq!(out["added"], json!(["notes/new.md"]));
     assert!(out["url"].as_str().unwrap().starts_with("https://"));
+}
+
+/// The same tool on a domain whose MANIFEST declares `sharing: direct`: the
+/// share is a commit on the branch, `origin_status` says so and names it, and
+/// a proposal somebody left open stands in the way of the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_commits_on_a_direct_domain_and_refuses_under_an_open_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock.clone()).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng.clone()).await;
+    let peer = client.peer();
+    let out = call(peer, "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], json!("committed"), "{out}");
+    let sha = out["sha"].as_str().unwrap().to_string();
+    assert_eq!(
+        out["url"],
+        json!(format!(
+            "https://forge.test/acme/brand-knowledge/commit/{sha}"
+        ))
+    );
+    assert_eq!(out["added"], json!(["notes/new.md"]));
+    let status = call(peer, "origin_status", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(status["domains"][0]["sharing"], json!("direct"), "{status}");
+    assert_eq!(
+        status["domains"][0]["direct_shares"][0]["sha"],
+        json!(sha),
+        "{status}"
+    );
+
+    let state_dir = origins_dir.join("brand");
+    let mut state = crystalline_remote::state::OriginState::load(&state_dir)
+        .unwrap()
+        .unwrap();
+    state.proposals.push(crystalline_remote::state::Proposal {
+        number: 2,
+        url: "https://github.test/pull/2".to_string(),
+        branch: "crystalline/share-brand-x".to_string(),
+        title: "Old".to_string(),
+        created_at: chrono::Utc::now(),
+        status: crystalline_remote::state::ProposalStatus::Open,
+        files: vec![],
+        head_commit: None,
+        pending_head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: vec![],
+        updated_at: None,
+        author_login: None,
+    });
+    state.save(&state_dir).unwrap();
+    // The forge knows it too, so the share's own pull refreshes it rather than
+    // asking after a proposal that exists on this machine alone.
+    mock.set_proposal_state(2, crystalline_remote::ProposalState::Open);
+    std::fs::write(root.join("notes/more.md"), engram("More", "more", "more")).unwrap();
+    let out = call(peer, "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], json!("proposal_open"), "{out}");
+    assert_eq!(out["proposal"]["number"], json!(2));
+    assert!(
+        out["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("merge or withdraw proposal #2 first")
+    );
 }
 
 /// A team-domain engine with one engram edited beside the base copy and one

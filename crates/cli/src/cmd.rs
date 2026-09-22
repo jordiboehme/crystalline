@@ -584,68 +584,125 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 /// at `origin resolve`. A proposal that stands in a chain of two or more open
 /// layers also says where it sits, through [`stack_line`]; a share that also
 /// carried refreshed folder listings says so in one line of its own, through
-/// [`print_change_counts`].
+/// [`change_count_lines`]. A direct domain's commit is reported with its
+/// branch and page (`committed`), and so are the three direct refusals: a
+/// proposal still open, a branch whose rules refuse the commit, a branch that
+/// moved twice.
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
         return;
     }
+    for line in origin_share_lines(domain, data) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_origin_share`] prints, built rather than printed so the
+/// wording of every outcome is a unit test rather than a subprocess.
+pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<String> {
     let empty = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
     match data["outcome"].as_str().unwrap_or("") {
         "proposed" => {
-            println!("Opened proposal: {}", data["url"].as_str().unwrap_or(""));
+            lines.push(format!(
+                "Opened proposal: {}",
+                data["url"].as_str().unwrap_or("")
+            ));
             if let Some(summary) = data["summary"].as_str() {
-                println!("  {summary}");
+                lines.push(format!("  {summary}"));
             }
-            print_change_counts(data);
+            lines.extend(change_count_lines(data));
             if let Some(line) = stack_line(data) {
-                println!("  {line}");
+                lines.push(format!("  {line}"));
             }
-            print_skipped_large(&data["skipped_large"]);
+            lines.extend(skipped_large_lines(&data["skipped_large"]));
         }
         "updated" => {
             let prop = &data["proposal"];
-            println!(
+            lines.push(format!(
                 "Updated proposal #{}: {}",
                 prop["number"].as_u64().unwrap_or(0),
                 prop["url"].as_str().unwrap_or("")
-            );
+            ));
             if let Some(summary) = prop["summary"].as_str() {
-                println!("  {summary}");
+                lines.push(format!("  {summary}"));
             }
-            print_change_counts(prop);
+            lines.extend(change_count_lines(prop));
             if let Some(line) = stack_line(prop) {
-                println!("  {line}");
+                lines.push(format!("  {line}"));
             }
-            print_skipped_large(&prop["skipped_large"]);
+            lines.extend(skipped_large_lines(&prop["skipped_large"]));
+        }
+        "committed" => {
+            let sha = data["sha"].as_str().unwrap_or("");
+            let short: String = sha.chars().take(7).collect();
+            let at = data["url"].as_str().map(str::to_string).unwrap_or(short);
+            lines.push(format!(
+                "Committed to {}: {at}",
+                data["branch"].as_str().unwrap_or("")
+            ));
+            if let Some(summary) = data["summary"].as_str() {
+                lines.push(format!("  {summary}"));
+            }
+            lines.extend(change_count_lines(data));
+            lines.extend(skipped_large_lines(&data["skipped_large"]));
+        }
+        "proposal_open" => {
+            let prop = &data["proposal"];
+            lines.push(format!(
+                "Cannot share '{domain}': proposal #{} ({}) is still open; merge or withdraw it first.",
+                prop["number"].as_u64().unwrap_or(0),
+                prop["url"].as_str().unwrap_or("")
+            ));
+        }
+        "branch_protected" => {
+            lines.push(format!(
+                "Cannot commit to {}: {} Set sharing: proposal in the MANIFEST, or ask a repository admin.",
+                data["branch"].as_str().unwrap_or(""),
+                data["message"].as_str().unwrap_or("")
+            ));
+        }
+        "branch_moved" => {
+            lines.push(format!(
+                "The branch {} moved while sharing; run: crystalline origin update --domain {domain} and share again.",
+                data["branch"].as_str().unwrap_or("")
+            ));
         }
         "proposal_diverged" => {
             let prop = &data["proposal"];
-            println!(
+            lines.push(format!(
                 "Cannot update proposal #{} ({}): a reviewer amended its branch.",
                 prop["number"].as_u64().unwrap_or(0),
                 prop["url"].as_str().unwrap_or("")
-            );
+            ));
             if let Some(guidance) = data["guidance"].as_str() {
-                println!("  {guidance}");
+                lines.push(format!("  {guidance}"));
             }
         }
         "nothing_to_share" => {
-            println!("Nothing to share: '{domain}' already matches its origin.");
-            print_skipped_large(&data["skipped_large"]);
+            lines.push(format!(
+                "Nothing to share: '{domain}' already matches its origin."
+            ));
+            lines.extend(skipped_large_lines(&data["skipped_large"]));
         }
         "conflicts_pending" => {
-            println!(
+            lines.push(format!(
                 "Cannot share '{domain}': {} conflict(s) need to be resolved first.",
                 data["count"].as_u64().unwrap_or(0)
-            );
+            ));
             for c in data["conflicts"].as_array().unwrap_or(&empty) {
-                println!("  conflict: {}", c["path"].as_str().unwrap_or(""));
+                lines.push(format!("  conflict: {}", c["path"].as_str().unwrap_or("")));
             }
-            println!("Run: crystalline origin resolve {domain} <path> --keep mine|theirs");
+            lines.push(format!(
+                "Run: crystalline origin resolve {domain} <path> --keep mine|theirs"
+            ));
         }
-        other => println!("origin share '{domain}': unexpected outcome '{other}'"),
+        other => lines.push(format!(
+            "origin share '{domain}': unexpected outcome '{other}'"
+        )),
     }
+    lines
 }
 
 /// Where a shared proposal sits in its chain, or `None` when there is no
@@ -674,9 +731,9 @@ fn stack_line(proposal: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// Print a shared proposal's change mix: one line of counts for the work
-/// somebody wrote, and one quiet line for the folder listings that rode along
-/// with it.
+/// A shared proposal's or a direct commit's change mix: one line of counts for
+/// the work somebody wrote, and one quiet line for the folder listings that
+/// rode along with it.
 ///
 /// The listings are `index.md` files, generated from the engrams beside them.
 /// They travel with a share only in a domain that declares
@@ -685,16 +742,19 @@ fn stack_line(proposal: &serde_json::Value) -> Option<String> {
 /// recognize their own work. The second line is skipped entirely when there
 /// are none, which is most shares and all of them in a domain that keeps its
 /// listings local.
-fn print_change_counts(proposal: &serde_json::Value) {
+fn change_count_lines(proposal: &serde_json::Value) -> Vec<String> {
     let (added, added_indexes) = split_indexes(&proposal["added"]);
     let (updated, updated_indexes) = split_indexes(&proposal["updated"]);
     let (deleted, deleted_indexes) = split_indexes(&proposal["deleted"]);
-    println!("  {added} added, {updated} updated, {deleted} deleted");
+    let mut lines = vec![format!(
+        "  {added} added, {updated} updated, {deleted} deleted"
+    )];
     let indexes = added_indexes + updated_indexes + deleted_indexes;
     if indexes > 0 {
         let noun = if indexes == 1 { "index" } else { "indexes" };
-        println!("  also refreshes {indexes} folder {noun}");
+        lines.push(format!("  also refreshes {indexes} folder {noun}"));
     }
+    lines
 }
 
 /// How many of a path list are real work and how many are generated folder
@@ -712,15 +772,20 @@ fn split_indexes(paths: &serde_json::Value) -> (usize, usize) {
     (work, indexes)
 }
 
-fn print_skipped_large(skipped_large: &serde_json::Value) {
+fn skipped_large_lines(skipped_large: &serde_json::Value) -> Vec<String> {
     let empty = Vec::new();
-    for s in skipped_large.as_array().unwrap_or(&empty) {
-        println!(
-            "  skipped (too large): {} ({} bytes)",
-            s[0].as_str().unwrap_or(""),
-            s[1].as_u64().unwrap_or(0)
-        );
-    }
+    skipped_large
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|s| {
+            format!(
+                "  skipped (too large): {} ({} bytes)",
+                s[0].as_str().unwrap_or(""),
+                s[1].as_u64().unwrap_or(0)
+            )
+        })
+        .collect()
 }
 
 /// Print `origin withdraw`'s result: what was closed, what was restored,
@@ -2977,6 +3042,66 @@ fn print_report(r: &crystalline_index::SyncReport) {
     );
     for (path, err) in &r.failed {
         println!("  failed: {path}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod origin_share_tests {
+    use super::origin_share_lines;
+    use serde_json::json;
+
+    #[test]
+    fn a_commit_prints_the_branch_the_link_the_summary_and_the_counts() {
+        let lines = origin_share_lines(
+            "kb",
+            &json!({
+                "outcome": "committed", "sha": "9f2c1a7deadbeef", "url": "https://github.com/acme/knowledge/commit/9f2c1a7deadbeef",
+                "branch": "main", "added": ["notes/b.md"], "updated": ["notes/a.md"], "deleted": [], "skipped_large": [],
+                "summary": "Shares 1 new engram and refines 1 engram.",
+            }),
+        );
+        assert_eq!(
+            lines[0],
+            "Committed to main: https://github.com/acme/knowledge/commit/9f2c1a7deadbeef"
+        );
+        assert_eq!(lines[1], "  Shares 1 new engram and refines 1 engram.");
+        assert_eq!(lines[2], "  1 added, 1 updated, 0 deleted");
+        let no_url = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "committed", "sha": "9f2c1a7deadbeef", "url": null, "branch": "main", "added": [], "updated": [], "deleted": [], "skipped_large": [], "summary": "s" }),
+        );
+        assert_eq!(
+            no_url[0], "Committed to main: 9f2c1a7",
+            "the short sha stands in for a forge with no page"
+        );
+    }
+
+    #[test]
+    fn the_three_direct_refusals_say_the_way_out() {
+        let open = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "proposal_open", "proposal": { "number": 4, "url": "https://github.com/acme/knowledge/pull/4", "title": "Refine" }, "guidance": "g" }),
+        );
+        assert_eq!(
+            open[0],
+            "Cannot share 'kb': proposal #4 (https://github.com/acme/knowledge/pull/4) is still open; merge or withdraw it first."
+        );
+        let protected = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": "g" }),
+        );
+        assert_eq!(
+            protected[0],
+            "Cannot commit to main: Changes must be made through a pull request. Set sharing: proposal in the MANIFEST, or ask a repository admin."
+        );
+        let moved = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "branch_moved", "branch": "main", "guidance": "g" }),
+        );
+        assert_eq!(
+            moved[0],
+            "The branch main moved while sharing; run: crystalline origin update --domain kb and share again."
+        );
     }
 }
 

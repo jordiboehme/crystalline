@@ -23,9 +23,7 @@ use super::{
 };
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
-use crystalline_core::{
-    GeneratedIndexes, Manifest, ProblemKind, TagAliasProblemKind, parse_engram,
-};
+use crystalline_core::{Manifest, ProblemKind, TagAliasProblemKind, parse_engram, policy_registry};
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
 /// routing bullets, plus the behavior rules that govern them.
@@ -249,9 +247,10 @@ pub async fn tree(
                    use.\n\n`sections` is what the core crate reads out of the \
                    source: the routing bullets and which of them an agent \
                    reads, the provisioning and tag alias declarations with \
-                   every bullet that did not parse, and the \
-                   `generated_indexes` switch. `null` for `provisioning` or \
-                   `tag_aliases` means the section is absent.",
+                   every bullet that did not parse, and every frontmatter \
+                   policy key with what it declares and what holds. `null` \
+                   for `provisioning` or `tag_aliases` means the section is \
+                   absent.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -285,7 +284,10 @@ pub async fn tree(
                     "missing": [],
                     "provisioning": null,
                     "tag_aliases": null,
-                    "generated_indexes": { "declared": null, "effective": "local" }
+                    "policies": [
+                        { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                        { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                    ]
                 }
             }),
         ),
@@ -341,7 +343,7 @@ pub async fn manifest(
         )
             .into_response());
     }
-    let mut resp = manifest_response(&domain, markdown, StatusCode::OK)?;
+    let mut resp = manifest_response(&domain, markdown, StatusCode::OK, None)?;
     resp.headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
     Ok(resp)
@@ -353,8 +355,8 @@ pub async fn manifest(
 #[schema(description = "The MANIFEST source beside the domain it belongs to, \
                         its checksum, and the features parsed out of it: \
                         what an agent routes by, what the domain provisions, \
-                        which tags fold into which, and the one frontmatter \
-                        switch.")]
+                        which tags fold into which, and every frontmatter \
+                        policy key with what it declares and what holds.")]
 pub struct ManifestResponse {
     /// The domain the MANIFEST introduces.
     #[schema(example = "eng")]
@@ -387,9 +389,12 @@ pub struct ManifestSections {
     pub provisioning: Option<ProvisioningView>,
     /// The `Tag Aliases` section, or `null` when the MANIFEST has none.
     pub tag_aliases: Option<TagAliasesView>,
-    /// The `generated_indexes` frontmatter switch: what is declared and what
-    /// holds.
-    pub generated_indexes: GeneratedIndexesView,
+    /// Every MANIFEST configuration key the core crate knows, with what the
+    /// frontmatter declares and what holds. Drawn from the policy registry, so
+    /// a key added there appears here without a line of this file changing.
+    /// Empty for a MANIFEST that did not parse: a document nobody can read
+    /// declares nothing.
+    pub policies: Vec<PolicyView>,
 }
 
 /// Which routing section an agent reads.
@@ -458,16 +463,49 @@ pub struct TagAliasDeclView {
     pub canonical: String,
 }
 
-/// The `generated_indexes` switch: declared, and effective.
+/// One MANIFEST policy key: the registry row beside what this MANIFEST says.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct GeneratedIndexesView {
-    /// The value as the frontmatter writes it, or `null` when the key is
-    /// absent.
-    #[schema(example = "shared")]
+pub struct PolicyView {
+    /// The frontmatter key.
+    #[schema(example = "sharing")]
+    pub key: String,
+    /// The value as the frontmatter writes it, or `null` when the key is absent.
+    #[schema(example = "direct")]
     pub declared: Option<String>,
-    /// `local` or `shared`. Absent and unrecognized both fall to `local`.
-    #[schema(example = "local")]
+    /// The value that holds: absent and unrecognized both fall to `default`.
+    #[schema(example = "direct")]
     pub effective: String,
+    /// The values the key takes, in display order.
+    pub values: Vec<String>,
+    /// What an absent or unrecognized declaration is read as.
+    #[schema(example = "proposal")]
+    pub default: String,
+    /// One line, present tense.
+    pub meaning: String,
+    /// Who may change it: `owner` (the domain's owner or an instance admin) or `admin`.
+    #[schema(example = "owner")]
+    pub changed_by: String,
+}
+
+/// The registry rows, joined with what `manifest` declares. A key the manifest
+/// does not know is at its registry default, which is what an absent
+/// declaration means.
+fn policies_of(manifest: &Manifest) -> Vec<PolicyView> {
+    policy_registry()
+        .iter()
+        .map(|spec| {
+            let (declared, effective) = manifest.policy(spec.key).unwrap_or((None, spec.default));
+            PolicyView {
+                key: spec.key.to_string(),
+                declared: declared.map(str::to_string),
+                effective: effective.to_string(),
+                values: spec.values.iter().map(|v| v.to_string()).collect(),
+                default: spec.default.to_string(),
+                meaning: spec.meaning.to_string(),
+                changed_by: spec.changed_by.as_str().to_string(),
+            }
+        })
+        .collect()
 }
 
 impl ManifestSections {
@@ -486,10 +524,9 @@ impl ManifestSections {
                 missing: vec!["Scope".to_string(), "When to Use".to_string()],
                 provisioning: None,
                 tag_aliases: None,
-                generated_indexes: GeneratedIndexesView {
-                    declared: None,
-                    effective: GeneratedIndexes::Local.as_str().to_string(),
-                },
+                // Not the registry defaults: nothing here was declared, and
+                // nothing here can be, until the document parses again.
+                policies: Vec::new(),
             };
         };
         let manifest = Manifest::from_engram(&engram, markdown);
@@ -547,10 +584,7 @@ impl ManifestSections {
                     })
                     .collect(),
             }),
-            generated_indexes: GeneratedIndexesView {
-                declared: manifest.declared_generated_indexes().map(str::to_string),
-                effective: manifest.generated_indexes().as_str().to_string(),
-            },
+            policies: policies_of(&manifest),
         }
     }
 }
@@ -644,7 +678,10 @@ pub struct SaveManifestBody {
                     "missing": [],
                     "provisioning": null,
                     "tag_aliases": null,
-                    "generated_indexes": { "declared": null, "effective": "local" }
+                    "policies": [
+                        { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                        { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                    ]
                 }
             }),
         ),
@@ -741,7 +778,7 @@ pub async fn save_manifest(
         .save_manifest(&domain, &body.markdown, &token)
         .await
     {
-        Ok(_) => manifest_response(&domain, body.markdown, StatusCode::OK),
+        Ok(_) => manifest_response(&domain, body.markdown, StatusCode::OK, None),
         // The same stale-edit translation `engrams::save` makes, repeated
         // rather than shared for the same reason.
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
@@ -751,6 +788,139 @@ pub async fn save_manifest(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// What `PATCH /domains/{domain}/manifest` takes: registry keys to values.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(
+    description = "One or more MANIFEST policy keys to the value each should \
+                   hold, for example {\"sharing\": \"direct\"}. Every key is \
+                   validated before the first is written."
+)]
+pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
+
+/// `PATCH /domains/{domain}/manifest` - set one or more MANIFEST policy keys
+/// through the engine's edit path, so disk, index, an unshared local change
+/// on a team domain and a draft in a reviewing domain all follow.
+///
+/// Gates, in order: read-only, an account, domain write, then per key the
+/// owner right (the engine's `require_domain_owner`, the rule
+/// `set_review_mode` applies) or the admin role for a key the registry marks
+/// `admin`. No `If-Match`: the write is one keyed line and the engine's
+/// compare-and-write serializes it against a concurrent editor save, whose
+/// later whole-document `PUT` still gets its 412.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/domains/{domain}/manifest",
+    tag = "domains",
+    operation_id = "set_domain_policies",
+    summary = "Set one or more MANIFEST policy keys.",
+    description = "The domain's owner (or an instance admin) changes the MANIFEST's \
+                   configuration keys - `generated_indexes`, `sharing` - without \
+                   editing the document: each key becomes one frontmatter line, \
+                   every other line stands, and the `generated` block is stamped \
+                   as on any edit. On a team domain the MANIFEST becomes an \
+                   unshared local change the next share carries; in a domain \
+                   that reviews changes the write lands in the caller's own \
+                   draft of the MANIFEST and the response says `draft: true`, \
+                   the domain's policy changing only when that draft lands. An \
+                   unknown key, a value the key does not take, or an empty \
+                   object is 422 and writes nothing, even beside a good key.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    request_body = SetPoliciesBody,
+    responses(
+        (
+            status = 200,
+            description = "The manifest as it now reads for this caller, mirroring the \
+                           GET shape, plus `draft: true` when it is the caller's draft.",
+            body = ManifestResponse,
+            headers(("etag" = String, description = "The quoted checksum of the manifest as it now reads.")),
+            example = json!({
+                "domain": "kb",
+                "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
+                "checksum": "3f8a1c05e2",
+                "sections": {
+                    "scope": ["Everything about kb"],
+                    "when_to_use": ["Route here for kb questions."],
+                    "routing": "when_to_use",
+                    "missing": [],
+                    "provisioning": null,
+                    "tag_aliases": null,
+                    "policies": [
+                        { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
+                        { "key": "sharing", "declared": "direct", "effective": "direct", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                    ]
+                }
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "This instance is read-only (answered ahead of \
+                           validation), the caller may write the domain but \
+                           is neither its owner nor an admin, the key needs \
+                           an admin, or the request did not echo its CSRF \
+                           token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "An unknown key (the detail names the registry \
+                           keys), a value the key does not take (the detail \
+                           names the allowed values), or an empty object. \
+                           Nothing was written.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_domain_policies(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<SetPoliciesBody>,
+) -> Result<Response, ApiError> {
+    super::refuse_read_only(&state)?;
+    identity.require_account()?;
+    super::require_domain_write(&state, &identity, &domain).await?;
+    // The admin gate is this layer's: the engine cannot ask a scope whether
+    // it administers the instance. No key needs it today.
+    for key in body.0.keys() {
+        if policy_registry()
+            .iter()
+            .any(|spec| spec.key == key && spec.changed_by == crystalline_core::PolicyRole::Admin)
+        {
+            identity.require_admin()?;
+        }
+    }
+    let changes: Vec<(String, String)> = body.0.into_iter().collect();
+    let written = state
+        .engine
+        .set_manifest_policies(&domain, &changes, &identity.scope())
+        .await?;
+    let markdown = written["markdown"].as_str().unwrap_or_default().to_string();
+    // Said only when it is true: an ordinary domain's answer is the GET shape
+    // exactly.
+    let extra = (written["draft"] == Value::Bool(true)).then_some(("draft", Value::Bool(true)));
+    manifest_response(&domain, markdown, StatusCode::OK, extra)
 }
 
 /// The prefix every refused compare-and-swap opens with, wherever the
@@ -766,25 +936,37 @@ const STALE_EDIT: &str = "stale edit";
 ///
 /// The sections are read from the markdown on every answer, a save's
 /// included, so a client that just saved holds the features of what it saved.
+///
+/// `extra` is one more top-level key beside the documented shape, which only
+/// [`set_domain_policies`] passes: its `draft` says the write landed in the
+/// caller's own draft rather than in the domain. A key rather than a field of
+/// [`ManifestResponse`], because the other two answers have nothing to say
+/// about drafts and would carry it as noise.
 fn manifest_response(
     domain: &str,
     markdown: String,
     status: StatusCode,
+    extra: Option<(&str, Value)>,
 ) -> Result<Response, ApiError> {
     let checksum = manifest_checksum(&markdown);
     let etag = HeaderValue::from_str(&format!("\"{checksum}\""))
         .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
     let sections = ManifestSections::of(&markdown);
-    let mut resp = (
-        status,
-        Json(ManifestResponse {
-            domain: domain.to_string(),
-            markdown,
-            checksum,
-            sections,
-        }),
-    )
-        .into_response();
+    let payload = ManifestResponse {
+        domain: domain.to_string(),
+        markdown,
+        checksum,
+        sections,
+    };
+    let mut resp = match extra {
+        None => (status, Json(payload)).into_response(),
+        Some((key, value)) => {
+            let mut body = serde_json::to_value(payload)
+                .map_err(|_| ApiError::internal("the manifest response could not be shaped"))?;
+            body[key] = value;
+            (status, Json(body)).into_response()
+        }
+    };
     resp.headers_mut().insert(ETAG, etag);
     Ok(resp)
 }
