@@ -58,10 +58,10 @@ pub mod web_url;
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use client::{
-    collect_orphaned_domains, configure, ctl_if_running, ctl_required, domain_export,
-    domain_import, domain_remove, domain_review, origin_add, origin_resolve, origin_share,
-    origin_status, origin_update, origin_withdraw, run_mcp, run_tool, scaffold_virtual_manifest,
-    tags_retag, use_daemon, virtual_routing_bullets,
+    collect_orphaned_domains, configure, ctl_if_running, ctl_if_running_passive, ctl_required,
+    domain_export, domain_import, domain_remove, domain_review, origin_add, origin_resolve,
+    origin_share, origin_status, origin_update, origin_withdraw, run_mcp, run_tool,
+    scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
 pub use engine::{

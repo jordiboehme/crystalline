@@ -382,6 +382,11 @@ fn install_into_an_empty_home_writes_the_exact_managed_shape() {
                 {
                     "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 10 } ]
                 }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [ { "type": "command", "command": "crystalline hook prompt --harness claude-code", "timeout": 5 } ]
+                }
             ]
         }
     });
@@ -487,6 +492,10 @@ fn foreign_hooks_survive_install_and_uninstall() {
         after_install["hooks"]["Stop"][0]["hooks"][0]["command"],
         "crystalline hook stop --harness claude-code"
     );
+    assert_eq!(
+        after_install["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        "crystalline hook prompt --harness claude-code"
+    );
 
     install_cmd(&home, &bin_dir)
         .args(["uninstall", "claude-code"])
@@ -513,6 +522,13 @@ fn foreign_hooks_survive_install_and_uninstall() {
             .as_object()
             .unwrap()
             .get("Stop")
+            .is_none()
+    );
+    assert!(
+        after_uninstall["hooks"]
+            .as_object()
+            .unwrap()
+            .get("UserPromptSubmit")
             .is_none()
     );
     assert!(
@@ -652,6 +668,10 @@ fn codex_writes_hooks_json_and_agents_skills_with_a_trust_notice() {
         settings["hooks"]["Stop"][0]["hooks"][0]["command"],
         "crystalline hook stop --harness codex"
     );
+    assert_eq!(
+        settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+        "crystalline hook prompt --harness codex"
+    );
 
     // Skills land under ~/.agents/skills.
     assert!(
@@ -687,7 +707,10 @@ fn copilot_skill(home: &Path, name: &str) -> PathBuf {
 /// The exact managed content of the Copilot-owned hooks file: the version
 /// marker, PascalCase event names (they select the snake_case payloads
 /// `crystalline hook stop` already parses) and flat command entries in
-/// Copilot's field spellings.
+/// Copilot's field spellings. The `UserPromptSubmit` entry is written too
+/// (ruled 2026-09-21, forward compatibility) even though Copilot drops a
+/// config-file prompt hook's output today - `crystalline doctor` is what
+/// reports it as present but inert, not this shape.
 fn copilot_managed_hooks() -> Value {
     json!({
         "version": 1,
@@ -697,6 +720,9 @@ fn copilot_managed_hooks() -> Value {
             ],
             "Stop": [
                 { "type": "command", "command": "crystalline hook stop --harness copilot", "timeoutSec": 10 }
+            ],
+            "UserPromptSubmit": [
+                { "type": "command", "command": "crystalline hook prompt --harness copilot", "timeoutSec": 5 }
             ]
         }
     })
@@ -1731,6 +1757,16 @@ fn prompt_system_rewrites_the_bare_hook_commands_of_an_older_release() {
         stop_hooks[0]["command"],
         "crystalline hook stop --harness claude-code"
     );
+    // The prompt hook did not exist when this file was written, so the
+    // reconcile gains a brand new group for it rather than rewriting one.
+    let prompt = settings["hooks"]["UserPromptSubmit"].as_array().unwrap();
+    assert_eq!(prompt.len(), 1, "exactly one UserPromptSubmit group");
+    let prompt_hooks = prompt[0]["hooks"].as_array().unwrap();
+    assert_eq!(prompt_hooks.len(), 1, "exactly one UserPromptSubmit hook");
+    assert_eq!(
+        prompt_hooks[0]["command"],
+        "crystalline hook prompt --harness claude-code"
+    );
 
     let receipt = read_json(&receipt_file(&home));
     assert_eq!(receipt["installs"][0]["version"], env!("CARGO_PKG_VERSION"));
@@ -1749,7 +1785,11 @@ fn prompt_system_rewrites_the_bare_hook_commands_of_an_older_release() {
 
 /// The other half of ownership: a settings file still carrying the bare
 /// commands is recognized as ours by `uninstall`, which would otherwise walk
-/// away leaving a hook behind that nothing reconciles any more.
+/// away leaving a hook behind that nothing reconciles any more. A bare
+/// `UserPromptSubmit` group is seeded alongside the other two bare groups
+/// (no real older release ever wrote one bare, since the hook postdates
+/// `--harness`, but ownership by leading words alone must claim it exactly
+/// the same way).
 #[test]
 fn uninstall_removes_the_bare_commands_of_an_older_release() {
     let work = tempfile::tempdir().unwrap();
@@ -1758,11 +1798,16 @@ fn uninstall_removes_the_bare_commands_of_an_older_release() {
     let log = work.path().join("claude.log");
     write_shim(&bin_dir, "claude", &log);
 
+    let mut seeded = bare_claude_hooks();
+    seeded["hooks"]["UserPromptSubmit"] = json!([
+        { "hooks": [ { "type": "command", "command": "crystalline hook prompt", "timeout": 5 } ] }
+    ]);
+
     let settings_path = claude_settings(&home);
     std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
     std::fs::write(
         &settings_path,
-        serde_json::to_string_pretty(&bare_claude_hooks()).unwrap(),
+        serde_json::to_string_pretty(&seeded).unwrap(),
     )
     .unwrap();
 

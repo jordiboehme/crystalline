@@ -465,6 +465,26 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
     (connect_socket().await, false)
 }
 
+/// Attach to a running daemon exactly as it is: read the lock record, check
+/// the pid, connect. Unlike [`try_attach`] it never displaces an older daemon
+/// and never waits on one leaving, so the whole call is a file read, a pid
+/// check and a connect - microseconds when no daemon runs, and never the six
+/// seconds a graceful takeover can cost.
+///
+/// That is what a per-prompt hook needs: it runs in front of a person's
+/// prompt, it has a one-second budget for the whole exchange, and a takeover
+/// is `crystalline mcp`'s to do at the next session start, where seconds are
+/// affordable and a respawn follows. A daemon older than this binary answers
+/// `tool search_engrams` the same way, so attaching as-is costs nothing but
+/// the version's own behaviour.
+pub async fn try_attach_passive() -> Option<Connection> {
+    let info = read_lock_info()?;
+    if !process_alive(info.pid) {
+        return None;
+    }
+    connect_socket().await
+}
+
 /// Connect to the daemon socket at its configured path.
 async fn connect_socket() -> Option<Connection> {
     let sock = config::service_sock_path().ok()?;

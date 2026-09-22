@@ -11,7 +11,7 @@ Crystalline organizes what you have been taught into Domains, each with a `MANIF
 
 At session start you are handed a routing block - injected as a session prompt in some harnesses, served as the MCP server's own instructions in others - with one routing line per registered domain summarizing when to use it, built from its `MANIFEST.md` `## When to Use` bullets, plus the crystalline MCP tool names (`search_engrams`, `write_engram` and the rest) those domains route through. Treat each routing line as a targeting aid, not a complete catalog - a domain that looks unrelated at a glance may still hold the answer.
 
-Either way, `list_domains` with `include_routing: true` re-fetches the same index mid-session.
+Either way, `list_domains` with `include_routing: true` re-fetches the same index mid-session. In a harness with the per-prompt hook, a prompt may arrive with a short "Knowledge that may apply" block naming engrams by `crystalline://` address: read the ones that fit with `read_engram` (the address is the identifier), and treat the block as a head start, not as the search you would otherwise run - a topic it does not name is still searched.
 
 A line naming a domain that "ships artifacts to provision" with no decision yet is a pending provisioning decision, not routine routing information: summarize in one sentence what the domain would ship, ask the user whether to allow it and only then apply their answer with the `provision` tool or `crystalline provision allow <domain>` / `deny <domain>` - never decide on the user's behalf.
 
