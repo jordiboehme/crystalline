@@ -89,8 +89,6 @@ The package ships a systemd unit, installed disabled: see [Linux server with sys
 
 Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<version>-windows-arm64.msi` for Arm devices) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and double-click it, or install silently with `msiexec /i <file> /qn`. The installer adds Crystalline to the system PATH and upgrades in place. Windows releases are not code signed yet, so verify against `SHA256SUMS` and confirm the SmartScreen prompt (More info > Run anyway).
 
-Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file, or build from a clone with `cargo build --release`. The macOS binaries are code signed and notarized, so Gatekeeper runs them without a prompt.
-
 </details>
 
 <details>
@@ -106,6 +104,8 @@ Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also
 | From the terminal | [The CLI mirrors everything an agent can do](docs/setup/terminal.md) |
 
 </details>
+
+Every [release](https://github.com/jordiboehme/crystalline/releases/latest) also ships the standalone `crystalline` binary for macOS (Apple Silicon and Intel), Linux (x86_64 and arm64, statically linked) and Windows (x64 and Arm64), with a `SHA256SUMS` file, or build from a clone with `cargo build --release`. The macOS binaries are code signed and notarized, so Gatekeeper runs them without a prompt.
 
 ## Why not a memory feature
 
