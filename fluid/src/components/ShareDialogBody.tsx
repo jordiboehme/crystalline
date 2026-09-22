@@ -37,8 +37,8 @@
  * menu on a row discards that one file, and "Discard selected" discards the
  * ticked set. Both ask first, in a strip under the list naming what goes -
  * never a typed confirmation, because the files name themselves - and both
- * post the digest the plan was read with, so a file somebody has edited since
- * is refused instead of being thrown away. A refusal lands on its own row, and
+ * post the digest each file wore when the question was asked, so a file
+ * somebody has edited since is refused instead of being thrown away. A refusal lands on its own row, and
  * the plan is read again afterwards, so the list says what is actually left.
  *
  * Which of those files travel is a choice too, and on a shared instance it is
@@ -152,9 +152,18 @@ export default function ShareDialogBody({
   );
   /** The path whose diff is up, or null while the form is. */
   const [pane, setPane] = useState<string | null>(null);
-  /** What a confirmed discard would take, and where to put the keyboard back. */
+  /**
+   * What a confirmed discard would take, and where to put the keyboard back.
+   *
+   * The digests are captured here, when the question is asked, rather than
+   * read off the plan when it is answered. The plan is refetched behind this
+   * strip - by a window coming back, by the card behind it, by this dialog's
+   * own invalidation - and a file edited while the question was on the screen
+   * would otherwise be discarded against its new digest, which is exactly the
+   * edit the guard exists to refuse.
+   */
   const [arming, setArming] = useState<{
-    paths: string[];
+    targets: { path: string; sha: string | null }[];
     from: HTMLElement | null;
   } | null>(null);
   /** Why the server refused a path last time, drawn on that path's own row. */
@@ -296,9 +305,9 @@ export default function ShareDialogBody({
   /**
    * Putting the ticked files back the way the team has them.
    *
-   * Every target carries the digest the plan was read with, so a file somebody
-   * has edited since this dialog opened is refused by name rather than having
-   * that edit thrown away. The rows leave the held plan the moment the receipt
+   * Every target carries the digest its row wore when the strip armed, so a
+   * file somebody has edited since is refused by name rather than having that
+   * edit thrown away. The rows leave the held plan the moment the receipt
    * says they are gone, and the refetch the effect below fires is what confirms
    * it against the engine.
    */
@@ -643,7 +652,17 @@ export default function ShareDialogBody({
                   mayDiscard
                     ? (path, from) => {
                         setDiscardProblem(null);
-                        setArming({ paths: [path], from });
+                        setArming({
+                          targets: [
+                            {
+                              path,
+                              sha:
+                                changes.find((c) => c.path === path)?.sha ??
+                                null,
+                            },
+                          ],
+                          from,
+                        });
                       }
                     : undefined
                 }
@@ -651,21 +670,15 @@ export default function ShareDialogBody({
               {arming !== null && (
                 <DiscardConfirm
                   question={
-                    arming.paths.length === 1
-                      ? `Discard ${arming.paths[0] ?? ""}?`
-                      : `Discard ${plural(arming.paths.length, "file", "files")}?`
+                    arming.targets.length === 1
+                      ? `Discard ${arming.targets[0]?.path ?? ""}?`
+                      : `Discard ${plural(arming.targets.length, "file", "files")}?`
                   }
                   pending={discard.isPending}
                   problem={discardProblem}
                   onConfirm={() => {
                     setDiscardProblem(null);
-                    // The digests this dialog was drawn from, not whatever is
-                    // on disk now: a file that moved since is refused by name.
-                    const targets = arming.paths.map((path) => ({
-                      path,
-                      sha: changes.find((c) => c.path === path)?.sha ?? null,
-                    }));
-                    discard.mutate(targets);
+                    discard.mutate(arming.targets);
                   }}
                   onCancel={() => {
                     const from = arming.from;
@@ -732,9 +745,12 @@ export default function ShareDialogBody({
                     onClick={(event) => {
                       setDiscardProblem(null);
                       setArming({
-                        paths: real
+                        targets: real
                           .filter((change) => selected.has(change.path))
-                          .map((change) => change.path),
+                          .map((change) => ({
+                            path: change.path,
+                            sha: change.sha,
+                          })),
                         from: event.currentTarget,
                       });
                     }}

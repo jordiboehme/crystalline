@@ -8,7 +8,7 @@
  * nothing on the screen could open it.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1653,6 +1653,64 @@ describe("seeing and discarding changes from the dialog", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: /share/i })).toBeNull();
     });
+  });
+
+  it("posts the digest the strip was armed with, not one the plan grew since", async () => {
+    let sha = "9f2c";
+    const discarded = vi.fn(() => ({
+      domain: "eng",
+      restored: [],
+      deleted: [],
+      cleared: [],
+      refused: [{ path: "notes/a.md", reason: "changed_since" }],
+      reindexed: 0,
+    }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "modified", sha }],
+      }),
+      "/domains/eng/changes/discard": (_path, init) =>
+        init?.method === "POST" ? discarded() : null,
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await within(dialog).findByRole("checkbox", { name: "notes/a.md" });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Discard selected" }),
+    );
+    expect(
+      await within(dialog).findByText(/Discard notes\/a\.md\?/),
+    ).toBeVisible();
+
+    // The file is edited while the question is on the screen, and the plan is
+    // read again behind it - a window coming back is enough. What the strip
+    // asks about is what the reader saw when they armed it, so the digest it
+    // posts is that one and the engine refuses it.
+    sha = "aaaa";
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => {
+      expect(reads("/domains/eng/sync/changes")).toBe(2);
+    });
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Confirm discard" }),
+    );
+    await waitFor(() => {
+      expect(discarded).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains/eng/changes/discard", "POST")).toEqual({
+      paths: [{ path: "notes/a.md", sha: "9f2c" }],
+    });
+    expect(
+      await within(dialog).findByText("Changed since you looked."),
+    ).toBeVisible();
   });
 
   it("shows the empty sentence once every change is gone", async () => {
