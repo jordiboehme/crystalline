@@ -40,7 +40,7 @@ When the question is also about the present-day state, put `domains` and `status
 }
 ```
 
-A hit's `snippet` is a window of roughly 200 characters around the match, often `...`-truncated - a targeting aid, never the engram. Answering straight from it is acceptable only for a single atomic fact that is completely visible in the snippet ("the retry limit is 5"). Anything that summarizes, characterizes, compares or quotes an engram's content requires `read_engram` first - pass the hit's permalink as `identifier` (bare or as a `crystalline://domain/permalink` URL); there is no `permalink` argument on `read_engram`.
+A hit's `snippet` is a window of roughly 200 characters around the match, often `...`-truncated - a targeting aid, never the engram. Answering straight from it is acceptable only for a single atomic fact that is completely visible in the snippet ("the retry limit is 5"). Anything that summarizes, characterizes, compares or quotes an engram's content requires `read_engram` first - pass the hit's permalink as `identifier` (bare or as a `crystalline://domain/permalink` URL); there is no `permalink` argument on `read_engram`. The read also carries `web_url`, the page a person opens in the browser; hand that over rather than the `crystalline://` address when somebody wants to look at the engram, with `#` and the heading's slug when they want one section.
 
 ### Broad: sweep, then narrow
 
