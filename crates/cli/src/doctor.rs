@@ -1860,11 +1860,13 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
 /// rendering without building a whole [`DoctorReport`].
 ///
 /// Copilot's `UserPromptSubmit` hook renders like the other two harnesses'
-/// when present, with a trailing note on why it does nothing today, and it
-/// never enters the "partial setup" count: Copilot's copy is permanently
-/// inert rather than merely not yet installed, so neither its presence nor
-/// its absence should ever nudge a person to "fix" a setup that already is
-/// what it can be. Which harness that is comes from
+/// present/absent line, but carries a trailing note on why it does nothing
+/// today whether the entry is present or absent (a hand-deleted entry is
+/// exactly as inert as a present one, so the note stays), and it never
+/// enters the "partial setup" count: Copilot's copy is permanently inert
+/// rather than merely not yet installed, so neither its presence nor its
+/// absence should ever nudge a person to "fix" a setup that already is what
+/// it can be. Which harness that is comes from
 /// [`install::prompt_hook_output_is_honoured`], never a string compare on
 /// `h.name` here - the fact belongs beside `prompt_hook_command`, not
 /// duplicated in the renderer.
@@ -1890,7 +1892,7 @@ fn hook_lines(h: &HarnessDoctor) -> String {
         .unwrap_or(true);
     match h.prompt_hook {
         Some(present) => {
-            let note = if present && !honoured {
+            let note = if !honoured {
                 " (Copilot does not honour a config-file prompt hook's output today)"
             } else {
                 ""
@@ -2565,13 +2567,17 @@ mod tests {
         let missing_session_start = harness("codex", false, true, Some(true));
         assert!(hook_lines(&missing_session_start).contains("partial setup"));
 
-        // Copilot with both real hooks but no prompt hook: not a partial
+        // Copilot with both real hooks but no prompt hook: the inert note
+        // still prints on the absent line too (a hand-deleted entry is
+        // exactly as inert as a present one), and it is still not a partial
         // setup, since Copilot's prompt hook never enters the count.
         let copilot_no_prompt = harness("copilot", true, true, Some(false));
         let lines = hook_lines(&copilot_no_prompt);
         assert!(
-            lines.contains("UserPromptSubmit hook: absent"),
-            "still reported, just not counted: {lines}"
+            lines.contains(
+                "UserPromptSubmit hook: absent (Copilot does not honour a config-file prompt hook's output today)"
+            ),
+            "{lines}"
         );
         assert!(!lines.contains("partial setup"), "{lines}");
 
