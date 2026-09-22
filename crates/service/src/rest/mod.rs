@@ -385,8 +385,9 @@ impl RestState {
     /// A builder rather than a parameter on [`RestState::new`] so the call
     /// sites that have no token to offer - every test state, and any future
     /// caller - stay as they are, and so the token is visibly opt-in at the one
-    /// place that has it: `run_serve`, which generates it for a non-loopback
-    /// bind and prints it once.
+    /// place that has it: `run_serve`, which generates it once, for a
+    /// non-loopback bind on an instance that has no account yet, and prints it
+    /// once.
     ///
     /// A blank token is stored as no token. Nothing generates one today, but a
     /// token nobody could type is not a token, and the handler that compares it

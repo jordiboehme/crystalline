@@ -273,13 +273,6 @@ pub async fn run_serve(
         },
         allowed_hosts: allowed_hosts.clone(),
     });
-    // The one-time first-run setup token, drawn once per serve process and only
-    // for a bind other machines can reach: on loopback the wizard is authorized
-    // by the peer address itself, so there is nothing to hand out and nothing to
-    // leak. See [`setup_token_for`] and the startup print below - the token is
-    // said once and never written anywhere again.
-    let setup_token = http_addr.as_deref().and_then(setup_token_for);
-
     // An env-defined domain that shadows a config file entry is worth one
     // startup warning (not one per `apply`, which runs constantly): the file
     // entry is silently overridden while the variable is set.
@@ -380,6 +373,26 @@ pub async fn run_serve(
     } else {
         drop(sessions_rx);
     }
+
+    // The one-time first-run setup token, drawn once per serve process and only
+    // when it could still be spent. Two things have to be true: the bind is one
+    // somebody else can reach (on loopback the wizard is authorized by the peer
+    // address itself, so there is nothing to hand out and nothing to leak), and
+    // this instance has no account yet (once one exists `POST /auth/setup`
+    // answers 410 to everybody, so a token would be a secret nobody can use,
+    // printed under a line offering a first admin that cannot be created).
+    //
+    // Drawn here rather than at the top of `run_serve` because the second
+    // question needs the accounts database: asking after the ownership lock is
+    // taken means a `serve` that loses that race never opens the file, and the
+    // handle is closed again well before the HTTP task reopens it below. See
+    // [`setup_token_for`] and the print just below - the token is said once and
+    // never written anywhere again.
+    let accounts_db = crystalline_core::config::web_auth_db_path().ok();
+    let setup_token = match http_addr.as_deref() {
+        Some(addr) => setup_token_for(addr, accounts_db.as_deref()).await,
+        None => None,
+    };
 
     if !daemon_flag {
         if std::io::stderr().is_terminal() {
@@ -926,7 +939,10 @@ async fn run_watcher(
 /// store and the router that fronts it. `allowed_hosts` carries the resolved
 /// `Host` header allow-list on top of loopback (a single `*` disables the
 /// guard); see [`http_config`]. `setup_token` is this process's first-run token,
-/// if it drew one ([`setup_token_for`]).
+/// if it drew one ([`setup_token_for`]). This opens the accounts database the
+/// token question was already asked of, which is a second open of the same file
+/// in the same process, sequentially: the store behind that question is closed
+/// before this one is asked for.
 ///
 /// Split from the bind and from [`run_http`] so the call site can tell three
 /// different failures apart: an endpoint that never came up, an address somebody
@@ -965,32 +981,97 @@ async fn run_http(
     Ok(())
 }
 
-/// The first-run setup token for a resolved bind address: `None` when only this
-/// machine can reach it, `Some` 32 lower-case hex characters otherwise.
+/// The first-run setup token for a resolved bind address: `Some` 32 lower-case
+/// hex characters when this serve process is one a first admin can still be
+/// created through from another machine, `None` otherwise.
 ///
-/// A loopback bind needs no token at all - the setup handler authorizes a
-/// loopback peer directly - so generating one there would be a secret with
-/// nothing to protect and one more thing to print. Any other bind is reachable
-/// by somebody else, and the token is what stands between them and the first
-/// admin account.
+/// Two questions, both of which have to say yes.
 ///
-/// The host half is read out of `host:port` (brackets stripped for an IPv6
-/// literal). An address that is not an IP literal is loopback only when it is
-/// literally `localhost`: a name this daemon cannot resolve to a loopback
-/// interface is treated as reachable, because a token nobody needs is harmless
-/// (a local peer is never asked for one) while a missing token on a reachable
-/// bind locks the wizard shut.
+/// **Can anybody else reach this bind?** A loopback bind needs no token at
+/// all, the setup handler authorizing a loopback peer directly, so generating
+/// one there would be a secret with nothing to protect and one more to print.
+/// Any other bind is reachable by somebody else, and the token is what stands
+/// between them and the first admin account. The host half is read out of
+/// `host:port` (brackets stripped for an IPv6 literal). An address that is not
+/// an IP literal is loopback only when it is literally `localhost`: a name this
+/// daemon cannot resolve to a loopback interface is treated as reachable,
+/// because a token nobody needs is harmless (a local peer is never asked for
+/// one) while a missing token on a reachable bind locks the wizard shut. This
+/// question is asked first, so a loopback bind never opens `accounts` at all.
+///
+/// **Is there still a first admin to create?** `POST /auth/setup` opens with
+/// `user_count() > 0 -> 410 Gone` and keeps answering that forever, so on an
+/// instance that already has an account the token unlocks nothing: minting one
+/// per restart only writes a fresh secret into the log under a line promising a
+/// wizard that is closed. `accounts` is the accounts database this instance
+/// serves from (`None` when this machine has no state directory to resolve one
+/// in, which the HTTP endpoint reports in its own words when it fails to build
+/// moments later), and the count comes from the same
+/// [`user_count`](crate::rest::AuthStore::user_count) the route itself reads,
+/// so the two cannot disagree about what they saw.
+///
+/// This is an optimisation of what gets printed and never an authorization
+/// gate. Withholding a token can only ever make setup harder (a non-local
+/// caller without one is refused), and a lost race - an account created between
+/// this question and the first `POST` - is still decided by the route's own
+/// single-statement claim on the first-account slot.
+///
+/// A database that cannot be read answers "no account yet", so the token is
+/// minted and printed. A first run is exactly the state where the file does not
+/// exist yet, and [`AuthStore::open`](crate::rest::AuthStore::open) creates it
+/// rather than failing, so the error case left over is a genuinely broken
+/// file, and a token printed where it cannot be spent is noise while a token
+/// withheld on a real first run locks a remote operator out of the only wizard
+/// there is.
 ///
 /// 32 hex characters is 128 bits from the same OS CSPRNG the session tokens
 /// are drawn from - a one-shot secret a human retypes off a terminal, not a
 /// stored credential.
-fn setup_token_for(addr: &str) -> Option<String> {
+async fn setup_token_for(addr: &str, accounts: Option<&Path>) -> Option<String> {
     if bind_is_loopback(addr) {
+        return None;
+    }
+    if an_account_already_exists(accounts).await {
         return None;
     }
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
     Some(crystalline_index::hex_lower(&bytes))
+}
+
+/// Whether this instance already has an account, asked of the accounts database
+/// at `accounts` - the same file the HTTP endpoint opens for every request that
+/// carries an identity.
+///
+/// Answers `false` for everything it cannot answer properly: no path at all, a
+/// database that will not open, a count that will not run. That direction is
+/// deliberate and is the reason this returns a `bool` rather than a `Result`:
+/// the caller is deciding what to print, not who may pass, and failing towards
+/// printing keeps a genuine first run reachable. The one case that is not a
+/// failure at all is the common one - a database that does not exist yet is
+/// created empty by `open`, counts zero, and mints.
+///
+/// The store opened here is dropped before this returns, so the handle the HTTP
+/// endpoint opens on the same file a moment later is the only one left.
+async fn an_account_already_exists(accounts: Option<&Path>) -> bool {
+    let Some(path) = accounts else {
+        return false;
+    };
+    let counted: anyhow::Result<usize> = async {
+        let store = crate::rest::AuthStore::open(path).await?;
+        store.user_count().await
+    }
+    .await;
+    match counted {
+        Ok(count) => count > 0,
+        Err(err) => {
+            tracing::warn!(
+                "the accounts database at {} could not be read ({err:#}); starting up as if this instance had no account yet",
+                path.display()
+            );
+            false
+        }
+    }
 }
 
 /// Whether a bind address can only be reached from this machine.
@@ -1016,6 +1097,13 @@ fn bind_is_loopback(addr: &str) -> bool {
 /// `at` is the full address, already resolved by [`setup_address`]: that line
 /// is read by a person on another machine, so the bind as given is right for
 /// it and the loopback rewrite is not.
+///
+/// Both sentences are said only where [`setup_token_for`] handed a token out,
+/// which is a reachable bind on an instance with no account yet - so the first
+/// line's offer of a first admin is one the reader can still take up, and the
+/// second's "a restart mints a new one" is the truth for as long as that stays
+/// the case. Creating the admin is what ends both, and by then there is nothing
+/// left to mint a token for.
 fn setup_token_lines(at: &str, token: &str) -> [String; 2] {
     [
         format!("first-run setup token (create the first admin at {at}): {token}"),
@@ -3421,23 +3509,50 @@ mod tests {
     // The one-time setup token exists for exactly one reason: on a bind other
     // machines can reach there is no loopback peer to trust, so the wizard needs
     // a secret the operator reads off the startup output. A bind only this
-    // machine can reach protects nothing by having one, so it gets none.
+    // machine can reach protects nothing by having one, so it gets none, and an
+    // instance that already has an account has no wizard left to protect.
 
-    #[test]
-    fn setup_token_only_for_non_loopback_binds() {
-        for addr in [
-            "127.0.0.1:7411",
-            "127.0.0.1:0",
-            "127.7.7.7:7411",
-            "[::1]:7411",
-            "localhost:7411",
-        ] {
-            assert_eq!(
-                setup_token_for(addr),
-                None,
-                "{addr} can only be reached from this machine"
+    /// An accounts database path inside a temporary directory, with the first
+    /// admin already created when `seeded`. The file is the same shape
+    /// `web_auth_db_path()` names in a real state directory; the directory is
+    /// this test's own, so nothing here can reach the one a person serves from.
+    async fn accounts_db(seeded: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("web-auth.db");
+        if seeded {
+            let store = crate::rest::AuthStore::open(&path)
+                .await
+                .expect("opening a fresh accounts database");
+            assert!(
+                store
+                    .add_first_admin("ada", "Ada", "correct horse battery")
+                    .await
+                    .expect("creating the first admin"),
+                "the first admin is created by this call"
             );
         }
+        (dir, path)
+    }
+
+    fn assert_is_a_setup_token(token: &str) {
+        assert_eq!(token.len(), 32, "32 hex characters: {token}");
+        assert!(
+            token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "lower-case hex, nothing a terminal font can confuse: {token}"
+        );
+    }
+
+    /// A reachable bind on an instance with no account yet is the case the
+    /// whole feature exists for: the token is minted, and the accounts database
+    /// that does not exist yet is the normal first-run state rather than a
+    /// failure to report.
+    #[tokio::test]
+    async fn a_reachable_bind_mints_a_token_while_no_account_exists() {
+        let (dir, accounts) = accounts_db(false).await;
+        assert!(
+            !accounts.exists(),
+            "the first run this test is about starts with no accounts database at all"
+        );
         // A host name that is not the literal `localhost` is treated as
         // reachable: the token is additive (a loopback peer never needs it), so
         // the unknown case fails towards having one.
@@ -3448,19 +3563,96 @@ mod tests {
             "[2001:db8::1]:7411",
             "fluid.example:7411",
         ] {
-            let token = setup_token_for(addr)
+            let token = setup_token_for(addr, Some(&accounts))
+                .await
                 .unwrap_or_else(|| panic!("{addr} is reachable from elsewhere and needs a token"));
-            assert_eq!(token.len(), 32, "32 hex characters: {token}");
-            assert!(
-                token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
-                "lower-case hex, nothing a terminal font can confuse: {token}"
-            );
+            assert_is_a_setup_token(&token);
         }
         assert_ne!(
-            setup_token_for("0.0.0.0:7411"),
-            setup_token_for("0.0.0.0:7411"),
+            setup_token_for("0.0.0.0:7411", Some(&accounts)).await,
+            setup_token_for("0.0.0.0:7411", Some(&accounts)).await,
             "drawn fresh every time, so one serve process's token is its own"
         );
+        drop(dir);
+    }
+
+    /// The bug this gate fixes: a reachable bind on an instance that already
+    /// has an account minted a fresh secret into the log on every restart,
+    /// under a line offering a first admin that `POST /auth/setup` answers
+    /// `410 Gone` to. Nothing is drawn there now.
+    #[tokio::test]
+    async fn a_reachable_bind_mints_nothing_once_an_account_exists() {
+        let (dir, accounts) = accounts_db(true).await;
+        for addr in [
+            "0.0.0.0:7411",
+            "192.168.1.5:7411",
+            "[::]:7411",
+            "fluid.example:7411",
+        ] {
+            assert_eq!(
+                setup_token_for(addr, Some(&accounts)).await,
+                None,
+                "{addr} serves an instance whose first-run setup is closed for good"
+            );
+        }
+        drop(dir);
+    }
+
+    /// A bind only this machine can reach gets no token whatever the accounts
+    /// database says, and is answered without opening it: the setup handler
+    /// authorizes a loopback peer on the peer address itself.
+    #[tokio::test]
+    async fn a_loopback_bind_mints_nothing_either_way() {
+        for seeded in [false, true] {
+            let (dir, accounts) = accounts_db(seeded).await;
+            for addr in [
+                "127.0.0.1:7411",
+                "127.0.0.1:0",
+                "127.7.7.7:7411",
+                "[::1]:7411",
+                "localhost:7411",
+            ] {
+                assert_eq!(
+                    setup_token_for(addr, Some(&accounts)).await,
+                    None,
+                    "{addr} can only be reached from this machine"
+                );
+            }
+            if !seeded {
+                assert!(
+                    !accounts.exists(),
+                    "a loopback bind is answered before the accounts database is opened"
+                );
+            }
+            drop(dir);
+        }
+    }
+
+    /// An accounts database that cannot be read is answered the way a first run
+    /// is, so a remote operator is never locked out of the wizard by a broken
+    /// file. Printing a token that cannot be spent is noise; withholding one
+    /// that can be is the failure that matters. A directory where the file
+    /// belongs is the portable way to make `open` fail, and the assertion above
+    /// the call pins that it really does.
+    #[tokio::test]
+    async fn an_unreadable_accounts_database_still_mints_a_token() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let accounts = dir.path().join("web-auth.db");
+        std::fs::create_dir(&accounts).expect("a directory where the database belongs");
+        assert!(
+            crate::rest::AuthStore::open(&accounts).await.is_err(),
+            "a directory at the database path is a database that cannot be opened"
+        );
+        let token = setup_token_for("0.0.0.0:7411", Some(&accounts))
+            .await
+            .expect("a database that cannot be read must not withhold the first-run secret");
+        assert_is_a_setup_token(&token);
+        // The same fail-open answer with no path to ask at all, which is what a
+        // machine with no resolvable state directory hands in.
+        let token = setup_token_for("0.0.0.0:7411", None)
+            .await
+            .expect("no accounts path to ask is not an answer of 'an account exists'");
+        assert_is_a_setup_token(&token);
     }
 
     #[test]
