@@ -151,6 +151,9 @@ describe("the diff pane", () => {
       await screen.findByText("Changed, 20 KiB to 24 KiB"),
     ).toBeInTheDocument();
     expect(binary.container.querySelector(".cm-content")).toBeNull();
+    // And says it once: the caption above a pane would repeat the figures the
+    // sentence has just given in its own words.
+    expect(screen.queryByText("Modified, 20 KiB to 24 KiB")).toBeNull();
     binary.unmount();
 
     mount({
@@ -164,6 +167,7 @@ describe("the diff pane", () => {
     expect(
       await screen.findByText("Too large to show here, 1.4 MiB to 1.5 MiB"),
     ).toBeInTheDocument();
+    expect(screen.queryByText("Modified, 1.4 MiB to 1.5 MiB")).toBeNull();
     // The domain the pane is about, not the placeholder the rule carries.
     expect(
       screen.getByText("crystalline origin diff eng --path notes/a.md"),

@@ -88,12 +88,18 @@ describe("the change list's rows", () => {
 
   it("draws a refusal under its row and never draws a listing", () => {
     mount({ refusals: new Map([["notes/a.md", "Changed since you looked."]]) });
-    const row = screen
-      .getByRole("checkbox", { name: "notes/a.md" })
-      .closest("li");
+    const box = screen.getByRole("checkbox", { name: "notes/a.md" });
+    const row = box.closest("li");
+    const reason = within(row as HTMLElement).getByText(
+      "Changed since you looked.",
+    );
+    expect(reason).toBeInTheDocument();
+    // And the row says it out loud: a reason nobody can see is a reason
+    // nobody hears without this.
+    expect(box).toHaveAttribute("aria-describedby", reason.id);
     expect(
-      within(row as HTMLElement).getByText("Changed since you looked."),
-    ).toBeInTheDocument();
+      screen.getByRole("checkbox", { name: "notes/new.md" }),
+    ).not.toHaveAttribute("aria-describedby");
     expect(screen.queryByText("notes/index.md")).toBeNull();
     expect(screen.queryByText(/folder index/)).toBeNull();
   });

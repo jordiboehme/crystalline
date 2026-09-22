@@ -89,6 +89,10 @@ function readOnly(dark: boolean) {
   return [
     EditorState.readOnly.of(true),
     EditorView.editable.of(false),
+    // An engram's paragraph is one long line, so without this the pane
+    // scrolls sideways for nearly every change it shows. A merge view aligns
+    // its chunks with wrapping on.
+    EditorView.lineWrapping,
     documentLanguage,
     syntaxHighlighting(editorHighlight),
     editorTheme(dark),
@@ -202,8 +206,9 @@ export default function DiffPane({
         </p>
       )}
       {/* Plain text before the editor, so a screen reader hears what it is
-          about to read: the kind and the sizes. */}
-      {detail.data && (
+          about to read: the kind and the sizes. A sentence face says the same
+          figures in its own words, so the caption stands only above a pane. */}
+      {detail.data && face?.kind !== "sentence" && (
         <p className="text-caption text-slate-500 dark:text-slate-400">
           {caption(detail.data)}
         </p>
