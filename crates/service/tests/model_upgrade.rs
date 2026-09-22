@@ -234,6 +234,8 @@ fn twin_rules(value: &Value) -> Vec<String> {
 }
 
 /// A model cache holding three models' weights, one of them the active one.
+/// The third is not in `LOCAL_MODELS`: another tool's weights sharing the
+/// same `CRYSTALLINE_MODELS_DIR`, which the prune must never touch.
 fn seeded_cache(tmp: &std::path::Path) -> std::path::PathBuf {
     let cache = tmp.join("models");
     for repo in [
@@ -275,13 +277,21 @@ async fn a_successful_load_prunes_the_models_the_config_no_longer_names() {
     engine.prune_model_cache(cache.clone()).await;
     assert_eq!(
         cached_repos(&cache),
-        vec!["ibm-granite/granite-embedding-97m-multilingual-r2".to_string()],
-        "only the active model's weights survive"
+        vec![
+            "ibm-granite/granite-embedding-97m-multilingual-r2".to_string(),
+            "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+        ],
+        "the active model's weights survive, and so does a directory the \
+         table does not know - only a table-known, not-kept model is pruned"
     );
 
     let report = engine.status_report().await.unwrap();
     let pruned = &report["embeddings"]["pruned_model_cache"];
-    assert_eq!(pruned.as_array().map(Vec::len), Some(2), "{report}");
+    assert_eq!(
+        pruned.as_array().map(Vec::len),
+        Some(1),
+        "only bge is both table-known and not kept: {report}"
+    );
     assert_eq!(pruned[0]["repo"], "BAAI/bge-small-en-v1.5");
     assert!(pruned[0]["bytes"].as_u64().unwrap() >= 128);
 

@@ -146,21 +146,30 @@ pub fn cached_model_dirs(models_dir: &Path) -> Vec<(String, u64)> {
     found
 }
 
-/// Remove every cached model directory whose repository id is not in `keep`,
-/// returning what went and how many bytes it freed, sorted by repo id.
+/// Remove every cached directory for a repository `LOCAL_MODELS` lists whose
+/// id is not in `keep`, returning what went and how many bytes it freed,
+/// sorted by repo id.
 ///
-/// `keep` holds repository ids, not table ids, so a caller that cannot resolve
-/// its configured model through the table must decline to prune rather than
-/// pass an empty list: an empty `keep` removes everything.
+/// Only a repository the table knows is ever a candidate: `CRYSTALLINE_MODELS_DIR`
+/// may point at a cache other Hugging Face tools share, and a directory that
+/// table does not list - another tool's model, or one this build used to know
+/// and has since dropped - is never touched, whatever `keep` says. `keep`
+/// itself holds repository ids, not table ids, so a caller that cannot
+/// resolve its configured model through the table must decline to prune
+/// rather than pass an empty list: an empty `keep` removes every OTHER
+/// table-known model.
 ///
-/// Only the `models--<org>--<name>` directories hf-hub writes are considered;
-/// anything else in that directory is left alone. A directory that cannot be
-/// emptied (the `-with-model` image bakes a read-only layer) is logged and
-/// skipped, never an error: a cache this process may not tidy is not a reason
-/// to fail the start that called this.
+/// Only the `models--<org>--<name>` directories hf-hub writes are considered
+/// in the first place; anything else in that directory is left alone. A
+/// directory that cannot be emptied (the `-with-model` image bakes a
+/// read-only layer) is logged and skipped, never an error: a cache this
+/// process may not tidy is not a reason to fail the start that called this.
 pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String, u64)>> {
     let mut removed = Vec::new();
-    let mut candidates = hub_dirs(models_dir);
+    let mut candidates: Vec<(String, PathBuf)> = hub_dirs(models_dir)
+        .into_iter()
+        .filter(|(repo, _)| LOCAL_MODELS.iter().any(|m| m.repo == repo))
+        .collect();
     candidates.sort();
     for (repo, path) in candidates {
         if keep.iter().any(|k| k.trim() == repo) {
@@ -369,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_removes_only_the_hub_directories_the_caller_did_not_keep() {
+    fn pruning_removes_only_table_known_hub_directories_the_caller_did_not_keep() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         hub_dir(
@@ -378,6 +387,11 @@ mod tests {
             &[7u8; 64],
         );
         hub_dir(root, "BAAI/bge-small-en-v1.5", &[3u8; 32]);
+        // A directory `LOCAL_MODELS` does not list: another tool's weights, or
+        // a model this build used to know and has since dropped from the
+        // table. The pruner never touches it, whatever the keep list says -
+        // that is the whole point of a shared `CRYSTALLINE_MODELS_DIR` being
+        // safe to point Crystalline at.
         hub_dir(root, "sentence-transformers/all-MiniLM-L6-v2", &[1u8; 16]);
         // Something in the cache that is not ours, which the pruner never
         // touches whatever the keep list says.
@@ -389,16 +403,13 @@ mod tests {
         let repos: Vec<&str> = removed.iter().map(|(r, _)| r.as_str()).collect();
         assert_eq!(
             repos,
-            [
-                "BAAI/bge-small-en-v1.5",
-                "sentence-transformers/all-MiniLM-L6-v2"
-            ],
-            "every model the caller did not keep is removed, repo ids restored"
+            ["BAAI/bge-small-en-v1.5"],
+            "only the table-known model the caller did not keep is removed"
         );
-        // The byte counts are the directories that were there.
+        // The byte count is the directory that was there.
         let bytes: Vec<u64> = removed.iter().map(|(_, b)| *b).collect();
         assert!(
-            bytes[0] >= 32 && bytes[1] >= 16,
+            bytes[0] >= 32,
             "the removal reports what it freed: {bytes:?}"
         );
 
@@ -410,9 +421,9 @@ mod tests {
         );
         assert!(!root.join(hub_dir_name("BAAI/bge-small-en-v1.5")).exists());
         assert!(
-            !root
-                .join(hub_dir_name("sentence-transformers/all-MiniLM-L6-v2"))
-                .exists()
+            root.join(hub_dir_name("sentence-transformers/all-MiniLM-L6-v2"))
+                .is_dir(),
+            "a directory the table does not know survives, kept or not"
         );
         assert!(
             root.join("version.txt").is_file(),
@@ -425,6 +436,31 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A model the table knows is pruned exactly like before the table
+    /// restriction landed: being known is not the same as being kept.
+    #[test]
+    fn a_known_model_not_in_the_keep_list_is_still_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        hub_dir(
+            root,
+            "ibm-granite/granite-embedding-97m-multilingual-r2",
+            &[7u8; 64],
+        );
+        hub_dir(root, "BAAI/bge-small-en-v1.5", &[3u8; 32]);
+
+        let removed =
+            prune_model_cache(root, &["ibm-granite/granite-embedding-97m-multilingual-r2"])
+                .unwrap();
+        let repos: Vec<&str> = removed.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            repos,
+            ["BAAI/bge-small-en-v1.5"],
+            "bge is in LOCAL_MODELS, so not being kept is reason enough to remove it"
+        );
+        assert!(!root.join(hub_dir_name("BAAI/bge-small-en-v1.5")).exists());
     }
 
     #[test]
