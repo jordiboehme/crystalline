@@ -2899,7 +2899,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. A domain whose MANIFEST declares sharing: direct has no review step: the share commits the selected files straight onto the connected branch, in one commit authored by the acting identity, and returns the commit's sha and URL instead of a proposal; it refuses while any proposal is still open (merge or withdraw it first) and answers branch_protected when the branch's rules do not accept direct commits. The confirmation question then says the change goes straight to the branch with no review. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3028,7 +3028,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle, and the domain's sharing policy (proposal or direct) with the commits this machine put straight on the branch (direct_shares). Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -4597,14 +4597,17 @@ fn removal_drafts_clause(preview: &Value) -> String {
 /// `action` word.
 ///
 /// **This is a deny-list on purpose, and the direction is the whole point.**
-/// Exactly three plans answer in round one without asking - `nothing_to_share`,
-/// `conflicts_pending` and `proposal_diverged` - because executing the share
-/// produces exactly those canonical shapes with no publishing write: no
-/// commit, no branch update, no proposal opened or patched. Stated that way
-/// rather than as "no provider write": the pull the share runs first can
-/// reconcile a proposal the forge already closed, so a diverged answer may be
-/// preceded by bookkeeping calls. Those record what the forge already decided;
-/// they never publish this domain's changes.
+/// Exactly four plans answer in round one without asking - `nothing_to_share`,
+/// `conflicts_pending`, `proposal_diverged` and `proposal_open` - because
+/// executing the share produces exactly those canonical shapes with no
+/// publishing write: no commit, no branch update, no proposal opened or
+/// patched. Stated that way rather than as "no provider write": the pull the
+/// share runs first can reconcile a proposal the forge already closed, so a
+/// diverged answer may be preceded by bookkeeping calls. Those record what the
+/// forge already decided; they never publish this domain's changes.
+///
+/// `commit` is deliberately NOT here: a direct commit publishes to the branch
+/// with no review, the one fact a proposal never asked the user for.
 ///
 /// Everything else asks, an unknown or absent word included. An allow-list
 /// would fail the wrong way: a new `PlannedAction` variant nobody wired in
@@ -4614,7 +4617,10 @@ fn removal_drafts_clause(preview: &Value) -> String {
 fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
     !matches!(
         action,
-        Some("nothing_to_share") | Some("conflicts_pending") | Some("proposal_diverged")
+        Some("nothing_to_share")
+            | Some("conflicts_pending")
+            | Some("proposal_diverged")
+            | Some("proposal_open")
     )
 }
 
@@ -4652,6 +4658,11 @@ fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
 /// refreshes 3 folder indexes." - and a share carrying nothing else says that
 /// plainly instead of reading as a share of nothing.
 ///
+/// **A commit says the one thing a proposal never asked.** On a direct domain
+/// the question opens `Commit straight to branch 'main' of acme/knowledge,
+/// with no review`, labels the value `Commit message` (it is one), and closes
+/// with what the team sees instead of what reviewers see: there are none.
+///
 /// **All four read as one instruction rather than four narrations.** Every
 /// leg opens with the imperative the create and update legs always used -
 /// "Open a new proposal", "Update open proposal #N", "Stack a new proposal on
@@ -4684,6 +4695,14 @@ fn share_question(preview: &Value) -> String {
                 preview["number"].as_u64().unwrap_or_default(),
                 preview["title"].as_str().unwrap_or_default(),
                 preview["layers_above"].as_u64().unwrap_or_default()
+            ),
+            "Commit message",
+        ),
+        "commit" => (
+            format!(
+                "Commit straight to branch '{}' of {}, with no review",
+                preview["branch"].as_str().unwrap_or_default(),
+                preview["repo"].as_str().unwrap_or_default()
             ),
             "Commit message",
         ),
@@ -4736,7 +4755,11 @@ fn share_question(preview: &Value) -> String {
             format!(" Also refreshes {indexes} folder {noun}.")
         });
     }
-    question.push_str(" Reviewers see the result on GitHub.");
+    question.push_str(if preview["action"].as_str() == Some("commit") {
+        " The team sees it on the branch at once."
+    } else {
+        " Reviewers see the result on GitHub."
+    });
     question
 }
 
@@ -6206,7 +6229,7 @@ mod tests {
     }
 
     /// The confirm gate's direction, stated as the property rather than as a
-    /// list: the three non-publishing plans answer straight away, and
+    /// list: the four non-publishing plans answer straight away, and
     /// everything else asks - a word this build has never heard of included.
     ///
     /// That last case is the one worth a test. A future `PlannedAction`
@@ -6215,13 +6238,18 @@ mod tests {
     /// words below stand in for it.
     #[test]
     fn the_share_confirm_gate_asks_about_anything_it_does_not_recognize() {
-        for quiet in ["nothing_to_share", "conflicts_pending", "proposal_diverged"] {
+        for quiet in [
+            "nothing_to_share",
+            "conflicts_pending",
+            "proposal_diverged",
+            "proposal_open",
+        ] {
             assert!(
                 !share_plan_needs_confirmation(Some(quiet)),
                 "{quiet} publishes nothing, so it answers in round one"
             );
         }
-        for asks in ["create", "update", "stack", "amend"] {
+        for asks in ["create", "update", "stack", "amend", "commit"] {
             assert!(share_plan_needs_confirmation(Some(asks)), "{asks}");
         }
         // The fail-safe: a plan word from a later version, and no word at all.
@@ -6283,6 +6311,44 @@ mod tests {
             "{amended}"
         );
         assert!(!amended.contains("Title: '"), "{amended}");
+    }
+
+    /// A direct domain's question names the branch and the repository and
+    /// says the one thing a proposal never asked: there is no review.
+    #[test]
+    fn the_share_question_says_a_commit_goes_to_the_branch_with_no_review() {
+        let question = share_question(&json!({
+            "action": "commit", "branch": "main", "repo": "acme/knowledge", "sharing": "direct",
+            "effective_title": "Refine 2 engrams in kb",
+            "changes": [{ "path": "notes/a.md", "kind": "modified" }, { "path": "notes/b.md", "kind": "modified" }],
+        }));
+        assert!(
+            question.starts_with(
+                "Commit straight to branch 'main' of acme/knowledge, with no review? \
+                 Commit message: 'Refine 2 engrams in kb'."
+            ),
+            "{question}"
+        );
+        assert!(
+            question.contains("0 added, 2 modified, 0 deleted: notes/a.md, notes/b.md"),
+            "{question}"
+        );
+        assert!(
+            question.ends_with("The team sees it on the branch at once."),
+            "{question}"
+        );
+        assert!(!question.contains("Reviewers see"), "{question}");
+    }
+
+    /// `commit` asks (it publishes); `proposal_open` does not (it refuses).
+    #[test]
+    fn a_commit_needs_confirmation_and_a_blocked_direct_share_does_not() {
+        assert!(share_plan_needs_confirmation(Some("commit")));
+        assert!(!share_plan_needs_confirmation(Some("proposal_open")));
+        assert!(
+            share_plan_needs_confirmation(None),
+            "unknown still fails safe"
+        );
     }
 
     /// The discard question names every path and what a discard does to it,

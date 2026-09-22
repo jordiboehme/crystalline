@@ -131,7 +131,11 @@ pub const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call
 /// "that work" rather than to the changes as a countable set. One sentence
 /// therefore follows "1 change ... is not yet shared" and "4 changes ... are
 /// not yet shared" equally, with no second variant to keep in step.
-pub const SHARE_NUDGE_REASON: &str = "If that work is done, propose sharing it with share_changes so the domain owner can review it and the team's archive stays current - and wait for a yes.";
+///
+/// Policy-neutral on purpose: the hook reads no MANIFEST, and "so the team has
+/// it" is true on a domain that reviews proposals and on one that commits
+/// straight to its branch.
+pub const SHARE_NUDGE_REASON: &str = "If that work is done, propose sharing it with share_changes so the team has it and the team's archive stays current - and wait for a yes.";
 
 /// How long a machine may go without a consolidation sweep before the ask
 /// arms itself: one week. Measured from the last recorded sweep, or from

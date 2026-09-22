@@ -144,6 +144,11 @@ pub struct DomainDoctor {
     pub unsyncable: Vec<UnsyncableFile>,
     /// Encoding problems, sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
+    /// MANIFEST policy keys - `generated_indexes`, `sharing` - whose declared
+    /// value is not one the domain recognizes, each with the value it is read
+    /// as. Empty when every declared policy parses and for a domain with no
+    /// MANIFEST.
+    pub policy_problems: Vec<PolicyProblem>,
     /// The instance currently hosting this file domain in a shared database, or
     /// `None` when unhosted (single-instance deployments, and virtual domains,
     /// which never take a host lock).
@@ -180,6 +185,18 @@ pub struct EncodingIssue {
     pub line: Option<usize>,
     /// The human message from `verify`.
     pub message: String,
+}
+
+/// A MANIFEST policy key whose declared value nobody recognizes, with what
+/// the domain reads it as. Reported, never fixed: a policy is a decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyProblem {
+    /// The frontmatter key, as `policy_registry` names it.
+    pub key: String,
+    /// The value the MANIFEST declares, quoted back as a reader wrote it.
+    pub declared: String,
+    /// The value the domain obeys instead.
+    pub read_as: String,
 }
 
 /// One `E001` finding: a file whose frontmatter does not parse at all, so no
@@ -1068,6 +1085,53 @@ async fn check_domain(
     Ok(d)
 }
 
+/// Every registry key the MANIFEST at `path` declares with a value the
+/// registry does not list, read through the core parser so the finding says
+/// exactly what the domain obeys. An unreadable or unparseable MANIFEST
+/// yields nothing here: `manifest_present` and the E001 check own that.
+fn policy_problems(path: &Path) -> Vec<PolicyProblem> {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(engram) = crystalline_core::parse_engram(&source) else {
+        return Vec::new();
+    };
+    let manifest = crystalline_core::Manifest::from_engram(&engram, &source);
+    crystalline_core::policy_registry()
+        .iter()
+        .filter_map(|spec| {
+            let (declared, effective) = manifest.policy(spec.key)?;
+            let declared = declared?;
+            (!spec.values.contains(&declared)).then(|| PolicyProblem {
+                key: spec.key.to_string(),
+                declared: declared.to_string(),
+                read_as: effective.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The values one registry key takes, or nothing for a key the registry does
+/// not know - which no [`PolicyProblem`] ever carries, since the finding is
+/// built from the registry itself.
+fn policy_values(key: &str) -> &'static [&'static str] {
+    crystalline_core::policy_registry()
+        .iter()
+        .find(|spec| spec.key == key)
+        .map(|spec| spec.values)
+        .unwrap_or(&[])
+}
+
+/// `a`, `a or b`, `a, b or c`: the values a key takes, read as a sentence
+/// rather than as a list a reader has to parse.
+fn join_or(values: &[&str]) -> String {
+    match values {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
 /// [`check_domain`] without the rebuild marker: the path, MANIFEST, orphan,
 /// unindexed and encoding checks themselves.
 async fn check_domain_checks(
@@ -1118,6 +1182,10 @@ async fn check_domain_checks(
         manifest_present,
         ..Default::default()
     };
+
+    if manifest_present {
+        d.policy_problems = policy_problems(&path.join("MANIFEST.md"));
+    }
 
     if !path_exists {
         return Ok(d);
@@ -2057,6 +2125,16 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.manifest_present {
             let _ = writeln!(out, "  [problem] no MANIFEST.md at the domain root");
         }
+        for p in &d.policy_problems {
+            let _ = writeln!(
+                out,
+                "  [problem] MANIFEST {}: {} is not {}; read as {}",
+                p.key,
+                p.declared,
+                join_or(policy_values(&p.key)),
+                p.read_as
+            );
+        }
         // Said once per domain so an empty orphan and unindexed list is never
         // mistaken for a clean bill of health. The cause, and its remedy, are
         // in the index section above.
@@ -2128,6 +2206,7 @@ pub fn render_human(report: &DoctorReport) -> String {
         // "ok" is a claim about everything, so a domain whose index checks
         // never ran does not get to make it.
         if d.manifest_present
+            && d.policy_problems.is_empty()
             && d.orphans.is_empty()
             && d.unindexed.is_empty()
             && d.unsyncable.is_empty()

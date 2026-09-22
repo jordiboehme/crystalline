@@ -2702,6 +2702,47 @@ fn ahead_line(d: &serde_json::Value) -> String {
     format!("  ahead: {total} local change(s) ({})", kinds.join(", "))
 }
 
+/// The one line a direct domain adds under its `repo@branch` line, and
+/// nothing for a proposal domain: a domain that behaves as it always did
+/// prints as it always did.
+fn sharing_line(d: &serde_json::Value) -> Option<String> {
+    (d["sharing"].as_str() == Some("direct")).then(|| {
+        format!(
+            "  sharing: direct (commits go straight to {})",
+            d["branch"].as_str().unwrap_or("the branch")
+        )
+    })
+}
+
+/// The commits this machine put straight on a direct domain's branch, newest
+/// first, under one heading.
+///
+/// Nothing at all where there are none, which is every proposal domain and a
+/// direct domain nobody has shared from yet - and a daemon from before the
+/// policy existed sends no key, which reads the same way. Each line leads with
+/// the short sha, because that is what a person matches against the forge, and
+/// names the page only where the forge has one.
+fn direct_share_lines(d: &serde_json::Value) -> Vec<String> {
+    let Some(shares) = d["direct_shares"].as_array().filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let mut lines = vec!["  shared directly:".to_string()];
+    for share in shares {
+        let sha: String = share["sha"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(7)
+            .collect();
+        let title = share["title"].as_str().unwrap_or("");
+        lines.push(match share["url"].as_str() {
+            Some(url) => format!("    {sha} {title} ({url})"),
+            None => format!("    {sha} {title}"),
+        });
+    }
+    lines
+}
+
 /// What a reviewing domain is holding that no share would pick up: this
 /// session's own drafts, and - for whoever holds the domain - who else is
 /// drafting in it.
@@ -2837,6 +2878,9 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
         let repo = d["repo"].as_str().unwrap_or("");
         let branch = d["branch"].as_str().unwrap_or("");
         println!("{name}: {repo}@{branch}");
+        if let Some(line) = sharing_line(d) {
+            println!("{line}");
+        }
         println!("{}", ahead_line(d));
         for line in draft_lines(d) {
             println!("{line}");
@@ -2908,6 +2952,11 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
                 p["title"].as_str().unwrap_or(""),
                 p["url"].as_str().unwrap_or("")
             );
+        }
+        // A direct domain's commits stand where a reviewing domain's proposals
+        // stand: this is the section that says what already reached the team.
+        for line in direct_share_lines(d) {
+            println!("{line}");
         }
         // The chain's own standing, after the layers it is about. Each line
         // is a debt or a blockage a caller settles with a verb they already
@@ -4358,6 +4407,54 @@ mod tests {
         assert_eq!(
             ahead_line(&all_deleted),
             "  ahead: 2 local change(s) (2 deleted)"
+        );
+    }
+
+    /// The policy line under a domain's `repo@branch` line, which only a
+    /// domain that commits straight to its branch draws.
+    #[test]
+    fn the_sharing_line_speaks_only_for_a_direct_domain() {
+        assert_eq!(
+            sharing_line(&json!({ "domain": "kb", "branch": "main", "sharing": "direct" })),
+            Some("  sharing: direct (commits go straight to main)".to_string())
+        );
+        assert_eq!(
+            sharing_line(&json!({ "domain": "kb", "branch": "main", "sharing": "proposal" })),
+            None,
+            "a domain that behaves as it always did prints as it always did"
+        );
+        assert_eq!(
+            sharing_line(&json!({ "domain": "kb", "branch": "main" })),
+            None,
+            "an older daemon says nothing"
+        );
+    }
+
+    /// The commits a direct domain already put on the branch, newest first,
+    /// and nothing at all where there are none.
+    #[test]
+    fn the_direct_share_lines_name_each_commit_and_stay_silent_when_there_are_none() {
+        assert_eq!(
+            direct_share_lines(&json!({
+                "direct_shares": [
+                    { "sha": "9f2c1a7deadbeef", "url": "https://github.com/acme/kb/commit/9f2c1a7deadbeef", "title": "Refine 2 engrams", "shared_at": "2026-09-22T09:00:00Z", "author_login": "octocat" },
+                    { "sha": "0badc0ffee11111", "url": null, "title": "Share 1 new engram", "shared_at": "2026-09-21T09:00:00Z", "author_login": null },
+                ],
+            })),
+            vec![
+                "  shared directly:".to_string(),
+                "    9f2c1a7 Refine 2 engrams (https://github.com/acme/kb/commit/9f2c1a7deadbeef)"
+                    .to_string(),
+                "    0badc0f Share 1 new engram".to_string(),
+            ]
+        );
+        assert!(
+            direct_share_lines(&json!({ "direct_shares": [] })).is_empty(),
+            "a domain with no commits of its own says nothing"
+        );
+        assert!(
+            direct_share_lines(&json!({ "domain": "kb" })).is_empty(),
+            "and neither does an older daemon"
         );
     }
 
