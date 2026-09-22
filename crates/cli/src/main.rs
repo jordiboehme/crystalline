@@ -19,6 +19,7 @@ mod doctor;
 mod hook;
 mod install;
 mod members;
+mod recall;
 mod receipt;
 mod render;
 mod users;
@@ -672,20 +673,23 @@ enum Command {
     /// Respond to a harness lifecycle hook event over stdin/stdout. Plumbing
     /// for `crystalline install`'s generated hook wiring, not something a
     /// person runs by hand - documented here so anyone who finds it in a
-    /// harness's settings file can identify what it is. Static like `verify`
-    /// and `prompt`: no database, service or network connection, and a call
-    /// completes in tens of milliseconds. Silent (exit 0, empty stdout) on
-    /// every call that is not the one earning a nudge, since a hook must
-    /// never be the reason a harness's turn breaks.
+    /// harness's settings file can identify what it is. `stop` is static like
+    /// `verify` and `prompt`: no database, service or network connection, and
+    /// a call completes in tens of milliseconds. `prompt` talks to a daemon
+    /// that is already running, over its control socket, and to nothing else:
+    /// it never opens the index in process, never starts a daemon and never
+    /// reaches the network. Silent (exit 0, empty stdout) on every call that
+    /// is not the one with something to say, since a hook must never be the
+    /// reason a harness's turn breaks.
     Hook {
         #[command(subcommand)]
         event: HookEvent,
     },
 }
 
-/// Which harness lifecycle event a `hook` invocation answers. `Stop` is the
-/// only kind today; future events attach here without reshaping `hook`
-/// again.
+/// Which harness lifecycle event a `hook` invocation answers: `Stop` at the
+/// end of a turn and `Prompt` in front of every prompt a person submits.
+/// Future events attach here without reshaping `hook` again.
 #[derive(Subcommand, Debug)]
 enum HookEvent {
     /// Once per substantive session, on the first Stop call that earns it:
@@ -706,6 +710,22 @@ enum HookEvent {
         /// lifecycle hook that refuses to start is worse than one that
         /// answers in the shape every harness has always accepted. Omitted or
         /// unrecognized is exactly today's behaviour.
+        #[arg(long)]
+        harness: Option<String>,
+    },
+    /// On every prompt a person submits: search every registered domain with
+    /// the prompt's words and hand the agent the few engrams that may apply,
+    /// each by its crystalline:// address, once per session per engram.
+    /// Silent - exit 0, empty stdout - on a short prompt, a slash command, an
+    /// unconfigured install, no running daemon, an index without embeddings
+    /// yet, a search slower than its one-second budget, or nothing over the
+    /// floor. Wired by `crystalline install`; `recall.enabled` turns it off
+    /// without touching the harness settings.
+    Prompt {
+        /// Which harness this hook is answering, as `crystalline install`
+        /// wrote it (claude-code, codex, copilot). Accepted for symmetry with
+        /// `stop`; the reply shape is the same for every harness today, and
+        /// an id this binary does not know is inert rather than a failure.
         #[arg(long)]
         harness: Option<String>,
     },
@@ -1735,6 +1755,12 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Hook { event }) => match event {
             HookEvent::Stop { harness } => {
                 hook::run_stop(harness.as_deref());
+                Ok(())
+            }
+            HookEvent::Prompt { harness } => {
+                // Silence is the contract: a runtime that fails to build is a
+                // bail like any other, never an exit code.
+                let _ = on_runtime_value_current_thread(move || recall::run_prompt(harness));
                 Ok(())
             }
         },
@@ -3933,10 +3959,22 @@ fn run_prompt(
     // suppression lives here instead. Everything about the read is tolerant -
     // a terminal stdin (someone running the command by hand must not hang),
     // a read error, empty input or unparseable JSON all mean "fresh start".
+    //
+    // The payload is read exactly once, whatever the format: it also says
+    // when the session's context was cleared or compacted, which is when the
+    // per-prompt recall hook's list of already-shown engrams is fair to
+    // empty - the block that named them is gone from the agent's context too.
+    let session_start = session_start_payload();
     if format == PromptFormat::Copilot
-        && let Some("resume") = session_start_source().as_deref()
+        && session_start.as_ref().and_then(|p| p.source.as_deref()) == Some("resume")
     {
         return Ok(());
+    }
+    if let Some(payload) = &session_start
+        && matches!(payload.source.as_deref(), Some("clear" | "compact"))
+        && let Some(id) = payload.session_id.as_deref()
+    {
+        hook::reset_recalled(id);
     }
 
     // Session-start auto-update: a binary upgraded since the last install
@@ -4063,13 +4101,31 @@ fn run_prompt(
     Ok(())
 }
 
-/// The `source` field of the SessionStart payload on stdin, when there is
-/// one to read: `None` when stdin is a terminal (a person at a shell, never
-/// block on them), on any read error and on input that is not the expected
-/// JSON object - every one of those proceeds as a fresh start. The read is
-/// capped at a megabyte like the Stop hook's, so a misbehaving harness
-/// cannot balloon this process.
-fn session_start_source() -> Option<String> {
+/// The two fields this command reads off a SessionStart payload. Both carry
+/// a serde default, so a harness that omits one, sends `null` or adds fields
+/// nobody here knows about still parses.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SessionStartPayload {
+    /// What started the session: `startup`, `resume`, `clear` or `compact`.
+    #[serde(default)]
+    source: Option<String>,
+    /// The session this start belongs to, which is the key to the per-session
+    /// hook state file.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// The SessionStart payload on stdin, when there is one to read: `None` when
+/// stdin is a terminal (a person at a shell, never block on them), on any
+/// read error and on input that is not the expected JSON object - every one
+/// of those proceeds as a fresh start. The read is capped at a megabyte like
+/// the Stop hook's, so a misbehaving harness cannot balloon this process.
+///
+/// Read once per call whatever the output format: a `clear` or a `compact`
+/// empties the per-prompt recall list for that session, and that is true of
+/// every harness this command answers, not only the copilot one whose resume
+/// suppression first needed the payload.
+fn session_start_payload() -> Option<SessionStartPayload> {
     use std::io::Read;
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
@@ -4077,11 +4133,7 @@ fn session_start_source() -> Option<String> {
     }
     let mut raw = String::new();
     stdin.take(1024 * 1024).read_to_string(&mut raw).ok()?;
-    let payload: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    payload
-        .get("source")
-        .and_then(serde_json::Value::as_str)
-        .map(String::from)
+    serde_json::from_str(&raw).ok()
 }
 
 fn resolve_format(format: Option<OutputFormat>, json_flag: bool) -> OutputFormat {

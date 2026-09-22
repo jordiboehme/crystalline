@@ -1691,6 +1691,17 @@ pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
     }
 }
 
+/// [`ctl_if_running`] over a passive attach: the answer of a daemon that is
+/// already there, `None` when none is, and never a displacement on the way.
+/// For callers on a latency budget that must not pay for a takeover - the
+/// per-prompt recall hook is the one today.
+pub async fn ctl_if_running_passive(cmd: Value) -> anyhow::Result<Option<Value>> {
+    match crate::instance::try_attach_passive().await {
+        Some(conn) => Ok(Some(ctl_exchange(conn, cmd).await?)),
+        None => Ok(None),
+    }
+}
+
 /// Send a ctl command, erroring when no daemon is running.
 pub async fn ctl_required(cmd: Value) -> anyhow::Result<Value> {
     match try_attach().await {

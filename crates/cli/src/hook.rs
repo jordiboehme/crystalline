@@ -35,7 +35,11 @@
 //! is printed, so a crash between the write and the print can only cost a
 //! missed nudge, never a repeated one. Every call also opportunistically
 //! sweeps state files older than a week, so a long-lived install never
-//! accumulates one file per session forever.
+//! accumulates one file per session forever. The same file carries the
+//! addresses `crystalline hook prompt` has already shown this session (see
+//! [`crate::recall`]), and this handler's rewrite carries that list through
+//! untouched: the two hooks share one file per session and neither erases
+//! what the other records.
 //!
 //! A session that earns the nudge also looks, once, at what every registered
 //! team domain owes its origin: the local delta against the recorded base
@@ -161,8 +165,10 @@ const FALLBACK_STOPS: u32 = 3;
 const STATE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// The state file's schema version, bumped only if the shape below changes
-/// incompatibly.
-const STATE_VERSION: u32 = 1;
+/// incompatibly. Adding a field that carries a serde default is not such a
+/// change: a file an older binary wrote still reads, and an older binary
+/// still reads one this version wrote.
+pub(crate) const STATE_VERSION: u32 = 1;
 
 /// The stdin payload a Stop hook sends. Every field carries a serde default,
 /// since a harness is free to add fields this handler does not know about
@@ -209,6 +215,12 @@ pub struct SessionState {
     pub nudged: bool,
     /// When this file was last written.
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Addresses this session has already been shown by the prompt hook,
+    /// oldest first. Capped at `RECALLED_MAX` (200); the oldest fall off.
+    /// Absent from every file written before 0.19.0, which is why it carries
+    /// a default rather than a version bump.
+    #[serde(default)]
+    pub recalled: Vec<String>,
 }
 
 impl SessionState {
@@ -217,12 +229,13 @@ impl SessionState {
     /// treated exactly like a missing one rather than aborting the hook: a
     /// worn nudge counter restarting at zero is a far smaller cost than a
     /// hook that starts failing loudly.
-    fn fresh() -> SessionState {
+    pub(crate) fn fresh() -> SessionState {
         SessionState {
             v: STATE_VERSION,
             stops: 0,
             nudged: false,
             updated_at: chrono::Utc::now(),
+            recalled: Vec::new(),
         }
     }
 }
@@ -553,12 +566,7 @@ pub fn run_stop(harness: Option<&str>) {
 
     let decision = decide(&input, has_domains, read_only, &state, transcript);
 
-    let new_state = SessionState {
-        v: STATE_VERSION,
-        stops: state.stops.saturating_add(1),
-        nudged: state.nudged || decision == StopDecision::Nudge,
-        updated_at: chrono::Utc::now(),
-    };
+    let new_state = stopped(&state, decision == StopDecision::Nudge);
     // State is persisted before the nudge is printed: a crash or a killed
     // process between the two can only cost a missed nudge, never a repeat
     // one. A write failure is itself silent, the same as every other bail -
@@ -683,7 +691,7 @@ fn stop_payload(harness: Option<HarnessKind>, reason: &str) -> serde_json::Value
 
 /// The state file path for a session, `<state_dir>/hooks/<session_id>.json`.
 /// Only ever called with an id [`valid_session_id`] has already accepted.
-fn state_path(session_id: &str) -> Result<PathBuf, config::ConfigError> {
+pub(crate) fn state_path(session_id: &str) -> Result<PathBuf, config::ConfigError> {
     Ok(config::state_dir()?
         .join("hooks")
         .join(format!("{session_id}.json")))
@@ -692,16 +700,61 @@ fn state_path(session_id: &str) -> Result<PathBuf, config::ConfigError> {
 /// Read and parse a session's state file. `None` for a missing file, an
 /// unreadable one or one that fails to parse - every case [`run_stop`]
 /// treats identically, falling back to [`SessionState::fresh`].
-fn read_state(path: &Path) -> Option<SessionState> {
+pub(crate) fn read_state(path: &Path) -> Option<SessionState> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 /// Serialize and atomically write a session's state file, creating
 /// `<state_dir>/hooks/` if it does not exist yet.
-fn write_state(path: &Path, state: &SessionState) -> Result<(), ()> {
+pub(crate) fn write_state(path: &Path, state: &SessionState) -> Result<(), ()> {
     let bytes = serde_json::to_vec(state).map_err(|_| ())?;
     config::save_bytes(path, &bytes).map_err(|_| ())
+}
+
+/// The state one Stop leaves behind: the counter advanced, the nudge flag
+/// latched, and everything the other hook owns carried through. Factored out
+/// of [`run_stop`] so the carry-through is the one thing both the handler and
+/// its test call, rather than a struct literal a test could only copy.
+fn stopped(state: &SessionState, nudge: bool) -> SessionState {
+    SessionState {
+        v: STATE_VERSION,
+        stops: state.stops.saturating_add(1),
+        nudged: state.nudged || nudge,
+        updated_at: chrono::Utc::now(),
+        recalled: state.recalled.clone(),
+    }
+}
+
+/// Empty a session's recalled list, keeping everything else. Called when the
+/// session's context is cleared or compacted: the block the prompt hook wrote
+/// is gone from the agent's context, so the engrams it named are fair to show
+/// again. A missing or unreadable file is left alone - there is nothing to
+/// reset, and conjuring a file for a session that never wrote one would only
+/// give the stale sweep something to collect.
+pub(crate) fn reset_recalled(session_id: &str) {
+    if !valid_session_id(session_id) {
+        return;
+    }
+    let Ok(path) = state_path(session_id) else {
+        return;
+    };
+    reset_recalled_at(&path);
+}
+
+/// The path-taking half of [`reset_recalled`], so the rewrite is testable
+/// without reaching the real state directory (the shape `maintenance.rs`
+/// uses for its recorders).
+fn reset_recalled_at(path: &Path) {
+    let Some(mut state) = read_state(path) else {
+        return;
+    };
+    if state.recalled.is_empty() {
+        return;
+    }
+    state.recalled.clear();
+    state.updated_at = chrono::Utc::now();
+    let _ = write_state(path, &state);
 }
 
 /// Measure a transcript without ever reading more than [`SUBSTANCE_BYTES`]:
@@ -856,6 +909,113 @@ mod tests {
                 "session id {id:?} expected valid={expected}"
             );
         }
+    }
+
+    // --- the recalled list ---------------------------------------------------
+
+    /// A state file the Stop hook wrote before this release has no `recalled`
+    /// key at all. It has to read as an empty list rather than as a parse
+    /// failure, which is what keeps `STATE_VERSION` at 1.
+    #[test]
+    fn a_state_file_without_the_recalled_field_reads_as_an_empty_list() {
+        let state: SessionState = serde_json::from_str(
+            r#"{"v":1,"stops":2,"nudged":false,"updated_at":"2026-09-21T10:00:00Z"}"#,
+        )
+        .expect("a pre-0.19.0 state file still parses");
+        assert_eq!(state.stops, 2);
+        assert!(state.recalled.is_empty());
+    }
+
+    /// The Stop hook rewrites the whole struct on every call, so the list the
+    /// prompt hook keeps has to ride through that rewrite untouched. Asserted
+    /// through [`stopped`], which is the literal `run_stop` itself builds.
+    #[test]
+    fn the_stop_rewrite_carries_the_recalled_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let state = SessionState {
+            v: STATE_VERSION,
+            stops: 1,
+            nudged: false,
+            updated_at: chrono::Utc::now(),
+            recalled: vec![
+                "crystalline://ship-ops/docking-gear".to_string(),
+                "crystalline://ship-ops/coolant/vent-driver-retries".to_string(),
+            ],
+        };
+        write_state(&path, &state).unwrap();
+        let read = read_state(&path).expect("the state round-trips");
+
+        let after = stopped(&read, true);
+
+        assert_eq!(after.stops, 2);
+        assert!(after.nudged);
+        assert_eq!(after.recalled, state.recalled);
+    }
+
+    /// A cleared or compacted session may be shown its engrams again, so the
+    /// list empties while the counters the Stop hook owns stay exactly as they
+    /// were.
+    #[test]
+    fn reset_recalled_empties_the_list_and_keeps_the_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let before = SessionState {
+            v: STATE_VERSION,
+            stops: 3,
+            nudged: true,
+            updated_at: chrono::Utc::now(),
+            recalled: vec![
+                "crystalline://a/b".to_string(),
+                "crystalline://c/d".to_string(),
+            ],
+        };
+        write_state(&path, &before).unwrap();
+
+        reset_recalled_at(&path);
+
+        let after = read_state(&path).expect("the file is still there");
+        assert_eq!(after.stops, 3);
+        assert!(after.nudged);
+        assert!(after.recalled.is_empty());
+    }
+
+    /// There is nothing to reset in a session that never wrote a file, and a
+    /// reset must not conjure one: the 7-day sweep would then find state for a
+    /// session that never had any.
+    #[test]
+    fn reset_recalled_leaves_a_missing_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nothing-here.json");
+
+        reset_recalled_at(&path);
+
+        assert!(!path.exists());
+    }
+
+    /// An already-empty list is not rewritten at all, which is observable on
+    /// the stamp: a `/clear` on a session that never recalled anything leaves
+    /// the file byte-identical.
+    #[test]
+    fn reset_recalled_does_not_rewrite_an_already_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let stamp = chrono::DateTime::parse_from_rfc3339("2026-09-01T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let before = SessionState {
+            v: STATE_VERSION,
+            stops: 1,
+            nudged: false,
+            updated_at: stamp,
+            recalled: Vec::new(),
+        };
+        write_state(&path, &before).unwrap();
+
+        reset_recalled_at(&path);
+
+        let after = read_state(&path).expect("the file is still there");
+        assert_eq!(after.updated_at, stamp);
     }
 
     // --- decide ----------------------------------------------------------------
