@@ -18094,6 +18094,16 @@ impl Engine {
                 .trim_start_matches("./")
                 .trim_start_matches('/')
                 .to_string();
+            // A generated listing is never a change of this feature, so it is
+            // never a path a discard can name, whatever the MANIFEST says
+            // about sharing listings. The team arm gets this from
+            // `resolve_local_change`; here it is the same rule written out,
+            // rather than something that happens to hold because no verb
+            // writes such a row today.
+            if !origin::takes_part_in_local_change(&path) {
+                refused.push(json!({ "path": path, "reason": "unknown_path" }));
+                continue;
+            }
             let row = match domain_id {
                 Some(domain_id) => {
                     let store = self.store.lock().await;
