@@ -13,6 +13,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 
+use crystalline_remote::ops::DiscardTarget;
+
 use crate::daemon::{open_store, resolve_db};
 use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone};
 use crate::instance::{Connection, acquire_ownership, ensure_daemon, try_attach};
@@ -1267,6 +1269,69 @@ pub async fn origin_withdraw(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     Ok(engine
         .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
+        .await?)
+}
+
+/// One team domain's unshared changes, offline, for `origin diff`: over the
+/// daemon when one owns the index, else against a directly opened store.
+/// `path` narrows to one change, `sides` inlines both texts per entry.
+pub async fn origin_changes(
+    domain: &str,
+    path: Option<&str>,
+    sides: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "origin_changes", "domain": domain, "path": path, "sides": sides,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    Ok(crate::control::origin_changes_inline(&engine, domain, path, sides).await?)
+}
+
+/// Put named paths of one team domain back the way the team has them, for
+/// `origin discard`: over the daemon when one owns the index, else against a
+/// directly opened store. The standalone path discards as
+/// [`ShareActor::Owner`], as every origin write verb does.
+pub async fn origin_discard(
+    domain: &str,
+    targets: &[(String, Option<String>)],
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    let wire: Vec<Value> = targets
+        .iter()
+        .map(|(path, sha)| json!({ "path": path, "sha": sha }))
+        .collect();
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "origin_discard", "domain": domain, "targets": wire,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let targets: Vec<DiscardTarget> = targets
+        .iter()
+        .map(|(path, sha)| DiscardTarget {
+            path: path.clone(),
+            sha256: sha.clone(),
+        })
+        .collect();
+    Ok(engine
+        .discard_local_changes(domain, &targets, &ShareActor::Owner)
         .await?)
 }
 

@@ -1437,6 +1437,38 @@ enum OriginCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Show what changed in a team domain's unshared files, as a unified
+    /// diff of the team's copy against yours, without contacting GitHub.
+    Diff {
+        /// The team domain to diff.
+        domain: String,
+        /// Show only this changed file, relative to the domain root. Omit
+        /// to diff every unshared change.
+        #[arg(long)]
+        path: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Put chosen unshared files back the way the team has them: a
+    /// modified engram gets the team's copy back, an added file is
+    /// deleted, a deleted file is restored; in a domain that reviews
+    /// changes, your own drafts of them are cleared. Previews first and
+    /// asks; never contacts GitHub.
+    Discard {
+        /// The team domain the changes belong to.
+        domain: String,
+        /// A changed file to discard, relative to the domain root. Repeat
+        /// for several.
+        #[arg(long = "path", required = true)]
+        paths: Vec<String>,
+        /// Skip the confirmation prompt and discard.
+        #[arg(long)]
+        yes: bool,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Resolve one recorded conflict for a team domain.
     Resolve {
         /// The team domain the conflict belongs to.
@@ -2350,8 +2382,9 @@ async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> 
 }
 
 /// `origin update`/`origin status`/`origin share`/`origin withdraw`/
-/// `origin resolve`: socket-first with an in-process fallback, all already
-/// handled inside their respective `crystalline_service` entry points.
+/// `origin diff`/`origin discard`/`origin resolve`: socket-first with an
+/// in-process fallback, all already handled inside their respective
+/// `crystalline_service` entry points.
 async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     match command {
         OriginCommand::Update { domain, config } => {
@@ -2424,6 +2457,91 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             )
             .await?;
             cmd::print_origin_withdraw(&data, json);
+            Ok(())
+        }
+        OriginCommand::Diff {
+            domain,
+            path,
+            config,
+        } => {
+            let data = crystalline_service::origin_changes(
+                &domain,
+                path.as_deref(),
+                true,
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            cmd::print_origin_diff(&domain, &data, json);
+            Ok(())
+        }
+        OriginCommand::Discard {
+            domain,
+            paths,
+            yes,
+            config,
+        } => {
+            if json && !yes {
+                anyhow::bail!("--json requires --yes");
+            }
+            // The preview is the list narrowed to the named paths, with the
+            // digest each was read at: what the discard is then guarded by.
+            let listed = crystalline_service::origin_changes(
+                &domain,
+                None,
+                false,
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            let targets = cmd::print_discard_preview(&listed, &paths, json);
+            // Only short-circuits the human path: `--json` always reaches
+            // the engine even when every named path is unknown, so the
+            // report carries the engine's own per-path refusal reason
+            // (`unknown_path`) instead of this CLI-side message, which a
+            // machine reader would have to special-case on top of the JSON
+            // shape every other refusal already comes back in.
+            if targets.is_empty() && !json {
+                anyhow::bail!(
+                    "nothing to discard: none of the named paths is among this domain's unshared changes"
+                );
+            }
+            if !yes {
+                if std::io::stdin().is_terminal() {
+                    print!("Discard {} file(s)? [y/N] ", targets.len());
+                    std::io::stdout().flush()?;
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    if !matches!(answer.trim(), "y" | "Y") {
+                        println!("aborted");
+                        return Ok(());
+                    }
+                } else {
+                    anyhow::bail!("not a terminal; pass --yes");
+                }
+            }
+            // The unknown paths travel too, so the report names them as
+            // refused rather than dropping them on the way.
+            let all: Vec<(String, Option<String>)> = paths
+                .iter()
+                .map(|p| {
+                    targets
+                        .iter()
+                        .find(|(t, _)| t == p)
+                        .cloned()
+                        .unwrap_or((p.clone(), None))
+                })
+                .collect();
+            let data = crystalline_service::origin_discard(
+                &domain,
+                &all,
+                db.as_deref(),
+                config.as_deref(),
+            )
+            .await?;
+            if !cmd::print_origin_discard(&data, json) {
+                std::process::exit(1);
+            }
             Ok(())
         }
         OriginCommand::Resolve {
