@@ -4,7 +4,10 @@
  * the file with no normalization and checksums those very bytes, so a Blob
  * of it is the file, byte for byte, without a raw-bytes route existing.
  * Share copies the page's own URL - the browser-shaped address, where Copy
- * address on the details panel copies the crystalline:// name. Print leans on
+ * address on the details panel copies the crystalline:// name. It is the
+ * address the server spelled for this reader where the payload carries one,
+ * so what a person hands over and what an agent hands over are one string,
+ * and this browser's own origin where the server could not say. Print leans on
  * the print stylesheet: chrome carries print:hidden, so what prints is the
  * content, the title and the trail above it.
  *
@@ -16,14 +19,12 @@
  */
 
 import type { ReactElement, RefObject } from "react";
-import { useCallback, useEffect, useImperativeHandle, useState } from "react";
+import { useCallback, useImperativeHandle } from "react";
 
 import type { EngramDetail } from "../api/engram";
 import { engramRoute } from "../paths";
 import { saveBlob } from "./downloads";
-
-/** How long the confirmations stay up, matching CopyAddressButton. */
-const CONFIRMED_FOR_MS = 2000;
+import { useSaid } from "./useSaid";
 
 /**
  * The document's own name: the permalink's last segment.
@@ -72,18 +73,7 @@ export function EngramActions({
   engram,
   handlers,
 }: EngramActionsProps): ReactElement {
-  const [said, setSaid] = useState<string | null>(null);
-  useEffect(() => {
-    if (said === null) {
-      return;
-    }
-    const timer = setTimeout(() => {
-      setSaid(null);
-    }, CONFIRMED_FOR_MS);
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [said]);
+  const [said, say] = useSaid();
 
   const download = useCallback(() => {
     // The same hand-over the full window's downloads use, so there is one
@@ -102,14 +92,19 @@ export function EngramActions({
         // rejecting a promise - the same reason CopyAddressButton wraps its
         // call in try/catch rather than chaining `.then`/`.catch` off it
         // directly.
-        const link = `${window.location.origin}${engramRoute(engram.domain, engram.permalink)}`;
+        // The server's own spelling of this page's address where it could
+        // work one out - the same string the tools hand an agent - and the
+        // browser's own origin where it could not.
+        const link =
+          engram.webUrl ??
+          `${window.location.origin}${engramRoute(engram.domain, engram.permalink)}`;
         await navigator.clipboard.writeText(link);
-        setSaid("Link copied");
+        say("Link copied");
       } catch {
-        setSaid("Copy refused");
+        say("Copy refused");
       }
     })();
-  }, [engram.domain, engram.permalink]);
+  }, [engram.domain, engram.permalink, engram.webUrl, say]);
 
   const print = useCallback(() => {
     window.print();

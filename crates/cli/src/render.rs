@@ -21,8 +21,9 @@ fn pretty_fallback(v: &Value, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "{text}")
 }
 
-/// `read`: the engram address on the first line, a blank line, then the engram
-/// content verbatim (real newlines, no JSON escaping).
+/// `read`: the engram address on the first line, the page address under it
+/// when the payload carries one, a blank line, then the engram content
+/// verbatim (real newlines, no JSON escaping).
 pub fn render_read(v: &Value, out: &mut impl Write) -> io::Result<()> {
     let (Some(domain), Some(permalink), Some(content)) = (
         v.get("domain").and_then(Value::as_str),
@@ -32,6 +33,9 @@ pub fn render_read(v: &Value, out: &mut impl Write) -> io::Result<()> {
         return pretty_fallback(v, out);
     };
     writeln!(out, "crystalline://{domain}/{permalink}")?;
+    if let Some(web) = v.get("web_url").and_then(Value::as_str) {
+        writeln!(out, "{web}")?;
+    }
     writeln!(out)?;
     write!(out, "{content}")
 }
@@ -500,6 +504,30 @@ mod tests {
         });
         let out = render_to_string(render_read, &v);
         assert_eq!(out, "crystalline://eng/alpha\n\nline one\nline \"two\"\n");
+    }
+
+    /// The page address is a second header line, under the address an agent
+    /// uses and above the blank line, so a person reading the terminal can
+    /// copy the link without asking for it. A payload that carries none is
+    /// printed exactly as it always was.
+    #[test]
+    fn render_read_prints_the_web_url_under_the_address_when_present() {
+        let v = json!({
+            "domain": "eng",
+            "permalink": "alpha",
+            "web_url": "http://127.0.0.1:7411/d/eng/e/alpha",
+            "content": "line one\n",
+        });
+        assert_eq!(
+            render_to_string(render_read, &v),
+            "crystalline://eng/alpha\nhttp://127.0.0.1:7411/d/eng/e/alpha\n\nline one\n"
+        );
+
+        let bare = json!({ "domain": "eng", "permalink": "alpha", "content": "line one\n" });
+        assert_eq!(
+            render_to_string(render_read, &bare),
+            "crystalline://eng/alpha\n\nline one\n"
+        );
     }
 
     #[test]

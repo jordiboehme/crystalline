@@ -11,9 +11,15 @@
  * fence, which becomes a diagram rather than a code block.
  */
 
-import { render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { describe, expect, it, vi } from "vitest";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
@@ -61,15 +67,18 @@ async function renderMarkdown(
   wikilinks?: WikilinkResolver,
   foldTitle?: string,
   documentName?: string,
+  anchors?: { pageUrl: string },
+  entry = "/",
 ) {
   const result = render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[entry]}>
       <ThemeProvider>
         <Markdown
           source={source}
           {...(wikilinks ? { wikilinks } : {})}
           {...(foldTitle === undefined ? {} : { foldTitle })}
           {...(documentName === undefined ? {} : { documentName })}
+          {...(anchors === undefined ? {} : { anchors })}
         />
       </ThemeProvider>
     </MemoryRouter>,
@@ -78,6 +87,12 @@ async function renderMarkdown(
     expect(screen.queryByText("crystallizing")).toBeNull();
   });
   return result;
+}
+
+/** Where the router stands, for the tests that care what a click did to it. */
+function LocationProbe() {
+  const { search, hash } = useLocation();
+  return <span data-testid="location">{`${search}${hash}`}</span>;
 }
 
 describe("the markdown renderer", () => {
@@ -438,5 +453,253 @@ describe("the markdown renderer", () => {
     } finally {
       clicked.mockRestore();
     }
+  });
+});
+
+/**
+ * Section anchors: the name every heading is reachable by, and the control
+ * that hands that name over.
+ *
+ * What is pinned here is what a reader and an agent can rely on. Every heading
+ * carries an id derived from its own text, so a URL written from the heading
+ * text lands on the heading; the control beside it is a real button with a
+ * real name, so a keyboard reaches it and a screen reader says what it is; and
+ * arriving with a fragment points the section out rather than leaving somebody
+ * to find it. A surface that does not opt in has none of it: no ids, no
+ * buttons, nothing to trip over.
+ */
+describe("section anchors", () => {
+  const PAGE = "https://kb.example.com/d/eng/e/alpha";
+  const SOURCE = ["## API", "", "## API", "", "### Auth & Tokens", ""].join(
+    "\n",
+  );
+
+  it("gives every heading an id from its text, numbered when repeated", async () => {
+    const { container } = await renderMarkdown(
+      SOURCE,
+      undefined,
+      undefined,
+      undefined,
+      { pageUrl: PAGE },
+    );
+
+    const ids = [...container.querySelectorAll("h2, h3")].map(
+      (heading) => heading.id,
+    );
+    expect(ids).toEqual(["api", "api-1", "auth-tokens"]);
+  });
+
+  it("draws no ids and no link symbols without anchors", async () => {
+    const { container } = await renderMarkdown(SOURCE);
+
+    for (const heading of container.querySelectorAll("h2, h3")) {
+      expect(heading.hasAttribute("id")).toBe(false);
+    }
+    expect(
+      screen.queryByRole("button", { name: "Link to this section" }),
+    ).toBeNull();
+  });
+
+  it("the link symbol is reachable by name and activates on Enter and Space", async () => {
+    const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+      Promise.resolve(),
+    );
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    await renderMarkdown(SOURCE, undefined, undefined, undefined, {
+      pageUrl: PAGE,
+    });
+
+    // One per heading, and each one is found by its name rather than by its
+    // position: a control with no text in it has nothing else to be known by.
+    expect(
+      screen.getAllByRole("button", { name: "Link to this section" }),
+    ).toHaveLength(3);
+
+    // In the tab order from the start, so it is reachable without a pointer
+    // ever hovering the heading it belongs to.
+    await userEvent.tab();
+    expect(document.activeElement).toBe(
+      screen.getAllByRole("button", { name: "Link to this section" })[0],
+    );
+
+    await userEvent.keyboard("{Enter}");
+    expect(writeText).toHaveBeenLastCalledWith(`${PAGE}#api`);
+    await userEvent.keyboard(" ");
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenLastCalledWith(`${PAGE}#api`);
+  });
+
+  it("says Link copied in the live region and beside the heading, then falls silent", async () => {
+    const writeText = vi.fn<(text: string) => Promise<void>>(() =>
+      Promise.resolve(),
+    );
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    const { container } = await renderMarkdown(
+      SOURCE,
+      undefined,
+      undefined,
+      undefined,
+      { pageUrl: PAGE },
+    );
+    const region = screen.getByRole("status", {
+      name: "Section link result",
+    });
+    expect(region).toHaveTextContent("");
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "Link to this section" })[2]!,
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(region).toHaveTextContent("Link copied");
+      // And beside the heading that was activated, which is the one a reader
+      // watching the pointer is looking at rather than the foot of the page.
+      expect(container.querySelector("#auth-tokens")).toHaveTextContent(
+        "Link copied",
+      );
+
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(region).toHaveTextContent("");
+      expect(container.querySelector("#auth-tokens")).not.toHaveTextContent(
+        "Link copied",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("scrolls to and flashes the heading the hash names, and does nothing for a missing one", async () => {
+    const scrolled = vi
+      .spyOn(Element.prototype, "scrollIntoView")
+      .mockImplementation(() => undefined);
+    try {
+      const { container, unmount } = await renderMarkdown(
+        SOURCE,
+        undefined,
+        undefined,
+        undefined,
+        { pageUrl: PAGE },
+        "/x#auth-tokens",
+      );
+
+      const target = container.querySelector("#auth-tokens");
+      expect(scrolled).toHaveBeenCalledWith({ block: "start" });
+      expect(scrolled.mock.instances[0]).toBe(target);
+      expect(target).toHaveClass("section-flash");
+      unmount();
+
+      // A fragment naming nothing in this document opens the page at the top,
+      // says nothing and throws nothing: an anchor is a hint, never a promise
+      // the page has to keep.
+      scrolled.mockClear();
+      const missing = await renderMarkdown(
+        SOURCE,
+        undefined,
+        undefined,
+        undefined,
+        { pageUrl: PAGE },
+        "/x#nowhere",
+      );
+      expect(scrolled).not.toHaveBeenCalled();
+      expect(missing.container.querySelector(".section-flash")).toBeNull();
+    } finally {
+      scrolled.mockRestore();
+    }
+  });
+
+  it("names the heading by its own text, with the control still reachable", async () => {
+    await renderMarkdown(SOURCE, undefined, undefined, undefined, {
+      pageUrl: PAGE,
+    });
+
+    // A button inside a heading joins the heading's computed name in a real
+    // browser, which would put "Link to this section" into every entry of a
+    // screen reader's heading list and into the document outline. The heading
+    // says what names it instead: a span around its own text and nothing else.
+    //
+    // Asserted through the wiring rather than through the computed name
+    // alone: this environment's name computation does not descend into the
+    // nested button, so the name reads correctly with or without the fix and
+    // would not notice it going away. What cannot be faked is the reference
+    // and what sits at the other end of it.
+    const heading = screen.getByRole("heading", { name: "Auth & Tokens" });
+    const labelledBy = heading.getAttribute("aria-labelledby");
+    expect(labelledBy).not.toBeNull();
+    const label = document.getElementById(labelledBy!);
+    expect(label?.textContent).toBe("Auth & Tokens");
+    expect(label?.querySelector("button")).toBeNull();
+    expect(heading).toHaveAccessibleName("Auth & Tokens");
+    // And the control keeps its own name, in the tab order, where it was.
+    expect(
+      screen.getAllByRole("button", { name: "Link to this section" }),
+    ).toHaveLength(3);
+  });
+
+  it("stops washing the heading it left when a second hash arrives", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn(() => Promise.resolve()) },
+      configurable: true,
+    });
+    const { container } = await renderMarkdown(
+      SOURCE,
+      undefined,
+      undefined,
+      undefined,
+      { pageUrl: PAGE },
+    );
+    const buttons = screen.getAllByRole("button", {
+      name: "Link to this section",
+    });
+
+    await userEvent.click(buttons[0]!);
+    expect(container.querySelector("#api")).toHaveClass("section-flash");
+
+    // The wash has to come off the one being left, not merely stop counting
+    // down: a reader who asked for reduced motion gets the tint with no fade,
+    // so a class left behind would stay on that heading for good.
+    await userEvent.click(buttons[2]!);
+    expect(container.querySelector("#api")).not.toHaveClass("section-flash");
+    expect(container.querySelector("#auth-tokens")).toHaveClass(
+      "section-flash",
+    );
+  });
+
+  it("keeps the page's query string when a link symbol is activated", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn(() => Promise.resolve()) },
+      configurable: true,
+    });
+    render(
+      <MemoryRouter initialEntries={["/x?tab=graph"]}>
+        <ThemeProvider>
+          <Markdown source={SOURCE} anchors={{ pageUrl: PAGE }} />
+          <LocationProbe />
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => {
+      expect(screen.queryByText("crystallizing")).toBeNull();
+    });
+
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Link to this section" })[0]!,
+    );
+
+    // The fragment is added to where the reader stands rather than replacing
+    // it: a page opened with a query string is still that page afterwards.
+    expect(screen.getByTestId("location")).toHaveTextContent("?tab=graph#api");
   });
 });

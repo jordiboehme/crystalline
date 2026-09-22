@@ -55,6 +55,7 @@ function detailOf(content: string): EngramDetail {
     permalink: "alpha",
     title: "A",
     url: "crystalline://eng/alpha",
+    webUrl: null,
     path: "alpha.md",
     content,
     checksum: "c1",

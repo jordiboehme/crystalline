@@ -121,6 +121,11 @@ export interface EngramDetail {
   title: string;
   /** Its `crystalline://` address. */
   url: string;
+  /**
+   * Its page in this app, as the server spelled it for the caller; `null`
+   * where the server could not say.
+   */
+  webUrl: string | null;
   /** The file it lives in, for a file domain. */
   path: string | null;
   /** The markdown as written, frontmatter and all. */
@@ -356,6 +361,7 @@ export function readEngramDetail(
     permalink: slug,
     title: asString(record?.title) ?? slug,
     url: asString(record?.url) ?? crystallineAddress(where, slug),
+    webUrl: asString(record?.web_url),
     path: asString(record?.path),
     content: asString(record?.content) ?? "",
     checksum: asString(record?.checksum),

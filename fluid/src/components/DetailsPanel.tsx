@@ -20,7 +20,6 @@
  */
 
 import { Copy } from "lucide-react";
-import { useEffect, useState } from "react";
 import { Link } from "react-router";
 
 import type { EngramFrontmatter, VerifiedEntry } from "../api/engram";
@@ -28,9 +27,7 @@ import { formatActor, formatDay } from "../format";
 import { tagRoute } from "../paths";
 import { AttachmentsSection } from "./AttachmentsSection";
 import { Chip, FOCUS_RING, IconButton, statusVariant } from "./primitives";
-
-/** How long the copy outcome stays announced. */
-const COPIED_FOR_MS = 2000;
+import { useSaid } from "./useSaid";
 
 export interface DetailsPanelProps {
   frontmatter: EngramFrontmatter;
@@ -182,19 +179,7 @@ function Row({
  * start and empty, so the text arriving in it is what gets read out.
  */
 export function CopyAddress({ address }: { address: string }) {
-  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
-
-  useEffect(() => {
-    if (state !== "copied") {
-      return;
-    }
-    const timer = setTimeout(() => {
-      setState("idle");
-    }, COPIED_FOR_MS);
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [state]);
+  const [said, say] = useSaid();
 
   return (
     <span className="inline-flex items-center gap-1">
@@ -205,13 +190,13 @@ export function CopyAddress({ address }: { address: string }) {
           void (async () => {
             try {
               await navigator.clipboard.writeText(address);
-              setState("copied");
+              say("Copied");
             } catch {
               // A browser that refuses the clipboard is not a failure of the
               // page: the address is written out right beside the button
               // either way, and saying so beats a control that silently does
               // nothing.
-              setState("failed");
+              say("Copy refused");
             }
           })();
         }}
@@ -222,11 +207,7 @@ export function CopyAddress({ address }: { address: string }) {
         aria-label="Copy address result"
         className="text-caption text-slate-500 dark:text-slate-400"
       >
-        {state === "copied"
-          ? "Copied"
-          : state === "failed"
-            ? "Copy refused"
-            : ""}
+        {said ?? ""}
       </span>
     </span>
   );

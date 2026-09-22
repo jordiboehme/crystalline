@@ -348,6 +348,7 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
                 "status": "stable",
                 "path": "alpha.md",
                 "url": "crystalline://eng/alpha",
+                "web_url": "http://127.0.0.1:7411/d/eng/e/alpha",
                 "content": "---\ntitle: Alpha\n---\n\nThe first engram.\n",
                 "checksum": "3f8a1c05e2",
                 "frontmatter": { "title": "Alpha", "permalink": "alpha" },
@@ -404,6 +405,14 @@ pub async fn detail(
             &identity.scope(),
         )
         .await?;
+    // The page this request's own origin opens the engram at, attached before
+    // the checksum is read because that read borrows the value. The ETag is
+    // unaffected either way: `etag` names the payload's own `checksum` rather
+    // than hashing the body, so two callers at different origins share a
+    // validator for the same engram, which `no-cache` and the per-session
+    // auth make harmless.
+    let mut value = value;
+    crate::web_url::attach_engram_url(&mut value, &state.engine.request_web_base(&headers));
     let checksum = checksum_of(&value)?.to_string();
     if if_none_match_matches(&headers, &checksum) {
         // The validator and `Cache-Control`, no body: the shape is stated

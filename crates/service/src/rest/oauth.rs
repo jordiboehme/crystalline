@@ -357,9 +357,11 @@ const MAX_STATE_LEN: usize = MAX_URI_LEN;
 
 /// How this instance names itself, per request.
 ///
-/// Either the origin of a configured `auth.oidc.redirect_uri` - the one place
-/// an operator behind a Host-rewriting proxy has already written the public
-/// address - or the origin the request itself says it arrived at. Held by the
+/// `service.public_url` when it is set - the operator's own statement of the
+/// address people reach this instance at - else the origin of a configured
+/// `auth.oidc.redirect_uri`, the older place a deployment behind a
+/// Host-rewriting proxy wrote that address, else the origin the request itself
+/// says it arrived at. Held by the
 /// MCP gate and by the two well-known handlers, so the address a client is told
 /// to use, the audience a token is minted for and the audience the gate checks
 /// are one answer rather than three.
@@ -368,6 +370,12 @@ pub struct OriginRule {
     /// The configured public origin, already parsed down to scheme, host and
     /// port. `None` means derive it from each request.
     override_origin: Option<String>,
+    /// `service.public_url` as the rule was built with it, in the canonical
+    /// origin spelling. Kept apart from [`OriginRule::override_origin`]
+    /// because a callback address is not a page address: a caller with no
+    /// request to derive from may follow this one and must not follow the
+    /// other.
+    public_url: Option<String>,
     /// The `Host` values a *derived* origin may name, normalized the way the
     /// transport normalizes one. Empty means every one of them, which is both
     /// an unconfigured `service.allowed_hosts` and a single `*` in it - the
@@ -483,12 +491,32 @@ impl OriginRule {
     /// served over are accepted, so nothing an operator can mistype reaches a
     /// document.
     pub fn from_config(config: &GlobalConfig, allowed_hosts: &[String]) -> OriginRule {
+        // The address people open the web UI at is the first answer to what
+        // this instance is called, ahead of the callback address: one of them
+        // is the public address stated outright, the other is a callback that
+        // happens to carry one.
+        // The same validator the key is set through, so the last reader of a
+        // value that reached a config some other way - hand-built, hand-edited
+        // past the load that drops it - refuses it too rather than publishing
+        // an address nothing can open.
+        let public_url = config.service_public_url().and_then(|value| {
+            if let Some(warning) = crate::settings::unusable_public_url_warning(value) {
+                tracing::warn!("{warning}");
+                return None;
+            }
+            Some(super::auth_store::normalize_resource(
+                &openidconnect::url::Url::parse(value)
+                    .expect("the validator above parsed it")
+                    .origin()
+                    .ascii_serialization(),
+            ))
+        });
         let configured = config
             .auth_oidc()
             .and_then(|oidc| oidc.redirect_uri.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let override_origin =
+        let redirect_origin =
             configured.and_then(|value| match openidconnect::url::Url::parse(value) {
                 Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {
                     Some(url.origin().ascii_serialization())
@@ -501,6 +529,15 @@ impl OriginRule {
                     None
                 }
             });
+        if let (Some(p), Some(r)) = (public_url.as_deref(), redirect_origin.as_deref())
+            && p != r
+        {
+            tracing::info!(
+                "service.public_url ({p}) and auth.oidc.redirect_uri ({r}) name different \
+                 origins; the OAuth resource identifier follows service.public_url"
+            );
+        }
+        let override_origin = public_url.clone().or(redirect_origin);
         // The same two escapes the transport's guard has, and nothing else:
         // an unconfigured list and a single `*` both mean every `Host` is
         // answered, so a derived origin echoes whatever arrives, which is what
@@ -519,8 +556,16 @@ impl OriginRule {
             };
         OriginRule {
             override_origin,
+            public_url,
             allowed_hosts,
         }
+    }
+
+    /// `service.public_url` as the rule was built with it, in the canonical
+    /// origin spelling. `None` where the key is unset, which is where a
+    /// caller with no request behind it falls back to the bind instead.
+    pub fn public_url(&self) -> Option<&str> {
+        self.public_url.as_deref()
     }
 
     /// The origin a request arrived at, in the spelling everything else
@@ -3141,7 +3186,7 @@ async fn rotate_refresh(
 mod tests {
     use super::*;
     use axum::http::header;
-    use crystalline_core::config::{AuthConfig, OidcConfig};
+    use crystalline_core::config::{AuthConfig, OidcConfig, ServiceConfig};
 
     /// A pending authorization that started `age` ago.
     fn pending(age: Duration) -> PendingAuthorization {
@@ -3697,6 +3742,71 @@ mod tests {
             .unwrap(),
             "http://localhost:7411"
         );
+    }
+
+    /// A config carrying `service.public_url` and whatever `redirect_uri` says.
+    fn config_with_public_url(public_url: &str, redirect_uri: Option<&str>) -> GlobalConfig {
+        GlobalConfig {
+            service: Some(ServiceConfig {
+                public_url: Some(public_url.to_string()),
+                ..ServiceConfig::default()
+            }),
+            ..config_with(redirect_uri)
+        }
+    }
+
+    /// The address people open the web UI at is what this instance calls
+    /// itself, so one origin reaches the two well-known documents, every
+    /// token's audience and every link an agent hands a person.
+    #[test]
+    fn service_public_url_is_the_resource_identifier_when_set() {
+        let rule = OriginRule::from_config(
+            &config_with_public_url("https://kb.example.com/", None),
+            &[],
+        );
+        assert_eq!(
+            rule.origin(&headers_with("other.example", None)).unwrap(),
+            "https://kb.example.com",
+            "the configured public address wins over whatever the request says"
+        );
+        assert_eq!(rule.public_url(), Some("https://kb.example.com"));
+    }
+
+    /// Both keys may name a public address, and they answer different
+    /// questions: the redirect uri is the callback a provider sends a browser
+    /// to, `service.public_url` is the address people open this instance at.
+    /// Where the two disagree the identifier follows the latter.
+    #[test]
+    fn service_public_url_outranks_the_oidc_redirect_uri_origin() {
+        let rule = OriginRule::from_config(
+            &config_with_public_url(
+                "https://kb.example.com",
+                Some("https://sso.example.com/api/v1/auth/oidc/callback"),
+            ),
+            &[],
+        );
+        assert_eq!(
+            rule.origin(&headers_with("127.0.0.1:7411", None)).unwrap(),
+            "https://kb.example.com"
+        );
+        assert_eq!(rule.public_url(), Some("https://kb.example.com"));
+    }
+
+    /// A redirect uri on its own still overrides the derived origin, exactly
+    /// as it always has, and reports no public url: a local caller then falls
+    /// to loopback rather than being handed a callback address as the place to
+    /// open a page.
+    #[test]
+    fn an_oidc_redirect_uri_alone_still_overrides_and_reports_no_public_url() {
+        let rule = OriginRule::from_config(
+            &config_with(Some("https://sso.example.com/api/v1/auth/oidc/callback")),
+            &[],
+        );
+        assert_eq!(
+            rule.origin(&headers_with("127.0.0.1:7411", None)).unwrap(),
+            "https://sso.example.com"
+        );
+        assert_eq!(rule.public_url(), None);
     }
 
     /// **A derived origin answers only for a `Host` this instance was told to

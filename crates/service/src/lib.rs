@@ -46,6 +46,7 @@ mod tool_schema;
 mod toon;
 #[cfg(feature = "fluid-ui")]
 pub mod ui;
+pub mod web_url;
 
 /// The name the consolidation sweep is advertised and dispatched under.
 ///

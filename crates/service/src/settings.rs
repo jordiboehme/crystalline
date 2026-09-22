@@ -277,6 +277,16 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: allowed_hosts_effective,
         },
         SettingSpec {
+            key: "service.public_url",
+            doc: "The address people open the Fluid web UI at, for example https://knowledge.example.com; used verbatim as the base of every web_url the tools hand back, and as the OAuth resource identifier. Unset (default) derives the address per caller: from the request for an HTTP client, from the bound port for a local one. Set it where a proxy rewrites the Host, where the instance runs in a container, or where a separate Fluid deployment fronts an API-only daemon. An instance served over plain http on a non-loopback address still derives an https address it does not serve, so set this key there (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_service_public_url,
+            clear: clear_service_public_url,
+            effective: service_public_url_effective,
+        },
+        SettingSpec {
             key: "service.response_format",
             doc: "How list-shaped MCP tool results are encoded: toon (token-efficient, default) or json",
             kind: SettingKind::String,
@@ -1118,6 +1128,131 @@ fn allowed_hosts_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+// --- service.public_url --------------------------------------------------------
+
+/// The key, spelled once so every message about it reads the same.
+pub const PUBLIC_URL_KEY: &str = "service.public_url";
+
+/// Why `value` cannot be the address people open the web UI at, or `None`
+/// when it can. One function for both arrivals of the key - the registry and
+/// the environment overlay - so the two cannot drift.
+pub fn service_public_url_problem(value: &str) -> Option<String> {
+    let key = PUBLIC_URL_KEY;
+    let Ok(url) = openidconnect::url::Url::parse(value.trim()) else {
+        return Some(format!(
+            "{key} must be an absolute url, for example https://knowledge.example.com, got '{value}'"
+        ));
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return Some(format!(
+            "{key} must be an http or https url; a browser opens nothing else"
+        ));
+    }
+    let Some(host) = url.host() else {
+        return Some(format!(
+            "{key} must name the host people reach this instance at"
+        ));
+    };
+    let unspecified = match host {
+        openidconnect::url::Host::Ipv4(ip) => ip.is_unspecified(),
+        openidconnect::url::Host::Ipv6(ip) => ip.is_unspecified(),
+        openidconnect::url::Host::Domain(_) => false,
+    };
+    if unspecified {
+        return Some(format!(
+            "{key} must be an address a browser can open: 0.0.0.0 and :: are bind wildcards, not addresses - name the host people reach this instance at"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some(format!("{key} must carry no user name or password"));
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Some(format!(
+            "{key} must be the origin alone - scheme, host and optional port, no path, query or fragment - because the web UI is served at the root"
+        ));
+    }
+    None
+}
+
+/// The one sentence said about a `service.public_url` that cannot be the
+/// address people open the web UI at, or `None` when the value can.
+///
+/// Writing the key through `configure` or `config set` is refused outright,
+/// because somebody is standing there to read the refusal. A value that
+/// arrives with no one watching - an environment variable in a compose file, a
+/// hand-edited `config.yaml` - is dropped with this line instead, and the
+/// address falls back to being derived per caller: an address a browser opens
+/// is not worth refusing to start a daemon over, and a container whose
+/// operator copied the bind into this key would otherwise never come up.
+pub fn unusable_public_url_warning(value: &str) -> Option<String> {
+    service_public_url_problem(value).map(|problem| {
+        format!(
+            "{problem}; ignoring '{value}', so the address people open Fluid at is derived per caller instead"
+        )
+    })
+}
+
+/// Canonicalise a `service.public_url` that came straight from the config
+/// file, which no setter has seen, the same way `set_service_public_url`
+/// does, so every reader compares the same spelling whichever layer the
+/// value arrived through; drop it instead when the validator refuses it, so
+/// an unusable value never reaches a reader. An environment-sourced value is
+/// already canonical by the time `apply` calls this (it went through
+/// `set_service_public_url` in the loop above), so re-running the same
+/// canonicalisation on it here is a no-op. Silent: the line is said once,
+/// where the value arrived, rather than on every re-read of the effective
+/// config.
+pub fn drop_unusable_public_url(config: &mut GlobalConfig) {
+    let Some(value) = config.service_public_url().map(str::to_string) else {
+        return;
+    };
+    match service_public_url_problem(&value) {
+        Some(_) => clear_service_public_url(config),
+        None => {
+            let origin = openidconnect::url::Url::parse(value.trim())
+                .expect("validated above")
+                .origin()
+                .ascii_serialization();
+            config
+                .service
+                .get_or_insert_with(ServiceConfig::default)
+                .public_url = Some(origin);
+        }
+    }
+}
+
+fn set_service_public_url(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    if let Some(problem) = service_public_url_problem(value) {
+        return Err(SettingsError(problem));
+    }
+    // Stored as its origin: the trailing slash gone, the host in its ascii
+    // spelling, a default port dropped - the one spelling every reader of the
+    // key compares, the same way the OAuth identifier is stored.
+    let origin = openidconnect::url::Url::parse(value.trim())
+        .expect("validated above")
+        .origin()
+        .ascii_serialization();
+    config
+        .service
+        .get_or_insert_with(ServiceConfig::default)
+        .public_url = Some(origin);
+    Ok(())
+}
+
+fn clear_service_public_url(config: &mut GlobalConfig) {
+    if let Some(s) = config.service.as_mut() {
+        s.public_url = None;
+    }
+    drop_service_if_empty(config);
+}
+
+fn service_public_url_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.service_public_url() {
+        Some(url) => (url.to_string(), false),
+        None => (String::new(), true),
+    }
+}
+
 // --- skills.serve -------------------------------------------------------------
 
 /// Accepts the tri-state `auto`, `true` and `false`. The two booleans are the
@@ -1891,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_thirty_five_keys_in_order() {
+    fn registry_lists_exactly_the_thirty_six_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1908,6 +2043,7 @@ mod tests {
                 "service.ui",
                 "service.api",
                 "service.allowed_hosts",
+                "service.public_url",
                 "service.response_format",
                 "skills.serve",
                 "database.backend",
@@ -1971,6 +2107,10 @@ mod tests {
                 (
                     "service.allowed_hosts",
                     "CRYSTALLINE_SERVICE_ALLOWED_HOSTS".to_string()
+                ),
+                (
+                    "service.public_url",
+                    "CRYSTALLINE_SERVICE_PUBLIC_URL".to_string()
                 ),
                 (
                     "service.response_format",
@@ -2047,6 +2187,7 @@ mod tests {
         assert!(change_note("service.ui", &no_env).is_some());
         assert!(change_note("service.api", &no_env).is_some());
         assert!(change_note("service.allowed_hosts", &no_env).is_some());
+        assert!(change_note("service.public_url", &no_env).is_some());
         assert!(change_note("service.response_format", &no_env).is_none());
         assert!(change_note("database.backend", &no_env).is_some());
         assert!(change_note("database.url", &no_env).is_some());
@@ -2522,7 +2663,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 35);
+        assert_eq!(views.len(), 36);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2539,6 +2680,7 @@ mod tests {
                 "service.ui",
                 "service.api",
                 "service.allowed_hosts",
+                "service.public_url",
                 "service.response_format",
                 "skills.serve",
                 "database.backend",
@@ -2629,47 +2771,51 @@ mod tests {
         assert_eq!(allowed_hosts.value, "");
         assert_eq!(allowed_hosts.source, SettingSource::Default);
 
-        let response_format = &views[13];
+        let public_url = &views[13];
+        assert_eq!(public_url.value, "");
+        assert_eq!(public_url.source, SettingSource::Default);
+
+        let response_format = &views[14];
         assert_eq!(response_format.value, "toon");
         assert_eq!(response_format.source, SettingSource::Default);
 
-        let skills_serve = &views[14];
+        let skills_serve = &views[15];
         assert_eq!(skills_serve.value, "auto");
         assert_eq!(skills_serve.source, SettingSource::Default);
 
-        let backend = &views[15];
+        let backend = &views[16];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[16];
+        let url = &views[17];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[17];
+        let salience_weight = &views[18];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[18];
+        let retired_weight = &views[19];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
 
-        let index_files = &views[19];
+        let index_files = &views[20];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let capture_similar = &views[20];
+        let capture_similar = &views[21];
         assert_eq!(capture_similar.value, "true");
         assert_eq!(capture_similar.source, SettingSource::Default);
 
-        let identity_actor = &views[21];
+        let identity_actor = &views[22];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[22];
+        let trusted_header = &views[23];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[23];
+        let anonymous = &views[24];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -2894,6 +3040,74 @@ mod tests {
             "read_only is still set, so the block must survive"
         );
         assert!(cfg.read_only());
+    }
+
+    // --- service.public_url --------------------------------------------------------
+
+    #[test]
+    fn service_public_url_round_trips_and_unsets_back_to_nothing() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "service.public_url", "https://kb.example.com/").unwrap();
+        assert_eq!(
+            service_public_url_effective(&cfg),
+            ("https://kb.example.com".to_string(), false),
+            "the stored value is the origin, so the trailing slash is gone"
+        );
+        assert_eq!(cfg.service_public_url(), Some("https://kb.example.com"));
+
+        unset(&mut cfg, "service.public_url").unwrap();
+        assert_eq!(service_public_url_effective(&cfg), (String::new(), true));
+        assert!(
+            cfg.service.is_none(),
+            "the block it was the only member of goes with it"
+        );
+    }
+
+    /// One spelling reaches every reader of the key, because the OAuth
+    /// resource identifier, the startup banner and every web_url compare it
+    /// and a second spelling is a mismatch nobody can see.
+    #[test]
+    fn service_public_url_is_stored_as_its_origin() {
+        for (written, stored) in [
+            ("https://KB.Example.com:443/", "https://kb.example.com"),
+            ("http://127.0.0.1:7411", "http://127.0.0.1:7411"),
+            ("http://[::1]:7411/", "http://[::1]:7411"),
+        ] {
+            let mut cfg = GlobalConfig::default();
+            apply(&mut cfg, "service.public_url", written).unwrap();
+            assert_eq!(
+                cfg.service_public_url(),
+                Some(stored),
+                "{written} is stored as {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_public_url_refuses_what_a_browser_cannot_open() {
+        for bad in [
+            "kb.example.com",
+            "ftp://kb.example.com",
+            "http://0.0.0.0:7411",
+            "http://[::]:7411",
+            "https://user:pw@kb.example.com",
+            "https://kb.example.com/crystalline",
+            "https://kb.example.com/?x=1",
+            "https://kb.example.com/#top",
+        ] {
+            let mut cfg = GlobalConfig::default();
+            let err = apply(&mut cfg, "service.public_url", bad)
+                .expect_err("expected '{bad}' to be refused");
+            assert!(
+                err.to_string().contains("service.public_url"),
+                "the refusal names the key it is about: {err}"
+            );
+            assert_eq!(
+                cfg.service_public_url(),
+                None,
+                "and nothing is stored when it is refused"
+            );
+        }
     }
 
     // --- database.backend ----------------------------------------------------------

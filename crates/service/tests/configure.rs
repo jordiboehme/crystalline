@@ -14,6 +14,8 @@ use crystalline_service::settings::SettingSource;
 use crystalline_service::{Engine, EnvOverlay};
 use tokio::sync::Mutex;
 
+mod support;
+
 async fn engine_at(config_path: &std::path::Path, read_only: bool) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
     Engine::new(
@@ -48,6 +50,62 @@ fn settings_of(data: &serde_json::Value) -> Vec<crystalline_service::settings::S
     serde_json::from_value(data["settings"].clone()).unwrap()
 }
 
+/// A `CRYSTALLINE_SERVICE_PUBLIC_URL` that cannot work is loaded as unset and
+/// said out loud once, rather than stopping the daemon: the line names the
+/// key, the value and why it cannot be opened, so an operator reading the log
+/// knows what to change and the instance is up while they change it.
+#[tokio::test]
+async fn an_unusable_public_url_variable_warns_and_loads_as_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+
+    let (logs, _guard) = support::capture_logs();
+    let engine = engine_with_overlay(
+        &config_path,
+        &[("CRYSTALLINE_SERVICE_PUBLIC_URL", "http://0.0.0.0:7411")],
+    )
+    .await;
+
+    assert_eq!(
+        engine.config().service_public_url(),
+        None,
+        "the key loads as unset, so the address is derived per caller"
+    );
+
+    let warning = logs
+        .lines()
+        .into_iter()
+        .find(|line| line.contains("service.public_url"))
+        .unwrap_or_else(|| panic!("expected a warning naming the key, got {:?}", logs.lines()));
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(
+        warning.contains("http://0.0.0.0:7411"),
+        "the line names the value that was dropped: {warning}"
+    );
+    assert!(
+        warning.contains("bind wildcards"),
+        "and says why it cannot be opened: {warning}"
+    );
+    assert!(
+        warning.contains("derived per caller"),
+        "and what happens instead: {warning}"
+    );
+
+    // Nothing was taken down: the engine is up and the rest of its
+    // configuration is exactly what it would have been.
+    let data = engine
+        .configure(&ConfigureAction::Show)
+        .await
+        .expect("the instance is serving");
+    let views = settings_of(&data);
+    let public_url = views
+        .iter()
+        .find(|v| v.key == "service.public_url")
+        .expect("the key is still in the registry");
+    assert_eq!(public_url.value, "");
+    assert_eq!(public_url.source, SettingSource::Default);
+}
+
 #[tokio::test]
 async fn show_lists_every_registry_key_at_its_default() {
     let tmp = tempfile::tempdir().unwrap();
@@ -56,7 +114,7 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 35);
+    assert_eq!(views.len(), 36);
     assert!(
         views
             .iter()

@@ -16,6 +16,7 @@
 import { Suspense, lazy } from "react";
 
 import type { WikilinkResolver } from "../wikilinks";
+import type { MarkdownAnchors } from "./MarkdownBody";
 
 const MarkdownBody = lazy(() => import("./MarkdownBody"));
 
@@ -49,6 +50,14 @@ export interface MarkdownProps {
    * picture alone.
    */
   documentName?: string;
+  /**
+   * The page this document is read at, which is what makes its headings
+   * addressable: every heading gets an id, a link symbol beside it copies the
+   * page URL plus that id, and a fragment in the location scrolls to the
+   * heading it names. Absent, none of that is drawn - a surface nobody can
+   * link into should not offer to be linked into.
+   */
+  anchors?: MarkdownAnchors;
 }
 
 export function Markdown({
@@ -57,6 +66,7 @@ export function Markdown({
   foldTitle,
   domain,
   documentName,
+  anchors,
 }: MarkdownProps) {
   return (
     <Suspense
@@ -94,6 +104,7 @@ export function Markdown({
         {...(foldTitle === undefined ? {} : { foldTitle })}
         {...(domain === undefined ? {} : { domain })}
         {...(documentName === undefined ? {} : { documentName })}
+        {...(anchors === undefined ? {} : { anchors })}
       />
     </Suspense>
   );

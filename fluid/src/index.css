@@ -463,3 +463,35 @@
     animation: none;
   }
 }
+/*
+ * The section a handed URL names, pointed out on arrival: a wash of the accent
+ * tint that fades to nothing over two and a half seconds, so a reader's eye
+ * lands on the right heading without the page shouting about it. A reader who
+ * asked for less motion gets the wash and no fade, which says the same thing
+ * standing still.
+ *
+ * The wash is a custom property rather than two rule sets, so the keyframes
+ * are written once and the dark theme only has to say which tint it means.
+ */
+.section-flash {
+  --section-flash-wash: var(--color-accent-200);
+  animation: section-flash 2.5s ease-out 1;
+  border-radius: 0.25rem;
+}
+[data-theme="dark"] .section-flash {
+  --section-flash-wash: var(--color-accent-800);
+}
+@keyframes section-flash {
+  from {
+    background-color: var(--section-flash-wash);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .section-flash {
+    animation: none;
+    background-color: var(--section-flash-wash);
+  }
+}
