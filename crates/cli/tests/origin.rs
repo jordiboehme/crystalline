@@ -1142,6 +1142,58 @@ mod chain {
         assert!(out.contains("\"restored\":[\"a.md\"]"), "{out}");
     }
 
+    /// A path named twice on the command line is one target, pinned where
+    /// the duplicate would otherwise be visible: the request the stand-in
+    /// daemon records. A stdout assertion cannot pin this reliably (the
+    /// engine's changed-since guard refuses a second, now-stale copy of the
+    /// same target after the first one restores the file, so `restored:
+    /// alpha.md` prints once either way); the posted `targets` array is the
+    /// only place the duplicate would actually show up before the dedupe.
+    #[test]
+    fn discard_over_the_daemon_posts_one_target_for_a_path_named_twice() {
+        let daemon = Daemon::serving_sequence(
+            "discard-dup",
+            vec![
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "mode": "team",
+                    "changes": [
+                        {
+                            "path": "a.md",
+                            "kind": "modified",
+                            "sha": "cafefeed",
+                            "size_before": 5,
+                            "size_after": 7,
+                            "binary": false,
+                            "engram": true,
+                        }
+                    ],
+                    "skipped_large": [],
+                }}),
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "restored": ["a.md"],
+                    "deleted": [],
+                    "cleared": [],
+                    "refused": [],
+                    "reindexed": 1,
+                }}),
+            ],
+        );
+        daemon.run(&[
+            "--json", "origin", "discard", "brand", "--path", "a.md", "--path", "a.md", "--yes",
+        ]);
+        // The preview.
+        daemon.request();
+        let discard_request = daemon.request();
+        assert_eq!(discard_request["cmd"], "origin_discard");
+        assert_eq!(
+            discard_request["targets"],
+            json!([{ "path": "a.md", "sha": "cafefeed" }]),
+            "a.md named twice must still post as one target"
+        );
+    }
+
     /// The status payload for a domain: `open` open proposals in chain order
     /// plus whatever chain state the test is about.
     fn status_payload(open: Vec<Value>, wedged: Vec<u64>, repair: bool, link: bool) -> Value {
