@@ -117,6 +117,7 @@ A chat memory is a hidden blob. One vendor owns it, it is tied to one model, and
 - **Scales past a folder of files.** Domains with MANIFEST routing, hybrid text-plus-semantic search, a knowledge graph and temporal filtering: the ten-thousandth engram is as findable as the tenth.
 - **Knowledge retires, it does not disappear.** A fact that stopped holding is superseded, not overwritten. The old engram stays addressable by date ("what applied last June"), retired knowledge fades in ranking instead of vanishing and `crystalline evolve` tells you what the archive needs next.
 - **Agents and people share one intelligence.** Agents work over MCP, people work in Fluid, and a team shares through GitHub pull requests, with review mode and private drafts for a domain that wants a gate.
+- **Many ways to the right engram, and all of them fast.** An agent does not have to guess one query. It searches by meaning, follows typed relations through the graph, filters by tag or status, walks the links between engrams and pulls a whole neighborhood in one call. At ten thousand engrams a search comes back in well under half a second, so looking before answering costs it nothing.
 - **Hello · Hallo · Hola · Bonjour · Ciao · Olá · Hoi · Ahoj · مرحبا · こんにちは · 안녕하세요 · 你好.** Search is multilingual: the built-in embedding model reads more than 200 languages, 52 of them with retrieval training, so a German engram answers an English question and the other way round, and a domain that mixes languages needs no translation.
 
 ## Fluid
@@ -148,7 +149,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 
 ## Go deeper
 
-- The Crystalline Handbook is the book-length guide: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from. Read it online at https://jordiboehme.github.io/crystalline/, or download the [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf), the [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub) or the single-file [Markdown](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.md) edition.
+- The Crystalline Handbook is the book-length guide: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from. Read it online at https://jordiboehme.github.io/crystalline/, or download the [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf) or the [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub).
 - [The docs](docs/README.md): setup per harness, how an agent learns, teams, verify and evolve, virtual domains, architecture.
 - [FAQ](docs/faq.md): the short answers, and why not just a folder of files.
 - [Deployment](docs/deployment.md): every scenario from a laptop to an air-gapped server, one diagram each.
