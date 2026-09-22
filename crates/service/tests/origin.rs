@@ -114,6 +114,14 @@ fn manifest_sharing_indexes() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
+/// The same MANIFEST, declaring that a share of this domain commits straight
+/// onto the connected branch instead of opening a proposal. The default is
+/// `proposal`, so a scenario whose subject is the direct path has to say so,
+/// the way a real team says it once in the file all of its members hold.
+fn manifest_sharing_direct() -> Vec<u8> {
+    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+}
+
 fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
     format!(
         "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
@@ -1349,12 +1357,13 @@ async fn origin_status_reports_behind_and_connection() {
 /// The keys one domain entry carries when nobody asked for detail. Pinned as a
 /// list rather than spot-checked so an accidental `detail: null` - a key that
 /// costs every reader something and says nothing - fails here.
-const STATUS_KEYS_WITHOUT_DETAIL: [&str; 17] = [
+const STATUS_KEYS_WITHOUT_DETAIL: [&str; 19] = [
     "base_commit",
     "behind",
     "branch",
     "conflicts",
     "declined_proposals",
+    "direct_shares",
     "domain",
     "last_checked",
     "local_changes",
@@ -1363,6 +1372,7 @@ const STATUS_KEYS_WITHOUT_DETAIL: [&str; 17] = [
     "probe_error",
     "repair_pending",
     "repo",
+    "sharing",
     "skipped_large",
     "stack_link_pending",
     "stack_number",
@@ -1883,6 +1893,300 @@ async fn a_share_records_the_login_it_acted_as_on_the_proposal() {
         state.proposals[0].author_login.as_deref(),
         Some("instance-gh"),
         "the acting login reaches the record, not the personal-mode-only one"
+    );
+}
+
+// --- the direct policy ---------------------------------------------------------
+
+/// A direct domain registered from the forge: the MANIFEST already declares
+/// `sharing: direct`, so the first share is a commit.
+async fn direct_team(
+    tmp: &tempfile::TempDir,
+    mock: Arc<MockProvider>,
+) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false)
+        .await
+        .with_origin_provider_login("instance-gh");
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+    (eng, root, origins_dir)
+}
+
+#[tokio::test]
+async fn a_direct_domain_shares_as_a_commit_and_the_files_stop_being_local_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, root, origins_dir) = direct_team(&tmp, mock.clone()).await;
+
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "committed", "{result}");
+    let sha = result["sha"].as_str().unwrap().to_string();
+    assert_eq!(
+        result["url"],
+        format!("https://forge.test/acme/brand-knowledge/commit/{sha}")
+    );
+    assert_eq!(result["branch"], "main");
+    assert_eq!(result["added"], serde_json::json!(["notes/new.md"]));
+    assert!(
+        result.get("number").is_none() && result.get("drafts_folded").is_none(),
+        "{result}"
+    );
+    assert_eq!(mock.branch_commit("main").unwrap(), sha);
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("create_proposal")),
+        "{:?}",
+        mock.calls()
+    );
+
+    // The folder is untouched, and the share is no longer local work.
+    assert_eq!(
+        std::fs::read(root.join("notes/new.md")).unwrap(),
+        engram("New", "new", "brand new content")
+    );
+    let status = eng
+        .origin_status(
+            Some("brand"),
+            true,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let d = &status["domains"][0];
+    assert_eq!(d["local_changes"], 0, "{d}");
+    assert_eq!(d["detail"]["added"], serde_json::json!([]), "{d}");
+    assert_eq!(d["sharing"], "direct", "{d}");
+    assert_eq!(d["open_proposals"], serde_json::json!([]), "{d}");
+    assert_eq!(d["direct_shares"][0]["sha"], sha, "{d}");
+    assert_eq!(d["direct_shares"][0]["author_login"], "instance-gh", "{d}");
+    assert!(
+        d["direct_shares"][0].get("files").is_none(),
+        "the status names the commit, not its files: {d}"
+    );
+
+    let state = OriginState::load(&origins_dir.join("brand"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.base_commit, sha);
+    assert!(state.proposals.is_empty());
+    assert_eq!(state.direct_shares.len(), 1);
+
+    // The next pull finds head == base and settles up to date.
+    let pulled = eng
+        .origin_update(Some("brand"), &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(pulled["domains"][0]["up_to_date"], true, "{pulled}");
+}
+
+#[tokio::test]
+async fn a_pulled_manifest_flips_the_policy_for_the_next_share_with_no_state_change_between() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // Upstream flips the policy; the pull brings it down as an ordinary edit.
+    let flipped = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    mock.set_branch("main", &flipped);
+    let before = std::fs::read_to_string(origins_dir.join("brand/state.json")).unwrap();
+    let plan_before = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    // The policy is the folder's as this call found it, and this call's own
+    // pull is what writes the new MANIFEST there - so the flip lands on the
+    // NEXT share rather than on the preview that fetched it.
+    assert_eq!(plan_before["sharing"], "proposal", "{plan_before}");
+    assert_eq!(plan_before["action"], "nothing_to_share");
+    let plan_after = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan_after["sharing"], "direct",
+        "the pulled MANIFEST decides, with nothing else having changed: {plan_after}"
+    );
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("notes/new.md"), engram("New", "new", "x")).unwrap();
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "committed", "{result}");
+    assert!(
+        !before.contains("\"sharing\""),
+        "the policy never enters origin state: {before}"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, _root, origins_dir) = direct_team(&tmp, mock.clone()).await;
+    let plan = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan["action"], "commit", "{plan}");
+    assert_eq!(plan["branch"], "main");
+    assert_eq!(plan["sharing"], "direct");
+    assert_eq!(plan["repo"], "acme/brand-knowledge");
+    assert_eq!(plan["changes"][0]["path"], "notes/new.md");
+
+    // A proposal this machine recorded stands in the way, by number and url.
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.proposals.push(Proposal {
+        number: 4,
+        url: "https://github.test/pull/4".to_string(),
+        branch: "crystalline/share-brand-x".to_string(),
+        title: "Refine".to_string(),
+        created_at: chrono::Utc::now(),
+        status: ProposalStatus::Open,
+        files: vec![],
+        head_commit: None,
+        pending_head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: vec![],
+        updated_at: None,
+        author_login: None,
+    });
+    state.save(&state_dir).unwrap();
+    // The forge knows it too, so the share's own pull refreshes it rather than
+    // asking after a proposal that exists on this machine alone.
+    mock.set_proposal_state(4, ProposalState::Open);
+    let plan = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan["action"], "proposal_open", "{plan}");
+    assert_eq!(plan["number"], 4);
+    assert_eq!(plan["title"], "Refine");
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposal_open", "{result}");
+    assert_eq!(result["proposal"]["url"], "https://github.test/pull/4");
+    assert!(
+        result["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("merge or withdraw proposal #4 first")
+    );
+
+    let refused = eng
+        .origin_share("brand", None, None, Some(4), None, ShareActor::Owner)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("there is no proposal to amend"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_protected_branch_answers_branch_protected_through_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, _root, _origins_dir) = direct_team(&tmp, mock.clone()).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "branch_protected", "{result}");
+    assert_eq!(result["branch"], "main");
+    assert_eq!(
+        result["message"],
+        "Changes must be made through a pull request."
+    );
+    assert!(
+        result["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("sharing: proposal")
+    );
+}
+
+#[tokio::test]
+async fn the_daemon_status_block_names_each_domains_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, _root, _origins_dir) = direct_team(&tmp, mock).await;
+    let status = eng.status_report().await.unwrap();
+    assert_eq!(
+        status["origins"]["domains"][0]["sharing"], "direct",
+        "{status}"
     );
 }
 

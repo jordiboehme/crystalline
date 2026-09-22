@@ -281,6 +281,10 @@ impl Provider for PinnedHead<'_> {
         self.inner.update_branch(origin, name, commit, force).await
     }
 
+    fn commit_url(&self, origin: &OriginSpec, sha: &str) -> Option<String> {
+        self.inner.commit_url(origin, sha)
+    }
+
     async fn update_proposal(
         &self,
         origin: &OriginSpec,

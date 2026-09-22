@@ -164,7 +164,7 @@ pub(crate) fn proposal_transitions_json(
 /// per-domain entry: `{ domain, repo, branch, base_commit, behind,
 /// local_changes, skipped_large, open_proposals, declined_proposals,
 /// merged_unconsumed, conflicts, last_checked, probe_error, stack_number,
-/// stack_wedged, repair_pending, stack_link_pending }`. `probe_error` carries the live
+/// stack_wedged, repair_pending, stack_link_pending, direct_shares }`. `probe_error` carries the live
 /// probe's own error message, verbatim, when the probe failed for a
 /// transport reason (offline, rate limited, an expired connection) and the
 /// report was produced by retrying with no probe at all; `null` when the
@@ -189,6 +189,11 @@ pub(crate) fn proposal_transitions_json(
 /// by sharing or checking status again, `repair_pending` and
 /// `stack_link_pending`. All four are always present, quiet rather than
 /// absent off the stacked path, so one reader handles either path.
+///
+/// `direct_shares` names the commits this machine put straight on the branch,
+/// newest first, without their file lists: a domain that shares directly has
+/// no proposal record to read its own history off, and the file list belongs
+/// to the commit rather than to a status glance.
 ///
 /// `detail` is the one key here that is opt-in: `local_changes` stays the bare
 /// count it has always been, and only a caller that asked for the file list
@@ -228,6 +233,13 @@ pub(crate) fn status_report_json(
         "stack_wedged": report.stack_wedged,
         "repair_pending": report.repair_pending,
         "stack_link_pending": report.stack_link_pending,
+        "direct_shares": report.direct_shares.iter().map(|share| json!({
+            "sha": share.sha,
+            "url": share.url,
+            "title": share.title,
+            "shared_at": share.shared_at,
+            "author_login": share.author_login,
+        })).collect::<Vec<Value>>(),
     });
     if let Some(detail) = detail
         && let Some(object) = value.as_object_mut()
@@ -1739,7 +1751,20 @@ mod tests {
             stack_wedged: vec![],
             repair_pending: false,
             stack_link_pending: false,
-            direct_shares: Vec::new(),
+            direct_shares: vec![crystalline_remote::state::DirectShare {
+                sha: "c0ffee".to_string(),
+                url: Some("https://forge.test/acme/brand-knowledge/commit/c0ffee".to_string()),
+                title: "Refine the brand voice".to_string(),
+                shared_at: chrono::Utc::now(),
+                author_login: Some("instance-gh".to_string()),
+                files: vec![crystalline_remote::state::ProposedFile {
+                    path: "notes/new.md".to_string(),
+                    change: crystalline_remote::state::ProposedChange::Added,
+                    sha256: None,
+                    blob_sha: None,
+                    size: None,
+                }],
+            }],
         };
         let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["domain"], "eng");
@@ -1750,6 +1775,12 @@ mod tests {
         // Emitted always, empty rather than absent, so a reader never has to
         // tell "nothing merged" from "this build does not report it".
         assert_eq!(v["merged_unconsumed"], json!([]));
+        // The commits this machine put straight on the branch, named rather
+        // than listed out: a status glance says what landed, not which files
+        // each commit carried.
+        assert_eq!(v["direct_shares"][0]["sha"], "c0ffee", "{v}");
+        assert_eq!(v["direct_shares"][0]["author_login"], "instance-gh", "{v}");
+        assert!(v["direct_shares"][0].get("files").is_none(), "{v}");
     }
 
     /// The merged-but-unpulled numbers ride both status shapes, because both
