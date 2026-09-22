@@ -12,12 +12,13 @@
  * empty case says so plainly instead of pretending the panel is still loading.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
 import { LAYOUT_WIDTH_KEY } from "../layoutWidth";
+import type { Answer } from "../test/harness";
 import {
   answersFor,
   domainsResponse,
@@ -179,7 +180,7 @@ function inboundResponse(path: string) {
   };
 }
 
-function serve(routes: Record<string, (path: string) => unknown> = {}) {
+function serve(routes: Record<string, Answer> = {}) {
   apiMock.mockImplementation(
     answersFor({
       "/auth/me": () => meResponse({ user: userFixture() }),
@@ -652,10 +653,14 @@ describe("the engram page", () => {
     // with it - which is the whole point of the row above.
     const title = screen.getByRole("heading", { name: "Alpha", level: 1 });
     expect(row).not.toContainElement(title);
-    // The trail's row, then the title, and that is the whole header: no
-    // control row underneath the name any more.
-    expect(title.previousElementSibling).toBe(row);
-    expect(title.parentElement?.lastElementChild).toBe(title);
+    // The trail's row, then the title's own line, and that is the whole
+    // header: no control row underneath the name any more. A line rather than
+    // the heading alone, because the chip saying what changed stands on it -
+    // and on a page the team already has, as here, the heading is all it
+    // holds.
+    const line = title.parentElement;
+    expect(line?.previousElementSibling).toBe(row);
+    expect(line?.lastElementChild).toBe(title);
   });
 
   it("runs a utility from its icon rather than from a second copy of it", async () => {
@@ -1071,5 +1076,441 @@ describe("the engram page at full width", () => {
 
       expect(writeText).toHaveBeenCalledWith(`${PAGE}#auth`);
     });
+  });
+});
+
+/**
+ * What this copy of the page holds that the team's copy does not.
+ *
+ * The server computes it and the page draws it: a chip beside the title
+ * carrying the one word for it, a menu on that chip for looking, sharing and
+ * putting it back, and nothing at all on a page the team already has. The
+ * word is never re-derived here, which is why every case below states it in
+ * the payload rather than in the fixture's shape.
+ */
+describe("what changed on this page", () => {
+  it("draws no chip on a page the team already has", async () => {
+    serve();
+
+    renderApp("/d/eng/e/alpha");
+
+    await screen.findByRole("heading", { name: "Alpha", level: 1 });
+    expect(screen.queryByRole("button", { name: "Changed" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Added" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Draft" })).toBeNull();
+  });
+
+  it.each([
+    ["modified", "Changed"],
+    ["added", "Added"],
+  ])(
+    "draws the %s chip as a named menu button beside the title",
+    async (word, label) => {
+      serve({
+        "/domains/eng/engrams/alpha": () =>
+          detailResponse({ local_change: word }),
+      });
+
+      renderApp("/d/eng/e/alpha");
+
+      const chip = await screen.findByRole("button", { name: label });
+      expect(chip).toHaveAttribute("aria-haspopup", "menu");
+      // Beside the title rather than inside it: the heading's own name is the
+      // engram's name and nothing else, which is what every other reader of
+      // this page - the smoke included - knows it by.
+      const title = screen.getByRole("heading", { name: "Alpha", level: 1 });
+      expect(title).toHaveTextContent("Alpha");
+      expect(title.textContent).not.toContain(label);
+
+      await userEvent.click(chip);
+      expect(
+        await screen.findByRole("menuitem", { name: "What changed" }),
+      ).toBeVisible();
+      // An editor on an instance-credential install: may write, may not share.
+      expect(
+        screen.queryByRole("menuitem", { name: "Share this change" }),
+      ).toBeNull();
+      expect(screen.getByRole("menuitem", { name: "Discard" })).toBeVisible();
+    },
+  );
+
+  it("draws Draft for the reader's own draft", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () => detailResponse({ draft: true }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    expect(await screen.findByRole("button", { name: "Draft" })).toBeVisible();
+  });
+
+  it("offers Share this change only to a sharer, and Discard only to a writer", async () => {
+    serve({
+      "/auth/me": () =>
+        meResponse({ user: userFixture({ role: "editor" }), can_share: true }),
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "modified" }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Changed" }),
+    );
+    expect(
+      await screen.findByRole("menuitem", { name: "Share this change" }),
+    ).toBeVisible();
+
+    cleanup();
+    apiMock.mockReset();
+    serve({
+      "/auth/me": () =>
+        meResponse({ user: userFixture({ role: "admin" }), read_only: true }),
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "modified" }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Changed" }),
+    );
+    // Looking is everybody's; putting a file back is not offered where it
+    // would be refused.
+    expect(
+      await screen.findByRole("menuitem", { name: "What changed" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Discard" })).toBeNull();
+  });
+
+  it("opens the diff in a dialog titled by the path", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "modified" }),
+      "/domains/eng/changes/alpha.md": () => ({
+        path: "alpha.md",
+        kind: "modified",
+        sha: "9f2c",
+        binary: false,
+        size_before: 8,
+        size_after: 8,
+        base: "old\n",
+        current: "new\n",
+        too_large: false,
+      }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Changed" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "What changed" }),
+    );
+
+    const dialog = await screen.findByRole("dialog", { name: "alpha.md" });
+    expect(
+      await within(dialog).findByRole("region", { name: "alpha.md" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+  });
+
+  it("opens the share dialog with only this path ticked", async () => {
+    serve({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "admin" }) }),
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "modified" }),
+      "/domains/eng/sync": () => ({
+        domain: "eng",
+        mode: "github",
+        repo: "acme/kb",
+        branch: "main",
+        local_changes: 2,
+        open_proposals: [],
+        declined_proposals: [],
+        conflicts: [],
+        connection: { connected: true },
+      }),
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "t",
+        changes: [
+          { path: "alpha.md", kind: "modified", sha: "9f2c" },
+          { path: "beta.md", kind: "added", sha: "51ab" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Changed" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Share this change" }),
+    );
+
+    // The whole delta is still in front of the reader; the choice this page
+    // opened with is the one file it is about.
+    const dialog = await screen.findByRole("dialog", { name: /share/i });
+    expect(
+      await within(dialog).findByRole("checkbox", { name: "alpha.md" }),
+    ).toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "beta.md" }),
+    ).not.toBeChecked();
+  });
+
+  it("discarding a modification reloads the page without the chip", async () => {
+    let local: string | undefined = "modified";
+    const discarded = vi.fn(() => ({
+      domain: "eng",
+      restored: ["alpha.md"],
+      deleted: [],
+      cleared: [],
+      refused: [],
+      reindexed: 1,
+    }));
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse(local === undefined ? {} : { local_change: local }),
+      "/domains/eng/changes/discard": (_path, init) => {
+        if (init?.method === "POST") {
+          local = undefined;
+          return discarded();
+        }
+        return null;
+      },
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Changed" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Discard" }),
+    );
+    expect(
+      await screen.findByText(
+        "Discard the changes to alpha.md? Their changes are put back the way the team has them.",
+      ),
+    ).toBeVisible();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm discard" }),
+    );
+    await waitFor(() => {
+      expect(discarded).toHaveBeenCalled();
+    });
+    // The digest the page is holding, which for a stored read is the file's
+    // own: a copy somebody edited since is refused rather than thrown away.
+    const call = apiMock.mock.calls.find(
+      (entry) => entry[0] === "/domains/eng/changes/discard",
+    );
+    const body = call?.[1]?.body;
+    if (typeof body !== "string") {
+      throw new Error("the discard carried no JSON body");
+    }
+    expect(JSON.parse(body)).toEqual({
+      paths: [{ path: "alpha.md", sha: "3f8a1c05e2" }],
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Changed" })).toBeNull();
+    });
+    expect(
+      screen.getByRole("heading", { name: "Alpha", level: 1 }),
+    ).toBeVisible();
+  });
+
+  it("puts the keyboard back on the chip when the question is dropped", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "modified" }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const chip = await screen.findByRole("button", { name: "Changed" });
+    await userEvent.click(chip);
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Discard" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Cancel discard" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Confirm discard" }),
+      ).toBeNull();
+    });
+    expect(screen.getByRole("button", { name: "Changed" })).toHaveFocus();
+  });
+
+  it("discarding an addition goes to the domain page and says so", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "added" }),
+      "/domains/eng/changes/discard": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              domain: "eng",
+              restored: [],
+              deleted: ["alpha.md"],
+              cleared: [],
+              refused: [],
+              reindexed: 1,
+            }
+          : null,
+      "/domains/eng/manifest": () => ({ domain: "eng", markdown: "# eng\n" }),
+      "/domains/eng/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/vocabulary": () => ({
+        domain: "eng",
+        tags: [],
+        categories: [],
+        relation_types: [],
+      }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(await screen.findByRole("button", { name: "Added" }));
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Discard" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Confirm discard" }),
+    );
+
+    // The page it was standing on is gone, so it lands where the file was and
+    // the landing says what happened to it.
+    expect(
+      await screen.findByRole("heading", { name: "eng", level: 1 }),
+    ).toBeVisible();
+    expect(await screen.findByText("Discarded alpha.md.")).toBeVisible();
+  });
+
+  it("discarding a draft of a page the team never had leaves the same way", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () => detailResponse({ draft: true }),
+      // The reviewing arm clears an overlay row rather than deleting a file,
+      // and names the kind the shared tree would have called it: "added" for
+      // a draft standing where the team has no page at all.
+      "/domains/eng/changes/discard": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              domain: "eng",
+              restored: [],
+              deleted: [],
+              cleared: [{ path: "alpha.md", kind: "added" }],
+              refused: [],
+              reindexed: 0,
+            }
+          : null,
+      "/domains/eng/manifest": () => ({ domain: "eng", markdown: "# eng\n" }),
+      "/domains/eng/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/vocabulary": () => ({
+        domain: "eng",
+        tags: [],
+        categories: [],
+        relation_types: [],
+      }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(await screen.findByRole("button", { name: "Draft" }));
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Discard" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Confirm discard" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "eng", level: 1 }),
+    ).toBeVisible();
+    expect(await screen.findByText("Discarded alpha.md.")).toBeVisible();
+  });
+
+  it("shows a refusal in the strip and refetches the page", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "modified" }),
+      "/domains/eng/changes/discard": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              domain: "eng",
+              restored: [],
+              deleted: [],
+              cleared: [],
+              refused: [{ path: "alpha.md", reason: "changed_since" }],
+              reindexed: 0,
+            }
+          : null,
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Changed" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Discard" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Confirm discard" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Changed since you looked.",
+    );
+    await waitFor(() => {
+      expect(
+        apiMock.mock.calls.filter(
+          (entry) => entry[0] === "/domains/eng/engrams/alpha",
+        ).length,
+      ).toBeGreaterThan(1);
+    });
+  });
+
+  it("lists What changed in the palette when the chip is shown", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ local_change: "modified" }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    await screen.findByRole("button", { name: "Changed" });
+    await userEvent.keyboard("{Meta>}k{/Meta}");
+
+    // Looking is a palette row; a discard is not. A destructive act belongs
+    // where it cannot be typed into by accident.
+    expect(await screen.findByText("What changed on this page")).toBeVisible();
+    expect(screen.queryByText("Discard this change")).toBeNull();
   });
 });
