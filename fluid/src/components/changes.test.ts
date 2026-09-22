@@ -26,7 +26,7 @@ function change(
   lastAuthor: string | null = null,
   kind = "modified",
 ): ShareChange {
-  return { path, kind, lastAuthor };
+  return { path, kind, lastAuthor, sha: null };
 }
 
 describe("folder listings", () => {

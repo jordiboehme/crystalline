@@ -175,7 +175,7 @@ const editorHighlight = HighlightStyle.define([
 ]);
 
 /** The chrome around the text, once per scheme. */
-function editorTheme(dark: boolean): Extension {
+export function editorTheme(dark: boolean): Extension {
   return EditorView.theme(
     {
       "&": { fontSize: "0.9375rem" },
@@ -237,6 +237,16 @@ export const RAW_MONO: Extension = Prec.high(
 );
 
 /**
+ * The markdown configuration every reading surface of a document shares: the
+ * editor buffer and the diff pane, so the parse cannot drift between the page
+ * somebody edits and the pane that shows what they changed.
+ */
+export const documentLanguage: Extension = markdown({
+  base: markdownLanguage,
+  codeLanguages: languages,
+});
+
+/**
  * Everything an editor surface starts from.
  *
  * `history` is a switch rather than a fixture because a co-editing buffer has
@@ -259,7 +269,7 @@ export function baseExtensions(
       ...searchKeymap,
     ]),
     EditorView.lineWrapping,
-    markdown({ base: markdownLanguage, codeLanguages: languages }),
+    documentLanguage,
     syntaxHighlighting(editorHighlight),
     editorTheme(dark),
   ];
