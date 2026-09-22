@@ -2511,7 +2511,20 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             // engine is asked.
             if !yes {
                 if std::io::stdin().is_terminal() {
-                    print!("Discard {} file(s)? [y/N] ", paths.len());
+                    // Counted over the targets, not the named paths: a path
+                    // the preview already printed as refused has nothing to
+                    // discard, and a question that counts it promises work
+                    // the report will not do. It still travels below.
+                    let refused = paths.len() - targets.len();
+                    let question = if refused > 0 {
+                        format!(
+                            "Discard {} file(s)? ({refused} refused above, named anyway) [y/N] ",
+                            targets.len()
+                        )
+                    } else {
+                        format!("Discard {} file(s)? [y/N] ", targets.len())
+                    };
+                    print!("{question}");
                     std::io::stdout().flush()?;
                     let mut answer = String::new();
                     std::io::stdin().read_line(&mut answer)?;
