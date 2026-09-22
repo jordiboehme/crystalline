@@ -1,14 +1,15 @@
 /**
  * Both sides of one unshared change, drawn by CodeMirror's merge view: a
  * unified diff by default, two panes side by side from the large breakpoint,
- * the editor's own markdown parse, read-only, with word-level marks inside a
- * changed chunk. Nothing in it is a control: accepting a chunk is not a verb
- * here, discard is per file.
+ * markdown highlighting from the editor's own language, read-only, with
+ * word-level marks inside a changed chunk. Nothing in it is a control:
+ * accepting a chunk is not a verb here, discard is per file.
  *
  * Lazy-loaded through `DiffPaneLazy.tsx`: the merge package is a cost the
  * reading path never pays.
  */
 
+import { syntaxHighlighting } from "@codemirror/language";
 import { MergeView, unifiedMergeView } from "@codemirror/merge";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -19,7 +20,11 @@ import { useEffect, useRef, useSyncExternalStore } from "react";
 import type { ChangeDetail } from "../api/admin";
 import { fetchChange, localChangeKey } from "../api/admin";
 import { problemDetail } from "../api/client";
-import { documentLanguage, editorTheme } from "../editor/setup";
+import {
+  documentLanguage,
+  editorHighlight,
+  editorTheme,
+} from "../editor/setup";
 import { useTheme } from "../theme/context";
 import type { PaneLayout } from "./diffFace";
 import { SPLIT_QUERY, kindWord, paneFace, sizeSentence } from "./diffFace";
@@ -54,13 +59,30 @@ function subscribeWide(onChange: () => void): () => void {
  * The pane's own faces for the merge classes, as tokens both schemes define in
  * index.css. The box around the view is what caps and scrolls it, so nothing
  * here sets a height.
+ *
+ * Every selector is written at the shape the package's own base theme uses,
+ * side class and all, because that is what decides which of the two paints.
+ * A plain `.cm-changedLine` lands at two classes against the base theme's
+ * three (`&.cm-merge-a .cm-changedLine`) and loses every time - specificity
+ * is read before precedence, and a base theme is mounted first, so raising
+ * this layer would not have rescued it either. The word marks use the
+ * `background` shorthand for the same reason: the base theme paints them with
+ * a gradient through the shorthand, and a `background-color` longhand under
+ * it is not the same property.
  */
 const diffTheme = EditorView.theme({
-  ".cm-changedLine, .cm-insertedLine": {
+  // The team's copy, and the chunks a unified view draws in its place.
+  "&.cm-merge-a .cm-changedLine, .cm-deletedChunk": {
+    backgroundColor: "var(--color-diff-removed)",
+  },
+  // This copy: the right-hand pane, and the whole buffer in a unified view,
+  // which is the `b` side.
+  "&.cm-merge-b .cm-changedLine, .cm-inlineChangedLine": {
     backgroundColor: "var(--color-diff-added)",
   },
-  ".cm-deletedChunk": { backgroundColor: "var(--color-diff-removed)" },
-  ".cm-changedText": { backgroundColor: "var(--color-diff-word)" },
+  // Word level, inside a changed line, on either side and in either scheme.
+  "&.cm-merge-a .cm-changedText, &.cm-merge-b .cm-changedText, .cm-deletedChunk .cm-deletedText":
+    { background: "var(--color-diff-word)" },
 });
 
 function readOnly(dark: boolean) {
@@ -68,6 +90,7 @@ function readOnly(dark: boolean) {
     EditorState.readOnly.of(true),
     EditorView.editable.of(false),
     documentLanguage,
+    syntaxHighlighting(editorHighlight),
     editorTheme(dark),
     diffTheme,
   ];

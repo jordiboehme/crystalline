@@ -170,6 +170,37 @@ describe("the diff pane", () => {
     ).toBeInTheDocument();
   });
 
+  it("paints the merge classes at the shape the package styles them in", async () => {
+    matchMediaAnswering(false);
+    const { container } = mount(MODIFIED);
+    await waitFor(() => {
+      expect(container.querySelector(".cm-content")).not.toBeNull();
+    });
+
+    // CodeMirror emits one rule per line into a style element of its own, so
+    // the stylesheet says which rule wins where jsdom, doing no layout, has
+    // no computed color to ask about. The package ships a base theme for
+    // these classes carrying the side class - three classes where a plainly
+    // written rule has two - so the pane's rules have to wear the same shape
+    // to be read at all, and then win on being mounted after it.
+    const rules = Array.from(document.querySelectorAll("style"))
+      .flatMap((style) => (style.textContent ?? "").split("\n"))
+      .filter((rule) => rule.includes(".cm-"));
+    const lastFor = (needle: string) =>
+      rules.filter((rule) => rule.includes(needle)).at(-1) ?? "";
+
+    expect(lastFor(".cm-merge-a .cm-changedLine")).toContain(
+      "var(--color-diff-removed)",
+    );
+    expect(lastFor(".cm-merge-b .cm-changedLine")).toContain(
+      "var(--color-diff-added)",
+    );
+    const changedText = lastFor(".cm-changedText");
+    expect(changedText).toContain("var(--color-diff-word)");
+    expect(changedText).toContain(".cm-merge-a .cm-changedText");
+    expect(changedText).toContain(".cm-merge-b .cm-changedText");
+  });
+
   it("shows the problem when the read fails", async () => {
     matchMediaAnswering(false);
     apiMock.mockRejectedValueOnce(new Error("boom"));
