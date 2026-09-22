@@ -2714,7 +2714,7 @@ impl McpServer {
             return result.map_err(to_error).and_then(ok);
         }
 
-        // `github.enabled` gates the listing of five collaboration tools
+        // `github.enabled` gates the listing of six collaboration tools
         // ([`hidden_collab_tool`]), so a call that flips it moves this
         // server's tool list and owes subscribers an announcement. That does
         // not live here: it lives on `Engine::configure`, which every key in
@@ -3212,7 +3212,7 @@ impl McpServer {
     #[tool(
         name = "discard_changes",
         title = "Discard changes",
-        description = "Discard, revert, undo or throw away unshared local changes in a team domain, file by file, before they are shared: each named path is put back the way the team has it - a modified engram gets the team's copy back, an added file is deleted, a deleted file is restored - and the index is updated at once. In a domain in review mode (review: overlay) it clears your own drafts of those paths and never anybody else's. Use it when a change turned out wrong, when an edit should not go into the next proposal, or when the user asks to drop a change; pass the paths from origin_status with detail: true, which is also where diff: true shows what each change is before you decide. Pass expected, a map of path to the sha origin_status reported, to have a file that moved since refused as changed_since instead of overwritten; without it each path is discarded as it stands. Refuses by name a path that is not among the domain's unshared changes, refuses a path whose earlier content only an open proposal below the top layer holds (withdraw that layer instead), and refuses a draft somebody has open in a live editor. Never touches GitHub, never closes a proposal (that is withdraw_proposal) and never deletes knowledge the team already has. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call discards nothing and answers input_required instead: a confirmation question naming the domain, the paths and their kinds, answered by re-sending the same call with the confirmation; anything but a yes discards nothing.",
+        description = "Discard, revert, undo or throw away unshared local changes in a team domain, file by file, before they are shared: each named path is put back the way the team has it - a modified engram gets the team's copy back, an added file is deleted, a deleted file is restored - and the index is updated at once. In a domain in review mode (review: overlay) it clears your own drafts of those paths and never anybody else's. Use it when a change turned out wrong, when an edit should not go into the next proposal, or when the user asks to drop a change; pass the paths from origin_status with detail: true, which is also where diff: true shows what each change is before you decide. Pass expected, a map of path to the sha origin_status reported with diff: true, to have a file that moved since you read that list refused as changed_since instead of overwritten; without it there is no guard and each path is discarded as it stands when the call runs. Refuses by name a path that is not among the domain's unshared changes, refuses a path whose earlier content only an open proposal below the top layer holds (withdraw that layer instead), and refuses a draft somebody has open in a live editor. Never touches GitHub, never closes a proposal (that is withdraw_proposal) and never deletes knowledge the team already has. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call discards nothing and answers input_required instead: a confirmation question naming the domain, the paths and their kinds, answered by re-sending the same call with the confirmation; anything but a yes discards nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3274,7 +3274,13 @@ impl McpServer {
                         ))
                         .map(CallToolResponse::from);
                     }
-                    return Ok(confirm_question(discard_question(&p.domain, &chosen)).into());
+                    // Guarded only where the caller actually named a digest
+                    // for one of these paths: an `expected` map that names
+                    // none of them guards nothing.
+                    let guarded = p.paths.iter().any(|path| expected.contains_key(path));
+                    return Ok(
+                        confirm_question(discard_question(&p.domain, &chosen, guarded)).into(),
+                    );
                 }
                 Some(false) => {
                     return refuse(DISCARD_REFUSAL).map(CallToolResponse::from);
@@ -3982,7 +3988,7 @@ impl ServerHandler for McpServer {
     /// # What can move, and what cannot
     ///
     /// One thing this server can be asked to do moves a list: `configure` can
-    /// flip `github.enabled`, and five collaboration tools appear or disappear
+    /// flip `github.enabled`, and six collaboration tools appear or disappear
     /// with it (see [`hidden_collab_tool`]). That is the only mover.
     /// `resources/list` and `prompts/list` read `skills.serve` and
     /// `harness_onboarded`, both fixed before the first request arrives, so
@@ -4902,7 +4908,15 @@ fn withdraw_question(preview: &Value) -> String {
 /// the way `share_question` caps its list, and the two facts a person
 /// deciding needs - a reviewing domain clears their own drafts, and nothing
 /// reaches GitHub.
-fn discard_question(domain: &str, changes: &[Value]) -> String {
+///
+/// `guarded` is whether the caller named an `expected` digest for any of these
+/// paths, and the last sentence turns on it because the guard is the caller's
+/// to ask for. With digests, a file edited between this question and the yes
+/// is refused rather than overwritten. Without them the engine fills every
+/// digest at discard time, so what is discarded is whatever the file holds by
+/// then - which is what the question says, rather than promising a guard
+/// nobody asked for.
+fn discard_question(domain: &str, changes: &[Value], guarded: bool) -> String {
     let count = changes.len();
     let noun = if count == 1 { "change" } else { "changes" };
     let lines: Vec<String> = changes
@@ -4924,8 +4938,14 @@ fn discard_question(domain: &str, changes: &[Value]) -> String {
         question.push_str(&format!(" and {} more", count - 10));
     }
     question.push_str(
-        ". In a domain that reviews changes this clears your own drafts of these paths. A file edited since you looked is refused rather than overwritten. Nothing reaches GitHub.",
+        ". In a domain that reviews changes this clears your own drafts of these paths. ",
     );
+    question.push_str(if guarded {
+        "A file edited since you looked is refused rather than overwritten. "
+    } else {
+        "Each file is discarded as it stands now, edits since you looked included. "
+    });
+    question.push_str("Nothing reaches GitHub.");
     question
 }
 
@@ -6281,7 +6301,7 @@ mod tests {
                 })
             })
             .collect();
-        let question = discard_question("kb", &changes);
+        let question = discard_question("kb", &changes, false);
         assert!(
             question.starts_with("Discard 12 changes in 'kb'? "),
             "{question}"
@@ -6301,7 +6321,29 @@ mod tests {
         assert!(question.contains("and 2 more"), "capped at ten: {question}");
         assert!(!question.contains("notes/10.md"));
         assert!(question.ends_with("Nothing reaches GitHub."), "{question}");
-        let one = discard_question("kb", &changes[..1]);
+        // Unguarded, which is the default call: the question promises no
+        // guard, it says what will actually be discarded.
+        assert!(
+            question.contains(
+                "Each file is discarded as it stands now, edits since you looked included."
+            ),
+            "{question}"
+        );
+        assert!(
+            !question.contains("refused rather than overwritten"),
+            "{question}"
+        );
+
+        // With a digest named, the guard is real and the question says so.
+        let guarded = discard_question("kb", &changes, true);
+        assert!(
+            guarded.contains("A file edited since you looked is refused rather than overwritten."),
+            "{guarded}"
+        );
+        assert!(!guarded.contains("as it stands now"), "{guarded}");
+        assert!(guarded.ends_with("Nothing reaches GitHub."), "{guarded}");
+
+        let one = discard_question("kb", &changes[..1], false);
         assert!(one.starts_with("Discard 1 change in 'kb'? "), "{one}");
     }
 

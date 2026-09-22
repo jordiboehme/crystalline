@@ -13626,7 +13626,7 @@ impl Engine {
     /// the write that just landed changed what `github.enabled` effectively
     /// reads.
     ///
-    /// `github.enabled` gates the listing of the five GitHub collaboration
+    /// `github.enabled` gates the listing of the six GitHub collaboration
     /// tools (`crate::mcp`'s `hidden_collab_tool`), so a settings write that
     /// flips it is the one thing on this server that moves a tool list - and
     /// the one that owes an announcement. It lives on the engine rather than

@@ -330,7 +330,7 @@ async fn list_shaped_responses_default_to_toon_and_configure_restores_json() {
     );
 }
 
-/// What a default install actually lists: every tool except the five that do
+/// What a default install actually lists: every tool except the six that do
 /// nothing but talk to a forge nobody connected.
 ///
 /// MCP 2026-07-28 (SEP-2567) forbids `tools/list` varying per connection or as
@@ -443,7 +443,7 @@ async fn no_tool_administers_a_domains_membership() {
     }
 }
 
-/// Turning collaboration on adds exactly the five tools it enables, and takes
+/// Turning collaboration on adds exactly the six tools it enables, and takes
 /// them away again when it goes back off.
 ///
 /// This is the one list on this server that moves, and the reading of SEP-2567
@@ -591,7 +591,7 @@ async fn the_tool_list_does_not_move_across_a_configure_that_flips_skills_serve(
     );
 }
 
-/// Hiding a tool never disables it. All five GitHub-gated tools here are
+/// Hiding a tool never disables it. All six GitHub-gated tools here are
 /// withheld from the listing while the setting is off and still answer a call
 /// by name, with a **tool-level** error - the shape whose text the caller's
 /// client actually renders - naming the setting and the call that flips it.
@@ -836,10 +836,10 @@ async fn tool_descriptions_teach_review_mode() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();
-    // share_changes is one of the five collaboration tools withheld from
+    // share_changes is one of the six collaboration tools withheld from
     // tools/list while github.enabled is off; turn it on so its description
     // is there to read, the same way
-    // flipping_github_enabled_moves_the_tool_list_by_exactly_the_five does.
+    // flipping_github_enabled_moves_the_tool_list_by_exactly_the_six does.
     call(
         peer,
         "configure",

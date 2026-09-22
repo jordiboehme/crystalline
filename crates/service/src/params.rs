@@ -619,9 +619,9 @@ pub struct DiscardChangesParams {
     /// The domain-relative paths to put back the way the team has them.
     pub paths: Vec<String>,
     /// Optional guard, path to the SHA-256 hex of the current content you
-    /// looked at (the `sha` origin_status reports with detail). A path whose
-    /// content moved since is refused as changed_since. Omit it to discard
-    /// each named path unconditionally.
+    /// looked at (the `sha` origin_status reports with diff: true). A path
+    /// whose content moved since is refused as changed_since. Omit it to
+    /// discard each named path unconditionally.
     #[serde(default)]
     pub expected: Option<std::collections::BTreeMap<String, String>>,
 }

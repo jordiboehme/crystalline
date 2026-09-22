@@ -288,7 +288,7 @@ async fn add_domain_is_visible_unless_read_only_regardless_of_github() {
 }
 
 /// Flipping `github.enabled` mid-session moves the listing **and** the
-/// refusal, in step: the five appear on the next list, and the same call that
+/// refusal, in step: the six appear on the next list, and the same call that
 /// was refused a moment ago now reaches the engine.
 ///
 /// The refusal is not made redundant by the hiding. A client that cached the
