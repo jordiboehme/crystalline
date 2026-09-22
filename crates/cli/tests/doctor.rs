@@ -1287,7 +1287,7 @@ fn harnesses_section_hints_partial_setup_when_only_one_hook_is_present() {
     let work = tempfile::tempdir().unwrap();
     let (config, db) = empty_config(work.path());
 
-    // Only the hand-written SessionStart recipe from the README, no Stop
+    // Only the hand-written SessionStart recipe from docs/learning-loop.md, no Stop
     // hook: exactly the "half installed" shape the hint exists for.
     let claude_dir = home.join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();

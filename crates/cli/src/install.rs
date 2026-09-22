@@ -31,7 +31,7 @@
 //! in `prompt system` replays install options from.
 //!
 //! Presence is decided by command string, ignoring the hook group's matcher,
-//! so the README's hand-written `startup` recipe counts as already installed
+//! so the hand-written `startup` recipe from docs/learning-loop.md counts as already installed
 //! (no duplicate is added) and is removed on uninstall like any managed
 //! entry. That test is on the command's leading words, not the whole string,
 //! because a managed command now carries `--harness <id>` and an install
@@ -2485,7 +2485,7 @@ mod tests {
             McpRepair::Repair
         );
         // Already correct: rerunning `crystalline install` leaves it alone,
-        // which is the idempotence the README promises.
+        // which is the idempotence docs/setup/claude-code.md promises.
         assert_eq!(
             mcp_repair(
                 &entry(user, "crystalline", &["mcp", "--harness", "claude-code"]),
@@ -2900,7 +2900,7 @@ mod tests {
 
     #[test]
     fn add_is_matcher_insensitive_for_an_existing_recipe() {
-        // The README's hand-written recipe: the same command under a plain
+        // The hand-written recipe from docs/learning-loop.md: the same command under a plain
         // "startup" matcher, no timeout.
         let mut root = root(json!({
             "hooks": {
