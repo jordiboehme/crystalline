@@ -25,7 +25,7 @@ service:
   http: false
 embeddings:
   provider: local
-  model: bge-small-en-v1.5
+  model: granite-embedding-97m-multilingual-r2
 prompt:
   rules:
     \"~/git/product/**\":

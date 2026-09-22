@@ -31,10 +31,11 @@
 services:
   crystalline:
     image: ghcr.io/jordiboehme/crystalline:latest
-    # Alternative: the with-model variant, with the BAAI/bge-small-en-v1.5
-    # embedding model baked in. Use it when the daemon needs semantic search
-    # ready on its very first start, or when this host has no egress to
-    # huggingface.co (air-gapped or otherwise offline deployments):
+    # Alternative: the with-model variant, with the
+    # ibm-granite/granite-embedding-97m-multilingual-r2 embedding model baked
+    # in. Use it when the daemon needs semantic search ready on its very
+    # first start, or when this host has no egress to huggingface.co
+    # (air-gapped or otherwise offline deployments):
     # image: ghcr.io/jordiboehme/crystalline:with-model
     # The image already defaults to serve with CRYSTALLINE_SERVICE_HTTP set, so
     # there is nothing to pass here. Exposure is configuration so that every

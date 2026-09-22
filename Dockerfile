@@ -104,11 +104,11 @@ CMD ["serve"]
 # same context root as the binaries above): the release workflow prefetches
 # the model once with the staged amd64 binary and stages the resulting
 # Hugging Face cache directory at
-#   dist/model/models--BAAI--bge-small-en-v1.5
+#   dist/model/models--ibm-granite--granite-embedding-97m-multilingual-r2
 # which is the on-disk layout hf-hub itself uses (blobs, snapshots and refs
 # subdirectories, with snapshot files as relative symlinks into blobs) - the
 # whole directory is copied verbatim so those symlinks keep resolving.
 FROM runtime AS runtime-with-model
 
-COPY --chown=nonroot:nonroot dist/model/models--BAAI--bge-small-en-v1.5 /opt/crystalline/models/models--BAAI--bge-small-en-v1.5
+COPY --chown=nonroot:nonroot dist/model/models--ibm-granite--granite-embedding-97m-multilingual-r2 /opt/crystalline/models/models--ibm-granite--granite-embedding-97m-multilingual-r2
 ENV CRYSTALLINE_MODELS_DIR=/opt/crystalline/models
