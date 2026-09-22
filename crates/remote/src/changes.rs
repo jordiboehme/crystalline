@@ -118,10 +118,7 @@ impl LocalChanges {
     /// refreshed listings has nothing to say, and offering to share it would be
     /// offering churn.
     pub fn substantive_count(&self) -> usize {
-        self.changes
-            .iter()
-            .filter(|c| !c.is_generated_index())
-            .count()
+        self.substantive().count()
     }
 
     /// How many changes are generated directory indexes, the other half of
@@ -131,6 +128,14 @@ impl LocalChanges {
             .iter()
             .filter(|c| c.is_generated_index())
             .count()
+    }
+
+    /// The changes somebody wrote, in path order: every entry except a
+    /// generated listing. What every surface of the local-changes feature
+    /// lists, diffs and discards; a listing follows the domain's own
+    /// configuration silently and is never named by any of them.
+    pub fn substantive(&self) -> impl Iterator<Item = &LocalChange> {
+        self.changes.iter().filter(|c| !c.is_generated_index())
     }
 
     /// Where to actually open `reported` on this machine.

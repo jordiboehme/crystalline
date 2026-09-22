@@ -30,8 +30,10 @@ pub use error::RemoteError;
 pub use github::GitHubProvider;
 pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use ops::{
-    OriginStatusReport, PlannedAction, ProposeOutcome, ProposeReport, PullReport, SharePlan,
-    SubscribeReport, propose, propose_preview, pull, status, subscribe,
+    ChangeSides, DiscardRefusal, DiscardReport, DiscardTarget, OriginStatusReport, PlannedAction,
+    ProposeOutcome, ProposeReport, PullReport, SharePlan, SubscribeReport, discard_local_files,
+    local_change_sides, propose, propose_preview, pull, resolve_local_change, status, subscribe,
+    unshared_base,
 };
 pub use provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,

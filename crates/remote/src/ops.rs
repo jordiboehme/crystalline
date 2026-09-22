@@ -46,7 +46,7 @@ use crystalline_core::manifest::Manifest;
 use crystalline_core::parse_engram;
 
 use crate::archive::{extract_repo_subtree, extract_tarball};
-use crate::changes::{LocalChange, MAX_SHARED_FILE_BYTES, detect_local_changes};
+use crate::changes::{LocalChange, LocalChanges, MAX_SHARED_FILE_BYTES, detect_local_changes};
 use crate::error::RemoteError;
 use crate::merge::{FileMerge, merge_file};
 use crate::provider::{
@@ -1202,6 +1202,79 @@ fn normalize_selected_path(raw: &str) -> String {
         .strip_prefix("./")
         .unwrap_or(trimmed.as_str())
         .to_string()
+}
+
+/// The detected change `raw` names, or `None` when it names nothing among
+/// them.
+///
+/// Both spellings select a change: the reported one (the base snapshot's, the
+/// name every stamp and proposal record carries) and the one on disk, which
+/// differ for a case-only rename. The answer is always the reported change,
+/// so a caller reads and writes through [`LocalChanges::disk_path`] exactly
+/// as a share does. A generated listing is never resolved, whatever the
+/// domain's MANIFEST says about sharing listings: no list of local changes
+/// names one, so no path a caller took from such a list can be one, and a
+/// caller that typed one by hand is answered as for any other unknown path.
+pub fn resolve_local_change<'a>(local: &'a LocalChanges, raw: &str) -> Option<&'a LocalChange> {
+    let wanted = normalize_selected_path(raw);
+    if crystalline_core::is_index_path(&wanted) {
+        return None;
+    }
+    local
+        .substantive()
+        .find(|change| change.path() == wanted || local.disk_path(change.path()) == wanted)
+}
+
+/// Both byte sides of one detected change.
+///
+/// The base side is the base snapshot's copy of the reported path, which is
+/// the team's version for a modification and the last known content for a
+/// deletion; `None` for an addition, and `None` for a path the trunk never
+/// carried because a lower open stacked layer owns it (its base side is the
+/// tip's shared content, which the stamps describe by digest alone). The
+/// current side is the working-tree file, read at the on-disk spelling
+/// through the validated join; `None` for a deletion, whose current side is
+/// absence and is not read from disk at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSides {
+    /// The change as detection reported it.
+    pub change: LocalChange,
+    /// The base copy, or `None`.
+    pub base: Option<Vec<u8>>,
+    /// The working-tree bytes, or `None`.
+    pub current: Option<Vec<u8>>,
+}
+
+/// [`ChangeSides`] for the change `raw` names, or `None` when it names none
+/// (see [`resolve_local_change`]). Reads two files at most and nothing else.
+pub fn local_change_sides(
+    domain_root: &Path,
+    state_dir: &Path,
+    local: &LocalChanges,
+    raw: &str,
+) -> Result<Option<ChangeSides>, RemoteError> {
+    let Some(change) = resolve_local_change(local, raw) else {
+        return Ok(None);
+    };
+    let path = change.path();
+    let base = match change {
+        LocalChange::Added { .. } => None,
+        LocalChange::Modified { .. } | LocalChange::Deleted { .. } => {
+            state::read_base_file(state_dir, path)?
+        }
+    };
+    let current = match change {
+        LocalChange::Deleted { .. } => None,
+        LocalChange::Added { .. } | LocalChange::Modified { .. } => {
+            let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
+            read_optional_file(&wt_path)?
+        }
+    };
+    Ok(Some(ChangeSides {
+        change: change.clone(),
+        base,
+        current,
+    }))
 }
 
 /// The cached stacks verdict for this origin, probing once when unknown.
@@ -4019,6 +4092,128 @@ pub async fn withdraw(
     Ok(report)
 }
 
+/// One path a discard is asked to put back, with the digest of the current
+/// side the caller looked at: the digest of an addition or a modification,
+/// `None` for a deletion, whose current side is absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscardTarget {
+    /// The path, in either spelling (see [`resolve_local_change`]).
+    pub path: String,
+    /// The digest of the current side the caller looked at.
+    pub sha256: Option<String>,
+}
+
+/// Why one target of a discard was left exactly as it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardRefusal {
+    /// The current side no longer hashes to what the caller looked at.
+    ChangedSince,
+    /// The path is a team file and it matches the base again already.
+    NotAChange,
+    /// The trunk has no copy: a lower open layer owns the path, and a discard
+    /// never fetches (withdrawing that layer is what brings the bytes back).
+    NoBaseCopy,
+    /// Not among this domain's local changes, a generated listing included.
+    UnknownPath,
+}
+
+impl DiscardRefusal {
+    /// The wire spelling every surface reports.
+    pub fn code(self) -> &'static str {
+        match self {
+            DiscardRefusal::ChangedSince => "changed_since",
+            DiscardRefusal::NotAChange => "not_a_change",
+            DiscardRefusal::NoBaseCopy => "no_base_copy",
+            DiscardRefusal::UnknownPath => "unknown_path",
+        }
+    }
+}
+
+/// What [`discard_local_files`] did, path by path, in the order asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscardReport {
+    /// Reported paths written back from the base copy (a modification or a
+    /// deletion).
+    pub restored: Vec<String>,
+    /// Reported paths removed from the working tree (an addition).
+    pub deleted: Vec<String>,
+    /// Paths left as they stand, each with its reason. A refused path never
+    /// stops the others.
+    pub refused: Vec<(String, DiscardRefusal)>,
+}
+
+/// Put each of `targets` back the way `base` has it: the loop a withdrawal's
+/// revert has always run, addressable by path and free of any provider.
+///
+/// Per target, in order: resolve it against `local` (both spellings; a path
+/// that is a base file but no longer differs is [`DiscardRefusal::NotAChange`],
+/// anything else unresolved is [`DiscardRefusal::UnknownPath`]); join it
+/// through [`checked_working_path`] at its on-disk spelling; read the current
+/// file and compare its digest with what the caller looked at, the guard
+/// [`revert_layer_files`] keeps, so newer work is never destroyed
+/// ([`DiscardRefusal::ChangedSince`]); then act. An addition is removed, a
+/// modification or a deletion is written back from the base copy, and a
+/// path the trunk has no copy of is [`DiscardRefusal::NoBaseCopy`] with
+/// nothing written: the fetch that could restore it belongs to the withdrawal
+/// of the layer that owns it, never to a discard.
+///
+/// Every path in the report is the reported spelling, the one the caller
+/// named it by; the write itself lands at the on-disk spelling, so a
+/// case-only rename never gains a second copy.
+pub fn discard_local_files(
+    domain_root: &Path,
+    state_dir: &Path,
+    base: &BTreeMap<String, BaseStamp>,
+    local: &LocalChanges,
+    targets: &[DiscardTarget],
+) -> Result<DiscardReport, RemoteError> {
+    let mut report = DiscardReport::default();
+    for target in targets {
+        let Some(change) = resolve_local_change(local, &target.path) else {
+            let normalized = normalize_selected_path(&target.path);
+            let reason = if !crystalline_core::is_index_path(&normalized)
+                && base.contains_key(&normalized)
+            {
+                DiscardRefusal::NotAChange
+            } else {
+                DiscardRefusal::UnknownPath
+            };
+            report.refused.push((target.path.clone(), reason));
+            continue;
+        };
+        let path = change.path().to_string();
+        let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(&path))?;
+        let current = read_optional_file(&wt_path)?;
+        let current_sha = current.as_deref().map(state::sha256_hex);
+        let diverged = match change {
+            LocalChange::Added { .. } | LocalChange::Modified { .. } => {
+                current_sha.as_deref() != target.sha256.as_deref()
+            }
+            LocalChange::Deleted { .. } => current.is_some() || target.sha256.is_some(),
+        };
+        if diverged {
+            report.refused.push((path, DiscardRefusal::ChangedSince));
+            continue;
+        }
+        match change {
+            LocalChange::Added { .. } => {
+                remove_working_file(&wt_path)?;
+                report.deleted.push(path);
+            }
+            LocalChange::Modified { .. } | LocalChange::Deleted { .. } => {
+                match state::read_base_file(state_dir, &path)? {
+                    Some(bytes) => {
+                        write_working_file(&wt_path, &bytes)?;
+                        report.restored.push(path);
+                    }
+                    None => report.refused.push((path, DiscardRefusal::NoBaseCopy)),
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// Puts the working tree back the way it stood before `proposal` was shared,
 /// for every file the proposal itself changed and no other.
 ///
@@ -4079,46 +4274,44 @@ async fn revert_layer_files(
     report: &mut WithdrawReport,
 ) -> Result<(), RemoteError> {
     let layers: Vec<&Proposal> = below.iter().collect();
-    let local = detect_local_changes(domain_root, &tip_files_over(base, &layers))?;
-    for pf in &proposal.files {
-        let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(&pf.path))?;
-        let current = read_optional_file(&wt_path)?;
-        let current_sha = current.as_deref().map(state::sha256_hex);
-
-        let diverged = match pf.change {
-            ProposedChange::Added | ProposedChange::Modified => {
-                current_sha.as_deref() != pf.sha256.as_deref()
-            }
-            ProposedChange::Deleted => current.is_some(),
-        };
-        if diverged {
-            report.skipped_diverged.push(pf.path.clone());
-            continue;
-        }
-
-        match pf.change {
-            ProposedChange::Added => {
-                remove_working_file(&wt_path)?;
-                report.deleted.push(pf.path.clone());
-            }
-            ProposedChange::Modified | ProposedChange::Deleted => {
-                match state::read_base_file(state_dir, &pf.path)? {
+    let base = tip_files_over(base, &layers);
+    let local = detect_local_changes(domain_root, &base)?;
+    let targets: Vec<DiscardTarget> = proposal
+        .files
+        .iter()
+        .map(|pf| DiscardTarget {
+            path: pf.path.clone(),
+            sha256: pf.sha256.clone(),
+        })
+        .collect();
+    let discarded = discard_local_files(domain_root, state_dir, &base, &local, &targets)?;
+    report.restored.extend(discarded.restored);
+    report.deleted.extend(discarded.deleted);
+    for (path, reason) in discarded.refused {
+        match reason {
+            DiscardRefusal::ChangedSince => report.skipped_diverged.push(path),
+            // The trunk has no copy. On a chain that means a layer below owns
+            // the path, and its recorded blob is the pre-share content; this
+            // is the one arm a withdrawal fetches for, and a discard never
+            // does.
+            DiscardRefusal::NoBaseCopy => {
+                let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(&path))?;
+                match layer_below_content(provider, spec, below, &path).await {
                     Some(bytes) => {
                         write_working_file(&wt_path, &bytes)?;
-                        report.restored.push(pf.path.clone());
+                        report.restored.push(path);
                     }
-                    // The trunk has no copy. On a chain that means a layer
-                    // below owns the path, and its recorded blob is the
-                    // pre-share content; anywhere else there is simply nothing
-                    // to restore from and the file is left alone.
-                    None => match layer_below_content(provider, spec, below, &pf.path).await {
-                        Some(bytes) => {
-                            write_working_file(&wt_path, &bytes)?;
-                            report.restored.push(pf.path.clone());
-                        }
-                        None => report.skipped_reverts.push(pf.path.clone()),
-                    },
+                    None => report.skipped_reverts.push(path),
                 }
+            }
+            // A proposed file that no longer differs from the tip is already
+            // where a revert would put it, and a path the detection cannot
+            // name (a re-cased addition, see the doc comment) is left
+            // standing rather than removed on a guess: both are the
+            // "diverged" outcome the report has always used for a file it
+            // did not touch.
+            DiscardRefusal::NotAChange | DiscardRefusal::UnknownPath => {
+                report.skipped_diverged.push(path)
             }
         }
     }
