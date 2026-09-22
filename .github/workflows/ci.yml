@@ -102,6 +102,14 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Pinned to the same major fluid/Dockerfile:18 pins (node:26-alpine), so
+      # CI, the image and a laptop are one fact. vitest 5 needs Node 22.12 or
+      # newer; corepack is installed through npm just below, which needs Node
+      # already present, so this step comes first.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+
       # Corepack rather than a pnpm setup action, and for one reason: corepack
       # reads the "packageManager" pin in fluid/package.json, so the pnpm
       # version used here, in the Fluid image and on a laptop is one fact in one
@@ -175,6 +183,14 @@ jobs:
         run: rustup show
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Pinned to the same major fluid/Dockerfile:18 pins (node:26-alpine), so
+      # CI, the image and a laptop are one fact. vitest 5 needs Node 22.12 or
+      # newer; corepack is installed through npm just below, which needs Node
+      # already present, so this step comes first.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
 
       - name: Enable corepack
         run: |
