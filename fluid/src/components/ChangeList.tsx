@@ -44,7 +44,7 @@
 import { MoreHorizontal } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import type { ReactElement } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import type { ShareChange } from "../api/admin";
 import { substantive } from "./changes";
@@ -222,12 +222,17 @@ function ChangeRow({
   onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
 }): ReactElement {
   const trigger = useRef<HTMLButtonElement>(null);
+  // The row's own refusal, named so the tick box can point at it: a reason
+  // drawn beside a row is read out with the row rather than left for somebody
+  // who cannot see it to wonder about.
+  const refusalId = useId();
   return (
     <li className="flex flex-col gap-0.5">
       <div className="flex items-center gap-2">
         <input
           type="checkbox"
           aria-label={path}
+          aria-describedby={refusal !== null ? refusalId : undefined}
           checked={checked}
           onChange={(event) => {
             onToggle(path, event.target.checked);
@@ -288,7 +293,10 @@ function ChangeRow({
         </DropdownMenu.Root>
       </div>
       {refusal !== null && (
-        <p className="pl-10 text-caption text-red-700 dark:text-red-300">
+        <p
+          id={refusalId}
+          className="pl-10 text-caption text-red-700 dark:text-red-300"
+        >
           {refusal}
         </p>
       )}

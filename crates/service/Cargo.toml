@@ -27,7 +27,8 @@ postgres = ["crystalline-index/postgres"]
 # green with this on - the embed is then simply empty.
 fluid-ui = ["dep:rust-embed"]
 # The test seams this crate carries outside plain `cfg(test)`, and nothing
-# else: the engine's own arming method and the branch that reads it, plus
+# else: the engine's own arming method and the branch that reads it, its
+# counters (`prune_statements_issued`, `detection_walks`), plus
 # `crate::nudge`'s share-walk counter (`SHARE_WALKS`, `share_walks_for`,
 # `count_walk`), which moved out of the engine into its own module but is
 # the same shape of seam. Off by default, so a released binary carries none

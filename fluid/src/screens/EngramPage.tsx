@@ -180,9 +180,17 @@ export default function EngramPage() {
    * against the shared base; a review-mode draft is not a file the origin
    * compares at all - it stands in the reader's own overlay - so `draft` is
    * the third word. Nothing about it is worked out here.
+   *
+   * The reader's OWN draft, though, and never one somebody shared with them.
+   * A granted draft arrives with the same flag and an owner beside it, and
+   * every act the chip offers is about an overlay the reader does not hold:
+   * a diff of nothing, a discard the engine refuses as an unknown path, and
+   * a share of work that is not theirs to share. The banner below already
+   * says whose page this is, which is the whole of what a grantee needs.
    */
   const change = loaded
-    ? (loaded.localChange ?? (loaded.draft ? "draft" : null))
+    ? (loaded.localChange ??
+      (loaded.draft && loaded.draftOwner === null ? "draft" : null))
     : null;
   const chipWord =
     change === "added"

@@ -437,11 +437,10 @@ fn write_diffable_team_domain(work: &Path, home: &Path, config: &Path) -> PathBu
         team_alpha.replace("permalink: alpha", "permalink: new"),
     )
     .unwrap();
-    let origin_dir = home
-        .join("state")
-        .join("crystalline")
-        .join("origins")
-        .join("eng");
+    // The platform's isolated state dir, never `<home>/state/crystalline` by
+    // hand: that spelling is the unix answer and the wrong folder on Windows
+    // (see `common::isolated_state_dir`).
+    let origin_dir = common::isolated_state_dir(home).join("origins").join("eng");
     std::fs::create_dir_all(origin_dir.join("base")).unwrap();
     std::fs::write(origin_dir.join("base").join("MANIFEST.md"), manifest).unwrap();
     std::fs::write(origin_dir.join("base").join("alpha.md"), team_alpha).unwrap();

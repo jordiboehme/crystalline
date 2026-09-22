@@ -766,7 +766,7 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
-    // The first of this file's two test seams: when armed, the next source edit
+    // The first of this file's four test seams: when armed, the next source edit
     // fails on its far side, once. See `Engine::fail_next_source_edit`.
     // Compiled only into a test build (`cfg(test)` for this crate's unit tests,
     // the `testing` feature for its integration tests), so a released binary
@@ -777,6 +777,13 @@ pub struct Engine {
     // `Engine::prune_statements_issued`.
     #[cfg(any(test, feature = "testing"))]
     prune_statements: std::sync::atomic::AtomicU64,
+    // The fourth: how many detection walks a team domain's change list has paid
+    // for. A walk reads and hashes every file in the domain, and answering a
+    // diff from one walk rather than one per changed file is invisible in the
+    // JSON, which is byte for byte the same either way. See
+    // `Engine::detection_walks`.
+    #[cfg(any(test, feature = "testing"))]
+    detection_walks: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "testing"))]
     fail_next_source_edit: std::sync::atomic::AtomicBool,
     // The second, and it is a stopwatch rather than a failure: when armed, the
@@ -1595,6 +1602,8 @@ impl Engine {
             read_only: false,
             #[cfg(any(test, feature = "testing"))]
             prune_statements: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            detection_walks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
@@ -13034,11 +13043,12 @@ impl Engine {
     /// with its TOCTOU guards - so a targeted pass never holds the store mutex
     /// across the scan either. The watcher, the archive import and a discard of
     /// local changes call this; it is intentionally not exposed over MCP or the
-    /// control socket, where a full sync is always wanted. A domain hosted by another live instance in collaboration mode is
-    /// skipped silently, exactly as the watcher's full-sync path skips it today,
-    /// so a non-host never writes the host's rows. A missed or mis-targeted event
-    /// is caught by the full fallback, the startup sync or a manual sync, so the
-    /// targeted pass only has to be convergent, never perfect.
+    /// control socket, where a full sync is always wanted. A domain hosted by
+    /// another live instance in collaboration mode is skipped silently, exactly
+    /// as the watcher's full-sync path skips it today, so a non-host never
+    /// writes the host's rows. A missed or mis-targeted event is caught by the
+    /// full fallback, the startup sync or a manual sync, so the targeted pass
+    /// only has to be convergent, never perfect.
     pub async fn sync_paths(&self, name: &str, paths: Vec<String>) -> Result<SyncReport> {
         let ContentSource::File { root } = self.content_source(name)? else {
             // A virtual domain has no files on disk; there is nothing to scan.
@@ -13360,6 +13370,21 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn prune_statements_issued(&self) -> u64 {
         self.prune_statements
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many times a team domain's change list has walked a folder since
+    /// this engine was built: every call of [`Engine::team_local_changes`],
+    /// which reads and hashes every file of the domain it is asked about.
+    ///
+    /// The seam exists because the cost is invisible in the answer: a diff
+    /// built from one walk and a diff built from one walk per changed file are
+    /// the same JSON, so only a count tells the two apart. Read as a delta
+    /// around the call under test, since building a fixture walks too. Nothing
+    /// in the daemon, the CLI or the MCP surface reads this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn detection_walks(&self) -> u64 {
+        self.detection_walks
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -18101,6 +18126,9 @@ impl Engine {
     /// base it detects against and the detected delta. Under no lock; a read
     /// a beat stale is the promise every offline read here makes.
     fn team_local_changes(&self, domain: &str) -> Result<TeamChanges> {
+        #[cfg(any(test, feature = "testing"))]
+        self.detection_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let state = crystalline_remote::state::OriginState::load(&state_dir)?.ok_or_else(|| {
             EngineError::Invalid(format!("domain '{domain}' has no origin state"))
@@ -18129,10 +18157,49 @@ impl Engine {
     /// anonymous HTTP agent, who holds no draft there, an empty list. Never
     /// pulls, never probes, never resolves a provider.
     pub async fn local_changes(&self, domain: &str, actor: &ShareActor) -> Result<Value> {
+        self.local_changes_listing(domain, actor, false).await
+    }
+
+    /// The same envelope as [`Engine::local_changes`] with both sides of every
+    /// change inlined: each entry is what [`Engine::local_change`] answers for
+    /// that path, uncapped, and in the same order.
+    ///
+    /// One detection walk for the whole envelope, which is the point of it:
+    /// asking [`Engine::local_change`] per listed path would re-run the walk
+    /// (a read and hash of every file in the domain, or a reviewing domain's
+    /// overlay read) once per change, so a domain with a hundred unshared
+    /// changes paid for a hundred walks to answer one call.
+    pub(crate) async fn local_changes_detailed(
+        &self,
+        domain: &str,
+        actor: &ShareActor,
+    ) -> Result<Value> {
+        self.local_changes_listing(domain, actor, true).await
+    }
+
+    /// The body both listings share. `sides` decides only what each entry
+    /// carries: the summary row, or that row with both texts on it.
+    async fn local_changes_listing(
+        &self,
+        domain: &str,
+        actor: &ShareActor,
+        sides: bool,
+    ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
         self.local_changes_need_an_origin(domain)?;
+        let entry = |path: &str, kind: &str, base: Option<&[u8]>, current: Option<&[u8]>| {
+            if sides {
+                // Uncapped, because a caller deciding what to discard reads
+                // the whole file rather than a preview of it.
+                let mut value = origin::change_detail_json(path, kind, base, current, None);
+                value["domain"] = json!(domain);
+                value
+            } else {
+                origin::change_entry_json(path, kind, base, current)
+            }
+        };
         if self.reviews_changes(domain) {
             let Ok(who) = share_staging::overlay_share_actor(actor) else {
                 return Ok(
@@ -18143,12 +18210,7 @@ impl Engine {
             let mut changes = Vec::new();
             for (path, kind, current) in self.overlay_local_changes(domain, &root, &who).await? {
                 let base = Self::folder_side(&root, &path)?;
-                changes.push(origin::change_entry_json(
-                    &path,
-                    kind,
-                    base.as_deref(),
-                    current.as_deref(),
-                ));
+                changes.push(entry(&path, kind, base.as_deref(), current.as_deref()));
             }
             return Ok(
                 json!({ "domain": domain, "mode": "review", "changes": changes, "skipped_large": [] }),
@@ -18157,15 +18219,15 @@ impl Engine {
         let (root, state_dir, _, local) = self.team_local_changes(domain)?;
         let mut changes = Vec::new();
         for change in local.substantive() {
-            let Some(sides) = ops::local_change_sides(&root, &state_dir, &local, change.path())?
+            let Some(found) = ops::local_change_sides(&root, &state_dir, &local, change.path())?
             else {
                 continue;
             };
-            changes.push(origin::change_entry_json(
+            changes.push(entry(
                 change.path(),
                 change_kind(change),
-                sides.base.as_deref(),
-                sides.current.as_deref(),
+                found.base.as_deref(),
+                found.current.as_deref(),
             ));
         }
         let skipped: Vec<Value> = local
@@ -18180,16 +18242,12 @@ impl Engine {
 
     /// Both sides of every unshared change of `domain`, in the order
     /// [`Engine::local_changes`] reports them: what `origin_status`'s `diff`
-    /// block carries. No cap, because a caller deciding what to discard reads
-    /// the whole file rather than a preview of it.
+    /// block carries: the changes array of
+    /// [`Engine::local_changes_detailed`]'s envelope, so the whole block costs
+    /// the one walk that listing makes.
     async fn local_change_sides(&self, domain: &str, actor: &ShareActor) -> Result<Value> {
-        let listed = self.local_changes(domain, actor).await?;
-        let mut sides = Vec::new();
-        for change in listed["changes"].as_array().into_iter().flatten() {
-            let path = change["path"].as_str().unwrap_or_default();
-            sides.push(self.local_change(domain, path, actor, None).await?);
-        }
-        Ok(json!(sides))
+        let mut listed = self.local_changes_detailed(domain, actor).await?;
+        Ok(listed["changes"].take())
     }
 
     /// Both sides of one unshared change, or `NotFound` in the words
