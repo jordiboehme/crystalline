@@ -1144,6 +1144,25 @@ describe("what changed on this page", () => {
     expect(await screen.findByRole("button", { name: "Draft" })).toBeVisible();
   });
 
+  it("draws no chip on a draft somebody shared with the reader", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ draft: true, draft_owner: "vera" }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    // The banner says whose work this is; the chip would offer to look at,
+    // share and throw away an overlay this reader does not hold - a fetch of
+    // nothing, a share of somebody else's work, and a refused discard.
+    const marker = await screen.findByRole("status", { name: /draft/i });
+    expect(marker).toHaveTextContent("vera's draft, shared with you");
+    expect(screen.queryByRole("button", { name: "Draft" })).toBeNull();
+
+    await userEvent.keyboard("{Meta>}k{/Meta}");
+    expect(screen.queryByText("What changed on this page")).toBeNull();
+  });
+
   it("offers Share this change only to a sharer, and Discard only to a writer", async () => {
     serve({
       "/auth/me": () =>
