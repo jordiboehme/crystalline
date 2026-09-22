@@ -1242,6 +1242,13 @@ const VENT_ADDRESS: &str = "crystalline://vents/vent-driver-retry";
 /// absent block does not mean "no embeddings", it means the built-in local
 /// model, which a test must never reach for because building it downloads
 /// one.
+///
+/// `recall.min_score` is pinned to the fixtures' original 0.5 rather than
+/// left at the shipped default: the stub is a 32-bucket bag-of-words vector,
+/// not any shipped embedding model, so its cosine geometry carries no
+/// relationship to `recall.min_score`'s granite-derived default (see
+/// `research/2026-09-22-granite-thresholds.md`). Pinning keeps every
+/// assertion below testing what it was written to test.
 fn write_daemon_config(path: &Path, domain_dir: &Path, endpoint: Option<&str>) {
     let mut yaml = format!(
         "service:\n  response_format: json\ndomains:\n  vents:\n    path: {}\nembeddings:\n  provider: openai-compatible\n  model: {STUB_MODEL}\n",
@@ -1250,6 +1257,7 @@ fn write_daemon_config(path: &Path, domain_dir: &Path, endpoint: Option<&str>) {
     if let Some(endpoint) = endpoint {
         yaml.push_str(&format!("  endpoint: {endpoint}\n"));
     }
+    yaml.push_str("recall:\n  min_score: 0.5\n");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, yaml).unwrap();
 }

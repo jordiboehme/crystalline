@@ -286,7 +286,7 @@ impl GlobalConfig {
     }
 
     /// The hybrid score an engram must reach before the per-prompt hook names
-    /// it, from `recall.min_score`. Absent means 0.5.
+    /// it, from `recall.min_score`. Absent means 0.69.
     pub fn recall_min_score(&self) -> f64 {
         self.recall
             .as_ref()
@@ -783,7 +783,7 @@ pub struct RecallConfig {
     /// How many engrams one prompt may be handed, 1 to 5. Absent means 3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
-    /// The hybrid score an engram must reach, 0.0 to 1.0. Absent means 0.5.
+    /// The hybrid score an engram must reach, 0.0 to 1.0. Absent means 0.69.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_score: Option<f64>,
 }
@@ -793,8 +793,13 @@ pub struct RecallConfig {
 pub const DEFAULT_RECALL_LIMIT: u64 = 3;
 
 /// `recall.min_score`'s default: the hybrid score an engram must reach before
-/// the per-prompt hook names it when the setting is absent.
-pub const DEFAULT_RECALL_MIN_SCORE: f64 = 0.5;
+/// the per-prompt hook names it when the setting is absent. Derived, not
+/// measured, for the granite embedding model: search's own semantic floor
+/// moved from 0.55 to 0.78 under granite, and this floor is
+/// `0.85 * (0.78 + 0.04) = 0.697`, rounded down to 0.69 the way the spec
+/// rounds its own bge-era `0.5015` down to `0.50`. See
+/// `research/2026-09-22-granite-thresholds.md`.
+pub const DEFAULT_RECALL_MIN_SCORE: f64 = 0.69;
 
 /// The `identity` block: who Crystalline records as the writer of an engram.
 /// Reads like a settings-page section - see the `configure` tool, which

@@ -388,7 +388,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "recall.min_score",
-            doc: "The hybrid score an engram must reach before the per-prompt hook names it, 0.0 to 1.0 (default 0.5); higher keeps the hook quieter, lower names weaker matches",
+            doc: "The hybrid score an engram must reach before the per-prompt hook names it, 0.0 to 1.0 (default 0.69); higher keeps the hook quieter, lower names weaker matches",
             kind: SettingKind::F64,
             startup_effective: false,
             secret: false,
@@ -2959,7 +2959,7 @@ mod tests {
         assert_eq!(recall_limit.source, SettingSource::Default);
 
         let recall_min_score = &views[24];
-        assert_eq!(recall_min_score.value, "0.5");
+        assert_eq!(recall_min_score.value, "0.69");
         assert_eq!(recall_min_score.source, SettingSource::Default);
 
         let identity_actor = &views[25];
@@ -3375,7 +3375,7 @@ mod tests {
 
         assert_eq!(recall_enabled_effective(&cfg), ("true".to_string(), true));
         assert_eq!(recall_limit_effective(&cfg), ("3".to_string(), true));
-        assert_eq!(recall_min_score_effective(&cfg), ("0.5".to_string(), true));
+        assert_eq!(recall_min_score_effective(&cfg), ("0.69".to_string(), true));
         assert!(cfg.recall.is_none(), "an unset block is dropped whole");
     }
 

@@ -215,11 +215,11 @@ fn domains_root_round_trips_and_is_absent_by_default() {
 }
 
 #[test]
-fn recall_defaults_are_on_three_and_a_half() {
+fn recall_defaults_are_on_three_and_sixty_nine_hundredths() {
     let cfg = GlobalConfig::default();
     assert!(cfg.recall_enabled(), "absent block means the hook is on");
     assert_eq!(cfg.recall_limit(), 3);
-    assert_eq!(cfg.recall_min_score(), 0.5);
+    assert_eq!(cfg.recall_min_score(), 0.69);
 }
 
 #[test]
