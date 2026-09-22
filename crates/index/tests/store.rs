@@ -2010,6 +2010,17 @@ parity!(
     search_applies_filters
 );
 
+/// The two backends' semantic-search floors are re-derived together
+/// (`research/2026-09-22-granite-thresholds.md`) and must never drift apart.
+#[cfg(feature = "postgres")]
+#[test]
+fn both_backends_default_the_same_minimum_similarity() {
+    assert_eq!(
+        crystalline_index::turso::DEFAULT_MIN_SIMILARITY,
+        crystalline_index::postgres::DEFAULT_MIN_SIMILARITY
+    );
+}
+
 // --- tag alias map -----------------------------------------------------------
 
 /// A minimal engram carrying an explicit tag set on its frontmatter.

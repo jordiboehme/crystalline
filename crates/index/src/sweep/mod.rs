@@ -82,11 +82,19 @@ pub const ORPHAN_MIN_AGE_DAYS: i64 = 14;
 pub const DUP_THRESHOLD: f64 = 0.80;
 
 /// The lead-vector cosine at or above which `V301` calls two engrams twins.
-/// Above the band where the one published measurement put ordinary related
-/// neighbours (median 0.84, p95 0.90), so a twin is a strong claim; the
-/// finding is judgment class and pair-scoped, so a wrong one costs one
-/// acknowledgment.
-pub const TWIN_THRESHOLD: f64 = 0.88;
+/// Re-derived for `granite-embedding-97m-multilingual-r2` in
+/// `research/2026-09-22-granite-thresholds.md`: the old bge-small-en-v1.5
+/// line of `0.88` sat at quantile 0.9528 of bge's nearest-other-engram lead
+/// cosines on Jordi's domains (the scale corpus is degenerate for this
+/// distribution, 96.75 percent of it already above 0.88 under bge) and at
+/// quantile 0.0325 on the scale corpus; granite reads 0.9422 and 0.9326 at
+/// those quantiles, and the higher, rounded to two decimals, is this value.
+/// All twelve hand-written rewrites clear it, the weakest at 0.9416; on
+/// Jordi's domains granite puts ordinary related neighbours at median
+/// 0.8740, p95 0.9422 (bge: median 0.84, p95 0.90), so a twin is still a
+/// strong claim above that band. The finding is judgment class and
+/// pair-scoped, so a wrong one costs one acknowledgment.
+pub const TWIN_THRESHOLD: f64 = 0.94;
 
 /// The most lead vectors `V301` will compare in one domain. All pairs is
 /// quadratic; above this the rule reports a truncation and skips.

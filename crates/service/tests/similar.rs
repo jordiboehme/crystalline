@@ -936,7 +936,7 @@ async fn an_authors_own_drafts_can_fill_the_advisory_and_the_cut_stands() {
         &team_engram(
             "Retry clamp runbook",
             "retry-clamp-runbook",
-            "The retry queue doubles its backoff and the dead-letter ttl bounds a retry.\nThe docking clamp seats in the bay before thrust and the clamps hold.",
+            "The retry queue doubles its backoff and the dead-letter ttl bounds a retry.\nThe hangar door swings shut before docking begins.",
         ),
     )])
     .await;

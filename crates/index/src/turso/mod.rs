@@ -25,10 +25,13 @@ mod search;
 /// from outside the crate and from nowhere else in it. `search` is a private
 /// submodule, so without this the registry would hold a second copy of each
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
+/// [`DEFAULT_MIN_SIMILARITY`] is re-exported the same way, for the same
+/// reason: the cross-backend parity test in `tests/store.rs` reads it rather
+/// than holding a second copy of the number.
 #[doc(hidden)]
 pub use search::{
-    filter_only_sql, lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql,
-    semantic_phase1_sql,
+    DEFAULT_MIN_SIMILARITY, filter_only_sql, lexical_candidate_sql, node_hydrate_sql,
+    semantic_hydrate_sql, semantic_phase1_sql,
 };
 
 use std::collections::HashMap;

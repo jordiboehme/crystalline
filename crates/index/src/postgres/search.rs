@@ -33,8 +33,18 @@ use sqlx::postgres::PgRow;
 const SNIPPET_MARGIN: usize = 70;
 const SNIPPET_LEAD: usize = 200;
 
-/// The default minimum cosine similarity for a semantic hit.
-pub(super) const DEFAULT_MIN_SIMILARITY: f32 = 0.55;
+/// The default minimum cosine similarity for a semantic hit. Re-derived for
+/// `granite-embedding-97m-multilingual-r2` in
+/// `research/2026-09-22-granite-thresholds.md`: the old bge-small-en-v1.5
+/// floor of `0.55` sat at quantile 0.8726 of bge's query-to-chunk cosines on
+/// the scale index and 0.7930 on Jordi's domains; granite reads 0.7802 and
+/// 0.7458 at those same quantiles, and the higher, rounded to two decimals,
+/// is this value. All eighteen known-answer queries of the German spot check
+/// clear it, the weakest (E1) at 0.8194. Must stay equal to
+/// `crate::turso::search::DEFAULT_MIN_SIMILARITY`; parity is pinned by
+/// `both_backends_default_the_same_minimum_similarity` in
+/// `crates/index/tests/store.rs`.
+pub const DEFAULT_MIN_SIMILARITY: f32 = 0.78;
 /// How many nearest chunks the vector scan considers before the cutoff and paging.
 const SEMANTIC_TOPK: usize = 100;
 /// Hybrid blend weights: the semantic signal leads, the lexical signal supports.
