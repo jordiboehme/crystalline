@@ -1860,9 +1860,11 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
     }))
 }
 
-/// Whole megabytes, for a size beside a model id.
+/// Whole megabytes, decimal (the unit every other surface names a model's
+/// size in: the release notes, deployment.md's image table), for a size
+/// beside a model id.
 fn mb(bytes: u64) -> String {
-    format!("{} MB", bytes / (1024 * 1024))
+    format!("{} MB", bytes / 1_000_000)
 }
 
 /// Render a report for a human.
@@ -2707,16 +2709,16 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("210 MB"),
+            out.contains("220 MB"),
             "the configured model's size is beside its id: {out}"
         );
         assert!(out.contains("cached models:"), "{out}");
         assert!(
-            out.contains("BAAI/bge-small-en-v1.5 127 MB [stale]"),
+            out.contains("BAAI/bge-small-en-v1.5 133 MB [stale]"),
             "a cached model the config does not use is marked: {out}"
         );
         assert!(
-            !out.contains("ibm-granite/granite-embedding-97m-multilingual-r2 210 MB [stale]"),
+            !out.contains("ibm-granite/granite-embedding-97m-multilingual-r2 220 MB [stale]"),
             "the model in use is not marked stale: {out}"
         );
     }
