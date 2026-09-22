@@ -8,7 +8,7 @@
  * nothing on the screen could open it.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -657,23 +657,7 @@ describe("the share dialog", () => {
     expect(within(dialog).getByText("notes/new-5.md")).toBeVisible();
   });
 
-  it("says nothing about folder listings when a share carries none", async () => {
-    serve({
-      "/domains/eng/sync/changes": () => ({
-        action: "create",
-        effective_title: "Share 1 new engram from eng",
-        changes: [{ path: "notes/a.md", kind: "added" }],
-      }),
-    });
-
-    renderApp("/d/eng");
-    const dialog = await openShareDialog();
-
-    expect(await within(dialog).findByText("Added 1")).toBeVisible();
-    expect(within(dialog).queryByText(/folder index/)).toBeNull();
-  });
-
-  it("counts refreshed folder listings in one line instead of listing them", async () => {
+  it("says nothing about folder listings ever", async () => {
     serve({
       "/domains/eng/sync/changes": () => ({
         action: "create",
@@ -690,37 +674,16 @@ describe("the share dialog", () => {
     renderApp("/d/eng");
     const dialog = await openShareDialog();
 
-    // The engrams are the share; the listings are what the share does to keep
-    // the repository browsable, and they never crowd the engrams out.
+    // The engrams are the share. A listing is rebuilt from the engrams beside
+    // it and follows the domain's own configuration, so it is neither a row
+    // nor a line nor a number anybody here is told about.
     expect(await within(dialog).findByText("Added 2")).toBeVisible();
     expect(within(dialog).queryByText("Modified 2")).toBeNull();
     expect(within(dialog).queryByText("notes/index.md")).toBeNull();
-    expect(
-      within(dialog).getByText("Also refreshes 3 folder indexes"),
-    ).toBeVisible();
+    expect(within(dialog).queryByText(/folder index/)).toBeNull();
   });
 
-  it("names a single refreshed listing in the singular", async () => {
-    serve({
-      "/domains/eng/sync/changes": () => ({
-        action: "create",
-        effective_title: "Share 1 new engram from eng",
-        changes: [
-          { path: "notes/a.md", kind: "added" },
-          { path: "index.md", kind: "modified" },
-        ],
-      }),
-    });
-
-    renderApp("/d/eng");
-    const dialog = await openShareDialog();
-
-    expect(
-      await within(dialog).findByText("Also refreshes 1 folder index"),
-    ).toBeVisible();
-  });
-
-  it("still shows the line when the listings are all a share carries", async () => {
+  it("draws no list and no line for a plan that only carries listings", async () => {
     serve({
       "/domains/eng/sync/changes": () => ({
         action: "create",
@@ -735,12 +698,15 @@ describe("the share dialog", () => {
     renderApp("/d/eng");
     const dialog = await openShareDialog();
 
-    // Nothing to group, and still something to say: somebody who opened this
-    // dialog is owed the reason the Share button is live.
-    expect(
-      await within(dialog).findByText("Also refreshes 2 folder indexes"),
-    ).toBeVisible();
-    expect(within(dialog).getByRole("button", { name: "Share" })).toBeEnabled();
+    // Nothing to group and nothing to say: the share still goes, and the
+    // button that sends it is live, which is all this plan is about.
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    expect(within(dialog).queryByText(/^Modified /)).toBeNull();
+    expect(within(dialog).queryByText(/folder index/)).toBeNull();
   });
 
   it("badges each change with its kind letter and the word behind it", async () => {
@@ -1337,7 +1303,7 @@ describe("the share dialog", () => {
     ).toEqual([]);
   });
 
-  it("shares only the ticked files, and recounts the listings that ride with them", async () => {
+  it("shares only the ticked files", async () => {
     const shared = vi.fn(() => ({
       outcome: "proposed",
       number: 7,
@@ -1361,21 +1327,9 @@ describe("the share dialog", () => {
     renderApp("/d/eng");
     const dialog = await openShareDialog();
 
-    // Everything is ticked to begin with, so the line counts the delta's own
-    // listings: this share sends no file list and carries all of it.
-    expect(
-      await within(dialog).findByText("Also refreshes 2 folder indexes"),
-    ).toBeVisible();
-
     await userEvent.click(
-      within(dialog).getByRole("checkbox", { name: "guides/g.md" }),
+      await within(dialog).findByRole("checkbox", { name: "guides/g.md" }),
     );
-
-    // Untick a file and its folder's listing goes with it, because the share
-    // now names the files it carries and the engine adds only their folders.
-    expect(
-      await within(dialog).findByText("Also refreshes 1 folder index"),
-    ).toBeVisible();
 
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Share" }),
@@ -1510,5 +1464,308 @@ describe("the share dialog", () => {
         within(dialog).getByRole("button", { name: "Share" }),
       ).toBeDisabled();
     });
+  });
+});
+
+describe("seeing and discarding changes from the dialog", () => {
+  const PLAN = () => ({
+    action: "create",
+    effective_title: "Share 2 engrams from eng",
+    changes: [
+      { path: "notes/a.md", kind: "modified", sha: "9f2c" },
+      { path: "notes/new.md", kind: "added", sha: "51ab" },
+    ],
+  });
+  const DETAIL = () => ({
+    path: "notes/a.md",
+    kind: "modified",
+    sha: "9f2c",
+    binary: false,
+    size_before: 8,
+    size_after: 8,
+    base: "the old rule\n",
+    current: "the new rule\n",
+    too_large: false,
+  });
+
+  it("opens a row's diff pane and comes back with the ticks intact", async () => {
+    serve({
+      "/domains/eng/sync/changes": PLAN,
+      "/domains/eng/changes/notes/a.md": DETAIL,
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      await within(dialog).findByRole("checkbox", { name: "notes/new.md" }),
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "notes/a.md" }),
+    );
+    expect(
+      await within(dialog).findByRole("heading", {
+        name: "notes/a.md",
+        level: 2,
+      }),
+    ).toBeVisible();
+    // The pane itself arrives a beat after its heading: the merge package is
+    // behind a lazy import and both sides are a read of their own.
+    expect(
+      await within(dialog).findByRole("region", { name: "notes/a.md" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Share" })).toBeNull();
+    expect(dialog).toHaveClass("w-[min(64rem,calc(100vw-2rem))]");
+    await userEvent.keyboard("{Escape}");
+    expect(
+      await within(dialog).findByRole("button", { name: "Share" }),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/new.md" }),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/a.md" }),
+    ).toBeChecked();
+    expect(dialog).toHaveClass("w-[min(28rem,calc(100vw-2rem))]");
+    expect(reads("/domains/eng/sync/changes")).toBe(1);
+  });
+
+  it("discards the ticked files after an inline confirmation and recounts", async () => {
+    // The plan answers the discard the way the engine would: the file that
+    // went back is not an unshared change any more, and the one that was
+    // refused still is. Held in a variable rather than served twice, so the
+    // refetch below reads the state this discard left behind.
+    let plan = PLAN();
+    const discarded = vi.fn(() => {
+      plan = {
+        ...plan,
+        changes: plan.changes.filter((c) => c.path !== "notes/a.md"),
+      };
+      return {
+        domain: "eng",
+        restored: ["notes/a.md"],
+        deleted: [],
+        refused: [{ path: "notes/new.md", reason: "changed_since" }],
+        cleared: [],
+        reindexed: 1,
+      };
+    });
+    serve({
+      "/domains/eng/sync/changes": () => plan,
+      "/domains/eng/changes/discard": (_path, init) =>
+        init?.method === "POST" ? discarded() : null,
+      "/sync": () => ({ connection: { connected: true }, domains: [] }),
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await within(dialog).findByRole("checkbox", { name: "notes/a.md" });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Discard selected" }),
+    );
+    expect(
+      await within(dialog).findByText(
+        "Discard 2 files? Their changes are put back the way the team has them.",
+      ),
+    ).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Confirm discard" }),
+    );
+    await waitFor(() => {
+      expect(discarded).toHaveBeenCalled();
+    });
+    // The digests the plan was read with, one per ticked path.
+    expect(sentBody("/domains/eng/changes/discard", "POST")).toEqual({
+      paths: [
+        { path: "notes/a.md", sha: "9f2c" },
+        { path: "notes/new.md", sha: "51ab" },
+      ],
+    });
+    await waitFor(() => {
+      expect(
+        within(dialog).queryByRole("checkbox", { name: "notes/a.md" }),
+      ).toBeNull();
+    });
+    // What it did, said once above the list, and why the one file that stayed
+    // stayed, said on its own row.
+    expect(within(dialog).getByText("Discarded 1 file.")).toBeVisible();
+    expect(within(dialog).getByText("Changed since you looked.")).toBeVisible();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/new.md" }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(reads("/domains/eng/sync/changes")).toBe(2);
+    });
+    await waitFor(() => {
+      expect(reads("/domains/eng/sync")).toBeGreaterThan(1);
+    });
+    // The instance-wide summary is invalidated with them and is deliberately
+    // not asserted on: standing inside a domain whose own status answered,
+    // the frame never asks `/sync` at all, so a count here would pin the
+    // frame's own gating rather than this dialog's invalidation.
+  });
+
+  it("arms the strip for one path from the row menu and can cancel it", async () => {
+    serve({ "/domains/eng/sync/changes": PLAN });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    const trigger = await within(dialog).findByRole("button", {
+      name: "Actions for notes/a.md",
+    });
+    await userEvent.click(trigger);
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Discard" }),
+    );
+    expect(
+      await within(dialog).findByText(
+        "Discard notes/a.md? Their changes are put back the way the team has them.",
+      ),
+    ).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Cancel discard" }),
+    );
+    expect(within(dialog).queryByText(/Discard notes\/a\.md\?/)).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("reads Escape as a way out of the strip rather than out of the dialog", async () => {
+    serve({ "/domains/eng/sync/changes": PLAN });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await within(dialog).findByRole("checkbox", { name: "notes/a.md" });
+    const armed = within(dialog).getByRole("button", {
+      name: "Discard selected",
+    });
+    await userEvent.click(armed);
+    expect(
+      await within(dialog).findByRole("button", { name: "Confirm discard" }),
+    ).toHaveFocus();
+
+    // The dialog's own Escape means "leave, and lose every tick in it", which
+    // is not what somebody backing out of a discard asked for. Answered by
+    // the dialog rather than by the strip: Radix listens for Escape on the
+    // document in the capture phase, so an event stopped inside the strip has
+    // already been seen and acted on.
+    await userEvent.keyboard("{Escape}");
+    expect(within(dialog).queryByText(/Discard 2 files\?/)).toBeNull();
+    expect(dialog).toBeInTheDocument();
+    expect(armed).toHaveFocus();
+
+    // And with nothing armed it means what it always meant.
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /share/i })).toBeNull();
+    });
+  });
+
+  it("posts the digest the strip was armed with, not one the plan grew since", async () => {
+    let sha = "9f2c";
+    const discarded = vi.fn(() => ({
+      domain: "eng",
+      restored: [],
+      deleted: [],
+      cleared: [],
+      refused: [{ path: "notes/a.md", reason: "changed_since" }],
+      reindexed: 0,
+    }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "modified", sha }],
+      }),
+      "/domains/eng/changes/discard": (_path, init) =>
+        init?.method === "POST" ? discarded() : null,
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await within(dialog).findByRole("checkbox", { name: "notes/a.md" });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Discard selected" }),
+    );
+    expect(
+      await within(dialog).findByText(/Discard notes\/a\.md\?/),
+    ).toBeVisible();
+
+    // The file is edited while the question is on the screen, and the plan is
+    // read again behind it - a window coming back is enough. What the strip
+    // asks about is what the reader saw when they armed it, so the digest it
+    // posts is that one and the engine refuses it.
+    sha = "aaaa";
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => {
+      expect(reads("/domains/eng/sync/changes")).toBe(2);
+    });
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Confirm discard" }),
+    );
+    await waitFor(() => {
+      expect(discarded).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains/eng/changes/discard", "POST")).toEqual({
+      paths: [{ path: "notes/a.md", sha: "9f2c" }],
+    });
+    expect(
+      await within(dialog).findByText("Changed since you looked."),
+    ).toBeVisible();
+  });
+
+  it("shows the empty sentence once every change is gone", async () => {
+    let plan = PLAN();
+    serve({
+      "/domains/eng/sync/changes": () => plan,
+      "/domains/eng/changes/discard": (_path, init) => {
+        if (init?.method !== "POST") return null;
+        plan = { action: "nothing_to_share", effective_title: "", changes: [] };
+        return {
+          domain: "eng",
+          restored: ["notes/a.md"],
+          deleted: ["notes/new.md"],
+          cleared: [],
+          refused: [],
+          reindexed: 2,
+        };
+      },
+      "/sync": () => ({ connection: { connected: true }, domains: [] }),
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await within(dialog).findByRole("checkbox", { name: "notes/a.md" });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Discard selected" }),
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Confirm discard" }),
+    );
+    expect(
+      await within(dialog).findByText(
+        "Nothing to share: the team already has all of this.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("has no discard controls on a read-only instance", async () => {
+    serve({
+      "/auth/me": () =>
+        meResponse({ user: userFixture({ role: "admin" }), read_only: true }),
+      "/domains/eng/sync/changes": PLAN,
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    expect(
+      within(dialog).queryByRole("button", { name: "Discard selected" }),
+    ).toBeNull();
+    await userEvent.click(
+      await within(dialog).findByRole("button", {
+        name: "Actions for notes/a.md",
+      }),
+    );
+    expect(
+      await screen.findByRole("menuitem", { name: "What changed" }),
+    ).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Discard" })).toBeNull();
   });
 });

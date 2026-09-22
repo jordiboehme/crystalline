@@ -139,8 +139,14 @@ export function replaceBuffer(
   onDocChanged(content);
 }
 
-/** The one highlight style; colors lean on the app's slate/sky palette. */
-const editorHighlight = HighlightStyle.define([
+/**
+ * The one highlight style; colors lean on the app's slate/sky palette.
+ *
+ * Exported so the diff pane can wear it too: the pane and the buffer show the
+ * same markdown, and a fence that is one color while it is read and another
+ * while it is edited is two answers to one question.
+ */
+export const editorHighlight = HighlightStyle.define([
   { tag: tags.heading1, fontSize: "1.4em", fontWeight: "600" },
   { tag: tags.heading2, fontSize: "1.2em", fontWeight: "600" },
   { tag: tags.heading3, fontSize: "1.1em", fontWeight: "600" },
@@ -175,7 +181,7 @@ const editorHighlight = HighlightStyle.define([
 ]);
 
 /** The chrome around the text, once per scheme. */
-function editorTheme(dark: boolean): Extension {
+export function editorTheme(dark: boolean): Extension {
   return EditorView.theme(
     {
       "&": { fontSize: "0.9375rem" },
@@ -237,6 +243,16 @@ export const RAW_MONO: Extension = Prec.high(
 );
 
 /**
+ * The markdown configuration every reading surface of a document shares: the
+ * editor buffer and the diff pane, so the parse cannot drift between the page
+ * somebody edits and the pane that shows what they changed.
+ */
+export const documentLanguage: Extension = markdown({
+  base: markdownLanguage,
+  codeLanguages: languages,
+});
+
+/**
  * Everything an editor surface starts from.
  *
  * `history` is a switch rather than a fixture because a co-editing buffer has
@@ -259,7 +275,7 @@ export function baseExtensions(
       ...searchKeymap,
     ]),
     EditorView.lineWrapping,
-    markdown({ base: markdownLanguage, codeLanguages: languages }),
+    documentLanguage,
     syntaxHighlighting(editorHighlight),
     editorTheme(dark),
   ];

@@ -19,6 +19,8 @@ export interface ShareDialogProps {
   domain: string;
   /** Leave the dialog: cancelled, dismissed, or a share that landed. */
   onClose: () => void;
+  /** Open with exactly these paths ticked. */
+  only?: string[];
 }
 
 export function ShareDialog(props: ShareDialogProps): ReactElement {

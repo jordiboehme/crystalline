@@ -309,6 +309,99 @@ pub(crate) fn local_change_detail(domain_root: &Path, state_dir: &Path) -> Optio
     }))
 }
 
+/// A text side above this many bytes is answered as `null` with
+/// `too_large: true` where a cap applies (the REST detail route), so a
+/// browser never receives a megabyte of prose to diff; the CLI and the MCP
+/// status detail pass no cap.
+pub const MAX_DIFF_TEXT_BYTES: usize = 1024 * 1024;
+
+/// Whether the local-change comparison is ever made for `path`: never for a
+/// generated listing or the activity log, whatever the MANIFEST says about
+/// sharing listings, and never for a dotfile, which detection skips too.
+pub(crate) fn takes_part_in_local_change(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    !crystalline_core::is_index_path(path) && name != "log.md" && !name.starts_with('.')
+}
+
+/// The `{ permalink, title }` of an engram file, parsed from whichever side
+/// holds it, or `Null` when the path is not an engram or does not parse.
+fn engram_of(path: &str, bytes: Option<&[u8]>) -> Value {
+    if !path.ends_with(".md") {
+        return Value::Null;
+    }
+    let Some(text) = bytes.and_then(|b| std::str::from_utf8(b).ok()) else {
+        return Value::Null;
+    };
+    match crystalline_core::parse_engram(text) {
+        Ok(engram) => json!({
+            "permalink": engram
+                .frontmatter
+                .permalink
+                .clone()
+                .unwrap_or_else(|| path.trim_end_matches(".md").to_string()),
+            "title": engram.frontmatter.title,
+        }),
+        Err(_) => Value::Null,
+    }
+}
+
+/// One row of the change list: the path, its kind, the digest of the current
+/// side (`null` for a deletion), both sizes (`null` where a side is absent),
+/// whether either present side is not UTF-8, and the engram the file holds.
+pub(crate) fn change_entry_json(
+    path: &str,
+    kind: &str,
+    base: Option<&[u8]>,
+    current: Option<&[u8]>,
+) -> Value {
+    let binary = [base, current]
+        .into_iter()
+        .flatten()
+        .any(|bytes| std::str::from_utf8(bytes).is_err());
+    let engram = match kind {
+        "deleted" => engram_of(path, base),
+        _ => engram_of(path, current),
+    };
+    json!({
+        "path": path,
+        "kind": kind,
+        "sha": current.map(crate::engine::sha256_hex),
+        "size_before": base.map(<[u8]>::len),
+        "size_after": current.map(<[u8]>::len),
+        "binary": binary,
+        "engram": engram,
+    })
+}
+
+/// [`change_entry_json`] plus both texts. A binary change carries `null`
+/// texts and its sizes; a text side above `cap` is `null` with `too_large`
+/// set, so a caller knows the side exists and was withheld rather than
+/// absent.
+pub(crate) fn change_detail_json(
+    path: &str,
+    kind: &str,
+    base: Option<&[u8]>,
+    current: Option<&[u8]>,
+    cap: Option<usize>,
+) -> Value {
+    let mut value = change_entry_json(path, kind, base, current);
+    let binary = value["binary"] == json!(true);
+    let too_large =
+        cap.is_some_and(|cap| [base, current].into_iter().flatten().any(|b| b.len() > cap));
+    let text = |side: Option<&[u8]>| -> Value {
+        if binary || too_large {
+            return Value::Null;
+        }
+        side.and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| Value::String(s.to_string()))
+            .unwrap_or(Value::Null)
+    };
+    value["base"] = text(base);
+    value["current"] = text(current);
+    value["too_large"] = json!(too_large);
+    value
+}
+
 /// Whether `err` is the kind of error a live probe raises when the network
 /// or the GitHub connection itself is the problem, rather than the domain's
 /// own local state: [`RemoteError::Offline`], [`RemoteError::RateLimited`]
@@ -609,7 +702,7 @@ pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWor
 
 /// Shapes [`ops::propose_preview`]'s plan for `origin_share_preview` and the
 /// REST changes route: always `effective_title` and `changes` (one
-/// `{ path, kind, last_author }` entry per detected local change), plus the
+/// `{ path, kind, sha, last_author }` entry per detected local change), plus the
 /// fields the planned action itself carries - `number` and `url` for an update,
 /// `top_number` and `top_title` for a `stack` (a new layer on an open chain),
 /// `number`, `url`, `title` and `layers_above` for an `amend`, all three of `number`,
@@ -640,6 +733,15 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
             json!({
                 "path": c.path(),
                 "kind": kind,
+                // The digest of the current side, which is what a discard from
+                // this plan sends back as the version it looked at. A deletion
+                // has no current side and so no digest.
+                "sha": match c {
+                    LocalChange::Deleted { .. } => Value::Null,
+                    LocalChange::Added { sha256, .. } | LocalChange::Modified { sha256, .. } => {
+                        json!(sha256)
+                    }
+                },
                 // Named at the reported path and read at the one on disk. A
                 // case-only rename is reported at the base snapshot's
                 // spelling, which is the name the repository knows and the
@@ -1040,6 +1142,94 @@ mod tests {
         let v = share_plan_json(&plan, Some(root));
         assert_eq!(v["changes"][0]["path"], "notes/Alpha.md");
         assert_eq!(v["changes"][0]["last_author"], json!("human:ada"));
+    }
+
+    /// A listing, the activity log and a dotfile never take part in the
+    /// comparison, at the root or under a folder; an ordinary engram does.
+    #[test]
+    fn takes_part_in_local_change_skips_listings_logs_and_dotfiles() {
+        assert!(takes_part_in_local_change("notes/a.md"));
+        for path in [
+            "index.md",
+            "notes/index.md",
+            "log.md",
+            "notes/log.md",
+            ".hidden.md",
+        ] {
+            assert!(!takes_part_in_local_change(path), "{path} takes no part");
+        }
+    }
+
+    /// One row carries the digest of the current side, both sizes and the
+    /// engram whichever side holds it, and a file that is not text says so
+    /// instead of pretending to be an engram.
+    #[test]
+    fn a_change_entry_reads_sizes_digest_and_the_engram_from_the_present_side() {
+        let base = engram_source("Plan", None);
+        let current = engram_source("Replan", None);
+        let modified = change_entry_json(
+            "plan.md",
+            "modified",
+            Some(base.as_bytes()),
+            Some(current.as_bytes()),
+        );
+        assert_eq!(
+            modified["sha"],
+            json!(crate::engine::sha256_hex(current.as_bytes()))
+        );
+        assert_eq!(modified["size_before"], json!(base.len()));
+        assert_eq!(modified["size_after"], json!(current.len()));
+        assert_eq!(modified["binary"], json!(false));
+        assert_eq!(
+            modified["engram"]["title"],
+            json!("Replan"),
+            "the side a reader is about to see: {modified}"
+        );
+
+        let deleted = change_entry_json("plan.md", "deleted", Some(base.as_bytes()), None);
+        assert_eq!(
+            deleted["sha"],
+            Value::Null,
+            "a deletion has no current side"
+        );
+        assert_eq!(deleted["size_after"], Value::Null);
+        assert_eq!(
+            deleted["engram"]["title"],
+            json!("Plan"),
+            "the only side left is the base's: {deleted}"
+        );
+
+        let png = change_entry_json("assets/logo.png", "added", None, Some(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(png["binary"], json!(true));
+        assert_eq!(png["engram"], Value::Null);
+        assert_eq!(png["size_before"], Value::Null);
+    }
+
+    /// A cap withholds both texts and says so; without one both are answered;
+    /// a side that is not text is withheld for being binary rather than big.
+    #[test]
+    fn a_change_detail_withholds_text_above_the_cap_and_for_binary() {
+        let capped =
+            change_detail_json("a.md", "modified", Some(b"12345"), Some(b"123456"), Some(5));
+        assert_eq!(capped["too_large"], json!(true), "{capped}");
+        assert_eq!(capped["base"], Value::Null);
+        assert_eq!(capped["current"], Value::Null);
+
+        let whole = change_detail_json("a.md", "modified", Some(b"12345"), Some(b"123456"), None);
+        assert_eq!(whole["too_large"], json!(false));
+        assert_eq!(whole["base"], json!("12345"));
+        assert_eq!(whole["current"], json!("123456"));
+
+        let png = change_detail_json(
+            "assets/logo.png",
+            "added",
+            None,
+            Some(b"\x89PNG\r\n\x1a\n"),
+            None,
+        );
+        assert_eq!(png["too_large"], json!(false), "big is not why: {png}");
+        assert_eq!(png["current"], Value::Null);
+        assert_eq!(png["size_after"], json!(8));
     }
 
     /// The whole point of the detail block, over the delta that misled a
@@ -1858,6 +2048,10 @@ mod tests {
                     LocalChange::Deleted {
                         path: "notes/old.md".to_string(),
                     },
+                    LocalChange::Modified {
+                        path: "notes/kept.md".to_string(),
+                        sha256: "bb".to_string(),
+                    },
                 ],
                 skipped_large: vec![],
                 ..Default::default()
@@ -1869,13 +2063,20 @@ mod tests {
         assert_eq!(v["number"], 4);
         assert_eq!(v["url"], "https://github.com/acme/brand-knowledge/pull/4");
         assert_eq!(v["effective_title"], "Share updates from brand");
+        // Each change carries the digest of its own current side, which is what
+        // a discard from this plan sends back as the version it looked at; a
+        // deletion has no current side and so none.
         assert_eq!(
             v["changes"][0],
-            json!({"path": "notes/new.md", "kind": "added", "last_author": null})
+            json!({"path": "notes/new.md", "kind": "added", "sha": "aa", "last_author": null})
         );
         assert_eq!(
             v["changes"][1],
-            json!({"path": "notes/old.md", "kind": "deleted", "last_author": null})
+            json!({"path": "notes/old.md", "kind": "deleted", "sha": null, "last_author": null})
+        );
+        assert_eq!(
+            v["changes"][2],
+            json!({"path": "notes/kept.md", "kind": "modified", "sha": "bb", "last_author": null})
         );
     }
 

@@ -522,7 +522,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // the call rather than the listing - `add_domain` and `update_domain` can
     // create a declaration mid-call, and there is no one setting to point at -
     // so `provision` is on every list. `github.enabled` is one shared setting
-    // and does gate the listing, so the five collaboration tools that need it
+    // and does gate the listing, so the six collaboration tools that need it
     // are absent here and appear together when it is turned on. Task 5 decides
     // the skills surface at construction instead. The assertion below is the
     // count, read off a failing run rather than computed here.
@@ -658,7 +658,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // `a_version_we_do_not_serve_is_refused_at_the_http_handshake` pins in both
     // of its shapes. Here the era is served: statelessly, with its caching
     // hints, and with the same 20 tools every other client of this instance is
-    // served (GitHub is off here, so the five collaboration tools are withheld
+    // served (GitHub is off here, so the six collaboration tools are withheld
     // from every era alike).
     // `tests/mcp_modern_era.rs` is where the rest of that surface lives.
     let era = post_with_standard_headers(

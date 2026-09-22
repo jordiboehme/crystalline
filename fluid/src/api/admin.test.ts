@@ -18,17 +18,22 @@ import {
   createDomain,
   disconnectGithub,
   disconnectMyGithubIdentity,
+  discardChanges,
+  fetchChange,
   fetchConflict,
   fetchGithubStatus,
   fetchMyGithubIdentity,
+  fetchLocalChanges,
   fetchShareChanges,
   fetchSyncStatus,
   fetchSyncSummary,
   importArchive,
   previewArchive,
+  readDiscardReceipt,
   readGithubStatus,
   readMyGithubIdentity,
   readStackPlacement,
+  refusalSentence,
   resolveConflict,
   shareDomain,
   sharePlanKey,
@@ -961,8 +966,13 @@ describe("the admin client layer", () => {
       action: "update",
       effectiveTitle: "Refine 2 engrams in kb",
       changes: [
-        { path: "notes/a.md", kind: "modified", lastAuthor: "human:ada" },
-        { path: "notes/b.md", kind: "modified", lastAuthor: null },
+        {
+          path: "notes/a.md",
+          kind: "modified",
+          lastAuthor: "human:ada",
+          sha: null,
+        },
+        { path: "notes/b.md", kind: "modified", lastAuthor: null, sha: null },
       ],
       number: 4,
       url: "https://github.example/acme/kb/pull/4",
@@ -1304,5 +1314,184 @@ describe("the admin client layer", () => {
         headers: { "Content-Type": "application/zip" },
       },
     );
+  });
+});
+describe("local changes", () => {
+  it("reads the change list tolerantly", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      mode: "team",
+      changes: [
+        {
+          path: "notes/a.md",
+          kind: "modified",
+          sha: "9f2c",
+          size_before: 1204,
+          size_after: 1388,
+          binary: false,
+          engram: { permalink: "notes/a", title: "A" },
+        },
+        {
+          path: "logo.png",
+          kind: "added",
+          sha: "51ab",
+          size_before: null,
+          size_after: 20480,
+          binary: true,
+          engram: null,
+        },
+        {
+          path: "notes/old.md",
+          kind: "deleted",
+          sha: null,
+          size_before: 880,
+          size_after: null,
+        },
+        // No path to address it by, so there is nothing a row could do.
+        { kind: "modified" },
+      ],
+      skipped_large: [{ path: "big.mov", size: 9000000 }],
+    });
+    const list = await fetchLocalChanges("team notes");
+
+    expect(apiMock).toHaveBeenLastCalledWith("/domains/team%20notes/changes");
+    expect(list.mode).toBe("team");
+    expect(list.changes).toEqual([
+      {
+        path: "notes/a.md",
+        kind: "modified",
+        sha: "9f2c",
+        sizeBefore: 1204,
+        sizeAfter: 1388,
+        binary: false,
+        engram: { permalink: "notes/a", title: "A" },
+      },
+      {
+        path: "logo.png",
+        kind: "added",
+        sha: "51ab",
+        sizeBefore: null,
+        sizeAfter: 20480,
+        binary: true,
+        engram: null,
+      },
+      {
+        path: "notes/old.md",
+        kind: "deleted",
+        sha: null,
+        sizeBefore: 880,
+        sizeAfter: null,
+        binary: false,
+        engram: null,
+      },
+    ]);
+    expect(list.skippedLarge).toEqual([{ path: "big.mov", size: 9000000 }]);
+  });
+
+  it("reads one change with both sides, encoding the path per segment", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      path: "notes/a b.md",
+      kind: "modified",
+      sha: "9f2c",
+      binary: false,
+      size_before: 10,
+      size_after: 12,
+      base: "old\n",
+      current: "new\n",
+      too_large: false,
+    });
+    const detail = await fetchChange("eng", "notes/a b.md");
+
+    // Per segment, so the path keeps its own slashes and loses its spaces.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/changes/notes/a%20b.md",
+    );
+    expect(detail.base).toBe("old\n");
+    expect(detail.current).toBe("new\n");
+    expect(detail.tooLarge).toBe(false);
+
+    apiMock.mockResolvedValueOnce({
+      path: "big.md",
+      kind: "modified",
+      too_large: true,
+    });
+    const big = await fetchChange("eng", "big.md");
+
+    expect(big.tooLarge).toBe(true);
+    expect(big.base).toBeNull();
+  });
+
+  it("posts the targets and reads the receipt", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      restored: ["notes/a.md"],
+      deleted: [],
+      cleared: [{ path: "d.md", kind: "added" }],
+      refused: [{ path: "b.md", reason: "changed_since" }],
+      reindexed: 1,
+    });
+    const receipt = await discardChanges("eng", [
+      { path: "notes/a.md", sha: "9f2c" },
+      { path: "gone.md", sha: null },
+    ]);
+
+    expect(apiMock).toHaveBeenLastCalledWith("/domains/eng/changes/discard", {
+      method: "POST",
+      body: JSON.stringify({
+        paths: [
+          { path: "notes/a.md", sha: "9f2c" },
+          { path: "gone.md", sha: null },
+        ],
+      }),
+    });
+    expect(receipt).toEqual({
+      restored: ["notes/a.md"],
+      deleted: [],
+      cleared: [{ path: "d.md", kind: "added" }],
+      refused: [{ path: "b.md", reason: "changed_since" }],
+      reindexed: 1,
+    });
+
+    // An answer carrying none of it is an empty receipt rather than a throw.
+    expect(readDiscardReceipt(null)).toEqual({
+      restored: [],
+      deleted: [],
+      cleared: [],
+      refused: [],
+      reindexed: 0,
+    });
+  });
+
+  it("names every refusal reason in words", () => {
+    expect(refusalSentence("changed_since")).toBe("Changed since you looked.");
+    expect(refusalSentence("not_a_change")).toBe(
+      "Already matches the team's copy.",
+    );
+    expect(refusalSentence("no_base_copy")).toBe(
+      "Its earlier content is in an open proposal below this one; withdraw that layer to get it back.",
+    );
+    expect(refusalSentence("unknown_path")).toBe(
+      "Not among this domain's unshared changes.",
+    );
+    expect(refusalSentence("open_in_editor")).toBe("Close the editor first.");
+    expect(refusalSentence("something_else")).toBe("Refused: something_else.");
+  });
+
+  it("the share plan carries sha per change", async () => {
+    apiMock.mockResolvedValueOnce({
+      action: "create",
+      effective_title: "t",
+      changes: [
+        { path: "a.md", kind: "added", sha: "51ab" },
+        { path: "d.md", kind: "deleted", sha: null },
+        // An older server names no digest, which discards the same way a
+        // deletion does: by whatever the list shows now.
+        { path: "old.md", kind: "modified" },
+      ],
+    });
+    const plan = await fetchShareChanges("eng");
+
+    expect(plan.changes.map((c) => c.sha)).toEqual(["51ab", null, null]);
   });
 });

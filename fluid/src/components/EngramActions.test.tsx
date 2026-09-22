@@ -45,6 +45,7 @@ const ENGRAM = {
   guidance: null,
   draft: false,
   draftOwner: null,
+  localChange: null,
 } satisfies EngramDetail;
 
 afterEach(() => {

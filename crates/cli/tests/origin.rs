@@ -15,6 +15,8 @@
 //! auth building blocks are covered by `crates/remote`'s own
 //! `github_auth.rs`/`github_client.rs` tests).
 
+use std::path::{Path, PathBuf};
+
 use assert_cmd::Command;
 
 mod common;
@@ -270,6 +272,26 @@ fn origin_share_withdraw_and_resolve_refuse_when_github_is_not_enabled() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("github.enabled"));
+
+    bin()
+        .args(["origin", "diff", "brand", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
+
+    bin()
+        .args([
+            "origin", "discard", "brand", "--path", "a.md", "--yes", "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("github.enabled"));
 }
 
 /// Isolated the same way as
@@ -336,6 +358,28 @@ fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("not registered"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["origin", "diff", "brand", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not registered"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "origin", "discard", "brand", "--path", "a.md", "--yes", "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("not registered"));
 }
 
 #[test]
@@ -351,19 +395,259 @@ fn origin_share_help_names_the_amend_and_file_flags() {
 }
 
 #[test]
-fn origin_discard_is_gone_and_withdraw_help_names_its_flags() {
+fn origin_diff_and_discard_help_name_their_flags() {
     bin()
-        .args(["origin", "discard", "brand", "--proposal", "1"])
+        .args(["origin", "diff", "--help"])
         .assert()
-        .failure()
-        .stderr(predicates::str::contains("unrecognized subcommand"));
-
+        .success()
+        .stdout(predicates::str::contains("--path"))
+        .stdout(predicates::str::contains("Show only this changed file"))
+        .stdout(predicates::str::contains("--json"));
+    bin()
+        .args(["origin", "discard", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--path"))
+        .stdout(predicates::str::contains("--yes"))
+        .stdout(predicates::str::contains("Skip the confirmation prompt"));
     bin()
         .args(["origin", "withdraw", "--help"])
         .assert()
         .success()
         .stdout(predicates::str::contains("--proposal"))
         .stdout(predicates::str::contains("--revert"));
+}
+
+// --- origin diff / origin discard --------------------------------------------
+
+/// A registered team domain whose origin state carries a base snapshot with
+/// a real base tree, written by hand where `<state_dir>/origins/<domain>/`
+/// puts it (the shape `hook.rs` seeds), so `origin diff` and `origin discard`
+/// have a team copy to compare with and restore from.
+fn write_diffable_team_domain(work: &Path, home: &Path, config: &Path) -> PathBuf {
+    let root = work.join("eng");
+    std::fs::create_dir_all(&root).unwrap();
+    let manifest = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- eng\n\n## When to Use\n\n- eng\n";
+    let team_alpha = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nthe team's line\n";
+    let my_alpha = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nmy line\n";
+    std::fs::write(root.join("MANIFEST.md"), manifest).unwrap();
+    std::fs::write(root.join("alpha.md"), my_alpha).unwrap();
+    std::fs::write(
+        root.join("new.md"),
+        team_alpha.replace("permalink: alpha", "permalink: new"),
+    )
+    .unwrap();
+    // The platform's isolated state dir, never `<home>/state/crystalline` by
+    // hand: that spelling is the unix answer and the wrong folder on Windows
+    // (see `common::isolated_state_dir`).
+    let origin_dir = common::isolated_state_dir(home).join("origins").join("eng");
+    std::fs::create_dir_all(origin_dir.join("base")).unwrap();
+    std::fs::write(origin_dir.join("base").join("MANIFEST.md"), manifest).unwrap();
+    std::fs::write(origin_dir.join("base").join("alpha.md"), team_alpha).unwrap();
+    let stamp = |text: &str| {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(text.as_bytes());
+        serde_json::json!({ "sha256": crystalline_index::hex_lower(&digest), "size": text.len() })
+    };
+    std::fs::write(
+        origin_dir.join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1, "repo": "acme/kb", "branch": "main", "base_commit": "abc",
+            "ref_etag": null, "last_checked": null,
+            "files": { "MANIFEST.md": stamp(manifest), "alpha.md": stamp(team_alpha) },
+            "proposals": [], "history": [], "conflicts": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        config,
+        format!(
+            "github:\n  enabled: true\ndomains:\n  eng:\n    path: {}\n    origin:\n      repo: acme/kb\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    root
+}
+
+#[test]
+fn origin_diff_prints_a_unified_diff_and_json_carries_both_sides() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    write_diffable_team_domain(work.path(), &home, &config);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args(["origin", "diff", "eng", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--- a/alpha.md (team)"))
+        .stdout(predicates::str::contains("+++ b/alpha.md (mine)"))
+        .stdout(predicates::str::contains("-the team's line"))
+        .stdout(predicates::str::contains("+my line"))
+        .stdout(predicates::str::contains("--- a/new.md (team)"))
+        .stdout(predicates::str::contains("+++ b/new.md (mine)"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .args([
+            "--json", "origin", "diff", "eng", "--path", "alpha.md", "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(data["mode"], "team");
+    let changes = data["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{data}");
+    assert_eq!(changes[0]["path"], "alpha.md");
+    assert_eq!(changes[0]["kind"], "modified");
+    assert!(
+        changes[0]["base"]
+            .as_str()
+            .unwrap()
+            .contains("the team's line")
+    );
+    assert!(changes[0]["current"].as_str().unwrap().contains("my line"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args(["origin", "diff", "eng", "--path", "nowhere.md", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "not among this domain's unshared changes",
+        ));
+}
+
+#[test]
+fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    let root = write_diffable_team_domain(work.path(), &home, &config);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args(["origin", "discard", "eng", "--path", "alpha.md", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("M alpha.md"))
+        .stdout(predicates::str::contains("restore the team's copy"))
+        .stderr(predicates::str::contains("not a terminal; pass --yes"));
+    assert!(
+        std::fs::read_to_string(root.join("alpha.md"))
+            .unwrap()
+            .contains("my line"),
+        "nothing moved"
+    );
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    // `alpha.md` is named twice: it is still one target, so the report
+    // names it restored exactly once, not twice.
+    cmd.args([
+        "origin",
+        "discard",
+        "eng",
+        "--path",
+        "alpha.md",
+        "--path",
+        "alpha.md",
+        "--path",
+        "new.md",
+        "--path",
+        "nowhere.md",
+        "--yes",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .success()
+    .stdout(predicates::str::contains("A new.md"))
+    .stdout(predicates::str::contains(
+        "nowhere.md  refused: not among this domain's unshared changes",
+    ))
+    .stdout(predicates::str::contains("restored: alpha.md").count(1))
+    .stdout(predicates::str::contains("deleted: new.md"))
+    .stdout(predicates::str::contains(
+        "refused: nowhere.md (unknown_path)",
+    ));
+    assert!(
+        std::fs::read_to_string(root.join("alpha.md"))
+            .unwrap()
+            .contains("the team's line")
+    );
+    assert!(!root.join("new.md").exists());
+
+    // Every named path refused: a non-zero exit, and the report says why.
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args([
+        "--json",
+        "origin",
+        "discard",
+        "eng",
+        "--path",
+        "nowhere.md",
+        "--yes",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stdout(predicates::str::contains("\"reason\":\"unknown_path\""));
+
+    // The same case in text mode: the engine is reached exactly as it is in
+    // JSON mode, and the refusal prints the same way it would for any other
+    // discard refusal, not as a special-cased CLI message.
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    cmd.args([
+        "origin",
+        "discard",
+        "eng",
+        "--path",
+        "nowhere.md",
+        "--yes",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stdout(predicates::str::contains(
+        "nowhere.md  refused: not among this domain's unshared changes",
+    ))
+    .stdout(predicates::str::contains(
+        "refused: nowhere.md (unknown_path)",
+    ));
 }
 
 // --- chain rendering, against a stand-in daemon ------------------------------
@@ -452,6 +736,58 @@ mod chain {
                 let mut write = stream;
                 let _ = writeln!(write, "{envelope}");
                 let _ = write.flush();
+            });
+            Daemon { dir, requests }
+        }
+
+        /// Bind the socket, write the owner record and answer each of
+        /// `envelopes` in order, one per connection: for a verb that opens
+        /// more than one ctl round trip, like `origin discard`'s preview
+        /// (`origin_changes`) followed by the discard itself
+        /// (`origin_discard`), where each call is its own `try_attach`.
+        /// Requests are recorded in the same order the envelopes answer them,
+        /// so `request()` called once per envelope reads them back in order.
+        fn serving_sequence(tag: &str, envelopes: Vec<Value>) -> Daemon {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = PathBuf::from("/tmp").join(format!("cq-chain-{tag}-{nanos}"));
+            let state = dir.join("state/crystalline");
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            std::fs::create_dir_all(dir.join("cache")).unwrap();
+
+            let sock = state.join("service.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let record = json!({
+                "pid": std::process::id(),
+                "socket_path": sock.display().to_string(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "started_at": "2026-08-27T00:00:00Z",
+            });
+            std::fs::write(state.join("service.json"), record.to_string()).unwrap();
+
+            let (tx, requests) = channel();
+            std::thread::spawn(move || {
+                for envelope in envelopes {
+                    let Ok((stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut mode = String::new();
+                    let mut line = String::new();
+                    if reader.read_line(&mut mode).is_err() || reader.read_line(&mut line).is_err()
+                    {
+                        return;
+                    }
+                    if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
+                        let _ = tx.send(request);
+                    }
+                    let mut write = stream;
+                    let _ = writeln!(write, "{envelope}");
+                    let _ = write.flush();
+                }
             });
             Daemon { dir, requests }
         }
@@ -710,6 +1046,151 @@ mod chain {
         let out = daemon.run(&["origin", "withdraw", "brand", "--proposal", "7"]);
         assert!(out.contains("stack dissolved"), "{out}");
         assert!(!out.contains("now stack"), "{out}");
+    }
+
+    /// `origin diff` is one ctl round trip: `origin_changes` with no `path`
+    /// and `sides: true` (a diff always wants both texts), and `--json`
+    /// prints exactly what the daemon answered.
+    #[test]
+    fn diff_over_the_daemon_sends_domain_and_sides_and_prints_the_answer() {
+        let daemon = Daemon::answering(
+            "diff",
+            json!({
+                "domain": "brand",
+                "mode": "team",
+                "changes": [
+                    {
+                        "path": "notes/a.md",
+                        "kind": "modified",
+                        "sha": "deadbeef",
+                        "size_before": 10,
+                        "size_after": 12,
+                        "binary": false,
+                        "engram": true,
+                        "base": "old text\n",
+                        "current": "new text\n",
+                        "too_large": false,
+                    }
+                ],
+                "skipped_large": [],
+            }),
+        );
+        let out = daemon.run(&["--json", "origin", "diff", "brand"]);
+        let request = daemon.request();
+        assert_eq!(request["cmd"], "origin_changes");
+        assert_eq!(request["domain"], "brand");
+        assert!(request["path"].is_null(), "{request}");
+        assert_eq!(request["sides"], true);
+        assert!(out.contains("\"mode\":\"team\""), "{out}");
+        assert!(out.contains("\"path\":\"notes/a.md\""), "{out}");
+        assert!(out.contains("\"current\":\"new text\\n\""), "{out}");
+    }
+
+    /// `origin discard` is two ctl round trips over two separate
+    /// connections: the preview (`origin_changes`, no `path`, `sides:
+    /// false`) and then the discard itself (`origin_discard`, carrying the
+    /// digest the preview answered for the named path). `--json` prints
+    /// exactly the daemon's discard report.
+    #[test]
+    fn discard_over_the_daemon_previews_then_posts_the_previewed_digest() {
+        let daemon = Daemon::serving_sequence(
+            "discard",
+            vec![
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "mode": "team",
+                    "changes": [
+                        {
+                            "path": "a.md",
+                            "kind": "modified",
+                            "sha": "cafefeed",
+                            "size_before": 5,
+                            "size_after": 7,
+                            "binary": false,
+                            "engram": true,
+                        }
+                    ],
+                    "skipped_large": [],
+                }}),
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "restored": ["a.md"],
+                    "deleted": [],
+                    "cleared": [],
+                    "refused": [],
+                    "reindexed": 1,
+                }}),
+            ],
+        );
+        let out = daemon.run(&[
+            "--json", "origin", "discard", "brand", "--path", "a.md", "--yes",
+        ]);
+        let preview_request = daemon.request();
+        assert_eq!(preview_request["cmd"], "origin_changes");
+        assert_eq!(preview_request["domain"], "brand");
+        assert!(preview_request["path"].is_null(), "{preview_request}");
+        assert_eq!(preview_request["sides"], false);
+
+        let discard_request = daemon.request();
+        assert_eq!(discard_request["cmd"], "origin_discard");
+        assert_eq!(discard_request["domain"], "brand");
+        assert_eq!(
+            discard_request["targets"],
+            json!([{ "path": "a.md", "sha": "cafefeed" }])
+        );
+        assert!(out.contains("\"restored\":[\"a.md\"]"), "{out}");
+    }
+
+    /// A path named twice on the command line is one target, pinned where
+    /// the duplicate would otherwise be visible: the request the stand-in
+    /// daemon records. A stdout assertion cannot pin this reliably (the
+    /// engine's changed-since guard refuses a second, now-stale copy of the
+    /// same target after the first one restores the file, so `restored:
+    /// alpha.md` prints once either way); the posted `targets` array is the
+    /// only place the duplicate would actually show up before the dedupe.
+    #[test]
+    fn discard_over_the_daemon_posts_one_target_for_a_path_named_twice() {
+        let daemon = Daemon::serving_sequence(
+            "discard-dup",
+            vec![
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "mode": "team",
+                    "changes": [
+                        {
+                            "path": "a.md",
+                            "kind": "modified",
+                            "sha": "cafefeed",
+                            "size_before": 5,
+                            "size_after": 7,
+                            "binary": false,
+                            "engram": true,
+                        }
+                    ],
+                    "skipped_large": [],
+                }}),
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "restored": ["a.md"],
+                    "deleted": [],
+                    "cleared": [],
+                    "refused": [],
+                    "reindexed": 1,
+                }}),
+            ],
+        );
+        daemon.run(&[
+            "--json", "origin", "discard", "brand", "--path", "a.md", "--path", "a.md", "--yes",
+        ]);
+        // The preview.
+        daemon.request();
+        let discard_request = daemon.request();
+        assert_eq!(discard_request["cmd"], "origin_discard");
+        assert_eq!(
+            discard_request["targets"],
+            json!([{ "path": "a.md", "sha": "cafefeed" }]),
+            "a.md named twice must still post as one target"
+        );
     }
 
     /// The status payload for a domain: `open` open proposals in chain order

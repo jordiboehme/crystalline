@@ -1,12 +1,12 @@
 /**
- * The three rules the share dialog's checkboxes run on, tested where they
- * live rather than through the dialog: which paths are generated listings,
- * which listings a selection drags along, and which boxes open ticked.
+ * The two rules the share dialog's checkboxes run on, tested where they live
+ * rather than through the dialog: which paths are generated listings, and
+ * which boxes open ticked.
  *
  * The dialog's own tests pin the wiring - that a tick reaches the request and
  * a hint reaches the screen. These pin the arithmetic behind them, which is
- * where the edge cases are: a deletion nobody is attributed for, a delta with
- * no authors in it at all, a folder whose last file was just unticked.
+ * where the edge cases are: a deletion nobody is attributed for, and a delta
+ * with no authors in it at all.
  */
 
 import { describe, expect, it } from "vitest";
@@ -16,7 +16,6 @@ import {
   isFolderIndex,
   ownedPhrase,
   preselect,
-  ridingIndexes,
   shareBadgeCount,
 } from "./changes";
 
@@ -26,7 +25,7 @@ function change(
   lastAuthor: string | null = null,
   kind = "modified",
 ): ShareChange {
-  return { path, kind, lastAuthor };
+  return { path, kind, lastAuthor, sha: null };
 }
 
 describe("folder listings", () => {
@@ -36,34 +35,6 @@ describe("folder listings", () => {
     expect(isFolderIndex("notes/deep/index.md")).toBe(true);
     expect(isFolderIndex("notes/indexes.md")).toBe(false);
     expect(isFolderIndex("index.md.bak")).toBe(false);
-  });
-
-  it("carries every listing while everything is ticked", () => {
-    const changes = [
-      change("notes/a.md"),
-      change("guides/g.md"),
-      change("index.md"),
-      change("notes/index.md"),
-      change("guides/index.md"),
-    ];
-    const all = new Set(["notes/a.md", "guides/g.md"]);
-    // No file list goes over the wire at all in this shape, so the share is
-    // the whole delta and the count is the delta's own.
-    expect(ridingIndexes(changes, all)).toBe(3);
-  });
-
-  it("carries only the chosen files' own folders once something is unticked", () => {
-    const changes = [
-      change("notes/a.md"),
-      change("guides/g.md"),
-      change("index.md"),
-      change("notes/index.md"),
-      change("guides/index.md"),
-    ];
-    expect(ridingIndexes(changes, new Set(["notes/a.md"]))).toBe(1);
-    // And nothing at all when the selection is empty: there is no folder for
-    // a listing to belong to.
-    expect(ridingIndexes(changes, new Set())).toBe(0);
   });
 });
 

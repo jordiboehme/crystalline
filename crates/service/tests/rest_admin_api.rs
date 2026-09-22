@@ -755,6 +755,330 @@ async fn the_share_routes_walk_the_loop() {
     assert_eq!(withdrawn["closed"], true);
 }
 
+/// The offline list and detail are served with no GitHub connection and on
+/// a read-only instance: nothing here pulls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_change_list_and_detail_are_served_offline_and_read_only() {
+    for read_only in [false, true] {
+        let fx = serve(Options {
+            github: true,
+            origin_domain: true,
+            read_only,
+            ..Options::default()
+        })
+        .await;
+        let admin = login(fx.addr, "root", "rootpw").await;
+        let list = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/kb/changes",
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            list.status(),
+            200,
+            "read_only={read_only}: {}",
+            list.text().await.unwrap()
+        );
+        let list: serde_json::Value = list.json().await.unwrap();
+        assert_eq!(list["mode"], "team");
+        // The fixture's base snapshot is empty, so the MANIFEST reads as new.
+        assert_eq!(list["changes"][0]["path"], "MANIFEST.md", "{list}");
+        assert_eq!(list["changes"][0]["kind"], "added");
+        assert_eq!(list["changes"][0]["engram"]["permalink"], "manifest");
+        assert!(list["changes"][0]["sha"].as_str().is_some());
+
+        let detail = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/kb/changes/MANIFEST.md",
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(detail.status(), 200);
+        let detail: serde_json::Value = detail.json().await.unwrap();
+        assert!(
+            detail["base"].is_null(),
+            "an addition has no base side: {detail}"
+        );
+        assert!(detail["current"].as_str().unwrap().contains("# kb"));
+        assert_eq!(detail["too_large"], false);
+
+        let missing = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/kb/changes/nowhere.md",
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(missing.status(), 404);
+        let plain = as_session(
+            fx.addr,
+            reqwest::Method::GET,
+            "/api/v1/domains/eng/changes",
+            &admin,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            plain.status(),
+            404,
+            "a domain with no origin has no changes"
+        );
+    }
+}
+
+/// Discarding restores the base copy, refuses a stale digest beside it, and
+/// the index follows the file; the detail payload names the change first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discard_restores_the_teams_copy_and_reindexes_it() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    let edited = b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nA sharper rule.\n";
+    // The mock commit's own `shared.md` literal (`serve_team_with_mock_sharing`),
+    // reused here to compute its byte length rather than hard-coding a value
+    // that would silently drift if the fixture literal ever moves.
+    let original_shared: &[u8] = b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nA rule the team agreed on.\n";
+    std::fs::write(kb_root.join("shared.md"), edited).unwrap();
+    std::fs::write(kb_root.join("new.md"), b"---\ntype: engram\ntitle: New\npermalink: new\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nNew.\n").unwrap();
+    std::fs::write(kb_root.join("logo.png"), b"\x89PNG\r\n\x1a\n\x00").unwrap();
+    // The watcher is not running in this harness: sync so the detail read
+    // sees the edit.
+    as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+
+    let page: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/engrams/shared",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(page["local_change"], "modified", "{page}");
+    let fresh: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/engrams/new",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(fresh["local_change"], "added", "{fresh}");
+    let direct: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/engrams/alpha",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(direct.get("local_change").is_none(), "{direct}");
+
+    let list: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/changes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let by_path = |p: &str| {
+        list["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"] == p)
+            .cloned()
+            .unwrap()
+    };
+    let png = by_path("logo.png");
+    assert_eq!(png["binary"], true, "{png}");
+    assert_eq!(png["size_after"], 9);
+    let png_detail: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/changes/logo.png",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        png_detail["current"].is_null() && png_detail["base"].is_null(),
+        "{png_detail}"
+    );
+    assert_eq!(png_detail["size_after"], 9);
+    let shared = by_path("shared.md");
+    assert_eq!(shared["size_before"], original_shared.len(), "{shared}");
+
+    let report = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains/kb/changes/discard", &admin)
+        .json(&serde_json::json!({ "paths": [
+            { "path": "shared.md", "sha": shared["sha"] },
+            { "path": "new.md", "sha": "0000000000000000000000000000000000000000000000000000000000000000" },
+        ]}))
+        .send().await.unwrap();
+    assert_eq!(report.status(), 200, "{}", report.text().await.unwrap());
+    let report: serde_json::Value = report.json().await.unwrap();
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["shared.md"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["refused"],
+        serde_json::json!([{ "path": "new.md", "reason": "changed_since" }])
+    );
+    assert_eq!(report["reindexed"], 1);
+    assert!(
+        std::fs::read_to_string(kb_root.join("shared.md"))
+            .unwrap()
+            .contains("A rule the team agreed on.")
+    );
+    assert!(kb_root.join("new.md").exists());
+    let page: serde_json::Value = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/engrams/shared",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        page["content"].as_str().unwrap().contains("agreed on"),
+        "the index followed the file: {page}"
+    );
+    assert!(page.get("local_change").is_none(), "{page}");
+
+    let empty = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/changes/discard",
+        &admin,
+    )
+    .json(&serde_json::json!({ "paths": [] }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        empty.status(),
+        422,
+        "an empty list is a request that asks for nothing"
+    );
+}
+
+/// The discard is a write: refused read-only, refused to a viewer, and it
+/// needs the CSRF token like every mutating route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discard_is_gated_like_every_write() {
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let body = serde_json::json!({ "paths": [{ "path": "MANIFEST.md", "sha": null }] });
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/changes/discard",
+        &admin,
+    )
+    .json(&body)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 403, "read-only refuses the discard");
+
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/changes/discard",
+        &vera,
+    )
+    .json(&body)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        refused.status(),
+        403,
+        "a viewer may read the list and not discard"
+    );
+    let list = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/changes",
+        &vera,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), 200, "the list needs domain read only");
+
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let no_token = client()
+        .post(format!(
+            "http://{}/api/v1/domains/kb/changes/discard",
+            fx.addr
+        ))
+        .header("cookie", format!("fluid_session={}", admin.0))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_token.status(), 403, "no csrf header, no discard");
+}
+
 /// One engram into the registered domain's working tree, so there is
 /// something for the next share to carry.
 fn write_kb_engram(kb_root: &std::path::Path, file: &str, title: &str, permalink: &str) {

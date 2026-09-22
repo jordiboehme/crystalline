@@ -59,10 +59,11 @@ pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use client::{
     collect_orphaned_domains, configure, ctl_if_running, ctl_if_running_passive, ctl_required,
-    domain_export, domain_import, domain_remove, domain_review, origin_add, origin_resolve,
-    origin_share, origin_status, origin_update, origin_withdraw, run_mcp, run_tool,
-    scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
+    domain_export, domain_import, domain_remove, domain_review, origin_add, origin_changes,
+    origin_discard, origin_resolve, origin_share, origin_status, origin_update, origin_withdraw,
+    run_mcp, run_tool, scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
+pub use crystalline_remote::ops::DiscardTarget;
 pub use daemon::run_serve;
 pub use engine::{
     ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, ShareActor,
@@ -77,7 +78,9 @@ pub use mcp::McpServer;
 pub use mcp_gate::{
     MCP_AUTH_REQUIRED, MCP_SESSION_IDENTITY_MISMATCH, McpGate, McpIdentity, SessionOwners,
 };
-pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
+pub use origin::{
+    MAX_DIFF_TEXT_BYTES, UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work,
+};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
 pub use review::{FoldChoice, ReviewModeConfirm};
 pub use scope::{DomainAccess, DomainRight, DomainVisibility, Scope, overlay_actor};

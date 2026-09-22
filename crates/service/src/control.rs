@@ -5,7 +5,8 @@
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! file_stamps, collect_orphaned_domains, sessions, tool, configure, origin_add,
 //! origin_update, origin_status,
-//! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
+//! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
+//! provision, forget_domain,
 //! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
@@ -18,6 +19,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+use crystalline_remote::ops::DiscardTarget;
 
 use crate::daemon::Shared;
 use crate::engine::{ConfigureAction, EmbedOutcome, Engine, ShareActor};
@@ -424,9 +427,13 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             // Absent reads as false: a client from before detail existed asks
             // for the counts it already knew how to render.
             let detail = req.get("detail").and_then(Value::as_bool).unwrap_or(false);
+            // And the same for `diff`, which is newer still: absent reads as
+            // false, so a client from before both sides were readable asks for
+            // exactly what it always asked for.
+            let diff = req.get("diff").and_then(Value::as_bool).unwrap_or(false);
             match shared
                 .engine
-                .origin_status(domain, detail, &crate::scope::Scope::Unrestricted)
+                .origin_status(domain, detail, diff, &crate::scope::Scope::Unrestricted)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -479,6 +486,49 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             match shared
                 .engine
                 .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // The offline change list of one domain, optionally with both sides
+        // of every entry inlined (the CLI's diff), optionally narrowed to one
+        // path. Never pulls.
+        "origin_changes" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let path = req.get("path").and_then(Value::as_str);
+            let sides = req.get("sides").and_then(Value::as_bool).unwrap_or(false);
+            match origin_changes_inline(&shared.engine, domain, path, sides).await {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Put named paths back the way the team has them; the machine owner
+        // discards, as the machine owner shares.
+        "origin_discard" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let targets: Vec<DiscardTarget> = match req.get("targets").and_then(Value::as_array) {
+                Some(items) => items
+                    .iter()
+                    .filter_map(|t| {
+                        let path = t.get("path").and_then(Value::as_str)?.to_string();
+                        let sha256 = t.get("sha").and_then(Value::as_str).map(str::to_string);
+                        Some(DiscardTarget { path, sha256 })
+                    })
+                    .collect(),
+                None => {
+                    return (
+                        envelope_err(
+                            "invalid targets: expected an array of { path, sha }".to_string(),
+                        ),
+                        false,
+                    );
+                }
+            };
+            match shared
+                .engine
+                .discard_local_changes(domain, &targets, &ShareActor::Owner)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -562,11 +612,45 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
                  domain_remove, retag, collect_orphaned_domains, \
                  configure, origin_add, origin_update, origin_status, origin_share, \
-                 origin_withdraw, origin_resolve, provision, forget_domain or shutdown"
+                 origin_withdraw, origin_changes, origin_discard, origin_resolve, provision, \
+                 forget_domain or shutdown"
             )),
             false,
         ),
     }
+}
+
+/// The change list of `domain` as the CLI reads it: `Engine::local_changes`,
+/// narrowed to `path` when one is named (a path not among the changes is
+/// the engine's own not-found), and with `Engine::local_change`'s two texts
+/// inlined per entry when `sides` is asked for. Uncapped: this is the CLI's
+/// surface, and a pager is where a megabyte of prose belongs.
+///
+/// The inlined form is read through `Engine::local_changes_detailed` rather
+/// than asked for per path, so the whole answer costs one detection walk
+/// however many files differ.
+pub(crate) async fn origin_changes_inline(
+    engine: &Engine,
+    domain: &str,
+    path: Option<&str>,
+    sides: bool,
+) -> crate::engine::Result<Value> {
+    if let Some(path) = path {
+        let mut listed = engine.local_changes(domain, &ShareActor::Owner).await?;
+        // Resolved through the detail, which is what refuses an unknown path
+        // by name; the list is then exactly that one entry.
+        let one = engine
+            .local_change(domain, path, &ShareActor::Owner, None)
+            .await?;
+        listed["changes"] = json!([one]);
+        return Ok(listed);
+    }
+    if sides {
+        return engine
+            .local_changes_detailed(domain, &ShareActor::Owner)
+            .await;
+    }
+    engine.local_changes(domain, &ShareActor::Owner).await
 }
 
 /// Run a background-equivalent embed pass and record the count on the response.

@@ -769,6 +769,145 @@ pub(crate) fn print_origin_withdraw(data: &serde_json::Value, json: bool) {
     }
 }
 
+/// A size a person reads: bytes up to a kilobyte, then one decimal until
+/// ten, whole above, in KB and MB.
+pub(crate) fn human_size(bytes: u64) -> String {
+    let kb = bytes as f64 / 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let (value, unit) = if kb < 1024.0 {
+        (kb, "KB")
+    } else {
+        (kb / 1024.0, "MB")
+    };
+    if value < 10.0 {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{} {unit}", value.round() as u64)
+    }
+}
+
+/// `origin diff`: one unified diff per changed path, in path order, with the
+/// sides named; a binary change and a withheld side print one line each.
+pub(crate) fn print_origin_diff(domain: &str, data: &serde_json::Value, json: bool) {
+    if json {
+        println!("{data}");
+        return;
+    }
+    let empty = Vec::new();
+    let changes = data["changes"].as_array().unwrap_or(&empty);
+    if changes.is_empty() {
+        println!("Nothing has changed in {domain}.");
+        return;
+    }
+    for change in changes {
+        let path = change["path"].as_str().unwrap_or("");
+        let kind = change["kind"].as_str().unwrap_or("");
+        let before = change["size_before"].as_u64();
+        let after = change["size_after"].as_u64();
+        if change["binary"].as_bool().unwrap_or(false) {
+            let sizes = match (before, after) {
+                (Some(b), Some(a)) => format!("{} to {}", human_size(b), human_size(a)),
+                (None, Some(a)) => human_size(a),
+                (Some(b), None) => human_size(b),
+                (None, None) => String::new(),
+            };
+            println!("{path}: {kind}, {sizes}");
+            continue;
+        }
+        let base = change["base"].as_str().unwrap_or("");
+        let current = change["current"].as_str().unwrap_or("");
+        let diff = similar::TextDiff::from_lines(base, current);
+        print!(
+            "{}",
+            diff.unified_diff()
+                .context_radius(3)
+                .header(&format!("a/{path} (team)"), &format!("b/{path} (mine)"))
+        );
+    }
+}
+
+/// `origin discard`'s preview: one line per named path saying what the
+/// discard would do, and the `(path, sha)` targets for the ones that are
+/// changes. Unknown paths print as refused and are not among the targets.
+pub(crate) fn print_discard_preview(
+    listed: &serde_json::Value,
+    paths: &[String],
+    json: bool,
+) -> Vec<(String, Option<String>)> {
+    let empty = Vec::new();
+    let changes = listed["changes"].as_array().unwrap_or(&empty);
+    let mut targets = Vec::new();
+    for path in paths {
+        let Some(change) = changes
+            .iter()
+            .find(|c| c["path"].as_str() == Some(path.as_str()))
+        else {
+            if !json {
+                println!("{path}  refused: not among this domain's unshared changes");
+            }
+            continue;
+        };
+        let sha = change["sha"].as_str().map(str::to_string);
+        if !json {
+            let before = change["size_before"].as_u64();
+            let after = change["size_after"].as_u64();
+            let line = match change["kind"].as_str().unwrap_or("") {
+                "added" => format!(
+                    "A {path}  {}  delete",
+                    after.map(human_size).unwrap_or_default()
+                ),
+                "modified" => format!(
+                    "M {path}  {} -> {}  restore the team's copy",
+                    before.map(human_size).unwrap_or_default(),
+                    after.map(human_size).unwrap_or_default()
+                ),
+                "deleted" => format!(
+                    "D {path}  {}  restore the team's copy",
+                    before.map(human_size).unwrap_or_default()
+                ),
+                other => format!("{other} {path}"),
+            };
+            println!("{line}");
+        }
+        targets.push((path.clone(), sha));
+    }
+    targets
+}
+
+/// Print `origin discard`'s report; true when at least one path was acted on.
+pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool {
+    let empty = Vec::new();
+    let acted = data["restored"].as_array().unwrap_or(&empty).len()
+        + data["deleted"].as_array().unwrap_or(&empty).len()
+        + data["cleared"].as_array().unwrap_or(&empty).len();
+    if json {
+        println!("{data}");
+        return acted > 0;
+    }
+    for p in data["restored"].as_array().unwrap_or(&empty) {
+        println!("restored: {}", p.as_str().unwrap_or(""));
+    }
+    for p in data["deleted"].as_array().unwrap_or(&empty) {
+        println!("deleted: {}", p.as_str().unwrap_or(""));
+    }
+    for p in data["cleared"].as_array().unwrap_or(&empty) {
+        println!("cleared: {}", p["path"].as_str().unwrap_or(""));
+    }
+    for p in data["refused"].as_array().unwrap_or(&empty) {
+        println!(
+            "refused: {} ({})",
+            p["path"].as_str().unwrap_or(""),
+            p["reason"].as_str().unwrap_or("")
+        );
+    }
+    if let Some(n) = data["reindexed"].as_u64().filter(|n| *n > 0) {
+        println!("re-indexed {n} file(s)");
+    }
+    acted > 0
+}
+
 /// Print `origin resolve`'s result: the resolved path and how many
 /// conflicts remain open.
 pub(crate) fn print_origin_resolve(data: &serde_json::Value, json: bool) {

@@ -19,6 +19,7 @@ use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, Caller, ProblemDetail, RestState, refuse_read_only,
     require_domain_read, require_domain_write,
 };
+use crate::DiscardTarget;
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
 use crate::review::{FoldChoice, ReviewModeConfirm};
 use crate::scope::DomainRight;
@@ -981,7 +982,7 @@ pub async fn sync_status(
     require_team_domain(&state, &domain, Refusal::Missing)?;
     let aggregate = state
         .engine
-        .origin_status(Some(&domain), false, &identity.scope())
+        .origin_status(Some(&domain), false, false, &identity.scope())
         .await?;
     // Lifted before `single_domain` takes the per-domain entry, which is all
     // that survives of the aggregate.
@@ -1157,7 +1158,7 @@ pub async fn sync_summary(
     }
     let aggregate = state
         .engine
-        .origin_status(None, false, &identity.scope())
+        .origin_status(None, false, false, &identity.scope())
         .await?;
     // This one route enumerates domains rather than addressing one, and a team
     // domain the caller may not see must be absent from the rows AND from the
@@ -2108,6 +2109,224 @@ pub async fn resolve_conflict(
             )
             .await?,
     ))
+}
+
+/// `GET /domains/{domain}/changes` - every unshared change, offline.
+///
+/// The sibling of `/sync/changes` that never pulls: the working tree against
+/// the base this machine already holds, or in review mode the caller's own
+/// drafts against the folder. Served read-only and without a GitHub
+/// connection for that reason, and gated on domain READ rather than the
+/// share role: looking is not sharing.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/changes",
+    tag = "domains",
+    operation_id = "list_domain_changes",
+    summary = "List a team domain's unshared changes, offline.",
+    description = "Any caller who may read the domain. Compares the working \
+                   tree with the base snapshot this machine holds - or, in a \
+                   domain that reviews changes, the caller's own drafts with \
+                   the folder - and names every file that differs with its \
+                   kind (`added`, `modified`, `deleted`), the SHA-256 of its \
+                   current content (`sha`, null for a deletion), both sizes, \
+                   whether either side is binary, and the engram it holds. \
+                   Generated folder listings never appear. Never pulls and \
+                   never contacts GitHub, so it is served on a read-only \
+                   instance and with no connection; `mode` says `team` or \
+                   `review`, and an anonymous reader of a reviewing domain \
+                   gets an empty list.",
+    params(("domain" = String, Path, description = "The registered team domain.")),
+    responses(
+        (
+            status = 200,
+            description = "The changes, sorted by path, and the files too large to share.",
+            body = Object,
+            example = json!({
+                "domain": "kb",
+                "mode": "team",
+                "changes": [
+                    { "path": "notes/a.md", "kind": "modified", "sha": "9f2c", "size_before": 1204, "size_after": 1388, "binary": false, "engram": { "permalink": "notes/a", "title": "A sharper rule" } },
+                    { "path": "notes/old.md", "kind": "deleted", "sha": null, "size_before": 880, "size_after": null, "binary": false, "engram": { "permalink": "notes/old", "title": "Old" } }
+                ],
+                "skipped_large": []
+            }),
+        ),
+        (status = 401, description = "No identity.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 404, description = "No such domain, none this caller may see, or one with no team origin.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 409, description = "GitHub is switched off on this instance.", body = ProblemDetail, content_type = "application/problem+json"),
+    ),
+)]
+pub async fn list_domain_changes(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_read(&state, &identity, &domain).await?;
+    require_team_domain(&state, &domain, Refusal::Missing)?;
+    Ok(Json(
+        state
+            .engine
+            .local_changes(&domain, &change_actor(&identity))
+            .await?,
+    ))
+}
+
+/// `GET /domains/{domain}/changes/{*path}` - both sides of one change.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/changes/{path}",
+    tag = "domains",
+    operation_id = "get_domain_change",
+    summary = "Both sides of one unshared change.",
+    description = "Any caller who may read the domain. The team's copy \
+                   (`base`, null for an addition) and this machine's or the \
+                   caller's draft (`current`, null for a deletion) as text, \
+                   beside the row the list reports. A binary file carries \
+                   null texts and its sizes; a text side above 1 MiB is \
+                   withheld with `too_large` true. 404 for a path that is not \
+                   among the domain's unshared changes.",
+    params(
+        ("domain" = String, Path, description = "The registered team domain."),
+        ("path" = String, Path, description = "The domain-relative path, as the list reported it."),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The change with both texts.",
+            body = Object,
+            example = json!({ "domain": "kb", "path": "notes/a.md", "kind": "modified", "sha": "9f2c", "binary": false, "size_before": 1204, "size_after": 1388, "base": "---\ntitle: A\n---\n\nthe old rule\n", "current": "---\ntitle: A\n---\n\nthe sharper rule\n", "too_large": false, "engram": { "permalink": "notes/a", "title": "A" } }),
+        ),
+        (status = 401, description = "No identity.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 404, description = "No such domain, or a path that is not among its unshared changes.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 409, description = "GitHub is switched off on this instance.", body = ProblemDetail, content_type = "application/problem+json"),
+    ),
+)]
+pub async fn get_domain_change(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, path)): ApiPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_read(&state, &identity, &domain).await?;
+    require_team_domain(&state, &domain, Refusal::Missing)?;
+    Ok(Json(
+        state
+            .engine
+            .local_change(
+                &domain,
+                &path,
+                &change_actor(&identity),
+                Some(crate::origin::MAX_DIFF_TEXT_BYTES),
+            )
+            .await?,
+    ))
+}
+
+/// One path a discard names, with the digest the caller looked at.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct DiscardTargetBody {
+    /// The domain-relative path, as the list reported it.
+    #[schema(example = "notes/a.md")]
+    pub path: String,
+    /// The `sha` the list reported for it: the current content's digest for
+    /// an addition or a modification, null for a deletion. A file that no
+    /// longer hashes to it is refused as `changed_since`.
+    #[serde(default)]
+    #[schema(example = "9f2c")]
+    pub sha: Option<String>,
+}
+
+/// What `POST /domains/{domain}/changes/discard` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(
+    description = "The paths to put back the way the team has them, each with the digest the caller looked at. Must name at least one."
+)]
+pub struct DiscardBody {
+    pub paths: Vec<DiscardTargetBody>,
+}
+
+/// `POST /domains/{domain}/changes/discard` - put chosen paths back.
+///
+/// A write to the working tree (or a clear of the caller's drafts), so a
+/// read-only instance refuses it and it needs domain WRITE; never a write to
+/// the origin, so no connection is needed and no share role either.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/changes/discard",
+    tag = "domains",
+    operation_id = "discard_domain_changes",
+    summary = "Discard chosen unshared changes.",
+    description = "An editor or an admin with write access to the domain. \
+                   Each named path is put back the way the team has it: a \
+                   modification gets the team's copy back, an addition is \
+                   deleted, a deletion is restored, and in a domain that \
+                   reviews changes the caller's own draft of the path is \
+                   cleared. The index is updated at once. Always 200 once \
+                   the body parses: refusals are per path, under `refused` \
+                   with a reason - `changed_since` (the file moved since the \
+                   digest was read), `not_a_change`, `no_base_copy` (an open \
+                   proposal below the top layer holds the earlier content; \
+                   withdraw that layer), `unknown_path`, `open_in_editor` (a \
+                   draft somebody has open). Never contacts GitHub; refused on \
+                   a read-only instance.",
+    params(("domain" = String, Path, description = "The registered team domain.")),
+    request_body = DiscardBody,
+    responses(
+        (
+            status = 200,
+            description = "What happened to each path.",
+            body = Object,
+            example = json!({ "domain": "kb", "restored": ["notes/a.md"], "deleted": ["notes/new.md"], "cleared": [], "refused": [{ "path": "notes/b.md", "reason": "changed_since" }], "reindexed": 2 }),
+        ),
+        (status = 401, description = "No identity, or an anonymous one.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 403, description = "A viewer, a membership below editor, or a read-only instance.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 404, description = "No such domain, or none this caller may see.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 409, description = "Not a team domain, or GitHub is switched off on this instance.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 422, description = "An empty path list.", body = ProblemDetail, content_type = "application/problem+json"),
+    ),
+)]
+pub async fn discard_domain_changes(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<DiscardBody>,
+) -> Result<Json<Value>, ApiError> {
+    refuse_read_only(&state)?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
+    require_team_domain(&state, &domain, Refusal::Conflict)?;
+    if body.paths.is_empty() {
+        return Err(ApiError::unprocessable(
+            "paths must name at least one change to discard",
+        ));
+    }
+    let targets: Vec<DiscardTarget> = body
+        .paths
+        .into_iter()
+        .map(|t| DiscardTarget {
+            path: t.path,
+            sha256: t.sha,
+        })
+        .collect();
+    Ok(Json(
+        state
+            .engine
+            .discard_local_changes(
+                &domain,
+                &targets,
+                &ShareActor::Account(caller.name().to_string()),
+            )
+            .await?,
+    ))
+}
+
+/// Whose drafts a change read is about on this surface: the session's
+/// account, or nobody for the anonymous viewer, who holds no draft anywhere
+/// and is answered an empty list by the engine.
+fn change_actor(identity: &Identity) -> ShareActor {
+    match identity.scope() {
+        crate::scope::Scope::User { account, .. } => ShareActor::Account(account),
+        _ => ShareActor::HttpAgent,
+    }
 }
 
 /// How a sync endpoint refuses a domain that is not a team domain: the status
