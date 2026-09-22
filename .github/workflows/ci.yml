@@ -25,7 +25,8 @@ jobs:
   # that only ever exercise code are gated on this one.
   #
   # Documentation is the repository's prose, narrowly: root-level *.md, docs/**,
-  # assets/**, LICENSE* and markdown under .github/ outside the workflows.
+  # assets/**, LICENSE (with an optional .md or .txt) and markdown under
+  # .github/ outside the workflows.
   # Everything else is code, including Cargo.toml, Cargo.lock, fluid/package.json,
   # scripts/** and .github/workflows/** itself, because a workflow change has to
   # exercise itself. Markdown deeper in the tree is code too: skills/*/SKILL.md is
@@ -118,7 +119,9 @@ jobs:
               # README.md under .github/workflows/ still counts as code.
               .github/workflows/*) verdict=code ;;
               docs/*|assets/*)     verdict=docs ;;
-              LICENSE*)            verdict=docs ;;
+              # LICENSE and LICENSE.md and LICENSE.txt only. A bare LICENSE*
+              # would read a root file like LICENSE_KEYS.rs as prose.
+              LICENSE|LICENSE.md|LICENSE.txt) verdict=docs ;;
               .github/*.md)        verdict=docs ;;
               # Anything else in a subdirectory, markdown included.
               */*)                 verdict=code ;;
