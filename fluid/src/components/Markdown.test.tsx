@@ -19,7 +19,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { describe, expect, it, vi } from "vitest";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
@@ -87,6 +87,12 @@ async function renderMarkdown(
     expect(screen.queryByText("crystallizing")).toBeNull();
   });
   return result;
+}
+
+/** Where the router stands, for the tests that care what a click did to it. */
+function LocationProbe() {
+  const { search, hash } = useLocation();
+  return <span data-testid="location">{`${search}${hash}`}</span>;
 }
 
 describe("the markdown renderer", () => {
@@ -612,5 +618,88 @@ describe("section anchors", () => {
     } finally {
       scrolled.mockRestore();
     }
+  });
+
+  it("names the heading by its own text, with the control still reachable", async () => {
+    await renderMarkdown(SOURCE, undefined, undefined, undefined, {
+      pageUrl: PAGE,
+    });
+
+    // A button inside a heading joins the heading's computed name in a real
+    // browser, which would put "Link to this section" into every entry of a
+    // screen reader's heading list and into the document outline. The heading
+    // says what names it instead: a span around its own text and nothing else.
+    //
+    // Asserted through the wiring rather than through the computed name
+    // alone: this environment's name computation does not descend into the
+    // nested button, so the name reads correctly with or without the fix and
+    // would not notice it going away. What cannot be faked is the reference
+    // and what sits at the other end of it.
+    const heading = screen.getByRole("heading", { name: "Auth & Tokens" });
+    const labelledBy = heading.getAttribute("aria-labelledby");
+    expect(labelledBy).not.toBeNull();
+    const label = document.getElementById(labelledBy!);
+    expect(label?.textContent).toBe("Auth & Tokens");
+    expect(label?.querySelector("button")).toBeNull();
+    expect(heading).toHaveAccessibleName("Auth & Tokens");
+    // And the control keeps its own name, in the tab order, where it was.
+    expect(
+      screen.getAllByRole("button", { name: "Link to this section" }),
+    ).toHaveLength(3);
+  });
+
+  it("stops washing the heading it left when a second hash arrives", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn(() => Promise.resolve()) },
+      configurable: true,
+    });
+    const { container } = await renderMarkdown(
+      SOURCE,
+      undefined,
+      undefined,
+      undefined,
+      { pageUrl: PAGE },
+    );
+    const buttons = screen.getAllByRole("button", {
+      name: "Link to this section",
+    });
+
+    await userEvent.click(buttons[0]!);
+    expect(container.querySelector("#api")).toHaveClass("section-flash");
+
+    // The wash has to come off the one being left, not merely stop counting
+    // down: a reader who asked for reduced motion gets the tint with no fade,
+    // so a class left behind would stay on that heading for good.
+    await userEvent.click(buttons[2]!);
+    expect(container.querySelector("#api")).not.toHaveClass("section-flash");
+    expect(container.querySelector("#auth-tokens")).toHaveClass(
+      "section-flash",
+    );
+  });
+
+  it("keeps the page's query string when a link symbol is activated", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn(() => Promise.resolve()) },
+      configurable: true,
+    });
+    render(
+      <MemoryRouter initialEntries={["/x?tab=graph"]}>
+        <ThemeProvider>
+          <Markdown source={SOURCE} anchors={{ pageUrl: PAGE }} />
+          <LocationProbe />
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => {
+      expect(screen.queryByText("crystallizing")).toBeNull();
+    });
+
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Link to this section" })[0]!,
+    );
+
+    // The fragment is added to where the reader stands rather than replacing
+    // it: a page opened with a query string is still that page afterwards.
+    expect(screen.getByTestId("location")).toHaveTextContent("?tab=graph#api");
   });
 });

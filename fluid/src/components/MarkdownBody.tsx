@@ -38,6 +38,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -728,6 +729,7 @@ function SectionAnchorProvider({
   const [said, say] = useSaid();
   const [activeId, setActiveId] = useState<string | null>(null);
   const navigate = useNavigate();
+  const { search } = useLocation();
   const activate = useCallback(
     (id: string) => {
       setActiveId(id);
@@ -736,7 +738,11 @@ function SectionAnchorProvider({
       // through every heading they glanced at would be useless. The hash
       // landing in the location is what runs the arrival behaviour, so the
       // highlight on a click is the very same highlight as on arrival.
-      void navigate({ hash: `#${id}` }, { replace: true });
+      //
+      // The query string is carried along rather than left out: a partial
+      // destination REPLACES the parts it does not name, so naming only the
+      // hash would drop whatever the page was opened with.
+      void navigate({ search, hash: `#${id}` }, { replace: true });
       void (async () => {
         try {
           // `navigator.clipboard` is absent on an insecure or older context
@@ -749,7 +755,7 @@ function SectionAnchorProvider({
         }
       })();
     },
-    [navigate, pageUrl, say],
+    [navigate, pageUrl, say, search],
   );
   const state = useMemo(
     () => ({ pageUrl, said, activeId, activate }),
@@ -843,10 +849,26 @@ function heading(
     children?: ReactNode | undefined;
     id?: string | undefined;
   }) {
+    // Generated rather than derived from the slug: a heading literally called
+    // "Auth text" would collide with a `${slug}-text` spelling, and two
+    // elements sharing an id is a reference pointing at whichever came first.
+    const textId = useId();
+    if (!anchored || id === undefined) {
+      return (
+        <Tag id={id} className={className}>
+          {children}
+        </Tag>
+      );
+    }
     return (
-      <Tag id={id} className={className}>
-        {children}
-        {anchored && id !== undefined && <SectionLink id={id} />}
+      // The link symbol is a real button inside the heading, so without this
+      // the heading's own name would end in "Link to this section" - in the
+      // document outline and in every entry of a screen reader's heading
+      // list. Naming the heading by the span around its text leaves the
+      // button its own name and the tab order untouched.
+      <Tag id={id} className={className} aria-labelledby={textId}>
+        <span id={textId}>{children}</span>
+        <SectionLink id={id} />
       </Tag>
     );
   };
@@ -1007,6 +1029,11 @@ export default function MarkdownBody({
     }, SECTION_FLASH_MS);
     return () => {
       clearTimeout(timer);
+      // And take the wash off the heading being left. Under reduced motion the
+      // class IS a static background rather than a fade, so a second fragment
+      // arriving inside the window would otherwise leave the first heading
+      // highlighted for as long as the page stays open.
+      target.classList.remove(SECTION_FLASH_CLASS);
     };
   }, [anchored, hash, source]);
   const rendered = (
