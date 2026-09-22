@@ -566,10 +566,14 @@ fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
 
     let mut cmd = bin();
     isolate(&mut cmd, &home);
+    // `alpha.md` is named twice: it is still one target, so the report
+    // names it restored exactly once, not twice.
     cmd.args([
         "origin",
         "discard",
         "eng",
+        "--path",
+        "alpha.md",
         "--path",
         "alpha.md",
         "--path",
@@ -588,7 +592,7 @@ fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
     .stdout(predicates::str::contains(
         "nowhere.md  refused: not among this domain's unshared changes",
     ))
-    .stdout(predicates::str::contains("restored: alpha.md"))
+    .stdout(predicates::str::contains("restored: alpha.md").count(1))
     .stdout(predicates::str::contains("deleted: new.md"))
     .stdout(predicates::str::contains(
         "refused: nowhere.md (unknown_path)",
@@ -733,6 +737,58 @@ mod chain {
                 let mut write = stream;
                 let _ = writeln!(write, "{envelope}");
                 let _ = write.flush();
+            });
+            Daemon { dir, requests }
+        }
+
+        /// Bind the socket, write the owner record and answer each of
+        /// `envelopes` in order, one per connection: for a verb that opens
+        /// more than one ctl round trip, like `origin discard`'s preview
+        /// (`origin_changes`) followed by the discard itself
+        /// (`origin_discard`), where each call is its own `try_attach`.
+        /// Requests are recorded in the same order the envelopes answer them,
+        /// so `request()` called once per envelope reads them back in order.
+        fn serving_sequence(tag: &str, envelopes: Vec<Value>) -> Daemon {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = PathBuf::from("/tmp").join(format!("cq-chain-{tag}-{nanos}"));
+            let state = dir.join("state/crystalline");
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            std::fs::create_dir_all(dir.join("cache")).unwrap();
+
+            let sock = state.join("service.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let record = json!({
+                "pid": std::process::id(),
+                "socket_path": sock.display().to_string(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "started_at": "2026-08-27T00:00:00Z",
+            });
+            std::fs::write(state.join("service.json"), record.to_string()).unwrap();
+
+            let (tx, requests) = channel();
+            std::thread::spawn(move || {
+                for envelope in envelopes {
+                    let Ok((stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut mode = String::new();
+                    let mut line = String::new();
+                    if reader.read_line(&mut mode).is_err() || reader.read_line(&mut line).is_err()
+                    {
+                        return;
+                    }
+                    if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
+                        let _ = tx.send(request);
+                    }
+                    let mut write = stream;
+                    let _ = writeln!(write, "{envelope}");
+                    let _ = write.flush();
+                }
             });
             Daemon { dir, requests }
         }
@@ -991,6 +1047,99 @@ mod chain {
         let out = daemon.run(&["origin", "withdraw", "brand", "--proposal", "7"]);
         assert!(out.contains("stack dissolved"), "{out}");
         assert!(!out.contains("now stack"), "{out}");
+    }
+
+    /// `origin diff` is one ctl round trip: `origin_changes` with no `path`
+    /// and `sides: true` (a diff always wants both texts), and `--json`
+    /// prints exactly what the daemon answered.
+    #[test]
+    fn diff_over_the_daemon_sends_domain_and_sides_and_prints_the_answer() {
+        let daemon = Daemon::answering(
+            "diff",
+            json!({
+                "domain": "brand",
+                "mode": "team",
+                "changes": [
+                    {
+                        "path": "notes/a.md",
+                        "kind": "modified",
+                        "sha": "deadbeef",
+                        "size_before": 10,
+                        "size_after": 12,
+                        "binary": false,
+                        "engram": true,
+                        "base": "old text\n",
+                        "current": "new text\n",
+                        "too_large": false,
+                    }
+                ],
+                "skipped_large": [],
+            }),
+        );
+        let out = daemon.run(&["--json", "origin", "diff", "brand"]);
+        let request = daemon.request();
+        assert_eq!(request["cmd"], "origin_changes");
+        assert_eq!(request["domain"], "brand");
+        assert!(request["path"].is_null(), "{request}");
+        assert_eq!(request["sides"], true);
+        assert!(out.contains("\"mode\":\"team\""), "{out}");
+        assert!(out.contains("\"path\":\"notes/a.md\""), "{out}");
+        assert!(out.contains("\"current\":\"new text\\n\""), "{out}");
+    }
+
+    /// `origin discard` is two ctl round trips over two separate
+    /// connections: the preview (`origin_changes`, no `path`, `sides:
+    /// false`) and then the discard itself (`origin_discard`, carrying the
+    /// digest the preview answered for the named path). `--json` prints
+    /// exactly the daemon's discard report.
+    #[test]
+    fn discard_over_the_daemon_previews_then_posts_the_previewed_digest() {
+        let daemon = Daemon::serving_sequence(
+            "discard",
+            vec![
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "mode": "team",
+                    "changes": [
+                        {
+                            "path": "a.md",
+                            "kind": "modified",
+                            "sha": "cafefeed",
+                            "size_before": 5,
+                            "size_after": 7,
+                            "binary": false,
+                            "engram": true,
+                        }
+                    ],
+                    "skipped_large": [],
+                }}),
+                json!({ "v": 1, "ok": true, "data": {
+                    "domain": "brand",
+                    "restored": ["a.md"],
+                    "deleted": [],
+                    "cleared": [],
+                    "refused": [],
+                    "reindexed": 1,
+                }}),
+            ],
+        );
+        let out = daemon.run(&[
+            "--json", "origin", "discard", "brand", "--path", "a.md", "--yes",
+        ]);
+        let preview_request = daemon.request();
+        assert_eq!(preview_request["cmd"], "origin_changes");
+        assert_eq!(preview_request["domain"], "brand");
+        assert!(preview_request["path"].is_null(), "{preview_request}");
+        assert_eq!(preview_request["sides"], false);
+
+        let discard_request = daemon.request();
+        assert_eq!(discard_request["cmd"], "origin_discard");
+        assert_eq!(discard_request["domain"], "brand");
+        assert_eq!(
+            discard_request["targets"],
+            json!([{ "path": "a.md", "sha": "cafefeed" }])
+        );
+        assert!(out.contains("\"restored\":[\"a.md\"]"), "{out}");
     }
 
     /// The status payload for a domain: `open` open proposals in chain order

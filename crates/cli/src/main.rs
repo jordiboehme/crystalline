@@ -2484,6 +2484,14 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             if json && !yes {
                 anyhow::bail!("--json requires --yes");
             }
+            // A path named twice is one target: dedupe in order of first
+            // appearance before the preview, so it prints once, the
+            // confirmation counts it once and one target is posted.
+            let mut seen = std::collections::HashSet::new();
+            let paths: Vec<String> = paths
+                .into_iter()
+                .filter(|p| seen.insert(p.clone()))
+                .collect();
             // The preview is the list narrowed to the named paths, with the
             // digest each was read at: what the discard is then guarded by.
             let listed = crystalline_service::origin_changes(
