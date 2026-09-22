@@ -255,6 +255,14 @@ pub trait Provider: Send + Sync {
         force: bool,
     ) -> Result<(), RemoteError>;
 
+    /// The web address a person opens a commit at, or `None` on a forge with
+    /// no browser page for one. Pure: no network is reached. Defaults to
+    /// `None` so a provider with no page to name needs no line; the GitHub
+    /// provider derives it from its API base.
+    fn commit_url(&self, _origin: &OriginSpec, _sha: &str) -> Option<String> {
+        None
+    }
+
     /// Rewrites the parts of an open proposal the caller supplies: its title,
     /// its body and the branch it targets. Every field is optional and an
     /// absent one is left untouched, so a retarget can move the base without

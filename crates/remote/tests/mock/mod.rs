@@ -56,11 +56,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// A commit in the fake graph: its full tree and links to its parents (two
-/// of them for the merge commit a share-update makes after the base moved).
+/// A commit in the fake graph: its full tree, links to its parents (two of
+/// them for the merge commit a share-update makes after the base moved) and
+/// the message it was created with (empty for a commit a test seeded).
 struct Commit {
     files: BTreeMap<String, Vec<u8>>,
     parents: Vec<String>,
+    message: String,
 }
 
 /// The message GitHub answers a misaligned chain with, taken verbatim from
@@ -146,6 +148,17 @@ struct Inner {
     /// The writes each `create_tree` call carried, keyed by the same tree id,
     /// as `(path, blob sha)` pairs in call order.
     tree_writes: HashMap<String, Vec<(String, Option<String>)>>,
+    /// Branches whose `update_branch` answers the forge's protected-branch
+    /// refusal, by the message the rule comes back with. Set through
+    /// `MockProvider::protect_branch`.
+    protected: HashMap<String, String>,
+    /// Branch moves armed to happen right AFTER a `branch_head` probe
+    /// answers, as `(branch, commit, probe number)`. The probe number is
+    /// absolute, counted per branch from this provider's first probe, and
+    /// `MockProvider::move_branch_after_probe` works out which one that is.
+    branch_moves: Vec<(String, String, usize)>,
+    /// How many `branch_head` probes each branch has answered so far.
+    probes: HashMap<String, usize>,
     gc: HashSet<String>,
     truncate: bool,
     etag_counter: u64,
@@ -156,6 +169,48 @@ struct Inner {
 }
 
 impl Inner {
+    /// Whether `ancestor` is reachable from `commit` through parent links.
+    fn is_ancestor(&self, ancestor: &str, commit: &str) -> bool {
+        let mut stack = vec![commit.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if id == ancestor {
+                return true;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(c) = self.commits.get(&id) {
+                stack.extend(c.parents.iter().cloned());
+            }
+        }
+        false
+    }
+
+    /// Answers a `branch_head` probe of `branch` and then applies every move
+    /// armed for that probe, bumping the ETag the way `set_branch` does. The
+    /// answer is fixed first, so the probe reports the head as it stood and
+    /// the next caller is the one that meets the advance.
+    fn count_probe_and_apply_moves(&mut self, branch: &str) {
+        let count = self.probes.entry(branch.to_string()).or_insert(0);
+        *count += 1;
+        let count = *count;
+        let due: Vec<(String, String)> = self
+            .branch_moves
+            .iter()
+            .filter(|(name, _, nth)| name == branch && *nth == count)
+            .map(|(name, commit, _)| (name.clone(), commit.clone()))
+            .collect();
+        self.branch_moves
+            .retain(|(name, _, nth)| !(name == branch && *nth == count));
+        for (name, commit) in due {
+            self.etag_counter += 1;
+            let etag = format!("etag{}", self.etag_counter);
+            self.branches.insert(name.clone(), commit);
+            self.etags.insert(name, etag);
+        }
+    }
+
     /// The branch proposal `number` carries, as `create_proposal` or
     /// `register_proposal_branch` recorded it.
     fn head_branch(&self, number: u64) -> Option<&str> {
@@ -268,9 +323,45 @@ impl MockProvider {
             Commit {
                 files,
                 parents: parent.map(str::to_string).into_iter().collect(),
+                message: String::new(),
             },
         );
         id
+    }
+
+    /// Makes `update_branch` on `name` answer the forge's protected-branch
+    /// refusal carrying `message`, whatever commit is offered.
+    pub fn protect_branch(&self, name: &str, message: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .protected
+            .insert(name.to_string(), message.to_string());
+    }
+
+    /// Moves `branch` to `commit` right after the `nth` `branch_head` probe
+    /// of that branch FOLLOWING this call (1-based), the way a colleague's
+    /// push lands between a share's pull and its update.
+    ///
+    /// Counted from here rather than from the provider's first probe ever,
+    /// because a test arms a move once its fixture stands, and the subscribe
+    /// that built the fixture has already probed.
+    pub fn move_branch_after_probe(&self, branch: &str, commit: &str, nth: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        let so_far = inner.probes.get(branch).copied().unwrap_or(0);
+        inner
+            .branch_moves
+            .push((branch.to_string(), commit.to_string(), so_far + nth));
+    }
+
+    /// The message `create_commit` was given for `commit`.
+    pub fn commit_message(&self, commit: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .map(|c| c.message.clone())
     }
 
     /// Points `branch` at `commit`, bumping the branch ETag so the next
@@ -480,21 +571,23 @@ impl Provider for MockProvider {
         origin: &OriginSpec,
         etag: Option<&str>,
     ) -> Result<HeadProbe, RemoteError> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let commit = inner.branches.get(&origin.branch).cloned().ok_or_else(|| {
             RemoteError::RepoNotFound {
                 repo: origin.repo.clone(),
             }
         })?;
         let current = inner.etags.get(&origin.branch).cloned();
-        if etag.is_some() && etag == current.as_deref() {
-            Ok(HeadProbe::Unchanged)
+        let answer = if etag.is_some() && etag == current.as_deref() {
+            HeadProbe::Unchanged
         } else {
-            Ok(HeadProbe::Changed {
+            HeadProbe::Changed {
                 head: commit,
                 etag: current,
-            })
-        }
+            }
+        };
+        inner.count_probe_and_apply_moves(&origin.branch);
+        Ok(answer)
     }
 
     async fn compare(
@@ -653,7 +746,7 @@ impl Provider for MockProvider {
     async fn create_commit(
         &self,
         origin: &OriginSpec,
-        _message: &str,
+        message: &str,
         tree: &str,
         parents: &[String],
     ) -> Result<String, RemoteError> {
@@ -672,6 +765,7 @@ impl Provider for MockProvider {
             Commit {
                 files,
                 parents: parents.to_vec(),
+                message: message.to_string(),
             },
         );
         inner.calls.push(format!("create_commit:{id}"));
@@ -719,16 +813,31 @@ impl Provider for MockProvider {
         force: bool,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
+        // The recorded string extends the old `update_branch:{name}:{commit}`
+        // with the force flag rather than rewording it, so the `starts_with`
+        // assertions across lifecycle.rs keep matching. It is recorded before
+        // either refusal below, so a refused update shows in `calls` too.
+        inner
+            .calls
+            .push(format!("update_branch:{name}:{commit}:force={force}"));
+        if let Some(message) = inner.protected.get(name).cloned() {
+            return Err(RemoteError::BranchProtected {
+                branch: name.to_string(),
+                message,
+            });
+        }
+        if !force
+            && let Some(current) = inner.branches.get(name).cloned()
+            && !inner.is_ancestor(&current, commit)
+        {
+            return Err(RemoteError::NotFastForward {
+                branch: name.to_string(),
+            });
+        }
         inner.etag_counter += 1;
         let etag = format!("etag{}", inner.etag_counter);
         inner.branches.insert(name.to_string(), commit.to_string());
         inner.etags.insert(name.to_string(), etag);
-        // The recorded string extends the old `update_branch:{name}:{commit}`
-        // with the force flag rather than rewording it, so the `starts_with`
-        // assertions across lifecycle.rs keep matching.
-        inner
-            .calls
-            .push(format!("update_branch:{name}:{commit}:force={force}"));
         Ok(())
     }
 
@@ -1008,5 +1117,9 @@ impl Provider for MockProvider {
 
     async fn current_user(&self) -> Result<String, RemoteError> {
         Ok("mock-user".to_string())
+    }
+
+    fn commit_url(&self, origin: &OriginSpec, sha: &str) -> Option<String> {
+        Some(format!("https://forge.test/{}/commit/{sha}", origin.repo))
     }
 }

@@ -22,17 +22,20 @@ mod mock;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crystalline_core::Sharing;
+use crystalline_remote::RemoteError;
 use crystalline_remote::merge::ConflictKind;
 use crystalline_remote::ops::{
-    OriginStatusReport, PlannedAction, ProposeOutcome, PullReport, Resolution, ShareOptions,
-    SubscribeReport, propose, propose_preview, pull, resolve, status, subscribe, withdraw,
+    CommitReport, DIRECT_NO_AMEND, OriginStatusReport, PlannedAction, ProposeOutcome, PullReport,
+    Resolution, ShareOptions, SubscribeReport, propose, propose_preview, pull, resolve, status,
+    subscribe, withdraw,
 };
 use crystalline_remote::provider::{
     Feedback, OriginSpec, ProposalRequest, ProposalState, Provider,
 };
 use crystalline_remote::state::{
     BaseStamp, FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange,
-    ProposedFile, read_conflict_files,
+    ProposedFile, read_base_file, read_conflict_files,
 };
 
 use mock::{MockProvider, sha256_hex};
@@ -1578,6 +1581,615 @@ async fn scenario_17_propose_freshness_pulls_first_then_proposes_on_new_base() {
     );
 }
 
+// --- Direct sharing: `sharing: direct` commits straight onto the branch ------
+//
+// The policy is the engine's to read (`crystalline_core::sharing_at`, off the
+// real folder) and this crate's to obey: every scenario hands it down in
+// `ShareOptions.sharing`. The fixture MANIFEST declares it too, so the tree a
+// direct commit carries is the tree such a domain really has.
+
+const DIRECT_MANIFEST: &[u8] = b"---\ntype: manifest\ntitle: Brand\npermalink: manifest\nsharing: direct\n---\n\n## Scope\n\n- brand\n\n## When to Use\n\n- brand\n";
+
+fn direct() -> ShareOptions<'static> {
+    ShareOptions {
+        sharing: Sharing::Direct,
+        ..ShareOptions::default()
+    }
+}
+
+/// A direct domain with an edit, an addition and a deletion waiting.
+async fn direct_domain(mock: &MockProvider) -> (Subscribed, String) {
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", DIRECT_MANIFEST),
+            ("notes/keep.md", b"keep\n"),
+            ("notes/edit.md", b"before\n"),
+            ("notes/gone.md", b"bye\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(mock, &spec, &c1, "Brand Team").await;
+    write(&sub.domain_root.join("notes/edit.md"), b"after\n");
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
+    (sub, c1)
+}
+
+async fn share_direct(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    options: ShareOptions<'_>,
+) -> ProposeOutcome {
+    propose(
+        mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        options,
+    )
+    .await
+    .unwrap()
+}
+
+fn committed(outcome: ProposeOutcome) -> CommitReport {
+    match outcome {
+        ProposeOutcome::Committed(report) => report,
+        other => panic!("expected Committed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_direct_share_commits_onto_the_branch_and_opens_no_proposal() {
+    let mock = MockProvider::new();
+    let (sub, c1) = direct_domain(&mock).await;
+
+    let report = committed(share_direct(&mock, &sub, direct()).await);
+    assert_eq!(report.branch, "main");
+    assert_eq!(report.added, vec!["notes/added.md".to_string()]);
+    assert_eq!(report.updated, vec!["notes/edit.md".to_string()]);
+    assert_eq!(report.deleted, vec!["notes/gone.md".to_string()]);
+    assert_eq!(
+        report.url.as_deref(),
+        Some(format!("https://forge.test/team/knowledge/commit/{}", report.sha).as_str())
+    );
+    assert!(
+        report.summary.starts_with("Shares 1 new engram"),
+        "{}",
+        report.summary
+    );
+
+    // Blobs, one tree on the base, one commit with one parent, the branch
+    // moved without force - and no branch of its own, no proposal.
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("create_blob:{}", sha256_hex(b"after\n"))),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("create_blob:{}", sha256_hex(b"brand new\n"))),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c == &format!("update_branch:main:{}:force=false", report.sha)),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("create_branch:") || c.starts_with("create_proposal:")),
+        "{calls:?}"
+    );
+    assert_eq!(mock.commit_parents(&report.sha).unwrap(), vec![c1.clone()]);
+    assert_eq!(mock.branch_commit("main").unwrap(), report.sha);
+    let tree = mock.commit_tree(&report.sha).unwrap();
+    assert_eq!(
+        tree.get("knowledge/notes/edit.md"),
+        Some(&b"after\n".to_vec())
+    );
+    assert_eq!(
+        tree.get("knowledge/notes/added.md"),
+        Some(&b"brand new\n".to_vec())
+    );
+    assert!(!tree.contains_key("knowledge/notes/gone.md"));
+    assert_eq!(
+        tree.get("knowledge/notes/keep.md"),
+        Some(&b"keep\n".to_vec())
+    );
+
+    // The base advanced to our commit: copies, stamps, no ETag, and the
+    // record of what went straight to the branch. No proposal exists.
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.base_commit, report.sha);
+    assert_eq!(
+        read_base_file(&sub.state_dir, "notes/edit.md").unwrap(),
+        Some(b"after\n".to_vec())
+    );
+    assert_eq!(
+        read_base_file(&sub.state_dir, "notes/added.md").unwrap(),
+        Some(b"brand new\n".to_vec())
+    );
+    assert_eq!(
+        read_base_file(&sub.state_dir, "notes/gone.md").unwrap(),
+        None
+    );
+    assert_eq!(
+        st.files.get("notes/added.md").map(|s| s.sha256.clone()),
+        Some(sha256_hex(b"brand new\n"))
+    );
+    assert!(!st.files.contains_key("notes/gone.md"));
+    assert!(st.ref_etag.is_none());
+    assert!(st.proposals.is_empty());
+    assert_eq!(st.direct_shares.len(), 1);
+    assert_eq!(st.direct_shares[0].sha, report.sha);
+    assert_eq!(st.direct_shares[0].files.len(), 3);
+
+    // Nothing is left to share and the next pull is up to date.
+    assert!(matches!(
+        share_direct(&mock, &sub, direct()).await,
+        ProposeOutcome::NothingToShare { .. }
+    ));
+    let pulled = pull(&mock, &share_spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(pulled.up_to_date, "{pulled:?}");
+}
+
+#[tokio::test]
+async fn a_scoped_direct_share_leaves_the_unselected_file_a_local_change() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let files = ["notes/edit.md".to_string()];
+    let report = committed(
+        share_direct(
+            &mock,
+            &sub,
+            ShareOptions {
+                files: Some(&files),
+                ..direct()
+            },
+        )
+        .await,
+    );
+    assert_eq!(report.updated, vec!["notes/edit.md".to_string()]);
+    assert!(report.added.is_empty() && report.deleted.is_empty());
+    let st = load_state(&sub.state_dir);
+    assert!(!st.files.contains_key("notes/added.md"), "still unshared");
+    assert!(
+        st.files.contains_key("notes/gone.md"),
+        "the deletion is still unshared"
+    );
+    let again = committed(share_direct(&mock, &sub, direct()).await);
+    assert_eq!(again.added, vec!["notes/added.md".to_string()]);
+    assert_eq!(again.deleted, vec!["notes/gone.md".to_string()]);
+}
+
+#[tokio::test]
+async fn the_commit_message_is_the_title_alone_or_title_blank_line_description() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let first = committed(
+        share_direct(
+            &mock,
+            &sub,
+            ShareOptions {
+                title: Some("Sharpen the brand rules"),
+                ..direct()
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        mock.commit_message(&first.sha).as_deref(),
+        Some("Sharpen the brand rules")
+    );
+    write(&sub.domain_root.join("notes/more.md"), b"more\n");
+    let second = committed(
+        share_direct(
+            &mock,
+            &sub,
+            ShareOptions {
+                title: Some("More"),
+                description: Some("Why it matters."),
+                ..direct()
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        mock.commit_message(&second.sha).as_deref(),
+        Some("More\n\nWhy it matters.")
+    );
+    write(&sub.domain_root.join("notes/third.md"), b"third\n");
+    let third = committed(share_direct(&mock, &sub, direct()).await);
+    assert_eq!(
+        mock.commit_message(&third.sha).as_deref(),
+        Some("Share 1 new engram from Brand Team")
+    );
+}
+
+#[tokio::test]
+async fn an_open_proposal_refuses_a_direct_share_and_writes_nothing() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    seed_proposal(&sub.state_dir, 7, "notes/other.md", None);
+    mock.set_proposal_state(7, ProposalState::Open);
+    let before = mock.calls().len();
+    match share_direct(&mock, &sub, direct()).await {
+        ProposeOutcome::ProposalOpen { number, url, title } => {
+            assert_eq!(number, 7);
+            assert_eq!(url, "https://example.test/pull/7");
+            assert_eq!(title, "Share proposal 7");
+        }
+        other => panic!("expected ProposalOpen, got {other:?}"),
+    }
+    assert!(
+        !mock.calls()[before..].iter().any(|c| is_write_call(c)),
+        "{:?}",
+        mock.calls()
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).proposals.len(),
+        1,
+        "the record stands"
+    );
+}
+
+#[tokio::test]
+async fn a_declined_proposal_is_settled_and_the_direct_share_goes_through() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    seed_proposal(&sub.state_dir, 3, "notes/other.md", None);
+    let mut st = load_state(&sub.state_dir);
+    st.proposals[0].status = ProposalStatus::Declined;
+    st.save(&sub.state_dir).unwrap();
+    let report = committed(share_direct(&mock, &sub, direct()).await);
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.is_empty());
+    assert_eq!(st.history[0].number, 3);
+    assert_eq!(st.history[0].status, ProposalStatus::Declined);
+    assert!(
+        mock.calls()
+            .contains(&"delete_branch:crystalline/share-3".to_string())
+    );
+    assert_eq!(st.base_commit, report.sha);
+}
+
+#[tokio::test]
+async fn naming_a_proposal_on_a_direct_domain_is_refused_before_any_write() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(4),
+            ..direct()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, RemoteError::Refused(text) if text == DIRECT_NO_AMEND),
+        "{err}"
+    );
+    assert!(!mock.calls()[before..].iter().any(|c| is_write_call(c)));
+    let err = propose_preview(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(4),
+            ..direct()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, RemoteError::Refused(text) if text == DIRECT_NO_AMEND),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_share_with_conflicts_pending_refuses_as_today() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", DIRECT_MANIFEST), ("notes/a.md", b"a v1\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+    write(&sub.domain_root.join("notes/a.md"), b"a mine\n");
+    let c2 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", DIRECT_MANIFEST),
+            ("notes/a.md", b"a theirs\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    let err = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        direct(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, RemoteError::ConflictsPending { count: 1 }),
+        "{err}"
+    );
+    let plan = propose_preview(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        direct(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::ConflictsPending { count: 1 });
+    assert_eq!(plan.sharing, Sharing::Direct);
+}
+
+#[tokio::test]
+async fn a_branch_that_moved_once_is_pulled_and_the_share_lands_on_the_new_head() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", DIRECT_MANIFEST), ("notes/a.md", b"a v1\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+    write(&sub.domain_root.join("notes/local.md"), b"brand new\n");
+    // Upstream moves AFTER the share's own pull: armed on the mock to happen
+    // right after the first `branch_head` probe that follows, so the pull
+    // sees c1 and the update finds c2.
+    let c2 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", DIRECT_MANIFEST),
+            ("notes/a.md", b"a v2 upstream\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.move_branch_after_probe("main", &c2, 1);
+
+    let report = committed(
+        propose(
+            &mock,
+            &spec,
+            &sub.domain_root,
+            "brand",
+            &sub.state_dir,
+            direct(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(mock.commit_parents(&report.sha).unwrap(), vec![c2.clone()]);
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"a v2 upstream\n"
+    );
+    let tree = mock.commit_tree(&report.sha).unwrap();
+    assert_eq!(
+        tree.get("knowledge/notes/a.md"),
+        Some(&b"a v2 upstream\n".to_vec())
+    );
+    assert_eq!(
+        tree.get("knowledge/notes/local.md"),
+        Some(&b"brand new\n".to_vec())
+    );
+    let calls = mock.calls();
+    let updates: Vec<&String> = calls
+        .iter()
+        .filter(|c| c.starts_with("update_branch:main:"))
+        .collect();
+    assert_eq!(updates.len(), 2, "one refused, one landed: {updates:?}");
+    assert_eq!(load_state(&sub.state_dir).base_commit, report.sha);
+}
+
+#[tokio::test]
+async fn a_branch_that_moved_twice_answers_branch_moved_and_nothing_more_is_tried() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", DIRECT_MANIFEST), ("notes/a.md", b"a v1\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "brand").await;
+    write(&sub.domain_root.join("notes/local.md"), b"brand new\n");
+    let c2 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", DIRECT_MANIFEST), ("notes/a.md", b"a v2\n")]),
+        Some(&c1),
+    );
+    let c3 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", DIRECT_MANIFEST), ("notes/a.md", b"a v3\n")]),
+        Some(&c2),
+    );
+    mock.move_branch_after_probe("main", &c2, 1);
+    mock.move_branch_after_probe("main", &c3, 2);
+
+    match propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "brand",
+        &sub.state_dir,
+        direct(),
+    )
+    .await
+    .unwrap()
+    {
+        ProposeOutcome::BranchMoved { branch } => assert_eq!(branch, "main"),
+        other => panic!("expected BranchMoved, got {other:?}"),
+    }
+    let updates = mock
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("update_branch:main:"))
+        .count();
+    assert_eq!(updates, 2, "exactly one retry");
+    let st = load_state(&sub.state_dir);
+    // The retry's pull applied c2 and the second refusal returned at once: the
+    // move to c3 lands after that pull's probe, so nothing here ever saw it.
+    assert_eq!(st.base_commit, c2, "the retry's pull applied, and no more");
+    assert_ne!(st.base_commit, c3);
+    assert!(st.direct_shares.is_empty());
+    assert_eq!(
+        read(&sub.domain_root.join("notes/local.md")),
+        b"brand new\n"
+    );
+}
+
+#[tokio::test]
+async fn a_protected_branch_answers_branch_protected_with_the_forges_sentence() {
+    let mock = MockProvider::new();
+    let (sub, c1) = direct_domain(&mock).await;
+    mock.protect_branch("main", "Required status check \"ci\" is expected.");
+    match share_direct(&mock, &sub, direct()).await {
+        ProposeOutcome::BranchProtected { branch, message } => {
+            assert_eq!(branch, "main");
+            assert_eq!(message, "Required status check \"ci\" is expected.");
+        }
+        other => panic!("expected BranchProtected, got {other:?}"),
+    }
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|c| c.starts_with("update_branch:main:"))
+            .count(),
+        1,
+        "nothing is retried"
+    );
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.base_commit, c1);
+    assert!(st.direct_shares.is_empty());
+}
+
+#[tokio::test]
+async fn propose_preview_on_a_direct_domain_names_the_commit_and_the_refusals() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let before = mock.calls().len();
+    let plan = propose_preview(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        direct(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        plan.action,
+        PlannedAction::Commit {
+            branch: "main".to_string()
+        }
+    );
+    assert_eq!(plan.sharing, Sharing::Direct);
+    assert_eq!(plan.effective_title, "Share updates from Brand Team");
+    assert_eq!(plan.changes.changes.len(), 3);
+    assert!(!mock.calls()[before..].iter().any(|c| is_write_call(c)));
+    assert!(
+        !mock.calls()[before..]
+            .iter()
+            .any(|c| c.starts_with("list_stacks")),
+        "no stacks probe on a direct domain"
+    );
+
+    seed_proposal(&sub.state_dir, 9, "notes/other.md", None);
+    mock.set_proposal_state(9, ProposalState::Open);
+    let plan = propose_preview(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        direct(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        plan.action,
+        PlannedAction::ProposalOpen {
+            number: 9,
+            url: "https://example.test/pull/9".to_string(),
+            title: "Share proposal 9".to_string()
+        }
+    );
+    assert_eq!(plan.effective_title, "");
+    assert_eq!(
+        plan.changes.changes.len(),
+        3,
+        "the changes ride beside the refusal"
+    );
+
+    let mut st = load_state(&sub.state_dir);
+    st.proposals.clear();
+    st.save(&sub.state_dir).unwrap();
+    committed(share_direct(&mock, &sub, direct()).await);
+    let plan = propose_preview(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        direct(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::NothingToShare);
+}
+
+#[tokio::test]
+async fn materialise_base_paths_writes_the_folder_from_the_base_copies() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let report = committed(share_direct(&mock, &sub, direct()).await);
+    // Undo the folder by hand, then ask for it back from the base copies.
+    write(&sub.domain_root.join("notes/edit.md"), b"stale\n");
+    write(&sub.domain_root.join("notes/gone.md"), b"back?\n");
+    std::fs::remove_file(sub.domain_root.join("notes/added.md")).unwrap();
+    let paths: Vec<String> = report
+        .added
+        .iter()
+        .chain(&report.updated)
+        .chain(&report.deleted)
+        .cloned()
+        .collect();
+    crystalline_remote::ops::materialise_base_paths(&sub.domain_root, &sub.state_dir, &paths)
+        .unwrap();
+    assert_eq!(read(&sub.domain_root.join("notes/edit.md")), b"after\n");
+    assert_eq!(
+        read(&sub.domain_root.join("notes/added.md")),
+        b"brand new\n"
+    );
+    assert!(!sub.domain_root.join("notes/gone.md").exists());
+    let err = crystalline_remote::ops::materialise_base_paths(
+        &sub.domain_root,
+        &sub.state_dir,
+        &["../escape.md".to_string()],
+    )
+    .unwrap_err();
+    assert!(matches!(err, RemoteError::State(_)), "{err}");
+}
+
 // Scenario 19 (e): full circle. The mock merges the proposed branch into
 // main verbatim; a later pull consumes the proposal to history as Merged
 // with no conflicts, through real propose output rather than seeded state.
@@ -2562,6 +3174,7 @@ async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
             stacks_allowed: false,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -3726,6 +4339,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
             stacks_allowed: false,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4301,6 +4915,7 @@ async fn the_probe_runs_once_and_caches_the_verdict() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4336,6 +4951,7 @@ async fn the_probe_runs_once_and_caches_the_verdict() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4372,6 +4988,7 @@ async fn config_off_never_probes() {
             stacks_allowed: false,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4408,6 +5025,7 @@ async fn stacked_share(mock: &MockProvider, sub: &Subscribed) -> ProposeOutcome 
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4599,6 +5217,7 @@ async fn divergence_on_the_top_layer_refuses_the_stacked_share() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4640,6 +5259,7 @@ async fn preview_names_the_stack_action() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4875,6 +5495,7 @@ async fn preview_stacks_on_the_surviving_layer_when_the_top_ref_is_gone() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4928,6 +5549,7 @@ async fn preview_of_a_diverged_top_still_measures_against_the_tip() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -4978,6 +5600,7 @@ async fn amend_share_as(
             stacks_allowed: true,
             author_login,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -5213,6 +5836,7 @@ async fn amend_refuses_a_number_that_is_not_an_open_layer() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -5262,6 +5886,7 @@ async fn amend_preview_counts_the_layers_above() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -5479,6 +6104,7 @@ async fn a_legacy_layer_a_layer_above_overwrote_refuses_before_any_write() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -5565,6 +6191,7 @@ async fn a_refusal_on_a_later_kept_entry_leaves_no_orphan_blob_behind() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -5611,6 +6238,7 @@ async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend()
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -5648,6 +6276,7 @@ async fn amend_preview_refuses_over_an_unreplayable_layer_above() {
         stacks_allowed: true,
         author_login: None,
         files: None,
+        sharing: Sharing::Proposal,
     };
     let err = propose_preview(
         &mock,
@@ -6926,6 +7555,7 @@ async fn share_with_stacks(mock: &MockProvider, sub: &Subscribed, allowed: bool)
             stacks_allowed: allowed,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -7566,6 +8196,7 @@ async fn an_amend_refusal_lists_the_layers_the_repair_left_open() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -7708,6 +8339,7 @@ async fn an_amend_over_a_merge_wedged_chain_pulls_the_merge_in_and_proceeds() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -7773,6 +8405,7 @@ async fn a_fallback_amend_runs_no_repair_machinery() {
                 stacks_allowed: false,
                 author_login: None,
                 files: None,
+                sharing: Sharing::Proposal,
             },
         )
         .await
@@ -7884,6 +8517,7 @@ async fn a_reviewer_commit_above_refuses_the_repair_too() {
             stacks_allowed: true,
             author_login: None,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -8502,6 +9136,7 @@ async fn a_status_on_a_stacked_chain_counts_only_the_work_above_the_tip() {
         stacks_allowed: true,
         author_login: None,
         files: None,
+        sharing: Sharing::Proposal,
     };
 
     write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
@@ -8603,6 +9238,7 @@ async fn a_merged_layer_nobody_pulled_yet_is_carried_not_unshared() {
         stacks_allowed: true,
         author_login: None,
         files: None,
+        sharing: Sharing::Proposal,
     };
 
     // The forge merges the layer and the trunk moves onto a commit carrying
@@ -8793,6 +9429,7 @@ async fn stacked_share_as(
             stacks_allowed: true,
             author_login,
             files: None,
+            sharing: Sharing::Proposal,
         },
     )
     .await
@@ -8862,6 +9499,7 @@ async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_know
                 stacks_allowed: false,
                 author_login: Some("bob"),
                 files: None,
+                sharing: Sharing::Proposal,
             },
         )
         .await
@@ -8965,6 +9603,7 @@ async fn share_files(
             stacks_allowed: true,
             author_login: None,
             files: Some(files),
+            sharing: Sharing::Proposal,
         },
     )
     .await

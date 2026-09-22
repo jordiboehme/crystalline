@@ -189,6 +189,28 @@ pub enum RemoteError {
     #[error("{0}")]
     Refused(String),
 
+    /// The branch moved between this share's pull and its push: the forge
+    /// refused a commit whose parent is no longer the head. Raised only by a
+    /// direct share; `ops` pulls once more and retries once before it answers
+    /// `BranchMoved`.
+    #[error(
+        "the branch {branch} moved while this share was prepared; run update_domain (or `crystalline origin update`) and share again"
+    )]
+    NotFastForward {
+        /// The branch that moved.
+        branch: String,
+    },
+
+    /// The branch's rules do not accept a direct commit. `message` is the
+    /// forge's own sentence naming the rule.
+    #[error("{}", branch_protected_guidance(branch, message))]
+    BranchProtected {
+        /// The branch the rule guards.
+        branch: String,
+        /// The forge's sentence, verbatim.
+        message: String,
+    },
+
     /// The GitHub API answered in a shape this client did not expect, with no
     /// more specific variant to map it to.
     #[error("GitHub returned an unexpected answer (status {status}): {message}")]
@@ -222,6 +244,33 @@ pub enum RemoteError {
         /// A short, human-readable description of what went wrong.
         detail: String,
     },
+}
+
+/// The sentence a caller is given when a branch rule refused a direct
+/// commit: what the forge said, and the two ways out (share as a proposal,
+/// or have the rule relaxed).
+///
+/// Lives here rather than beside each surface that renders it, so the
+/// [`RemoteError::BranchProtected`] display and every receipt carrying a
+/// `guidance` field say the same thing word for word.
+pub fn branch_protected_guidance(branch: &str, message: &str) -> String {
+    format!(
+        "The branch {branch} does not accept direct commits ({message}). Set `sharing: proposal` in this domain's MANIFEST so shares open a proposal the branch's rules can review, or ask a repository admin to allow direct pushes."
+    )
+}
+
+/// The sentence a caller is given when a direct share gave up because the
+/// branch moved a second time, after the retry's pull had already caught up
+/// with the first move.
+///
+/// Deliberately not [`RemoteError::NotFastForward`]'s own text: that one is
+/// raised on the first refusal, which the share answers by pulling and
+/// retrying, and this one is what a person reads once the retry lost the
+/// race too ("moved again").
+pub fn branch_moved_guidance(branch: &str) -> String {
+    format!(
+        "the branch {branch} moved again while this share was prepared; run update_domain (or `crystalline origin update`) and share again"
+    )
 }
 
 /// Renders where a MANIFEST.md was expected, for the `NotADomain` message.
@@ -316,6 +365,45 @@ mod tests {
     fn refused_renders_its_message_with_no_prefix() {
         let text = "proposal #9 is not an open layer of this domain; open layers: #3 (layer 1)";
         assert_eq!(RemoteError::Refused(text.to_string()).to_string(), text);
+    }
+
+    /// A branch rule refusing a direct commit has to name three things: the
+    /// branch, the forge's own sentence for the rule and what to do instead.
+    /// The way out is the policy key, because that is the one a person can
+    /// change without asking anybody.
+    #[test]
+    fn branch_protected_names_the_branch_the_rule_and_the_way_out() {
+        let text = RemoteError::BranchProtected {
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+        }
+        .to_string();
+        assert!(
+            text.starts_with(
+                "The branch main does not accept direct commits (Changes must be made through a pull request.)."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("sharing: proposal"), "{text}");
+    }
+
+    /// The two guidance sentences are one move apart: the error a refused
+    /// push raises says the branch moved, the guidance a given-up share
+    /// carries says it moved again - after the retry's own pull.
+    #[test]
+    fn branch_moved_guidance_names_the_second_move() {
+        let guidance = branch_moved_guidance("main");
+        assert!(guidance.contains("moved again while"), "{guidance}");
+        assert!(guidance.contains("share again"), "{guidance}");
+        let first = RemoteError::NotFastForward {
+            branch: "main".to_string(),
+        }
+        .to_string();
+        assert!(
+            first.contains("moved while this share was prepared"),
+            "{first}"
+        );
+        assert!(!first.contains("moved again"), "{first}");
     }
 
     #[test]

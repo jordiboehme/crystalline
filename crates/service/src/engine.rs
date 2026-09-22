@@ -17303,6 +17303,9 @@ impl Engine {
                 // that credential carries no login (the environment token).
                 author_login: login.as_deref(),
                 files,
+                // The proposal policy, until this engine reads the domain's
+                // own from its MANIFEST.
+                sharing: crystalline_core::Sharing::Proposal,
             },
         )
         .await
@@ -17539,6 +17542,9 @@ impl Engine {
                 // resolves exactly what the share would. It records nothing.
                 author_login: login.as_deref(),
                 files,
+                // The proposal policy, until this engine reads the domain's
+                // own from its MANIFEST.
+                sharing: crystalline_core::Sharing::Proposal,
             },
         )
         .await

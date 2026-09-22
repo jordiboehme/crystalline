@@ -86,6 +86,12 @@ pub struct OriginState {
     /// Merged or withdrawn proposals kept for status display, newest first,
     /// capped at 20 by [`OriginState::push_history`].
     pub history: Vec<Proposal>,
+    /// Direct commits this machine put on the connected branch, newest first,
+    /// capped at 20 by [`OriginState::push_direct_share`] like `history`. A
+    /// list of its own rather than `Proposal` records: a proposal number is a
+    /// forge identifier and every reader of `history` treats it as one.
+    #[serde(default)]
+    pub direct_shares: Vec<DirectShare>,
     /// Conflicts from a previous pull still waiting to be resolved.
     pub conflicts: Vec<Conflict>,
     /// The GitHub stack number linking the open proposals, once two or more
@@ -284,6 +290,24 @@ pub enum ProposedChange {
     Deleted,
 }
 
+/// One direct commit this machine put on the connected branch (a share of a
+/// domain whose MANIFEST declares `sharing: direct`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectShare {
+    /// The commit's sha on the forge.
+    pub sha: String,
+    /// The web address a person opens the commit at, when the forge has one.
+    pub url: Option<String>,
+    /// The commit message's first line: the share's effective title.
+    pub title: String,
+    /// When the commit landed.
+    pub shared_at: DateTime<Utc>,
+    /// The login the share acted as, as [`Proposal::author_login`] records it.
+    pub author_login: Option<String>,
+    /// The files the commit changed, the same record a proposal keeps.
+    pub files: Vec<ProposedFile>,
+}
+
 /// An unresolved conflict from a previous pull, recorded so it can be
 /// revisited: what path, what kind, and copies of the two sides that could
 /// not be merged automatically (see [`record_conflict_files`]).
@@ -319,6 +343,7 @@ impl OriginState {
             files: BTreeMap::new(),
             proposals: Vec::new(),
             history: Vec::new(),
+            direct_shares: Vec::new(),
             conflicts: Vec::new(),
             stack_number: None,
             stacks_available: None,
@@ -377,6 +402,13 @@ impl OriginState {
     pub fn push_history(&mut self, proposal: Proposal) {
         self.history.insert(0, proposal);
         self.history.truncate(HISTORY_CAP);
+    }
+
+    /// Inserts `share` at the front of `direct_shares` and truncates to the
+    /// newest 20, the rule [`OriginState::push_history`] keeps.
+    pub fn push_direct_share(&mut self, share: DirectShare) {
+        self.direct_shares.insert(0, share);
+        self.direct_shares.truncate(HISTORY_CAP);
     }
 }
 
@@ -888,6 +920,27 @@ mod tests {
     fn read_base_file_returns_none_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_base_file(dir.path(), "missing.md").unwrap(), None);
+    }
+
+    /// A direct share is recorded the way a settled proposal is: newest
+    /// first, and the list stops at twenty so a domain shared every day does
+    /// not grow its state file without bound.
+    #[test]
+    fn push_direct_share_keeps_the_newest_twenty() {
+        let mut state = OriginState::new("acme/brand-knowledge", "main");
+        for i in 0..21u64 {
+            state.push_direct_share(DirectShare {
+                sha: format!("s{i}"),
+                url: None,
+                title: format!("Share {i}"),
+                shared_at: chrono::Utc::now(),
+                author_login: None,
+                files: Vec::new(),
+            });
+        }
+        assert_eq!(state.direct_shares.len(), 20);
+        assert_eq!(state.direct_shares[0].sha, "s20");
+        assert_eq!(state.direct_shares.last().unwrap().sha, "s1");
     }
 
     #[test]

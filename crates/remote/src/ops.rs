@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use crystalline_core::Sharing;
 use crystalline_core::manifest::Manifest;
 use crystalline_core::parse_engram;
 
@@ -54,7 +55,8 @@ use crate::provider::{
     TreeWrite, UpstreamChange,
 };
 use crate::state::{
-    self, BaseStamp, Conflict, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
+    self, BaseStamp, Conflict, DirectShare, OriginState, Proposal, ProposalStatus, ProposedChange,
+    ProposedFile,
 };
 
 /// Above this many changed files (after subpath filtering) a compare is
@@ -171,6 +173,9 @@ pub struct OriginStatusReport {
     /// pull request exists, they are simply not grouped. A status with a probe
     /// tries to settle it first, so this reads false once the retry lands.
     pub stack_link_pending: bool,
+    /// Direct commits this machine put on the connected branch, newest first,
+    /// from [`crate::state::OriginState::direct_shares`].
+    pub direct_shares: Vec<DirectShare>,
 }
 
 /// What [`propose`] did with a domain's local changes.
@@ -198,6 +203,32 @@ pub enum ProposeOutcome {
         /// The web URL a human reviews the proposal at.
         url: String,
         /// The branch a reviewer moved out from under us.
+        branch: String,
+    },
+    /// A direct share landed: one commit on the connected branch, no proposal.
+    Committed(CommitReport),
+    /// A direct share refused because a proposal this machine recorded is
+    /// still open; nothing was written. Merge or withdraw it first.
+    ProposalOpen {
+        /// The open proposal's number.
+        number: u64,
+        /// The web URL a human reviews the proposal at.
+        url: String,
+        /// The open proposal's title.
+        title: String,
+    },
+    /// The branch's rules do not accept direct commits; nothing landed.
+    BranchProtected {
+        /// The branch the rule guards.
+        branch: String,
+        /// The forge's own sentence naming the rule.
+        message: String,
+    },
+    /// The branch moved twice while the share was prepared (or once, under a
+    /// pinned pull); nothing landed and nothing local changed beyond what the
+    /// pulls applied.
+    BranchMoved {
+        /// The branch that moved.
         branch: String,
     },
 }
@@ -233,6 +264,32 @@ pub struct ProposeReport {
     /// layers)` with a 1-based position. `None` off the stacked path.
     pub stack_position: Option<(usize, usize)>,
 }
+
+/// What a direct share did: [`ProposeReport`] minus the proposal fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitReport {
+    /// The commit's sha on the forge.
+    pub sha: String,
+    /// The commit's web address, from [`Provider::commit_url`].
+    pub url: Option<String>,
+    /// The connected branch the commit landed on.
+    pub branch: String,
+    /// Domain-relative paths of files the commit added.
+    pub added: Vec<String>,
+    /// Domain-relative paths of files the commit modified.
+    pub updated: Vec<String>,
+    /// Domain-relative paths of files the commit deleted.
+    pub deleted: Vec<String>,
+    /// Working-tree files skipped for exceeding [`MAX_SHARED_FILE_BYTES`],
+    /// each with its size in bytes.
+    pub skipped_large: Vec<(String, u64)>,
+    /// The one-line summary, as [`generate_summary_line`] writes it.
+    pub summary: String,
+}
+
+/// The refusal a direct domain answers a named proposal with: there is no
+/// proposal to amend, because a share here commits onto the branch.
+pub const DIRECT_NO_AMEND: &str = "this domain shares directly (sharing: direct in its MANIFEST), so there is no proposal to amend; leave proposal out";
 
 /// What [`withdraw`] did with a declined or still-open proposal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1053,6 +1110,7 @@ pub async fn status(
             .collect(),
         repair_pending: state.repair_pending,
         stack_link_pending: state.stack_link_pending,
+        direct_shares: state.direct_shares.clone(),
     })
 }
 
@@ -1105,6 +1163,11 @@ pub struct ShareOptions<'a> {
     /// empty slice is a selection of nothing, which is
     /// [`ProposeOutcome::NothingToShare`] rather than an error.
     pub files: Option<&'a [String]>,
+    /// How this share reaches the team: a proposal for review, or a commit
+    /// straight onto the connected branch. The caller reads it off the
+    /// domain's MANIFEST at share time (`crystalline_core::sharing_at`); this
+    /// crate never opens the MANIFEST for it.
+    pub sharing: Sharing,
 }
 
 /// The changes a share carries once the caller's selection is applied: the
@@ -1685,6 +1748,23 @@ pub async fn propose(
         });
     }
 
+    // A domain that shares directly has no proposal to open, stack or amend,
+    // so it leaves here before the stacks probe: everything below is about
+    // proposals, and asking the forge whether it stacks them would be a
+    // question this share never has a use for.
+    if options.sharing == Sharing::Direct {
+        return commit_direct(
+            provider,
+            spec,
+            domain_root,
+            domain_name,
+            state_dir,
+            state,
+            options,
+        )
+        .await;
+    }
+
     // Ask the forge once, before any share work: whether this share can stack
     // is a property of the origin, and the answer is cached from here on.
     let stacked_path = stacks_available(
@@ -1817,22 +1897,7 @@ pub async fn propose(
     // 3. A declined proposal is superseded by this share: record to history
     //    (keeping Declined), branch best-effort deleted, exactly like the
     //    merged path's cleanup.
-    let declined: Vec<Proposal> = state
-        .proposals
-        .iter()
-        .filter(|p| p.status == ProposalStatus::Declined)
-        .cloned()
-        .collect();
-    if !declined.is_empty() {
-        for prop in &declined {
-            state.proposals.retain(|p| p.number != prop.number);
-            state.push_history(prop.clone());
-        }
-        state.save(state_dir)?;
-        for prop in &declined {
-            let _ = provider.delete_branch(spec, &prop.branch).await;
-        }
-    }
+    settle_declined(provider, spec, &mut state, state_dir).await?;
 
     // 4a. On a stackable chain a share never rewrites what is already open:
     //     it opens a new layer on top of the one resolved above, so each
@@ -2002,6 +2067,9 @@ pub struct SharePlan {
     /// The caller's title, or the generated one for this change mix. Empty
     /// when there is nothing to title (nothing to share, conflicts pending).
     pub effective_title: String,
+    /// How the domain shares, from the options the caller handed down;
+    /// `direct` says the plan is about a commit before the action is read.
+    pub sharing: Sharing,
 }
 
 /// The single thing a share would do, as [`propose_preview`] classifies it.
@@ -2056,6 +2124,20 @@ pub enum PlannedAction {
         /// The branch a reviewer moved out from under us.
         branch: String,
     },
+    /// A share would commit straight onto this branch.
+    Commit {
+        /// The connected branch the commit would land on.
+        branch: String,
+    },
+    /// A share would refuse: this proposal is still open on a direct domain.
+    ProposalOpen {
+        /// The open proposal's number.
+        number: u64,
+        /// The web URL a human reviews the proposal at.
+        url: String,
+        /// The open proposal's title.
+        title: String,
+    },
 }
 
 /// The read-only twin of [`propose`]: runs the same pull, conflicts guard,
@@ -2093,6 +2175,12 @@ pub async fn propose_preview(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
+    // The direct plan is computed off state alone, and it leaves here for
+    // the same reason the share does: nothing below this line is about a
+    // commit onto the connected branch.
+    if options.sharing == Sharing::Direct {
+        return preview_direct(spec, domain_root, domain_name, &state, options);
+    }
     // The same capability question a real share asks, and the same cached
     // answer: a preview that guessed would name an action the share then
     // would not take.
@@ -2126,6 +2214,7 @@ pub async fn propose_preview(
                 },
                 changes: local,
                 effective_title: String::new(),
+                sharing: Sharing::Proposal,
             });
         }
         // Read-only, and the same question the amend asks before its first
@@ -2151,6 +2240,7 @@ pub async fn propose_preview(
                 action: PlannedAction::NothingToShare,
                 changes: local,
                 effective_title: String::new(),
+                sharing: Sharing::Proposal,
             });
         }
         let (added, updated, deleted, indexes) = count_changes(&local);
@@ -2162,6 +2252,7 @@ pub async fn propose_preview(
                 action,
                 changes: local,
                 effective_title,
+                sharing: Sharing::Proposal,
             });
         }
         let layers_above = state.proposals[index + 1..]
@@ -2177,6 +2268,7 @@ pub async fn propose_preview(
             },
             changes: local,
             effective_title,
+            sharing: Sharing::Proposal,
         });
     }
 
@@ -2238,6 +2330,7 @@ pub async fn propose_preview(
             },
             changes: local,
             effective_title: String::new(),
+            sharing: Sharing::Proposal,
         });
     }
     if local.changes.is_empty() {
@@ -2245,6 +2338,7 @@ pub async fn propose_preview(
             action: PlannedAction::NothingToShare,
             changes: local,
             effective_title: String::new(),
+            sharing: Sharing::Proposal,
         });
     }
 
@@ -2258,6 +2352,7 @@ pub async fn propose_preview(
             action,
             changes: local,
             effective_title,
+            sharing: Sharing::Proposal,
         });
     }
 
@@ -2296,7 +2391,313 @@ pub async fn propose_preview(
         action,
         changes: local,
         effective_title,
+        sharing: Sharing::Proposal,
     })
+}
+
+/// Settle every declined record into history and delete its branch best
+/// effort: a declined proposal is superseded by whatever share comes next.
+async fn settle_declined(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) -> Result<(), RemoteError> {
+    let declined: Vec<Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Declined)
+        .cloned()
+        .collect();
+    if declined.is_empty() {
+        return Ok(());
+    }
+    for prop in &declined {
+        state.proposals.retain(|p| p.number != prop.number);
+        state.push_history(prop.clone());
+    }
+    state.save(state_dir)?;
+    for prop in &declined {
+        let _ = provider.delete_branch(spec, &prop.branch).await;
+    }
+    Ok(())
+}
+
+/// The first open record from the top: the top open layer of a stack, or the
+/// one living proposal.
+fn open_proposal(state: &OriginState) -> Option<&Proposal> {
+    state
+        .proposals
+        .iter()
+        .rev()
+        .find(|p| p.status == ProposalStatus::Open)
+}
+
+/// The commit message of a direct share: the title alone, or the title, a
+/// blank line and the description. No generated body: that text is a pull
+/// request body, and a commit carries its file list in its tree.
+fn commit_message(title: &str, description: Option<&str>) -> String {
+    match description.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(description) => format!("{title}\n\n{description}"),
+        None => title.to_string(),
+    }
+}
+
+/// The read-only twin of [`commit_direct`]: what a direct share would do,
+/// with no provider call at all. No stacks probe is made - a direct share
+/// never asks the forge whether it stacks - and the protected-branch answer
+/// is the share's alone, since finding out needs a write.
+fn preview_direct(
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state: &OriginState,
+    options: ShareOptions<'_>,
+) -> Result<SharePlan, RemoteError> {
+    if options.proposal.is_some() {
+        return Err(RemoteError::Refused(DIRECT_NO_AMEND.to_string()));
+    }
+    let local = select_share_files(
+        detect_local_changes(domain_root, &state.files)?,
+        options.files,
+    )?;
+    let plan = |action: PlannedAction, effective_title: String| SharePlan {
+        action,
+        changes: local.clone(),
+        effective_title,
+        sharing: Sharing::Direct,
+    };
+    if !state.conflicts.is_empty() {
+        return Ok(plan(
+            PlannedAction::ConflictsPending {
+                count: state.conflicts.len(),
+            },
+            String::new(),
+        ));
+    }
+    if let Some(open) = open_proposal(state) {
+        return Ok(plan(
+            PlannedAction::ProposalOpen {
+                number: open.number,
+                url: open.url.clone(),
+                title: open.title.clone(),
+            },
+            String::new(),
+        ));
+    }
+    if local.changes.is_empty() {
+        return Ok(plan(PlannedAction::NothingToShare, String::new()));
+    }
+    let (added, updated, deleted, indexes) = count_changes(&local);
+    let effective_title = options
+        .title
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_title(added, updated, deleted, indexes, domain_name));
+    Ok(plan(
+        PlannedAction::Commit {
+            branch: spec.branch.clone(),
+        },
+        effective_title,
+    ))
+}
+
+/// A direct share: the selected files as one commit onto the connected
+/// branch, with one pull and one retry when the branch moved underneath.
+///
+/// Runs after [`propose`]'s own pull, state load and conflicts guard. Every
+/// refusal before the first blob is a success-shaped outcome or a teaching
+/// refusal; blobs, trees and commits created before a forge refusal are
+/// unreachable objects the forge collects, the same residue the proposal
+/// path leaves when `create_proposal` fails after `create_branch`.
+async fn commit_direct(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    mut state: OriginState,
+    options: ShareOptions<'_>,
+) -> Result<ProposeOutcome, RemoteError> {
+    if options.proposal.is_some() {
+        return Err(RemoteError::Refused(DIRECT_NO_AMEND.to_string()));
+    }
+    settle_declined(provider, spec, &mut state, state_dir).await?;
+    if let Some(open) = open_proposal(&state) {
+        return Ok(ProposeOutcome::ProposalOpen {
+            number: open.number,
+            url: open.url.clone(),
+            title: open.title.clone(),
+        });
+    }
+    let mut local = select_share_files(
+        detect_local_changes(domain_root, &state.files)?,
+        options.files,
+    )?;
+    if local.changes.is_empty() {
+        return Ok(ProposeOutcome::NothingToShare {
+            skipped_large: local.skipped_large,
+        });
+    }
+    let mut retried = false;
+    loop {
+        let collected = collect_changes(
+            provider,
+            spec,
+            domain_root,
+            state_dir,
+            &local,
+            options.description,
+        )
+        .await?;
+        let (added, updated, deleted, indexes) = count_collected(&collected);
+        let effective_title = options
+            .title
+            .map(str::to_string)
+            .unwrap_or_else(|| generate_title(added, updated, deleted, indexes, domain_name));
+        let summary = generate_summary_line(added, updated, deleted, indexes);
+        let message = commit_message(&effective_title, options.description);
+        let tree_sha = provider
+            .create_tree(spec, &state.base_commit, &collected.writes)
+            .await?;
+        let commit_sha = provider
+            .create_commit(
+                spec,
+                &message,
+                &tree_sha,
+                std::slice::from_ref(&state.base_commit),
+            )
+            .await?;
+        match provider
+            .update_branch(spec, &spec.branch, &commit_sha, false)
+            .await
+        {
+            Ok(()) => {
+                let url = provider.commit_url(spec, &commit_sha);
+                advance_base_after_commit(
+                    &mut state,
+                    state_dir,
+                    &commit_sha,
+                    url.clone(),
+                    &effective_title,
+                    options.author_login,
+                    &collected,
+                )?;
+                return Ok(ProposeOutcome::Committed(CommitReport {
+                    sha: commit_sha,
+                    url,
+                    branch: spec.branch.clone(),
+                    added: collected.added,
+                    updated: collected.updated,
+                    deleted: collected.deleted,
+                    skipped_large: local.skipped_large,
+                    summary,
+                }));
+            }
+            Err(RemoteError::NotFastForward { branch }) if !retried => {
+                retried = true;
+                // Somebody pushed between our pull and our update: pull once
+                // more and rebuild on the new head. Only a team domain whose
+                // pull follows the live branch ever gets here - a review-mode
+                // domain pulls a pinned head, and its own probe refuses a
+                // moved head with SHARE_HEAD_MOVED before any update_branch
+                // is tried. An up-to-date pull here therefore means the move
+                // is one this provider cannot see, which is answered at once
+                // rather than retried into the same refusal.
+                let report = pull(provider, spec, domain_root, state_dir).await?;
+                if report.up_to_date {
+                    return Ok(ProposeOutcome::BranchMoved { branch });
+                }
+                state = OriginState::load(state_dir)?.ok_or_else(|| {
+                    RemoteError::Refused(
+                        "this domain has no origin state; add the domain from its origin first"
+                            .to_string(),
+                    )
+                })?;
+                if !state.conflicts.is_empty() {
+                    return Err(RemoteError::ConflictsPending {
+                        count: state.conflicts.len(),
+                    });
+                }
+                local = select_share_files(
+                    detect_local_changes(domain_root, &state.files)?,
+                    options.files,
+                )?;
+                if local.changes.is_empty() {
+                    return Ok(ProposeOutcome::NothingToShare {
+                        skipped_large: local.skipped_large,
+                    });
+                }
+            }
+            Err(RemoteError::NotFastForward { branch }) => {
+                return Ok(ProposeOutcome::BranchMoved { branch });
+            }
+            Err(RemoteError::BranchProtected { branch, message }) => {
+                return Ok(ProposeOutcome::BranchProtected { branch, message });
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The state update after a direct commit landed, in one save: the base is
+/// our commit, the base copies and stamps are the pushed bytes (the advance a
+/// pull makes for the paths it applied, made here for the paths we pushed),
+/// the ETag is dropped so the next probe reads the head unconditionally, and
+/// the commit joins `direct_shares`.
+#[allow(clippy::too_many_arguments)]
+fn advance_base_after_commit(
+    state: &mut OriginState,
+    state_dir: &Path,
+    commit_sha: &str,
+    url: Option<String>,
+    title: &str,
+    author_login: Option<&str>,
+    collected: &CollectedChanges,
+) -> Result<(), RemoteError> {
+    for (path, bytes) in collected
+        .entries
+        .added
+        .iter()
+        .chain(&collected.entries.updated)
+    {
+        state::write_base_file(state_dir, path, bytes)?;
+        state.files.insert(path.clone(), stamp(bytes));
+    }
+    for path in &collected.deleted {
+        state::remove_base_file(state_dir, path)?;
+        state.files.remove(path);
+    }
+    state.base_commit = commit_sha.to_string();
+    state.ref_etag = None;
+    state.last_checked = Some(Utc::now());
+    state.push_direct_share(DirectShare {
+        sha: commit_sha.to_string(),
+        url,
+        title: title.to_string(),
+        shared_at: Utc::now(),
+        author_login: author_login.map(str::to_string),
+        files: collected.files.clone(),
+    });
+    state.save(state_dir)
+}
+
+/// Writes the folder at `paths` from the base copies: the write a pull would
+/// have made for a commit that just landed. A path with no base copy is
+/// removed from the folder. Every path goes through [`checked_working_path`],
+/// so a crafted path is refused rather than joined.
+pub fn materialise_base_paths(
+    domain_root: &Path,
+    state_dir: &Path,
+    paths: &[String],
+) -> Result<(), RemoteError> {
+    for rel in paths {
+        let wt_path = checked_working_path(state_dir, domain_root, rel)?;
+        match state::read_base_file(state_dir, rel)? {
+            Some(bytes) => write_working_file(&wt_path, &bytes)?,
+            None => remove_working_file(&wt_path)?,
+        }
+    }
+    Ok(())
 }
 
 /// The (added, updated, deleted) counts of the real work in a detected change

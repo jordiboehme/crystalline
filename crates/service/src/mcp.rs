@@ -5180,6 +5180,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::ProposalNotFound { .. }
         | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::StacksUnsupported
+        | RemoteError::NotFastForward { .. }
+        | RemoteError::BranchProtected { .. }
         | RemoteError::Refused(_)
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }
