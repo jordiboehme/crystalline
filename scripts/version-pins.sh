@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 #
-# The version moves three files together, and CI only ever checked two of them.
+# The version moves four files together, and CI used to check only two of them.
 #
 # The workspace Cargo.toml is the authority. fluid/package.json is compared
 # against it by the `fluid` job (the UI warns a reader about a version skew when
-# the two disagree), and docs/evolve.md carries three pins nothing read at all:
+# the two disagree), docs/evolve.md carries three pins nothing read at all:
 # the action ref users copy into their workflow, the binary version that
 # workflow downloads, and the prose that tells them pinning both is what makes
-# the check reproducible. A bump that updates two files of the three goes green
-# and ships, and every reader who copies the snippet pins the previous release.
+# the check reproducible, and release-notes/v<version>.md is the file the
+# tagged release workflow publishes as the release page's body - on main the
+# version is always the last released one, so a bump that lands without its
+# notes file fails here, in the release PR, before the tag exists rather than
+# in the tagged workflow after a build has already run.
 #
-# So this checks all three, and fails when a pin is missing as loudly as when
-# one is wrong: a docs rewrite that drops a pin must not read as agreement.
+# A bump that updates some of the four files goes green and ships, and every
+# reader who copies the docs/evolve.md snippet pins the previous release, or
+# the release page ends up untagged.
+#
+# So this checks all four, and fails when a pin is missing as loudly as when
+# one is wrong: a docs rewrite that drops a pin, or a release PR that forgets
+# the notes file, must not read as agreement.
 #
 #   bash scripts/version-pins.sh
 #
@@ -55,5 +63,18 @@ if [ "$fluid" != "$version" ]; then
   bad=1
 fi
 
+# release-notes/v<version>.md must exist, be non-empty and open with an H1
+# that carries text: the tagged release workflow's own `notes` job checks the
+# same three things before any build starts, and this is what catches a
+# missing file earlier, in the release PR, while it is still a one-line fix.
+notesfile="$root/release-notes/v$version.md"
+if [ ! -s "$notesfile" ]; then
+  echo "::error file=release-notes/v$version.md::release-notes/v$version.md is missing or empty. The workspace version on main is always the last released one, so this file is the body the release page for v$version shows; add it in this PR before the tag is pushed." >&2
+  bad=1
+elif ! head -1 "$notesfile" | grep -qE '^# .+'; then
+  echo "::error file=release-notes/v$version.md::release-notes/v$version.md must open with an H1 (a line starting with '# ' followed by text), the release's motto." >&2
+  bad=1
+fi
+
 [ "$bad" = "0" ] || exit 1
-echo "version pins: $version (Cargo.toml, 3 pins in docs/evolve.md, fluid/package.json)"
+echo "version pins: $version (Cargo.toml, 3 pins in docs/evolve.md, fluid/package.json, release-notes/v$version.md)"
