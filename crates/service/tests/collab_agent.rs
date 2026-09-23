@@ -686,6 +686,60 @@ async fn a_live_manifest_edit_reports_the_dropped_heading_and_the_findings() {
     );
 }
 
+/// The one way `write_engram` reaches a MANIFEST: a capture titled after it,
+/// with `overwrite`, while the MANIFEST is open in the editor. The capture's
+/// destination slugs to the MANIFEST's own permalink, so the live arm finds
+/// that room and replaces the document in it - and the receipt carries the
+/// MANIFEST rules' findings, which here start with the wrong type.
+#[tokio::test]
+async fn a_capture_that_replaces_an_open_manifest_reports_the_findings() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "manifest", None).await.unwrap();
+    let _doc = sync_client(&joined).await;
+    let before = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+
+    let receipt = engine
+        .write_engram(&WriteParams {
+            domain: "eng".to_string(),
+            title: "MANIFEST".to_string(),
+            content: "## Scope\n\n- Everything about eng\n".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec![],
+            status: None,
+            metadata: None,
+            overwrite: true,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .expect("the capture lands in the room");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+    let codes: Vec<&str> = receipt["manifest_findings"]
+        .as_array()
+        .expect("findings on the receipt")
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        codes.contains(&"M002") && codes.contains(&"M003"),
+        "{receipt}"
+    );
+    assert!(
+        receipt["guidance"]
+            .as_str()
+            .is_some_and(|g| g.contains("breaks routing")),
+        "{receipt}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        before,
+        "the file waits for the room's saver"
+    );
+}
+
 /// A room that is open over a DIFFERENT document leaves the ordinary write
 /// path exactly as it was: the live arm is asked about one document, not about
 /// the domain.

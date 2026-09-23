@@ -4448,10 +4448,23 @@ impl Engine {
             && let Some(rooms) = self.collab_rooms()
             && rooms.has_live_room(&p.domain, &permalink, overlay).await
         {
+            // **The one arm on which a capture can replace a MANIFEST**, so
+            // the one that reads it. A capture's destination is a slug, which
+            // is lowercase, so it never names `MANIFEST.md` itself - but it
+            // slugs to the MANIFEST's own permalink, and the room open over
+            // that permalink IS the MANIFEST's. What lands there is this
+            // capture's document, and the rules are owed their say about it
+            // exactly as an edit of the MANIFEST gets it.
+            let manifest_text = rel
+                .eq_ignore_ascii_case("MANIFEST.md")
+                .then(|| markdown.clone());
             let applied = rooms
                 .apply_text(&p.domain, &permalink, overlay, markdown, &actor, peer)
                 .await
                 .map_err(EngineError::Conflict)?;
+            if let Some(text) = manifest_text {
+                note_manifest_findings(&mut receipt, &text, domain_verify_config(&source).as_ref());
+            }
             if overlay.is_some() {
                 receipt["draft"] = json!(true);
             }
