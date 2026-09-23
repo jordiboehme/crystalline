@@ -383,6 +383,9 @@ pub async fn run_serve(
     );
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
     if let Some(park) = parked_blocking_task() {
+        // Said out loud, so the test that sets it can tell its own parked
+        // task from any other blocking work that happens to be running.
+        tracing::info!("test hook: parking a blocking task for {}s", park.as_secs());
         tokio::task::spawn_blocking(move || std::thread::sleep(park));
     }
 
@@ -702,10 +705,11 @@ pub async fn run_serve(
 /// How long a stopping daemon has from the moment it decides to stop to the
 /// moment its process is gone. Each shutdown step normally takes milliseconds;
 /// a step still running at the deadline is abandoned by [`Departure`]'s
-/// watchdog, which names it in the log and exits anyway. Ten seconds is the
-/// same patience a starting successor gives a departing holder of the index
-/// ([`STORE_LOCK_WAIT`]), so a successor that arrives during a stuck shutdown
-/// still finds the index free before it gives up.
+/// watchdog, which names it in the log and exits anyway. The deadline is the
+/// longest a stuck daemon keeps its ownership: the record, the socket and the
+/// service lock stay until [`Departure`] removes them, so a successor arriving
+/// in the meantime meets a held service lock rather than a held index, and
+/// once ownership goes the exit follows at once.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The end of a process that owns the index: a daemon's shutdown, or the
@@ -2738,11 +2742,10 @@ pub(crate) async fn open_store(
 ///
 /// A predecessor removes its ownership record before the index lock goes, so a
 /// successor can take ownership while the file is still held. From this
-/// release on that gap is the few instructions between [`Departure::finish`]
-/// removing the files and the process exiting, which is when the kernel drops
-/// the index lock; a daemon whose shutdown stalls is ended by the same
-/// watchdog after [`SHUTDOWN_DEADLINE`], which this wait matches. Older
-/// daemons are why the wait is still ten seconds and not a moment: they
+/// release on that gap is the few instructions between [`Departure`] removing
+/// the files and the process exiting, which is when the kernel drops the index
+/// lock, and that holds for a shutdown its watchdog ends too. Older daemons
+/// are why the wait is still ten seconds and not a moment: they
 /// removed the record first and then waited for their runtime to wind down,
 /// which on a loaded CI runner was long enough for a successor to fail
 /// outright, and they are what an upgrade meets. A holder that is not leaving

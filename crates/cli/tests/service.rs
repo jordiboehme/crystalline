@@ -660,6 +660,15 @@ fn a_stopping_daemon_does_not_wait_for_a_blocking_task() {
         .spawn()
         .unwrap();
     env.wait_ready();
+    // The hook parked its task before the socket came up. Checked, because a
+    // real model download may also be running here and would make the old
+    // shutdown linger by itself: without this line the test could pass for
+    // the wrong reason on a machine with no network.
+    let before = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    assert!(
+        before.contains("test hook: parking a blocking task for 60s"),
+        "the blocking task is parked before the daemon is asked to stop:\n{before}"
+    );
 
     let (ok, out) = env.run(&["ctl", "shutdown"]);
     assert!(ok, "ctl shutdown: {out}");
