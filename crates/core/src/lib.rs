@@ -28,6 +28,7 @@ pub mod parse;
 pub mod path;
 pub mod prompt;
 pub mod provision;
+pub mod relink;
 pub mod schema;
 pub mod similarity;
 pub mod skills;
@@ -36,7 +37,10 @@ pub mod temporal;
 pub mod verify;
 pub mod yaml;
 
-pub use address::{CrystallineUrl, LinkResolver, LookupTable, Resolution, ResolvedRef, slugify};
+pub use address::{
+    CrystallineUrl, LinkResolver, LookupTable, Resolution, ResolvedRef, path_permalink,
+    permalink_folder, slugify, validate_permalink,
+};
 pub use attachment::{
     ASSETS_FOLDER, ASSETS_PREFIX, AssetPathError, MAX_ATTACHMENT_BYTES, attachment_mime,
     canonical_asset_path, find_asset_refs, is_inline_attachment_mime, is_text_attachment_mime,
