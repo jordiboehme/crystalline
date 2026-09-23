@@ -454,7 +454,9 @@ enum Command {
         /// One of append, prepend, find_replace, replace_section,
         /// insert_before_section, insert_after_section, set_frontmatter.
         operation: String,
-        /// The content to add or the replacement. Read from stdin when omitted,
+        /// The content to add or the replacement. For the section operations
+        /// this is the section body; the heading line stays, so never repeat
+        /// it (a repeated heading is dropped). Read from stdin when omitted,
         /// except for set_frontmatter, which takes --key and --value instead.
         /// Accepts a value that begins with `-`.
         #[arg(long, allow_hyphen_values = true)]
