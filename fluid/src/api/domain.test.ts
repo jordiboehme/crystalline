@@ -113,7 +113,13 @@ describe("a manifest detail", () => {
     apiMock.mockResolvedValueOnce({ markdown: "# eng", checksum: "abc123" });
     const detail = await fetchManifestDetail("eng");
     expect(apiMock).toHaveBeenLastCalledWith("/domains/eng/manifest");
-    expect(detail).toEqual({ markdown: "# eng", checksum: "abc123" });
+    // A daemon that sends no sections leaves the editor with none, which is
+    // what the seeding path falls back from.
+    expect(detail).toEqual({
+      markdown: "# eng",
+      checksum: "abc123",
+      sections: null,
+    });
   });
 
   it("saves with a quoted If-Match", async () => {

@@ -3568,6 +3568,28 @@
                     "scope": [
                       "Everything about eng"
                     ],
+                    "starters": [
+                      {
+                        "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+                        "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+                        "section": "When to Use"
+                      },
+                      {
+                        "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+                        "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+                        "section": "Scope"
+                      },
+                      {
+                        "example": "## Provisioning\n\n- skills: skills",
+                        "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+                        "section": "Provisioning"
+                      },
+                      {
+                        "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+                        "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+                        "section": "Tag Aliases"
+                      }
+                    ],
                     "tag_aliases": null,
                     "when_to_use": [
                       "Route here for eng questions."
@@ -3702,6 +3724,28 @@
                     "routing": "when_to_use",
                     "scope": [
                       "Everything about eng"
+                    ],
+                    "starters": [
+                      {
+                        "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+                        "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+                        "section": "When to Use"
+                      },
+                      {
+                        "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+                        "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+                        "section": "Scope"
+                      },
+                      {
+                        "example": "## Provisioning\n\n- skills: skills",
+                        "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+                        "section": "Provisioning"
+                      },
+                      {
+                        "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+                        "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+                        "section": "Tag Aliases"
+                      }
                     ],
                     "tag_aliases": null,
                     "when_to_use": [
@@ -3884,6 +3928,28 @@
                     "routing": "when_to_use",
                     "scope": [
                       "Everything about kb"
+                    ],
+                    "starters": [
+                      {
+                        "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+                        "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+                        "section": "When to Use"
+                      },
+                      {
+                        "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+                        "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+                        "section": "Scope"
+                      },
+                      {
+                        "example": "## Provisioning\n\n- skills: skills",
+                        "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+                        "section": "Provisioning"
+                      },
+                      {
+                        "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+                        "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+                        "section": "Tag Aliases"
+                      }
                     ],
                     "tag_aliases": null,
                     "when_to_use": [
@@ -9472,7 +9538,8 @@
           "when_to_use",
           "routing",
           "missing",
-          "policies"
+          "policies",
+          "starters"
         ],
         "properties": {
           "missing": {
@@ -9510,6 +9577,13 @@
               "type": "string"
             },
             "description": "The `Scope` bullets; empty when the section is absent or empty."
+          },
+          "starters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StarterStanzaView"
+            },
+            "description": "Every MANIFEST section that carries meaning, with a line on what it\ndoes and an example that can be saved as it stands. Drawn from the\ncore registry rather than from this document, so it is sent whether or\nnot the MANIFEST declares any of them - and sent for a MANIFEST that\ndid not parse too, which is the one a reader most needs explained."
           },
           "tag_aliases": {
             "oneOf": [
@@ -10463,6 +10537,31 @@
             "type": "string",
             "description": "The provider's authorization endpoint, with PKCE, state and nonce.",
             "example": "https://idp.example/authorize?client_id=..."
+          }
+        }
+      },
+      "StarterStanzaView": {
+        "type": "object",
+        "description": "One MANIFEST section a reader can start: what it is for, and markdown\nthat parses as it stands.",
+        "required": [
+          "section",
+          "meaning",
+          "example"
+        ],
+        "properties": {
+          "example": {
+            "type": "string",
+            "description": "Markdown a person can save as it stands. The core crate's guard test\nparses every one of these back into the declaration it advertises.",
+            "example": "## Tag Aliases\n\n- k8s -> kubernetes"
+          },
+          "meaning": {
+            "type": "string",
+            "description": "One line, present tense: what the section does."
+          },
+          "section": {
+            "type": "string",
+            "description": "The H2 heading, as the parser matches it.",
+            "example": "Tag Aliases"
           }
         }
       },

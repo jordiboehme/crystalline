@@ -162,6 +162,24 @@ export interface ManifestSections {
    * parse: a document nobody can read declares nothing.
    */
   policies: PolicyView[];
+  /**
+   * Every MANIFEST section that carries meaning, with a line on what it does
+   * and an example a person can save as it stands. Sent whether or not this
+   * MANIFEST declares them, and sent for one that did not parse: the point is
+   * to show what CAN be configured. Empty from a daemon that predates them,
+   * which is the case each reader falls back from.
+   */
+  starters: StarterStanza[];
+}
+
+/** One startable MANIFEST section, as the server's registry describes it. */
+export interface StarterStanza {
+  /** The H2 heading, as the parser matches it. */
+  section: string;
+  /** One line, present tense: what the section does. */
+  meaning: string;
+  /** Markdown that parses as it stands, ready to be seeded into the editor. */
+  example: string;
 }
 
 /** One MANIFEST policy key, as the registry describes it beside what this MANIFEST says. */
@@ -233,6 +251,28 @@ function readPolicies(value: unknown): PolicyView[] {
   });
 }
 
+/**
+ * The startable sections, dropping a row that carries no section name for the
+ * reason `readPolicies` drops a row with no key: there is no box to head
+ * without one. The two describing fields fall back to empty, which every
+ * reader of them treats as nothing to say.
+ */
+function readStarters(value: unknown): StarterStanza[] {
+  return asArray(value).flatMap((entry) => {
+    const record = asObject(entry);
+    const section = asString(record?.section);
+    return section === null
+      ? []
+      : [
+          {
+            section,
+            meaning: asString(record?.meaning) ?? "",
+            example: asString(record?.example) ?? "",
+          },
+        ];
+  });
+}
+
 /** Read the `sections` member of a manifest payload, or null when it is not there. */
 export function readManifestSections(value: unknown): ManifestSections | null {
   const record = asObject(value);
@@ -275,6 +315,7 @@ export function readManifestSections(value: unknown): ManifestSections | null {
             problems: readProblems(aliases.problems),
           },
     policies: readPolicies(record.policies),
+    starters: readStarters(record.starters),
   };
 }
 
@@ -302,6 +343,14 @@ export interface ManifestDetail {
   markdown: string;
   /** sha256 of the markdown, the manifest save's If-Match token. */
   checksum: string | null;
+  /**
+   * The features the server read out of it, or null from a daemon that sends
+   * none. Read here as well as in `fetchManifest` because it is one endpoint
+   * answering both: the editor needs the startable sections to seed one into
+   * the buffer, and a second round trip for a list it was already sent would
+   * be a request made to avoid a field.
+   */
+  sections: ManifestSections | null;
 }
 
 /**
@@ -327,6 +376,7 @@ export async function fetchManifestDetail(
   return {
     markdown: asString(record?.markdown) ?? "",
     checksum: asString(record?.checksum),
+    sections: readManifestSections(record?.sections),
   };
 }
 
@@ -348,6 +398,7 @@ export async function saveManifest(
   return {
     markdown: asString(record?.markdown) ?? markdown,
     checksum: asString(record?.checksum),
+    sections: readManifestSections(record?.sections),
   };
 }
 

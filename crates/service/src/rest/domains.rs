@@ -23,7 +23,9 @@ use super::{
 };
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
-use crystalline_core::{Manifest, ProblemKind, TagAliasProblemKind, parse_engram, policy_registry};
+use crystalline_core::{
+    Manifest, ProblemKind, TagAliasProblemKind, parse_engram, policy_registry, starter_stanzas,
+};
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
 /// routing bullets, plus the behavior rules that govern them.
@@ -287,6 +289,12 @@ pub async fn tree(
                     "policies": [
                         { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
                         { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                    ],
+                    "starters": [
+                        { "section": "When to Use", "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.", "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works" },
+                        { "section": "Scope", "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.", "example": "## Scope\n\n- Infrastructure and deployment, not application code" },
+                        { "section": "Provisioning", "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.", "example": "## Provisioning\n\n- skills: skills" },
+                        { "section": "Tag Aliases", "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.", "example": "## Tag Aliases\n\n- k8s -> kubernetes" }
                     ]
                 }
             }),
@@ -395,6 +403,12 @@ pub struct ManifestSections {
     /// Empty for a MANIFEST that did not parse: a document nobody can read
     /// declares nothing.
     pub policies: Vec<PolicyView>,
+    /// Every MANIFEST section that carries meaning, with a line on what it
+    /// does and an example that can be saved as it stands. Drawn from the
+    /// core registry rather than from this document, so it is sent whether or
+    /// not the MANIFEST declares any of them - and sent for a MANIFEST that
+    /// did not parse too, which is the one a reader most needs explained.
+    pub starters: Vec<StarterStanzaView>,
 }
 
 /// Which routing section an agent reads.
@@ -487,6 +501,35 @@ pub struct PolicyView {
     pub changed_by: String,
 }
 
+/// One MANIFEST section a reader can start: what it is for, and markdown
+/// that parses as it stands.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StarterStanzaView {
+    /// The H2 heading, as the parser matches it.
+    #[schema(example = "Tag Aliases")]
+    pub section: String,
+    /// One line, present tense: what the section does.
+    pub meaning: String,
+    /// Markdown a person can save as it stands. The core crate's guard test
+    /// parses every one of these back into the declaration it advertises.
+    #[schema(example = "## Tag Aliases\n\n- k8s -> kubernetes")]
+    pub example: String,
+}
+
+/// The startable sections, straight off the core registry. Nothing about this
+/// document is read: the point of the list is what a MANIFEST CAN say, which
+/// is the same list for every domain and for a document that will not parse.
+fn starters() -> Vec<StarterStanzaView> {
+    starter_stanzas()
+        .iter()
+        .map(|stanza| StarterStanzaView {
+            section: stanza.section.to_string(),
+            meaning: stanza.meaning.to_string(),
+            example: stanza.example.to_string(),
+        })
+        .collect()
+}
+
 /// The registry rows, joined with what `manifest` declares. A key the manifest
 /// does not know is at its registry default, which is what an absent
 /// declaration means.
@@ -527,6 +570,10 @@ impl ManifestSections {
                 // Not the registry defaults: nothing here was declared, and
                 // nothing here can be, until the document parses again.
                 policies: Vec::new(),
+                // The starters are not read out of the document, so they
+                // survive a document that cannot be read: a reader looking at
+                // a broken MANIFEST still learns what it can be made to say.
+                starters: starters(),
             };
         };
         let manifest = Manifest::from_engram(&engram, markdown);
@@ -585,6 +632,7 @@ impl ManifestSections {
                     .collect(),
             }),
             policies: policies_of(&manifest),
+            starters: starters(),
         }
     }
 }
@@ -681,6 +729,12 @@ pub struct SaveManifestBody {
                     "policies": [
                         { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
                         { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                    ],
+                    "starters": [
+                        { "section": "When to Use", "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.", "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works" },
+                        { "section": "Scope", "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.", "example": "## Scope\n\n- Infrastructure and deployment, not application code" },
+                        { "section": "Provisioning", "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.", "example": "## Provisioning\n\n- skills: skills" },
+                        { "section": "Tag Aliases", "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.", "example": "## Tag Aliases\n\n- k8s -> kubernetes" }
                     ]
                 }
             }),
@@ -849,6 +903,12 @@ pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
                     "policies": [
                         { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
                         { "key": "sharing", "declared": "direct", "effective": "direct", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
+                    ],
+                    "starters": [
+                        { "section": "When to Use", "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.", "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works" },
+                        { "section": "Scope", "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.", "example": "## Scope\n\n- Infrastructure and deployment, not application code" },
+                        { "section": "Provisioning", "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.", "example": "## Provisioning\n\n- skills: skills" },
+                        { "section": "Tag Aliases", "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.", "example": "## Tag Aliases\n\n- k8s -> kubernetes" }
                     ]
                 }
             }),

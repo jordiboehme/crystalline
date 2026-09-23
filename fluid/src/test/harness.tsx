@@ -160,6 +160,44 @@ export function defaultPolicyRows(): PolicyRowFixture[] {
 }
 
 /**
+ * The startable sections as the server sends them: the core registry, whole,
+ * in its own order and independent of what any MANIFEST declares.
+ *
+ * A function rather than a constant for the reason the policy rows are one: a
+ * test that wants one section declared maps over a fresh copy.
+ */
+export function defaultStarterRows() {
+  return [
+    {
+      section: "When to Use",
+      meaning:
+        "Agents pick this domain by these bullets. Without one, nothing routes here.",
+      example:
+        "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+    },
+    {
+      section: "Scope",
+      meaning:
+        "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+      example:
+        "## Scope\n\n- Infrastructure and deployment, not application code",
+    },
+    {
+      section: "Provisioning",
+      meaning:
+        "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+      example: "## Provisioning\n\n- skills: skills",
+    },
+    {
+      section: "Tag Aliases",
+      meaning:
+        "Spellings that fold into one canonical tag, so a search for either finds both.",
+      example: "## Tag Aliases\n\n- k8s -> kubernetes",
+    },
+  ];
+}
+
+/**
  * The sections a server reads out of a domain's MANIFEST, in the wire shape.
  *
  * Shared rather than spelled per file: the domain screen and the policies
@@ -177,6 +215,7 @@ export function manifestSectionsResponse(
     provisioning: null,
     tag_aliases: null,
     policies: defaultPolicyRows(),
+    starters: defaultStarterRows(),
     ...overrides,
   };
 }

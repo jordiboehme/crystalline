@@ -1897,6 +1897,25 @@ async fn domain_manifest_honours_if_none_match() {
 /// Overwrite the fixture domain's MANIFEST on disk. The manifest route reads
 /// the file at request time, so no sync stands between the write and the
 /// next GET.
+/// The startable sections as the response carries them, built from the core
+/// registry rather than retyped: the wording of a stanza is pinned by the
+/// core guard test that parses each one back, and repeating it here would be
+/// a second copy to keep in step for no extra proof.
+fn starters_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        crystalline_core::manifest::starter_stanzas()
+            .iter()
+            .map(|stanza| {
+                serde_json::json!({
+                    "section": stanza.section,
+                    "meaning": stanza.meaning,
+                    "example": stanza.example,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn write_manifest(fixture: &Fixture, markdown: &str) {
     std::fs::write(fixture._tmp.path().join("eng/MANIFEST.md"), markdown).unwrap();
 }
@@ -1949,7 +1968,8 @@ async fn domain_manifest_carries_every_section_it_declares() {
             "policies": [
                 { "key": "generated_indexes", "declared": "shared", "effective": "shared", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
                 { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
-            ]
+            ],
+            "starters": starters_json()
         }),
         "{body}"
     );
@@ -1981,7 +2001,8 @@ async fn domain_manifest_names_what_it_lacks() {
             "policies": [
                 { "key": "generated_indexes", "declared": null, "effective": "local", "values": ["local", "shared"], "default": "local", "meaning": "Whether the generated folder listings travel with a share.", "changed_by": "owner" },
                 { "key": "sharing", "declared": null, "effective": "proposal", "values": ["proposal", "direct"], "default": "proposal", "meaning": "Whether a share opens a proposal for review or commits straight to the branch.", "changed_by": "owner" }
-            ]
+            ],
+            "starters": starters_json()
         }),
         "{body}"
     );
@@ -2045,6 +2066,18 @@ async fn an_unparseable_manifest_declares_no_policies() {
         body["sections"]["missing"],
         serde_json::json!(["Scope", "When to Use"]),
         "{body}"
+    );
+    // The startable sections come from the registry, not from the document,
+    // so they are there for the MANIFEST that most needs them: a reader
+    // looking at a broken file still learns what the file can say.
+    assert_eq!(body["sections"]["starters"], starters_json(), "{body}");
+    assert!(
+        body["sections"]["starters"]
+            .as_array()
+            .expect("starters travel with the sections")
+            .iter()
+            .any(|stanza| stanza["section"] == "Tag Aliases"),
+        "every startable section is offered, declared or not: {body}"
     );
 }
 

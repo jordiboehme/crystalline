@@ -2396,6 +2396,14 @@ export interface components {
             routing: components["schemas"]["RoutingSource"];
             /** @description The `Scope` bullets; empty when the section is absent or empty. */
             scope: string[];
+            /**
+             * @description Every MANIFEST section that carries meaning, with a line on what it
+             *     does and an example that can be saved as it stands. Drawn from the
+             *     core registry rather than from this document, so it is sent whether or
+             *     not the MANIFEST declares any of them - and sent for a MANIFEST that
+             *     did not parse too, which is the one a reader most needs explained.
+             */
+            starters: components["schemas"]["StarterStanzaView"][];
             tag_aliases?: null | components["schemas"]["TagAliasesView"];
             /** @description The `When to Use` bullets; empty when the section is absent or empty. */
             when_to_use: string[];
@@ -3071,6 +3079,27 @@ export interface components {
              * @example https://idp.example/authorize?client_id=...
              */
             location: string;
+        };
+        /**
+         * @description One MANIFEST section a reader can start: what it is for, and markdown
+         *     that parses as it stands.
+         */
+        StarterStanzaView: {
+            /**
+             * @description Markdown a person can save as it stands. The core crate's guard test
+             *     parses every one of these back into the declaration it advertises.
+             * @example ## Tag Aliases
+             *
+             *     - k8s -> kubernetes
+             */
+            example: string;
+            /** @description One line, present tense: what the section does. */
+            meaning: string;
+            /**
+             * @description The H2 heading, as the parser matches it.
+             * @example Tag Aliases
+             */
+            section: string;
         };
         /** @description One `old -> canonical` mapping, both sides verbatim. */
         TagAliasDeclView: {
@@ -6141,6 +6170,28 @@ export interface operations {
                      *         "scope": [
                      *           "Everything about eng"
                      *         ],
+                     *         "starters": [
+                     *           {
+                     *             "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+                     *             "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+                     *             "section": "When to Use"
+                     *           },
+                     *           {
+                     *             "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+                     *             "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+                     *             "section": "Scope"
+                     *           },
+                     *           {
+                     *             "example": "## Provisioning\n\n- skills: skills",
+                     *             "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+                     *             "section": "Provisioning"
+                     *           },
+                     *           {
+                     *             "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+                     *             "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+                     *             "section": "Tag Aliases"
+                     *           }
+                     *         ],
                      *         "tag_aliases": null,
                      *         "when_to_use": [
                      *           "Route here for eng questions."
@@ -6254,6 +6305,28 @@ export interface operations {
                      *         "routing": "when_to_use",
                      *         "scope": [
                      *           "Everything about eng"
+                     *         ],
+                     *         "starters": [
+                     *           {
+                     *             "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+                     *             "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+                     *             "section": "When to Use"
+                     *           },
+                     *           {
+                     *             "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+                     *             "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+                     *             "section": "Scope"
+                     *           },
+                     *           {
+                     *             "example": "## Provisioning\n\n- skills: skills",
+                     *             "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+                     *             "section": "Provisioning"
+                     *           },
+                     *           {
+                     *             "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+                     *             "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+                     *             "section": "Tag Aliases"
+                     *           }
                      *         ],
                      *         "tag_aliases": null,
                      *         "when_to_use": [
@@ -6409,6 +6482,28 @@ export interface operations {
                      *         "routing": "when_to_use",
                      *         "scope": [
                      *           "Everything about kb"
+                     *         ],
+                     *         "starters": [
+                     *           {
+                     *             "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+                     *             "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+                     *             "section": "When to Use"
+                     *           },
+                     *           {
+                     *             "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+                     *             "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+                     *             "section": "Scope"
+                     *           },
+                     *           {
+                     *             "example": "## Provisioning\n\n- skills: skills",
+                     *             "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+                     *             "section": "Provisioning"
+                     *           },
+                     *           {
+                     *             "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+                     *             "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+                     *             "section": "Tag Aliases"
+                     *           }
                      *         ],
                      *         "tag_aliases": null,
                      *         "when_to_use": [
