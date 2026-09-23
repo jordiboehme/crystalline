@@ -13,6 +13,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Guards the whole build against a tag with no notes to publish. A tag push
+  # with a missing, empty or motto-less release-notes/<tag>.md would otherwise
+  # sail through the entire build-and-package matrix and fail only at the very
+  # end, in `publish`, when `gh release create` has nothing to point
+  # --notes-file at. `scripts/version-pins.sh` catches the common case (the
+  # release PR forgot the file) earlier still, on main before the tag exists;
+  # this is the backstop for a tag pushed straight, or a tag re-pushed after a
+  # fix.
+  #
+  # workflow_dispatch has no tag and nothing to check, so the one step below
+  # is a no-op then and the job stays green, which is what keeps a manual dry
+  # run building end to end without a notes file.
+  notes:
+    name: verify the release notes file
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: The release notes file exists, is not empty and opens with an H1
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "not a tag push, nothing to verify"
+            exit 0
+          fi
+          file="release-notes/${{ github.ref_name }}.md"
+          if [ ! -s "$file" ]; then
+            echo "::error file=$file::$file is missing or empty. Add it and push the tag again (or, if the release PR already merged without it, add the file to main first)."
+            exit 1
+          fi
+          if ! head -1 "$file" | grep -qE '^# .+'; then
+            echo "::error file=$file::$file must open with an H1 (a line starting with '# ' followed by text), the release's motto. Fix the file and push the tag again."
+            exit 1
+          fi
+          echo "release notes: $file"
+
   # The Fluid bundle, built once for the whole release. It is JavaScript, so it
   # is the same bytes on every platform and there is no reason for six build
   # legs to each stand up a Node toolchain and produce it again. Every leg
@@ -21,6 +58,7 @@ jobs:
   # and the binary carries the copy.
   fluid-dist:
     name: build the fluid bundle
+    needs: notes
     runs-on: ubuntu-latest
     env:
       # Corepack fetches the pinned pnpm on first use, and the confirmation it
@@ -638,7 +676,7 @@ jobs:
           set -euo pipefail
           gh release create "${{ github.ref_name }}" release/* \
             --title "${{ github.ref_name }}" \
-            --generate-notes
+            --notes-file "release-notes/${{ github.ref_name }}.md"
 
   images:
     name: publish container images
