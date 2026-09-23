@@ -167,12 +167,17 @@ impl Fixture {
 
     /// The unresolved references the maintenance sweep reports in `domain`.
     async fn unresolved(&self, domain: &str) -> Vec<String> {
+        self.findings(domain, "V102").await
+    }
+
+    /// One rule's findings in `domain`, as permalink and evidence.
+    async fn findings(&self, domain: &str, rule: &str) -> Vec<String> {
         let v = self
             .engine
             .evolve_detect(
                 &EvolveParams {
                     domains: vec![domain.to_string()],
-                    rules: vec!["V102".to_string()],
+                    rules: vec![rule.to_string()],
                     limit: Some(50),
                     ..EvolveParams::default()
                 },
@@ -684,6 +689,15 @@ async fn issue_92_four_drifted_engrams_are_repaired_in_place() {
         f.glob(VELOG).await.is_empty(),
         "the glob misses every drifted engram"
     );
+    // And the sweep says so before the glob ever has to.
+    let drift = f.findings("notes", "V109").await;
+    assert_eq!(drift.len(), 4, "{drift:?}");
+    assert!(
+        drift
+            .iter()
+            .any(|row| row.contains("permalink=velog/setup; path=projects/velog/setup.md")),
+        "{drift:?}"
+    );
 
     for (path, _, permalink) in drifted {
         let receipt = f
@@ -719,6 +733,10 @@ async fn issue_92_four_drifted_engrams_are_repaired_in_place() {
         f.unresolved("notes").await.is_empty(),
         "every reference still resolves: {:?}",
         f.unresolved("notes").await
+    );
+    assert!(
+        f.findings("notes", "V109").await.is_empty(),
+        "and nothing has drifted any more"
     );
     // And a resync changes none of it: the files say what the rows say.
     f.sync().await;
