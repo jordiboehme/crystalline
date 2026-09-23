@@ -36,7 +36,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::extract::{FromRequestParts, Request, State};
@@ -1368,13 +1368,48 @@ enum Attempt {
 /// blocking pool, so a second, unbounded, source of it would defeat the cap
 /// rather than sit beside it. [`RestState::with_login_slot`] is how a handler
 /// outside this module reaches it.
+///
+/// The wait for a permit is bounded, which is the difference between a memory
+/// cap and a denial of service: an unbounded `acquire` let four junk logins
+/// park every permit while real sign-ins queued behind them for as long as the
+/// sender kept going. Past [`LOGIN_SLOT_WAIT`] a caller is told to come back
+/// instead of holding a connection open indefinitely.
 pub(super) async fn with_login_slot<F: Future>(
     slots: &Semaphore,
     work: F,
 ) -> Result<F::Output, ApiError> {
-    let _permit = slots.acquire().await.map_err(|_| {
-        ApiError::internal("the login limiter is closed, so this instance is shutting down")
-    })?;
+    with_login_slot_waiting(slots, LOGIN_SLOT_WAIT, work).await
+}
+
+/// How long a request waits for a password-checking permit before it is told
+/// to come back. Long enough that a real queue of household sign-ins clears,
+/// short enough that a parked connection is not a free way to hold one.
+const LOGIN_SLOT_WAIT: Duration = Duration::from_secs(10);
+
+/// [`with_login_slot`] with the wait as a parameter, so the refusal can be
+/// tested without a test that waits ten seconds for it.
+async fn with_login_slot_waiting<F: Future>(
+    slots: &Semaphore,
+    wait: Duration,
+    work: F,
+) -> Result<F::Output, ApiError> {
+    let permit = tokio::time::timeout(wait, slots.acquire()).await;
+    let _permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            return Err(ApiError::internal(
+                "the login limiter is closed, so this instance is shutting down",
+            ));
+        }
+        Err(_elapsed) => {
+            // A 503 rather than the throttle's 429: this one is about the
+            // instance being busy, not about this caller being slowed down.
+            return Err(ApiError::service_unavailable(
+                "this instance is busy checking other sign-ins - try again in a moment",
+            )
+            .retry_after(5));
+        }
+    };
     Ok(work.await)
 }
 
@@ -2157,6 +2192,33 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// **A caller does not queue forever for a password verification.**
+    ///
+    /// [`LOGIN_SLOTS`] is a memory cap, not a rate limit, and its `acquire`
+    /// waited without a bound: four junk logins could park every permit and
+    /// real sign-ins queued behind them for as long as the attacker kept
+    /// sending. The wait is driven short here rather than at its real ten
+    /// seconds, which is the only reason the inner function takes it.
+    #[tokio::test]
+    async fn a_full_login_queue_refuses_rather_than_hanging() {
+        let slots = Semaphore::new(1);
+        let held = slots.acquire().await.unwrap();
+        let refused = with_login_slot_waiting(&slots, Duration::from_millis(50), async {})
+            .await
+            .expect_err("a full queue answers rather than waiting");
+        assert_eq!(refused.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refused.retry_after,
+            Some(5),
+            "the refusal says when to come back"
+        );
+        drop(held);
+        // And the permit is takeable again the moment it is handed back.
+        with_login_slot_waiting(&slots, Duration::from_millis(50), async {})
+            .await
+            .expect("the freed permit is served");
     }
 
     /// The memory cap: however many logins arrive at once, only [`LOGIN_SLOTS`]
