@@ -1,6 +1,6 @@
 /**
- * The move dialog: a destination path prefilled with the engram's own
- * permalink and an optional target domain, landing on the engram at its new
+ * The move dialog: a destination path prefilled with the file the engram
+ * lives in and an optional target domain, landing on the engram at its new
  * address once the move answers.
  */
 
@@ -172,6 +172,142 @@ describe("the move dialog", () => {
       expect(within(landed).getByText("guides")).toBeInTheDocument();
     });
     expect(screen.queryByRole("dialog", { name: /move/i })).toBeNull();
+  });
+
+  it("repairs a permalink that drifted off its folder in place and says what followed", async () => {
+    const moved = vi.fn((init?: RequestInit) => {
+      expect(JSON.parse(init?.body as string)).toEqual({
+        permalink: "velog/alpha",
+        destination: "projects/velog/alpha",
+        new_permalink: "path",
+      });
+      return {
+        from: {
+          domain: "eng",
+          permalink: "velog/alpha",
+          path: "projects/velog/alpha.md",
+        },
+        to: {
+          domain: "eng",
+          permalink: "projects/velog/alpha",
+          path: "projects/velog/alpha.md",
+        },
+        cross_domain: false,
+        links_rewritten: 2,
+        references_rewritten: 3,
+      };
+    });
+    serve({
+      "/domains/eng/engrams/velog/alpha": () =>
+        detailResponse({
+          permalink: "velog/alpha",
+          path: "projects/velog/alpha.md",
+        }),
+      "/domains/eng/move": (_path, init) =>
+        init?.method === "POST" ? moved(init) : null,
+      "/domains/eng/engrams/projects/velog/alpha": () =>
+        detailResponse({
+          permalink: "projects/velog/alpha",
+          path: "projects/velog/alpha.md",
+        }),
+    });
+    renderApp("/d/eng/e/velog/alpha");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /move/i });
+
+    // Prefilled with the file, not the drifted address, and saying the
+    // permalink would stay: moving it nowhere changes nothing yet.
+    expect(within(dialog).getByLabelText("Destination path")).toHaveValue(
+      "projects/velog/alpha",
+    );
+    expect(within(dialog).getByText("velog/alpha")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Move engram" }),
+    ).toBeDisabled();
+
+    await userEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Update the permalink to match",
+      }),
+    );
+    expect(
+      within(dialog).getByText("projects/velog/alpha"),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Move engram" }),
+    );
+    await waitFor(() => {
+      expect(moved).toHaveBeenCalled();
+    });
+    expect(
+      await screen.findByRole("status", { name: "Moved" }),
+    ).toHaveTextContent("Rewrote 3 references in 2 engrams to point here.");
+  });
+
+  it("previews a draft keeping its permalink in a reviewing domain", async () => {
+    serve({
+      "/domains": () => {
+        const listing = domainsResponse();
+        return {
+          ...listing,
+          domains: listing.domains.map((entry) => ({
+            ...entry,
+            review: "overlay",
+          })),
+        };
+      },
+    });
+    renderApp("/d/eng/e/alpha");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /move/i });
+    await userEvent.clear(within(dialog).getByLabelText("Destination path"));
+    await userEvent.type(
+      within(dialog).getByLabelText("Destination path"),
+      "guides/alpha",
+    );
+    // The draft carries its address along unless asked, so the preview says
+    // "alpha" and the offer to match the folder is there.
+    expect(within(dialog).getByText("alpha")).toBeInTheDocument();
+    await userEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Update the permalink to match",
+      }),
+    );
+    expect(within(dialog).getByText("guides/alpha")).toBeInTheDocument();
+  });
+
+  it("offers no permalink update when the permalink already follows the file", async () => {
+    serve();
+    renderApp("/d/eng/e/alpha");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /move/i });
+    await userEvent.clear(within(dialog).getByLabelText("Destination path"));
+    await userEvent.type(
+      within(dialog).getByLabelText("Destination path"),
+      "guides/alpha",
+    );
+    // In step with its path, so it follows the file on its own.
+    expect(within(dialog).getByText("guides/alpha")).toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("checkbox", {
+        name: "Update the permalink to match",
+      }),
+    ).toBeNull();
   });
 
   it("moves the tree on, so the sidebar shows the new address", async () => {

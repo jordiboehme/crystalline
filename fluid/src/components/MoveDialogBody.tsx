@@ -1,8 +1,17 @@
 /**
- * Moving an engram: a destination path, prefilled with where it already
- * lives, and an optional target domain. The receipt names where it landed as
- * a file path, and the caller follows the engram there rather than being
- * left on a page that now 404s.
+ * Moving an engram: a destination path, prefilled with the file it already
+ * lives in, and an optional target domain. The receipt names the address it
+ * answers to afterwards, and the caller follows the engram there rather than
+ * being left on a page that now 404s.
+ *
+ * The permalink it will answer to is shown before the move is sent, worked
+ * out the way the engine works it out: one in step with the old path follows
+ * the file, a custom one stays. When the one that stays would sit in a
+ * different folder than the file, the dialog offers "Update the permalink to
+ * match", which asks the engine for the path's own - and with the destination
+ * left at the current path, that is the in-place repair for a permalink that
+ * drifted off its folder. A move rewrites every reference to the engram, and
+ * how many it rewrote is handed to the page the author lands on.
  *
  * A move that left attachments behind is the one case where following it
  * immediately would lose something. The receipt's warnings name files the
@@ -25,7 +34,13 @@ import { engramDetailKey } from "../api/engram";
 import type { MoveReceipt } from "../api/writes";
 import { moveEngram } from "../api/writes";
 import { engramRoute } from "../paths";
-import type { MoveDialogProps } from "./MoveDialog";
+import {
+  defaultMovedPermalink,
+  destinationFile,
+  pathPermalink,
+  permalinkFolder,
+} from "../permalink";
+import type { MoveDialogProps, MovedState } from "./MoveDialog";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
@@ -39,14 +54,42 @@ const BUTTON_CLASSES =
 export default function MoveDialogBody({
   engram,
   domains,
+  reviewing = false,
   onClose,
 }: MoveDialogProps): ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [destination, setDestination] = useState(engram.permalink);
+  // The file, not the permalink: the two differ exactly when a permalink has
+  // drifted, and prefilling the permalink would move the file to where the
+  // drifted address points instead of fixing the address.
+  const [destination, setDestination] = useState(
+    engram.path?.replace(/\.md$/i, "") ?? engram.permalink,
+  );
   const [targetDomain, setTargetDomain] = useState(engram.domain);
+  const [matchPermalink, setMatchPermalink] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const [warned, setWarned] = useState<MoveReceipt | null>(null);
+
+  const destFile = destinationFile(destination);
+  // In a reviewing domain the move lands in the author's draft, which keeps
+  // the address it carries unless one is asked for: the review pairs a moved
+  // draft with the team's engram by that address.
+  const kept = reviewing
+    ? engram.permalink
+    : defaultMovedPermalink(engram.permalink, engram.path, destination);
+  const ownPermalink = pathPermalink(destFile);
+  // Offered only when the permalink the default keeps names another folder
+  // than the file will sit in, which is the drift a folder glob misses.
+  const offerMatch =
+    destFile !== "" &&
+    ownPermalink !== "" &&
+    permalinkFolder(kept) !== permalinkFolder(ownPermalink);
+  const updatePermalink = offerMatch && matchPermalink;
+  const resulting = updatePermalink ? ownPermalink : kept;
+  const changesNothing =
+    targetDomain === engram.domain &&
+    destFile === engram.path &&
+    resulting === engram.permalink;
 
   /** Leave the dialog, refresh what the move changed and follow the engram. */
   const settle = (receipt: MoveReceipt): void => {
@@ -66,7 +109,21 @@ export default function MoveDialogBody({
         queryKey: domainTreeKey(receipt.domain),
       });
     }
-    void navigate(engramRoute(receipt.domain, receipt.permalink));
+    // A detail read cached under the NEW address could predate the move when
+    // the move only renamed the permalink in place; read it fresh.
+    void queryClient.invalidateQueries({
+      queryKey: engramDetailKey(receipt.domain, receipt.permalink),
+    });
+    const state: MovedState | undefined =
+      receipt.referencesRewritten > 0
+        ? {
+            moved: {
+              references: receipt.referencesRewritten,
+              engrams: receipt.linksRewritten,
+            },
+          }
+        : undefined;
+    void navigate(engramRoute(receipt.domain, receipt.permalink), { state });
   };
 
   const move = useMutation({
@@ -77,6 +134,7 @@ export default function MoveDialogBody({
         ...(targetDomain !== engram.domain
           ? { destination_domain: targetDomain }
           : {}),
+        ...(updatePermalink ? { new_permalink: "path" } : {}),
       }),
     onSuccess: (receipt) => {
       if (receipt.attachmentWarnings.length > 0) {
@@ -119,7 +177,7 @@ export default function MoveDialogBody({
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-slate-500 dark:text-slate-400">
             {warned === null
-              ? "Inbound bare links are rewritten to follow it."
+              ? "Every link to it follows it to the new address."
               : "The engram moved. These attachments did not come with it."}
           </Dialog.Description>
           {warned !== null ? (
@@ -166,7 +224,7 @@ export default function MoveDialogBody({
               className="mt-3 flex flex-col gap-3"
               onSubmit={(event) => {
                 event.preventDefault();
-                if (destination.trim() !== "" && !move.isPending) {
+                if (destFile !== "" && !changesNothing && !move.isPending) {
                   setProblem(null);
                   move.mutate();
                 }
@@ -209,6 +267,31 @@ export default function MoveDialogBody({
                   </select>
                 </label>
               )}
+              {offerMatch && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={matchPermalink}
+                    onChange={(event) => {
+                      setMatchPermalink(event.target.checked);
+                    }}
+                  />
+                  Update the permalink to match
+                </label>
+              )}
+              {/*
+                The address it will answer to, said before it is asked for:
+                a permalink is what every link and bookmark knows the engram
+                by, so a move that changes it should never be a surprise.
+              */}
+              {ownPermalink !== "" && (
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  <span className={LABEL_CLASSES}>
+                    Permalink after the move
+                  </span>{" "}
+                  <code className="break-all">{resulting}</code>
+                </p>
+              )}
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
@@ -219,7 +302,7 @@ export default function MoveDialogBody({
                 </button>
                 <button
                   type="submit"
-                  disabled={destination.trim() === "" || move.isPending}
+                  disabled={destFile === "" || changesNothing || move.isPending}
                   className={BUTTON_CLASSES}
                 >
                   Move engram

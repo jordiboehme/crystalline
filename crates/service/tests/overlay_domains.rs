@@ -2489,6 +2489,7 @@ async fn every_write_verb_lands_in_the_draft_and_none_of_them_touches_the_tree()
                 domain: "team".to_string(),
                 destination: "archive/plan.md".to_string(),
                 destination_domain: None,
+                permalink: None,
                 update_links: None,
             },
             &alice,
@@ -3096,6 +3097,7 @@ async fn a_mirror_that_fails_never_unsays_a_draft_that_landed() {
                 domain: "team".to_string(),
                 destination: "archive/plan.md".to_string(),
                 destination_domain: None,
+                permalink: None,
                 update_links: None,
             },
             &alice,
@@ -3770,6 +3772,7 @@ async fn a_draft_never_takes_a_permalink_another_path_holds() {
                 domain: "team".to_string(),
                 destination: "archive/rota.md".to_string(),
                 destination_domain: None,
+                permalink: None,
                 update_links: None,
             },
             &alice,
@@ -5800,6 +5803,7 @@ async fn a_rename_inside_one_overlay_previews_clean_and_folds_clean() {
                 domain: "team".to_string(),
                 destination: "archive/plan.md".to_string(),
                 destination_domain: None,
+                permalink: None,
                 update_links: None,
             },
             &alice,
@@ -6200,6 +6204,7 @@ async fn one_view_answers_the_fold_the_share_the_sweep_and_the_browse() {
                 domain: "team".to_string(),
                 destination: "archive/moving.md".to_string(),
                 destination_domain: None,
+                permalink: None,
                 update_links: None,
             },
             &owner,
@@ -7477,5 +7482,45 @@ async fn setting_a_policy_in_a_reviewing_domain_is_a_draft_of_the_manifest() {
             .iter()
             .any(|c| c["path"] == "MANIFEST.md"),
         "the draft MANIFEST is what the share carries: {plan}"
+    );
+}
+
+/// A section edit of the MANIFEST in a reviewing domain lands in the actor's
+/// draft, and its receipt reports what any other landing reports: the heading
+/// it dropped, and what the MANIFEST rules find in the draft's text. A draft
+/// is a proposal about the domain's routing, and the agent writing it is the
+/// one to hear that the proposal would break it.
+#[tokio::test]
+async fn a_draft_manifest_edit_reports_the_dropped_heading_and_the_findings() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let receipt = f
+        .engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "manifest".to_string(),
+                domain: "team".to_string(),
+                operation: "replace_section".to_string(),
+                section: Some("## When to Use".to_string()),
+                content: Some("## When to Use\n".to_string()),
+                ..EditParams::default()
+            },
+            Some("claude-code/2.0-for-alice"),
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["draft"], true, "{receipt}");
+    assert_eq!(receipt["heading_stripped"], "## When to Use", "{receipt}");
+    assert!(
+        receipt["manifest_findings"]
+            .as_array()
+            .is_some_and(|findings| findings.iter().any(|f| f["code"] == "M004")),
+        "{receipt}"
+    );
+    // The folder still says what the team reviewed.
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("team/MANIFEST.md")).unwrap(),
+        MANIFEST
     );
 }

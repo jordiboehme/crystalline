@@ -43,7 +43,7 @@ pub(crate) fn effective_permalink(file: &ScannedFile, engram: &Engram) -> String
         .permalink
         .clone()
         .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| address::slugify(&file.rel_path.to_string_lossy()))
+        .unwrap_or_else(|| address::path_permalink(&file.rel_path.to_string_lossy()))
 }
 
 /// `file_lines` holds each file's engram body tokenized once by the verify

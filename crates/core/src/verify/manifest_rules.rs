@@ -8,9 +8,11 @@
 //! the identical structural checks to any other file it wants enforced (a
 //! glossary, a runbook index, and so on).
 
+use std::path::Path;
+
 use indexmap::IndexMap;
 
-use crate::engram::Heading;
+use crate::engram::{Engram, Heading};
 use crate::manifest::{
     GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, ProblemKind, ProvisioningSection,
     SHARING_KEY, Sharing, TagAliasSection, in_root_artifact_dirs,
@@ -46,10 +48,34 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
     };
     let file = &domain.files[idx];
     let Ok(engram) = &file.parsed else { return };
+    check_manifest_text(&file.path, &file.source, engram, Some(&domain.root), sink);
+}
 
+/// Every MANIFEST rule that reads the MANIFEST's own text, over one parsed
+/// MANIFEST: `M002`-`M007`, `M101`-`M104`, `M106`, `M107`, and `M105` when
+/// `root` names a folder to look in.
+///
+/// The one body both callers share, so what validate reports about a
+/// MANIFEST and what an edit receipt reports about the MANIFEST it just
+/// changed can never disagree: [`check_manifest`] runs it over the file a
+/// scan found, [`super::check_manifest_source`] over a text in hand. `M001`
+/// (the file is missing) stays with the scan, since a text in hand exists.
+///
+/// `root` is the domain folder, for the one rule that looks at the disk
+/// rather than the text - `M105`, a provisioned folder that does not exist.
+/// `None` skips it: a draft, a live co-editing document or a virtual domain
+/// has no folder the text describes, and a rule that stats paths is a claim
+/// about a disk, not about the text.
+pub(crate) fn check_manifest_text(
+    path: &Path,
+    source: &str,
+    engram: &Engram,
+    root: Option<&Path>,
+    sink: &mut Sink,
+) {
     if engram.frontmatter.engram_type != "manifest" {
         sink.emit(
-            &file.path,
+            path,
             None,
             "M002",
             Severity::Error,
@@ -61,10 +87,10 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
         );
     }
 
-    let manifest = Manifest::from_engram(engram, &file.source);
+    let manifest = Manifest::from_engram(engram, source);
     for missing in manifest.missing_required_sections() {
         sink.emit(
-            &file.path,
+            path,
             None,
             "M003",
             Severity::Error,
@@ -78,7 +104,7 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
             && bullets.is_empty()
         {
             sink.emit(
-                &file.path,
+                path,
                 None,
                 "M004",
                 Severity::Error,
@@ -90,7 +116,7 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
 
     if manifest.when_to_use().is_empty() && !manifest.scope().is_empty() {
         sink.emit(
-            &file.path,
+            path,
             None,
             "M101",
             Severity::Warning,
@@ -103,7 +129,7 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
         for bullet in bullets {
             if bullet.chars().count() > DEFAULT_MAX_BULLET_LENGTH {
                 sink.emit(
-                    &file.path,
+                    path,
                     None,
                     "M102",
                     Severity::Warning,
@@ -118,11 +144,11 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
     }
 
     if let Some(section) = manifest.provisioning() {
-        check_provisioning(&section, &file.path, &domain.root, sink);
+        check_provisioning(&section, path, root, sink);
     }
 
     if let Some(section) = manifest.tag_aliases() {
-        check_tag_aliases(&section, &file.path, sink);
+        check_tag_aliases(&section, path, sink);
     }
 
     // `M006`: a `generated_indexes` value that spells neither policy. It is an
@@ -134,7 +160,7 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
         && GeneratedIndexes::parse(declared).is_none()
     {
         sink.emit(
-            &file.path,
+            path,
             None,
             "M006",
             Severity::Error,
@@ -160,7 +186,7 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
         && Sharing::parse(declared).is_none()
     {
         sink.emit(
-            &file.path,
+            path,
             None,
             "M007",
             Severity::Error,
@@ -177,18 +203,19 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
         );
     }
 
-    check_duplicate_h2(&engram.headings, &file.path, sink);
+    check_duplicate_h2(&engram.headings, path, sink);
 }
 
 /// The `## Provisioning` rules. Parse problems route to a rule by their
 /// [`ProblemKind`] so no message text is matched: an invalid path is an error
 /// (`M005`, never provisioned), an unknown type is a warning (`M104`) and a
 /// malformed or duplicate bullet is a warning (`M106`). `M105` then warns about
-/// a valid decl whose in-root folder is missing on disk.
+/// a valid decl whose in-root folder is missing on disk, when there is a
+/// `root` to look in (see [`check_manifest_text`]).
 fn check_provisioning(
     section: &ProvisioningSection,
-    path: &std::path::Path,
-    root: &std::path::Path,
+    path: &Path,
+    root: Option<&Path>,
     sink: &mut Sink,
 ) {
     for problem in &section.problems {
@@ -212,6 +239,7 @@ fn check_provisioning(
     // legitimately lacks it, since a state-dir mirror provides the folder, so a
     // disk check would warn spuriously. `in_root_artifact_dirs` is the single
     // source that decides in-root membership, shared with the scan exclusion.
+    let Some(root) = root else { return };
     for dir in in_root_artifact_dirs(root) {
         if !dir.exists() {
             let shown = dir.strip_prefix(root).unwrap_or(&dir).display();

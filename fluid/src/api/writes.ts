@@ -12,6 +12,7 @@
 import { ApiProblem, api, encodeSegment, engramPath } from "./client";
 import type { EngramDetail } from "./engram";
 import { readEngramDetail } from "./engram";
+import { pathPermalink } from "../permalink";
 import { asObject, asString, asStrings } from "./json";
 import type {
   CreateEngramBody,
@@ -143,7 +144,10 @@ export interface MoveReceipt {
   domain: string;
   permalink: string;
   crossDomain: boolean;
+  /** How many engrams had references to the moved one rewritten. */
   linksRewritten: number;
+  /** How many references inside those engrams were rewritten. */
+  referencesRewritten: number;
   /**
    * What the move could not carry with it, in the engine's own words: an
    * attachment the engram still references that stayed in the old domain. The
@@ -155,9 +159,10 @@ export interface MoveReceipt {
 }
 
 /**
- * Move an engram. The receipt names the destination as a file path; the
- * permalink is that path without its `.md` suffix, which is the rule the
- * engine derives permalinks by.
+ * Move an engram. The receipt names the address the engram answers to after
+ * the move, which is not always its path without the `.md` suffix: a custom
+ * permalink can stay while the file moves. Only a receipt that names none - an
+ * older server - falls back to the path's own slug.
  */
 export async function moveEngram(
   domain: string,
@@ -172,10 +177,14 @@ export async function moveEngram(
   const path = asString(to?.path) ?? body.destination;
   return {
     domain: asString(to?.domain) ?? body.destination_domain ?? domain,
-    permalink: path.replace(/\.md$/, ""),
+    permalink: asString(to?.permalink) ?? pathPermalink(path),
     crossDomain: record?.cross_domain === true,
     linksRewritten:
       typeof record?.links_rewritten === "number" ? record.links_rewritten : 0,
+    referencesRewritten:
+      typeof record?.references_rewritten === "number"
+        ? record.references_rewritten
+        : 0,
     attachmentWarnings: asStrings(record?.attachment_warnings),
   };
 }

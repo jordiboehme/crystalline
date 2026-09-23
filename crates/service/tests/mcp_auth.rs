@@ -1223,9 +1223,10 @@ const VIS_LAB_MANIFEST: &str = "---\ntype: manifest\ntitle: lab\npermalink: mani
 const VIS_OPEN_NOTE: &str = "---\ntype: engram\ntitle: Open Note\npermalink: open-note\ntags:\n  - shared\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Open Note\n\n- [decision] the shared thing is public #shared\n";
 /// The private engram, written so a cross-domain move of `open-note` reaches
 /// into it. The prefixed `[[open:Open Note]]` relation is what resolves, so
-/// this file is one of the inbound references the move gathers; the bare
-/// `[[Open Note]]` in its prose is what the rewrite would then replace, which
-/// is the side effect the mover's scope has to bound. Its third link resolves
+/// this file is one of the inbound references the move gathers, and the
+/// rewrite would repoint that relation at the new domain, which is the side
+/// effect the mover's scope has to bound. The bare `[[Open Note]]` in its
+/// prose resolves inside `lab` and is never rewritten. Its third link resolves
 /// to nothing, so the maintenance sweep has something to find in `lab` and a
 /// sweep that reached in would say so.
 const VIS_LAB_NOTE: &str = "---\ntype: dossier\ntitle: Lab Note\npermalink: lab-note\ntags:\n  - confidential\nstatus: stable\nrecorded_at: 2026-01-03\n---\n\n# Lab Note\n\n- [secret] the secret formula is here #confidential\n- relates_to [[open:Open Note]]\n- relates_to [[Nothing Here At All]]\n\nSee also [[Open Note]] for the shared half.\n";
@@ -1744,17 +1745,15 @@ async fn an_instance_viewers_agent_is_refused_and_an_admins_is_not() {
 /// **A cross-domain move rewrites links only where the mover can see, and only
 /// the links it is for.**
 ///
-/// Two rules hold this test up now and it is worth saying which does the work:
-/// `lab`'s references to the moved engram are a prefixed `[[open:Open Note]]`
-/// and a bare `[[Open Note]]` that resolves inside `lab` and never pointed
-/// here, so NEITHER is a link this rewrite repairs, whoever asks. The scope
-/// skip is a second line of defence behind that (see the note at the skip in
-/// `Engine::move_engram`), and its converse is pinned by
-/// `an_admins_move_rewrites_the_bare_link_in_the_domain_left_behind`, where an
-/// admin's move does repair the link that actually dangles.
+/// The scope skip is what does the work here. `lab` holds a prefixed
+/// `[[open:Open Note]]` that pointed at the moved engram and dangles once it
+/// leaves `open`, so a mover who could see `lab` would repoint it - which
+/// `an_admins_move_rewrites_the_bare_link_in_the_domain_left_behind` pins for
+/// an admin. The bare `[[Open Note]]` beside it resolves inside `lab` and never
+/// pointed here, so nobody's move touches that one.
 ///
-/// Moving an engram between domains rewrites every bare `[[target]]` that
-/// pointed at it into the prefixed form, and those linking engrams were not
+/// A move is a refactoring: every reference that pointed at the moved engram
+/// follows it to its new address, and those referencing engrams were not
 /// written by whoever asked for the move. A linking engram in a domain the
 /// mover may not see is therefore left exactly as it was - dangling, which its
 /// own members see as an unresolved-reference finding on their next sweep -
@@ -1763,6 +1762,15 @@ async fn an_instance_viewers_agent_is_refused_and_an_admins_is_not() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_strangers_move_leaves_a_hidden_domains_link_alone() {
     let ctx = mcp_ctx(true).await;
+    // A reference no edge table records: the move finds it by content, which
+    // is a second route into other domains and has to stop at the same wall.
+    std::fs::write(
+        ctx.path("lab", "url-note.md"),
+        "---\ntype: engram\ntitle: Url Note\npermalink: url-note\ntags:\n  - confidential\nstatus: stable\nrecorded_at: 2026-01-05\n---\n\n# Url Note\n\nThe shared half lives at crystalline://open/open-note for now.\n",
+    )
+    .unwrap();
+    ctx.engine.sync(None).await.unwrap();
+    let url_before = std::fs::read_to_string(ctx.path("lab", "url-note.md")).unwrap();
     let token = ctx.token_for("out").await;
     let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
     let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
@@ -1795,20 +1803,29 @@ async fn a_strangers_move_leaves_a_hidden_domains_link_alone() {
         before,
         "the private engram's link is byte-for-byte what it was"
     );
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "url-note.md")).unwrap(),
+        url_before,
+        "and so is the private URL the content scan found"
+    );
+    assert!(
+        moved.contains("references_rewritten\\\":0"),
+        "counted nowhere either:\n{moved}"
+    );
 }
 
 /// The converse, so the skip above is the scope rather than a broken rewrite:
 /// an admin sees every domain, and the same move repairs what it should.
 ///
-/// What it should repair is a BARE link in the domain the engram is LEAVING:
-/// that link resolved at home and now points at nothing, which is the dangle
-/// this rewrite exists for. `lab`'s two references are deliberately not that -
-/// `[[open:Open Note]]` named its domain, and the bare `[[Open Note]]` beside
-/// it never pointed here at all, since a bare link resolves in its own domain -
-/// so neither is touched even by a caller who sees everything. Rewriting the
-/// second used to be counted as a success, because the needle built from the
-/// prefixed reference's target text found the bare one sitting in the same
-/// file; this pair now pins the absence of that.
+/// What it should repair is every reference that pointed at the engram: the
+/// bare link in the domain it is LEAVING, which resolved at home and now
+/// points at nothing, gains the new domain's prefix; `lab`'s prefixed
+/// `[[open:Open Note]]` named the old domain and now names the new one. The
+/// bare `[[Open Note]]` in `lab` never pointed here at all, since a bare link
+/// resolves in its own domain, so it stays byte-for-byte what it was even for
+/// a caller who sees everything. A needle built from the prefixed
+/// reference's target text once found that bare one and rewrote it too; the
+/// rewrite now reads each link's own brackets, and this pins that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admins_move_rewrites_the_bare_link_in_the_domain_left_behind() {
     let ctx = mcp_ctx(true).await;
@@ -1834,20 +1851,26 @@ async fn an_admins_move_rewrites_the_bare_link_in_the_domain_left_behind() {
         )
         .await;
     assert!(
-        moved.contains("links_rewritten\\\":1"),
-        "an admin's move repairs the link that now dangles:\n{moved}"
+        moved.contains("links_rewritten\\\":2") && moved.contains("references_rewritten\\\":2"),
+        "an admin's move repairs both references that now dangle:\n{moved}"
     );
     assert!(
         std::fs::read_to_string(ctx.path("open", "linker.md"))
             .unwrap()
             .contains("[[second:Open Note]]"),
-        "and the link is prefixed"
+        "and the bare link is prefixed"
     );
     assert_eq!(
-        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
-        before,
-        "while the references that were never bare links to this engram are \
-         byte-for-byte what they were"
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md"))
+            .unwrap()
+            .split("\n---\n")
+            .nth(1),
+        before
+            .replace("[[open:Open Note]]", "[[second:Open Note]]")
+            .split("\n---\n")
+            .nth(1),
+        "the prefixed relation follows the engram, while the bare link that \
+         never pointed here is byte-for-byte what it was"
     );
 }
 

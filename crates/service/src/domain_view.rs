@@ -49,6 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+use crystalline_core::emit::{set_frontmatter_field, touch_generated};
 use crystalline_core::{CrystallineUrl, parse_engram};
 use crystalline_index::{
     AttachmentRow, BrowseLevel, DomainId, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
@@ -898,6 +899,20 @@ impl<'a> DomainView<'a> {
     /// reviewer anywhere else - so carrying one across would either write into
     /// a domain that never reviewed it or leave the engram in two places at
     /// once, and the refusal names the order that works instead.
+    ///
+    /// `new_permalink` is the permalink the caller asked for, `None` when they
+    /// named none. Unnamed, the document travels verbatim and keeps the
+    /// address it carries, which is how a later fold recognizes the draft as
+    /// a move of the team's engram. Named, it is written into the draft's
+    /// `permalink:` line when the text would not answer to it on its own, with
+    /// `mover` in its `generated` block, exactly as a direct move writes it. A
+    /// destination equal to the source path is the permalink-only rename, and
+    /// in a draft that is one write rather than two: the draft at that path
+    /// with its new `permalink:` line. References in other engrams are not
+    /// rewritten here - each of those would be a draft of its own, of an
+    /// engram the mover never opened - so they follow when the move is shared
+    /// and moved by the team, and `links_rewritten` stays 0.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn move_within(
         &self,
         p: &MoveParams,
@@ -905,6 +920,8 @@ impl<'a> DomainView<'a> {
         src_source: &ContentSource,
         dest_rel: &str,
         cross: bool,
+        new_permalink: Option<&str>,
+        mover: &str,
     ) -> Result<Value> {
         let actor = self.writing_actor()?;
         if cross {
@@ -915,7 +932,8 @@ impl<'a> DomainView<'a> {
                 p.domain
             )));
         }
-        if dest_rel == src.path {
+        let in_place = dest_rel == src.path;
+        if in_place && new_permalink.is_none_or(|asked| asked == src.permalink) {
             return Err(EngineError::Invalid(
                 "the destination is where the engram already is".into(),
             ));
@@ -923,8 +941,9 @@ impl<'a> DomainView<'a> {
         // Free in THIS actor's view, which is the only view the move happens
         // in: a path another actor is drafting at is not taken for this one,
         // and a base row at the destination is, since the moved engram would
-        // shadow it rather than land beside it.
-        {
+        // shadow it rather than land beside it. An in-place rename is its own
+        // destination.
+        if !in_place {
             let store = self.engine.store();
             let store = store.lock().await;
             let taken = store
@@ -952,12 +971,26 @@ impl<'a> DomainView<'a> {
         })?;
         // Where the engram would answer from once it has moved: the document
         // travels verbatim, so the address travels with it unless the
-        // frontmatter never carried one and the path's own slug is it.
-        let dest_permalink = parse_engram(&text)
+        // frontmatter never carried one and the path's own slug is it - and
+        // when the caller named another, the draft's `permalink:` line is
+        // rewritten to say so.
+        let implied = parse_engram(&text)
             .map(|engram| {
                 EngramRecord::from_engram(&engram, dest_rel, virtual_stamp(&text)).permalink
             })
             .unwrap_or_else(|_| src.permalink.clone());
+        let (text, dest_permalink) = match new_permalink {
+            Some(asked) if asked != implied => (
+                touch_generated(
+                    &set_frontmatter_field(&text, "permalink", asked),
+                    mover,
+                    None,
+                    chrono::Utc::now().fixed_offset(),
+                ),
+                asked.to_string(),
+            ),
+            _ => (text, implied),
+        };
         // Asked BEFORE either write, although the writer below asks it again:
         // a move is two writes, and a refusal that arrived at the second one
         // would already have tombstoned or dropped the source, leaving the
@@ -971,6 +1004,24 @@ impl<'a> DomainView<'a> {
             Some(&src.path),
         )
         .await?;
+        // The permalink-only rename: one write, the draft at the path it
+        // already has, answering to its new name. Nothing is tombstoned and no
+        // grant ends, since a grant was minted on the path and the path stays.
+        if in_place {
+            let warning = self.write(src.domain_id, &src.path, &text).await?;
+            let mut receipt = json!({
+                "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
+                "to": { "domain": p.domain, "permalink": dest_permalink, "path": src.path },
+                "cross_domain": false,
+                "links_rewritten": 0,
+                "references_rewritten": 0,
+                "rewritten": Vec::<Value>::new(),
+                "attachment_warnings": Vec::<String>::new(),
+                "draft": true,
+            });
+            note_unmirrored(&mut receipt, warning);
+            return Ok(receipt);
+        }
         // The SOURCE first, and the order is forced rather than preferred: one
         // actor holds one row per permalink per domain, and until the source is
         // a tombstone (which answers to no permalink) or gone, the engram's own
@@ -1066,6 +1117,8 @@ impl<'a> DomainView<'a> {
             "to": { "domain": p.domain, "permalink": dest_permalink, "path": dest_rel },
             "cross_domain": false,
             "links_rewritten": 0,
+            "references_rewritten": 0,
+            "rewritten": Vec::<Value>::new(),
             "attachment_warnings": Vec::<String>::new(),
             "draft": true,
         });

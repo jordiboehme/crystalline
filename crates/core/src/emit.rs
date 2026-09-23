@@ -760,19 +760,117 @@ fn resolve_path(headings: &[HeadingSpan], path: &str) -> Option<usize> {
     matched
 }
 
+/// A section edit, with what the guard took out of the content on its way in.
+///
+/// Returned by the reporting variants of the two section edits that place
+/// content under a heading that stays, [`replace_section_reporting`] and
+/// [`insert_after_section_reporting`], for a caller that owes its own caller a
+/// sentence about it: an agent that sent the heading again is told it was
+/// dropped, so it sends only the body next time instead of learning nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionEdit {
+    /// The edited document.
+    pub text: String,
+    /// The target section's heading line, spelled with the document's own
+    /// level and text (`## When to Use`, or `### Auth` for the path
+    /// `## API > ### Auth`), when the content opened with a repeat of it and
+    /// that repeat was dropped. `None` when the content was placed as sent.
+    pub heading_stripped: Option<String>,
+}
+
+/// Drop a repeat of the target section's own heading from the top of
+/// `content`, for the two section edits whose content lands under a heading
+/// that stays.
+///
+/// **Why this exists.** `replace_section` keeps the heading line and replaces
+/// what is under it, and `insert_after_section` puts its content right under
+/// that same line. An agent that reads "the replacement text for a section" as
+/// the whole section sends the heading along, and the result is the heading
+/// twice: `## When to Use`, a blank line, `## When to Use` again, then the
+/// bullets. The first of the two is now an empty section, and in a MANIFEST
+/// that is the quiet kind of broken - the reader keeps the first of two
+/// same-named sections on purpose, so routing reads nothing and every session
+/// that connects is routed on nothing. Nobody sends the same heading twice on
+/// purpose, so the repeat is dropped rather than refused, and the caller is
+/// told (see [`SectionEdit::heading_stripped`]).
+///
+/// **What counts as a repeat.** After any leading blank lines, the first line
+/// must parse as an ATX heading - with the parser the heading walker runs, so
+/// closing `#`s and up to three spaces of indent read the same way - with the
+/// target's level and the target's text, compared the way a heading path is
+/// resolved: exactly, or ASCII case-insensitively. That line and the blank
+/// lines after it are dropped. Anything else is placed as sent:
+///
+/// - a heading of another level or other text, which opens a new subsection
+///   and is legitimate content;
+/// - a matching heading further down, which is the author's own structure;
+/// - a heading inside a fenced block at the top. That needs no fence walk: the
+///   block's first line is its fence, and a fence never parses as a heading.
+///
+/// `insert_before_section` is deliberately not guarded: its content lands
+/// above the heading, where a same-named heading makes a second section rather
+/// than a doubled heading under one, and that is a thing an author can mean.
+fn strip_repeated_heading<'a>(target: &HeadingSpan, content: &'a str) -> (&'a str, Option<String>) {
+    let rest = skip_blank_lines(content);
+    let (first, after) = rest.split_once('\n').unwrap_or((rest, ""));
+    let Some((level, text)) = parse_heading(first.trim_end_matches('\r')) else {
+        return (content, None);
+    };
+    if level != target.level || !(text == target.text || text.eq_ignore_ascii_case(&target.text)) {
+        return (content, None);
+    }
+    let heading = format!("{} {}", "#".repeat(usize::from(level)), target.text);
+    // The blank lines between the dropped heading and the body go with it, so
+    // the body sits under the kept heading exactly as a body sent on its own
+    // would. Whole lines only: trimming characters would eat the indent of an
+    // indented first line.
+    (skip_blank_lines(after), Some(heading))
+}
+
+/// `text` past its leading blank lines, whole lines at a time. A text that is
+/// nothing but blank lines comes back empty.
+fn skip_blank_lines(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        match rest.split_once('\n') {
+            Some((line, after)) if line.trim().is_empty() => rest = after,
+            Some(_) => return rest,
+            None if rest.trim().is_empty() => return "",
+            None => return rest,
+        }
+    }
+}
+
 /// Replace the content under a section addressed by heading path. By default
 /// deeper subsections are preserved; pass `include_subsections` to replace
 /// them too.
+///
+/// The heading line itself always stays, and `new_content` is the body that
+/// goes under it: a repeat of the heading at the top of `new_content` is
+/// dropped (see `strip_repeated_heading`). [`replace_section_reporting`] is
+/// the same edit, saying whether that happened.
 pub fn replace_section(
     source: &str,
     path: &str,
     new_content: &str,
     include_subsections: bool,
 ) -> Result<String, EditError> {
+    replace_section_reporting(source, path, new_content, include_subsections).map(|edit| edit.text)
+}
+
+/// [`replace_section`], reporting whether the content repeated the section's
+/// own heading and had it dropped.
+pub fn replace_section_reporting(
+    source: &str,
+    path: &str,
+    new_content: &str,
+    include_subsections: bool,
+) -> Result<SectionEdit, EditError> {
     let headings = heading_spans(source);
     let p = resolve_path(&headings, path).ok_or_else(|| EditError::SectionNotFound {
         path: path.to_string(),
     })?;
+    let (new_content, heading_stripped) = strip_repeated_heading(&headings[p], new_content);
     let own_start = headings[p].line_end;
     let sec_end_idx = section_end_index(&headings, p);
     let section_end = headings
@@ -795,12 +893,10 @@ pub fn replace_section(
     } else {
         format!("\n{body}\n")
     };
-    Ok(format!(
-        "{}{}{}",
-        &source[..own_start],
-        region,
-        &source[boundary..]
-    ))
+    Ok(SectionEdit {
+        text: format!("{}{}{}", &source[..own_start], region, &source[boundary..]),
+        heading_stripped,
+    })
 }
 
 /// The one-based line range a section occupies, its heading line included and
@@ -858,14 +954,32 @@ pub fn insert_before_section(source: &str, path: &str, content: &str) -> Result<
 }
 
 /// Insert content immediately after a section's heading line.
+///
+/// The content lands under a heading that stays, so a repeat of that heading
+/// at the top of `content` is dropped, exactly as [`replace_section`] drops
+/// it; [`insert_after_section_reporting`] says whether it did.
 pub fn insert_after_section(source: &str, path: &str, content: &str) -> Result<String, EditError> {
+    insert_after_section_reporting(source, path, content).map(|edit| edit.text)
+}
+
+/// [`insert_after_section`], reporting whether the content repeated the
+/// section's own heading and had it dropped.
+pub fn insert_after_section_reporting(
+    source: &str,
+    path: &str,
+    content: &str,
+) -> Result<SectionEdit, EditError> {
     let headings = heading_spans(source);
     let p = resolve_path(&headings, path).ok_or_else(|| EditError::SectionNotFound {
         path: path.to_string(),
     })?;
+    let (content, heading_stripped) = strip_repeated_heading(&headings[p], content);
     let at = headings[p].line_end;
     let block = format!("\n{}\n", content.trim_matches('\n'));
-    Ok(format!("{}{}{}", &source[..at], block, &source[at..]))
+    Ok(SectionEdit {
+        text: format!("{}{}{}", &source[..at], block, &source[at..]),
+        heading_stripped,
+    })
 }
 
 /// Append content to the end of the body.

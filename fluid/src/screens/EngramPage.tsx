@@ -49,7 +49,7 @@ import {
 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
 import { useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router";
+import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { discardChanges, refusalSentence } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
@@ -82,6 +82,7 @@ import type { LifecycleLink } from "../components/LifecycleBanner";
 import { Markdown } from "../components/Markdown";
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import { MoveDialog } from "../components/MoveDialog";
+import type { MovedState } from "../components/MoveDialog";
 import { NeighborhoodGraph } from "../components/NeighborhoodGraph";
 import {
   BUTTON,
@@ -93,6 +94,7 @@ import { RetireDialog } from "../components/RetireDialog";
 import { ShareDialog } from "../components/ShareDialog";
 import { Skeleton } from "../components/Skeleton";
 import { useRememberedDisclosure } from "../disclosure";
+import { plural } from "../format";
 import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute, graphRoute } from "../paths";
 import { prefetchEngramEditor } from "../prefetch";
@@ -110,6 +112,13 @@ export default function EngramPage() {
   const { capabilities } = useAuth();
   const { fullWidth } = useFullWidth();
   const navigate = useNavigate();
+  /**
+   * What the move that brought the reader here rewrote on the way: the move
+   * dialog hands the counts over in the navigation state, since the dialog
+   * that could have said so is gone by the time this page renders.
+   */
+  const moved =
+    (useLocation().state as Partial<MovedState> | null)?.moved ?? null;
   const [retiring, setRetiring] = useState(false);
   const [moving, setMoving] = useState(false);
   // What the chip beside the title opened: the diff, the share dialog about
@@ -563,6 +572,15 @@ export default function EngramPage() {
         tree does not hold it. Absent on everything else, which is nearly
         every page.
       */}
+      {moved !== null && (
+        <p
+          role="status"
+          aria-label="Moved"
+          className="text-sm text-slate-600 dark:text-slate-300"
+        >
+          {`Moved. Rewrote ${plural(moved.references, "reference", "references")} in ${plural(moved.engrams, "engram", "engrams")} to point here.`}
+        </p>
+      )}
       {engram.draft && (
         <p
           role="status"
@@ -698,6 +716,11 @@ export default function EngramPage() {
         <MoveDialog
           engram={engram}
           domains={(domains.data?.domains ?? []).map((entry) => entry.name)}
+          reviewing={
+            (domains.data?.domains ?? []).find(
+              (entry) => entry.name === engram.domain,
+            )?.review != null
+          }
           onClose={() => {
             setMoving(false);
           }}

@@ -14,10 +14,27 @@ import type { EngramDetail } from "../api/engram";
 
 const MoveDialogBody = lazy(() => import("./MoveDialogBody"));
 
+/**
+ * What a move hands the page it lands on, in the navigation state: how many
+ * references followed the engram there and across how many engrams. Absent
+ * when none did, so an ordinary move says nothing. Declared on this seam
+ * rather than in the lazy body, so the page that reads it never has to name
+ * the chunk it is trying not to load.
+ */
+export interface MovedState {
+  moved: { references: number; engrams: number };
+}
+
 export interface MoveDialogProps {
   engram: EngramDetail;
   /** Every registered domain name, for the optional cross-domain target. */
   domains: string[];
+  /**
+   * Whether the engram's domain reviews changes before they land. A move
+   * there moves the author's draft, and a draft keeps the permalink it
+   * carries unless one is asked for, so the preview has to say so.
+   */
+  reviewing?: boolean;
   onClose: () => void;
 }
 

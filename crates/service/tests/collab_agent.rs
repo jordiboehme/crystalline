@@ -637,6 +637,94 @@ async fn an_agent_edit_in_a_reviewing_domain_composes_into_its_own_overlay_room(
     );
 }
 
+/// A section edit of a MANIFEST somebody has open composes into their
+/// document, and its receipt says what every other landing says: which
+/// repeated heading was dropped, and what the MANIFEST rules find in the text
+/// that went live. The text is not durable yet, but it is on their screen and
+/// the room's saver will write it, so the finding is owed now.
+#[tokio::test]
+async fn a_live_manifest_edit_reports_the_dropped_heading_and_the_findings() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "manifest", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let before = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+
+    let receipt = engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "manifest".to_string(),
+                domain: "eng".to_string(),
+                operation: "replace_section".to_string(),
+                section: Some("## When to Use".to_string()),
+                content: Some("## When to Use".to_string()),
+                ..EditParams::default()
+            },
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .expect("the edit lands");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+    assert_eq!(receipt["heading_stripped"], "## When to Use", "{receipt}");
+    assert!(
+        receipt["manifest_findings"]
+            .as_array()
+            .is_some_and(|findings| findings.iter().any(|f| f["code"] == "M004")),
+        "{receipt}"
+    );
+
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert_eq!(live.matches("## When to Use").count(), 1, "{live:?}");
+    assert!(!live.contains("Route here for eng questions"), "{live:?}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        before,
+        "the file waits for the room's saver"
+    );
+}
+
+/// A capture titled after the MANIFEST, with `overwrite`, while the MANIFEST is
+/// open in the editor. Its destination slugs to the MANIFEST's own address,
+/// which used to let the live arm replace the document in the room with an
+/// ordinary engram. It is refused before it reaches the room: a MANIFEST
+/// changes through edit_engram only, and neither the room's document nor the
+/// file moves.
+#[tokio::test]
+async fn a_capture_titled_after_an_open_manifest_is_refused() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "manifest", None).await.unwrap();
+    let _doc = sync_client(&joined).await;
+    let before = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+
+    let err = engine
+        .write_engram(&WriteParams {
+            domain: "eng".to_string(),
+            title: "MANIFEST".to_string(),
+            content: "## Scope\n\n- Everything about eng\n".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec![],
+            status: None,
+            metadata: None,
+            overwrite: true,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .expect_err("a capture never replaces the MANIFEST, open or not");
+    assert!(err.to_string().contains("edit_engram"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        before,
+        "the file is untouched"
+    );
+}
+
 /// A room that is open over a DIFFERENT document leaves the ordinary write
 /// path exactly as it was: the live arm is asked about one document, not about
 /// the domain.

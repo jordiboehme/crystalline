@@ -1497,6 +1497,50 @@ async fn write_read_overwrite_and_domain_errors() {
     assert!(err.contains("eng"), "{err}");
 }
 
+/// Issue 91 end to end: an agent rewrites a MANIFEST's routing section with
+/// content that opens with the section's own heading. Before the guard, the
+/// heading came out twice, the reader kept the empty first one, and
+/// `list_domains` routed on nothing while the edit reported success. Now the
+/// repeat is dropped, the receipt says so, and routing reads the new bullets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_routing_rewrite_that_repeats_its_heading_still_routes() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let receipt = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "manifest",
+            "domain": "eng",
+            "operation": "replace_section",
+            "section": "## When to Use",
+            "content": "## When to Use\n\n- Route here for eng runbooks and on-call notes",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["heading_stripped"], "## When to Use", "{receipt}");
+    assert!(
+        receipt["guidance"]
+            .as_str()
+            .is_some_and(|g| g.contains("Send only the body next time")),
+        "{receipt}"
+    );
+    assert!(receipt.get("manifest_findings").is_none(), "{receipt}");
+
+    let domains = call(peer, "list_domains", json!({ "include_routing": true }))
+        .await
+        .unwrap();
+    let bullets = domains["domains"][0]["when_to_use"].as_array().unwrap();
+    assert_eq!(
+        bullets,
+        &vec![json!("Route here for eng runbooks and on-call notes")],
+        "{domains}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn edit_operations_and_subsection_regression() {
     let h = Harness::new(&["eng"]).await;

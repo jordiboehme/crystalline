@@ -124,8 +124,10 @@ pub struct EditParams {
     /// One of append, prepend, find_replace, replace_section,
     /// insert_before_section, insert_after_section, set_frontmatter.
     pub operation: String,
-    /// The content to add or the replacement text. Required by every operation
-    /// except set_frontmatter, which takes key and value instead.
+    /// The content to add or the replacement text. For the section operations
+    /// this is the section body; the heading line stays, so never repeat it
+    /// (a repeated heading is dropped). Required by every operation except
+    /// set_frontmatter, which takes key and value instead.
     #[serde(default)]
     pub content: Option<String>,
     /// The frontmatter field to assign, for set_frontmatter. One of status,
@@ -279,13 +281,29 @@ pub struct MoveParams {
     pub identifier: String,
     /// The engram's current domain.
     pub domain: String,
-    /// The new domain-relative path (with or without the `.md` suffix).
+    /// The new domain-relative path (with or without the `.md` suffix). Pass
+    /// the engram's own current path to change only its permalink.
     pub destination: String,
-    /// Move to a different domain. Cross-domain moves rewrite inbound bare links
-    /// to the domain-prefixed form.
+    /// Move to a different domain. Bare links from the domain it leaves gain
+    /// the domain prefix, [[domain:Target]], so they still resolve.
     #[serde(default)]
     pub destination_domain: Option<String>,
-    /// Rewrite inbound links on a cross-domain move. Defaults to true.
+    /// The permalink the engram answers to after the move. Omit it and the
+    /// permalink follows the move when it was in step with the old path (the
+    /// path's own slug) and stays when it was a deliberate custom one. "path"
+    /// derives it from the destination path, which is how an engram whose
+    /// permalink drifted off its folder is repaired: destination = its own
+    /// path, permalink = "path". "keep" keeps the current permalink whatever
+    /// it is. Any other value is that permalink: a domain-relative slug such
+    /// as projects/velog/alpha, with no crystalline:// scheme and no domain
+    /// prefix. Refused when another engram in the destination domain already
+    /// answers to it.
+    #[serde(default)]
+    pub permalink: Option<String>,
+    /// Rewrite every reference to the moved engram when its address changes:
+    /// [[old]] and [[domain:old]] links, relations and crystalline://domain/old
+    /// URLs (a #fragment is kept), in every domain you can see. Defaults to
+    /// true; false leaves them dangling.
     #[serde(default)]
     pub update_links: Option<bool>,
 }

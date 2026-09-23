@@ -50,6 +50,70 @@ pub fn slugify(path: &str) -> String {
         .join("/")
 }
 
+/// The permalink a file answers to when its frontmatter names none: the
+/// domain-relative path, slugified. The one derivation every surface shares -
+/// verify's link rules, the move's `permalink: "path"` and the evolve rule that
+/// compares a permalink against its folder - so the three can never disagree
+/// about what "in step with the path" means.
+pub fn path_permalink(rel_path: &str) -> String {
+    slugify(rel_path)
+}
+
+/// The folder part of a permalink or slugified path: everything before the
+/// last `/`, empty at the root.
+pub fn permalink_folder(permalink: &str) -> &str {
+    permalink
+        .rsplit_once('/')
+        .map(|(folder, _)| folder)
+        .unwrap_or("")
+}
+
+/// Check a permalink a caller asked for by name, answering why it cannot be
+/// one.
+///
+/// A permalink is what [`slugify`] produces, so the test is that slugifying it
+/// changes nothing: lowercase ASCII letters, digits, `-` and `/`, no empty or
+/// hyphen-trimmed segment. Two misreadings get a message of their own because
+/// they are the likely ones - an absolute `crystalline://` address and a
+/// `domain:` prefix, both of which name the domain the permalink never
+/// carries. The reserved `assets/` folder is refused too: an address under it
+/// is an attachment's, never an engram's.
+pub fn validate_permalink(permalink: &str) -> Result<(), String> {
+    if permalink.trim().is_empty() {
+        return Err("the permalink is empty".to_string());
+    }
+    if permalink.starts_with(SCHEME) {
+        return Err(format!(
+            "'{permalink}' is an absolute address; a permalink is domain-relative, so drop \
+             the {SCHEME}<domain>/ part"
+        ));
+    }
+    if permalink.contains(':') {
+        return Err(format!(
+            "'{permalink}' carries a domain prefix; a permalink is domain-relative and never \
+             names its domain"
+        ));
+    }
+    let slug = slugify(permalink);
+    if slug != permalink {
+        return Err(if slug.is_empty() {
+            format!("'{permalink}' does not slugify to a permalink; use letters or digits")
+        } else {
+            format!(
+                "'{permalink}' is not a permalink: use lowercase letters, digits, '-' and '/' \
+                 only, for example '{slug}'"
+            )
+        });
+    }
+    if permalink.starts_with(ASSETS_PREFIX) {
+        return Err(format!(
+            "'{permalink}' cannot be a permalink: it sits under the reserved {ASSETS_PREFIX} folder, \
+             which holds attachments and never an engram"
+        ));
+    }
+    Ok(())
+}
+
 /// A parsed `crystalline://<domain>/<permalink>` address, including the `/*`
 /// glob form used by context anchors.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,5 +345,40 @@ impl LinkResolver for LookupTable {
 
     fn is_domain(&self, name: &str) -> bool {
         self.domains.contains(name)
+    }
+}
+
+#[cfg(test)]
+mod permalink_tests {
+    use super::*;
+
+    #[test]
+    fn a_slug_shaped_permalink_is_accepted() {
+        assert_eq!(validate_permalink("projects/velog/alpha"), Ok(()));
+        assert_eq!(validate_permalink("alpha-2"), Ok(()));
+    }
+
+    #[test]
+    fn the_likely_misreadings_are_named() {
+        let scheme = validate_permalink("crystalline://eng/alpha").unwrap_err();
+        assert!(scheme.contains("domain-relative"), "{scheme}");
+        let prefix = validate_permalink("eng:alpha").unwrap_err();
+        assert!(prefix.contains("domain prefix"), "{prefix}");
+        let shape = validate_permalink("Projects/Alpha Notes").unwrap_err();
+        assert!(shape.contains("'projects/alpha-notes'"), "{shape}");
+        assert!(validate_permalink("").is_err());
+        assert!(validate_permalink("a//b").is_err());
+        assert!(validate_permalink("/alpha").is_err());
+        assert!(validate_permalink("assets/deck").is_err());
+    }
+
+    #[test]
+    fn the_folder_of_a_permalink_is_everything_before_the_last_slash() {
+        assert_eq!(permalink_folder("projects/velog/alpha"), "projects/velog");
+        assert_eq!(permalink_folder("alpha"), "");
+        assert_eq!(
+            path_permalink("Projects/Velog/Alpha Notes.md"),
+            "projects/velog/alpha-notes"
+        );
     }
 }
