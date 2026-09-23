@@ -4189,6 +4189,18 @@ impl Engine {
         if crystalline_core::is_reserved_path(&rel) {
             return Err(EngineError::Invalid(reserved_name_error(&rel)));
         }
+        // The domain's MANIFEST is never a capture's destination, in any
+        // letter case. `slugify` lowercases, so a title of "MANIFEST" lands at
+        // `manifest.md`, which a case-insensitive filesystem (the macOS and
+        // Windows defaults) opens as the very `MANIFEST.md` routing reads: an
+        // overwriting write replaced it with an ordinary engram and only then
+        // failed on the permalink check, too late to keep the file. A MANIFEST
+        // changes through edit_engram, which keeps its type and its routing.
+        if rel.eq_ignore_ascii_case("MANIFEST.md") {
+            return Err(EngineError::Invalid(
+                "a new engram cannot be written at the domain root as MANIFEST.md: that file is the domain's MANIFEST, which routing reads. Change it with edit_engram, or pick another title or a folder".into(),
+            ));
+        }
         // The other reserved shape: the folder attachments live in. Checked on
         // the joined path, so a `folder` of `assets`, `/assets/`, `Assets` or
         // `assets/deep` is refused whichever spelling arrived.
