@@ -9,9 +9,15 @@
  *
  * The trio is the mark itself: three cells tiled the way the banner's own
  * lattice tiles them, which is why the offsets below are the cell's own
- * geometry rather than round numbers. A cell is 21 wide and 18.18 tall at
- * this viewBox; a neighbour to the upper right sits half a height up and
- * three quarters of a width across.
+ * geometry rather than round numbers. A cell is 21 wide and 18.18 tall; a
+ * neighbour to the upper right sits half a height up and three quarters of a
+ * width across.
+ *
+ * The trio's viewBox is the tiled bounding box rather than a round rectangle,
+ * and that is not cosmetic: an outermost svg clips to its viewport, so a box
+ * shorter than the content silently slices a cube off. Three cells at these
+ * offsets span x 1.5 to 38.25 and y -0.09 to 36.09, which is exactly what the
+ * viewBox says. Change an offset and this has to be recomputed with it.
  */
 import type { ReactElement } from "react";
 
@@ -56,8 +62,8 @@ export function GemTrio({ size = 96 }: { size?: number }): ReactElement {
     <svg
       aria-hidden="true"
       width={size}
-      height={(size * 30) / 45}
-      viewBox="0 0 45 30"
+      height={(size * 36.18) / 36.75}
+      viewBox="1.5 -0.09 36.75 36.18"
       className="shrink-0"
     >
       <g transform="translate(0, 6)">
