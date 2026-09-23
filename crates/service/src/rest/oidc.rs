@@ -2306,6 +2306,7 @@ mod tests {
                 oauth: None,
                 max_users: None,
                 oidc: Some(oidc),
+                login: None,
             }),
             ..GlobalConfig::default()
         }

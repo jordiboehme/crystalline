@@ -2116,6 +2116,7 @@ mod tests {
             oauth: None,
             max_users: Some(5),
             oidc: None,
+            login: None,
         });
         let cfg = AuthCfg::resolve(&config).unwrap();
         assert_eq!(cfg.trusted_header.unwrap().as_str(), "remote-user");
@@ -2130,6 +2131,7 @@ mod tests {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         });
         let err = AuthCfg::resolve(&config).unwrap_err().to_string();
         assert!(

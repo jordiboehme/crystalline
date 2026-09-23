@@ -72,6 +72,7 @@ async fn build_engine_with(
             oauth: opts.oauth,
             max_users: opts.max_users,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };

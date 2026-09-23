@@ -91,6 +91,7 @@ async fn serve(opts: Options) -> Fixture {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         github: opts.github.then(|| GitHubConfig {
             enabled: Some(true),

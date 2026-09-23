@@ -373,6 +373,28 @@ impl GlobalConfig {
     pub fn auth_oidc(&self) -> Option<&OidcConfig> {
         self.auth.as_ref().and_then(|a| a.oidc.as_ref())
     }
+
+    /// `auth.login.free_attempts`. Absent config or an absent key means the
+    /// default.
+    pub fn auth_login_free_attempts(&self) -> u32 {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.login.as_ref())
+            .and_then(|l| l.free_attempts)
+            .unwrap_or(DEFAULT_LOGIN_FREE_ATTEMPTS)
+    }
+
+    /// `auth.login.max_delay`. Absent config or an absent key means the
+    /// default; zero means the throttle is off.
+    pub fn auth_login_max_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.auth
+                .as_ref()
+                .and_then(|a| a.login.as_ref())
+                .and_then(|l| l.max_delay)
+                .unwrap_or(DEFAULT_LOGIN_MAX_DELAY_SECS),
+        )
+    }
 }
 
 /// Which side of the one-truth-per-domain rule a domain lives on: files on
@@ -822,6 +844,15 @@ pub struct IdentityConfig {
 /// a config in hand (a test, a settings default) has it too.
 pub const DEFAULT_MAX_USERS: usize = 100;
 
+/// `auth.login.free_attempts`'s default: how many consecutive failures a name
+/// may make before the delay starts.
+pub const DEFAULT_LOGIN_FREE_ATTEMPTS: u32 = 3;
+
+/// `auth.login.max_delay`'s default, in seconds. The delay doubles from one
+/// second up to this; past it a refusal is sent instead of a longer nap. Zero
+/// turns the throttle off, which is why there is no separate enabled flag.
+pub const DEFAULT_LOGIN_MAX_DELAY_SECS: u64 = 8;
+
 /// The `auth` block: how the served API identifies a caller. Reads like a
 /// settings-page section - see the `configure` tool, which exposes exactly
 /// these keys.
@@ -870,6 +901,29 @@ pub struct AuthConfig {
     /// beside them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc: Option<OidcConfig>,
+    /// The sign-in throttle block. Absent means the defaults, which is a
+    /// throttle that is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginConfig>,
+}
+
+/// The `auth.login` block: what repeated failed sign-ins for one name cost.
+///
+/// A block of its own rather than two flat keys on [`AuthConfig`], so the
+/// config file reads the way the setting keys are spelled - `auth.login.*`,
+/// exactly as `auth.oidc.*` does.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoginConfig {
+    /// How many consecutive failed sign-ins a name may make before each
+    /// further one is delayed. Absent means
+    /// [`DEFAULT_LOGIN_FREE_ATTEMPTS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_attempts: Option<u32>,
+    /// How long the escalating delay may grow, in seconds, before a refusal
+    /// is sent instead of a longer nap. `0` turns the throttle off entirely.
+    /// Absent means [`DEFAULT_LOGIN_MAX_DELAY_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay: Option<u64>,
 }
 
 /// The `auth.oidc` block: one OpenID Connect provider Crystalline signs people
@@ -1924,5 +1978,38 @@ mod tests {
         let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(back.domains.get("allowed").unwrap().provision, Some(true));
         assert_eq!(back.domains.get("denied").unwrap().provision, Some(false));
+    }
+
+    /// The two login throttle keys default, read back and round trip through
+    /// the file, and `0` is how the ceiling spells "off".
+    #[test]
+    fn the_login_throttle_keys_default_and_read_back() {
+        let mut config = GlobalConfig::default();
+        assert_eq!(
+            config.auth_login_free_attempts(),
+            DEFAULT_LOGIN_FREE_ATTEMPTS
+        );
+        assert_eq!(
+            config.auth_login_max_delay(),
+            std::time::Duration::from_secs(DEFAULT_LOGIN_MAX_DELAY_SECS)
+        );
+
+        config.auth = Some(AuthConfig {
+            login: Some(LoginConfig {
+                free_attempts: Some(1),
+                max_delay: Some(0),
+            }),
+            ..AuthConfig::default()
+        });
+        assert_eq!(config.auth_login_free_attempts(), 1);
+        assert!(
+            config.auth_login_max_delay().is_zero(),
+            "zero is how the key spells off"
+        );
+
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
+        assert!(yaml.contains("free_attempts: 1"), "{yaml}");
+        let back: GlobalConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back, config);
     }
 }

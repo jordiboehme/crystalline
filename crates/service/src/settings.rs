@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use crystalline_core::config::{
     AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig,
-    HttpSetting, IdentityConfig, IndexConfig, OidcConfig, RecallConfig, ResponseFormat,
-    SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
+    HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig, RecallConfig,
+    ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -535,6 +535,26 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_oidc_redirect_uri,
             clear: clear_oidc_redirect_uri,
             effective: oidc_redirect_uri_effective,
+        },
+        SettingSpec {
+            key: "auth.login.free_attempts",
+            doc: "How many consecutive failed sign-ins one name may make before each further one is delayed (default 3); the count is kept per submitted name whether or not an account by that name exists, and a successful sign-in clears it (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_login_free_attempts,
+            clear: clear_login_free_attempts,
+            effective: login_free_attempts_effective,
+        },
+        SettingSpec {
+            key: "auth.login.max_delay",
+            doc: "How many seconds the delay on a failing name may grow to, doubling from one second, before a 429 with Retry-After is sent instead of a longer wait (default 8); 0 turns the throttle off entirely, which is why there is no separate switch (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_login_max_delay,
+            clear: clear_login_max_delay,
+            effective: login_max_delay_effective,
         },
     ]
 }
@@ -1842,6 +1862,89 @@ fn max_users_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_max_users().to_string(), is_default)
 }
 
+// --- auth.login.* -------------------------------------------------------------
+
+fn login_mut(config: &mut GlobalConfig) -> &mut LoginConfig {
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .login
+        .get_or_insert_with(LoginConfig::default)
+}
+
+/// Drop an emptied `auth.login` block, then an `auth` block emptied by that,
+/// for the reason [`drop_oidc_if_empty`] states: unsetting the last key in a
+/// block must leave the file as it was before the first one was set.
+fn drop_login_if_empty(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut()
+        && a.login.as_ref() == Some(&LoginConfig::default())
+    {
+        a.login = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn set_login_free_attempts(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: u32 = value.trim().parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.login.free_attempts must be a whole number of attempts, got '{value}'"
+        ))
+    })?;
+    // Zero is a legitimate setting here, unlike auth.max_users: it means the
+    // very first failure for a name is already delayed.
+    login_mut(config).free_attempts = Some(parsed);
+    Ok(())
+}
+
+fn clear_login_free_attempts(config: &mut GlobalConfig) {
+    if let Some(l) = config.auth.as_mut().and_then(|a| a.login.as_mut()) {
+        l.free_attempts = None;
+    }
+    drop_login_if_empty(config);
+}
+
+fn login_free_attempts_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .auth
+        .as_ref()
+        .and_then(|a| a.login.as_ref())
+        .and_then(|l| l.free_attempts)
+        .is_none();
+    (config.auth_login_free_attempts().to_string(), is_default)
+}
+
+fn set_login_max_delay(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: u64 = value.trim().parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.login.max_delay must be a whole number of seconds, got '{value}'"
+        ))
+    })?;
+    // Zero is how this key spells off, so it is the one value that must not
+    // be refused.
+    login_mut(config).max_delay = Some(parsed);
+    Ok(())
+}
+
+fn clear_login_max_delay(config: &mut GlobalConfig) {
+    if let Some(l) = config.auth.as_mut().and_then(|a| a.login.as_mut()) {
+        l.max_delay = None;
+    }
+    drop_login_if_empty(config);
+}
+
+fn login_max_delay_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .auth
+        .as_ref()
+        .and_then(|a| a.login.as_ref())
+        .and_then(|l| l.max_delay)
+        .is_none();
+    (
+        config.auth_login_max_delay().as_secs().to_string(),
+        is_default,
+    )
+}
+
 // --- auth.oidc.* --------------------------------------------------------------
 
 /// The placeholder in the tenant-independent Entra discovery url, lowercased
@@ -2156,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_thirty_nine_keys_in_order() {
+    fn registry_lists_exactly_the_forty_one_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -2199,6 +2302,8 @@ mod tests {
                 "auth.oidc.scopes",
                 "auth.oidc.default_role",
                 "auth.oidc.redirect_uri",
+                "auth.login.free_attempts",
+                "auth.login.max_delay",
             ]
         );
     }
@@ -2308,6 +2413,14 @@ mod tests {
                 (
                     "auth.oidc.redirect_uri",
                     "CRYSTALLINE_AUTH_OIDC_REDIRECT_URI".to_string()
+                ),
+                (
+                    "auth.login.free_attempts",
+                    "CRYSTALLINE_AUTH_LOGIN_FREE_ATTEMPTS".to_string()
+                ),
+                (
+                    "auth.login.max_delay",
+                    "CRYSTALLINE_AUTH_LOGIN_MAX_DELAY".to_string()
                 ),
             ]
         );
@@ -2803,7 +2916,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 39);
+        assert_eq!(views.len(), 41);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2846,6 +2959,8 @@ mod tests {
                 "auth.oidc.scopes",
                 "auth.oidc.default_role",
                 "auth.oidc.redirect_uri",
+                "auth.login.free_attempts",
+                "auth.login.max_delay",
             ]
         );
 
@@ -3816,6 +3931,42 @@ mod tests {
         assert!(
             !yaml.contains("auth"),
             "an emptied auth block must not round-trip into the yaml: {yaml}"
+        );
+    }
+
+    // --- auth.login.* -------------------------------------------------------
+
+    /// Both throttle keys apply, read back, refuse a non-number and accept the
+    /// zero that spells "off"; unsetting them leaves no empty block behind.
+    #[test]
+    fn the_login_keys_apply_and_unset_without_leaving_an_empty_block() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(
+            login_free_attempts_effective(&cfg),
+            ("3".to_string(), true),
+            "an absent key reads as the default"
+        );
+        assert_eq!(login_max_delay_effective(&cfg), ("8".to_string(), true));
+
+        apply(&mut cfg, "auth.login.free_attempts", "0").unwrap();
+        apply(&mut cfg, "auth.login.max_delay", "0").unwrap();
+        assert_eq!(cfg.auth_login_free_attempts(), 0);
+        assert!(cfg.auth_login_max_delay().is_zero());
+        assert_eq!(login_max_delay_effective(&cfg), ("0".to_string(), false));
+
+        let err = apply(&mut cfg, "auth.login.max_delay", "a while").unwrap_err();
+        assert!(err.to_string().contains("whole number of seconds"), "{err}");
+
+        unset(&mut cfg, "auth.login.free_attempts").unwrap();
+        unset(&mut cfg, "auth.login.max_delay").unwrap();
+        assert!(
+            cfg.auth.is_none(),
+            "the only set fields were cleared, so both blocks should vanish"
+        );
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("login"),
+            "an emptied login block must not round-trip into the yaml: {yaml}"
         );
     }
 

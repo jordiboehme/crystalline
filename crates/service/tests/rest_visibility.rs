@@ -179,6 +179,7 @@ impl RestCtx {
                 oauth: None,
                 max_users: None,
                 oidc: None,
+                login: None,
             }),
             github: team.then(|| GitHubConfig {
                 enabled: Some(true),

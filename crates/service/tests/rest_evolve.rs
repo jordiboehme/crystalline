@@ -83,6 +83,7 @@ async fn serve(opts: Options) -> Fixture {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };
@@ -933,6 +934,7 @@ async fn serve_review() -> (Fixture, Arc<Engine>) {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };

@@ -694,6 +694,7 @@ impl RestCtx {
                 oauth: None,
                 max_users,
                 oidc,
+                login: None,
             }),
             service: Some(ServiceConfig {
                 response_format: Some(ResponseFormat::Json),

@@ -59,6 +59,7 @@ async fn serve(opts: Options) -> Fixture {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };
@@ -1411,6 +1412,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };

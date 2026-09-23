@@ -489,6 +489,7 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };

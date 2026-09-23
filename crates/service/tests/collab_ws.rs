@@ -67,6 +67,7 @@ async fn serve(opts: Options_) -> Fixture {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };
@@ -638,6 +639,7 @@ async fn serve_review() -> Review {
             oauth: None,
             max_users: None,
             oidc: None,
+            login: None,
         }),
         ..GlobalConfig::default()
     };

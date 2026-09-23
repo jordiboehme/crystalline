@@ -124,6 +124,7 @@ impl RestCtx {
                 oauth: None,
                 max_users: None,
                 oidc: None,
+                login: None,
             }),
             ..GlobalConfig::default()
         };
