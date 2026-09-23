@@ -2097,6 +2097,38 @@ fn wait_port_within(addr: &str, budget: Duration) {
     }
 }
 
+/// [`wait_port_within`], for a child this test holds a handle to: whichever
+/// comes first, the port opening or the process exiting, is what it reports.
+///
+/// The distinction is the whole reason this exists. `the_owner_record_...`
+/// failed on CI repeatedly with nothing but "the endpoint did not open", and a
+/// budget raised from 8 to 30 seconds did not help - which is the tell that the
+/// daemon was not slow but gone. A wait that cannot tell those apart sends the
+/// next person to look at timing, which is where the last two attempts went.
+fn wait_port_or_exit(addr: &str, budget: Duration, child: &mut std::process::Child) {
+    let start = Instant::now();
+    loop {
+        if TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "the daemon exited with {status} after {:?} instead of binding {addr}; its \
+                 output is above",
+                start.elapsed()
+            );
+        }
+        let elapsed = start.elapsed();
+        if elapsed > budget {
+            panic!(
+                "the daemon is still running but never bound {addr} within {budget:?} \
+                 (waited {elapsed:?})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// `crystalline healthcheck` against a port nothing is listening on: the
 /// connection is refused immediately, so this needs no daemon spawn and no
 /// wait, unlike the success path piggybacked on the HTTP smoke test above.
@@ -3049,14 +3081,26 @@ fn the_owner_record_says_how_the_daemon_was_started() {
             "--config",
         ])
         .arg(env.config_path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Inherited rather than discarded, and that is the point. This start
+        // has failed on CI more than once with nothing to go on but "the
+        // endpoint did not open", because the daemon's own account of why it
+        // did not was thrown away here. nextest prints a failing test's output
+        // and swallows a passing one's, so this costs nothing on a green run
+        // and is the whole diagnosis on a red one.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     // The autostarted daemon above only just released the lock (see
     // `wait_lock_released`), so this second start is racing a shared CI
     // runner's scheduler rather than a fresh process; give it real room.
-    wait_port_within(&addr, Duration::from_secs(30));
+    //
+    // Watched through `wait_port_or_exit` rather than `wait_port_within`,
+    // because the two failures it can have want different answers and this
+    // test has so far reported neither. A daemon still running after the
+    // budget was too slow. One that has already exited was never going to
+    // bind, and waiting the rest of the budget for it says nothing.
+    wait_port_or_exit(&addr, Duration::from_secs(30), &mut child);
     let record = env.lock_record().expect("the daemon published a record");
     assert_eq!(record["started_by"], "serve", "{record}");
     assert_eq!(
