@@ -554,6 +554,61 @@ async fn unregistering_a_domain_closes_its_rooms_and_lands_their_text() {
     assert_eq!(refusal_status(&err), Some(404));
 }
 
+/// A room saves back to the permalink it was opened under, so a move that
+/// would change that address under an open editor is refused with a 409 that
+/// says why, and the file stays where it was. A move that keeps the permalink
+/// is not the room's business and goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_that_readdresses_an_open_room_is_refused() {
+    let fx = serve(Options_::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let mut room = connect(
+        fx.addr,
+        "/api/v1/collab/eng/alpha",
+        Some(&editor.0),
+        same_host(fx.addr),
+    )
+    .await
+    .unwrap();
+    let _ = next_binary(&mut room).await;
+
+    let move_with = |body: serde_json::Value| {
+        client()
+            .post(format!("http://{}/api/v1/domains/eng/move", fx.addr))
+            .header("cookie", format!("fluid_session={}", editor.0))
+            .header("x-csrf-token", &editor.1)
+            .json(&body)
+            .send()
+    };
+
+    let refused = move_with(serde_json::json!({
+        "permalink": "alpha",
+        "destination": "alpha.md",
+        "new_permalink": "renamed-alpha",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 409);
+    let detail = refused.text().await.unwrap();
+    assert!(detail.contains("open in the editor"), "{detail}");
+    assert!(fx.domain_dir.join("alpha.md").exists());
+    assert!(
+        std::fs::read_to_string(fx.domain_dir.join("alpha.md"))
+            .unwrap()
+            .contains("permalink: alpha\n"),
+        "nothing was written"
+    );
+
+    let kept = move_with(serde_json::json!({
+        "permalink": "alpha",
+        "destination": "guides/alpha.md",
+        "new_permalink": "keep",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(kept.status(), 200, "{:?}", kept.text().await);
+}
+
 /// Capacity is refused like every other guard: on the plain GET, with a status
 /// a client can read, never as a socket that opens and immediately closes. And
 /// the slot comes back when a socket closes, which is the property that makes
@@ -1512,6 +1567,7 @@ async fn a_rename_by_the_owner_closes_the_guests_socket() {
                 domain: "team".to_string(),
                 destination: "notes/fresh.md".to_string(),
                 destination_domain: None,
+                permalink: None,
                 update_links: None,
             },
             &crystalline_service::Scope::User {

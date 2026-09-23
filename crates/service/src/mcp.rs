@@ -2349,7 +2349,7 @@ impl McpServer {
     #[tool(
         name = "move_engram",
         title = "Move engram",
-        description = "Re-home an engram to a new path or domain as the knowledge base is reorganized. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. On a cross-domain move, inbound bare links from other domains are rewritten to the domain-prefixed [[domain:Target]] form so nothing dangles. Set update_links to false to skip that. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move.",
+        description = "Move, rename or re-home an engram: a new path, a new permalink, a new domain, or any mix, as the knowledge base is reorganized. A move is a refactoring, so use this tool, never write_engram plus delete_engram, which loses recorded_at and the generated provenance. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. Every reference follows the engram to its new address: [[old]] and [[domain:old]] wikilinks, relation bullets and crystalline://domain/old URLs (a #fragment is kept) are rewritten in every domain you can see, and the receipt counts them (links_rewritten engrams, references_rewritten references, rewritten names them); a link by title is left alone unless the domain changed. Set update_links to false to skip the rewrite. The permalink: omit it and it follows the move when it was in step with the old path, and stays when it was a deliberate custom one; permalink \"path\" derives it from the destination path, \"keep\" keeps it, any other value is the new permalink. Rename a permalink in place, for example to repair a permalink that drifted off its folder (evolve_engrams V109), by passing the engram's own current path as destination with permalink \"path\". A permalink another engram already holds, or an engram open in the editor, is refused. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move; a draft keeps its permalink unless you pass one, and references in other engrams follow when the team moves the engram.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2386,7 +2386,11 @@ impl McpServer {
                 return refuse(refusal);
             }
         }
-        let receipt = match self.engine.move_engram(&p, &scope).await {
+        let receipt = match self
+            .engine
+            .move_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
+            .await
+        {
             Ok(receipt) => receipt,
             Err(e) => return overlay_write_error(e),
         };

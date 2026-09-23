@@ -678,20 +678,31 @@ pub struct RetireBody {
 /// permalink, and where it goes. The permalink rides in the body for the same
 /// reason [`RetireBody`]'s does.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-#[schema(description = "Move an engram to a new path, or into another \
-                        registered domain. Inbound bare links are rewritten \
-                        to the domain-prefixed form on a cross-domain move.")]
+#[schema(description = "Move an engram to a new path, a new permalink or \
+                        into another registered domain. Every reference to \
+                        it that the caller can see follows it to the new \
+                        address.")]
 pub struct MoveBody {
     /// The engram to move, by permalink.
     #[schema(example = "notes/beta")]
     permalink: String,
-    /// The new domain-relative path, with or without `.md`.
+    /// The new domain-relative path, with or without `.md`. The engram's own
+    /// current path renames only its permalink.
     #[schema(example = "guides/beta")]
     destination: String,
-    /// Move into another registered domain. Inbound bare links are rewritten
-    /// to the domain-prefixed form.
+    /// Move into another registered domain. Bare links from the domain it
+    /// leaves gain the domain prefix.
     #[serde(default)]
     destination_domain: Option<String>,
+    /// The permalink the engram answers to after the move. Omitted, it
+    /// follows the move when it was in step with the old path and stays when
+    /// it was a custom one; `path` derives it from the destination path,
+    /// `keep` keeps the current one, and any other value is that permalink.
+    /// Named `new_permalink` because `permalink` already names the engram
+    /// being moved.
+    #[serde(default)]
+    #[schema(example = "path")]
+    new_permalink: Option<String>,
 }
 
 /// `POST /domains/{domain}/engrams` - create an engram from a title and a
@@ -1376,14 +1387,18 @@ pub async fn retire(
     path = "/api/v1/domains/{domain}/move",
     tag = "engrams",
     operation_id = "move_engram",
-    summary = "Move an engram to a new path, or into another domain.",
+    summary = "Move an engram to a new path, a new permalink or another domain.",
     description = "A same-domain move is a rename; a cross-domain move reads \
                    the source content and re-indexes it into the \
-                   destination's source, rewriting inbound bare links from \
-                   other domains to the domain-prefixed form.\n\nThe \
-                   permalink rides in the body for the same reason \
-                   `RetireBody`'s does: the engram route's wildcard cannot be \
-                   followed by an action segment.",
+                   destination's source. A move is a refactoring: whenever \
+                   the engram's address changes (domain, permalink or both), \
+                   every reference to it in a domain the caller can see - \
+                   wikilinks, relations and `crystalline://` URLs - is \
+                   rewritten to the new address. A destination equal to the \
+                   engram's own path with a `new_permalink` renames the \
+                   permalink in place.\n\nThe permalink rides in the body \
+                   for the same reason `RetireBody`'s does: the engram \
+                   route's wildcard cannot be followed by an action segment.",
     params(("domain" = String, Path, description = "The engram's current domain.")),
     request_body = MoveBody,
     responses(
@@ -1391,11 +1406,17 @@ pub async fn retire(
             status = 200,
             description = "The move receipt: where the engram came from, \
                            where it landed, whether the move crossed domains \
-                           and how many inbound links were rewritten.\n\n\
+                           and which references followed it.\n\n\
                            `to.permalink` is the address the engram answers \
                            to after the move, which is not always the one it \
-                           went in with: a permalink that was derived from \
-                           the path follows the file.\n\n\
+                           went in with: a permalink in step with the path \
+                           follows the file, and `new_permalink` can ask for \
+                           another.\n\n\
+                           `links_rewritten` counts the engrams whose \
+                           references were rewritten, \
+                           `references_rewritten` the references inside \
+                           them, and `rewritten` names those engrams by \
+                           domain and permalink.\n\n\
                            `attachment_warnings` lists the attachments the \
                            move could not carry, one sentence each and empty \
                            when everything travelled; those files stay whole \
@@ -1405,7 +1426,9 @@ pub async fn retire(
                 "from": { "domain": "eng", "permalink": "beta", "path": "beta.md" },
                 "to": { "domain": "eng", "permalink": "guides/beta", "path": "guides/beta.md" },
                 "cross_domain": false,
-                "links_rewritten": 0,
+                "links_rewritten": 1,
+                "references_rewritten": 2,
+                "rewritten": [{ "domain": "eng", "permalink": "alpha" }],
                 "attachment_warnings": []
             }),
         ),
@@ -1433,7 +1456,9 @@ pub async fn retire(
         (
             status = 409,
             description = "The destination already exists in the target \
-                           domain.",
+                           domain, another engram there already answers to \
+                           the new permalink, or the engram is open in the \
+                           editor and its address would change under it.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1446,7 +1471,9 @@ pub async fn retire(
         (
             status = 422,
             description = "The destination path is empty, or resolves to one \
-                           of the reserved OKF names (`index.md`, `log.md`).",
+                           of the reserved OKF names (`index.md`, `log.md`), \
+                           `new_permalink` is not a permalink, or the move \
+                           would change neither the path nor the permalink.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1458,7 +1485,7 @@ pub async fn move_action(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<MoveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    require_domain_write(&state, &identity, &domain).await?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     // Both ends, because a move writes at both: it takes an engram out of the
     // source and puts it into the destination, and a caller who may write only
     // one of the two could otherwise carry knowledge out of a private domain
@@ -1480,20 +1507,23 @@ pub async fn move_action(
     }
     let value = state
         .engine
-        .move_engram(
+        .move_engram_as(
             &MoveParams {
                 identifier: body.permalink,
                 domain,
                 destination: body.destination,
                 destination_domain: body.destination_domain,
+                permalink: body.new_permalink,
                 update_links: None,
             },
+            Some(&format!("human:{}", caller.name())),
             &identity.scope(),
         )
         .await
-        // The one collision this verb can hit: a destination already taken.
-        // Answered 409 rather than the generic 422 caller-error class, same
-        // reasoning as `create`'s own translation.
+        // The collisions this verb can hit: a destination path already taken,
+        // a permalink another engram already answers to, or an engram open in
+        // the editor. Answered 409 rather than the generic 422 caller-error
+        // class, same reasoning as `create`'s own translation.
         .map_err(|e| match e {
             EngineError::Conflict(message) => ApiError::conflict(message),
             other => other.into(),
