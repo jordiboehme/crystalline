@@ -68,6 +68,29 @@ export function manifestEditRoute(domain: string): string {
 }
 
 /**
+ * What the domain page asks the MANIFEST editor to write into the buffer, in
+ * the navigation state of the hop between them.
+ *
+ * A name rather than the text itself: the text is the server's, read by the
+ * editor off the manifest it loads, so the two screens never carry a copy of
+ * the grammar between them.
+ */
+export interface SeedRequest {
+  /** An H2 heading the server offers a starter for, or `WHOLE_MANIFEST`. */
+  seedSection: string;
+}
+
+/**
+ * The seed name that means the whole document rather than one section of it.
+ *
+ * Not a heading the registry knows, which is the point: the editor reads it
+ * as "put the whole scaffold in", which is what a domain whose MANIFEST is
+ * blank needs. Spelled here, beside the route it travels on, so the two ends
+ * of one navigation cannot drift apart.
+ */
+export const WHOLE_MANIFEST = "MANIFEST";
+
+/**
  * The neighborhood of one engram, full screen.
  *
  * The anchor is the engram's own `crystalline://` address rather than the two

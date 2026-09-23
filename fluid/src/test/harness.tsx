@@ -11,6 +11,7 @@
 import { render } from "@testing-library/react";
 import type { RenderResult } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
+import type { InitialEntry } from "react-router";
 
 import App from "../App";
 import { ApiProblem } from "../api/client";
@@ -247,8 +248,14 @@ export function manifestSectionsResponse(
   };
 }
 
-/** Mount the app at `entry`, on an in-memory history. */
-export function renderApp(entry = "/"): RenderResult {
+/**
+ * Mount the app at `entry`, on an in-memory history.
+ *
+ * An entry may be an object rather than a path when a test needs the
+ * navigation state a screen was reached with - the seed the domain page hands
+ * the MANIFEST editor is carried there and nowhere else.
+ */
+export function renderApp(entry: InitialEntry = "/"): RenderResult {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       <App />

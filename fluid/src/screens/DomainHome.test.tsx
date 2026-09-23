@@ -755,11 +755,17 @@ describe("the domain screen", () => {
       await screen.findByRole("button", { name: "Add Tag Aliases" }),
     );
 
-    // The action does not write: it opens the editor, and what lands in the
-    // buffer there is the editor's own test.
+    // The whole hop, end to end: the button names a section, the navigation
+    // state carries the name, and the editor puts the server's own example
+    // for it into the buffer. The two ends are only ever tested together.
     expect(
       await screen.findByRole("heading", { name: "Editing eng MANIFEST" }),
     ).toBeVisible();
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("## Tag Aliases");
+    });
+    expect(editor.textContent).toContain("k8s -> kubernetes");
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {

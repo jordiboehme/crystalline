@@ -19,8 +19,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api/client";
 import type { Answer } from "../test/harness";
 import {
+  STARTER_DOCUMENT,
   answersFor,
   domainsResponse,
+  manifestSectionsResponse,
   meResponse,
   renderApp,
   userFixture,
@@ -41,6 +43,10 @@ function manifestResponse(overrides: Record<string, unknown> = {}) {
     domain: "eng",
     markdown: MARKDOWN,
     checksum: "m1",
+    // One endpoint answers the reading page and this one, so the editor is
+    // sent the startable sections too: that registry is where a seeded
+    // section's text comes from.
+    sections: manifestSectionsResponse(),
     ...overrides,
   };
 }
@@ -186,6 +192,85 @@ describe("the MANIFEST editor", () => {
     });
     expect(firstIfMatch()).toBe('"m1"');
     expect(await screen.findByText("Saved")).toBeInTheDocument();
+  });
+
+  it("appends the seeded section and leaves it unsaved", async () => {
+    const put = vi.fn(() => manifestResponse({ checksum: "m2" }));
+    serveEditor(savingManifest(put));
+
+    renderApp({
+      pathname: "/d/eng/manifest/edit",
+      state: { seedSection: "Tag Aliases" },
+    });
+
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("## Tag Aliases");
+    });
+    // The server's own example, not a spelling this side invented.
+    expect(editor.textContent).toContain("k8s -> kubernetes");
+    // What was already there is still there, and it is still first.
+    expect(editor.textContent).toContain("Route here for eng.");
+    // Nothing reached disk: the person saves, or leaves and is asked.
+    expect(put).not.toHaveBeenCalled();
+    expect(await screen.findByText("Unsaved changes")).toBeVisible();
+  });
+
+  it("leaves the buffer alone when nothing was seeded", async () => {
+    serveEditor();
+
+    renderApp("/d/eng/manifest/edit");
+
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("Route here for eng.");
+    });
+    expect(editor.textContent).not.toContain("## Tag Aliases");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+  });
+
+  it("seeds a whole starter document over a MANIFEST that is blank", async () => {
+    serveEditor({
+      "/domains/eng/manifest": () =>
+        manifestResponse({ markdown: "", checksum: "m0" }),
+    });
+
+    renderApp({
+      pathname: "/d/eng/manifest/edit",
+      state: { seedSection: "MANIFEST" },
+    });
+
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("## When to Use");
+    });
+    expect(editor.textContent).toContain("## Scope");
+    // The frontmatter comes with it and starts the document, or the file
+    // would not verify and the Save button would never enable.
+    expect(STARTER_DOCUMENT.startsWith("---")).toBe(true);
+    expect(editor.textContent).toContain("type: manifest");
+  });
+
+  it("leaves the buffer alone when the daemon offered no such section", async () => {
+    serveEditor({
+      "/domains/eng/manifest": () =>
+        manifestResponse({
+          sections: manifestSectionsResponse({ starters: [] }),
+        }),
+    });
+
+    renderApp({
+      pathname: "/d/eng/manifest/edit",
+      state: { seedSection: "Tag Aliases" },
+    });
+
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("Route here for eng.");
+    });
+    // Nothing to seed is nothing done, rather than a guess at the syntax.
+    expect(editor.textContent).not.toContain("## Tag Aliases");
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
   });
 
   it("carries the format bar's table verbs", async () => {

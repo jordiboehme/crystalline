@@ -83,7 +83,12 @@ import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
 import { orderQuery, useEngramsOrder } from "../engramsOrder";
 import { frontmatterFilters } from "../filters";
 import { plural } from "../format";
-import { domainRoute, folderRoute, manifestEditRoute } from "../paths";
+import {
+  WHOLE_MANIFEST,
+  domainRoute,
+  folderRoute,
+  manifestEditRoute,
+} from "../paths";
 import { prefetchManifestEditor } from "../prefetch";
 
 export default function DomainHome() {
@@ -892,15 +897,6 @@ function ManifestPanel({
     </div>
   );
 }
-
-/**
- * The section name that means the whole document rather than one part of it.
- *
- * Not a section the registry knows, which is the point: the editor reads it
- * as "seed every stanza" for a domain whose MANIFEST is blank. Spelled here
- * and read there, so the two ends of one navigation cannot drift.
- */
-export const WHOLE_MANIFEST = "MANIFEST";
 
 /**
  * The stanza the server sent for `section`, or null when it sent none.

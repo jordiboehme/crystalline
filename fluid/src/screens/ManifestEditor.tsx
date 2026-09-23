@@ -21,11 +21,11 @@
 import type { Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { useNavigate, useParams } from "react-router";
+import { useEffect, useRef, useState } from "react";
+import { useLocation, useNavigate, useParams } from "react-router";
 
 import { problemDetail } from "../api/client";
-import type { ManifestDetail } from "../api/domain";
+import type { ManifestDetail, ManifestSections } from "../api/domain";
 import {
   fetchManifestDetail,
   manifestDetailKey,
@@ -52,7 +52,7 @@ import { formattingKeymap } from "../editor/toolbar";
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
 import { useFullWidth } from "../layoutWidth";
-import { domainRoute } from "../paths";
+import { WHOLE_MANIFEST, domainRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import NotFound from "./NotFound";
 
@@ -99,6 +99,60 @@ function extensionsFor(
     formattingKeymap,
     RAW_MONO,
   ];
+}
+
+/**
+ * The markdown the domain page asked to be seeded, or null when it asked for
+ * nothing this manifest can offer.
+ *
+ * Read off the manifest the editor already loaded rather than carried in the
+ * navigation, so the text a person is shown is the server's registry and the
+ * two screens never hold two copies of the grammar. A daemon that sends no
+ * starters answers null here, and the buffer is left exactly as it was read.
+ */
+function starterText(
+  sections: ManifestSections | null,
+  section: string,
+): string | null {
+  if (sections === null) {
+    return null;
+  }
+  if (section === WHOLE_MANIFEST) {
+    return sections.starterDocument === "" ? null : sections.starterDocument;
+  }
+  return (
+    sections.starters.find((row) => row.section === section)?.example ?? null
+  );
+}
+
+/**
+ * Put `text` in the buffer and leave the caret on its first bullet.
+ *
+ * Appended at the end rather than inserted in document order, because the
+ * MANIFEST is somebody's prose and a tool that reorders it is a tool that
+ * rewrites their writing; the end is predictable and the caret lands there.
+ * A buffer with nothing in it is replaced instead of appended to: a scaffold
+ * has to start at byte zero for its frontmatter to be frontmatter at all.
+ *
+ * Nothing is saved. The dirty flag comes from the buffer moving, the way it
+ * does for a keystroke, so the way out asks the question it asks of any
+ * unsaved edit.
+ */
+function seedInto(view: EditorView, text: string): void {
+  const doc = view.state.doc;
+  const blank = doc.toString().trim() === "";
+  const from = blank ? 0 : doc.length;
+  const insert = blank ? text : `\n\n${text}`;
+  const bullet = insert.indexOf("\n- ");
+  const lineEnd = bullet === -1 ? -1 : insert.indexOf("\n", bullet + 1);
+  const caret =
+    bullet === -1 || lineEnd === -1 ? from + insert.length : from + lineEnd;
+  view.dispatch({
+    changes: { from, to: doc.length, insert },
+    selection: { anchor: caret },
+    scrollIntoView: true,
+  });
+  view.focus();
 }
 
 export default function ManifestEditor() {
@@ -158,6 +212,30 @@ function EditorSurface({
    * the listener inside the buffer, which reports crossings only.
    */
   const [tableActive, setTableActive] = useState(false);
+  /**
+   * The section the domain page asked for, if the reader arrived by pressing
+   * one of its Add buttons rather than by opening the editor.
+   */
+  const seedSection = (useLocation().state as { seedSection?: string } | null)
+    ?.seedSection;
+  /**
+   * Applied once, and only once the buffer exists: the view arrives through
+   * `onReady` after this component first renders, which is why the effect
+   * waits on the state rather than on the ref - filling the ref schedules no
+   * re-render of its own, so an effect watching it would never run again.
+   */
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (seeded.current || seedSection === undefined || view === null) {
+      return;
+    }
+    seeded.current = true;
+    const text = starterText(manifest.sections, seedSection);
+    if (text === null) {
+      return;
+    }
+    seedInto(view, text);
+  }, [seedSection, view, manifest.sections]);
 
   /**
    * The standing "leave when this save lands" flag, made before the session
