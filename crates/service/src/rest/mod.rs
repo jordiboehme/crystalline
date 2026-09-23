@@ -18,6 +18,7 @@ mod github_identity;
 mod github_settings;
 mod graph;
 mod identity_links;
+mod login_throttle;
 mod mcp_tokens;
 mod members;
 mod oauth;
