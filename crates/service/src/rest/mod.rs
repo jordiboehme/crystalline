@@ -41,6 +41,7 @@ pub use error::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
     if_none_match_matches, precondition_failed,
 };
+use login_throttle::LoginThrottle;
 /// The loopback names every tier answers to, shared with `daemon::http_config`
 /// so the transport's allow-list and the origin rule's cannot come apart.
 pub(crate) use oauth::ALWAYS_ALLOWED_HOSTS;
@@ -335,6 +336,10 @@ pub struct RestState {
     /// Caps how many password verifications run at once. See
     /// [`LOGIN_SLOTS`].
     login_slots: Arc<Semaphore>,
+    /// The bound on password guessing at `POST /auth/login`, resolved at
+    /// startup from `auth.login.*` like the rest of the auth settings. See
+    /// [`login_throttle`].
+    login_throttle: Arc<LoginThrottle>,
 }
 
 impl RestState {
@@ -352,6 +357,10 @@ impl RestState {
     ) -> anyhow::Result<RestState> {
         let config = engine.config();
         let auth_cfg = AuthCfg::resolve(&config)?;
+        // Read here with the rest of `auth.*`, so the throttle a running
+        // daemon applies is the one it came up with.
+        let login_free_attempts = config.auth_login_free_attempts();
+        let login_max_delay = config.auth_login_max_delay();
         let oidc = OidcClient::new(&config)?;
         let oauth = OauthServer::new(&config, allowed_hosts);
         if oauth.is_some() {
@@ -377,6 +386,7 @@ impl RestState {
             auth_cfg,
             setup_token: None,
             login_slots: auth::login_slots(),
+            login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
         })
     }
 
@@ -450,6 +460,11 @@ impl RestState {
         work: F,
     ) -> Result<F::Output, ApiError> {
         auth::with_login_slot(&self.login_slots, work).await
+    }
+
+    /// The login throttle, for the one handler that consults it.
+    pub(super) fn login_throttle(&self) -> &LoginThrottle {
+        &self.login_throttle
     }
 }
 

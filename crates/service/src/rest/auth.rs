@@ -36,6 +36,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::extract::{FromRequestParts, Request, State};
@@ -51,6 +52,7 @@ use super::auth_store::{
     AuthStore, DEFAULT_OIDC_ROLE, PasswordCheck, RefusalKind, Role, SessionMint, StoreRefusal,
     User, dummy_verify, normalize_account_name,
 };
+use super::login_throttle::Verdict;
 use super::oidc::sanitize_account_name;
 use super::{ApiError, ApiJson, ProblemDetail, RestState};
 use crate::scope::Scope;
@@ -1141,19 +1143,90 @@ pub struct MeResponse {
 )]
 pub async fn login(
     State(state): State<RestState>,
+    peer: PeerAddr,
     jar: CookieJar,
     headers: HeaderMap,
     ApiJson(body): ApiJson<LoginBody>,
 ) -> Result<(CookieJar, NoStore, axum::Json<LoginResponse>), ApiError> {
-    let Some(user) =
-        authenticate(&state.auth, &state.login_slots, &body.name, &body.password).await?
-    else {
-        // One message for every way this can fail, so the response says only
-        // that the pair was wrong, never which half.
-        return Err(ApiError::unauthorized("the name or password is wrong"));
-    };
-    sign_in(&state, jar, &headers, user).await
+    let key = throttle_key(&body.name);
+    let throttle = state.login_throttle();
+    match throttle.check(&key, Instant::now()) {
+        // A request the throttle turned away is not looked at any further: no
+        // argon2, no store read. The same rule the registration limiter
+        // states for its own refusal.
+        Verdict::Refuse(seconds) => {
+            return Err(ApiError::too_many_requests(TOO_MANY_SIGN_INS).retry_after(seconds));
+        }
+        Verdict::Delay(delay) if !delay.is_zero() => {
+            // The nap happens before and OUTSIDE the login slot. A request
+            // napping on one of the four argon2 permits would be a better
+            // denial of service than the one this closes.
+            let Some(_permit) = throttle.try_take_sleeper() else {
+                return Err(ApiError::too_many_requests(TOO_MANY_SIGN_INS)
+                    .retry_after(delay.as_secs().max(1)));
+            };
+            tokio::time::sleep(delay).await;
+        }
+        Verdict::Delay(_) => {}
+    }
+
+    match authenticate(&state.auth, &state.login_slots, &body.name, &body.password).await? {
+        Attempt::Signed(user) => {
+            throttle.record_success(&key);
+            sign_in(&state, jar, &headers, user).await
+        }
+        outcome => {
+            throttle.record_failure(&key, Instant::now());
+            // The folded name when there is an account to name, and a
+            // placeholder when there is not: the wire answer is the same
+            // either way, and a log is not a channel an attacker reads.
+            let who: &dyn std::fmt::Display = if matches!(outcome, Attempt::WrongPassword) {
+                &key
+            } else {
+                &"an unknown or password-less account"
+            };
+            tracing::warn!(
+                account = %who,
+                peer = ?peer.0,
+                failures = throttle.failures(&key),
+                "a sign-in failed"
+            );
+            // One message for every way this can fail, so the response says
+            // only that the pair was wrong, never which half.
+            Err(ApiError::unauthorized("the name or password is wrong"))
+        }
+    }
 }
+
+/// What a caller past the throttle's ceiling is told. One sentence for both
+/// refusals the route can send - the escalation ceiling and the sleeper cap -
+/// so neither says anything the other does not.
+const TOO_MANY_SIGN_INS: &str = "too many sign-ins have failed for this name - wait and try again";
+
+/// The key a submitted name is throttled under.
+///
+/// Folded the way the store folds a name, so the same account cannot be
+/// attacked under two casings. A name the store would reject still gets a key:
+/// it must escalate like any other, or a wrong name would be the cheap path.
+/// Bounded in length on both branches, because what goes in the table is
+/// whatever a stranger typed, and taken by characters rather than by bytes so
+/// the cut can never land inside one.
+fn throttle_key(submitted: &str) -> String {
+    let folded = normalize_account_name(submitted).unwrap_or_else(|_| {
+        submitted
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    });
+    folded.chars().take(MAX_THROTTLE_KEY_CHARS).collect()
+}
+
+/// How much of a submitted name is kept as a throttle key.
+///
+/// Comfortably past any login name a person would pick, and short enough that
+/// a hundred thousand of them is the few megabytes the table's own cap
+/// assumes.
+const MAX_THROTTLE_KEY_CHARS: usize = 64;
 
 /// Issue a session for `user` and answer in the login shape: the cookie, the
 /// `no-store` header and the account plus its CSRF token.
@@ -1237,30 +1310,53 @@ pub(super) async fn issue_session(
 /// `one_argon2_verification_per_login_attempt` asserts the cost rather than the
 /// shape of the code, so an inversion fails the test instead of reading fine.
 ///
-/// Chosen over a login rate limiter, the other way to close this: a per-name
+/// Chosen over a login rate limiter as the answer to THIS channel: a per-name
 /// limiter hands an attacker a lockout lever against a known account, needs
 /// eviction and a clock, and would still leak the difference within its own
 /// window. This is stateless and closes the channel itself rather than
-/// rationing access to it.
+/// rationing access to it. [`super::login_throttle`] sits in front of this
+/// rather than instead of it, and bounds a different threat - online guessing
+/// against one name - which is why it is keyed on the submitted name whether
+/// or not an account by that name exists: the equal cost below must not be
+/// undone one layer up.
 async fn authenticate(
     auth: &AuthStore,
     slots: &Semaphore,
     name: &str,
     password: &str,
-) -> Result<Option<User>, ApiError> {
+) -> Result<Attempt, ApiError> {
     with_login_slot(slots, async {
         match auth.check_password(name, password).await? {
-            PasswordCheck::Verified(user) => Ok(Some(user)),
+            PasswordCheck::Verified(user) => Ok(Attempt::Signed(user)),
             // A verification already ran against the stored hash.
-            PasswordCheck::Mismatch => Ok(None),
+            PasswordCheck::Mismatch => Ok(Attempt::WrongPassword),
             // Nothing was hashed, so buy the same amount of time here.
             PasswordCheck::NoHash => {
                 dummy_verify(password).await?;
-                Ok(None)
+                Ok(Attempt::NoSuchAccount)
             }
         }
     })
     .await?
+}
+
+/// What one login attempt turned out to be.
+///
+/// The two failures are one answer on the wire and two in the log. Splitting
+/// them here costs nothing - [`AuthStore::check_password`] already knows which
+/// it was - and it is what lets the log name the account when there is one to
+/// name, while an unknown name is recorded as unknown rather than written out.
+/// An unknown name is most often a password typed into the name field, which
+/// is precisely the string that must not reach a log file.
+#[derive(Debug)]
+enum Attempt {
+    /// The name and the password matched an account that may sign in.
+    Signed(User),
+    /// An account by that name has a password, and this was not it.
+    WrongPassword,
+    /// No account by that name, or one with no password to check: an unknown
+    /// name, a disabled account, a header-provisioned one.
+    NoSuchAccount,
 }
 
 /// Run `work` holding one of the [`LOGIN_SLOTS`] password-checking permits, so
@@ -2047,11 +2143,11 @@ mod tests {
                 ] {
                     let before = auth_store::VERIFICATIONS.with(|count| count.get());
                     let got = authenticate(&store, &slots, name, password).await.unwrap();
-                    assert_eq!(
-                        got.map(|u| u.name).as_deref(),
-                        expected,
-                        "wrong outcome for {name:?}"
-                    );
+                    let signed = match got {
+                        Attempt::Signed(user) => Some(user.name),
+                        Attempt::WrongPassword | Attempt::NoSuchAccount => None,
+                    };
+                    assert_eq!(signed.as_deref(), expected, "wrong outcome for {name:?}");
                     assert_eq!(
                         auth_store::VERIFICATIONS.with(|count| count.get()) - before,
                         1,
