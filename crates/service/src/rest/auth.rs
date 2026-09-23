@@ -1518,6 +1518,7 @@ fn gone() -> ApiError {
                  closed: log in instead"
             .to_string(),
         token_required: None,
+        retry_after: None,
     }
 }
 

@@ -700,6 +700,7 @@ impl DiscoveryFailure {
                     crate::settings::ENTRA_TEMPLATE_HELP
                 ),
                 token_required: None,
+                retry_after: None,
             },
             DiscoveryFailure::Unavailable => provider_unavailable("discovery"),
         }
@@ -1104,6 +1105,7 @@ fn provider_unavailable(what: &str) -> ApiError {
              happening"
         ),
         token_required: None,
+        retry_after: None,
     }
 }
 
@@ -1557,6 +1559,7 @@ async fn start_sign_on(
                      wait a moment and try again"
                 .to_string(),
             token_required: None,
+            retry_after: None,
         });
     }
     let cookie = Cookie::build((STATE_COOKIE, state_value))

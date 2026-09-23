@@ -44,6 +44,14 @@ pub struct ApiError {
     /// [`ApiError::token_required`]; `None` on every other failure, and the
     /// member is then absent from the body entirely.
     pub token_required: Option<bool>,
+    /// How many seconds until a refused caller may try again, sent as
+    /// `Retry-After`. `None` on every refusal that has no answer to that, and
+    /// the header is then absent entirely.
+    ///
+    /// Never zero by construction at the call sites: a `Retry-After: 0`
+    /// invites an immediate retry into the same refusal, which is the rule
+    /// [`super::oauth`]'s registration limiter already states for its own 429.
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -54,6 +62,7 @@ impl ApiError {
             title: "not found",
             detail: detail.into(),
             token_required: None,
+            retry_after: None,
         }
     }
 
@@ -65,6 +74,7 @@ impl ApiError {
             title: "unauthorized",
             detail: detail.into(),
             token_required: None,
+            retry_after: None,
         }
     }
 
@@ -78,6 +88,7 @@ impl ApiError {
             title: "forbidden",
             detail: detail.into(),
             token_required: None,
+            retry_after: None,
         }
     }
 
@@ -93,6 +104,7 @@ impl ApiError {
             title: "conflict",
             detail: detail.into(),
             token_required: None,
+            retry_after: None,
         }
     }
 
@@ -115,6 +127,7 @@ impl ApiError {
             title: "precondition required",
             detail: detail.into(),
             token_required: None,
+            retry_after: None,
         }
     }
 
@@ -128,6 +141,7 @@ impl ApiError {
             title: "invalid request",
             detail: detail.into(),
             token_required: None,
+            retry_after: None,
         }
     }
 
@@ -141,7 +155,38 @@ impl ApiError {
             title: "method not allowed",
             detail: "this path does not serve that method".to_string(),
             token_required: None,
+            retry_after: None,
         }
+    }
+
+    /// A 429 for a caller the server is deliberately slowing down.
+    pub fn too_many_requests(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            title: "too many requests",
+            detail: detail.into(),
+            token_required: None,
+            retry_after: None,
+        }
+    }
+
+    /// A 503 for a caller the server cannot serve right now but expects to
+    /// serve shortly. Distinct from the 429 above: that one is aimed at this
+    /// caller, this one is about the instance.
+    pub fn service_unavailable(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            title: "service unavailable",
+            detail: detail.into(),
+            token_required: None,
+            retry_after: None,
+        }
+    }
+
+    /// Say when the caller may come back. Seconds, never zero.
+    pub fn retry_after(mut self, seconds: u64) -> ApiError {
+        self.retry_after = Some(seconds.max(1));
+        self
     }
 
     /// Mark this problem document with the `token_required` extension member,
@@ -191,6 +236,7 @@ impl ApiError {
             title,
             detail,
             token_required: None,
+            retry_after: None,
         }
     }
 }
@@ -299,6 +345,8 @@ pub struct ProblemDetail {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Read before `self.detail` is moved into the body below.
+        let retry_after = self.retry_after;
         let body = ProblemDetail {
             problem_type: "about:blank",
             status: self.status.as_u16(),
@@ -313,6 +361,14 @@ impl IntoResponse for ApiError {
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/problem+json"),
         );
+        // Only the refusals that know when to come back carry the header; on
+        // every other failure it is absent rather than guessed at.
+        if let Some(seconds) = retry_after
+            && let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string())
+        {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
         resp
     }
 }
@@ -552,6 +608,7 @@ fn unprocessable_error(detail: String) -> ApiError {
         title: "invalid request",
         detail,
         token_required: None,
+        retry_after: None,
     }
 }
 
@@ -562,12 +619,45 @@ fn internal_error(detail: String) -> ApiError {
         title: "internal error",
         detail,
         token_required: None,
+        retry_after: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal that knows when the caller may come back says so in the
+    /// header, not only in the prose a person reads.
+    #[test]
+    fn a_refusal_that_says_when_to_come_back_sends_retry_after() {
+        let response = ApiError::too_many_requests("slow down")
+            .retry_after(7)
+            .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "7"
+        );
+    }
+
+    /// And a refusal that does not know sends no header at all, rather than a
+    /// zero that invites an immediate retry into the same refusal.
+    #[test]
+    fn a_refusal_without_one_sends_no_retry_after() {
+        let response = ApiError::unauthorized("nope").into_response();
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let floored = ApiError::service_unavailable("busy").retry_after(0);
+        assert_eq!(floored.retry_after, Some(1), "a wait is never zero seconds");
+    }
 
     #[test]
     fn missing_things_are_404_and_bad_requests_are_422() {

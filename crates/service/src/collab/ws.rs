@@ -338,6 +338,7 @@ fn busy(detail: &str) -> ApiError {
         title: "busy",
         detail: detail.to_string(),
         token_required: None,
+        retry_after: None,
     }
 }
 
