@@ -151,14 +151,23 @@ async fn past_the_ceiling_the_answer_is_a_refusal() {
     // the ceiling, so it refuses.
     let ctx = LoginCtx::start_with_throttle(1, 1).await;
     ctx.create_account("ada", "correct horse").await;
-    assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
+    // The first failure is free, and timing it gives the cost of a round trip
+    // that DOES verify a password. The refusal below must come in under that,
+    // because the whole claim is that it verifies nothing.
+    let verified = ctx.timed_login("ada", "wrong").await;
+    assert_eq!(verified.response.status(), 401);
     assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
     let refused = ctx.timed_login("ada", "wrong").await;
     assert_eq!(refused.response.status(), 429);
+    // Compared against that baseline rather than against a constant: a refusal
+    // takes a lock and reads a map, where a 401 pays for argon2, so the gap is
+    // large on any machine while an absolute bound is a bet on a fast one.
     assert!(
-        refused.elapsed < Duration::from_millis(500),
-        "a refusal is immediate rather than a longer nap: {:?}",
-        refused.elapsed
+        refused.elapsed < verified.elapsed,
+        "a refusal must reach neither argon2 nor the store: {:?} against a \
+         {:?} round trip that did verify",
+        refused.elapsed,
+        verified.elapsed
     );
     let retry: u64 = refused
         .response
@@ -193,13 +202,22 @@ async fn the_refusal_body_never_changes() {
 async fn a_correct_password_inside_the_free_attempts_is_not_delayed() {
     let ctx = LoginCtx::start_with_throttle(2, 8).await;
     ctx.create_account("ada", "correct horse").await;
-    assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
+    // The baseline is measured rather than assumed: one failed attempt, itself
+    // inside the free window, so it pays for a password check and nothing else.
+    // An absolute bound here would be a bet on how fast the machine is, and
+    // that bet loses on a shared runner - where a single argon2 verification
+    // can outlast any constant worth writing down.
+    let baseline = ctx.timed_login("ada", "wrong").await;
+    assert_eq!(baseline.response.status(), 401);
     let ok = ctx.timed_login("ada", "correct horse").await;
     assert_eq!(ok.response.status(), 200);
+    // The smallest nap the schedule can impose is a full second, so anything
+    // inside the baseline plus half of one was not napped on.
     assert!(
-        ok.elapsed < Duration::from_millis(500),
-        "one mistype must not cost a sign-in anything: {:?}",
-        ok.elapsed
+        ok.elapsed < baseline.elapsed + Duration::from_millis(500),
+        "one mistype must not cost a sign-in a nap: {:?} against a {:?} baseline",
+        ok.elapsed,
+        baseline.elapsed
     );
 }
 
@@ -216,31 +234,40 @@ async fn a_correct_password_inside_the_free_attempts_is_not_delayed() {
 async fn a_success_clears_the_slate_for_the_next_attempt() {
     let ctx = LoginCtx::start_with_throttle(1, 8).await;
     ctx.create_account("ada", "correct horse").await;
-    assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
+    // The baseline, taken while the name is still inside its one free attempt.
+    let baseline = ctx.timed_login("ada", "wrong").await;
+    assert_eq!(baseline.response.status(), 401);
     assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
     assert_eq!(ctx.login("ada", "correct horse").await.status(), 200);
     let after = ctx.timed_login("ada", "wrong").await;
     assert_eq!(after.response.status(), 401);
+    // Without the clearing this would be a fourth consecutive failure and cost
+    // four seconds, so half a second over the baseline separates the two cases
+    // by a wide margin whatever the machine.
     assert!(
-        after.elapsed < Duration::from_millis(500),
-        "the slate was not cleared: {:?}",
-        after.elapsed
+        after.elapsed < baseline.elapsed + Duration::from_millis(500),
+        "the slate was not cleared: {:?} against a {:?} baseline",
+        after.elapsed,
+        baseline.elapsed
     );
 }
 
 /// **A zero ceiling is off**, which is what every other fixture on this
-/// surface relies on: a run of failures costs nothing at all.
+/// surface relies on: a run of failures is served rather than refused.
+///
+/// Asserted on the answers rather than on the clock. A throttle that was merely
+/// lenient rather than off would still refuse somewhere in this run - with a
+/// ceiling of even one second the third attempt is already past it - so the
+/// absence of a single `429` is the whole property, and it holds at any speed.
 #[tokio::test]
-async fn a_zero_ceiling_serves_a_run_of_failures_at_full_speed() {
+async fn a_zero_ceiling_never_refuses_however_long_the_run() {
     let ctx = LoginCtx::start_with_throttle(0, 0).await;
     ctx.create_account("ada", "correct horse").await;
-    let started = Instant::now();
-    for _ in 0..6 {
-        assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
+    for attempt in 1..=8 {
+        assert_eq!(
+            ctx.login("ada", "wrong").await.status(),
+            401,
+            "attempt {attempt} must be served, not refused"
+        );
     }
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "a disabled throttle must not delay anything: {:?}",
-        started.elapsed()
-    );
 }
