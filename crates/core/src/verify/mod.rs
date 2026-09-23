@@ -213,6 +213,40 @@ pub fn check_document(domain: &str, rel_path: &Path, source: &str) -> Vec<Issue>
     issues
 }
 
+/// Run the MANIFEST rules over one MANIFEST text, without scanning a domain:
+/// `M002`-`M007`, `M101`-`M104`, `M106` and `M107`, plus `M105` when `root`
+/// names the domain folder its provisioned folders are looked up in.
+///
+/// Backs the edit and write receipts, which report what a change did to a
+/// MANIFEST at the moment it lands rather than waiting for somebody to run
+/// validate: an empty `## When to Use` or a doubled heading breaks routing
+/// quietly, and the agent that caused it is the one that can fix it right
+/// away. It is the same code `crystalline verify` runs over a scanned
+/// MANIFEST, so the receipt and validate cannot disagree about a text.
+///
+/// `path` is what each [`Issue::path`] carries. `verify` is the domain's
+/// `.crystalline.yaml` `verify` block, when it has one, so a rule the domain
+/// turned off or re-levelled comes out here the way it does in validate;
+/// `None` reports every rule at its default severity. There is no `--strict`
+/// promotion. `M001` (the MANIFEST is missing) is never raised, since a text
+/// in hand exists, and a text that does not parse raises nothing: the parse
+/// failure is the format rules' finding, not a MANIFEST one.
+pub fn check_manifest_source(
+    path: &Path,
+    source: &str,
+    root: Option<&Path>,
+    verify: Option<&crate::config::VerifyConfig>,
+) -> Vec<Issue> {
+    let Ok(engram) = crate::parse::parse_engram(source) else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    let mut summary = Summary::default();
+    let mut sink = Sink::new(&mut issues, &mut summary, verify, false);
+    manifest_rules::check_manifest_text(path, source, &engram, root, &mut sink);
+    issues
+}
+
 /// Report paths are part of the stable output schema and must be identical
 /// on every platform, so they always use forward slashes.
 pub(crate) fn forward_slashes(path: &Path) -> std::path::PathBuf {

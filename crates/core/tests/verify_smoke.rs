@@ -725,3 +725,68 @@ fn both_recognized_sharing_values_and_an_absent_key_are_clean() {
         report.issues
     );
 }
+
+/// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
+/// empty, which is the one routing reads.
+const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";
+
+#[test]
+fn the_manifest_rules_over_one_text_find_what_validate_finds() {
+    let found =
+        verify::check_manifest_source(Path::new("MANIFEST.md"), DOUBLED_MANIFEST, None, None);
+    let mut rules: Vec<&str> = found.iter().map(|i| i.rule).collect();
+    rules.sort_unstable();
+    // The empty first section (an error, and the routing fallback warning)
+    // and the doubled heading, pointed at the second one's line.
+    assert_eq!(rules, ["M004", "M101", "M103"], "{found:#?}");
+    let m004 = found.iter().find(|i| i.rule == "M004").unwrap();
+    assert_eq!(m004.severity, Severity::Error);
+    let m103 = found.iter().find(|i| i.rule == "M103").unwrap();
+    assert_eq!(m103.severity, Severity::Warning);
+    assert_eq!(m103.line, Some(17));
+
+    // The same text as a scanned domain draws the same M findings from
+    // validate, because both run one body of rules.
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", DOUBLED_MANIFEST);
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let mut scanned: Vec<(&str, Option<usize>)> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule.starts_with('M'))
+        .map(|i| (i.rule, i.line))
+        .collect();
+    scanned.sort_unstable();
+    let mut direct: Vec<(&str, Option<usize>)> = found.iter().map(|i| (i.rule, i.line)).collect();
+    direct.sort_unstable();
+    assert_eq!(scanned, direct);
+}
+
+#[test]
+fn a_clean_or_unparseable_manifest_text_draws_nothing() {
+    let clean = DOUBLED_MANIFEST.replacen("## When to Use\n\n## When to Use", "## When to Use", 1);
+    assert!(verify::check_manifest_source(Path::new("MANIFEST.md"), &clean, None, None).is_empty());
+    // A parse failure is the format rules' finding, not a MANIFEST one.
+    assert!(
+        verify::check_manifest_source(Path::new("MANIFEST.md"), "---\n: [\n---\n", None, None)
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_manifest_rules_over_one_text_honour_the_domains_overrides() {
+    let config = crystalline_core::config::VerifyConfig {
+        rules: [("M103".to_string(), "off".to_string())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let found = verify::check_manifest_source(
+        Path::new("MANIFEST.md"),
+        DOUBLED_MANIFEST,
+        None,
+        Some(&config),
+    );
+    assert!(found.iter().all(|i| i.rule != "M103"), "{found:#?}");
+    assert!(found.iter().any(|i| i.rule == "M004"), "{found:#?}");
+}
