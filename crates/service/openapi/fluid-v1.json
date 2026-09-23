@@ -2292,7 +2292,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted checksum of the engram as written, the token a later save carries in `If-Match`."
+                "description": "The quoted `\"{checksum}-{version}\"` of the engram as written, the token a later save carries in `If-Match`."
               }
             },
             "content": {
@@ -2392,7 +2392,7 @@
           "engrams"
         ],
         "summary": "One engram in full.",
-        "description": "Its frontmatter, its markdown as written and the references the engine resolves around it.\n\nThe response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.",
+        "description": "Its frontmatter, its markdown as written and the references the engine resolves around it.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the engine's own checksum plus this binary's own version, so a client knows which version it is holding and can say so when it later writes back - `If-Match` accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere - or an upgrade that changed this JSON's own shape - is picked up on its next use.",
         "operationId": "get_engram",
         "parameters": [
           {
@@ -2417,7 +2417,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "The quoted checksum of a version already held. A match answers 304 with no body.",
+            "description": "The quoted tag of a version already held: the bare checksum, or `\"{checksum}-{version}\"`. A match against the CURRENT tag answers 304 with no body.",
             "required": false,
             "schema": {
               "type": [
@@ -2425,7 +2425,7 @@
                 "null"
               ]
             },
-            "example": "\"3f8a1c05e2\""
+            "example": "\"3f8a1c05e2-0.19.2\""
           }
         ],
         "responses": {
@@ -2442,7 +2442,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted checksum of the engram as read, the same token a later write compares an `expected_checksum` against."
+                "description": "The quoted `\"{checksum}-{version}\"` of the engram as read, the same checksum a later write compares an `expected_checksum` against."
               }
             },
             "content": {
@@ -2473,7 +2473,7 @@
             }
           },
           "304": {
-            "description": "`If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
+            "description": "`If-None-Match` names the current tag; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
           },
           "401": {
             "description": "No identity.",
@@ -2537,12 +2537,12 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "The quoted `ETag` of the version being replaced, from the detail read.",
+            "description": "The quoted `ETag` of the version being replaced, from the detail read: the bare checksum or `\"{checksum}-{version}\"`, either way compared by checksum only.",
             "required": true,
             "schema": {
               "type": "string"
             },
-            "example": "\"3f8a1c05e2\""
+            "example": "\"3f8a1c05e2-0.19.2\""
           },
           {
             "name": "X-Crystalline-Join",
@@ -2575,7 +2575,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted checksum of the engram as saved, the token the next save carries."
+                "description": "The quoted `\"{checksum}-{version}\"` of the engram as saved, the token the next save carries."
               }
             },
             "content": {
@@ -2708,12 +2708,12 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "The quoted `ETag` of the version being deleted, from the detail read.",
+            "description": "The quoted `ETag` of the version being deleted, from the detail read: the bare checksum or `\"{checksum}-{version}\"`, either way compared by checksum only.",
             "required": true,
             "schema": {
               "type": "string"
             },
-            "example": "\"3f8a1c05e2\""
+            "example": "\"3f8a1c05e2-0.19.2\""
           }
         ],
         "responses": {
@@ -3483,7 +3483,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -3498,7 +3498,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "The quoted checksum of a version already held. A match answers 304 with no body.",
+            "description": "The quoted tag of a version already held: the bare checksum, or `\"{checksum}-{version}\"`. A match against the CURRENT tag answers 304 with no body.",
             "required": false,
             "schema": {
               "type": [
@@ -3506,7 +3506,7 @@
                 "null"
               ]
             },
-            "example": "\"3f8a1c05e2\""
+            "example": "\"3f8a1c05e2-0.19.2\""
           }
         ],
         "responses": {
@@ -3523,7 +3523,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted checksum of the manifest as read, the token a later `PUT` carries in `If-Match`."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as read, the token a later `PUT` carries in `If-Match`."
               }
             },
             "content": {
@@ -3601,7 +3601,7 @@
             }
           },
           "304": {
-            "description": "`If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
+            "description": "`If-None-Match` names the current tag; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
           },
           "401": {
             "description": "No identity.",
@@ -3655,12 +3655,12 @@
           {
             "name": "If-Match",
             "in": "header",
-            "description": "The quoted `ETag` of the version being replaced, from the manifest read.",
+            "description": "The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum or `\"{checksum}-{version}\"`, either way compared by checksum only.",
             "required": true,
             "schema": {
               "type": "string"
             },
-            "example": "\"3f8a1c05e2\""
+            "example": "\"3f8a1c05e2-0.19.2\""
           }
         ],
         "requestBody": {
@@ -3681,7 +3681,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted checksum of the manifest as saved, the token the next save carries."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as saved, the token the next save carries."
               }
             },
             "content": {
@@ -3886,7 +3886,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The quoted checksum of the manifest as it now reads."
+                "description": "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads."
               }
             },
             "content": {

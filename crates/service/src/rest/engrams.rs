@@ -3,8 +3,11 @@
 //!
 //! The reads hand the engine's own JSON over unchanged, so this API and the MCP
 //! tools answer with one payload rather than two shapes that drift. The detail
-//! route adds exactly one thing on top: an `ETag`, so a client that later wants
-//! to write back can say which version it read.
+//! route adds exactly one thing on top: an `ETag` (see [`etag`]), so a client
+//! that later wants to write back can say which version it read. The tag
+//! carries this binary's own version alongside the checksum, since this JSON
+//! shape is read out of the engine rather than sent as written and has
+//! changed between releases before.
 //!
 //! The two writes are the first content mutations on this surface, so the rules
 //! they are held to are written down here rather than left to be re-derived by
@@ -38,6 +41,7 @@ use super::auth::Identity;
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, RestState,
     csv, if_match, if_none_match_matches, precondition_failed, require_domain_write,
+    versioned_etag,
 };
 use crate::engine::EngineError;
 use crate::params::{
@@ -285,8 +289,8 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
 /// two folders down carries `notes/deep/gamma`, and a single segment would only
 /// ever reach the ones at a domain's root.
 ///
-/// The response carries an `ETag` over the markdown, so a client knows which
-/// version it is holding. See [`etag`].
+/// The response carries an `ETag` of `"{checksum}-{version}"` over the
+/// markdown, so a client knows which version it is holding. See [`etag`].
 #[utoipa::path(
     get,
     path = "/api/v1/domains/{domain}/engrams/{permalink}",
@@ -295,13 +299,16 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
     summary = "One engram in full.",
     description = "Its frontmatter, its markdown as written and the references \
                    the engine resolves around it.\n\nThe response carries an \
-                   `ETag` over the markdown, so a client knows which version it \
-                   is holding and can say so when it later writes back. \
-                   `If-None-Match` naming the current checksum answers 304 with \
-                   no body, and `Cache-Control: no-cache` on both the 200 and \
-                   the 304 keeps a stored copy revalidating instead of going \
-                   heuristically fresh, so a save elsewhere is picked up on its \
-                   next use.",
+                   `ETag` of `\"{checksum}-{version}\"`: the engine's own \
+                   checksum plus this binary's own version, so a client knows \
+                   which version it is holding and can say so when it later \
+                   writes back - `If-Match` accepts either this full tag or \
+                   the bare checksum. `If-None-Match` naming the current tag \
+                   answers 304 with no body, and `Cache-Control: no-cache` on \
+                   both the 200 and the 304 keeps a stored copy revalidating \
+                   instead of going heuristically fresh, so a save elsewhere - \
+                   or an upgrade that changed this JSON's own shape - is \
+                   picked up on its next use.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -314,9 +321,11 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
         (
             "If-None-Match" = Option<String>,
             Header,
-            description = "The quoted checksum of a version already held. A \
-                           match answers 304 with no body.",
-            example = "\"3f8a1c05e2\"",
+            description = "The quoted tag of a version already held: the \
+                           bare checksum, or `\"{checksum}-{version}\"`. A \
+                           match against the CURRENT tag answers 304 with \
+                           no body.",
+            example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
     responses(
@@ -334,9 +343,10 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
                            keys are absent on every ordinary read.",
             body = Object,
             headers(
-                ("etag" = String, description = "The quoted checksum of the \
-                 engram as read, the same token a later write compares an \
-                 `expected_checksum` against."),
+                ("etag" = String, description = "The quoted \
+                 `\"{checksum}-{version}\"` of the engram as read, the same \
+                 checksum a later write compares an `expected_checksum` \
+                 against."),
                 ("cache-control" = String, description = "Always `no-cache`: \
                  store it, but revalidate before every use."),
             ),
@@ -359,7 +369,7 @@ fn listing_order(sort: Option<&str>, dir: Option<&str>) -> Result<SearchOrder, A
         ),
         (
             status = 304,
-            description = "`If-None-Match` names the current checksum; no body \
+            description = "`If-None-Match` names the current tag; no body \
                            is sent. Carries the `ETag` it matched and the same \
                            `Cache-Control`.",
         ),
@@ -414,7 +424,7 @@ pub async fn detail(
     let mut value = value;
     crate::web_url::attach_engram_url(&mut value, &state.engine.request_web_base(&headers));
     let checksum = checksum_of(&value)?.to_string();
-    if if_none_match_matches(&headers, &checksum) {
+    if if_none_match_matches(&headers, &versioned_etag(&checksum)) {
         // The validator and `Cache-Control`, no body: the shape is stated
         // once, on `if_none_match_matches`.
         return Ok((
@@ -735,9 +745,9 @@ pub struct MoveBody {
                            `notices` list of sentences naming what happened \
                            and what to write instead.",
             body = Object,
-            headers(("etag" = String, description = "The quoted checksum of the \
-                     engram as written, the token a later save carries in \
-                     `If-Match`.")),
+            headers(("etag" = String, description = "The quoted \
+                     `\"{checksum}-{version}\"` of the engram as written, \
+                     the token a later save carries in `If-Match`.")),
         ),
         (
             status = 400,
@@ -951,8 +961,10 @@ pub async fn create(
             "If-Match" = String,
             Header,
             description = "The quoted `ETag` of the version being replaced, \
-                           from the detail read.",
-            example = "\"3f8a1c05e2\"",
+                           from the detail read: the bare checksum or \
+                           `\"{checksum}-{version}\"`, either way compared \
+                           by checksum only.",
+            example = "\"3f8a1c05e2-0.19.2\"",
         ),
         (
             "X-Crystalline-Join" = Option<String>,
@@ -979,8 +991,9 @@ pub async fn create(
                            body instead, with `joined` carrying the sentence \
                            naming whose draft it landed in.",
             body = Object,
-            headers(("etag" = String, description = "The quoted checksum of the \
-                     engram as saved, the token the next save carries.")),
+            headers(("etag" = String, description = "The quoted \
+                     `\"{checksum}-{version}\"` of the engram as saved, the \
+                     token the next save carries.")),
         ),
         (
             status = 400,
@@ -1147,7 +1160,13 @@ pub async fn save(
                     "joined": receipt["joined"],
                 });
                 let mut resp = (StatusCode::OK, Json(body)).into_response();
-                if let Ok(tag) = axum::http::HeaderValue::from_str(&format!("\"{checksum}\"")) {
+                // Versioned the same way the detail route's own ETag is: this
+                // is still a save of an engram, and a header that meant
+                // different things depending on which branch of this handler
+                // answered would defeat the point of one contract for it.
+                if let Ok(tag) =
+                    axum::http::HeaderValue::from_str(&format!("\"{}\"", versioned_etag(&checksum)))
+                {
                     resp.headers_mut().insert(ETAG, tag);
                 }
                 return Ok(resp);
@@ -1209,7 +1228,11 @@ pub async fn save(
                 ApiError::internal("the engram read carried no checksum to version it by")
             })?;
             let content = current["content"].as_str().unwrap_or_default().to_string();
-            Ok(precondition_failed(message, checksum, content))
+            Ok(precondition_failed(
+                message,
+                &versioned_etag(checksum),
+                content,
+            ))
         }
         Err(e) => Err(e.into()),
     }
@@ -1701,8 +1724,10 @@ impl ValidateFinding {
             "If-Match" = String,
             Header,
             description = "The quoted `ETag` of the version being deleted, \
-                           from the detail read.",
-            example = "\"3f8a1c05e2\"",
+                           from the detail read: the bare checksum or \
+                           `\"{checksum}-{version}\"`, either way compared \
+                           by checksum only.",
+            example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
     responses(
@@ -1815,7 +1840,11 @@ pub async fn remove(
                 ApiError::internal("the engram read carried no checksum to version it by")
             })?;
             let content = current["content"].as_str().unwrap_or_default().to_string();
-            Ok(precondition_failed(message, checksum, content))
+            Ok(precondition_failed(
+                message,
+                &versioned_etag(checksum),
+                content,
+            ))
         }
         Err(e) => Err(e.into()),
     }
@@ -1896,23 +1925,26 @@ fn carry_advisory(detail: &mut Value, receipt: &Value) {
     }
 }
 
-/// The strong validator for the engram this read returned: the checksum the
-/// engine computed over the markdown it is handing back, quoted the way RFC
+/// The strong validator for the engram this read returned: the engine's
+/// checksum, versioned (see [`super::versioned_etag`]) and quoted the way RFC
 /// 9110 requires of a strong one.
 ///
 /// The engine's `checksum` is reused rather than the content hashed a second
 /// time here, and not to save the hash: it is the same value `edit_engram`
 /// compares an `expected_checksum` against, so the tag a client reads out of a
-/// response is exactly the token a later `If-Match` can be turned into, with
-/// one definition of what version an engram is at rather than two that agree
-/// until one of them moves.
+/// response is exactly the token a later `If-Match` can be turned into (which
+/// accepts the bare checksum too), with one definition of what version an
+/// engram is at rather than two that agree until one of them moves. The
+/// version half exists because this JSON's own shape can change between
+/// releases, so a browser holding a 304 from an older daemon is answered
+/// fresh instead of kept on a shape the client has never seen.
 ///
 /// The error branch is unreachable under the current engine, which always emits
 /// `checksum` from a read; it guards against a future contract break, loudly,
 /// rather than letting an engram be served without a version.
 fn etag(value: &Value) -> Result<HeaderValue, ApiError> {
     let checksum = checksum_of(value)?;
-    HeaderValue::from_str(&format!("\"{checksum}\""))
+    HeaderValue::from_str(&format!("\"{}\"", versioned_etag(checksum)))
         .map_err(|_| ApiError::internal("the engram's checksum is not a usable ETag"))
 }
 
@@ -1931,11 +1963,16 @@ mod tests {
     use super::*;
 
     /// The tag is a quoted strong validator, which is what an `If-Match`
-    /// comparison later depends on: unquoted or `W/`-prefixed would not match.
+    /// comparison later depends on: unquoted or `W/`-prefixed would not
+    /// match. It carries this binary's own version beside the checksum, so a
+    /// shape change between releases is never masked by a stale 304.
     #[test]
-    fn the_etag_is_the_quoted_checksum() {
+    fn the_etag_is_the_quoted_versioned_checksum() {
         let value = serde_json::json!({ "checksum": "abc123", "content": "hi" });
-        assert_eq!(etag(&value).unwrap(), "\"abc123\"");
+        assert_eq!(
+            etag(&value).unwrap(),
+            format!("\"abc123-{}\"", crystalline_core::VERSION)
+        );
     }
 
     /// A response with no checksum is an engine contract this layer cannot

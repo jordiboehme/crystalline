@@ -412,6 +412,81 @@ async fn save_walks_the_if_match_contract() {
     assert!(final_content.contains("A sharper rule."));
 }
 
+/// `If-Match` accepts three shapes of the same checksum: the bare form Fluid
+/// sends from the detail read's `checksum` field, the current versioned tag
+/// the `ETag` header carries, and a tag written by an older version of this
+/// binary - the checksum is what the guard protects, so a client that copied
+/// the header from a stale build still saves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_accepts_a_bare_or_a_versioned_if_match() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    // The bare checksum.
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+    let checksum = etag.rsplit_once('-').map_or(etag.as_str(), |(c, _)| c);
+    let bare = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{checksum}\""))
+    .json(&serde_json::json!({
+        "content": content.replace("A rule about alpha.", "A rule, v1.")
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(bare.status(), 200, "the bare checksum is accepted");
+
+    // The current versioned tag, straight off the response the bare save just
+    // answered with.
+    let etag = bare.headers()["etag"].to_str().unwrap().to_string();
+    let (_etag, content) = read_alpha(fx.addr, &editor).await;
+    let versioned = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", etag)
+    .json(&serde_json::json!({ "content": content.replace("v1", "v2") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        versioned.status(),
+        200,
+        "the current versioned tag is accepted"
+    );
+
+    // The same checksum under an older version's tag - not what this binary
+    // would have written, but still a valid precondition.
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+    let checksum = etag.rsplit_once('-').map_or(etag.as_str(), |(c, _)| c);
+    let older = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{checksum}-0.18.1\""))
+    .json(&serde_json::json!({ "content": content.replace("v2", "v3") }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        older.status(),
+        200,
+        "an older version's tag is still a valid precondition when the \
+         checksum matches"
+    );
+}
+
 /// Two tabs saving the same engram from the same read. Exactly one lands and
 /// the other is told it is stale, and the file on disk holds one writer's bytes
 /// whole rather than a blend of both.
@@ -1310,10 +1385,11 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
         .trim_matches('"')
         .to_string();
     let body: serde_json::Value = read.json().await.unwrap();
+    let checksum = body["checksum"].as_str().unwrap().to_string();
     assert_eq!(
-        body["checksum"].as_str().unwrap(),
         etag,
-        "header and body agree"
+        format!("{checksum}-{}", crystalline_core::VERSION),
+        "header and body agree, versioned for the shape `sections` carries"
     );
     let markdown = body["markdown"].as_str().unwrap().to_string();
 
@@ -1353,20 +1429,23 @@ async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
         "Route here for eng questions",
         "Route here for all things eng",
     );
+    // The bare checksum, the way Fluid sends it from the body's own
+    // `checksum` field rather than the versioned header: still a valid
+    // precondition, since the checksum is what the guard protects.
     let saved = as_session(
         fx.addr,
         reqwest::Method::PUT,
         "/api/v1/domains/eng/manifest",
         &admin,
     )
-    .header("if-match", format!("\"{etag}\""))
+    .header("if-match", format!("\"{checksum}\""))
     .json(&serde_json::json!({"markdown": edited}))
     .send()
     .await
     .unwrap();
     assert_eq!(saved.status(), 200);
     let saved_body: serde_json::Value = saved.json().await.unwrap();
-    assert_ne!(saved_body["checksum"].as_str().unwrap(), etag);
+    assert_ne!(saved_body["checksum"].as_str().unwrap(), checksum);
     assert_eq!(
         std::fs::read_to_string(fx._tmp.path().join("eng/MANIFEST.md")).unwrap(),
         edited
@@ -1522,10 +1601,11 @@ async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
         .trim_matches('"')
         .to_string();
     let body: serde_json::Value = read.json().await.unwrap();
+    let checksum = body["checksum"].as_str().unwrap().to_string();
     assert_eq!(
-        body["checksum"].as_str().unwrap(),
         etag,
-        "header and body agree"
+        format!("{checksum}-{}", crystalline_core::VERSION),
+        "header and body agree, versioned for the shape `sections` carries"
     );
     let markdown = body["markdown"].as_str().unwrap().to_string();
 
@@ -1533,6 +1613,8 @@ async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
         "Route here for docs questions",
         "Route here for all things docs",
     );
+    // The versioned header tag round-trips into `If-Match` too, not only the
+    // bare checksum the other half of this pair proves.
     let saved = as_session(
         fx.addr,
         reqwest::Method::PUT,
@@ -1546,7 +1628,7 @@ async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
     .unwrap();
     assert_eq!(saved.status(), 200);
     let saved_body: serde_json::Value = saved.json().await.unwrap();
-    assert_ne!(saved_body["checksum"].as_str().unwrap(), etag);
+    assert_ne!(saved_body["checksum"].as_str().unwrap(), checksum);
     assert_eq!(saved_body["markdown"].as_str().unwrap(), edited);
 }
 
@@ -3030,7 +3112,11 @@ async fn create_and_save_answer_with_the_neighbours_advisory() {
     // saves what it read is still holding the right token.
     assert_eq!(
         created_etag,
-        format!("\"{}\"", second["checksum"].as_str().unwrap()),
+        format!(
+            "\"{}-{}\"",
+            second["checksum"].as_str().unwrap(),
+            crystalline_core::VERSION
+        ),
         "the advisory did not move the ETag off the engram's checksum"
     );
 
@@ -3061,7 +3147,11 @@ async fn create_and_save_answer_with_the_neighbours_advisory() {
     );
     assert_eq!(
         saved_etag,
-        format!("\"{}\"", saved["checksum"].as_str().unwrap()),
+        format!(
+            "\"{}-{}\"",
+            saved["checksum"].as_str().unwrap(),
+            crystalline_core::VERSION
+        ),
         "the saved ETag is the new version, advisory or not"
     );
 }

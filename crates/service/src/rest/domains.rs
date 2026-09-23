@@ -19,7 +19,7 @@ use utoipa::{IntoParams, ToSchema};
 use super::auth::Identity;
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, RestState,
-    if_match, if_none_match_matches, precondition_failed, require_domain_read,
+    if_match, if_none_match_matches, precondition_failed, require_domain_read, versioned_etag,
 };
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
@@ -229,10 +229,15 @@ pub async fn tree(
 /// written, so a client can render or edit the source rather than a reduction
 /// of it.
 ///
-/// The response carries an `ETag` over the markdown, the same strong
-/// validator [`save_manifest`] compares an `If-Match` against, so a client
-/// that means to edit the manifest can go straight from this read to that
-/// write without a second round trip.
+/// The response carries an `ETag` of `"{checksum}-{version}"` over the
+/// markdown, the same strong validator [`save_manifest`] compares an
+/// `If-Match` against - which accepts the bare checksum too, see
+/// [`super::if_match`] - so a client that means to edit the manifest can go
+/// straight from this read to that write without a second round trip. The
+/// version half exists because `sections` is read out of the markdown by
+/// this binary rather than sent as written: a shape it gained across a
+/// release (`sections` itself arrived in 0.18.3) would otherwise stay hidden
+/// behind a 304 answered from a browser's pre-upgrade cache.
 #[utoipa::path(
     get,
     path = "/api/v1/domains/{domain}/manifest",
@@ -240,15 +245,19 @@ pub async fn tree(
     operation_id = "get_domain_manifest",
     summary = "The domain's MANIFEST markdown as written.",
     description = "The source, not a reduction of it, so a client can render \
-                   or edit it directly.\n\nThe response carries an `ETag` \
-                   over the markdown, the same strong validator a later \
-                   `PUT` compares an `If-Match` against. `If-None-Match` \
-                   naming the current checksum answers 304 with no body, and \
-                   `Cache-Control: no-cache` on both the 200 and the 304 keeps \
-                   a stored copy revalidating instead of going heuristically \
-                   fresh, so a save elsewhere is picked up on its next \
-                   use.\n\n`sections` is what the core crate reads out of the \
-                   source: the routing bullets and which of them an agent \
+                   or edit it directly.\n\nThe response carries an `ETag` of \
+                   `\"{checksum}-{version}\"`: the plain content checksum \
+                   plus this binary's own version, so a shape `sections` \
+                   gains across a release is never masked by a 304 answered \
+                   from a browser's pre-upgrade cache. It is the same \
+                   validator a later `PUT` compares an `If-Match` against, \
+                   which accepts either this full tag or the bare checksum. \
+                   `If-None-Match` naming the current tag answers 304 with \
+                   no body, and `Cache-Control: no-cache` on both the 200 \
+                   and the 304 keeps a stored copy revalidating instead of \
+                   going heuristically fresh, so a save elsewhere is picked \
+                   up on its next use.\n\n`sections` is what the core crate \
+                   reads out of the source: the routing bullets and which of them an agent \
                    reads, the provisioning and tag alias declarations with \
                    every bullet that did not parse, and every frontmatter \
                    policy key with what it declares and what holds. `null` \
@@ -262,9 +271,11 @@ pub async fn tree(
         (
             "If-None-Match" = Option<String>,
             Header,
-            description = "The quoted checksum of a version already held. A \
-                           match answers 304 with no body.",
-            example = "\"3f8a1c05e2\"",
+            description = "The quoted tag of a version already held: the \
+                           bare checksum, or `\"{checksum}-{version}\"`. A \
+                           match against the CURRENT tag answers 304 with \
+                           no body.",
+            example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
     responses(
@@ -273,9 +284,9 @@ pub async fn tree(
             description = "The manifest source beside the domain it belongs to.",
             body = ManifestResponse,
             headers(
-                ("etag" = String, description = "The quoted checksum of \
-                 the manifest as read, the token a later `PUT` carries \
-                 in `If-Match`."),
+                ("etag" = String, description = "The quoted \
+                 `\"{checksum}-{version}\"` of the manifest as read, the \
+                 token a later `PUT` carries in `If-Match`."),
                 ("cache-control" = String, description = "Always `no-cache`: \
                  store it, but revalidate before every use."),
             ),
@@ -306,7 +317,7 @@ pub async fn tree(
         ),
         (
             status = 304,
-            description = "`If-None-Match` names the current checksum; no body \
+            description = "`If-None-Match` names the current tag; no body \
                            is sent. Carries the `ETag` it matched and the same \
                            `Cache-Control`.",
         ),
@@ -342,8 +353,9 @@ pub async fn manifest(
     require_domain_read(&state, &identity, &domain).await?;
     let markdown = state.engine.manifest_markdown(&domain).await?;
     let checksum = manifest_checksum(&markdown);
-    if if_none_match_matches(&headers, &checksum) {
-        let etag = HeaderValue::from_str(&format!("\"{checksum}\""))
+    let tag = versioned_etag(&checksum);
+    if if_none_match_matches(&headers, &tag) {
+        let etag = HeaderValue::from_str(&format!("\"{tag}\""))
             .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
         // The validator and `Cache-Control`, no body: the shape is stated
         // once, on `if_none_match_matches`.
@@ -725,8 +737,10 @@ pub struct SaveManifestBody {
             "If-Match" = String,
             Header,
             description = "The quoted `ETag` of the version being replaced, \
-                           from the manifest read.",
-            example = "\"3f8a1c05e2\"",
+                           from the manifest read: the bare checksum or \
+                           `\"{checksum}-{version}\"`, either way compared \
+                           by checksum only.",
+            example = "\"3f8a1c05e2-0.19.2\"",
         ),
     ),
     request_body = SaveManifestBody,
@@ -735,9 +749,9 @@ pub struct SaveManifestBody {
             status = 200,
             description = "The manifest as saved, mirroring the GET shape.",
             body = ManifestResponse,
-            headers(("etag" = String, description = "The quoted checksum of \
-                     the manifest as saved, the token the next save \
-                     carries.")),
+            headers(("etag" = String, description = "The quoted \
+                     `\"{checksum}-{version}\"` of the manifest as saved, \
+                     the token the next save carries.")),
             example = json!({
                 "domain": "eng",
                 "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
@@ -862,7 +876,11 @@ pub async fn save_manifest(
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state.engine.manifest_markdown(&domain).await?;
             let checksum = manifest_checksum(&current);
-            Ok(precondition_failed(message, &checksum, current))
+            Ok(precondition_failed(
+                message,
+                &versioned_etag(&checksum),
+                current,
+            ))
         }
         Err(e) => Err(e.into()),
     }
@@ -912,7 +930,7 @@ pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
             description = "The manifest as it now reads for this caller, mirroring the \
                            GET shape, plus `draft: true` when it is the caller's draft.",
             body = ManifestResponse,
-            headers(("etag" = String, description = "The quoted checksum of the manifest as it now reads.")),
+            headers(("etag" = String, description = "The quoted `\"{checksum}-{version}\"` of the manifest as it now reads.")),
             example = json!({
                 "domain": "kb",
                 "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
@@ -1015,9 +1033,10 @@ pub async fn set_domain_policies(
 const STALE_EDIT: &str = "stale edit";
 
 /// The manifest response both the GET and the PUT answer with: the domain,
-/// the markdown, its checksum, and the same checksum again as a quoted `ETag`
-/// header - one shape for a manifest on this surface, so a client that has
-/// just saved one holds what the GET route would have given it.
+/// the markdown, its checksum, and the same checksum again - versioned, see
+/// [`versioned_etag`] - as a quoted `ETag` header. One shape for a manifest on
+/// this surface, so a client that has just saved one holds what the GET route
+/// would have given it.
 ///
 /// The sections are read from the markdown on every answer, a save's
 /// included, so a client that just saved holds the features of what it saved.
@@ -1034,7 +1053,7 @@ fn manifest_response(
     extra: Option<(&str, Value)>,
 ) -> Result<Response, ApiError> {
     let checksum = manifest_checksum(&markdown);
-    let etag = HeaderValue::from_str(&format!("\"{checksum}\""))
+    let etag = HeaderValue::from_str(&format!("\"{}\"", versioned_etag(&checksum)))
         .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
     let sections = ManifestSections::of(&markdown, domain);
     let payload = ManifestResponse {

@@ -18,8 +18,10 @@
 //! the strong validator a write must carry, [`precondition_failed`] renders
 //! the 412 it fails with (a [`ConflictDetail`], which carries the current
 //! version so a client can merge), [`if_none_match_matches`] decides whether a
-//! read may answer 304 and documents the shape of that 304, and [`REVALIDATE`]
-//! is the `Cache-Control` both the 200 and the 304 carry.
+//! read may answer 304 and documents the shape of that 304, [`versioned_etag`]
+//! builds the tag a manifest or an engram read carries so a cached JSON shape
+//! from an older release is never mistaken for the current one, and
+//! [`REVALIDATE`] is the `Cache-Control` both the 200 and the 304 carry.
 
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::StatusCode;
@@ -383,6 +385,14 @@ impl IntoResponse for ApiError {
 /// trimming quotes off it would silently mangle it into a malformed token
 /// instead of refusing it, and this surface's tokens are hex, so a comma can
 /// never appear in a legitimate one.
+///
+/// A manifest or an engram's `ETag` is versioned (see [`versioned_etag`]), so
+/// the token here may carry a trailing `-{version}` too. It is stripped
+/// before the checksum is returned: the content is what this guard protects,
+/// and a tag copied from a response written by another version of this binary
+/// is still a valid precondition when its checksum matches, whatever version
+/// wrote it. An attachment's `If-Match` (were one ever added) would carry no
+/// such suffix, since the plain content hash has no shape to version.
 pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
     let raw = headers
         .get(axum::http::header::IF_MATCH)
@@ -410,10 +420,17 @@ pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
         ));
     }
     let token = raw.trim_matches('"');
-    if token.is_empty() {
+    // The checksum is hex and a version never contains one, so the first `-`
+    // is always the boundary between them, whichever form arrived: the bare
+    // checksum Fluid sends from the body, or the versioned tag a client that
+    // copied the header sends back.
+    let checksum = token
+        .split_once('-')
+        .map_or(token, |(checksum, _)| checksum);
+    if checksum.is_empty() {
         return Err(ApiError::unprocessable("the If-Match token is empty"));
     }
-    Ok(token.to_string())
+    Ok(checksum.to_string())
 }
 
 /// `Cache-Control` for every conditional single-resource read, sent on both
@@ -440,6 +457,12 @@ pub const REVALIDATE: &str = "no-cache";
 /// direction either, since the worst outcome is a full response the client
 /// discards.
 ///
+/// `tag` is whatever the caller's own `ETag` carries, not necessarily a bare
+/// checksum: the manifest and engram routes pass a [`versioned_etag`] and the
+/// attachment route passes the plain content hash, and this function is
+/// indifferent to which - it only ever does an exact comparison against
+/// whatever it is handed.
+///
 /// # The 304 this gates
 ///
 /// The canonical statement of that response's shape, kept here because three
@@ -449,7 +472,7 @@ pub const REVALIDATE: &str = "no-cache";
 /// caching under the same token; and it repeats [`REVALIDATE`] as well, since
 /// a 304 updates the stored response's own headers and dropping the directive
 /// there would let the very response it refreshes turn heuristically fresh.
-pub fn if_none_match_matches(headers: &axum::http::HeaderMap, checksum: &str) -> bool {
+pub fn if_none_match_matches(headers: &axum::http::HeaderMap, tag: &str) -> bool {
     let Some(raw) = headers
         .get(axum::http::header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
@@ -463,8 +486,24 @@ pub fn if_none_match_matches(headers: &axum::http::HeaderMap, checksum: &str) ->
                 .strip_prefix("W/")
                 .unwrap_or(candidate)
                 .trim_matches('"')
-                == checksum
+                == tag
     })
+}
+
+/// The versioned strong validator a manifest or an engram read carries.
+///
+/// Both answer with JSON whose shape the core crate has changed between
+/// releases - `sections` on the manifest arrived in 0.18.3, for instance -
+/// while their `ETag` was only ever the plain content checksum. A daemon
+/// upgraded in place kept answering `If-None-Match` with 304 for a shape a
+/// browser had cached from the OLD daemon, so the new field never appeared
+/// until the cache was emptied by hand: the bytes had not changed, but what
+/// they mean to this binary had. Folding [`crystalline_core::VERSION`] into
+/// the tag makes a shape change a validator change too, so an upgrade is
+/// answered fresh exactly once. An attachment's `ETag` stays the plain
+/// content hash instead: it serves raw bytes with no shape to version.
+pub fn versioned_etag(checksum: &str) -> String {
+    format!("{checksum}-{}", crystalline_core::VERSION)
 }
 
 /// The wire form of a 412: a problem detail carrying the version the server
@@ -484,13 +523,19 @@ pub struct ConflictDetail {
 
 /// A 412 for a write whose `If-Match` no longer matches the server's copy,
 /// carrying that copy so the caller can merge instead of retrying blind.
-pub fn precondition_failed(detail: String, checksum: &str, content: String) -> Response {
+///
+/// `tag` becomes `current_etag` quoted, verbatim: the manifest and engram
+/// routes pass a [`versioned_etag`] here, the same one their next detail read
+/// would answer with, so a client that turns around and sends this value back
+/// as `If-Match` is sending exactly what [`if_match`] already knows how to
+/// read.
+pub fn precondition_failed(detail: String, tag: &str, content: String) -> Response {
     let body = ConflictDetail {
         problem_type: "about:blank",
         status: StatusCode::PRECONDITION_FAILED.as_u16(),
         title: "precondition failed",
         detail,
-        current_etag: format!("\"{checksum}\""),
+        current_etag: format!("\"{tag}\""),
         current_content: content,
     };
     let mut resp = (StatusCode::PRECONDITION_FAILED, axum::Json(body)).into_response();
@@ -763,6 +808,43 @@ mod tests {
         }
     }
 
+    /// A manifest or an engram's `ETag` carries `{checksum}-{version}`; this
+    /// guard accepts that form back, and the bare checksum Fluid sends from
+    /// the body's own `checksum` field, whatever version wrote the tag.
+    #[test]
+    fn if_match_accepts_a_bare_or_a_versioned_checksum() {
+        use axum::http::{HeaderMap, HeaderValue, header};
+        let with = |raw: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::IF_MATCH, HeaderValue::from_str(raw).unwrap());
+            h
+        };
+
+        assert_eq!(
+            if_match(&with("\"abc123\"")).unwrap(),
+            "abc123",
+            "the bare form still works"
+        );
+        assert_eq!(
+            if_match(&with(&format!("\"abc123-{}\"", crystalline_core::VERSION))).unwrap(),
+            "abc123",
+            "today's version"
+        );
+        assert_eq!(
+            if_match(&with("\"abc123-0.18.1\"")).unwrap(),
+            "abc123",
+            "an older version's tag is still a valid precondition when the \
+             checksum matches"
+        );
+        // A tag that is nothing but the version suffix has no checksum at
+        // all, which this surface refuses the same way it refuses any other
+        // empty token.
+        assert_eq!(
+            if_match(&with("\"-0.19.1\"")).unwrap_err().status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
     /// RFC 9110 allows a comma-separated `If-Match` list; this surface refuses
     /// it outright (400) rather than mangling it into a bogus single token by
     /// trimming quotes off the whole thing.
@@ -804,6 +886,16 @@ mod tests {
         assert!(
             !if_none_match_matches(&HeaderMap::new(), "abc123"),
             "no header asks for the bytes"
+        );
+    }
+
+    /// The versioned tag is the checksum, a dash, and this binary's own
+    /// version - not the manifest's or the engram's own version of anything.
+    #[test]
+    fn versioned_etag_appends_this_binarys_version() {
+        assert_eq!(
+            versioned_etag("abc123"),
+            format!("abc123-{}", crystalline_core::VERSION)
         );
     }
 

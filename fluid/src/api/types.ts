@@ -512,7 +512,7 @@ export interface paths {
          * One engram in full.
          * @description Its frontmatter, its markdown as written and the references the engine resolves around it.
          *
-         *     The response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
+         *     The response carries an `ETag` of `"{checksum}-{version}"`: the engine's own checksum plus this binary's own version, so a client knows which version it is holding and can say so when it later writes back - `If-Match` accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere - or an upgrade that changed this JSON's own shape - is picked up on its next use.
          */
         get: operations["get_engram"];
         /**
@@ -630,7 +630,7 @@ export interface paths {
          * The domain's MANIFEST markdown as written.
          * @description The source, not a reduction of it, so a client can render or edit it directly.
          *
-         *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
+         *     The response carries an `ETag` of `"{checksum}-{version}"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
          *
          *     `sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.
          *
@@ -5203,7 +5203,7 @@ export interface operations {
             /** @description The engine's own read payload for the new engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. A title that will not read back the way it was written - one holding a `/`, which lands the engram nested, or a `:`, which a link reads as a domain prefix - also carries a `notices` list of sentences naming what happened and what to write instead. */
             201: {
                 headers: {
-                    /** @description The quoted checksum of the engram as written, the token a later save carries in `If-Match`. */
+                    /** @description The quoted `"{checksum}-{version}"` of the engram as written, the token a later save carries in `If-Match`. */
                     etag?: string;
                     [name: string]: unknown;
                 };
@@ -5290,8 +5290,8 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The quoted checksum of a version already held. A match answers 304 with no body.
-                 * @example "3f8a1c05e2"
+                 * @description The quoted tag of a version already held: the bare checksum, or `"{checksum}-{version}"`. A match against the CURRENT tag answers 304 with no body.
+                 * @example "3f8a1c05e2-0.19.2"
                  */
                 "If-None-Match"?: string | null;
             };
@@ -5317,7 +5317,7 @@ export interface operations {
                 headers: {
                     /** @description Always `no-cache`: store it, but revalidate before every use. */
                     "cache-control"?: string;
-                    /** @description The quoted checksum of the engram as read, the same token a later write compares an `expected_checksum` against. */
+                    /** @description The quoted `"{checksum}-{version}"` of the engram as read, the same checksum a later write compares an `expected_checksum` against. */
                     etag?: string;
                     [name: string]: unknown;
                 };
@@ -5346,7 +5346,7 @@ export interface operations {
                     "application/json": Record<string, never>;
                 };
             };
-            /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
+            /** @description `If-None-Match` names the current tag; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
             304: {
                 headers: {
                     [name: string]: unknown;
@@ -5387,8 +5387,8 @@ export interface operations {
             query?: never;
             header: {
                 /**
-                 * @description The quoted `ETag` of the version being replaced, from the detail read.
-                 * @example "3f8a1c05e2"
+                 * @description The quoted `ETag` of the version being replaced, from the detail read: the bare checksum or `"{checksum}-{version}"`, either way compared by checksum only.
+                 * @example "3f8a1c05e2-0.19.2"
                  */
                 "If-Match": string;
                 /** @description The key of a live join this session opened on a draft share-link (`POST /draft-links/join`). Present only while working inside somebody else's draft: it routes the save into that person's draft and changes the reply to the accepted-draft body. A key naming no live join of this account's is refused 403 and nothing is written. */
@@ -5414,7 +5414,7 @@ export interface operations {
             /** @description The engine's own read payload for the saved engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. A save routed by `X-Crystalline-Join` answers the accepted-draft body instead, with `joined` carrying the sentence naming whose draft it landed in. */
             200: {
                 headers: {
-                    /** @description The quoted checksum of the engram as saved, the token the next save carries. */
+                    /** @description The quoted `"{checksum}-{version}"` of the engram as saved, the token the next save carries. */
                     etag?: string;
                     [name: string]: unknown;
                 };
@@ -5510,8 +5510,8 @@ export interface operations {
             query?: never;
             header: {
                 /**
-                 * @description The quoted `ETag` of the version being deleted, from the detail read.
-                 * @example "3f8a1c05e2"
+                 * @description The quoted `ETag` of the version being deleted, from the detail read: the bare checksum or `"{checksum}-{version}"`, either way compared by checksum only.
+                 * @example "3f8a1c05e2-0.19.2"
                  */
                 "If-Match": string;
             };
@@ -6121,8 +6121,8 @@ export interface operations {
             query?: never;
             header?: {
                 /**
-                 * @description The quoted checksum of a version already held. A match answers 304 with no body.
-                 * @example "3f8a1c05e2"
+                 * @description The quoted tag of a version already held: the bare checksum, or `"{checksum}-{version}"`. A match against the CURRENT tag answers 304 with no body.
+                 * @example "3f8a1c05e2-0.19.2"
                  */
                 "If-None-Match"?: string | null;
             };
@@ -6139,7 +6139,7 @@ export interface operations {
                 headers: {
                     /** @description Always `no-cache`: store it, but revalidate before every use. */
                     "cache-control"?: string;
-                    /** @description The quoted checksum of the manifest as read, the token a later `PUT` carries in `If-Match`. */
+                    /** @description The quoted `"{checksum}-{version}"` of the manifest as read, the token a later `PUT` carries in `If-Match`. */
                     etag?: string;
                     [name: string]: unknown;
                 };
@@ -6215,7 +6215,7 @@ export interface operations {
                     "application/json": components["schemas"]["ManifestResponse"];
                 };
             };
-            /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
+            /** @description `If-None-Match` names the current tag; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
             304: {
                 headers: {
                     [name: string]: unknown;
@@ -6256,8 +6256,8 @@ export interface operations {
             query?: never;
             header: {
                 /**
-                 * @description The quoted `ETag` of the version being replaced, from the manifest read.
-                 * @example "3f8a1c05e2"
+                 * @description The quoted `ETag` of the version being replaced, from the manifest read: the bare checksum or `"{checksum}-{version}"`, either way compared by checksum only.
+                 * @example "3f8a1c05e2-0.19.2"
                  */
                 "If-Match": string;
             };
@@ -6276,7 +6276,7 @@ export interface operations {
             /** @description The manifest as saved, mirroring the GET shape. */
             200: {
                 headers: {
-                    /** @description The quoted checksum of the manifest as saved, the token the next save carries. */
+                    /** @description The quoted `"{checksum}-{version}"` of the manifest as saved, the token the next save carries. */
                     etag?: string;
                     [name: string]: unknown;
                 };
@@ -6454,7 +6454,7 @@ export interface operations {
             /** @description The manifest as it now reads for this caller, mirroring the GET shape, plus `draft: true` when it is the caller's draft. */
             200: {
                 headers: {
-                    /** @description The quoted checksum of the manifest as it now reads. */
+                    /** @description The quoted `"{checksum}-{version}"` of the manifest as it now reads. */
                     etag?: string;
                     [name: string]: unknown;
                 };

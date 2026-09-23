@@ -1894,6 +1894,51 @@ async fn domain_manifest_honours_if_none_match() {
     assert_eq!(body["domain"], "eng");
 }
 
+/// The incident this pins: a browser that cached the manifest reply from an
+/// older daemon must never be told 304 for it. The `ETag` carries this
+/// binary's own version beside the checksum, so a tag from another version -
+/// or the bare checksum an old client remembers - is not a match even when
+/// the content is unchanged, and only the CURRENT tag short-circuits the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_manifest_if_none_match_is_scoped_to_this_versions_shape() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/manifest").await;
+    let etag = header(&resp, "etag");
+    let checksum = etag.trim_matches('"').rsplit_once('-').unwrap().0;
+
+    // The current tag still short-circuits the read.
+    let current = get_if_none_match(fixture.addr, "/api/v1/domains/eng/manifest", &etag).await;
+    assert_eq!(current.status(), 304);
+
+    // The same checksum under an older version's tag is not a match: the
+    // shape this binary answers with may have moved since that version wrote
+    // it, so the full body comes back rather than a 304 for a shape the
+    // client may never have seen.
+    let older = get_if_none_match(
+        fixture.addr,
+        "/api/v1/domains/eng/manifest",
+        &format!("\"{checksum}-0.18.1\""),
+    )
+    .await;
+    assert_eq!(older.status(), 200, "an older version's tag is not today's");
+    let body: serde_json::Value = older.json().await.unwrap();
+    assert_eq!(body["domain"], "eng");
+
+    // The bare checksum - what a pre-versioning client cached - is not a
+    // match either, for the same reason: this is the incident itself.
+    let bare = get_if_none_match(
+        fixture.addr,
+        "/api/v1/domains/eng/manifest",
+        &format!("\"{checksum}\""),
+    )
+    .await;
+    assert_eq!(
+        bare.status(),
+        200,
+        "a bare checksum is not the versioned tag"
+    );
+}
+
 /// Overwrite the fixture domain's MANIFEST on disk. The manifest route reads
 /// the file at request time, so no sync stands between the write and the
 /// next GET.
@@ -2612,8 +2657,8 @@ async fn engram_detail_carries_the_source_and_a_strong_etag() {
     );
     assert_eq!(
         etag,
-        format!("\"{}\"", sha256_hex(&on_disk)),
-        "the ETag is the quoted SHA-256 of that markdown"
+        format!("\"{}-{}\"", sha256_hex(&on_disk), crystalline_core::VERSION),
+        "the ETag is the quoted SHA-256 of that markdown, versioned"
     );
     assert!(
         etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/"),
@@ -2690,6 +2735,42 @@ async fn engram_detail_honours_if_none_match() {
     assert_eq!(body["permalink"], "alpha");
 }
 
+/// The same incident the manifest test pins, for the engram detail route: an
+/// older version's tag, and the bare checksum a pre-versioning client
+/// remembers, are both a miss - only the current versioned tag answers 304.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_detail_if_none_match_is_scoped_to_this_versions_shape() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/engrams/alpha").await;
+    let etag = header(&resp, "etag");
+    let checksum = etag.trim_matches('"').rsplit_once('-').unwrap().0;
+
+    let current = get_if_none_match(fixture.addr, "/api/v1/domains/eng/engrams/alpha", &etag).await;
+    assert_eq!(current.status(), 304);
+
+    let older = get_if_none_match(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams/alpha",
+        &format!("\"{checksum}-0.18.1\""),
+    )
+    .await;
+    assert_eq!(older.status(), 200, "an older version's tag is not today's");
+    let body: serde_json::Value = older.json().await.unwrap();
+    assert_eq!(body["permalink"], "alpha");
+
+    let bare = get_if_none_match(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams/alpha",
+        &format!("\"{checksum}\""),
+    )
+    .await;
+    assert_eq!(
+        bare.status(),
+        200,
+        "a bare checksum is not the versioned tag"
+    );
+}
+
 /// A permalink is a path, not a segment: the route captures the rest of the URL
 /// so an engram two folders down is reachable by the permalink it carries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2704,8 +2785,9 @@ async fn engram_detail_resolves_a_permalink_with_folders() {
     assert_eq!(
         etag,
         format!(
-            "\"{}\"",
-            sha256_hex(&fixture.engram_bytes("notes/deep/gamma.md"))
+            "\"{}-{}\"",
+            sha256_hex(&fixture.engram_bytes("notes/deep/gamma.md")),
+            crystalline_core::VERSION
         )
     );
 }
