@@ -607,6 +607,35 @@ async fn a_move_that_readdresses_an_open_room_is_refused() {
     .await
     .unwrap();
     assert_eq!(kept.status(), 200, "{:?}", kept.text().await);
+
+    // Closing the editor ends the room - its last socket's teardown saves and
+    // disposes it - so the ordinary flow (edit, close, then move) is never
+    // refused. The teardown runs after the close frame, hence the short wait.
+    room.close(None).await.unwrap();
+    let deadline = std::time::Instant::now() + FRAME_TIMEOUT;
+    loop {
+        let renamed = move_with(serde_json::json!({
+            "permalink": "alpha",
+            "destination": "guides/alpha.md",
+            "new_permalink": "guides/alpha",
+        }))
+        .await
+        .unwrap();
+        if renamed.status() == 200 {
+            break;
+        }
+        assert_eq!(renamed.status(), 409, "{:?}", renamed.text().await);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the room outlived its last editor"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        std::fs::read_to_string(fx.domain_dir.join("guides/alpha.md"))
+            .unwrap()
+            .contains("permalink: guides/alpha\n")
+    );
 }
 
 /// Capacity is refused like every other guard: on the plain GET, with a status

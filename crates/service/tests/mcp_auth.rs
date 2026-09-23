@@ -1762,6 +1762,15 @@ async fn an_instance_viewers_agent_is_refused_and_an_admins_is_not() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_strangers_move_leaves_a_hidden_domains_link_alone() {
     let ctx = mcp_ctx(true).await;
+    // A reference no edge table records: the move finds it by content, which
+    // is a second route into other domains and has to stop at the same wall.
+    std::fs::write(
+        ctx.path("lab", "url-note.md"),
+        "---\ntype: engram\ntitle: Url Note\npermalink: url-note\ntags:\n  - confidential\nstatus: stable\nrecorded_at: 2026-01-05\n---\n\n# Url Note\n\nThe shared half lives at crystalline://open/open-note for now.\n",
+    )
+    .unwrap();
+    ctx.engine.sync(None).await.unwrap();
+    let url_before = std::fs::read_to_string(ctx.path("lab", "url-note.md")).unwrap();
     let token = ctx.token_for("out").await;
     let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
     let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
@@ -1793,6 +1802,15 @@ async fn a_strangers_move_leaves_a_hidden_domains_link_alone() {
         std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
         before,
         "the private engram's link is byte-for-byte what it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "url-note.md")).unwrap(),
+        url_before,
+        "and so is the private URL the content scan found"
+    );
+    assert!(
+        moved.contains("references_rewritten\\\":0"),
+        "counted nowhere either:\n{moved}"
     );
 }
 
