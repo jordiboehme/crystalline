@@ -414,7 +414,8 @@ pub fn read_lock_info() -> Option<LockInfo> {
 /// Attach to a running daemon if one is reachable. Returns `None` when no live
 /// daemon owns the index (no lock record, a dead pid or an unreachable socket),
 /// which is the signal that ownership is takeable. A daemon older than this
-/// binary is displaced first (graceful shutdown, then `None`), so the caller
+/// binary is displaced first (a graceful shutdown, then signals when a verified
+/// Crystalline process stays, then `None`), so the caller
 /// proceeds exactly as if no daemon ran and the next spawn runs the new
 /// version. A thin wrapper over [`try_attach_reporting`] for callers that do
 /// not need the displacement flag.
@@ -447,15 +448,19 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
         if displace(&sock, info.pid).await {
             return (None, true);
         }
-        // The wait ran out. Another client may have finished the takeover
-        // in the meantime (its bridge respawns a daemon the moment the old
-        // one leaves), so re-read the record: a different pid means the
-        // socket already belongs to the successor and attaching is right.
+        // The old daemon is still running: `displace` either could not verify
+        // it as a Crystalline process and so never signalled it, or not even
+        // the hard signal ended it. Another client may also have finished the
+        // takeover in the meantime (its bridge respawns a daemon the moment
+        // the old one leaves), so re-read the record: a different pid means
+        // the socket already belongs to the successor and attaching is right.
+        // Otherwise the connect below reaches whatever still answers on the
+        // socket, if anything, rather than contending for the index.
         match read_lock_info() {
             Some(now) if now.pid != info.pid => {}
             _ => {
                 tracing::warn!(
-                    "daemon v{} (pid {}) did not shut down; attaching to it as-is",
+                    "daemon v{} (pid {}) is still running after the shutdown ask and could not be stopped; leaving it in place",
                     info.version,
                     info.pid
                 );
@@ -536,22 +541,78 @@ fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// How long each stage of a displacement waits for the old daemon to leave.
+struct DisplaceWaits {
+    /// After the graceful `ctl shutdown` ask.
+    ask: Duration,
+    /// After the graceful signal (`SIGTERM`).
+    term: Duration,
+    /// After the hard signal (`SIGKILL`, `TerminateProcess` on Windows).
+    kill: Duration,
+}
+
+/// The waits a real displacement uses. The ask gets twelve seconds: a daemon
+/// of this version is gone inside its own [`crate::daemon::SHUTDOWN_DEADLINE`]
+/// of it, and the rest of the window is OS teardown on a loaded machine. The
+/// two signal steps take `dislodge_unresponsive`'s waits, since they are the
+/// same escalation.
+const DISPLACE_WAITS: DisplaceWaits = DisplaceWaits {
+    ask: Duration::from_secs(12),
+    term: DISLODGE_TERM_WAIT,
+    kill: DISLODGE_KILL_WAIT,
+};
+
 /// Ask the daemon behind `sock` to shut down gracefully and wait for `pid` to
-/// exit. Returns true once the process is gone, meaning ownership is takeable;
-/// false leaves the daemon in place and the caller attaches to it as before,
-/// so a failed takeover degrades to the old behavior instead of contending
-/// for the index.
+/// exit, escalating to signals when it does not. Returns true only once the
+/// process is gone, meaning ownership is takeable. False means the process is
+/// still there: it could not be verified as a Crystalline binary and so was
+/// never signalled, or even the hard signal did not end it.
+///
+/// The escalation is what the 2026-09-23 incident was missing. A 0.18.1
+/// daemon answered the ask, removed its record, socket and lock file, and then
+/// stayed alive for minutes inside its runtime's drop, waiting for a model
+/// download while it held the index. Waiting and then attaching as-is could not
+/// end that, and every successor found the index held. This version's own
+/// shutdown can no longer linger (see [`crate::daemon::Departure`]), but a
+/// daemon being displaced is by definition an older one, and nothing but a
+/// signal reaches it once it stops listening.
 async fn displace(sock: &Path, pid: u32) -> bool {
+    displace_within(sock, pid, &DISPLACE_WAITS).await
+}
+
+/// [`displace`] with its waits spelled out, so the tests need not sit through
+/// the real ones.
+async fn displace_within(sock: &Path, pid: u32, waits: &DisplaceWaits) -> bool {
+    // A daemon that took the ask gets its window to leave on its own. One
+    // that could not be asked at all - its socket already gone, which is the
+    // lingering shape itself, or a ctl exchange that failed - goes straight
+    // to the signals, whose first step is just as graceful for a daemon that
+    // is still healthy.
+    if ask_to_shut_down(sock).await && wait_until_gone(pid, waits.ask).await {
+        return true;
+    }
+    if process_gone(pid) {
+        return true;
+    }
+    tracing::warn!(
+        "crystalline daemon pid {pid} is still running after the shutdown ask; stopping it"
+    );
+    escalate(pid, waits).await
+}
+
+/// Send the `ctl shutdown` ask and read the ack best-effort. Returns whether
+/// the ask was delivered. The daemon exits promptly after the ack - it does
+/// not drain active sessions, it cancels them, and bridges resync and answer
+/// their orphaned requests with a retry error - so the caller's window
+/// tolerates OS process teardown, not a session drain.
+async fn ask_to_shut_down(sock: &Path) -> bool {
     let Ok(name) = socket_name(sock) else {
         return false;
     };
-    let stream = match IpcStream::connect(name).await {
-        Ok(stream) => stream,
-        // Nothing answers: gone already, or wedged beyond a graceful ask.
-        Err(_) => return !process_alive(pid),
+    let Ok(stream) = IpcStream::connect(name).await else {
+        return false;
     };
-    let conn = Connection { stream };
-    let Ok(mut stream) = conn.into_ctl().await else {
+    let Ok(mut stream) = (Connection { stream }).into_ctl().await else {
         return false;
     };
     if stream
@@ -562,20 +623,140 @@ async fn displace(sock: &Path, pid: u32) -> bool {
     {
         return false;
     }
-    // Read the ack best-effort, then wait for the process to leave. The
-    // daemon exits promptly after the ack - it does not drain active
-    // sessions, it cancels them, and bridges resync and answer their
-    // orphaned requests with a retry error - so the generous window here
-    // tolerates OS process teardown, not a session drain.
     let mut buf = [0u8; 256];
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-    for _ in 0..240 {
-        if !process_alive(pid) {
+    true
+}
+
+/// Signal a displaced daemon that did not leave: the graceful signal first,
+/// then the hard one, each followed by its wait. The identity gate
+/// `dislodge_unresponsive` relies on is checked before each of the two,
+/// because a pid is only a number and may have been reused by the time the
+/// hard step comes: the process behind it has to be a Crystalline binary, and
+/// never init or this process. Returns whether the pid is gone.
+async fn escalate(pid: u32, waits: &DisplaceWaits) -> bool {
+    for (hard, wait) in [(false, waits.term), (true, waits.kill)] {
+        if process_gone(pid) {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if pid <= 1 || pid == std::process::id() {
+            tracing::warn!("pid {pid} is not a process this client may signal; leaving it alone");
+            return false;
+        }
+        match process_exe_name(pid) {
+            Some(name) if is_crystalline_exe_name(&name) => {}
+            Some(name) => {
+                tracing::warn!(
+                    "pid {pid} is '{name}', not a Crystalline process; nothing was signalled"
+                );
+                return false;
+            }
+            None => {
+                // A process that left between the two checks is what was
+                // wanted; one that is there but unreadable is left alone.
+                if process_gone(pid) {
+                    return true;
+                }
+                tracing::warn!("what pid {pid} is could not be verified; nothing was signalled");
+                return false;
+            }
+        }
+        signal_process(pid, hard);
+        if wait_until_gone(pid, wait).await {
+            return true;
+        }
     }
+    tracing::warn!("crystalline daemon pid {pid} did not stop even after the hard signal");
     false
+}
+
+/// Poll until `pid` is gone or `budget` has passed.
+async fn wait_until_gone(pid: u32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if process_gone(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DISLODGE_POLL).await;
+    }
+}
+
+/// Whether `pid` no longer runs: it does not exist, or it has exited and only
+/// its zombie is left for a parent that has not reaped it yet.
+///
+/// The zombie matters because of who the parent is. A daemon the Claude
+/// Desktop extension started is a plain child of its bridge (it stays inside
+/// the bridge's job so it cannot outlive Desktop, see `spawn_daemon`), and
+/// that bridge never waits for it. Once such a daemon exits, the signal-0
+/// probe [`process_alive`] uses still succeeds on the zombie until the bridge
+/// itself goes, so a displacement would wait out every stage and report a
+/// daemon that has released everything as still there. A zombie holds no file,
+/// no lock and no socket, which is all a successor cares about.
+fn process_gone(pid: u32) -> bool {
+    !process_alive(pid) || is_zombie(pid)
+}
+
+/// Whether `pid` is a zombie: exited, not yet reaped. Only Linux and macOS are
+/// asked; a Windows process that exited already reads as not alive, and any
+/// other platform answers false.
+fn is_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // The state is the first field after the command name, which sits in
+        // parentheses and may itself contain spaces or parentheses; the last
+        // `)` is where it ends.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state == "Z")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // libproc's `proc_pidinfo` refuses a zombie outright (both BSD info
+        // flavours fail on one, which is how this was found), so the answer
+        // comes from `sysctl(KERN_PROC_PID)` instead, which still describes a
+        // zombie. The `libc` crate does not bind `struct kinfo_proc`, so the
+        // one byte needed is read at its offset: `kp_proc.p_stat` sits at
+        // byte 36 of the structure on every 64-bit macOS (a 16 byte union, two
+        // pointers, an int flag, then the state), unchanged since the
+        // structure was introduced.
+        const P_STAT_OFFSET: usize = 36;
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as libc::c_int,
+        ];
+        // `struct kinfo_proc` is 648 bytes on 64-bit macOS; the buffer is
+        // generous so a larger future layout still fits.
+        let mut buf = [0u8; 1024];
+        let mut len = buf.len();
+        // SAFETY: `mib` names four valid integers, `buf` is `len` writable
+        // bytes and the kernel writes at most `len` of them, reporting how
+        // many in `len`.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        // An unknown pid answers success with nothing written.
+        rc == 0 && len > P_STAT_OFFSET && u32::from(buf[P_STAT_OFFSET]) == libc::SZOMB
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 // --- unresponsive holders ---------------------------------------------------
@@ -1918,15 +2099,45 @@ mod tests {
         killer.await.unwrap();
     }
 
-    /// A daemon that ignores the ask is left in place: displace reports
-    /// failure so the caller attaches to it instead of contending.
+    /// Short waits for the displacement tests below: long enough for a
+    /// signalled child to be torn down, short enough that a stage which is
+    /// meant to run out does not hold the suite up.
+    #[cfg(unix)]
+    const TEST_WAITS: DisplaceWaits = DisplaceWaits {
+        ask: Duration::from_millis(300),
+        term: Duration::from_secs(1),
+        kill: Duration::from_secs(5),
+    };
+
+    /// A scripted daemon socket that acknowledges the shutdown ask and then
+    /// does nothing about it, the shape of a daemon that answers and lingers.
+    #[cfg(unix)]
+    fn acknowledge_and_linger(sock: &Path) -> tokio::task::JoinHandle<()> {
+        let name = socket_name(sock).unwrap();
+        let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
+        tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let _ = read_mode_line(&mut stream).await;
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink).await;
+            stream.write_all(b"{\"ok\":true}\n").await.unwrap();
+            stream.flush().await.unwrap();
+            // Keep the stream open; the "daemon" never exits by itself.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        })
+    }
+
+    /// A process that ignores the ask and is not a Crystalline binary is
+    /// never signalled: displace reports failure and the process is still
+    /// running afterwards. `sleep` is the stranger - the identity gate
+    /// refuses its name - so this is the gate holding on the displace path,
+    /// not a signal that merely failed to land.
     #[cfg(unix)]
     #[tokio::test]
-    async fn displace_reports_failure_when_the_pid_stays() {
+    async fn displace_never_signals_a_stranger() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("crystalline.sock");
-        let name = socket_name(&sock).unwrap();
-        let listener = ListenerOptions::new().name(name).create_tokio().unwrap();
+        let server = acknowledge_and_linger(&sock);
 
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -1936,21 +2147,127 @@ mod tests {
             .unwrap();
         let pid = child.id();
 
-        let server = tokio::spawn(async move {
-            let mut stream = listener.accept().await.unwrap();
-            let _ = read_mode_line(&mut stream).await;
-            let mut sink = [0u8; 64];
-            let _ = stream.read(&mut sink).await;
-            stream.write_all(b"{\"ok\":true}\n").await.unwrap();
-            stream.flush().await.unwrap();
-            // Keep the stream open; the "daemon" never exits.
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        });
-
-        assert!(!displace(&sock, pid).await, "the pid never went away");
+        assert!(
+            !displace_within(&sock, pid, &TEST_WAITS).await,
+            "the pid never went away"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the stranger is still running: nothing was signalled"
+        );
         server.abort();
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The variable that tells [`displace_stand_in`] to act as a daemon.
+    #[cfg(unix)]
+    const STAND_IN_ENV: &str = "CRYSTALLINE_TEST_DISPLACE_STAND_IN";
+
+    /// Not a test: the process [`displace_stops_a_verified_daemon_that_ignores_both_asks`]
+    /// displaces. It runs only when that test starts this very test binary
+    /// with [`STAND_IN_ENV`] set, and then just stays alive; run any other
+    /// way it returns at once. Being this binary is the point: the identity
+    /// gate accepts a holder that wears this client's own executable name,
+    /// exactly as it accepts a renamed release binary, so the displacement is
+    /// verified honestly rather than with the gate switched off.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a stand-in process for a displace test, started by that test"]
+    fn displace_stand_in() {
+        if std::env::var_os(STAND_IN_ENV).is_some() {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// The 2026-09-23 incident's escalation: a verified Crystalline process
+    /// that acknowledges the shutdown ask, stays, and ignores `SIGTERM` too
+    /// (a lingering tokio daemon swallows it, since its signal handler stays
+    /// installed after its signal streams are gone) is ended by the hard
+    /// signal, and displace reports it gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn displace_stops_a_verified_daemon_that_ignores_both_asks() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("crystalline.sock");
+        let server = acknowledge_and_linger(&sock);
+
+        let mut stand_in = std::process::Command::new(std::env::current_exe().unwrap());
+        stand_in
+            .args([
+                "instance::tests::displace_stand_in",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(STAND_IN_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: `signal` is async-signal-safe, which is all `pre_exec`
+        // requires. An ignored disposition survives the exec.
+        unsafe {
+            stand_in.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = stand_in.spawn().unwrap();
+        let pid = child.id();
+        // Reaped as soon as it dies, so its end is observed as an exit status
+        // and the pid is really gone rather than a zombie of this process.
+        let reaper = std::thread::spawn(move || child.wait());
+
+        let gone = displace_within(&sock, pid, &TEST_WAITS).await;
+        if !gone {
+            signal_process(pid, true);
+        }
+        let status = reaper.join().unwrap().unwrap();
+        server.abort();
+
+        assert!(gone, "displace reports the verified daemon gone");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "it ignored the ask and SIGTERM, so only the hard signal ended it: {status:?}"
+        );
+    }
+
+    /// An exited process its parent has not reaped yet is gone for a
+    /// displacement, although the signal-0 probe still finds it: the case of
+    /// an extension daemon whose bridge never waits for it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_unreaped_exited_process_counts_as_gone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(!process_gone(pid), "a running process is not gone");
+
+        // SIGKILL without reaping: the child is a zombie from here on.
+        signal_process(pid, true);
+        let start = Instant::now();
+        while !is_zombie(pid) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            is_zombie(pid),
+            "the killed, unreaped child reads as a zombie"
+        );
+        assert!(
+            process_alive(pid),
+            "the signal-0 probe alone still finds the zombie"
+        );
+        assert!(process_gone(pid), "but for a displacement it is gone");
+
+        child.wait().unwrap();
+        assert!(process_gone(pid), "and reaped it is gone either way");
     }
 
     // `try_attach_reporting` tests below. A true two-version end-to-end is
