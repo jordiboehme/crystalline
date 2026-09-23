@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 
 use crystalline_remote::ops::DiscardTarget;
 
-use crate::daemon::{open_store, resolve_db};
+use crate::daemon::{Departure, SHUTDOWN_DEADLINE, open_store, resolve_db};
 use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone};
 use crate::instance::{Connection, acquire_ownership, ensure_daemon, try_attach};
 use crate::mcp::McpServer;
@@ -591,6 +591,9 @@ where
 /// take the primed reader with no risk of failing after it is consumed.
 struct EmbeddedStack {
     server: McpServer,
+    /// The engine the server runs on, kept here too so the end of the session
+    /// can take its store before the process leaves.
+    engine: Arc<Engine>,
     ownership: crate::instance::Ownership,
 }
 
@@ -655,7 +658,8 @@ async fn build_embedded(
     engine.refresh_routing_cache().await;
 
     Ok(EmbeddedStack {
-        server: McpServer::new(engine).with_onboarded_harness(harness_onboarded),
+        server: McpServer::new(engine.clone()).with_onboarded_harness(harness_onboarded),
+        engine,
         ownership,
     })
 }
@@ -665,6 +669,13 @@ async fn build_embedded(
 /// so this path never touches the pre-init probe itself; it hands the reader
 /// straight to `rmcp::serve_server`. This runs only after [`build_embedded`]
 /// succeeded, so nothing here consumes the reader on a startup failure.
+///
+/// A served session ends the process the way a daemon's shutdown does, in
+/// `std::process::exit` through [`Departure`], and never by returning: this
+/// stack owns the index exactly like a daemon, runs the same background model
+/// download in a blocking task, and a return would leave the process waiting
+/// for that task in the runtime's drop with its lock file already removed and
+/// the index still held.
 async fn run_embedded_stdio<R>(stack: EmbeddedStack, reader: R) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -672,8 +683,17 @@ where
     let stdout = tokio::io::stdout();
     let running = rmcp::serve_server(stack.server, (reader, stdout)).await?;
     let _ = running.waiting().await;
-    drop(stack.ownership);
-    Ok(())
+    tracing::info!(
+        "stopping (the client closed the session); exiting within {}s",
+        SHUTDOWN_DEADLINE.as_secs()
+    );
+    let departure = Departure::begin(stack.ownership, SHUTDOWN_DEADLINE);
+    // Held to the exit, as in the daemon: an operation already inside the
+    // store finishes and no new one starts.
+    departure.step("waiting for the store");
+    let store = stack.engine.store();
+    let _held = store.lock().await;
+    departure.finish(None)
 }
 
 /// Serve the degraded status server over stdio: a stand-in that answers

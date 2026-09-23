@@ -90,6 +90,34 @@ const COPYRIGHT_LINE: &str = concat!(
 /// does, so the two spellings cannot drift apart unnoticed.
 pub const COPYRIGHT_HOLDER: &str = "Copyright (C) 2026 Jordi Böhme";
 
+/// The test-only variable that parks a blocking task in a daemon; see
+/// [`parked_blocking_task`].
+pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
+
+/// How long a daemon parks one `spawn_blocking` task at startup, from
+/// [`PARK_BLOCKING_ENV`], or `None`.
+///
+/// A test-only seam, named `TEST` for the same reason
+/// `CRYSTALLINE_TEST_REBUILD_HOLD_MS` is: it is not a knob an install is meant
+/// to set and nothing documents it as one. It stands in for the task that
+/// kept a displaced daemon alive for minutes on 2026-09-23, a model download
+/// running in `spawn_blocking`. A tokio runtime's drop waits for every such
+/// task, and none of them can be cancelled, so a daemon that ended by
+/// returning from `run_serve` stayed a live process holding the index long
+/// after it had removed its record. The shutdown now ends in
+/// `std::process::exit` instead (see [`Departure`]), and the test that proves
+/// it needs a blocking task that is still running when the daemon is asked to
+/// stop; a real download is neither hermetic nor slow on demand.
+///
+/// An unset, empty, zero or unparsable value parks nothing.
+fn parked_blocking_task() -> Option<Duration> {
+    std::env::var(PARK_BLOCKING_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
 /// A tracked live session.
 #[derive(Clone, serde::Serialize)]
 struct SessionInfo {
@@ -115,6 +143,9 @@ pub struct Shared {
     sessions_tx: watch::Sender<usize>,
     /// The idle grace this daemon leaves after, when it was asked to.
     idle_exit: Option<Duration>,
+    /// Why the daemon is stopping, recorded by whoever asked first, for the
+    /// shutdown's first log line.
+    shutdown_reason: std::sync::OnceLock<&'static str>,
 }
 
 impl Shared {
@@ -169,9 +200,22 @@ impl Shared {
         let _ = self.sessions_tx.send(sessions.len());
     }
 
-    /// Signal shutdown to every watcher.
-    pub fn trigger_shutdown(&self) {
+    /// Signal shutdown to every watcher, recording `reason` (`ctl shutdown`,
+    /// `idle exit`, a signal's name) unless an earlier request already
+    /// recorded its own. Recorded before the send, so the shutdown that wakes
+    /// on it always finds a reason.
+    pub fn trigger_shutdown(&self, reason: &'static str) {
+        let _ = self.shutdown_reason.set(reason);
         let _ = self.shutdown_tx.send(true);
+    }
+
+    /// Why the daemon is stopping: the reason the first
+    /// [`Shared::trigger_shutdown`] recorded.
+    fn shutdown_reason(&self) -> &'static str {
+        self.shutdown_reason
+            .get()
+            .copied()
+            .unwrap_or("an unrecorded request")
     }
 
     fn watch(&self) -> watch::Receiver<bool> {
@@ -338,6 +382,9 @@ pub async fn run_serve(
             .with_env_overlay(loaded.overlay.clone()),
     );
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
+    if let Some(park) = parked_blocking_task() {
+        tokio::task::spawn_blocking(move || std::thread::sleep(park));
+    }
 
     // Prime the routing cache once as the HTTP baseline: every HTTP session
     // shares this engine and reads its cache at initialize, and each socket
@@ -352,7 +399,6 @@ pub async fn run_serve(
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let (sessions_tx, sessions_rx) = watch::channel(0usize);
-    let idle_shutdown = shutdown_tx.clone();
     let http_sessions = Arc::new(AtomicUsize::new(0));
     let shared = Arc::new(Shared {
         engine: engine.clone(),
@@ -365,11 +411,18 @@ pub async fn run_serve(
         shutdown_tx,
         sessions_tx,
         idle_exit: exit_when_idle.then_some(IDLE_EXIT_GRACE),
+        shutdown_reason: std::sync::OnceLock::new(),
     });
     // The extension's bounded life: started now, so a stub that dies before
     // it ever attaches (Desktop quitting mid-spawn) still ends this daemon.
     if exit_when_idle {
-        tokio::spawn(run_idle_exit(sessions_rx, IDLE_EXIT_GRACE, idle_shutdown));
+        let idle = shared.clone();
+        tokio::spawn(run_idle_exit(
+            sessions_rx,
+            IDLE_EXIT_GRACE,
+            shared.watch(),
+            move || idle.trigger_shutdown("idle exit"),
+        ));
     } else {
         drop(sessions_rx);
     }
@@ -605,29 +658,157 @@ pub async fn run_serve(
 
     let accept = tokio::spawn(accept_loop(listener, shared.clone()));
 
-    tokio::select! {
-        _ = wait_signal() => {}
-        _ = shared.wait_shutdown() => {}
-    }
-    shared.trigger_shutdown();
+    let reason = tokio::select! {
+        signal = wait_signal() => signal,
+        _ = shared.wait_shutdown() => shared.shutdown_reason(),
+    };
+    shared.trigger_shutdown(reason);
+
+    // From here the daemon ends in `std::process::exit`, never by returning:
+    // see [`Departure`] for why, and for the watchdog that bounds every step
+    // below by [`SHUTDOWN_DEADLINE`].
+    tracing::info!(
+        "stopping ({reason}); exiting within {}s",
+        SHUTDOWN_DEADLINE.as_secs()
+    );
+    let departure = Departure::begin(ownership, SHUTDOWN_DEADLINE);
+
+    departure.step("waiting for the accept loop");
     let _ = accept.await;
 
     // Release every host lock this instance holds so a successor daemon acquires
     // immediately instead of waiting out the stale threshold. A no-op when this
     // instance hosts nothing.
+    departure.step("releasing host locks");
     engine.release_hosts().await;
 
     // Best-effort WAL checkpoint so a stopped daemon's state dir holds a clean
-    // single-file db, backup and copy friendly. Never blocks or fails
-    // shutdown: checkpoint_wal logs and swallows any error itself.
+    // single-file db, backup and copy friendly. Never fails shutdown:
+    // checkpoint_wal logs and swallows any error itself, and the watchdog
+    // bounds how long it may block.
+    departure.step("checkpointing the WAL");
     engine.checkpoint_wal().await;
 
-    // Dropping ownership releases the lock and removes the socket and lock files.
-    drop(ownership);
-    if !daemon_flag {
-        eprintln!("crystalline stopped");
+    // Taken and never given back: this waits for an operation already inside
+    // the store to finish and admits no new one, so nothing writes to the
+    // index between here and the exit.
+    departure.step("waiting for the store");
+    let store = engine.store();
+    let _held = store.lock().await;
+
+    departure.finish((!daemon_flag).then_some("crystalline stopped"))
+}
+
+/// How long a stopping daemon has from the moment it decides to stop to the
+/// moment its process is gone. Each shutdown step normally takes milliseconds;
+/// a step still running at the deadline is abandoned by [`Departure`]'s
+/// watchdog, which names it in the log and exits anyway. Ten seconds is the
+/// same patience a starting successor gives a departing holder of the index
+/// ([`STORE_LOCK_WAIT`]), so a successor that arrives during a stuck shutdown
+/// still finds the index free before it gives up.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The end of a process that owns the index: a daemon's shutdown, or the
+/// embedded MCP stack's once its client has gone.
+///
+/// It exists because such a process must never outlive its ownership record.
+/// On 2026-09-23 a displaced daemon dropped its [`crate::instance::Ownership`]
+/// (record, socket and lock file gone) and then returned from `run_serve`, so
+/// the tokio runtime was dropped next, and a runtime's drop waits for every
+/// `spawn_blocking` task. One of those was a model download that ran for
+/// minutes, and the whole time the process kept `index.db` locked: every
+/// successor took ownership, found the index held and quit. The index lock
+/// cannot be let go of from inside the process either, since turso releases
+/// its file lock only when every handle to the database in the process is
+/// gone, and the engine is shared with tasks that may be the very thing that
+/// is stuck.
+///
+/// So the process leaves instead: [`Departure::finish`] removes the record,
+/// the socket and the lock file and calls `std::process::exit`, and the kernel
+/// drops the index lock and the service lock together. No runtime drop runs,
+/// so no blocking task is waited for. A plain `std::thread` watchdog, which a
+/// stuck runtime cannot starve, does the same after [`SHUTDOWN_DEADLINE`] when
+/// a step never finishes, and names that step in the log.
+pub(crate) struct Departure {
+    /// The step in progress, for the watchdog's line.
+    step: Arc<std::sync::Mutex<&'static str>>,
+    /// The ownership, shared with the watchdog so whichever of the two ends
+    /// the process removes the files first. The lock is held from the removal
+    /// to the exit, which keeps the two from ending the process at once.
+    ownership: Arc<std::sync::Mutex<Option<crate::instance::Ownership>>>,
+}
+
+impl Departure {
+    /// Start the departure: take over `ownership` and arm the watchdog, which
+    /// ends the process `deadline` from now unless [`Departure::finish`] does
+    /// so first.
+    pub(crate) fn begin(ownership: crate::instance::Ownership, deadline: Duration) -> Departure {
+        let departure = Departure {
+            step: Arc::new(std::sync::Mutex::new("starting")),
+            ownership: Arc::new(std::sync::Mutex::new(Some(ownership))),
+        };
+        let step = departure.step.clone();
+        let ownership = departure.ownership.clone();
+        let watchdog = std::thread::Builder::new()
+            .name("shutdown-watchdog".into())
+            .spawn(move || {
+                std::thread::sleep(deadline);
+                let stuck = *step
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tracing::warn!(
+                    "shutdown did not finish in {}s (stuck in {stuck}); exiting now",
+                    deadline.as_secs()
+                );
+                let mut slot = ownership
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(slot.take());
+                exit_now();
+            });
+        if let Err(err) = watchdog {
+            // Not fatal: the steps still run and the process still exits at
+            // the end, it is only the bound on a stuck step that is missing.
+            tracing::warn!("could not start the shutdown watchdog ({err}); stopping without one");
+        }
+        departure
     }
-    Ok(())
+
+    /// Log the step that starts now and remember it for the watchdog, so a
+    /// shutdown that stalls says where.
+    pub(crate) fn step(&self, name: &'static str) {
+        tracing::info!("shutdown: {name}");
+        *self
+            .step
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
+    }
+
+    /// Remove the record, the socket and the lock file, print `farewell` to
+    /// stderr when there is one, and exit with status 0.
+    pub(crate) fn finish(self, farewell: Option<&str>) -> ! {
+        self.step("removing the record, the socket and the lock file");
+        let mut slot = self
+            .ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(slot.take());
+        if let Some(line) = farewell {
+            eprintln!("{line}");
+        }
+        exit_now();
+    }
+}
+
+/// Flush what this process has written and exit with status 0. Both streams,
+/// because `std::process::exit` runs no destructors and a line still sitting
+/// in a buffer would be lost; stderr is unbuffered in std today, and flushing
+/// it costs nothing if that ever changes.
+fn exit_now() -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(0)
 }
 
 /// Accept connections until shutdown, dispatching each by its handshake line.
@@ -1889,13 +2070,15 @@ async fn run_heartbeat(engine: Arc<Engine>, secs: u64, mut shutdown: watch::Rece
 /// (the web UI, a remote agent) are not what keeps a Desktop-started daemon
 /// alive. The grace restarts from zero whenever the count returns to zero, so a
 /// client that reconnects inside it (Desktop restarting its server) keeps the
-/// daemon. Ends quietly on an external shutdown.
+/// daemon. Ends quietly on an external shutdown, which `stop` reports; `trip`
+/// is how it asks for its own, so the daemon can record the idle exit as the
+/// reason it stopped.
 pub(crate) async fn run_idle_exit(
     mut sessions: watch::Receiver<usize>,
     grace: Duration,
-    shutdown: watch::Sender<bool>,
+    mut stop: watch::Receiver<bool>,
+    trip: impl FnOnce(),
 ) {
-    let mut stop = shutdown.subscribe();
     loop {
         while *sessions.borrow_and_update() > 0 {
             tokio::select! {
@@ -1920,7 +2103,7 @@ pub(crate) async fn run_idle_exit(
                         "no client for {}s; exiting, the bounded life of a daemon the Claude Desktop extension started",
                         grace.as_secs()
                     );
-                    let _ = shutdown.send(true);
+                    trip();
                     return;
                 }
             }
@@ -2121,7 +2304,8 @@ async fn wait_true(rx: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn wait_signal() {
+/// Resolve on the first stop signal, naming it for the shutdown's reason line.
+async fn wait_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -2134,13 +2318,14 @@ async fn wait_signal() {
             Err(_) => return futures::future::pending().await,
         };
         tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        "Ctrl+C"
     }
 }
 
@@ -2551,14 +2736,17 @@ pub(crate) async fn open_store(
 /// How long a daemon that holds ownership waits for the index database to come
 /// free before it gives up.
 ///
-/// A predecessor removes its ownership record while the engine it is dropping
-/// still holds the file: the engine is shared with background tasks, and the
-/// database lock goes with the last of them. That window is milliseconds on a
-/// quiet machine and has been long enough on a loaded CI runner for a successor
-/// to fail outright, which is what an upgrade or an autostart reconnect right
-/// after a shutdown would meet. Ten seconds covers any departure that is
-/// actually happening; a holder that is not leaving still fails the start, as
-/// before, and says who holds it.
+/// A predecessor removes its ownership record before the index lock goes, so a
+/// successor can take ownership while the file is still held. From this
+/// release on that gap is the few instructions between [`Departure::finish`]
+/// removing the files and the process exiting, which is when the kernel drops
+/// the index lock; a daemon whose shutdown stalls is ended by the same
+/// watchdog after [`SHUTDOWN_DEADLINE`], which this wait matches. Older
+/// daemons are why the wait is still ten seconds and not a moment: they
+/// removed the record first and then waited for their runtime to wind down,
+/// which on a loaded CI runner was long enough for a successor to fail
+/// outright, and they are what an upgrade meets. A holder that is not leaving
+/// still fails the start, as before, and says who holds it.
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// How often the owner asks again while it waits.
@@ -2569,8 +2757,11 @@ const STORE_LOCK_POLL: Duration = Duration::from_millis(50);
 /// Holding ownership is what makes waiting correct. Another process on the
 /// index file at that point is either a predecessor that has already given up
 /// ownership and is on its way out, or a short daemonless command, and either
-/// lets go by itself. Every other caller of [`open_store`] fails fast, which is
-/// right for them: they hold nothing, and the answer they need is who does.
+/// lets go by itself. A predecessor of this version is gone within moments of
+/// giving up ownership (see [`Departure`]); an older one may still be winding
+/// down its runtime, and the retry is kept for it. Every other caller of
+/// [`open_store`] fails fast, which is right for them: they hold nothing, and
+/// the answer they need is who does.
 async fn open_store_as_owner(
     cfg: &GlobalConfig,
     db: Option<&Path>,
@@ -2692,10 +2883,14 @@ mod tests {
     async fn idle_exit_trips_shutdown_after_the_grace_with_no_session() {
         let (_sessions_tx, sessions_rx) = watch::channel(0usize);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let trip = shutdown_tx.clone();
         let task = tokio::spawn(run_idle_exit(
             sessions_rx,
             Duration::from_secs(5),
-            shutdown_tx.clone(),
+            shutdown_tx.subscribe(),
+            move || {
+                let _ = trip.send(true);
+            },
         ));
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(!*shutdown_rx.borrow(), "not before the grace");
@@ -2712,10 +2907,14 @@ mod tests {
     async fn idle_exit_waits_while_a_session_is_live() {
         let (sessions_tx, sessions_rx) = watch::channel(1usize);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let trip = shutdown_tx.clone();
         let task = tokio::spawn(run_idle_exit(
             sessions_rx,
             Duration::from_secs(5),
-            shutdown_tx.clone(),
+            shutdown_tx.subscribe(),
+            move || {
+                let _ = trip.send(true);
+            },
         ));
         tokio::time::sleep(Duration::from_secs(600)).await;
         assert!(!*shutdown_rx.borrow(), "a live session holds the daemon");
@@ -2733,10 +2932,14 @@ mod tests {
     async fn idle_exit_is_cancelled_by_a_session_arriving_inside_the_grace() {
         let (sessions_tx, sessions_rx) = watch::channel(0usize);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let trip = shutdown_tx.clone();
         let task = tokio::spawn(run_idle_exit(
             sessions_rx,
             Duration::from_secs(5),
-            shutdown_tx.clone(),
+            shutdown_tx.subscribe(),
+            move || {
+                let _ = trip.send(true);
+            },
         ));
         tokio::time::sleep(Duration::from_secs(3)).await;
         sessions_tx.send(1).unwrap();
@@ -2764,10 +2967,14 @@ mod tests {
     async fn idle_exit_stops_on_an_external_shutdown() {
         let (sessions_tx, sessions_rx) = watch::channel(1usize);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let trip = shutdown_tx.clone();
         let task = tokio::spawn(run_idle_exit(
             sessions_rx,
             Duration::from_secs(5),
-            shutdown_tx.clone(),
+            shutdown_tx.subscribe(),
+            move || {
+                let _ = trip.send(true);
+            },
         ));
         tokio::task::yield_now().await;
         shutdown_tx.send(true).unwrap();

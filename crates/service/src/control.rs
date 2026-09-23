@@ -56,7 +56,7 @@ pub async fn serve_ctl(stream: IpcStream, shared: Arc<Shared>) {
         }
         let _ = write.flush().await;
         if shutdown {
-            shared.trigger_shutdown();
+            shared.trigger_shutdown("ctl shutdown");
             break;
         }
     }

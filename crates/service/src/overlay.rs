@@ -123,6 +123,11 @@ const RESERVED_VARS: &[&str] = &[
     // does. Read straight from the environment in `crates/remote`, never
     // through the settings registry, so reserved here for the same reason.
     "CRYSTALLINE_TEST_NO_KEYCHAIN",
+    // The daemon's parked blocking task (`crate::daemon::parked_blocking_task`),
+    // which the shutdown test uses to hold a `spawn_blocking` open while the
+    // daemon is asked to stop. Read straight from the environment in
+    // `run_serve`, so reserved for the same reason as the two above.
+    crate::daemon::PARK_BLOCKING_ENV,
     // The install-channel marker (see [`crate::stub::CHANNEL_ENV`]): the mcpb
     // manifest sets it so the degraded status server can tell the Desktop
     // extension apart from a plain install. It is read straight from the

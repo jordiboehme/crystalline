@@ -611,6 +611,83 @@ fn a_plain_autostarted_daemon_outlives_its_clients() {
     assert!(!env.lock_path().exists(), "lock removed on shutdown");
 }
 
+/// The 2026-09-23 incident, from the stopping daemon's side: a daemon asked to
+/// stop while a blocking task is still running (a model download there, a
+/// parked `spawn_blocking` here) is gone within the shutdown deadline, and the
+/// index opens from another process straight after.
+///
+/// Before the fix the daemon dropped its record, socket and lock file at once
+/// and then waited in the tokio runtime's drop for the blocking task, holding
+/// `index.db` the whole time, so every successor failed on the index. The
+/// files are therefore not the proof here: the process is. The daemon is this
+/// test's own child rather than one an `mcp` bridge spawned, so its exit is
+/// read with `try_wait` and a zombie left for a living bridge to reap cannot
+/// pass for a live process.
+#[test]
+fn a_stopping_daemon_does_not_wait_for_a_blocking_task() {
+    let env = Env::new("park");
+    env.setup_domain("eng");
+
+    let stderr_path = env.dir.join("serve.stderr");
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    cmd.env("CRYSTALLINE_TEST_PARK_BLOCKING_SECS", "60");
+    let mut daemon = cmd
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    env.wait_ready();
+
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    let asked = Instant::now();
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break Some(status);
+        }
+        if asked.elapsed() > Duration::from_secs(12) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = status else {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        panic!(
+            "the daemon was still running {:?} after ctl shutdown; its stderr:\n{stderr}",
+            asked.elapsed()
+        );
+    };
+    assert!(status.success(), "a clean exit: {status:?}\n{stderr}");
+    assert!(
+        stderr.trim_end().ends_with("crystalline stopped"),
+        "the farewell line was flushed before the exit:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("stopping (ctl shutdown)"),
+        "the first shutdown line names the reason:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("did not finish in"),
+        "the steps finished on their own; the watchdog never fired:\n{stderr}"
+    );
+    assert!(!env.info_path().exists(), "record removed");
+    assert!(!env.sock_path().exists(), "socket removed");
+    assert!(!env.lock_path().exists(), "lock file removed");
+
+    // The index lock went with the process: a direct read opens it at once.
+    let db = env.state_dir().join("index.db");
+    let (ok, stdout, stderr) = env.run_full(&["search", "seed", "--db", db.to_str().unwrap()]);
+    assert!(
+        ok,
+        "the index opens right after the daemon left: {stdout}\n{stderr}"
+    );
+}
+
 /// End to end: a daemon started read-only reports it over ctl status, hides
 /// the write-gated tools from tools/list and refuses a write call by name with
 /// the read-only error.
