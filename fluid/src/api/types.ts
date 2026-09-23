@@ -633,6 +633,8 @@ export interface paths {
          *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
          *
          *     `sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.
+         *
+         *     `starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.
          */
         get: operations["get_domain_manifest"];
         /**
@@ -2396,6 +2398,16 @@ export interface components {
             routing: components["schemas"]["RoutingSource"];
             /** @description The `Scope` bullets; empty when the section is absent or empty. */
             scope: string[];
+            /**
+             * @description A whole MANIFEST for a domain that has none worth the name: the same
+             *     scaffold `domain init` writes, frontmatter and all.
+             *
+             *     The scaffold rather than the stanzas joined together, because a
+             *     document with no frontmatter fails verification on its first line and
+             *     a seeded buffer that cannot be saved is a dead end. Named for this
+             *     domain, so what the editor receives is ready as it stands.
+             */
+            starter_document: string;
             /**
              * @description Every MANIFEST section that carries meaning, with a line on what it
              *     does and an example that can be saved as it stands. Drawn from the
@@ -6170,6 +6182,7 @@ export interface operations {
                      *         "scope": [
                      *           "Everything about eng"
                      *         ],
+                     *         "starter_document": "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Describe the knowledge this domain covers\n\n## When to Use\n\n- Describe when an agent should route here\n\n## Notes for Agents\n\n- Add guidance for agents working in this domain\n- Note the folder layout new engrams should reuse\n",
                      *         "starters": [
                      *           {
                      *             "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
@@ -6306,6 +6319,7 @@ export interface operations {
                      *         "scope": [
                      *           "Everything about eng"
                      *         ],
+                     *         "starter_document": "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Describe the knowledge this domain covers\n\n## When to Use\n\n- Describe when an agent should route here\n\n## Notes for Agents\n\n- Add guidance for agents working in this domain\n- Note the folder layout new engrams should reuse\n",
                      *         "starters": [
                      *           {
                      *             "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
@@ -6483,6 +6497,7 @@ export interface operations {
                      *         "scope": [
                      *           "Everything about kb"
                      *         ],
+                     *         "starter_document": "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Describe the knowledge this domain covers\n\n## When to Use\n\n- Describe when an agent should route here\n\n## Notes for Agents\n\n- Add guidance for agents working in this domain\n- Note the folder layout new engrams should reuse\n",
                      *         "starters": [
                      *           {
                      *             "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",

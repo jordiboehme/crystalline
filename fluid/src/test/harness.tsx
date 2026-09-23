@@ -160,6 +160,32 @@ export function defaultPolicyRows(): PolicyRowFixture[] {
 }
 
 /**
+ * The scaffold the server offers for a domain with no MANIFEST worth the
+ * name, shortened to the parts a test reads: it is the CLI's own template,
+ * and what matters here is that it opens with frontmatter and carries the two
+ * required sections.
+ */
+export const STARTER_DOCUMENT = [
+  "---",
+  "type: manifest",
+  "title: eng",
+  "permalink: manifest",
+  "status: stable",
+  "---",
+  "",
+  "# eng",
+  "",
+  "## Scope",
+  "",
+  "- Describe the knowledge this domain covers",
+  "",
+  "## When to Use",
+  "",
+  "- Describe when an agent should route here",
+  "",
+].join("\n");
+
+/**
  * The startable sections as the server sends them: the core registry, whole,
  * in its own order and independent of what any MANIFEST declares.
  *
@@ -216,6 +242,7 @@ export function manifestSectionsResponse(
     tag_aliases: null,
     policies: defaultPolicyRows(),
     starters: defaultStarterRows(),
+    starter_document: STARTER_DOCUMENT,
     ...overrides,
   };
 }

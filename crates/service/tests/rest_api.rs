@@ -1916,6 +1916,31 @@ fn starters_json() -> serde_json::Value {
     )
 }
 
+/// The sections with the starter document lifted out, after checking it is
+/// the scaffold it claims to be.
+///
+/// Lifted rather than compared in place because it carries today's date: an
+/// exact literal here would go red overnight, and what matters about it is
+/// that it is a whole saveable MANIFEST for this domain.
+fn sections_without_the_scaffold(body: &serde_json::Value) -> serde_json::Value {
+    let mut sections = body["sections"].clone();
+    let document = sections["starter_document"]
+        .as_str()
+        .expect("the scaffold travels with the sections")
+        .to_string();
+    assert!(
+        document.starts_with("---\ntype: manifest\ntitle: eng\n"),
+        "{document}"
+    );
+    assert!(document.contains("## When to Use"), "{document}");
+    assert!(document.contains("## Scope"), "{document}");
+    sections
+        .as_object_mut()
+        .expect("the sections are an object")
+        .remove("starter_document");
+    sections
+}
+
 fn write_manifest(fixture: &Fixture, markdown: &str) {
     std::fs::write(fixture._tmp.path().join("eng/MANIFEST.md"), markdown).unwrap();
 }
@@ -1945,7 +1970,7 @@ async fn domain_manifest_carries_every_section_it_declares() {
     );
     assert!(body["checksum"].is_string());
     assert_eq!(
-        body["sections"],
+        sections_without_the_scaffold(&body),
         serde_json::json!({
             "scope": ["Everything about eng"],
             "when_to_use": ["Route here for eng questions"],
@@ -1990,7 +2015,7 @@ async fn domain_manifest_names_what_it_lacks() {
         .await
         .unwrap();
     assert_eq!(
-        body["sections"],
+        sections_without_the_scaffold(&body),
         serde_json::json!({
             "scope": ["Everything about eng"],
             "when_to_use": ["Route here for eng questions"],
@@ -2071,6 +2096,15 @@ async fn an_unparseable_manifest_declares_no_policies() {
     // so they are there for the MANIFEST that most needs them: a reader
     // looking at a broken file still learns what the file can say.
     assert_eq!(body["sections"]["starters"], starters_json(), "{body}");
+    // And so does the whole-document scaffold: a MANIFEST nobody can read is
+    // exactly the one somebody may want to start again from a clean one.
+    assert!(
+        body["sections"]["starter_document"]
+            .as_str()
+            .expect("the scaffold travels with the sections")
+            .starts_with("---\n"),
+        "{body}"
+    );
     assert!(
         body["sections"]["starters"]
             .as_array()

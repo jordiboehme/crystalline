@@ -170,6 +170,12 @@ export interface ManifestSections {
    * which is the case each reader falls back from.
    */
   starters: StarterStanza[];
+  /**
+   * A whole MANIFEST for a domain that has none worth the name: the same
+   * scaffold the CLI writes, named for this domain, frontmatter and all.
+   * Empty from a daemon that predates it.
+   */
+  starterDocument: string;
 }
 
 /** One startable MANIFEST section, as the server's registry describes it. */
@@ -316,6 +322,7 @@ export function readManifestSections(value: unknown): ManifestSections | null {
           },
     policies: readPolicies(record.policies),
     starters: readStarters(record.starters),
+    starterDocument: asString(record.starter_document) ?? "",
   };
 }
 

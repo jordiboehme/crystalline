@@ -24,7 +24,8 @@ use super::{
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
 use crystalline_core::{
-    Manifest, ProblemKind, TagAliasProblemKind, parse_engram, policy_registry, starter_stanzas,
+    Manifest, ProblemKind, TagAliasProblemKind, manifest_template, parse_engram, policy_registry,
+    starter_stanzas,
 };
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
@@ -252,7 +253,10 @@ pub async fn tree(
                    every bullet that did not parse, and every frontmatter \
                    policy key with what it declares and what holds. `null` \
                    for `provisioning` or `tag_aliases` means the section is \
-                   absent.",
+                   absent.\n\n`starters` and `starter_document` come from \
+                   the core registry rather than from this document, so a \
+                   client can show what a MANIFEST CAN say whether or not \
+                   this one says any of it.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -295,7 +299,8 @@ pub async fn tree(
                         { "section": "Scope", "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.", "example": "## Scope\n\n- Infrastructure and deployment, not application code" },
                         { "section": "Provisioning", "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.", "example": "## Provisioning\n\n- skills: skills" },
                         { "section": "Tag Aliases", "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.", "example": "## Tag Aliases\n\n- k8s -> kubernetes" }
-                    ]
+                    ],
+                    "starter_document": "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Describe the knowledge this domain covers\n\n## When to Use\n\n- Describe when an agent should route here\n\n## Notes for Agents\n\n- Add guidance for agents working in this domain\n- Note the folder layout new engrams should reuse\n"
                 }
             }),
         ),
@@ -409,6 +414,14 @@ pub struct ManifestSections {
     /// not the MANIFEST declares any of them - and sent for a MANIFEST that
     /// did not parse too, which is the one a reader most needs explained.
     pub starters: Vec<StarterStanzaView>,
+    /// A whole MANIFEST for a domain that has none worth the name: the same
+    /// scaffold `domain init` writes, frontmatter and all.
+    ///
+    /// The scaffold rather than the stanzas joined together, because a
+    /// document with no frontmatter fails verification on its first line and
+    /// a seeded buffer that cannot be saved is a dead end. Named for this
+    /// domain, so what the editor receives is ready as it stands.
+    pub starter_document: String,
 }
 
 /// Which routing section an agent reads.
@@ -558,7 +571,15 @@ impl ManifestSections {
     /// MANIFEST lacking both required sections rather than as a failure of
     /// the read: the markdown beside it is still the thing to fix, in the
     /// editor.
-    pub fn of(markdown: &str) -> ManifestSections {
+    pub fn of(markdown: &str, domain: &str) -> ManifestSections {
+        // The same scaffold `domain init` writes, named for this domain. Read
+        // off the clock rather than off the document: it is an offer, not a
+        // reading of anything, and `recorded_at` is the day somebody takes it.
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let starter_document = manifest_template(domain, &today);
         let Ok(engram) = parse_engram(markdown) else {
             return ManifestSections {
                 scope: Vec::new(),
@@ -574,6 +595,7 @@ impl ManifestSections {
                 // survive a document that cannot be read: a reader looking at
                 // a broken MANIFEST still learns what it can be made to say.
                 starters: starters(),
+                starter_document,
             };
         };
         let manifest = Manifest::from_engram(&engram, markdown);
@@ -633,6 +655,7 @@ impl ManifestSections {
             }),
             policies: policies_of(&manifest),
             starters: starters(),
+            starter_document,
         }
     }
 }
@@ -735,7 +758,8 @@ pub struct SaveManifestBody {
                         { "section": "Scope", "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.", "example": "## Scope\n\n- Infrastructure and deployment, not application code" },
                         { "section": "Provisioning", "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.", "example": "## Provisioning\n\n- skills: skills" },
                         { "section": "Tag Aliases", "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.", "example": "## Tag Aliases\n\n- k8s -> kubernetes" }
-                    ]
+                    ],
+                    "starter_document": "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Describe the knowledge this domain covers\n\n## When to Use\n\n- Describe when an agent should route here\n\n## Notes for Agents\n\n- Add guidance for agents working in this domain\n- Note the folder layout new engrams should reuse\n"
                 }
             }),
         ),
@@ -909,7 +933,8 @@ pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
                         { "section": "Scope", "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.", "example": "## Scope\n\n- Infrastructure and deployment, not application code" },
                         { "section": "Provisioning", "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.", "example": "## Provisioning\n\n- skills: skills" },
                         { "section": "Tag Aliases", "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.", "example": "## Tag Aliases\n\n- k8s -> kubernetes" }
-                    ]
+                    ],
+                    "starter_document": "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# eng\n\n## Scope\n\n- Describe the knowledge this domain covers\n\n## When to Use\n\n- Describe when an agent should route here\n\n## Notes for Agents\n\n- Add guidance for agents working in this domain\n- Note the folder layout new engrams should reuse\n"
                 }
             }),
         ),
@@ -1011,7 +1036,7 @@ fn manifest_response(
     let checksum = manifest_checksum(&markdown);
     let etag = HeaderValue::from_str(&format!("\"{checksum}\""))
         .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
-    let sections = ManifestSections::of(&markdown);
+    let sections = ManifestSections::of(&markdown, domain);
     let payload = ManifestResponse {
         domain: domain.to_string(),
         markdown,
