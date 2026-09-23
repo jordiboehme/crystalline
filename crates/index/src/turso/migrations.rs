@@ -1634,6 +1634,10 @@ mod tests {
             ),
             "the message names both versions and both remedies"
         );
+        assert!(
+            crate::is_schema_too_new_text(&err.to_string()),
+            "the advice composers recognise the refusal by its opening words"
+        );
 
         // Nothing was applied: the ledger still says the future version, not
         // something this binary invented by running a migration that was

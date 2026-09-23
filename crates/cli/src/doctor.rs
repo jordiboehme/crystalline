@@ -1023,6 +1023,10 @@ fn index_unavailable_reason(
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let skipped = "so the orphan, unindexed, embedding and tag checks did not run";
+    // Not a holder problem: see `instance::words_for_holder`.
+    if crystalline_index::is_schema_too_new_text(error) {
+        return format!("the index at {db} cannot be used by this binary, {skipped}. {error}");
+    }
     // The wedge first: it is the one holder `--fix` can do something about.
     if service.daemon_unresponsive && !service.daemon_dislodged {
         return format!(
@@ -1448,7 +1452,11 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
     let lock_stale = lock_present && !alive && instance::service_lock_is_free();
 
     let socket_present = sock_path.exists();
-    let socket_orphaned = socket_present && !(lock_present && alive);
+    // The same guard as `lock_stale`: a socket beside a lock somebody holds
+    // belongs to that holder, record or not, and deleting it would cut a
+    // running daemon off from every client that has not connected yet.
+    let socket_orphaned =
+        socket_present && !(lock_present && alive) && instance::service_lock_is_free();
 
     // Who actually holds the lock, probed read-only: this is the check that
     // sees the wedge (a live daemon holding the lock while its socket answers
@@ -1505,6 +1513,9 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
             let info_removed = std::fs::remove_file(&info_path).is_ok();
             let legacy_removed = std::fs::remove_file(&legacy_path).is_ok();
             s.lock_removed = info_removed || legacy_removed;
+        }
+        if s.socket_orphaned && !instance::service_lock_is_free() {
+            s.socket_orphaned = false;
         }
         if s.socket_orphaned {
             s.socket_removed = std::fs::remove_file(&sock_path).is_ok();

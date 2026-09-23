@@ -34,7 +34,7 @@ pub use embed::{
     hub_dir_name, local_model, lookup_local_model, order_jobs_for_batching, provider_from_config,
     prune_model_cache, run_embedding_pass, run_embedding_pass_with_page,
 };
-pub use error::{IndexError, Result};
+pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_text};
 pub use factory::open_store;
 pub use store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DEFAULT_RETIRED_WEIGHT,

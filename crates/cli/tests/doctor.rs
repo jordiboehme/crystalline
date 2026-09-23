@@ -743,6 +743,9 @@ fn a_held_lock_with_no_record_is_never_treated_as_stale() {
         "hold-lock publishes a record before announcing readiness"
     );
     std::fs::remove_file(&info_path).unwrap();
+    // A socket file beside the held lock belongs to its holder too.
+    let sock_path = state_dir.join("service.sock");
+    std::fs::write(&sock_path, b"").unwrap();
 
     let mut cmd = bin();
     apply(&mut cmd);
@@ -776,6 +779,10 @@ fn a_held_lock_with_no_record_is_never_treated_as_stale() {
     assert!(
         state_dir.join("service.lock").exists(),
         "--fix must never delete a service.lock that is actually held"
+    );
+    assert!(
+        sock_path.exists(),
+        "nor the socket beside it, which a running holder still serves on: {report}"
     );
 
     let _ = child.kill();

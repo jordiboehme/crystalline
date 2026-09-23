@@ -1608,6 +1608,12 @@ pub fn words_for_holder(
     error: &str,
     bypassed: bool,
 ) -> String {
+    // An index newer than this binary is not a holder problem, and the lock
+    // advice below would send a person looking for a process that is not
+    // there. Its own message names the remedy, so it stands alone.
+    if crystalline_index::is_schema_too_new_text(error) {
+        return format!("the index at {location} cannot be used by this binary: {error}");
+    }
     match (holder, bypassed) {
         (Some(pid), true) => format!(
             "the running Crystalline daemon (pid {pid}) owns the index at {location}, and --db or --config told this command to read that file directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}"
@@ -1887,6 +1893,21 @@ mod tests {
         );
         assert!(words.contains("crystalline doctor --fix"), "{words}");
         assert_error_is_only_the_tail(&words, raw);
+    }
+
+    /// A newer schema is not a holder problem: whoever holds the lock, the
+    /// words carry the refusal's own remedy and none of the lock advice that
+    /// would contradict it.
+    #[test]
+    fn a_schema_newer_than_this_binary_stands_alone() {
+        let raw = "this index was upgraded by a newer Crystalline (schema v16, this binary knows v15). \
+                   This copy is out of date.";
+        for holder in [None, Some(4242)] {
+            let words = words_for_holder(holder, "/tmp/index.db", raw, false);
+            assert!(words.ends_with(raw), "{words}");
+            assert!(!words.contains("doctor --fix"), "{words}");
+            assert!(!words.contains("ctl shutdown"), "{words}");
+        }
     }
 
     // --- the mcp handshake line ---------------------------------------------

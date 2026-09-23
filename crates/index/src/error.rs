@@ -137,6 +137,18 @@ pub enum IndexError {
     },
 }
 
+/// The opening words of [`IndexError::SchemaTooNew`]'s message. The readers
+/// that turn an index error into advice receive it as text, and this one must
+/// not be wrapped in advice about locks and file permissions that contradicts
+/// its own remedy, so they recognise it by these words. A test pins the
+/// message to them.
+pub const SCHEMA_TOO_NEW_OPENING: &str = "this index was upgraded by a newer Crystalline";
+
+/// Whether an index error, as text, is the schema-too-new refusal.
+pub fn is_schema_too_new_text(error: &str) -> bool {
+    error.contains(SCHEMA_TOO_NEW_OPENING)
+}
+
 impl From<turso::Error> for IndexError {
     fn from(e: turso::Error) -> Self {
         match e {
