@@ -49,6 +49,7 @@ import type {
   ManifestProblem,
   ManifestSections,
   ManifestView,
+  StarterStanza,
 } from "../api/domain";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramFilters, EngramPage, ListingOrder } from "../api/engrams";
@@ -390,11 +391,25 @@ function DomainPage({
             </Link>
           )}
         </div>
+        {/*
+          The same door the Edit MANIFEST link above is behind, and behind the
+          same second condition: seeding a section IS opening that editor, so
+          a reader who may not open it is not offered a button that would.
+        */}
         <ManifestPanel
           domain={domain}
           manifest={manifest.data}
           pending={manifest.isPending}
           error={manifest.error}
+          onStart={
+            capabilities.canAdminister && manifestEditable
+              ? (section) => {
+                  void navigate(manifestEditRoute(domain), {
+                    state: { seedSection: section },
+                  });
+                }
+              : null
+          }
         />
       </section>
 
@@ -794,11 +809,19 @@ function ManifestPanel({
   manifest,
   pending,
   error,
+  onStart,
 }: {
   domain: string;
   manifest: ManifestView | undefined;
   pending: boolean;
   error: Error | null;
+  /**
+   * Seed a section into the editor and hand over, or null for a reader who
+   * may not edit this MANIFEST. Nothing here writes: the button navigates,
+   * the editor appends, and the person saves - which is the rule the facets
+   * below were built on and the reason they stay read-only.
+   */
+  onStart: ((section: string) => void) | null;
 }) {
   if (pending) {
     return <Skeleton label="Loading the manifest" />;
@@ -819,35 +842,124 @@ function ManifestPanel({
   }
   // A missing MANIFEST is a gap in the domain rather than a failure of the
   // screen, and it is the one thing every domain is supposed to have, so it is
-  // said plainly rather than announced as an error.
-  if (
+  // said plainly rather than announced as an error. The boxes below it are
+  // drawn all the same where the server answered: a domain with nothing
+  // written is the moment the page has most to explain, not least.
+  const empty =
     isMissing(error) ||
     manifest === undefined ||
-    manifest.markdown.trim() === ""
-  ) {
-    return (
-      <p className="text-sm text-slate-500 dark:text-slate-400">
-        This domain has no MANIFEST yet, so nothing tells an agent what it is
-        for.
-      </p>
-    );
-  }
+    manifest.markdown.trim() === "";
+  // A read that 404ed carries no sections and so no starters either: the
+  // registry travels with the manifest payload, and there is no payload. That
+  // reader gets the sentence and the editor link above it, which is what they
+  // got before.
+  const sections = manifest?.sections ?? null;
   return (
     <div className="flex flex-col gap-4">
-      {manifest.sections !== null && (
-        <ManifestFacets sections={manifest.sections} />
+      {empty && (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          This domain has no MANIFEST yet, so nothing tells an agent what it is
+          for.
+        </p>
       )}
-      <article className="measured">
-        {/*
-          The domain's own attachments live at its root, so a MANIFEST that
-          references one resolves it exactly the way an engram does.
-        */}
-        <Markdown
-          source={manifest.markdown}
-          domain={domain}
-          foldTitle={domain}
-        />
-      </article>
+      {sections !== null && (
+        <ManifestFacets sections={sections} onStart={onStart} />
+      )}
+      {empty && sections !== null && onStart !== null && (
+        <button
+          type="button"
+          className={`self-start ${BUTTON.primary}`}
+          onClick={() => {
+            onStart(WHOLE_MANIFEST);
+          }}
+        >
+          Create a MANIFEST
+        </button>
+      )}
+      {!empty && manifest !== undefined && (
+        <article className="measured">
+          {/*
+            The domain's own attachments live at its root, so a MANIFEST that
+            references one resolves it exactly the way an engram does.
+          */}
+          <Markdown
+            source={manifest.markdown}
+            domain={domain}
+            foldTitle={domain}
+          />
+        </article>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The section name that means the whole document rather than one part of it.
+ *
+ * Not a section the registry knows, which is the point: the editor reads it
+ * as "seed every stanza" for a domain whose MANIFEST is blank. Spelled here
+ * and read there, so the two ends of one navigation cannot drift.
+ */
+export const WHOLE_MANIFEST = "MANIFEST";
+
+/**
+ * The stanza the server sent for `section`, or null when it sent none.
+ *
+ * Null is the older daemon: it answered sections without the registry of
+ * startable ones, and a facet then draws the bare line it drew before rather
+ * than an explanation this side invented.
+ */
+function starterFor(
+  sections: ManifestSections,
+  section: string,
+): StarterStanza | null {
+  return sections.starters.find((row) => row.section === section) ?? null;
+}
+
+/**
+ * What an empty facet says instead of a bare "nothing here".
+ *
+ * The line and the example both come from the server's registry, never from a
+ * list kept here, for the reason the policies card draws its rows from the
+ * server: a section added to the registry in core shows up with its meaning
+ * and its syntax without a line of this file changing, and the core-side
+ * guard test parses every example back into the declaration it advertises, so
+ * what a person is shown is what the parser accepts.
+ *
+ * The action does not write anything. It seeds the editor and hands over,
+ * which keeps the rule this panel was built on: the document is the source
+ * and the editor is where a change goes.
+ */
+function EmptyFacet({
+  starter,
+  fallback,
+  onStart,
+}: {
+  starter: StarterStanza | null;
+  /** What to say when the server sent no registry to say anything from. */
+  fallback: string;
+  onStart: ((section: string) => void) | null;
+}) {
+  if (starter === null) {
+    return <p>{fallback}</p>;
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-slate-600 dark:text-slate-400">{starter.meaning}</p>
+      <pre className="text-caption overflow-x-auto rounded bg-slate-100 p-2 font-mono whitespace-pre dark:bg-slate-900">
+        {starter.example}
+      </pre>
+      {onStart !== null && (
+        <button
+          type="button"
+          className={`self-start ${BUTTON.secondary}`}
+          onClick={() => {
+            onStart(starter.section);
+          }}
+        >
+          {`Add ${starter.section}`}
+        </button>
+      )}
     </div>
   );
 }
@@ -864,7 +976,13 @@ function ManifestPanel({
  * denied on this machine is not here either; that decision lives with the
  * `provision` tool, not with the domain's own description.
  */
-function ManifestFacets({ sections }: { sections: ManifestSections }) {
+function ManifestFacets({
+  sections,
+  onStart,
+}: {
+  sections: ManifestSections;
+  onStart: ((section: string) => void) | null;
+}) {
   const missingScope = sections.missing.includes("Scope");
   const missingWhenToUse = sections.missing.includes("When to Use");
   return (
@@ -874,7 +992,11 @@ function ManifestFacets({ sections }: { sections: ManifestSections }) {
           When to Use
         </h4>
         {missingWhenToUse ? (
-          <p>No When to Use section</p>
+          <EmptyFacet
+            starter={starterFor(sections, "When to Use")}
+            fallback="No When to Use section"
+            onStart={onStart}
+          />
         ) : (
           <Bullets items={sections.whenToUse} />
         )}
@@ -882,7 +1004,11 @@ function ManifestFacets({ sections }: { sections: ManifestSections }) {
           Scope
         </h4>
         {missingScope ? (
-          <p>No Scope section</p>
+          <EmptyFacet
+            starter={starterFor(sections, "Scope")}
+            fallback="No Scope section"
+            onStart={onStart}
+          />
         ) : (
           <Bullets items={sections.scope} />
         )}
@@ -897,7 +1023,11 @@ function ManifestFacets({ sections }: { sections: ManifestSections }) {
       <Facet title="Provisioning">
         {sections.provisioning === null ||
         sections.provisioning.decls.length === 0 ? (
-          <p>Nothing declared</p>
+          <EmptyFacet
+            starter={starterFor(sections, "Provisioning")}
+            fallback="Nothing declared"
+            onStart={onStart}
+          />
         ) : (
           <ul className="flex flex-col gap-1">
             {sections.provisioning.decls.map((decl) => (
@@ -914,7 +1044,11 @@ function ManifestFacets({ sections }: { sections: ManifestSections }) {
       <Facet title="Tag aliases">
         {sections.tagAliases === null ||
         sections.tagAliases.decls.length === 0 ? (
-          <p>No aliases</p>
+          <EmptyFacet
+            starter={starterFor(sections, "Tag Aliases")}
+            fallback="No aliases"
+            onStart={onStart}
+          />
         ) : (
           <ul className="flex flex-col gap-1">
             {sections.tagAliases.decls.map((decl) => (

@@ -437,9 +437,18 @@ describe("the domain screen", () => {
 
     renderApp("/d/eng");
 
+    // What an undeclared section says is what it is FOR, in the server's own
+    // words, and the syntax that starts it: naming the absence alone taught a
+    // reader nothing they did not already know from the empty box.
     const routing = await screen.findByRole("region", { name: "Routing" });
-    expect(within(routing).getByText("No When to Use section")).toBeVisible();
-    expect(within(routing).queryByText("No Scope section")).toBeNull();
+    expect(
+      within(routing).getByText(/Agents pick this domain by these bullets/),
+    ).toBeVisible();
+    expect(
+      within(routing).queryByText(
+        /What belongs in this domain and what does not/,
+      ),
+    ).toBeNull();
     expect(
       within(routing).getByText(
         "Agents route by Scope, because When to Use is absent or empty.",
@@ -447,12 +456,12 @@ describe("the domain screen", () => {
     ).toBeVisible();
     expect(
       within(screen.getByRole("region", { name: "Provisioning" })).getByText(
-        "Nothing declared",
+        /Folders this domain installs into an AI harness/,
       ),
     ).toBeVisible();
     expect(
       within(screen.getByRole("region", { name: "Tag aliases" })).getByText(
-        "No aliases",
+        /Spellings that fold into one canonical tag/,
       ),
     ).toBeVisible();
     const policies = screen.getByRole("region", { name: "Domain policies" });
@@ -478,8 +487,14 @@ describe("the domain screen", () => {
     renderApp("/d/eng");
 
     const routing = await screen.findByRole("region", { name: "Routing" });
-    expect(within(routing).getByText("No Scope section")).toBeVisible();
-    expect(within(routing).getByText("No When to Use section")).toBeVisible();
+    expect(
+      within(routing).getByText(
+        /What belongs in this domain and what does not/,
+      ),
+    ).toBeVisible();
+    expect(
+      within(routing).getByText(/Agents pick this domain by these bullets/),
+    ).toBeVisible();
     expect(
       within(routing).getByText(
         "Agents cannot route here until When to Use has a bullet.",
@@ -581,6 +596,170 @@ describe("the domain screen", () => {
     expect(
       screen.queryByRole("region", { name: "Domain policies" }),
     ).toBeNull();
+  });
+
+  it("explains a section that is not declared, and offers to start it", async () => {
+    serve({}, "admin");
+
+    renderApp("/d/eng");
+
+    const aliases = await screen.findByRole("region", { name: "Tag aliases" });
+    // The meaning and the syntax, both the server's: a reader learns what the
+    // section is for and what one line of it looks like without leaving the
+    // page or already knowing.
+    expect(
+      within(aliases).getByText(/Spellings that fold into one canonical tag/),
+    ).toBeVisible();
+    expect(within(aliases).getByText(/k8s -> kubernetes/)).toBeVisible();
+    expect(
+      within(aliases).getByRole("button", { name: "Add Tag Aliases" }),
+    ).toBeVisible();
+  });
+
+  it("says nothing extra about a section that is declared", async () => {
+    serve(
+      {
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: MANIFEST,
+          sections: sectionsResponse({
+            tag_aliases: {
+              decls: [{ alias: "k8s", canonical: "kubernetes" }],
+              problems: [],
+            },
+          }),
+        }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    const aliases = await screen.findByRole("region", { name: "Tag aliases" });
+    expect(within(aliases).getByText("k8s -> kubernetes")).toBeVisible();
+    // Somebody who has already configured a thing does not need to be told
+    // what it is, and has nothing to start.
+    expect(
+      within(aliases).queryByText(/Spellings that fold into one canonical tag/),
+    ).toBeNull();
+    expect(
+      within(aliases).queryByRole("button", { name: "Add Tag Aliases" }),
+    ).toBeNull();
+  });
+
+  it("shows the explanation but no action to a reader who cannot edit", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    // The honest answer for somebody without the right: they can still learn
+    // what the section does, they just cannot start it from here.
+    const aliases = await screen.findByRole("region", { name: "Tag aliases" });
+    expect(
+      within(aliases).getByText(/Spellings that fold into one canonical tag/),
+    ).toBeVisible();
+    expect(
+      within(aliases).queryByRole("button", { name: "Add Tag Aliases" }),
+    ).toBeNull();
+  });
+
+  it("draws the old bare line for a daemon that sends no startable sections", async () => {
+    serve(
+      {
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: MANIFEST,
+          sections: sectionsResponse({ starters: [] }),
+        }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    // Nothing to explain a section with, so nothing is invented on this side.
+    const aliases = await screen.findByRole("region", { name: "Tag aliases" });
+    expect(within(aliases).getByText("No aliases")).toBeVisible();
+    expect(
+      within(aliases).queryByRole("button", { name: "Add Tag Aliases" }),
+    ).toBeNull();
+  });
+
+  it("shows the whole configurable surface for a domain whose MANIFEST is blank", async () => {
+    serve(
+      {
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: "",
+          sections: sectionsResponse({
+            scope: [],
+            when_to_use: [],
+            routing: "none",
+            missing: ["Scope", "When to Use"],
+            policies: [],
+          }),
+        }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    // The gap is still named, and every box below it is now something the
+    // reader can see, understand and start.
+    expect(await screen.findByText(/no MANIFEST yet/)).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Add When to Use" }),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Add Scope" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Add Provisioning" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Create a MANIFEST" }),
+    ).toBeVisible();
+  });
+
+  it("offers no seeding action over a MANIFEST nobody could read", async () => {
+    serve(
+      {
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: MANIFEST,
+          sections: sectionsResponse({ policies: [] }),
+        }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    // The sections are still explained - the registry does not depend on this
+    // document - and the document itself is still drawn, because repairing it
+    // is what somebody does next.
+    const aliases = await screen.findByRole("region", { name: "Tag aliases" });
+    expect(
+      within(aliases).getByText(/Spellings that fold into one canonical tag/),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Create a MANIFEST" }),
+    ).toBeNull();
+  });
+
+  it("carries the section to the editor when the action is pressed", async () => {
+    serve({ "/validate": () => ({ findings: [], errors: 0 }) }, "admin");
+
+    renderApp("/d/eng");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Add Tag Aliases" }),
+    );
+
+    // The action does not write: it opens the editor, and what lands in the
+    // buffer there is the editor's own test.
+    expect(
+      await screen.findByRole("heading", { name: "Editing eng MANIFEST" }),
+    ).toBeVisible();
   });
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
