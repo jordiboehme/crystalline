@@ -1139,6 +1139,30 @@ pub struct MeResponse {
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 429,
+            description = "Too many sign-ins have failed for this name. Nothing \
+                           is looked at on this path: no password is verified \
+                           and no account is read, so a refusal says no more \
+                           about which accounts exist than the `401` does.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+            headers(
+                ("retry-after" = String, description = "Seconds until this name \
+                 may try again. Never zero."),
+            ),
+        ),
+        (
+            status = 503,
+            description = "This instance is busy checking other sign-ins and the \
+                           wait for a slot ran out.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+            headers(
+                ("retry-after" = String, description = "Seconds to wait before \
+                 trying again."),
+            ),
+        ),
     ),
 )]
 pub async fn login(

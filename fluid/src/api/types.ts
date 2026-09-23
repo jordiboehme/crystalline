@@ -3499,6 +3499,28 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
+            /** @description Too many sign-ins have failed for this name. Nothing is looked at on this path: no password is verified and no account is read, so a refusal says no more about which accounts exist than the `401` does. */
+            429: {
+                headers: {
+                    /** @description Seconds until this name may try again. Never zero. */
+                    "retry-after"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance is busy checking other sign-ins and the wait for a slot ran out. */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before trying again. */
+                    "retry-after"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
         };
     };
     logout: {
@@ -9698,6 +9720,17 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
+            /** @description This instance is busy checking other passwords and the wait for a slot ran out. Hashing a password uses the same bounded pool signing in does. */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before trying again. */
+                    "retry-after"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
         };
     };
     delete_user: {
@@ -9920,6 +9953,17 @@ export interface operations {
             /** @description The new password is empty. */
             422: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance is busy checking other passwords and the wait for a slot ran out. Hashing a password uses the same bounded pool signing in does. */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before trying again. */
+                    "retry-after"?: string;
                     [name: string]: unknown;
                 };
                 content: {

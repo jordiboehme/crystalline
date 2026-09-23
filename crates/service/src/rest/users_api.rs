@@ -199,6 +199,18 @@ pub struct CreateBody {
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 503,
+            description = "This instance is busy checking other passwords and \
+                           the wait for a slot ran out. Hashing a password uses \
+                           the same bounded pool signing in does.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+            headers(
+                ("retry-after" = String, description = "Seconds to wait before \
+                 trying again."),
+            ),
+        ),
     ),
 )]
 pub async fn create(
@@ -477,6 +489,18 @@ pub async fn update(
             description = "The new password is empty.",
             body = ProblemDetail,
             content_type = "application/problem+json",
+        ),
+        (
+            status = 503,
+            description = "This instance is busy checking other passwords and \
+                           the wait for a slot ran out. Hashing a password uses \
+                           the same bounded pool signing in does.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+            headers(
+                ("retry-after" = String, description = "Seconds to wait before \
+                 trying again."),
+            ),
         ),
     ),
 )]
