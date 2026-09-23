@@ -6,7 +6,7 @@ use common::{fixtures_dir, read};
 use crystalline_core::manifest::{
     ArtifactType, GeneratedIndexes, Manifest, PolicyKey, PolicyRole, ProblemKind, SHARING_KEY,
     Sharing, TagAliasProblemKind, append_tag_alias, generated_indexes_at, in_root_artifact_dirs,
-    policy_registry, sharing_at, tag_alias_pairs,
+    policy_registry, sharing_at, starter_stanzas, tag_alias_pairs,
 };
 use crystalline_core::parse_engram;
 
@@ -908,6 +908,82 @@ fn every_manifest_key_constant_is_in_the_registry_and_back() {
         assert!(
             declared.iter().any(|d| d == key),
             "`{key}` is registered and not declared"
+        );
+    }
+}
+
+// --- The starter stanzas ----------------------------------------------------
+
+/// **Every starter stanza parses back into the declaration it advertises.**
+///
+/// The example is shown to a person as a promise about what the parser
+/// accepts. Keeping it beside the parser makes a drift a test failure rather
+/// than a wrong screenshot.
+#[test]
+fn every_starter_stanza_parses_into_what_it_describes() {
+    for stanza in starter_stanzas() {
+        assert!(
+            !stanza.meaning.is_empty() && !stanza.meaning.contains('\n'),
+            "{}: one line",
+            stanza.section
+        );
+        let source = format!(
+            "---\ntype: manifest\ntitle: eng\npermalink: manifest\nstatus: stable\n---\n\n# eng\n\n{}\n",
+            stanza.example
+        );
+        let parsed = manifest_from_source(&source);
+        match stanza.section {
+            "When to Use" => assert!(
+                !parsed.when_to_use().is_empty(),
+                "the When to Use example leaves a routing bullet"
+            ),
+            "Scope" => assert!(
+                !parsed.scope().is_empty(),
+                "the Scope example leaves a scope bullet"
+            ),
+            "Provisioning" => {
+                let section = parsed
+                    .provisioning()
+                    .expect("the Provisioning example declares the section");
+                assert_eq!(
+                    section.decls.len(),
+                    1,
+                    "the Provisioning example declares exactly one folder"
+                );
+                assert!(section.problems.is_empty(), "{:?}", section.problems);
+            }
+            "Tag Aliases" => {
+                let section = parsed
+                    .tag_aliases()
+                    .expect("the Tag Aliases example declares the section");
+                assert_eq!(section.decls.len(), 1);
+                assert!(section.problems.is_empty(), "{:?}", section.problems);
+            }
+            other => panic!("no assertion for {other}"),
+        }
+    }
+}
+
+/// The four sections a domain page offers to start, in the order it draws
+/// them. A section added to the registry without a place on the page, or the
+/// other way round, fails here.
+#[test]
+fn the_starter_registry_names_every_section_the_page_offers() {
+    let sections: Vec<&str> = starter_stanzas()
+        .iter()
+        .map(|stanza| stanza.section)
+        .collect();
+    assert_eq!(
+        sections,
+        ["When to Use", "Scope", "Provisioning", "Tag Aliases"]
+    );
+    for stanza in starter_stanzas() {
+        assert!(
+            stanza
+                .example
+                .starts_with(&format!("## {}\n", stanza.section)),
+            "{}: the example opens with the heading it starts",
+            stanza.section
         );
     }
 }

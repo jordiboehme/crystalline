@@ -549,6 +549,51 @@ pub fn policy_registry() -> &'static [PolicyKey] {
     ]
 }
 
+/// One MANIFEST section a domain page can offer to start, as the page shows
+/// it and as the editor seeds it.
+///
+/// Beside the parser rather than in the web app, for the reason the policy
+/// registry is: an example shown to a person is a promise about what the
+/// parser accepts, and the guard test in crates/core/tests/manifest.rs parses
+/// every one of these back into the declaration it advertises, so a change to
+/// the grammar that forgets the example fails a test instead of shipping a
+/// wrong screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StarterStanza {
+    /// The H2 heading, as the parser matches it after folding.
+    pub section: &'static str,
+    /// One line, user-facing, present tense: what the section does.
+    pub meaning: &'static str,
+    /// Markdown a person can save as it stands.
+    pub example: &'static str,
+}
+
+/// Every MANIFEST section a domain page offers to start, in display order.
+pub fn starter_stanzas() -> &'static [StarterStanza] {
+    &[
+        StarterStanza {
+            section: "When to Use",
+            meaning: "Agents pick this domain by these bullets. Without one, nothing routes here.",
+            example: "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+        },
+        StarterStanza {
+            section: "Scope",
+            meaning: "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+            example: "## Scope\n\n- Infrastructure and deployment, not application code",
+        },
+        StarterStanza {
+            section: "Provisioning",
+            meaning: "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+            example: "## Provisioning\n\n- skills: skills",
+        },
+        StarterStanza {
+            section: "Tag Aliases",
+            meaning: "Spellings that fold into one canonical tag, so a search for either finds both.",
+            example: "## Tag Aliases\n\n- k8s -> kubernetes",
+        },
+    ]
+}
+
 /// A frontmatter scalar rendered as the text a reader wrote, so a declaration
 /// nobody recognizes can be quoted back in a finding. A list or a mapping has
 /// no such text and is named by its shape instead; either way the value is not
