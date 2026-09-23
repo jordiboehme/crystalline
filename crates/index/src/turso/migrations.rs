@@ -590,6 +590,20 @@ async fn apply_migrations(conn: &Connection, migrations: &[Migration]) -> Result
     .map_err(|e| IndexError::Migration(e.to_string()))?;
 
     let current = current_version(conn).await?;
+    // A database raised past every migration this binary ships is a newer
+    // Crystalline's work, not damage: applying nothing and refusing is the
+    // only safe move, since there is no migration list here that could ever
+    // replay backwards to the version this binary expects. Checked once,
+    // before the loop touches anything, so an out-of-date binary never
+    // partially applies a step it does have against a schema whose later
+    // history it cannot see.
+    let known = migrations.last().map(|m| m.version).unwrap_or(0);
+    if current > known {
+        return Err(IndexError::SchemaTooNew {
+            found: current,
+            known,
+        });
+    }
     for m in migrations {
         if m.version <= current {
             continue;
@@ -1562,6 +1576,76 @@ mod tests {
             scalar(&conn, "SELECT COUNT(*) FROM engram WHERE id=7 AND actor=''").await,
             1,
             "the row came through the retry as a base row"
+        );
+    }
+
+    /// A database stamped one version above the newest migration this binary
+    /// knows: exactly what an older binary meets when it opens an index a
+    /// newer Crystalline already raised. `apply` must refuse rather than
+    /// silently skip every migration in its list (all of them are already
+    /// `<= current` and would simply be passed over) and report back as
+    /// current, which is the bug this guard exists to close.
+    #[tokio::test]
+    async fn a_schema_stamped_above_the_newest_known_migration_is_refused() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+
+        // A real database at the newest version this binary knows, reached
+        // through the actual entry point so the ledger and every table are in
+        // the shape a real open leaves them in.
+        apply_migrations(&conn, MIGRATIONS).await.unwrap();
+        let known = MIGRATIONS.last().unwrap().version;
+
+        // Stamp one version past it, the way a newer binary's own migration
+        // would have: same ledger table, same shape, a version this binary's
+        // list does not contain.
+        conn.execute(
+            "INSERT INTO schema_migration (version, applied_at) VALUES (?1, ?2)",
+            vec![
+                turso::Value::Integer(known + 1),
+                turso::Value::Text(chrono::Utc::now().to_rfc3339()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let err = apply_migrations(&conn, MIGRATIONS)
+            .await
+            .expect_err("a schema newer than this binary knows is refused, not applied over");
+        match err {
+            IndexError::SchemaTooNew { found, known: k } => {
+                assert_eq!(found, known + 1, "the recorded version is reported back");
+                assert_eq!(k, known, "alongside the newest version this binary ships");
+            }
+            other => panic!("expected SchemaTooNew, got: {other}"),
+        }
+        assert!(
+            !err.is_locked_by_another_process(),
+            "a version mismatch is not a held file, so the owner's startup retry must not \
+             wait it out: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "this index was upgraded by a newer Crystalline (schema v{}, this binary knows v{known}). \
+                 This copy is out of date. If Claude Desktop runs Crystalline as an extension, install \
+                 the current .mcpb over it; otherwise upgrade this binary.",
+                known + 1
+            ),
+            "the message names both versions and both remedies"
+        );
+
+        // Nothing was applied: the ledger still says the future version, not
+        // something this binary invented by running a migration that was
+        // never supposed to run again.
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migration"
+            )
+            .await,
+            known + 1,
+            "the refusal touches nothing; the recorded version is untouched"
         );
     }
 }

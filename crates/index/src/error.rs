@@ -105,6 +105,36 @@ pub enum IndexError {
         /// Total chunks in the index.
         total: usize,
     },
+    /// The database's recorded schema version is above the newest migration
+    /// this binary knows: a later Crystalline already raised the schema past
+    /// what this copy ships. Applying nothing and refusing is the only safe
+    /// move - a migration list this binary does not have cannot be replayed
+    /// backwards, and running the known migrations against a newer schema
+    /// would either no-op past the gap or, worse, misapply a step whose
+    /// preconditions the newer schema no longer meets.
+    ///
+    /// This is exactly the 2026-09-23 incident: an older bundled binary
+    /// (Claude Desktop's extension, still on a previous release) opened an
+    /// index a newer install had already migrated, found no guard, and ran
+    /// anyway - failing partway through sync and re-downloading a model the
+    /// newer binary had already pruned. The message names both versions and
+    /// the two remedies (the two ways an out-of-date binary reaches this
+    /// index) so a person fixes the actual cause rather than the symptom.
+    ///
+    /// Deliberately not `is_locked_by_another_process`: this is a version
+    /// mismatch, not a held file, so `open_store_as_owner`'s retry must never
+    /// treat it as a predecessor still letting go and wait it out.
+    #[error(
+        "this index was upgraded by a newer Crystalline (schema v{found}, this binary knows v{known}). \
+         This copy is out of date. If Claude Desktop runs Crystalline as an extension, install the \
+         current .mcpb over it; otherwise upgrade this binary."
+    )]
+    SchemaTooNew {
+        /// The schema version recorded in the database.
+        found: i64,
+        /// The newest migration version this binary ships.
+        known: i64,
+    },
 }
 
 impl From<turso::Error> for IndexError {

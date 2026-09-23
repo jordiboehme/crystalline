@@ -4862,6 +4862,16 @@ pub fn resolve(
 /// names an operation that cannot clear it. No rebase is adopted here: the
 /// trunk never moved, so nothing above the merge was rebased onto it.
 ///
+/// `state.last_checked` is stamped and the state saved here on every
+/// completed check, not only when a proposal transitioned or the etag moved.
+/// "Last checked" means exactly that - the moment this function last ran to
+/// completion - not "last time something else changed"; a poller finding
+/// nothing new every five minutes but never touching the stamp on that path
+/// leaves a domain's card frozen on its last real change for however long
+/// that streak runs (17 hours, observed once, poller running the whole time
+/// underneath it). The write is one small JSON file per origin per poll,
+/// cheap beside the network round trip that produced this outcome.
+///
 /// `new_etag` is `Some` when this was reached from a moved branch that
 /// happened to equal the base commit (carrying a possibly-new etag to store)
 /// and `None` when the conditional probe answered Unchanged (nothing to
@@ -4873,19 +4883,13 @@ async fn settle_up_to_date(
     mut state: OriginState,
     new_etag: Option<Option<String>>,
 ) -> Result<PullReport, RemoteError> {
-    let (transitions, touched) = refresh_proposals(provider, spec, &mut state).await?;
+    let (transitions, _touched) = refresh_proposals(provider, spec, &mut state).await?;
     let consumed = consume_merged(&mut state);
-    let mut dirty = touched || !consumed.is_empty();
-    if let Some(etag) = new_etag
-        && state.ref_etag != etag
-    {
+    if let Some(etag) = new_etag {
         state.ref_etag = etag;
-        dirty = true;
     }
-    if dirty {
-        state.last_checked = Some(Utc::now());
-        state.save(state_dir)?;
-    }
+    state.last_checked = Some(Utc::now());
+    state.save(state_dir)?;
     // Best-effort branch cleanup once the state is durable, exactly as the
     // moved-trunk arm does it.
     for prop in &consumed {
