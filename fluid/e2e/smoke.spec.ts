@@ -152,6 +152,31 @@ test("the sidebar collapse control is desktop only", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("an undeclared MANIFEST section explains itself and can be started", async ({
+  page,
+}) => {
+  // The fixture MANIFEST declares Scope and When to Use and nothing else, so
+  // Tag aliases is the box with nothing in it. What it says and the example it
+  // shows are the server's own registry, which is the half a jsdom test cannot
+  // reach: there the payload is a fixture, here it is the daemon.
+  await page.goto(`/d/${DOMAIN}`);
+  const aliases = page.getByRole("region", { name: "Tag aliases" });
+  await expect(
+    aliases.getByText(/Spellings that fold into one canonical tag/),
+  ).toBeVisible();
+
+  await aliases.getByRole("button", { name: "Add Tag Aliases" }).click();
+
+  // The editor, with the section appended to the buffer and nothing saved.
+  await expect(
+    page.getByRole("heading", { name: `Editing ${DOMAIN} MANIFEST` }),
+  ).toBeVisible();
+  await expect(page.getByLabel("MANIFEST source")).toContainText(
+    "## Tag Aliases",
+  );
+  await expect(page.getByText("Unsaved changes")).toBeVisible();
+});
+
 test("an engram renders its mermaid fence as a diagram", async ({ page }) => {
   await openEngram(page, "Lantern Protocol");
 
