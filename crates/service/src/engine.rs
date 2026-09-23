@@ -4190,18 +4190,6 @@ impl Engine {
         if crystalline_core::is_reserved_path(&rel) {
             return Err(EngineError::Invalid(reserved_name_error(&rel)));
         }
-        // The domain's MANIFEST is never a capture's destination, in any
-        // letter case. `slugify` lowercases, so a title of "MANIFEST" lands at
-        // `manifest.md`, which a case-insensitive filesystem (the macOS and
-        // Windows defaults) opens as the very `MANIFEST.md` routing reads: an
-        // overwriting write replaced it with an ordinary engram and only then
-        // failed on the permalink check, too late to keep the file. A MANIFEST
-        // changes through edit_engram, which keeps its type and its routing.
-        if rel.eq_ignore_ascii_case("MANIFEST.md") {
-            return Err(EngineError::Invalid(
-                "a new engram cannot be written at the domain root as MANIFEST.md: that file is the domain's MANIFEST, which routing reads. Change it with edit_engram, or pick another title or a folder".into(),
-            ));
-        }
         // The other reserved shape: the folder attachments live in. Checked on
         // the joined path, so a `folder` of `assets`, `/assets/`, `Assets` or
         // `assets/deep` is refused whichever spelling arrived.
@@ -4339,6 +4327,23 @@ impl Engine {
         let tags = p.tags.clone();
 
         let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title)?;
+
+        // A file domain's MANIFEST is never a capture's destination, in any
+        // letter case. `slugify` lowercases, so a title of "MANIFEST" lands at
+        // `manifest.md`, which a case-insensitive filesystem (the macOS and
+        // Windows defaults) opens as the very `MANIFEST.md` routing reads: an
+        // overwriting write replaced it with an ordinary engram and only then
+        // failed on the permalink check, too late to keep the file. There a
+        // MANIFEST changes through edit_engram. A virtual domain has no
+        // filesystem to fold the case, and a capture titled after its MANIFEST
+        // is how one is written there (Ruling I2), so it is left alone.
+        if rel.eq_ignore_ascii_case("MANIFEST.md")
+            && matches!(self.read_source(&p.domain), ContentSource::File { .. })
+        {
+            return Err(EngineError::Invalid(
+                "a new engram cannot be written at the domain root as MANIFEST.md: in this domain that file is the MANIFEST, which routing reads. Change it with edit_engram, or pick another title or a folder".into(),
+            ));
+        }
 
         // A join is into ONE draft: a capture inside one that resolved
         // anywhere else has nowhere to land, and is told so rather than

@@ -686,13 +686,14 @@ async fn a_live_manifest_edit_reports_the_dropped_heading_and_the_findings() {
     );
 }
 
-/// The one way `write_engram` reaches a MANIFEST: a capture titled after it,
-/// with `overwrite`, while the MANIFEST is open in the editor. The capture's
-/// destination slugs to the MANIFEST's own permalink, so the live arm finds
-/// that room and replaces the document in it - and the receipt carries the
-/// MANIFEST rules' findings, which here start with the wrong type.
+/// A capture titled after the MANIFEST, with `overwrite`, while the MANIFEST is
+/// open in the editor. Its destination slugs to the MANIFEST's own address,
+/// which used to let the live arm replace the document in the room with an
+/// ordinary engram. It is refused before it reaches the room: a MANIFEST
+/// changes through edit_engram only, and neither the room's document nor the
+/// file moves.
 #[tokio::test]
-async fn a_capture_that_replaces_an_open_manifest_reports_the_findings() {
+async fn a_capture_titled_after_an_open_manifest_is_refused() {
     let (tmp, engine, _scratch) = engine_fixture(false).await;
     let sessions = CollabSessions::new(engine.clone());
     engine.set_collab_sessions(&sessions);
@@ -700,7 +701,7 @@ async fn a_capture_that_replaces_an_open_manifest_reports_the_findings() {
     let _doc = sync_client(&joined).await;
     let before = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
 
-    let receipt = engine
+    let err = engine
         .write_engram(&WriteParams {
             domain: "eng".to_string(),
             title: "MANIFEST".to_string(),
@@ -715,28 +716,12 @@ async fn a_capture_that_replaces_an_open_manifest_reports_the_findings() {
             model: None,
         })
         .await
-        .expect("the capture lands in the room");
-    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
-    let codes: Vec<&str> = receipt["manifest_findings"]
-        .as_array()
-        .expect("findings on the receipt")
-        .iter()
-        .map(|f| f["code"].as_str().unwrap())
-        .collect();
-    assert!(
-        codes.contains(&"M002") && codes.contains(&"M003"),
-        "{receipt}"
-    );
-    assert!(
-        receipt["guidance"]
-            .as_str()
-            .is_some_and(|g| g.contains("breaks routing")),
-        "{receipt}"
-    );
+        .expect_err("a capture never replaces the MANIFEST, open or not");
+    assert!(err.to_string().contains("edit_engram"), "{err}");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap(),
         before,
-        "the file waits for the room's saver"
+        "the file is untouched"
     );
 }
 

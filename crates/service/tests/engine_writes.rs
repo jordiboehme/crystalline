@@ -2322,26 +2322,25 @@ async fn a_virtual_manifest_edit_reports_the_same_way() {
 /// A capture titled "MANIFEST" slugifies to `manifest.md`, which a
 /// case-insensitive filesystem opens as the domain's own `MANIFEST.md`. An
 /// overwriting write used to replace the MANIFEST and only then fail on the
-/// permalink check. It is refused before anything is written, on both storage
-/// kinds, and the MANIFEST is byte for byte what it was.
+/// permalink check. It is refused before anything is written, and the
+/// MANIFEST is byte for byte what it was. A virtual domain is left alone: a
+/// capture titled after its MANIFEST is how one is written there.
 #[tokio::test]
 async fn a_capture_titled_manifest_never_replaces_the_domains_manifest() {
     let (tmp, engine) = engine_fixture().await;
     let manifest = tmp.path().join("eng").join("MANIFEST.md");
     let before = std::fs::read(&manifest).unwrap();
     for title in ["MANIFEST", "Manifest", "manifest"] {
-        for domain in ["eng", "scratch"] {
-            let mut params = write_params(domain, title, "- a capture\n");
-            params.overwrite = true;
-            let err = engine
-                .write_engram(&params)
-                .await
-                .expect_err("a capture never lands on the MANIFEST");
-            assert!(
-                err.to_string().contains("edit_engram"),
-                "the refusal names the way to change a MANIFEST: {err}"
-            );
-        }
+        let mut params = write_params("eng", title, "- a capture\n");
+        params.overwrite = true;
+        let err = engine
+            .write_engram(&params)
+            .await
+            .expect_err("a capture never lands on the MANIFEST");
+        assert!(
+            err.to_string().contains("edit_engram"),
+            "the refusal names the way to change a MANIFEST: {err}"
+        );
     }
     assert_eq!(
         std::fs::read(&manifest).unwrap(),
