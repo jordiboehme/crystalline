@@ -718,6 +718,26 @@ mod tests {
         )
     }
 
+    /// The two login throttle variables reach the config the HTTP surface
+    /// reads, including the `0` that turns the throttle off - which is what
+    /// `docs/deployment.md` promises an operator who sets it in a compose
+    /// file. `0` is not an empty value, so the "empty reads as unset" rule
+    /// above must not swallow it.
+    #[test]
+    fn the_login_throttle_variables_reach_the_config() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_LOGIN_FREE_ATTEMPTS", "5"),
+            ("CRYSTALLINE_AUTH_LOGIN_MAX_DELAY", "0"),
+        ])
+        .unwrap();
+        let effective = ov.apply(&GlobalConfig::default());
+        assert_eq!(effective.auth_login_free_attempts(), 5);
+        assert!(
+            effective.auth_login_max_delay().is_zero(),
+            "zero must reach the config as zero rather than as unset"
+        );
+    }
+
     /// A public url that cannot work never takes the instance down. The key
     /// is loaded as unset and the address is derived per caller, exactly as an
     /// absent key is: the container image binds `0.0.0.0`, so an operator who

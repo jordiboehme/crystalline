@@ -187,16 +187,38 @@ async fn the_refusal_body_never_changes() {
     assert!(first.contains("the name or password is wrong"), "{first}");
 }
 
-/// **A correct password works immediately after failures**, with no residual
-/// delay, which is what somebody who mistyped twice then got it right does.
+/// **A correct password inside the free attempts is not delayed at all**,
+/// which is what somebody who mistyped once and then got it right does.
 #[tokio::test]
-async fn a_success_after_failures_is_not_delayed_and_clears_the_slate() {
-    let ctx = LoginCtx::start_with_throttle(0, 8).await;
+async fn a_correct_password_inside_the_free_attempts_is_not_delayed() {
+    let ctx = LoginCtx::start_with_throttle(2, 8).await;
     ctx.create_account("ada", "correct horse").await;
-    ctx.login("ada", "wrong").await;
+    assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
     let ok = ctx.timed_login("ada", "correct horse").await;
     assert_eq!(ok.response.status(), 200);
-    // The next wrong attempt is a first failure again, so it is not delayed.
+    assert!(
+        ok.elapsed < Duration::from_millis(500),
+        "one mistype must not cost a sign-in anything: {:?}",
+        ok.elapsed
+    );
+}
+
+/// **A success clears the slate**, so the next sign-in starts from zero again
+/// rather than from where the run left off.
+///
+/// Past the free attempts the successful sign-in itself IS delayed, and that
+/// is inherent rather than an oversight: the nap happens before the password
+/// is checked, because nothing knows yet that this one is right. What the
+/// success buys is the attempt after it. With one free attempt the fourth
+/// request below would be a fourth consecutive failure and cost four seconds
+/// if the slate had not been cleared, so its speed is the assertion.
+#[tokio::test]
+async fn a_success_clears_the_slate_for_the_next_attempt() {
+    let ctx = LoginCtx::start_with_throttle(1, 8).await;
+    ctx.create_account("ada", "correct horse").await;
+    assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
+    assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
+    assert_eq!(ctx.login("ada", "correct horse").await.status(), 200);
     let after = ctx.timed_login("ada", "wrong").await;
     assert_eq!(after.response.status(), 401);
     assert!(

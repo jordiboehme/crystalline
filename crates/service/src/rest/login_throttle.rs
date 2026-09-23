@@ -107,17 +107,29 @@ impl LoginThrottle {
         // for the life of the process would be a worse outcome than the panic
         // that poisoned it.
         let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(seen) = names.get(key).copied() else {
-            return Verdict::Delay(Duration::ZERO);
+        // A name nobody is tracking, and a name whose window has passed, both
+        // carry a count of zero and go through the schedule like any other
+        // rather than short-circuiting to no delay. With free attempts left
+        // the two are the same answer; with `free_attempts` at zero, where
+        // the setting means the very first attempt already pays, they are
+        // not, and a short circuit here would skip the base second entirely.
+        let seen = match names.get(key).copied() {
+            Some(seen) if now.duration_since(seen.last) >= FORGET_AFTER => {
+                names.remove(key);
+                None
+            }
+            other => other,
         };
-        if now.duration_since(seen.last) >= FORGET_AFTER {
-            names.remove(key);
-            return Verdict::Delay(Duration::ZERO);
-        }
-        match self.delay_for(seen.count) {
+        let count = seen.map(|seen| seen.count).unwrap_or(0);
+        match self.delay_for(count) {
             Some(delay) => Verdict::Delay(delay),
             None => {
-                let left = FORGET_AFTER.saturating_sub(now.duration_since(seen.last));
+                // Unreachable at a count of zero, since the ceiling is whole
+                // seconds and a zero one answered above, but the wait is
+                // computed without assuming that.
+                let left = seen
+                    .map(|seen| FORGET_AFTER.saturating_sub(now.duration_since(seen.last)))
+                    .unwrap_or(FORGET_AFTER);
                 Verdict::Refuse(left.as_secs().max(1))
             }
         }
@@ -239,6 +251,18 @@ mod tests {
             matches!(t.check("ada", now), Verdict::Refuse(_)),
             "past the ceiling the answer is a refusal, not a longer nap"
         );
+    }
+
+    /// **Zero free attempts charges from the very first try**, which is what
+    /// that setting means, and the base second is reachable rather than
+    /// skipped: an untracked name is a count of zero, not a special case.
+    #[test]
+    fn a_zero_free_attempt_setting_charges_from_the_first_attempt() {
+        let t = LoginThrottle::new(0, Duration::from_secs(8));
+        let now = Instant::now();
+        assert_eq!(t.check("ada", now), Verdict::Delay(BASE_DELAY));
+        t.record_failure("ada", now);
+        assert_eq!(t.check("ada", now), Verdict::Delay(Duration::from_secs(2)));
     }
 
     /// **A refusal never says zero.** A `Retry-After: 0` invites an immediate
