@@ -73,6 +73,7 @@ import { EngramList } from "../components/EngramList";
 import { EngramsOrderMenu } from "../components/EngramsOrderMenu";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
+import { InlineMarkdown } from "../components/InlineMarkdown";
 import { Markdown } from "../components/Markdown";
 import { MembersCard } from "../components/MembersCard";
 import { ProposalsCard } from "../components/ProposalsCard";
@@ -1078,7 +1079,13 @@ function Facet({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-/** A section's bullets, as the MANIFEST lists them. Nothing for none. */
+/**
+ * A section's bullets, as the MANIFEST lists them. Nothing for none.
+ *
+ * Each bullet is drawn as inline markdown rather than as plain text, so
+ * `**Search `project2030` first**` reads as bold text around a code span
+ * instead of showing its own asterisks and backticks.
+ */
 function Bullets({ items }: { items: string[] }) {
   if (items.length === 0) {
     return null;
@@ -1086,7 +1093,9 @@ function Bullets({ items }: { items: string[] }) {
   return (
     <ul className="list-disc pl-5">
       {items.map((item) => (
-        <li key={item}>{item}</li>
+        <li key={item}>
+          <InlineMarkdown source={item} />
+        </li>
       ))}
     </ul>
   );

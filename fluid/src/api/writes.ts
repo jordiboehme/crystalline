@@ -31,7 +31,18 @@ export interface SaveConflict {
   detail: string;
 }
 
-/** Read a failure as a save conflict, or null for any other failure. */
+/**
+ * Read a failure as a save conflict, or null for any other failure.
+ *
+ * The manifest and engram routes carry `current_etag` as
+ * `"{checksum}-{version}"`, not a bare checksum: their JSON shape has changed
+ * between releases, so the server folds its own version into the validator
+ * rather than answering a stale reader with a 304 for a shape it never sends
+ * any more (see the server's `versioned_etag`). This module's own contract is
+ * the bare checksum - `currentChecksum` becomes the next `If-Match`, and a
+ * draft's stored `baseChecksum` is read back as one too - so the version
+ * suffix is stripped here rather than carried into either.
+ */
 export function conflictOf(error: unknown): SaveConflict | null {
   if (!(error instanceof ApiProblem) || error.status !== 412) {
     return null;
@@ -42,7 +53,7 @@ export function conflictOf(error: unknown): SaveConflict | null {
     return null;
   }
   return {
-    currentChecksum: etag.replace(/^"|"$/g, ""),
+    currentChecksum: etag.replace(/^"|"$/g, "").split("-")[0] ?? "",
     currentContent: content,
     detail: error.detail,
   };

@@ -16,9 +16,12 @@
  * a title as often as a permalink. Turning that into a link takes the
  * neighborhood graph as well, which is why `wikilinks.ts` reads both.
  *
- * `checksum` is the version of the engram this app is holding: the same token
- * the response's `ETag` carries, and the one a later conditional write presents
- * as `expected_checksum`. It is kept on the cached detail for that reason.
+ * `checksum` is the version of the engram this app is holding, and the one a
+ * later conditional write presents as `expected_checksum`. The response's
+ * `ETag` carries this same checksum too, but versioned as
+ * `"{checksum}-{server version}"` - a cache validator, not a second copy of
+ * this field - so nothing here reads the header at all. It is kept on the
+ * cached detail for the reason above.
  */
 
 import { api, engramPath } from "./client";
@@ -130,7 +133,10 @@ export interface EngramDetail {
   path: string | null;
   /** The markdown as written, frontmatter and all. */
   content: string;
-  /** The version of it this app is holding. Equal to the response's `ETag`. */
+  /**
+   * The version of it this app is holding: the checksum half of the
+   * response's `ETag`, which also carries the server's own version.
+   */
   checksum: string | null;
   frontmatter: EngramFrontmatter;
   observations: EngramObservation[];
