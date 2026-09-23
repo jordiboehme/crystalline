@@ -448,13 +448,19 @@
  * READY voice: the width grows one character at a time over twelve steps and
  * the block cursor keeps blinking once the line is there. A reader who asked
  * for less motion gets the line whole and the cursor still.
+ *
+ * The width counts the letter-spacing as well as the glyphs: each character
+ * takes 1ch plus the 0.18em after it, and 0.2ch of slack keeps a browser's
+ * sub-pixel rounding off the last glyph. A width in ch alone clipped the line
+ * at "End of li", since the spacing adds more than two characters' worth.
  */
 .end-of-line {
   display: inline-block;
   overflow: hidden;
   white-space: nowrap;
+  --end-of-line-width: calc(12.2ch + 12 * 0.18em);
   letter-spacing: 0.18em;
-  width: 12.2ch;
+  width: var(--end-of-line-width);
   border-right: 0.6em solid currentColor;
   animation:
     end-of-line-type 1.2s steps(12, end) both,
@@ -465,7 +471,7 @@
     width: 0;
   }
   to {
-    width: 12.2ch;
+    width: var(--end-of-line-width);
   }
 }
 @keyframes end-of-line-blink {
