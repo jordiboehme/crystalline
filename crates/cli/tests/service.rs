@@ -202,6 +202,20 @@ impl Env {
         v.get("pid").and_then(Value::as_u64)
     }
 
+    /// The last `lines` lines of the daemon log a spawned daemon writes under
+    /// this environment's state directory, for a failure message: a daemon a
+    /// bridge started has no other place a test can read what it did.
+    fn daemon_log_tail(&self, lines: usize) -> String {
+        let path = self.state_dir().join("daemon.log");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let all: Vec<&str> = text.lines().collect();
+                all[all.len().saturating_sub(lines)..].join("\n")
+            }
+            Err(e) => format!("({} could not be read: {e})", path.display()),
+        }
+    }
+
     /// The whole owner record, for the tests that assert on more than the pid.
     fn lock_record(&self) -> Option<Value> {
         let text = std::fs::read_to_string(self.info_path()).ok()?;
@@ -520,11 +534,16 @@ fn an_extension_started_daemon_leaves_once_its_last_client_is_gone() {
     assert_eq!(
         status["pid"].as_u64(),
         Some(pid),
-        "the returning client kept the daemon: {status}"
+        "the returning client kept the daemon: {status}\ndaemon.log tail:\n{}",
+        env.daemon_log_tail(60)
     );
     assert_eq!(status["sessions"], json!(1), "{status}");
 
     // The last client leaves: gone within the grace plus its own shutdown.
+    // A failure here carries the daemon's own account of it - whether the
+    // idle exit fired at all and, if it did, which shutdown step it stopped
+    // in - because this is the test that has failed on macOS runners with
+    // nothing else to go on.
     drop(c2);
     let start = Instant::now();
     while (env.lock_path().exists() || env.info_path().exists())
@@ -534,8 +553,9 @@ fn an_extension_started_daemon_leaves_once_its_last_client_is_gone() {
     }
     assert!(
         !env.lock_path().exists() && !env.info_path().exists(),
-        "the daemon left on its own after {:?}",
-        start.elapsed()
+        "the daemon left on its own after {:?}\ndaemon.log tail:\n{}",
+        start.elapsed(),
+        env.daemon_log_tail(60)
     );
 }
 
