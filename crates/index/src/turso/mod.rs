@@ -124,21 +124,26 @@ impl TursoStore {
     /// names it so a caller can say where it went. A rename that fails is
     /// returned as the error it is and never falls back to a delete.
     ///
-    /// A file another process holds is the one failure this must not treat as
-    /// damage. `reindex --wipe` is daemonless by construction, so it meets a
-    /// running daemon's index as an open that fails - and moving the files
-    /// aside then would take a healthy index out from under a process still
-    /// serving it, which is the opposite of recovery. Such an error is
-    /// returned untouched, and the caller turns it into the usual sentence
-    /// naming the holder.
+    /// Two failures must not be treated as damage (see [`must_not_be_set_aside`]).
+    /// A file another process holds: `reindex --wipe` is daemonless by
+    /// construction, so it meets a running daemon's index as an open that
+    /// fails, and moving the files aside then would take a healthy index out
+    /// from under a process still serving it, which is the opposite of
+    /// recovery. And a schema a newer Crystalline already raised past what
+    /// this binary knows ([`IndexError::SchemaTooNew`]): the file is not
+    /// broken, this binary is merely behind, and setting it aside would
+    /// discard a virtual domain's only copy of its engrams over nothing worse
+    /// than needing an upgrade. Both errors are returned untouched, and the
+    /// caller turns them into the usual sentence naming the holder or the
+    /// remedy.
     pub async fn open_resilient(path: &Path) -> Result<TursoStore> {
         match TursoStore::open(path).await {
             Ok(store) => match store.store_info().await {
                 Ok(_) => return Ok(store),
-                Err(e) if is_locked_by_another_process(&e) => return Err(e),
+                Err(e) if must_not_be_set_aside(&e) => return Err(e),
                 Err(_) => {}
             },
-            Err(e) if is_locked_by_another_process(&e) => return Err(e),
+            Err(e) if must_not_be_set_aside(&e) => return Err(e),
             Err(_) => {}
         }
         // Subsecond precision, so a second attempt inside the same second
@@ -1009,16 +1014,28 @@ pub fn lead_vectors_sql(actor_screen: &str) -> String {
     )
 }
 
-/// The stored discriminator string for a domain kind.
-/// Whether a failure is another process holding the database file rather than a
-/// damaged one. See [`IndexError::is_locked_by_another_process`]: a message it
-/// does not recognize is treated as damage, which is the existing behaviour,
-/// and the one message it does recognize is the one that must never lead to a
-/// file being set aside.
-fn is_locked_by_another_process(err: &IndexError) -> bool {
-    err.is_locked_by_another_process()
+/// Whether [`TursoStore::open_resilient`] must return a failure untouched
+/// rather than treat it as damage and set the file aside.
+///
+/// Two failures qualify, for the same underlying reason: the file is not
+/// broken, so moving it aside would destroy a healthy index rather than
+/// recover a damaged one.
+///
+/// - Another process holding the database file (see
+///   [`IndexError::is_locked_by_another_process`]: a message it does not
+///   recognize is treated as damage, which is the existing behaviour for
+///   everything else this function does not name).
+/// - [`IndexError::SchemaTooNew`]: a newer Crystalline already raised the
+///   schema past what this binary knows. `reindex --wipe` is daemonless, so
+///   an out-of-date binary meets that index exactly the way it meets one a
+///   live daemon holds - an open that fails - and the fix is upgrading this
+///   binary, never discarding a virtual domain's only copy of its engrams by
+///   renaming a schema this binary simply cannot read yet.
+fn must_not_be_set_aside(err: &IndexError) -> bool {
+    err.is_locked_by_another_process() || matches!(err, IndexError::SchemaTooNew { .. })
 }
 
+/// The stored discriminator string for a domain kind.
 fn kind_str(kind: DomainKind) -> &'static str {
     match kind {
         DomainKind::File => "file",
@@ -3077,6 +3094,70 @@ mod tests {
             tags_by_line(&store, id).await,
             expected,
             "the mapping survives a re-upsert"
+        );
+    }
+
+    /// [`must_not_be_set_aside`] against [`IndexError::SchemaTooNew`]: a
+    /// resilient open over a schema a newer Crystalline already raised past
+    /// what this binary knows must return the guard's own error, not the file
+    /// renamed aside as if it were corrupt.
+    ///
+    /// Before this test existed the case fell through `Err(_) => {}` in
+    /// [`TursoStore::open_resilient`] exactly the way real corruption does,
+    /// which would move a virtual domain's only copy of its engrams aside
+    /// under a timestamped sibling and open an empty database in its place -
+    /// over nothing worse than this binary being behind. `reindex --wipe` is
+    /// the caller that reaches this path.
+    #[tokio::test]
+    async fn open_resilient_refuses_a_schema_newer_than_this_binary_knows_rather_than_setting_it_aside()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let store = TursoStore::open(&path).await.unwrap();
+            // Stamp one version past the newest this binary ships, the way an
+            // actually-newer Crystalline's own migration would have. Dropped
+            // at the end of this scope so the next open is not fighting this
+            // store's own handle for the file.
+            store
+                .conn
+                .execute(
+                    "INSERT INTO schema_migration (version, applied_at) VALUES (?1, ?2)",
+                    vec![
+                        Value::Integer(store.schema_version + 1),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let err = match TursoStore::open_resilient(&path).await {
+            Err(e) => e,
+            Ok(_) => panic!("a schema this binary cannot read yet is refused, not opened"),
+        };
+        assert!(
+            matches!(err, IndexError::SchemaTooNew { .. }),
+            "expected SchemaTooNew, got: {err}"
+        );
+
+        assert!(
+            path.exists(),
+            "the original file is still at its own path, not renamed aside"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "and its bytes are untouched"
+        );
+        let siblings: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !siblings.iter().any(|n| n.contains(".unreadable-")),
+            "no set-aside sibling was created: {siblings:?}"
         );
     }
 }

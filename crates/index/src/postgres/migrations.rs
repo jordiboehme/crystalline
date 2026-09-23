@@ -504,6 +504,17 @@ pub async fn apply(conn: &mut PgConnection) -> Result<i64> {
     .map_err(|e| IndexError::Migration(e.to_string()))?;
 
     let current = current_version(conn).await?;
+    // The Turso twin of this guard: a schema raised past every migration this
+    // binary ships is a newer Crystalline's work, not damage, and there is no
+    // migration list here that could replay backwards to what this binary
+    // expects. Checked before the loop touches anything.
+    let known = MIGRATIONS.last().map(|m| m.version).unwrap_or(0);
+    if current > known {
+        return Err(IndexError::SchemaTooNew {
+            found: current,
+            known,
+        });
+    }
     for m in MIGRATIONS {
         if m.version <= current {
             continue;
@@ -910,6 +921,63 @@ mod tests {
         assert!(
             WIPE_TABLES.contains(&"engram_content"),
             "a wipe that leaves the bodies behind fails on the foreign key"
+        );
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    /// The Turso twin's Postgres counterpart: a database stamped one version
+    /// above the newest migration this binary knows must refuse rather than
+    /// silently report back as current. Runs `apply` itself (not raw SQL for
+    /// the buildup), since it is the entry point the guard has to protect and
+    /// the one every backend caller actually goes through.
+    ///
+    /// Runs only when `CRYSTALLINE_TEST_POSTGRES_URL` is set, the same gate
+    /// every other test in this module uses.
+    #[tokio::test]
+    async fn a_schema_stamped_above_the_newest_known_migration_is_refused() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_toonew_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        apply(&mut conn).await.unwrap();
+        let known = MIGRATIONS.last().unwrap().version;
+
+        sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
+            .bind(known + 1)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let err = apply(&mut conn)
+            .await
+            .expect_err("a schema newer than this binary knows is refused, not applied over");
+        match err {
+            IndexError::SchemaTooNew { found, known: k } => {
+                assert_eq!(found, known + 1, "the recorded version is reported back");
+                assert_eq!(k, known, "alongside the newest version this binary ships");
+            }
+            other => panic!("expected SchemaTooNew, got: {other}"),
+        }
+        assert!(
+            !err.is_locked_by_another_process(),
+            "a version mismatch is not a held file, so the owner's startup retry must not \
+             wait it out: {err}"
         );
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
