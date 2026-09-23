@@ -6,9 +6,10 @@ mod common;
 use chrono::{DateTime, FixedOffset};
 use common::{fixtures_dir, read};
 use crystalline_core::emit::{
-    append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_evolve_ack, set_frontmatter_field,
-    set_frontmatter_number, set_stale_after, set_verified, touch_generated,
+    append_body, insert_after_section, insert_after_section_reporting, insert_before_section,
+    prepend_body, remove_frontmatter_field, replace_section, replace_section_reporting,
+    set_evolve_ack, set_frontmatter_field, set_frontmatter_number, set_stale_after, set_verified,
+    touch_generated,
 };
 use crystalline_core::{EvolveAck, Verified, parse_engram};
 
@@ -73,6 +74,158 @@ fn insert_before_and_after_section() {
     let idx_inject = after.find("Injected after heading.").unwrap();
     let idx_body = after.find("The endpoints are grouped by concern.").unwrap();
     assert!(idx_heading < idx_inject && idx_inject < idx_body);
+}
+
+/// A MANIFEST shaped like the one in issue 91: two routing sections, the
+/// second one last so both the "a peer follows" and the "runs to the end"
+/// placements are exercised.
+const ROUTED: &str = "---\ntype: manifest\ntitle: eng\npermalink: manifest\nstatus: stable\n---\n\n# eng\n\n## Scope\n\n- old scope\n\n## When to Use\n\n- old routing\n";
+
+#[test]
+fn replace_section_drops_a_repeat_of_the_sections_own_heading() {
+    // The issue's exact shape: the content opens with the heading it replaces
+    // the body of. One heading comes out, with the new body under it, and the
+    // edit says which heading it dropped.
+    let edit = replace_section_reporting(
+        ROUTED,
+        "## When to Use",
+        "## When to Use\n\n- route here for eng work",
+        false,
+    )
+    .unwrap();
+    assert_eq!(edit.heading_stripped.as_deref(), Some("## When to Use"));
+    assert!(
+        edit.text
+            .ends_with("## When to Use\n\n- route here for eng work\n"),
+        "{}",
+        edit.text
+    );
+    assert_eq!(edit.text.matches("## When to Use").count(), 1);
+    // The same content, sent without the heading, lands byte for byte the same:
+    // the guard makes the mistaken call equal to the intended one.
+    let intended =
+        replace_section(ROUTED, "## When to Use", "- route here for eng work", false).unwrap();
+    assert_eq!(edit.text, intended);
+
+    // Mid-document, where a peer section follows, as well.
+    let edit =
+        replace_section_reporting(ROUTED, "## Scope", "## Scope\n\n- new scope", false).unwrap();
+    assert_eq!(edit.heading_stripped.as_deref(), Some("## Scope"));
+    assert!(
+        edit.text
+            .contains("## Scope\n\n- new scope\n\n## When to Use"),
+        "{}",
+        edit.text
+    );
+}
+
+#[test]
+fn insert_after_section_drops_a_repeat_of_the_sections_own_heading() {
+    let edit = insert_after_section_reporting(
+        ROUTED,
+        "## When to Use",
+        "\n\n## When to Use\n\n- first bullet",
+    )
+    .unwrap();
+    assert_eq!(edit.heading_stripped.as_deref(), Some("## When to Use"));
+    assert_eq!(edit.text.matches("## When to Use").count(), 1);
+    assert!(
+        edit.text
+            .contains("## When to Use\n\n- first bullet\n\n- old routing"),
+        "{}",
+        edit.text
+    );
+}
+
+#[test]
+fn the_repeat_matches_case_insensitively_and_ignores_closing_hashes() {
+    let edit =
+        replace_section_reporting(ROUTED, "## When to Use", "## when to use ##\n\n- x", false)
+            .unwrap();
+    // Reported in the document's spelling, which is the heading that stays.
+    assert_eq!(edit.heading_stripped.as_deref(), Some("## When to Use"));
+    assert!(!edit.text.contains("when to use"), "{}", edit.text);
+}
+
+#[test]
+fn a_nested_path_compares_against_the_resolved_heading_not_the_path() {
+    let source = nested_headings();
+    let edit = replace_section_reporting(
+        &source,
+        "## Endpoints > ### Auth",
+        "### Auth\n\nNew auth text.",
+        false,
+    )
+    .unwrap();
+    assert_eq!(edit.heading_stripped.as_deref(), Some("### Auth"));
+    assert_eq!(edit.text.matches("### Auth").count(), 1, "{}", edit.text);
+    assert!(edit.text.contains("### Auth\n\nNew auth text."));
+}
+
+#[test]
+fn a_heading_of_another_level_or_other_text_is_content() {
+    // Another level: a subsection the content means to open.
+    let edit = replace_section_reporting(ROUTED, "## When to Use", "### When to Use\n\n- x", false)
+        .unwrap();
+    assert_eq!(edit.heading_stripped, None);
+    assert!(
+        edit.text
+            .contains("## When to Use\n\n### When to Use\n\n- x")
+    );
+
+    // Other text at the same level: kept as sent, even though it makes a peer.
+    let edit =
+        replace_section_reporting(ROUTED, "## When to Use", "## Notes\n\n- x", false).unwrap();
+    assert_eq!(edit.heading_stripped, None);
+    assert!(edit.text.contains("## When to Use\n\n## Notes\n\n- x"));
+
+    let edit = insert_after_section_reporting(ROUTED, "## Scope", "## Other\n\n- x").unwrap();
+    assert_eq!(edit.heading_stripped, None);
+    assert!(edit.text.contains("## Scope\n\n## Other\n\n- x"));
+}
+
+#[test]
+fn a_matching_heading_below_the_first_line_is_the_authors_structure() {
+    let content = "- intro bullet\n\n## When to Use\n\n- more";
+    let edit = replace_section_reporting(ROUTED, "## When to Use", content, false).unwrap();
+    assert_eq!(edit.heading_stripped, None);
+    assert_eq!(edit.text.matches("## When to Use").count(), 2);
+}
+
+#[test]
+fn a_heading_inside_a_fence_at_the_top_is_kept() {
+    let content = "```markdown\n## When to Use\n```\n\n- x";
+    let edit = replace_section_reporting(ROUTED, "## When to Use", content, false).unwrap();
+    assert_eq!(edit.heading_stripped, None);
+    assert!(edit.text.contains("```markdown\n## When to Use\n```"));
+}
+
+#[test]
+fn content_that_is_only_the_heading_leaves_an_empty_body() {
+    // The same result empty content gives: the heading and nothing under it.
+    let edit =
+        replace_section_reporting(ROUTED, "## When to Use", "## When to Use\n", false).unwrap();
+    assert_eq!(edit.heading_stripped.as_deref(), Some("## When to Use"));
+    let empty = replace_section(ROUTED, "## When to Use", "", false).unwrap();
+    assert_eq!(edit.text, empty);
+
+    let edit = insert_after_section_reporting(ROUTED, "## Scope", "## Scope").unwrap();
+    assert_eq!(edit.heading_stripped.as_deref(), Some("## Scope"));
+    assert_eq!(edit.text.matches("## Scope").count(), 1);
+}
+
+#[test]
+fn the_plain_section_edits_strip_too_and_insert_before_does_not() {
+    // The non-reporting forms are the same edit, so no caller is left
+    // unguarded by calling the old name.
+    let out = replace_section(ROUTED, "## Scope", "## Scope\n\n- s", false).unwrap();
+    assert_eq!(out.matches("## Scope").count(), 1);
+    let out = insert_after_section(ROUTED, "## Scope", "## Scope\n\n- s").unwrap();
+    assert_eq!(out.matches("## Scope").count(), 1);
+    // Above the heading a same-named heading makes a second section, which an
+    // author can mean, so it is placed as sent.
+    let out = insert_before_section(ROUTED, "## Scope", "## Scope\n\n- s").unwrap();
+    assert_eq!(out.matches("## Scope").count(), 2);
 }
 
 #[test]
