@@ -38,7 +38,13 @@ function Cell(): ReactElement {
 /** The single cell, as the top bar and the favicon draw it. */
 export function GemGlyph({ size = 18 }: { size?: number }): ReactElement {
   return (
-    <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" className="shrink-0">
+    <svg
+      aria-hidden="true"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      className="shrink-0"
+    >
       <Cell />
     </svg>
   );

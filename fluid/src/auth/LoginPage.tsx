@@ -9,13 +9,14 @@
  * bring to the moment; this is where the two think in the same place. The line
  * says that once, quietly, and no other screen repeats it.
  *
- * The gem is the CLI banner's own gem, cut down to a size that fits a login
- * card. The full block-letter wordmark beside it in the README and the serve
- * banner is 87 columns wide, which is more than twice this card at any legible
- * monospace size, so the word is set as ordinary letter-spaced text instead:
- * readable beats faithful, and a wordmark that is real text is a wordmark a
- * screen reader can read. Only the gem is art, and art is what `aria-hidden`
- * is for.
+ * The mark is the lattice cell the top bar and the favicon draw, tiled into
+ * the trio three times. It is the same drawing rather than a copy of it, so a
+ * retune of the accent ramp reaches this screen with the rest. The full
+ * block-letter wordmark from the README and the serve banner is 87 columns
+ * wide, more than twice this card at any legible monospace size, so the word
+ * is set as ordinary letter-spaced text instead: readable beats faithful, and
+ * a wordmark that is real text is a wordmark a screen reader can read. Only
+ * the mark is art, and art is what `aria-hidden` is for.
  *
  * On an instance with no accounts at all there is nothing to log in to, so the
  * card carries the first-run wizard instead of the credentials form. Same
@@ -51,28 +52,13 @@ import { Link, Navigate, useLocation } from "react-router";
 
 import { ApiProblem } from "../api/client";
 import { PROVIDERS_KEY, fetchProviders, ssoSignInUrl } from "../api/sso";
+import { GemTrio } from "../components/GemGlyph";
 import { BUTTON, FOCUS_RING } from "../components/primitives";
 import { useAuth } from "./AuthContext";
 import { FirstRunSetup } from "./FirstRunSetup";
 import type { FromLocation } from "./RequireAuth";
 import { CARD_FIELD, CARD_LABEL } from "./card";
 import { LOGIN_MUTATION_KEY } from "./keys";
-
-/**
- * The gem from the CLI's startup banner, at a sixth of its width.
- *
- * Same silhouette and the same shading vocabulary the terminal draws it with -
- * a flat table, a faceted crown, then the pavilion tapering to a point - so
- * somebody who has seen the banner recognizes this, and somebody who has not
- * still sees a cut stone. Held as one string rather than assembled at render:
- * this route is eager, and a constant costs a few hundred bytes once.
- */
-const GEM = ` ▄▄▄▄▄▄▄▄▄▄▄
-▐░░▒▒▓█▓▒▒░░▌
-  ▀█░▒█▒░█▀
-   ▀█▒█▒█▀
-    ▀███▀
-      ▀`;
 
 export default function LoginPage() {
   const { user, capabilities, login } = useAuth();
@@ -161,21 +147,13 @@ export default function LoginPage() {
     <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6 dark:bg-slate-950">
       <div className="w-full max-w-sm">
         {/*
-          The banner gem, decorative on purpose: the word it stands over is
-          right beneath it as text, so a screen reader is spared six lines of
-          block characters that say nothing it can pronounce.
-
-          Centered as one block (`mx-auto w-fit`) rather than line by line: the
-          taper is drawn with leading spaces, so centering each line on its own
-          width would walk the point three columns to the right of the crown it
-          hangs under.
+          The mark, decorative on purpose: the word it stands over is right
+          beneath it as text, so a screen reader is spared three drawn cubes
+          that say nothing it can pronounce.
         */}
-        <pre
-          aria-hidden="true"
-          className="text-caption mx-auto mb-3 w-fit leading-none font-mono text-accent-600 select-none dark:text-accent-400"
-        >
-          {GEM}
-        </pre>
+        <div className="mx-auto mb-3 w-fit">
+          <GemTrio />
+        </div>
         {/*
           Text, not art: the product's name has to survive being listened to.
           The letter spacing is what makes it read as the wordmark from the
