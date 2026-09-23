@@ -91,8 +91,39 @@ describe("the engram writes module", () => {
       permalink: "guides/alpha",
       crossDomain: false,
       linksRewritten: 2,
+      referencesRewritten: 0,
       attachmentWarnings: [],
     });
+
+    // The address the engine chose wins over the path: a custom permalink
+    // stays while the file moves, and the counts ride along.
+    apiMock.mockResolvedValueOnce({
+      to: {
+        domain: "eng",
+        path: "guides/alpha.md",
+        permalink: "handbook/alpha",
+      },
+      cross_domain: false,
+      links_rewritten: 2,
+      references_rewritten: 5,
+    });
+    const kept = await moveEngram("eng", {
+      permalink: "handbook/alpha",
+      destination: "guides/alpha",
+      new_permalink: "keep",
+    });
+    expect(kept.permalink).toBe("handbook/alpha");
+    expect(kept.referencesRewritten).toBe(5);
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/move",
+      expect.objectContaining({
+        body: JSON.stringify({
+          permalink: "handbook/alpha",
+          destination: "guides/alpha",
+          new_permalink: "keep",
+        }),
+      }),
+    );
 
     apiMock.mockResolvedValueOnce(undefined);
     await deleteEngram("eng", "alpha", "abc123");

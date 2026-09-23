@@ -2069,8 +2069,8 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
 }
 
 #[test]
-fn the_catalog_carries_twenty_two_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 22);
+fn the_catalog_carries_twenty_three_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 23);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -2113,7 +2113,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         ids,
         vec![
             "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V010", "V101",
-            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203", "V301",
+            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V109", "V201", "V202", "V203",
+            "V301",
         ]
     );
     for rule in RULES {
@@ -2473,7 +2474,7 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
     // empty-scope arm, which is the safe default, and this pins that the
     // catalog and the scope function are read together.
     let scoped = [
-        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V201", "V202", "V301",
+        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V109", "V201", "V202", "V301",
     ];
     for info in RULES {
         let produced = scope_for(info.id, vec!["one".to_string()]);
@@ -2602,5 +2603,107 @@ fn unresolved(from: i64, target: &str) -> UnresolvedRef {
         // was written, which is what an unprefixed link actually stores.
         raw: target.to_string(),
         line: Some(3),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V109 - permalink off its folder
+// ---------------------------------------------------------------------------
+
+/// A fact whose file sits at `path` and answers to `permalink`.
+fn filed(id: i64, permalink: &str, path: &str) -> EngramFacts {
+    let mut f = fact(id, permalink);
+    f.path = path.to_string();
+    f
+}
+
+#[test]
+fn v109_fires_on_a_permalink_whose_folder_is_not_the_files() {
+    let sweep = input(vec![
+        filed(1, "velog/alpha", "projects/velog/alpha.md"),
+        filed(2, "overview", "projects/velog/overview.md"),
+    ]);
+    let report = detect(&sweep);
+    assert_eq!(fired_on(&report, "velog/alpha"), vec!["V109"]);
+    assert_eq!(fired_on(&report, "overview"), vec!["V109"]);
+
+    let drifted = report
+        .findings
+        .iter()
+        .find(|f| f.permalink == "velog/alpha")
+        .unwrap();
+    assert_eq!(drifted.class, Class::Judgment);
+    assert_eq!(drifted.family, Family::Structure);
+    assert_eq!(
+        drifted.finding,
+        "permalink sits in velog/ while the file sits in projects/velog/"
+    );
+    assert_eq!(
+        drifted.evidence,
+        "permalink=velog/alpha; path=projects/velog/alpha.md"
+    );
+    assert!(
+        drifted.fix.contains("destination projects/velog/alpha.md")
+            && drifted.fix.contains("permalink \"path\"")
+            && drifted.fix.contains("projects/velog/alpha"),
+        "{}",
+        drifted.fix
+    );
+    assert_eq!(
+        drifted.scope, "velog/alpha, projects/velog/alpha.md",
+        "the permalink and the path, in that order"
+    );
+    let flat = report
+        .findings
+        .iter()
+        .find(|f| f.permalink == "overview")
+        .unwrap();
+    assert_eq!(
+        flat.finding,
+        "permalink sits in the domain root while the file sits in projects/velog/"
+    );
+}
+
+#[test]
+fn v109_stays_quiet_on_a_matching_folder_a_root_file_and_a_reserved_one() {
+    let sweep = input(vec![
+        // In step, including a different spelling of the same folder and a
+        // last segment that differs from the file name.
+        filed(1, "projects/velog/alpha", "projects/velog/alpha.md"),
+        filed(2, "projects/velog/renamed", "Projects/Velog/Beta Notes.md"),
+        // A root file answers to whatever it likes.
+        filed(3, "handbook/gamma", "gamma.md"),
+        // The generated listing and the log are structure.
+        filed(4, "somewhere/else", "projects/index.md"),
+        filed(5, "somewhere/log", "projects/log.md"),
+    ]);
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V109"), "{:?}", fired(&report));
+}
+
+#[test]
+fn a_v109_ack_holds_until_the_permalink_or_the_path_changes() {
+    let acked = |permalink: &str, path: &str| {
+        let mut f = filed(1, permalink, path);
+        f.acks = vec![ack(
+            "V109",
+            Some("handbook/alpha, projects/alpha.md"),
+            "the handbook address is deliberate",
+        )];
+        detect(&input(vec![f]))
+    };
+
+    let silent = acked("handbook/alpha", "projects/alpha.md");
+    assert!(!fired(&silent).contains(&"V109"), "{:?}", fired(&silent));
+    assert_eq!(silent.acknowledged.structure, 1);
+
+    for (permalink, path) in [
+        ("handbook/alpha-notes", "projects/alpha.md"),
+        ("handbook/alpha", "archive/alpha.md"),
+    ] {
+        let report = acked(permalink, path);
+        let finding = only(&report, "V109");
+        assert!(finding.ack_stale, "{permalink} at {path}");
+        assert!(!finding.acknowledged);
     }
 }

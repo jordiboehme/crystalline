@@ -431,6 +431,60 @@ async fn move_is_rename(store: &dyn Store) {
 }
 parity!(move_is_rename_without_reparse, move_is_rename);
 
+/// `readdress_engram` sets the path and the permalink it is handed, keeping the
+/// row's id, including the permalink-only rename where the path stays put.
+async fn readdress_keeps_the_id(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "projects/velog/alpha.md",
+        &engram("Alpha", "velog/alpha", "engram", "", "the alpha body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let before = store.lookup_id("d", "velog/alpha").await.unwrap().unwrap();
+
+    // In place: the path stays, the permalink moves to the path's own.
+    store
+        .readdress_engram(
+            domain,
+            "projects/velog/alpha.md",
+            "projects/velog/alpha.md",
+            "projects/velog/alpha",
+        )
+        .await
+        .unwrap();
+    assert!(store.lookup_id("d", "velog/alpha").await.unwrap().is_none());
+    assert_eq!(
+        store.lookup_id("d", "projects/velog/alpha").await.unwrap(),
+        Some(before),
+        "the permalink-only rename keeps the id"
+    );
+
+    // And a path move naming a permalink unrelated to the path.
+    store
+        .readdress_engram(
+            domain,
+            "projects/velog/alpha.md",
+            "archive/alpha.md",
+            "kept/alpha",
+        )
+        .await
+        .unwrap();
+    let rows = store.list_engrams("d", None, None).await.unwrap();
+    let row = rows.iter().find(|r| r.path == "archive/alpha.md").unwrap();
+    assert_eq!(row.permalink, "kept/alpha");
+    assert_eq!(
+        store.lookup_id("d", "kept/alpha").await.unwrap(),
+        Some(before)
+    );
+}
+parity!(readdress_sets_path_and_permalink, readdress_keeps_the_id);
+
 async fn forward_reference_resolves(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -1002,6 +1056,78 @@ async fn inbound_refs_kinds(store: &dyn Store) {
     );
 }
 parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
+
+/// `engrams_mentioning` finds the engrams whose content holds an address
+/// verbatim - the `crystalline://` URLs no edge table records - in byte order
+/// on both backends, case-sensitively and with `%` and `_` read literally.
+async fn engrams_mentioning_finds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let url = "crystalline://d/notes/hub";
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "notes/hub", "engram", "", "the hub body\n"),
+    );
+    write(
+        root,
+        "Capital.md",
+        &engram(
+            "Capital",
+            "capital",
+            "engram",
+            "",
+            &format!("See {url}#setup for it.\n"),
+        ),
+    );
+    write(
+        root,
+        "plain.md",
+        &engram("Plain", "plain", "engram", "", &format!("Anchor {url}\n")),
+    );
+    write(
+        root,
+        "upper.md",
+        &engram(
+            "Upper",
+            "upper",
+            "engram",
+            "",
+            "CRYSTALLINE://D/NOTES/HUB is not the address\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    write(
+        other_dir.path(),
+        "far.md",
+        &engram("Far", "far", "engram", "", &format!("From afar: {url}\n")),
+    );
+    sync_domain(store, "Zed", other_dir.path()).await.unwrap();
+
+    let found = store.engrams_mentioning(url).await.unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|m| (m.domain.as_str(), m.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("Zed", "far.md"), ("d", "Capital.md"), ("d", "plain.md")],
+        "every verbatim mention, byte-ordered by domain then path: {found:?}"
+    );
+    assert!(
+        store
+            .engrams_mentioning("crystalline://d/notes/h_b")
+            .await
+            .unwrap()
+            .is_empty(),
+        "an underscore is literal, never a wildcard"
+    );
+    assert!(store.engrams_mentioning("").await.unwrap().is_empty());
+}
+parity!(
+    engrams_mentioning_finds_verbatim_addresses,
+    engrams_mentioning_finds
+);
 
 /// A hub with seven references pointing at it from two domains, for the
 /// `inbound_page` tests: four `cites`, two `part_of` and one prose wikilink.
@@ -7812,13 +7938,15 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 148,
+        census.sites, 152,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         60 per backend in mod.rs, 9 per backend in search.rs, 10 in the shared \
+         62 per backend in mod.rs (the move's `readdress_engram` and \
+         `engrams_mentioning` are the newest two, both on the base rows), 9 per \
+         backend in search.rs, 10 in the shared \
          statement builders in store.rs: the reference-resolution expression's four \
          arms, plus the three engram hops of each of the two graph frontiers. Those \
-         six used to be six per backend in search.rs, which is the whole of the move \
-         from 152: one copy of each frontier now, not one per dialect. One per \
+         six used to be six per backend in search.rs: one copy of each frontier \
+         now, not one per dialect. One per \
          backend in search.rs is the anti-join inside `actor_screen_on`, which asks \
          whether the reader holds a row of their own at a base row's path - one site \
          however many statements compose the screen. Two shapes carry no screen of \

@@ -11,7 +11,8 @@
 //!   staleness date that elapsed, a replacement that landed without the
 //!   retirement being finished, work that has sat unshared past its window;
 //! - `V1xx` **structural integrity** - unresolved references, one-sided
-//!   reciprocal relations, orphans, stubs, oversized engrams;
+//!   reciprocal relations, orphans, stubs, oversized engrams, attachments
+//!   nothing references and permalinks that drifted off their folder;
 //! - `V2xx` **redundancy and drift** - near-duplicate bodies, colliding titles,
 //!   tag spellings that drifted apart;
 //! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
@@ -317,7 +318,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 22] = [
+pub const RULES: [RuleInfo; 23] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -445,6 +446,13 @@ pub const RULES: [RuleInfo; 22] = [
         instruction: "An attachment without a reference from an engram should not exist. Delete it - or, if it should have been knowledge, analyze it into an engram that references and claims it first. Deleting is irreversible, so ask before acting. Delete with delete_engram using the assets/ path as the identifier, or in Fluid. One limit worth knowing: nothing records reference history, so a file nobody ever referenced and a file an edit stopped referencing look the same here, and the resolution is the same either way.",
     },
     RuleInfo {
+        id: "V109",
+        family: Family::Structure,
+        base: 45,
+        summary: "permalink off its folder",
+        instruction: "The engram's permalink names a different folder than the one its file sits in, usually left over from an earlier reorganisation, so a build_context glob on the folder misses it. Repair it with move_engram, passing the engram's own current path as destination and permalink \"path\": the permalink becomes the path's own and every reference to the engram is rewritten with it. The new address breaks bookmarks outside Crystalline, so ask first. When the custom permalink is deliberate, acknowledge with evolve_ack V109; the acknowledgment holds until the permalink or the path changes.",
+    },
+    RuleInfo {
         id: "V201",
         family: Family::Redundancy,
         base: 80,
@@ -522,6 +530,10 @@ pub fn is_pair_scoped(rule: &str) -> bool {
 ///   while a new member must;
 /// - `V007` and `V008` name **one attachment path**, so the first part is the
 ///   whole scope;
+/// - `V109` names **a pair**, the permalink and the file path in that order:
+///   an acknowledgment of a deliberate custom permalink holds exactly as long
+///   as neither changes, and re-filing the engram or renaming the permalink
+///   asks the question again;
 /// - every other rule's identity is just (engram, rule) - the plain temporal
 ///   rules, orphans, stubs, size, tag drift and the anchorless orphaned
 ///   attachment - and carries an empty scope, which matches whatever the engram
@@ -534,6 +546,7 @@ fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
             parts.join(SCOPE_SEPARATOR)
         }
         "V007" | "V008" => parts.into_iter().next().unwrap_or_default(),
+        "V109" => parts.join(SCOPE_SEPARATOR),
         _ => String::new(),
     }
 }
@@ -1924,6 +1937,11 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             ));
         }
 
+        // V109: a permalink whose folder is not the file's folder.
+        if let Some(finding) = permalink_off_its_folder(fact) {
+            report.findings.push(finding);
+        }
+
         // V104: nothing points here and it points nowhere.
         if orphans_enabled
             && fact.inbound + fact.outbound == 0
@@ -1954,6 +1972,57 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
 
     detect_unresolved(input, graph, report);
     detect_reciprocal(input, graph, report);
+}
+
+/// `V109`: the permalink's folder part differs from the folder the file sits
+/// in - `velog/alpha` for a file at `projects/velog/alpha.md`, or a flat
+/// `alpha` for a file inside a folder.
+///
+/// The drift a `build_context` glob on the folder silently misses, since a glob
+/// matches permalinks and not paths. Compared on the slugified folder, the
+/// derivation a permalink is made by, so `Projects/Velog/` and
+/// `projects/velog` are one folder, and on the folder alone: a permalink whose
+/// last segment differs from the file name is a rename, which no glob misses.
+///
+/// Two shapes never fire. A root-level file has no folder a glob could be
+/// anchored on, so whatever its permalink says is not drift from one; and the
+/// reserved files (`MANIFEST.md`, the generated `index.md` listings, `log.md`)
+/// are structure, answering to the names Crystalline gives them.
+///
+/// Judgment class, although the repair is one call: the new address is what
+/// every bookmark and every reference outside Crystalline knows the engram by,
+/// and nothing redirects from the old one.
+fn permalink_off_its_folder(fact: &EngramFacts) -> Option<Finding> {
+    if !fact.path.contains('/') || crystalline_core::is_reserved_path(&fact.path) {
+        return None;
+    }
+    let derived = crystalline_core::path_permalink(&fact.path);
+    let file_folder = crystalline_core::permalink_folder(&derived);
+    let link_folder = crystalline_core::permalink_folder(&fact.permalink);
+    if file_folder == link_folder {
+        return None;
+    }
+    let named = |folder: &str| match folder {
+        "" => "the domain root".to_string(),
+        folder => format!("{folder}/"),
+    };
+    Some(
+        Finding::about("V109", fact)
+            .with(
+                Class::Judgment,
+                format!(
+                    "permalink sits in {} while the file sits in {}",
+                    named(link_folder),
+                    named(file_folder)
+                ),
+                format!("permalink={}; path={}", fact.permalink, fact.path),
+                format!(
+                    "move_engram with destination {} and permalink \"path\", which makes it {derived} and rewrites every reference",
+                    fact.path
+                ),
+            )
+            .scoped([fact.permalink.clone(), fact.path.clone()]),
+    )
 }
 
 /// `V102`: references the index could not resolve.

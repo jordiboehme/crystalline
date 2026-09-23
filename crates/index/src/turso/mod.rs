@@ -44,8 +44,8 @@ use turso::{Builder, Connection, Database, Row, Value};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
-    DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DomainHost, DomainId,
+    DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
     Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
@@ -1303,6 +1303,28 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn readdress_engram(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+        permalink: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE engram SET path=?1, permalink=?2 \
+                 WHERE domain_id=?3 AND path=?4 AND actor = ''",
+                vec![
+                    Value::Text(to.to_string()),
+                    Value::Text(permalink.to_string()),
+                    Value::Integer(domain.0),
+                    Value::Text(from.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
         let n = self
             .conn
@@ -1680,6 +1702,34 @@ impl Store for TursoStore {
                 } else {
                     EdgeKind::Link
                 },
+            })
+            .collect())
+    }
+
+    async fn engrams_mentioning(&self, needle: &str) -> Result<Vec<ContentMention>> {
+        // `instr` rather than `LIKE`: this backend's LIKE folds ASCII case and
+        // reads `%` and `_` in the needle as wildcards, and an address is
+        // matched exactly. Narrow projection, as the trait doc says: the body
+        // is read by the predicate and never selected or sorted.
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = query_all(
+            &self.conn,
+            "SELECT d.name, e.domain_id, e.path \
+             FROM engram e JOIN engram_content ec ON ec.engram_id=e.id \
+                  JOIN domain d ON d.id=e.domain_id \
+             WHERE e.actor = '' AND instr(ec.content, ?1) > 0 \
+             ORDER BY d.name, e.path",
+            vec![Value::Text(needle.to_string())],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ContentMention {
+                domain: cell_text(r, 0).unwrap_or_default(),
+                domain_id: DomainId(cell_i64(r, 1).unwrap_or(0)),
+                path: cell_text(r, 2).unwrap_or_default(),
             })
             .collect())
     }

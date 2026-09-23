@@ -713,8 +713,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Move an engram to a new path, or into another domain.
-         * @description A same-domain move is a rename; a cross-domain move reads the source content and re-indexes it into the destination's source, rewriting inbound bare links from other domains to the domain-prefixed form.
+         * Move an engram to a new path, a new permalink or another domain.
+         * @description A same-domain move is a rename; a cross-domain move reads the source content and re-indexes it into the destination's source. A move is a refactoring: whenever the engram's address changes (domain, permalink or both), every reference to it in a domain the caller can see - wikilinks, relations and `crystalline://` URLs - is rewritten to the new address. A destination equal to the engram's own path with a `new_permalink` renames the permalink in place.
          *
          *     The permalink rides in the body for the same reason `RetireBody`'s does: the engram route's wildcard cannot be followed by an action segment.
          */
@@ -2590,18 +2590,29 @@ export interface components {
             /** @description The link itself, `dl_` plus 64 hex characters. Hand it to one person. */
             token: string;
         };
-        /** @description Move an engram to a new path, or into another registered domain. Inbound bare links are rewritten to the domain-prefixed form on a cross-domain move. */
+        /** @description Move an engram to a new path, a new permalink or into another registered domain. Every reference to it that the caller can see follows it to the new address. */
         MoveBody: {
             /**
-             * @description The new domain-relative path, with or without `.md`.
+             * @description The new domain-relative path, with or without `.md`. The engram's own
+             *     current path renames only its permalink.
              * @example guides/beta
              */
             destination: string;
             /**
-             * @description Move into another registered domain. Inbound bare links are rewritten
-             *     to the domain-prefixed form.
+             * @description Move into another registered domain. Bare links from the domain it
+             *     leaves gain the domain prefix.
              */
             destination_domain?: string | null;
+            /**
+             * @description The permalink the engram answers to after the move. Omitted, it
+             *     follows the move when it was in step with the old path and stays when
+             *     it was a custom one; `path` derives it from the destination path,
+             *     `keep` keeps the current one, and any other value is that permalink.
+             *     Named `new_permalink` because `permalink` already names the engram
+             *     being moved.
+             * @example path
+             */
+            new_permalink?: string | null;
             /**
              * @description The engram to move, by permalink.
              * @example notes/beta
@@ -6775,9 +6786,11 @@ export interface operations {
         };
         responses: {
             /**
-             * @description The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.
+             * @description The move receipt: where the engram came from, where it landed, whether the move crossed domains and which references followed it.
              *
-             *     `to.permalink` is the address the engram answers to after the move, which is not always the one it went in with: a permalink that was derived from the path follows the file.
+             *     `to.permalink` is the address the engram answers to after the move, which is not always the one it went in with: a permalink in step with the path follows the file, and `new_permalink` can ask for another.
+             *
+             *     `links_rewritten` counts the engrams whose references were rewritten, `references_rewritten` the references inside them, and `rewritten` names those engrams by domain and permalink.
              *
              *     `attachment_warnings` lists the attachments the move could not carry, one sentence each and empty when everything travelled; those files stay whole in the source domain.
              */
@@ -6795,7 +6808,14 @@ export interface operations {
                      *         "path": "beta.md",
                      *         "permalink": "beta"
                      *       },
-                     *       "links_rewritten": 0,
+                     *       "links_rewritten": 1,
+                     *       "references_rewritten": 2,
+                     *       "rewritten": [
+                     *         {
+                     *           "domain": "eng",
+                     *           "permalink": "alpha"
+                     *         }
+                     *       ],
                      *       "to": {
                      *         "domain": "eng",
                      *         "path": "guides/beta.md",
@@ -6833,7 +6853,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The destination already exists in the target domain. */
+            /** @description The destination already exists in the target domain, another engram there already answers to the new permalink, or the engram is open in the editor and its address would change under it. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6851,7 +6871,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`). */
+            /** @description The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`), `new_permalink` is not a permalink, or the move would change neither the path nor the permalink. */
             422: {
                 headers: {
                     [name: string]: unknown;

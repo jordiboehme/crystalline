@@ -105,8 +105,8 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
-    DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DomainHost, DomainId,
+    DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
     Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
@@ -1235,6 +1235,28 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn readdress_engram(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+        permalink: &str,
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(
+            "UPDATE engram SET path=$1, permalink=$2 \
+             WHERE domain_id=$3 AND path=$4 AND actor = ''",
+        )
+        .bind(to)
+        .bind(permalink)
+        .bind(domain.0)
+        .bind(from)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
         // The statement lives in `crate::store`, one copy for both backends;
         // postgres binds the domain id as `$1`.
@@ -1645,6 +1667,35 @@ impl Store for PostgresStore {
                 } else {
                     EdgeKind::Link
                 },
+            })
+            .collect())
+    }
+
+    async fn engrams_mentioning(&self, needle: &str) -> Result<Vec<ContentMention>> {
+        // `strpos` rather than `LIKE`, for the reason the turso twin gives for
+        // `instr`: `%` and `_` in the needle are literal here. Both sort keys
+        // pinned to `COLLATE "C"` so the order matches turso's byte order.
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT d.name, e.domain_id, e.path \
+             FROM engram e JOIN engram_content ec ON ec.engram_id=e.id \
+                  JOIN domain d ON d.id=e.domain_id \
+             WHERE e.actor = '' AND strpos(ec.content, $1) > 0 \
+             ORDER BY d.name COLLATE \"C\", e.path COLLATE \"C\"",
+        )
+        .bind(needle)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .iter()
+            .map(|r| ContentMention {
+                domain: cell_text(r, 0).unwrap_or_default(),
+                domain_id: DomainId(cell_i64(r, 1).unwrap_or(0)),
+                path: cell_text(r, 2).unwrap_or_default(),
             })
             .collect())
     }

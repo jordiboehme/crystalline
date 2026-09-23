@@ -1044,8 +1044,8 @@ pub struct StoredEngram {
 }
 
 /// One inbound reference to an engram: a relation or a prose link that resolves
-/// to it. Used by the cross-domain move to rewrite linkers to the domain-prefixed
-/// form.
+/// to it. Used by the move to find the engrams whose references follow the
+/// engram to its new address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InboundRef {
     /// The linking engram's domain name.
@@ -1070,6 +1070,18 @@ pub struct InboundRef {
     pub to_domain: Option<String>,
     /// Whether the reference came from a relation bullet or a prose link.
     pub kind: EdgeKind,
+}
+
+/// One engram whose stored content holds a given text, from
+/// [`Store::engrams_mentioning`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContentMention {
+    /// The engram's domain name.
+    pub domain: String,
+    /// The engram's domain id.
+    pub domain_id: DomainId,
+    /// The engram's domain-relative file path.
+    pub path: String,
 }
 
 /// The label a prose wikilink carries wherever inbound references are grouped
@@ -1730,6 +1742,26 @@ pub trait Store: Send + Sync {
     /// follows only when it was path-derived.
     async fn rename_engram(&self, domain: DomainId, from: &str, to: &str) -> Result<()>;
 
+    /// Give the base row at `from` a new path and a new permalink in one
+    /// statement, without reparsing, keeping its id.
+    ///
+    /// The move's own rename, beside the sync's [`Store::rename_engram`]: a
+    /// move decides the permalink itself - the path's, the one the engram
+    /// kept, or one the caller named - and writes it into the frontmatter, so
+    /// the row takes exactly that value rather than the path-derived guess.
+    /// The id is what every chunk, embedding and bound reference keys to, so
+    /// keeping it is what makes a rename cheaper than a delete and a create.
+    /// `from` and `to` may be the same path, which is the permalink-only
+    /// rename. The caller has already made sure no other row in the domain
+    /// holds `permalink`; the unique index refuses it otherwise.
+    async fn readdress_engram(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+        permalink: &str,
+    ) -> Result<()>;
+
     /// Resolve every pending forward reference in a domain in one batch,
     /// matching the target text against permalink then title within the target
     /// domain. Returns the number of relations newly resolved.
@@ -1841,8 +1873,8 @@ pub trait Store: Send + Sync {
     async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>>;
 
     /// Every relation or prose link that points at the given engram, with the
-    /// linking engram's path and the exact target text. Used by the cross-domain
-    /// move to rewrite inbound links.
+    /// linking engram's path and the exact target text. Used by the move to
+    /// find the engrams whose references it rewrites.
     async fn inbound_refs(
         &self,
         engram_id: EngramId,
@@ -1850,6 +1882,24 @@ pub trait Store: Send + Sync {
         permalink: &str,
         title: &str,
     ) -> Result<Vec<InboundRef>>;
+
+    /// Every base engram whose stored content holds `needle` verbatim, as its
+    /// domain and path, ordered by domain name then path.
+    ///
+    /// The move's second finder, beside [`Store::inbound_refs`]: a
+    /// `crystalline://domain/permalink` URL written in prose is a reference a
+    /// reader follows, but the parser never turns it into a `link` row, so no
+    /// edge table knows about it. This asks the content instead, and the move
+    /// passes the old address as the needle. A hit is a candidate, not a
+    /// verdict - `old` also matches inside `old-notes`, and inside code - so
+    /// the caller's rewrite decides what is actually a reference.
+    ///
+    /// A plain substring scan over `engram_content`, case-sensitive like the
+    /// address it looks for. It projects three narrow columns and never
+    /// selects or sorts a body: sorting wide rows is what once made a search
+    /// spill gigabytes here. Base rows only, like the inbound query: a draft
+    /// is its author's own and is not rewritten by somebody else's move.
+    async fn engrams_mentioning(&self, needle: &str) -> Result<Vec<ContentMention>>;
 
     /// One page of the references that point at an engram, filtered and counted
     /// in SQL, with the per-relation summary of all of them.
