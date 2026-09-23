@@ -25,8 +25,8 @@ use crystalline_core::config::{
     ResponseFormat, ShareIdentityMode, VerifyConfig,
 };
 use crystalline_core::emit::{
-    append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_evolve_ack, set_frontmatter_field,
+    append_body, insert_after_section_reporting, insert_before_section, prepend_body,
+    remove_frontmatter_field, replace_section_reporting, set_evolve_ack, set_frontmatter_field,
     set_frontmatter_number, set_stale_after, set_verified, touch_generated,
 };
 use crystalline_core::schema::{self, Schema};
@@ -7646,6 +7646,14 @@ impl Engine {
         // The model the agent reported, held against the actor this edit
         // records: a person's edit never carries one (`stamped_model`).
         let model = stamped_model(&actor, p.model.as_deref());
+        // What the text edit itself has to report, collected from inside the
+        // one arm that ran it - the file, the virtual row, a draft or a live
+        // room - so every landing path reports the same two things: the
+        // heading a section edit dropped, and for a MANIFEST the text that
+        // landed, which the MANIFEST rules then read.
+        let is_manifest = is_manifest_path(&desc.path);
+        let mut heading_stripped: Option<String> = None;
+        let mut manifest_text: Option<String> = None;
         let edited = self
             .apply_source_edit_staged(
                 &desc,
@@ -7661,14 +7669,19 @@ impl Engine {
                     // the actor it records (above), and a `verified` entry is
                     // held against the actor IT records, which only the arm
                     // that builds it knows.
-                    self.apply_edit(
+                    let (text, stripped) = self.apply_edit(
                         current,
                         p,
                         &desc.permalink,
                         &actor,
                         p.model.as_deref(),
                         ack.as_ref(),
-                    )
+                    )?;
+                    heading_stripped = stripped;
+                    if is_manifest {
+                        manifest_text = Some(text.clone());
+                    }
+                    Ok(text)
                 },
             )
             .await
@@ -7704,6 +7717,10 @@ impl Engine {
             Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
             Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
             None => {}
+        }
+        note_heading_stripped(&mut response, heading_stripped);
+        if let Some(text) = manifest_text {
+            note_manifest_findings(&mut response, &text, domain_verify_config(&source).as_ref());
         }
         Ok(response)
     }
@@ -8020,6 +8037,12 @@ impl Engine {
     /// an actor: the only operation that records it here is a verification, and
     /// a verification is held against the actor it names rather than the one
     /// making the call ([`stamped_model`]).
+    ///
+    /// Beside the text, the heading line a section edit dropped from the top
+    /// of its content because it repeated the target's own heading, which
+    /// only `replace_section` and `insert_after_section` can report (see
+    /// [`crystalline_core::emit::SectionEdit`]); `None` for every other
+    /// operation and for content placed as sent.
     #[allow(clippy::too_many_arguments)]
     fn apply_edit(
         &self,
@@ -8029,8 +8052,8 @@ impl Engine {
         actor: &str,
         model: Option<&str>,
         ack: Option<&AckDraft>,
-    ) -> Result<String> {
-        Ok(match p.operation.as_str() {
+    ) -> Result<(String, Option<String>)> {
+        let text = match p.operation.as_str() {
             "append" => append_body(source, self.require_content(p)?),
             "prepend" => prepend_body(source, self.require_content(p)?),
             "find_replace" => {
@@ -8056,11 +8079,16 @@ impl Engine {
                 }
                 source.replace(find, content)
             }
+            // The two operations whose content lands under a heading that
+            // stays: a repeat of that heading is dropped by the core edit, and
+            // reported here so the receipt can say so.
             "replace_section" => {
                 let content = self.require_content(p)?;
                 let section = self.require_section(p)?;
-                replace_section(source, section, content, p.include_subsections)
-                    .map_err(section_err)?
+                let edit =
+                    replace_section_reporting(source, section, content, p.include_subsections)
+                        .map_err(section_err)?;
+                return Ok((edit.text, edit.heading_stripped));
             }
             "insert_before_section" => {
                 let content = self.require_content(p)?;
@@ -8070,7 +8098,9 @@ impl Engine {
             "insert_after_section" => {
                 let content = self.require_content(p)?;
                 let section = self.require_section(p)?;
-                insert_after_section(source, section, content).map_err(section_err)?
+                let edit = insert_after_section_reporting(source, section, content)
+                    .map_err(section_err)?;
+                return Ok((edit.text, edit.heading_stripped));
             }
             "set_frontmatter" => {
                 Self::apply_set_frontmatter(source, p, permalink, actor, model, ack)?
@@ -8080,7 +8110,8 @@ impl Engine {
                     "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
                 )));
             }
-        })
+        };
+        Ok((text, None))
     }
 
     /// Assign or clear one lifecycle frontmatter field, the `set_frontmatter`
@@ -22268,6 +22299,100 @@ fn assets_reserved_error(rel: &str) -> String {
 pub(crate) fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
     if let Some(text) = warning {
         receipt["draft_warning"] = json!(text);
+    }
+}
+
+/// The sentence an edit receipt carries when a section edit dropped a repeat
+/// of the section's own heading from its content.
+pub const HEADING_STRIPPED_GUIDANCE: &str = "Content repeated the section's own heading; it was dropped, since the heading stays. Send only the body next time.";
+
+/// The sentence an edit or write receipt carries when the MANIFEST it just
+/// changed draws an error from the MANIFEST rules.
+pub const MANIFEST_BROKEN_GUIDANCE: &str =
+    "This MANIFEST now breaks routing for this domain; fix it before you move on.";
+
+/// Add one sentence to a receipt's `guidance`, after whatever is there.
+///
+/// Appending rather than assigning because more than one part of the server
+/// has something to tell the caller about one write - the engine about the
+/// text it landed, the similar advisory about the engrams it found beside
+/// it - and each of them runs without knowing about the others. An assignment
+/// would let the last one to run silently erase what the first said.
+pub(crate) fn add_guidance(receipt: &mut Value, sentence: &str) {
+    let Value::Object(map) = receipt else {
+        return;
+    };
+    let joined = match map.get("guidance").and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() => format!("{existing} {sentence}"),
+        _ => sentence.to_string(),
+    };
+    map.insert("guidance".to_string(), Value::String(joined));
+}
+
+/// Say on an edit receipt that the section edit dropped a repeated heading:
+/// which heading, and one sentence on why and what to send next time.
+///
+/// The repeat is dropped rather than refused because nobody means it, and
+/// said out loud because an agent that is only ever corrected in silence
+/// learns nothing and keeps sending it.
+fn note_heading_stripped(receipt: &mut Value, stripped: Option<String>) {
+    if let Some(heading) = stripped {
+        receipt["heading_stripped"] = json!(heading);
+        add_guidance(receipt, HEADING_STRIPPED_GUIDANCE);
+    }
+}
+
+/// Whether a domain-relative path is the domain's MANIFEST.
+fn is_manifest_path(rel: &str) -> bool {
+    rel == "MANIFEST.md"
+}
+
+/// Put the MANIFEST rules' findings about `text` on a receipt, when there are
+/// any; a clean MANIFEST adds nothing, so its receipt is the one it always was.
+///
+/// **Why a receipt carries them.** A MANIFEST is the one engram whose text is
+/// also configuration: its `## When to Use` bullets are what every session is
+/// routed by. An edit that empties that section, or doubles its heading so
+/// the reader keeps the empty first one, breaks routing for the whole domain,
+/// and nothing said so - the rules that notice ran only when somebody ran
+/// validate. The receipt is the moment the agent that did it is still there to
+/// fix it. Nothing is refused: a MANIFEST in the middle of a rewrite may be
+/// wrong for one step, and the finding is advice.
+///
+/// The rules are the core's own ([`crystalline_core::verify::check_manifest_source`]),
+/// the ones validate runs, under the domain's own `.crystalline.yaml`
+/// overrides, so the receipt and validate cannot disagree about one text.
+/// With no domain root handed in: `M105` stats the provisioned folders on
+/// disk, which says nothing about a draft, a live document or a virtual
+/// domain, and validate still raises it.
+fn note_manifest_findings(receipt: &mut Value, text: &str, verify: Option<&VerifyConfig>) {
+    let issues = crystalline_core::verify::check_manifest_source(
+        Path::new("MANIFEST.md"),
+        text,
+        None,
+        verify,
+    );
+    if issues.is_empty() {
+        return;
+    }
+    let breaks_routing = issues
+        .iter()
+        .any(|issue| issue.severity == crystalline_core::Severity::Error);
+    receipt["manifest_findings"] = Value::Array(
+        issues
+            .into_iter()
+            .map(|issue| {
+                json!({
+                    "code": issue.rule,
+                    "severity": issue.severity,
+                    "message": issue.message,
+                    "line": issue.line,
+                })
+            })
+            .collect(),
+    );
+    if breaks_routing {
+        add_guidance(receipt, MANIFEST_BROKEN_GUIDANCE);
     }
 }
 

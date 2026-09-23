@@ -187,6 +187,11 @@ pub fn overrun_warning(elapsed: Duration, domain: &str, kind: &str) -> String {
 
 /// Put the advisory on a receipt. Nothing is added for an empty list, so a
 /// quiet receipt is byte-identical to today's.
+///
+/// The guidance sentence joins whatever the engine already put there (a
+/// dropped heading, a MANIFEST that no longer routes) rather than replacing
+/// it: this runs after the engine answered, and the engine's sentence is
+/// about the text that just landed, which the advisory must not erase.
 pub fn attach(receipt: &mut Value, similar: &[SimilarEngram]) {
     if similar.is_empty() {
         return;
@@ -195,10 +200,7 @@ pub fn attach(receipt: &mut Value, similar: &[SimilarEngram]) {
         return;
     };
     map.insert("similar".to_string(), json!(similar));
-    map.insert(
-        "guidance".to_string(),
-        Value::String(SIMILAR_GUIDANCE.to_string()),
-    );
+    crate::engine::add_guidance(receipt, SIMILAR_GUIDANCE);
 }
 
 /// The first `max` characters, on a character boundary.
@@ -286,6 +288,30 @@ mod tests {
         );
         assert_eq!(receipt["similar"][0]["type"], "engram");
         assert_eq!(receipt["guidance"], SIMILAR_GUIDANCE);
+    }
+
+    /// The advisory runs after the engine answered, so a sentence the engine
+    /// already put on the receipt must survive it: the advisory's joins it.
+    #[test]
+    fn the_advisory_keeps_guidance_the_engine_already_gave() {
+        let mut receipt = json!({ "guidance": crate::engine::HEADING_STRIPPED_GUIDANCE });
+        attach(
+            &mut receipt,
+            &[SimilarEngram {
+                domain: "d".into(),
+                permalink: "q".into(),
+                title: "Q".into(),
+                status: "stable".into(),
+                engram_type: "engram".into(),
+            }],
+        );
+        assert_eq!(
+            receipt["guidance"],
+            format!(
+                "{} {SIMILAR_GUIDANCE}",
+                crate::engine::HEADING_STRIPPED_GUIDANCE
+            )
+        );
     }
 
     /// The advisory renders as a TOON table, which is the property spec 3.4

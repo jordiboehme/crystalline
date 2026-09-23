@@ -637,6 +637,55 @@ async fn an_agent_edit_in_a_reviewing_domain_composes_into_its_own_overlay_room(
     );
 }
 
+/// A section edit of a MANIFEST somebody has open composes into their
+/// document, and its receipt says what every other landing says: which
+/// repeated heading was dropped, and what the MANIFEST rules find in the text
+/// that went live. The text is not durable yet, but it is on their screen and
+/// the room's saver will write it, so the finding is owed now.
+#[tokio::test]
+async fn a_live_manifest_edit_reports_the_dropped_heading_and_the_findings() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "manifest", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let before = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+
+    let receipt = engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "manifest".to_string(),
+                domain: "eng".to_string(),
+                operation: "replace_section".to_string(),
+                section: Some("## When to Use".to_string()),
+                content: Some("## When to Use".to_string()),
+                ..EditParams::default()
+            },
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .expect("the edit lands");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+    assert_eq!(receipt["heading_stripped"], "## When to Use", "{receipt}");
+    assert!(
+        receipt["manifest_findings"]
+            .as_array()
+            .is_some_and(|findings| findings.iter().any(|f| f["code"] == "M004")),
+        "{receipt}"
+    );
+
+    resync(&joined, &doc).await;
+    let live = client_text(&doc);
+    assert_eq!(live.matches("## When to Use").count(), 1, "{live:?}");
+    assert!(!live.contains("Route here for eng questions"), "{live:?}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap(),
+        before,
+        "the file waits for the room's saver"
+    );
+}
+
 /// A room that is open over a DIFFERENT document leaves the ordinary write
 /// path exactly as it was: the live arm is asked about one document, not about
 /// the domain.

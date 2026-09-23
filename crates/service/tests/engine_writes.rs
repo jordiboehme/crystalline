@@ -2102,3 +2102,219 @@ async fn every_write_verb(scope: &Scope) -> Vec<(&'static str, serde_json::Value
 
     receipts
 }
+
+// ---------------------------------------------------------------------------
+// section edits: a repeated heading, and what an edit does to a MANIFEST
+// ---------------------------------------------------------------------------
+
+/// A section edit of `identifier` in `domain`.
+fn section_edit(
+    domain: &str,
+    identifier: &str,
+    operation: &str,
+    section: &str,
+    content: &str,
+) -> crystalline_service::params::EditParams {
+    crystalline_service::params::EditParams {
+        identifier: identifier.to_string(),
+        domain: domain.to_string(),
+        operation: operation.to_string(),
+        section: Some(section.to_string()),
+        content: Some(content.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The codes a receipt's `manifest_findings` lists, in order.
+fn finding_codes(receipt: &serde_json::Value) -> Vec<String> {
+    receipt["manifest_findings"]
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .map(|f| f["code"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Issue 91 as it happened: the content of a section rewrite opened with the
+/// section's own heading. The heading is kept once, the body lands under it,
+/// and the receipt names the heading it dropped and says why - which is also
+/// what makes the MANIFEST still route, so there is nothing for the rules to
+/// find.
+#[tokio::test]
+async fn a_repeated_heading_is_dropped_and_the_receipt_says_so() {
+    let (tmp, engine) = engine_fixture().await;
+    let receipt = engine
+        .edit_engram(&section_edit(
+            "eng",
+            "manifest",
+            "replace_section",
+            "## When to Use",
+            "## When to Use\n\n- Route here for eng runbooks",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt["heading_stripped"], "## When to Use", "{receipt}");
+    assert_eq!(
+        receipt["guidance"],
+        crystalline_service::engine::HEADING_STRIPPED_GUIDANCE
+    );
+    assert!(
+        receipt.get("manifest_findings").is_none(),
+        "the MANIFEST still routes: {receipt}"
+    );
+
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+    assert_eq!(on_disk.matches("## When to Use").count(), 1, "{on_disk}");
+    assert!(
+        on_disk.contains("## When to Use\n\n- Route here for eng runbooks"),
+        "{on_disk}"
+    );
+}
+
+/// The same guard on an ordinary engram, through the other guarded
+/// operation: nothing about it is MANIFEST-specific.
+#[tokio::test]
+async fn insert_after_section_drops_a_repeated_heading_on_any_engram() {
+    let (tmp, engine) = engine_fixture().await;
+    let receipt = engine
+        .edit_engram(&section_edit(
+            "eng",
+            "alpha",
+            "insert_after_section",
+            "# Alpha",
+            "# alpha\n\nA note under the title.",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt["heading_stripped"], "# Alpha", "{receipt}");
+    assert!(receipt.get("manifest_findings").is_none(), "{receipt}");
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(
+        on_disk.contains("# Alpha\n\nA note under the title.\n\nA rule about alpha."),
+        "{on_disk}"
+    );
+}
+
+/// A rewrite that leaves `## When to Use` with no bullets is the MANIFEST
+/// breaking routing quietly. It still lands - nothing is refused - and the
+/// receipt carries the rule's finding and the sentence that says to fix it.
+/// Content that is nothing but the repeated heading earns both notes at once.
+#[tokio::test]
+async fn a_manifest_edit_that_empties_when_to_use_reports_m004() {
+    let (tmp, engine) = engine_fixture().await;
+    let receipt = engine
+        .edit_engram(&section_edit(
+            "eng",
+            "manifest",
+            "replace_section",
+            "## When to Use",
+            "## When to Use",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt["heading_stripped"], "## When to Use", "{receipt}");
+    assert!(
+        finding_codes(&receipt).contains(&"M004".to_string()),
+        "{receipt}"
+    );
+    let m004 = receipt["manifest_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "M004")
+        .unwrap();
+    assert_eq!(m004["severity"], "error");
+    assert_eq!(m004["message"], "`## When to Use` has no top-level bullets");
+    assert!(m004["line"].is_null(), "{m004}");
+    let guidance = receipt["guidance"].as_str().unwrap();
+    assert!(
+        guidance.contains(crystalline_service::engine::HEADING_STRIPPED_GUIDANCE)
+            && guidance.contains(crystalline_service::engine::MANIFEST_BROKEN_GUIDANCE),
+        "{guidance}"
+    );
+    // Landed all the same: the finding is advice, not a refusal.
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+    assert!(
+        !on_disk.contains("Route here for eng questions"),
+        "{on_disk}"
+    );
+}
+
+/// `insert_before_section` is not guarded - a same-named heading above the
+/// target is a second section, which an author can mean - so on a MANIFEST it
+/// can still double a heading. The rules say so: `M103` is a warning, and with
+/// no error among the findings the receipt says nothing about broken routing.
+#[tokio::test]
+async fn a_manifest_edit_that_doubles_a_heading_reports_m103() {
+    let (_tmp, engine) = engine_fixture().await;
+    let receipt = engine
+        .edit_engram(&section_edit(
+            "eng",
+            "manifest",
+            "insert_before_section",
+            "## When to Use",
+            "## When to Use\n\n- Route here first",
+        ))
+        .await
+        .unwrap();
+    assert!(receipt.get("heading_stripped").is_none(), "{receipt}");
+    assert_eq!(finding_codes(&receipt), ["M103"], "{receipt}");
+    let m103 = &receipt["manifest_findings"][0];
+    assert_eq!(m103["severity"], "warning");
+    assert!(m103["line"].is_u64(), "{m103}");
+    assert!(receipt.get("guidance").is_none(), "{receipt}");
+}
+
+/// A MANIFEST edit that leaves it routing adds no key at all, so the receipt
+/// is the one it always was.
+#[tokio::test]
+async fn a_clean_manifest_edit_adds_nothing_to_the_receipt() {
+    let (_tmp, engine) = engine_fixture().await;
+    let receipt = engine
+        .edit_engram(&section_edit(
+            "eng",
+            "manifest",
+            "insert_after_section",
+            "## Scope",
+            "- Also the eng tooling",
+        ))
+        .await
+        .unwrap();
+    assert!(receipt.get("heading_stripped").is_none(), "{receipt}");
+    assert!(receipt.get("manifest_findings").is_none(), "{receipt}");
+    assert!(receipt.get("guidance").is_none(), "{receipt}");
+}
+
+/// A virtual domain's MANIFEST is a row, and its edit goes through the other
+/// landing arm: both notes come back the same way.
+#[tokio::test]
+async fn a_virtual_manifest_edit_reports_the_same_way() {
+    let (_tmp, engine) = engine_fixture().await;
+    engine
+        .scaffold_virtual_manifest(
+            "scratch",
+            "---\ntype: manifest\ntitle: scratch\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# scratch\n\n## Scope\n\n- Scratch work\n\n## When to Use\n\n- Route here for scratch work\n",
+        )
+        .await
+        .unwrap();
+    let receipt = engine
+        .edit_engram(&section_edit(
+            "scratch",
+            "manifest",
+            "replace_section",
+            "## When to Use",
+            "## when to use\n",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt["heading_stripped"], "## When to Use", "{receipt}");
+    assert!(
+        finding_codes(&receipt).contains(&"M004".to_string()),
+        "{receipt}"
+    );
+    let text = engine.engram_text("scratch", "manifest").await.unwrap();
+    assert_eq!(text.content.matches("## When to Use").count(), 1);
+}
