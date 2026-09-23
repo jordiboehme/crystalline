@@ -1311,13 +1311,22 @@ function DomainSidebar({
         </div>
       ) : (
         <>
-          <div className="flex justify-end pb-1">
-            {/*
-              Only where there is a rail to fold into: below the medium
-              breakpoint the sidebar is a drawer the top bar's own disclosure
-              opens and shuts, and a second control for the same column would
-              be one too many.
-            */}
+          {/*
+            The breakpoint gate sits on this wrapper rather than on the button
+            inside it. `IconButton` bakes `inline-flex` into its own class
+            string, and a `hidden` passed through `className` loses to it: both
+            are base display utilities, so the emitted stylesheet's order
+            decides and `.inline-flex` is written after `.hidden`. On a plain
+            div there is no baked display to lose to, `.hidden` is emitted after
+            `.flex`, and `md:flex` wins from the breakpoint up because a
+            responsive variant is emitted after every base utility.
+
+            Only where there is a rail to fold into: below the medium
+            breakpoint the sidebar is a drawer the top bar's own disclosure
+            opens and shuts, and a second control for the same column would
+            be one too many.
+          */}
+          <div className="hidden justify-end pb-1 md:flex">
             <IconButton
               ref={toggleRef}
               label="Collapse the sidebar"
@@ -1325,7 +1334,6 @@ function DomainSidebar({
               aria-expanded={true}
               aria-controls="domain-sidebar"
               onClick={fold}
-              className="hidden md:inline-flex"
             />
           </div>
           {domain === "" ? (

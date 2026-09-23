@@ -126,6 +126,32 @@ test("the home screen lists the fixture domain", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("the sidebar collapse control is desktop only", async ({ page }) => {
+  // Below the medium breakpoint the sidebar is a drawer the top bar's own
+  // disclosure opens and shuts, and the fold control has no rail to fold
+  // into. It must render at a wide viewport and stay off the page at a
+  // phone one; a jsdom test cannot see this because there is no Tailwind
+  // cascade in jsdom.
+  //
+  // The drawer is closed by default below the breakpoint, which already
+  // hides the whole sidebar and would make this assertion pass whether or
+  // not the collapse control itself is gated correctly. The disclosure is
+  // opened first so the control is actually on screen and the assertion
+  // exercises the thing it is meant to guard.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Domains" }).click();
+  await expect(page.getByRole("navigation", { name: "Domains" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Collapse the sidebar" }),
+  ).toBeHidden();
+
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(
+    page.getByRole("button", { name: "Collapse the sidebar" }),
+  ).toBeVisible();
+});
+
 test("an engram renders its mermaid fence as a diagram", async ({ page }) => {
   await openEngram(page, "Lantern Protocol");
 
