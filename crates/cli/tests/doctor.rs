@@ -697,6 +697,135 @@ fn detects_and_fixes_a_stale_lock_and_orphaned_socket() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A lock genuinely held (by a real separate process, not a fabricated file)
+/// with no readable record beside it must never be treated as stale: `--fix`
+/// deleting `service.lock` here would let the next opener take a fresh inode
+/// while the real holder still has the old one locked, exactly the "two
+/// owners" failure mode the 2026-09-23 incident's `doctor --fix` produced.
+///
+/// `crystalline hold-lock` (the same hidden test entry the wedge tests in
+/// `service.rs` use) takes the lock and publishes `service.json` before it
+/// announces readiness; this test deletes that record while the child still
+/// holds the lock, so what doctor meets is exactly "something holds
+/// `service.lock`, nothing answers its socket, and no record says who" - the
+/// `holder_unknown` case, not `lock_stale`.
+#[test]
+#[cfg(unix)]
+fn a_held_lock_with_no_record_is_never_treated_as_stale() {
+    let (home, state_dir) = isolated_home("held-no-record");
+    let apply = |cmd: &mut Command| apply_home(cmd, &home);
+
+    let mut holder = std::process::Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+    holder
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+        .args(["hold-lock", "--secs", "60"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = holder.spawn().unwrap();
+    // The readiness line means the lock is taken and service.json published;
+    // no sleep-and-hope.
+    {
+        use std::io::BufRead;
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "holding", "hold-lock did not take the lock");
+    }
+
+    let info_path = state_dir.join("service.json");
+    assert!(
+        info_path.is_file(),
+        "hold-lock publishes a record before announcing readiness"
+    );
+    std::fs::remove_file(&info_path).unwrap();
+
+    let mut cmd = bin();
+    apply(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--fix"])
+        .output()
+        .unwrap()
+        .stdout;
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["service"]["lock_stale"],
+        serde_json::json!(false),
+        "a lock the OS probe finds held is not stale, record or no record: {report}"
+    );
+    assert!(
+        report["service"]["lock_removed"]
+            .as_bool()
+            .is_some_and(|b| !b),
+        "and --fix never marks it removed: {report}"
+    );
+    assert!(
+        report["service"]["holder_unknown"].is_string(),
+        "the held-but-unidentified lock is named instead: {report}"
+    );
+    let holder_detail = report["service"]["holder_unknown"].as_str().unwrap();
+    assert!(
+        holder_detail.contains("no service record names the holder"),
+        "{holder_detail}"
+    );
+
+    assert!(
+        state_dir.join("service.lock").exists(),
+        "--fix must never delete a service.lock that is actually held"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The other half of the record-less lock file: nobody holds it at all (a
+/// killed process that never got as far as publishing `service.json`, or a
+/// legacy record this reader could not parse), so the OS probe reads free and
+/// `lock_stale` must still fire - the fix in
+/// [`a_held_lock_with_no_record_is_never_treated_as_stale`] narrows the
+/// `lock_stale` verdict, it must not disable it. `lock_pid` is `None` here
+/// (no record at all, not even a dead one), so the human report has to say
+/// "no record" rather than the old "dead pid None".
+#[test]
+#[cfg(unix)]
+fn a_free_lock_with_no_record_is_reported_by_name_and_fixed() {
+    let (home, state_dir) = isolated_home("free-no-record");
+    let apply = |cmd: &mut Command| apply_home(cmd, &home);
+
+    // An empty lock file: present, unheld (nothing ever took `flock` on it in
+    // this test), and with no `service.json` beside it - the "no record"
+    // shape rather than "dead pid".
+    std::fs::write(state_dir.join("service.lock"), b"").unwrap();
+
+    let mut cmd = bin();
+    apply(&mut cmd);
+    let human = String::from_utf8(cmd.arg("doctor").output().unwrap().stdout).unwrap();
+    assert!(
+        human.contains("stale lock file (no record)"),
+        "the free, record-less lock is named \"no record\", not \"dead pid None\": {human}"
+    );
+
+    let mut fix_cmd = bin();
+    apply(&mut fix_cmd);
+    let out = fix_cmd
+        .args(["--json", "doctor", "--fix"])
+        .output()
+        .unwrap()
+        .stdout;
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["service"]["lock_stale"], serde_json::json!(true));
+    assert_eq!(report["service"]["lock_pid"], serde_json::Value::Null);
+    assert_eq!(report["service"]["lock_removed"], serde_json::json!(true));
+    assert!(!state_dir.join("service.lock").exists());
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Origin state (like the service lock/socket above) lives under the state
 /// directory, reachable only through `HOME`/`XDG_*`, never a CLI flag, so the
 /// tests below isolate a short-path temp `HOME` the same way. Unix-only like

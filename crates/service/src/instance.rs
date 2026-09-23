@@ -670,6 +670,22 @@ fn lock_is_free(lock_path: &Path) -> io::Result<bool> {
     }
 }
 
+/// [`lock_is_free`] for the service lock, over whatever path this process
+/// resolves it to. `doctor`'s stale-lock check needs exactly this probe:
+/// a lock file with no readable record (`read_lock_info` returns `None`) is
+/// not on its own evidence that nobody holds it - the holder may simply have
+/// published no record, or published one this reader cannot parse - so a
+/// "stale" verdict has to rest on the OS lock itself, not on the record's
+/// absence. Conservative on a path that cannot be resolved or a probe that
+/// errors: `false`, so a caller never treats an unreadable state directory as
+/// license to delete a file that might still be held.
+pub fn service_lock_is_free() -> bool {
+    let Ok(lock_path) = config::service_lock_path() else {
+        return false;
+    };
+    lock_is_free(&lock_path).unwrap_or(false)
+}
+
 /// Ask the daemon socket for a trivial `ctl` answer, bounded by
 /// [`HOLDER_PROBE_TIMEOUT`]. `sessions` is the cheapest real command: it reads
 /// in-memory counters and touches neither the store nor the routing cache, so

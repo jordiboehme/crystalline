@@ -216,7 +216,12 @@ pub struct ServiceDoctor {
     pub lock_present: bool,
     /// The pid recorded in the lock file, when parseable.
     pub lock_pid: Option<u32>,
-    /// Whether the lock is stale (present but not held by a live process).
+    /// Whether the lock is stale: present, its record names no live process
+    /// (or names none at all), *and* the OS lock itself probes free. That
+    /// last clause is load bearing - a lock with no readable record can still
+    /// be held by something else entirely, and such a holder is the
+    /// `holder_unknown` case, never this one, so `--fix` never deletes a
+    /// lock file that is actually held.
     pub lock_stale: bool,
     /// Whether `--fix` removed the stale lock file.
     pub lock_removed: bool,
@@ -1400,6 +1405,20 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('.') && name != "." && name != ".."
 }
 
+/// The report's words for who a stale lock used to belong to. A `lock_stale`
+/// verdict now requires the OS lock to probe free (see [`ServiceDoctor::lock_stale`]),
+/// so a genuinely stale lock can still carry no readable record at all - a
+/// killed daemon that never got as far as `service.json`, or a legacy record
+/// this reader could not parse - and "dead pid None" said nothing a person
+/// could act on. "no record" says exactly what is known: not who it was, only
+/// that nothing living claims it now.
+fn stale_lock_holder_desc(pid: Option<u32>) -> String {
+    match pid {
+        Some(pid) => format!("dead pid {pid}"),
+        None => "no record".to_string(),
+    }
+}
+
 async fn check_service(fix: bool) -> Result<ServiceDoctor> {
     // The record's primary home is `service.json`; a still-present pre-split
     // daemon's record sitting in the lock file itself counts as present too
@@ -1418,7 +1437,15 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
     let alive = info
         .as_ref()
         .is_some_and(|i| instance::process_alive(i.pid));
-    let lock_stale = lock_present && !alive;
+    // `!alive` alone is not enough: a lock file with no record, or a record
+    // naming a dead pid, both read `alive = false` even when something else
+    // entirely still holds the OS lock (the 2026-09-23 incident - a daemon
+    // that had dropped its record but not yet exited kept the file locked
+    // for minutes). A genuinely stale lock is also a *free* one, so the
+    // real-lock probe is required alongside the record check; a lock that is
+    // still held with no readable record falls to `holder_unknown` instead,
+    // which never deletes anything.
+    let lock_stale = lock_present && !alive && instance::service_lock_is_free();
 
     let socket_present = sock_path.exists();
     let socket_orphaned = socket_present && !(lock_present && alive);
@@ -1461,6 +1488,18 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
                 Ok(instance::DislodgeOutcome::NotNeeded) => s.daemon_unresponsive = false,
                 Err(e) => s.holder_unknown = Some(e.to_string()),
             }
+        }
+        // Re-probed right before the delete, not trusted from the diagnosis
+        // above: `diagnose_holder`'s socket probe alone can take up to
+        // `HOLDER_PROBE_TIMEOUT`, and a daemon starting up in that window
+        // would take the lock after this run decided it was free but before
+        // it acted on that verdict - the exact "delete a lock a starting
+        // daemon holds" shape the 2026-09-23 incident's doctor produced. A
+        // lock that is held now is reported as recovered rather than
+        // removed, the same treatment `daemon_unresponsive`'s `NotNeeded`
+        // case gets above.
+        if s.lock_stale && !instance::service_lock_is_free() {
+            s.lock_stale = false;
         }
         if s.lock_stale {
             let info_removed = std::fs::remove_file(&info_path).is_ok();
@@ -2252,13 +2291,13 @@ pub fn render_human(report: &DoctorReport) -> String {
     let s = &report.service;
     let _ = writeln!(out, "service:");
     if s.lock_stale {
+        let holder = stale_lock_holder_desc(s.lock_pid);
         if s.lock_removed {
-            let _ = writeln!(out, "  removed stale lock file (dead pid {:?})", s.lock_pid);
+            let _ = writeln!(out, "  removed stale lock file ({holder})");
         } else {
             let _ = writeln!(
                 out,
-                "  [problem] stale lock file (dead pid {:?}), rerun with --fix to remove",
-                s.lock_pid
+                "  [problem] stale lock file ({holder}), rerun with --fix to remove"
             );
         }
     }
