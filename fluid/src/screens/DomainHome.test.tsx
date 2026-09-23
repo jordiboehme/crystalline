@@ -421,6 +421,26 @@ describe("the domain screen", () => {
     ).toBeVisible();
   });
 
+  it("draws a routing bullet's markdown instead of its punctuation", async () => {
+    serve({
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: MANIFEST,
+        sections: sectionsResponse({
+          when_to_use: ["**Search `project2030` first**"],
+        }),
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const routing = await screen.findByRole("region", { name: "Routing" });
+    const code = await within(routing).findByText("project2030");
+    expect(code.tagName).toBe("CODE");
+    expect(code.closest("strong")).not.toBeNull();
+    expect(within(routing).queryByText(/\*\*/)).toBeNull();
+  });
+
   it("names what a MANIFEST lacks, panel by panel", async () => {
     serve({
       "/domains/eng/manifest": () => ({

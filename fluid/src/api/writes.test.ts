@@ -164,4 +164,17 @@ describe("the engram writes module", () => {
     expect(conflictOf(new ApiProblem(409, "conflict", "taken"))).toBeNull();
     expect(conflictOf(new Error("network"))).toBeNull();
   });
+
+  it("strips the server's version suffix off a versioned current_etag", () => {
+    // The manifest and engram routes answer with "{checksum}-{version}",
+    // never a bare checksum - this module's own contract, the next
+    // `If-Match` a caller builds from `currentChecksum`, stays the bare form.
+    const conflict = conflictOf(
+      new ApiProblem(412, "precondition failed", "stale edit: changed", {
+        current_etag: '"def456-0.19.2"',
+        current_content: "theirs",
+      }),
+    );
+    expect(conflict?.currentChecksum).toBe("def456");
+  });
 });

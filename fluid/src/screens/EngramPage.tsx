@@ -20,9 +20,11 @@
  * warning about what would be left dangling.
  *
  * The detail response is cached under `(domain, permalink)` with the checksum
- * it carries, which is the same token its `ETag` carries and the one a later
- * conditional write presents back as `expected_checksum`. Keeping it is what
- * makes editing from this screen possible without a re-read.
+ * it carries, the one a later conditional write presents back as
+ * `expected_checksum` (the response's `ETag` carries this same checksum too,
+ * versioned for the server that answered it, which is why nothing here reads
+ * the header). Keeping it is what makes editing from this screen possible
+ * without a re-read.
  *
  * The observation and relation bullets render once, in the body, in chip
  * form: the written line and its indexed reading are the same line drawn

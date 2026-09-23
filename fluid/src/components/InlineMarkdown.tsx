@@ -4,52 +4,24 @@
  * where `**Search `project2030` first**` should read as bold text around a
  * code span rather than asterisks and backticks.
  *
- * A seam of its own rather than a mode on `Markdown`: that component is lazy
- * because the renderer behind it carries a syntax highlighter and mermaid,
- * and a line of routing prose needs neither and should never show a loading
- * flash for two words of bold text. `allowedElements` with `unwrapDisallowed`
- * is what keeps this inline: anything that is not on the list - a heading, a
- * list, a fenced code block, an image, the paragraph react-markdown always
- * wraps a line in - collapses to its own children instead of being dropped or
- * drawn as a block, so the caller's own wrapper (a `<li>`, typically) is the
- * only block element in play. Raw HTML stays inert the same way it does in
- * the full renderer: react-markdown does not interpret it unless something
- * adds `rehype-raw`, which this file does not.
+ * It is a seam rather than the renderer, the same split `Markdown.tsx` makes
+ * for the block renderer and for the same reason: react-markdown is a real
+ * dependency, and a routing bullet drawn on a page that never opens a
+ * document should not pay for it up front. Measured at the point this split
+ * was made: the block renderer's own chunk already carries react-markdown,
+ * so a page that draws both - a domain's MANIFEST facets beside its raw
+ * source, for instance - fetches it once either way; bundling this renderer
+ * into the entry chunk instead grew it by roughly 117 kB raw (36 kB gzipped).
+ * No loading flash needed here, unlike the block renderer's "crystallizing"
+ * placeholder: the fallback is the plain source text, which for the common
+ * case - a bullet with no markdown in it at all - is pixel-identical to the
+ * rendered answer, and for the rare bullet that does use markup is a one-time
+ * flash of its own punctuation rather than a blank line.
  */
 
-import ReactMarkdown from "react-markdown";
-import type { Components } from "react-markdown";
+import { Suspense, lazy } from "react";
 
-/** Every tag this renderer is allowed to draw. Everything else unwraps into
- * its own children rather than becoming an element of its own. */
-const ALLOWED_ELEMENTS = ["strong", "em", "code", "a"];
-
-/** The inline elements that need more than their default drawing: the same
- * chip-like code span and link styling the block renderer uses, kept in step
- * by hand since the two never share a chunk. */
-const components: Components = {
-  code: ({ children }) => (
-    <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[0.9em] dark:bg-slate-800">
-      {children}
-    </code>
-  ),
-  a: ({ children, href }) => {
-    // The same rule the block renderer's anchor applies to an ordinary link:
-    // a target out of the app opens in its own tab, an in-app one navigates
-    // in place. There is no wikilink or attachment resolution here - a
-    // routing bullet carries neither - so every link is drawn as written.
-    const outward = typeof href === "string" && /^https?:\/\//i.test(href);
-    return (
-      <a
-        href={href}
-        className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
-        {...(outward ? { target: "_blank", rel: "noreferrer" } : {})}
-      >
-        {children}
-      </a>
-    );
-  },
-};
+const InlineMarkdownBody = lazy(() => import("./InlineMarkdownBody"));
 
 export interface InlineMarkdownProps {
   /** The single line of prose to draw. */
@@ -61,12 +33,8 @@ export interface InlineMarkdownProps {
  * into the source loses only its own wrapper, never the text inside it. */
 export function InlineMarkdown({ source }: InlineMarkdownProps) {
   return (
-    <ReactMarkdown
-      allowedElements={ALLOWED_ELEMENTS}
-      unwrapDisallowed
-      components={components}
-    >
-      {source}
-    </ReactMarkdown>
+    <Suspense fallback={source}>
+      <InlineMarkdownBody source={source} />
+    </Suspense>
   );
 }
