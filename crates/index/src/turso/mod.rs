@@ -1011,16 +1011,12 @@ pub fn lead_vectors_sql(actor_screen: &str) -> String {
 
 /// The stored discriminator string for a domain kind.
 /// Whether a failure is another process holding the database file rather than a
-/// damaged one.
-///
-/// turso raises the lock failure through its catch-all string variant rather
-/// than a typed one, so the `Locking error:` prefix its own message carries is
-/// the only handle there is; the same test the web-auth store already makes.
-/// Read conservatively: a message this does not recognize is treated as damage,
-/// which is the existing behaviour, and the one message it does recognize is
-/// the one that must never lead to a delete.
+/// damaged one. See [`IndexError::is_locked_by_another_process`]: a message it
+/// does not recognize is treated as damage, which is the existing behaviour,
+/// and the one message it does recognize is the one that must never lead to a
+/// file being set aside.
 fn is_locked_by_another_process(err: &IndexError) -> bool {
-    err.to_string().contains("Locking error")
+    err.is_locked_by_another_process()
 }
 
 fn kind_str(kind: DomainKind) -> &'static str {

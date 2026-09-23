@@ -315,7 +315,7 @@ pub async fn run_serve(
     // (see `temp_store::point_at_state_dir`).
     crate::temp_store::sweep_at_startup();
 
-    let store = open_store(&loaded.effective, Some(&db_path)).await?;
+    let store = open_store_as_owner(&loaded.effective, Some(&db_path)).await?;
     // A channel the engine uses to tell the watcher (spawned below) about a
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
@@ -2548,9 +2548,143 @@ pub(crate) async fn open_store(
     Ok(crystalline_index::open_store(&cfg.database(), db, false).await?)
 }
 
+/// How long a daemon that holds ownership waits for the index database to come
+/// free before it gives up.
+///
+/// A predecessor removes its ownership record while the engine it is dropping
+/// still holds the file: the engine is shared with background tasks, and the
+/// database lock goes with the last of them. That window is milliseconds on a
+/// quiet machine and has been long enough on a loaded CI runner for a successor
+/// to fail outright, which is what an upgrade or an autostart reconnect right
+/// after a shutdown would meet. Ten seconds covers any departure that is
+/// actually happening; a holder that is not leaving still fails the start, as
+/// before, and says who holds it.
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// How often the owner asks again while it waits.
+const STORE_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// [`open_store`], for the one caller that holds the ownership lock.
+///
+/// Holding ownership is what makes waiting correct. Another process on the
+/// index file at that point is either a predecessor that has already given up
+/// ownership and is on its way out, or a short daemonless command, and either
+/// lets go by itself. Every other caller of [`open_store`] fails fast, which is
+/// right for them: they hold nothing, and the answer they need is who does.
+async fn open_store_as_owner(
+    cfg: &GlobalConfig,
+    db: Option<&Path>,
+) -> anyhow::Result<Arc<TokioMutex<dyn Store>>> {
+    let database = cfg.database();
+    Ok(retry_while_locked(STORE_LOCK_WAIT, STORE_LOCK_POLL, || {
+        crystalline_index::open_store(&database, db, false)
+    })
+    .await?)
+}
+
+/// Run `open` until it succeeds, fails for a reason other than another process
+/// holding the file, or `budget` has passed. The last lock failure is what a
+/// spent budget returns, so the caller's message about the holder is unchanged.
+async fn retry_while_locked<T, F, Fut>(
+    budget: Duration,
+    poll: Duration,
+    mut open: F,
+) -> crystalline_index::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crystalline_index::Result<T>>,
+{
+    let start = tokio::time::Instant::now();
+    let mut waited = false;
+    loop {
+        match open().await {
+            Ok(value) => {
+                if waited {
+                    tracing::info!(
+                        waited_ms = start.elapsed().as_millis() as u64,
+                        "the index database came free; a previous daemon had not yet let go of it"
+                    );
+                }
+                return Ok(value);
+            }
+            Err(err) if err.is_locked_by_another_process() && start.elapsed() < budget => {
+                if !waited {
+                    tracing::info!(
+                        "the index database is still held by another process; waiting up to {budget:?} for it to let go"
+                    );
+                    waited = true;
+                }
+                tokio::time::sleep(poll).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn locked() -> crystalline_index::IndexError {
+        // The shape turso actually raises, catch-all variant and all.
+        crystalline_index::IndexError::Db(
+            "Locking error: Failed locking file 'index.db'. File is locked by another process"
+                .to_string(),
+        )
+    }
+
+    /// The owner waits out a predecessor that has not yet let go of the file.
+    #[tokio::test(start_paused = true)]
+    async fn the_owner_waits_for_a_departing_holder() {
+        let mut calls = 0;
+        let got = retry_while_locked(Duration::from_secs(10), Duration::from_millis(50), || {
+            calls += 1;
+            let n = calls;
+            async move { if n < 4 { Err(locked()) } else { Ok(n) } }
+        })
+        .await;
+        assert_eq!(got.unwrap(), 4, "the fourth attempt found the file free");
+    }
+
+    /// Anything other than a held file fails at once, exactly as before.
+    #[tokio::test(start_paused = true)]
+    async fn any_other_failure_is_not_retried() {
+        let mut calls = 0;
+        let got: crystalline_index::Result<()> =
+            retry_while_locked(Duration::from_secs(10), Duration::from_millis(50), || {
+                calls += 1;
+                async { Err(crystalline_index::IndexError::Migration("bad".into())) }
+            })
+            .await;
+        assert!(got.is_err());
+        assert_eq!(
+            calls, 1,
+            "a damaged or misconfigured store is not a holder to wait out"
+        );
+    }
+
+    /// A holder that is not leaving still fails the start, with the lock error
+    /// itself, once the budget is spent.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_stays_fails_the_start_after_the_budget() {
+        let started = tokio::time::Instant::now();
+        let got: crystalline_index::Result<()> = retry_while_locked(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async { Err(locked()) },
+        )
+        .await;
+        let err = got.unwrap_err();
+        assert!(
+            err.is_locked_by_another_process(),
+            "the holder is still named: {err}"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        assert!(
+            started.elapsed() < Duration::from_secs(11),
+            "and not much longer"
+        );
+    }
 
     /// The idle exit on a paused clock: with no session it trips the shutdown
     /// once the grace has elapsed, and not before.

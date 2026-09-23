@@ -1,5 +1,24 @@
 //! Error type for the storage and index layer.
 
+impl IndexError {
+    /// Whether this is another process holding the database file, rather than
+    /// a damaged file or any other failure.
+    ///
+    /// turso raises the lock failure through its catch-all string variant
+    /// rather than a typed one, so the `Locking error` text its own message
+    /// carries is the only handle there is. Read conservatively: a message this
+    /// does not recognize answers `false`, which every caller treats as the
+    /// ordinary failure it already handled.
+    ///
+    /// Public because two layers act on it differently. The store's recovery
+    /// path must never set a held file aside as if it were damaged, and the
+    /// daemon's startup waits a moment for a predecessor that has given up
+    /// ownership but not yet let go of the file.
+    pub fn is_locked_by_another_process(&self) -> bool {
+        self.to_string().contains("Locking error")
+    }
+}
+
 /// The result type used across `crystalline-index`.
 pub type Result<T> = std::result::Result<T, IndexError>;
 
