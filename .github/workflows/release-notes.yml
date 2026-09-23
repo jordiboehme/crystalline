@@ -1,0 +1,62 @@
+name: Release notes sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'release-notes/v*.md'
+  # Syncs every file rather than a diff, so a run against a release the
+  # regular push trigger somehow missed (a manual edit reverted upstream, a
+  # workflow that did not fire) always converges the pages back onto what is
+  # in the tree.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # scripts/sync-release-notes.sh diffs github.event.before against
+          # the pushed commit below, which the default shallow clone does not
+          # have. Same reasoning as the `changes` job in ci.yml.
+          fetch-depth: 0
+
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            bash scripts/sync-release-notes.sh
+            exit 0
+          fi
+
+          before="${{ github.event.before }}"
+          case "$before" in
+            ''|0000000000000000000000000000000000000000)
+              # A first push to main, or one git has no usable base for:
+              # there is no diff to narrow, so fall back to every file. Still
+              # correct, just does more comparing than strictly necessary.
+              echo "no usable base commit, syncing every file"
+              bash scripts/sync-release-notes.sh
+              exit 0
+              ;;
+          esac
+
+          # --diff-filter=d drops deletions: a removed notes file has nothing
+          # left to sync and scripts/sync-release-notes.sh would skip a
+          # missing path anyway, but there is no reason to even pass it one.
+          mapfile -t files < <(git diff --name-only --diff-filter=d "$before" "${{ github.sha }}" -- 'release-notes/v*.md')
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no release-notes files changed"
+            exit 0
+          fi
+
+          bash scripts/sync-release-notes.sh "${files[@]}"
