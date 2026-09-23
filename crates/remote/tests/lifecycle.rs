@@ -513,6 +513,48 @@ async fn scenario_02_pull_with_no_movement_is_up_to_date() {
     assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha");
 }
 
+// Scenario 2b (0.19.2 item 8): an unchanged probe still moves last_checked.
+//
+// `settle_up_to_date` used to stamp and save `last_checked` only when a
+// proposal transitioned or the etag moved, so a domain a poller checked every
+// five minutes with nothing new upstream left its card frozen on whatever it
+// last showed - 17 hours, once, on the real poller, while it kept running
+// underneath the whole time. "Last checked" has to mean last checked, not
+// last changed.
+
+#[tokio::test]
+async fn scenario_02b_an_unchanged_pull_still_moves_last_checked() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // `subscribe` already stamped `last_checked` once; back it off by a
+    // day so a later "did it move forward" comparison cannot pass merely
+    // because two `Utc::now()` calls landed in the same instant.
+    let mut state = load_state(&sub.state_dir);
+    let backdated = chrono::Utc::now() - chrono::Duration::hours(17);
+    state.last_checked = Some(backdated);
+    state.save(&sub.state_dir).unwrap();
+
+    // The mock's branch has not moved since subscribe, so this pull reaches
+    // `branch_head` with the etag `subscribe` recorded, which the mock
+    // answers `HeadProbe::Unchanged` - exactly the branch under test.
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(report.up_to_date, "the mock branch never moved: {report:?}");
+
+    let after = load_state(&sub.state_dir);
+    assert!(
+        after.last_checked.is_some_and(|t| t > backdated),
+        "an unchanged probe still stamps last_checked forward: before {backdated:?}, after {:?}",
+        after.last_checked
+    );
+}
+
 // Scenario 3: upstream edits a file the working tree never touched. The edit
 // applies cleanly, the working tree matches upstream and the base advances.
 
