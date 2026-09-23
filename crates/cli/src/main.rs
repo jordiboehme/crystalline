@@ -489,7 +489,9 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Move an engram to a new path or domain.
+    /// Move an engram to a new path, permalink or domain. Every link,
+    /// relation and crystalline:// URL that pointed at its old address is
+    /// rewritten to the new one.
     Move {
         /// A bare permalink, title or crystalline:// URL. Without the scheme
         /// the identifier is domain-relative: never prefix it with a domain
@@ -497,12 +499,19 @@ enum Command {
         identifier: String,
         /// The engram's current domain.
         domain: String,
-        /// The new domain-relative path.
+        /// The new domain-relative path. The engram's own current path
+        /// renames only its permalink (pass --permalink with it).
         destination: String,
         /// Move to a different domain.
         #[arg(long)]
         destination_domain: Option<String>,
-        /// Do not rewrite inbound links on a cross-domain move.
+        /// The permalink after the move: "path" derives it from the
+        /// destination path, "keep" keeps the current one, any other value is
+        /// the new permalink. Omitted, it follows the move when it was in step
+        /// with the old path and stays when it was a custom one.
+        #[arg(long)]
+        permalink: Option<String>,
+        /// Do not rewrite the references to the moved engram.
         #[arg(long)]
         no_update_links: bool,
         /// Load the global config from this file instead of the default path.
@@ -3144,6 +3153,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             domain,
             destination,
             destination_domain,
+            permalink,
             no_update_links,
             config,
         } => (
@@ -3153,6 +3163,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                 "domain": domain,
                 "destination": destination,
                 "destination_domain": destination_domain,
+                "permalink": permalink,
                 "update_links": !no_update_links,
             }),
             config,
