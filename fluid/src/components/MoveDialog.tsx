@@ -29,6 +29,12 @@ export interface MoveDialogProps {
   engram: EngramDetail;
   /** Every registered domain name, for the optional cross-domain target. */
   domains: string[];
+  /**
+   * Whether the engram's domain reviews changes before they land. A move
+   * there moves the author's draft, and a draft keeps the permalink it
+   * carries unless one is asked for, so the preview has to say so.
+   */
+  reviewing?: boolean;
   onClose: () => void;
 }
 

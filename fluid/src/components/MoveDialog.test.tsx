@@ -249,6 +249,43 @@ describe("the move dialog", () => {
     ).toHaveTextContent("Rewrote 3 references in 2 engrams to point here.");
   });
 
+  it("previews a draft keeping its permalink in a reviewing domain", async () => {
+    serve({
+      "/domains": () => {
+        const listing = domainsResponse();
+        return {
+          ...listing,
+          domains: listing.domains.map((entry) => ({
+            ...entry,
+            review: "overlay",
+          })),
+        };
+      },
+    });
+    renderApp("/d/eng/e/alpha");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /move/i });
+    await userEvent.clear(within(dialog).getByLabelText("Destination path"));
+    await userEvent.type(
+      within(dialog).getByLabelText("Destination path"),
+      "guides/alpha",
+    );
+    // The draft carries its address along unless asked, so the preview says
+    // "alpha" and the offer to match the folder is there.
+    expect(within(dialog).getByText("alpha")).toBeInTheDocument();
+    await userEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "Update the permalink to match",
+      }),
+    );
+    expect(within(dialog).getByText("guides/alpha")).toBeInTheDocument();
+  });
+
   it("offers no permalink update when the permalink already follows the file", async () => {
     serve();
     renderApp("/d/eng/e/alpha");

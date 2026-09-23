@@ -54,6 +54,7 @@ const BUTTON_CLASSES =
 export default function MoveDialogBody({
   engram,
   domains,
+  reviewing = false,
   onClose,
 }: MoveDialogProps): ReactElement {
   const navigate = useNavigate();
@@ -70,11 +71,12 @@ export default function MoveDialogBody({
   const [warned, setWarned] = useState<MoveReceipt | null>(null);
 
   const destFile = destinationFile(destination);
-  const kept = defaultMovedPermalink(
-    engram.permalink,
-    engram.path,
-    destination,
-  );
+  // In a reviewing domain the move lands in the author's draft, which keeps
+  // the address it carries unless one is asked for: the review pairs a moved
+  // draft with the team's engram by that address.
+  const kept = reviewing
+    ? engram.permalink
+    : defaultMovedPermalink(engram.permalink, engram.path, destination);
   const ownPermalink = pathPermalink(destFile);
   // Offered only when the permalink the default keeps names another folder
   // than the file will sit in, which is the drift a folder glob misses.

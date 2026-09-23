@@ -716,6 +716,11 @@ export default function EngramPage() {
         <MoveDialog
           engram={engram}
           domains={(domains.data?.domains ?? []).map((entry) => entry.name)}
+          reviewing={
+            (domains.data?.domains ?? []).find(
+              (entry) => entry.name === engram.domain,
+            )?.review != null
+          }
           onClose={() => {
             setMoving(false);
           }}
