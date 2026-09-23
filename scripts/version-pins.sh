@@ -52,7 +52,7 @@ while read -r pin; do
   [ -n "$pin" ] || continue
   pinned="$(printf '%s' "$pin" | sed -E 's/.*@?v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
   if [ "$pinned" != "$version" ]; then
-    echo "::error file=docs/evolve.md::docs/evolve.md pins $pin while the workspace Cargo.toml says $version. The version moves three files together: Cargo.toml, docs/evolve.md and fluid/package.json." >&2
+    echo "::error file=docs/evolve.md::docs/evolve.md pins $pin while the workspace Cargo.toml says $version. The version moves four files together: Cargo.toml, docs/evolve.md, fluid/package.json and release-notes/v<version>.md." >&2
     bad=1
   fi
 done <<< "$pins"
