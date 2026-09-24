@@ -715,13 +715,14 @@ fn an_env_defined_domain_alone_earns_the_nudge() {
 const STOP_SYSTEM_MESSAGE: &str =
     "Crystalline is checking this session for anything worth keeping.";
 
-/// A Stop hook wired for Claude Code answers in the shape that version
-/// honours: the top-level pair that delivers the nudge, the plain sentence a
-/// person reads beside the harness's own unconditional error line, and the
-/// block the documentation describes, carried for the version that implements
-/// it.
+/// A Stop hook wired for Claude Code answers with the top-level pair that
+/// delivers the nudge and the plain sentence a person reads beside the
+/// harness's own unconditional error line - and nothing else. No
+/// `hookSpecificOutput` block: an older Claude Code's schema rejects the
+/// whole answer over it, and a current one only logs its keys as
+/// unrecognized.
 #[test]
-fn the_claude_code_nudge_carries_the_message_and_the_documented_block() {
+fn the_claude_code_nudge_carries_the_message_and_no_hook_specific_output() {
     let work = tempfile::tempdir().unwrap();
     let home = work.path().join("home");
     let config = work.path().join("config.yaml");
@@ -742,9 +743,10 @@ fn the_claude_code_nudge_carries_the_message_and_the_documented_block() {
     assert_eq!(printed["decision"], "block");
     assert_eq!(printed["reason"], NUDGE_REASON);
     assert_eq!(printed["systemMessage"], STOP_SYSTEM_MESSAGE);
-    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "Stop");
-    assert_eq!(printed["hookSpecificOutput"]["decision"], "block");
-    assert_eq!(printed["hookSpecificOutput"]["stopReason"], NUDGE_REASON);
+    assert!(
+        printed.get("hookSpecificOutput").is_none(),
+        "no hookSpecificOutput block: {printed}"
+    );
 }
 
 /// Every harness whose Stop parser nobody here has measured gets byte-for-byte

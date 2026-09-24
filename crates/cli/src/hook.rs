@@ -653,24 +653,30 @@ pub fn run_stop(harness: Option<&str>) {
 ///
 /// Every harness gets the top-level `decision`/`reason` pair, which is what
 /// actually carries the nudge. Claude Code additionally gets a
-/// `systemMessage` and the `hookSpecificOutput` block its own documentation
-/// describes. Measured against Claude Code 2.1.263 on 2026-09-08, with a
-/// scratch project and `claude -p --output-format stream-json`:
+/// `systemMessage`. Measured against Claude Code 2.1.263 on 2026-09-08, with
+/// a scratch project and `claude -p --output-format stream-json`:
 ///
 /// | response | nudge delivered | user sees |
 /// | --- | --- | --- |
 /// | top-level `decision`/`reason` | yes | `Stop hook error occurred` |
 /// | `hookSpecificOutput.decision` plus `stopReason` | no, silently dropped | nothing |
 /// | top-level pair plus `systemMessage` | yes | a notice line reading `Stop says: <text>` |
-/// | all three together | yes, exactly once | the notice, plus the same error line |
 ///
-/// So the documented shape is not implemented for Stop in that version, and
-/// adopting it on its own would have killed the nudge without a word. All
-/// three go out together instead: the top-level pair is what works today, the
-/// block is forward compatibility for the version that does implement it, and
-/// the two together still deliver exactly one nudge. The error line is
-/// unconditional on a blocked stop and is not ours to remove;
-/// [`STOP_SYSTEM_MESSAGE`] is what puts a plain sentence beside it.
+/// The top-level pair is what carries the nudge; `systemMessage` puts a
+/// notice beside the "Stop hook error occurred" line Claude Code shows on
+/// every blocked stop regardless of payload shape, which is not ours to
+/// remove. [`STOP_SYSTEM_MESSAGE`] is what puts a plain sentence there.
+///
+/// A `hookSpecificOutput` block was added here for forward compatibility and
+/// removed on 2026-09-24 after two more measurements. An older Claude Code -
+/// whose schema knows `hookSpecificOutput` only for PreToolUse,
+/// UserPromptSubmit and PostToolUse - rejected the whole answer over it
+/// ("- : Invalid input"), losing the nudge along with everything else.
+/// Claude Code 2.1.281 accepted the block but logged its `decision` and
+/// `stopReason` as unrecognized keys and ignored them; the current docs
+/// allow only `additionalContext` in a Stop block, which this hook has no
+/// use for. So the block broke old versions and did nothing on new ones -
+/// there is no version it helps.
 ///
 /// Codex and Copilot get exactly the two fields they have always got, and not
 /// one field more. Codex's Stop parser is stricter and neither harness has
@@ -684,11 +690,6 @@ fn stop_payload(harness: Option<HarnessKind>, reason: &str) -> serde_json::Value
     let mut payload = serde_json::json!({ "decision": "block", "reason": reason });
     if harness == Some(HarnessKind::ClaudeCode) {
         payload["systemMessage"] = serde_json::json!(STOP_SYSTEM_MESSAGE);
-        payload["hookSpecificOutput"] = serde_json::json!({
-            "hookEventName": "Stop",
-            "decision": "block",
-            "stopReason": reason,
-        });
     }
     payload
 }
@@ -844,18 +845,51 @@ mod tests {
 
     // --- the response shape per harness --------------------------------------
 
-    /// Claude Code gets all three: the top-level pair that actually delivers
-    /// the nudge today, the system message a person reads, and the block its
-    /// documentation describes, carried for the version that implements it.
+    /// Claude Code gets the top-level pair that actually delivers the nudge
+    /// and the system message a person reads - no `hookSpecificOutput`
+    /// block: an older Claude Code's schema does not know one for Stop and
+    /// rejects the whole answer over it, and the newest measured version
+    /// only logs its keys as unrecognized.
     #[test]
-    fn claude_code_gets_the_pair_the_message_and_the_documented_block() {
+    fn claude_code_gets_the_pair_and_the_message_and_no_hook_specific_output() {
         let payload = stop_payload(Some(HarnessKind::ClaudeCode), "the reason");
         assert_eq!(payload["decision"], "block");
         assert_eq!(payload["reason"], "the reason");
         assert_eq!(payload["systemMessage"], STOP_SYSTEM_MESSAGE);
-        assert_eq!(payload["hookSpecificOutput"]["hookEventName"], "Stop");
-        assert_eq!(payload["hookSpecificOutput"]["decision"], "block");
-        assert_eq!(payload["hookSpecificOutput"]["stopReason"], "the reason");
+        assert!(
+            payload.get("hookSpecificOutput").is_none(),
+            "no hookSpecificOutput block: {payload}"
+        );
+    }
+
+    /// The old hook schema an older Claude Code still validates Stop
+    /// answers against knows only these top-level keys. Every key this
+    /// payload carries must be one of them, and `hookSpecificOutput` - the
+    /// key that made validation fail at the root - must be absent.
+    #[test]
+    fn the_claude_code_stop_answer_fits_the_old_hook_schema() {
+        const OLD_SCHEMA_KEYS: &[&str] = &[
+            "continue",
+            "suppressOutput",
+            "stopReason",
+            "decision",
+            "reason",
+            "systemMessage",
+            "permissionDecision",
+        ];
+        let payload = stop_payload(Some(HarnessKind::ClaudeCode), "the reason");
+        let object = payload.as_object().expect("payload is a JSON object");
+        for key in object.keys() {
+            assert!(
+                OLD_SCHEMA_KEYS.contains(&key.as_str()),
+                "key {key:?} is not in the old hook schema: {payload}"
+            );
+        }
+        assert!(
+            !object.contains_key("hookSpecificOutput"),
+            "the old schema knows hookSpecificOutput only for PreToolUse, \
+             UserPromptSubmit and PostToolUse: {payload}"
+        );
     }
 
     /// Every other harness gets byte-for-byte what it has always got. Asserted
