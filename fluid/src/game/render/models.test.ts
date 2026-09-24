@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { CELL, MACHINE_KINDS } from "../world/generate";
 import {
@@ -24,18 +24,17 @@ import {
   type Surface,
   type V3,
 } from "./geometry";
-import {
-  createKit,
-  frameForDecor,
-  frameForSlot,
-  type Frame,
-  type Kit,
-} from "./kit";
+import { createKit, frameForDecor, frameForSlot, type Frame } from "./kit";
 import { LOOKS } from "./looks";
 import {
+  BLAST_DOWN_TRAVEL,
+  BLAST_UP_TRAVEL,
+  BULKHEAD_TRAVEL,
   FLUSH_DEPTH,
   HEADROOM,
+  HOUSING_DEPTH,
   PIPE_DROP,
+  SLIDE_TRAVEL,
   buildDecor,
   buildFixture,
   pipeLength,
@@ -43,30 +42,102 @@ import {
   type Mover,
 } from "./models";
 
-/** The lowest ceiling the generator makes. */
+/** One kit call, as the recording kit saw it. */
+interface Part {
+  /** The builder it emitted into: the room's, or a mover's own. */
+  builder: object;
+  method: string;
+  layer: number;
+  flag: number;
+  points: V3[];
+}
+
+/**
+ * Every kit made while a model builds, the models' own mover kits
+ * included, records each primitive call with its surface and its own
+ * vertices (emitted a second time into a scratch builder).
+ */
+const rec = vi.hoisted(() => ({ parts: [] as Part[] }));
+
+vi.mock("./kit", async (importOriginal) => {
+  // Only the kit is imported here: geometry imports the kit, so importing
+  // it from this factory would wait on itself. The kit emits through
+  // `builder.vertex` alone, which is all a scratch builder needs.
+  const real = await importOriginal<typeof import("./kit")>();
+  type Fn = (...args: unknown[]) => void;
+  type KitBuilder = Parameters<typeof real.createKit>[0];
+  const call = (kit: object, name: string, args: unknown[]) => {
+    (kit as Record<string, Fn | undefined>)[name]?.(...args);
+  };
+  return {
+    ...real,
+    createKit: (builder: KitBuilder, f: Frame) => {
+      const kit = real.createKit(builder, f);
+      const wrapped: Record<string, Fn> = {};
+      for (const name of Object.keys(kit)) {
+        wrapped[name] = (...args: unknown[]) => {
+          call(kit, name, args);
+          const points: V3[] = [];
+          const scratch = {
+            vertex: (p: V3) => points.push([p[0], p[1], p[2]]),
+          } as unknown as KitBuilder;
+          call(real.createKit(scratch, f), name, args);
+          const s = args.find(
+            (x): x is Surface =>
+              typeof x === "object" && x !== null && "flag" in x,
+          );
+          rec.parts.push({
+            builder,
+            method: name,
+            layer: s?.layer ?? -1,
+            flag: s?.flag ?? -1,
+            points,
+          });
+        };
+      }
+      return wrapped as unknown as ReturnType<typeof real.createKit>;
+    },
+  };
+});
+
+/** The lowest ceiling the generator makes, and the highest. */
 const CEILING = 3.0;
+const HIGH_CEILING = 5.0;
 const EPS = 1e-4;
 const HALL: Rect = { x0: 2, y0: 0, x1: 7, y1: 6 };
+/** The text layer the test hands out for one-line labels. */
+const LABEL_LAYER = 12;
 
-const CTX: ModelContext = {
-  look: LOOKS.aperture,
-  ceiling: CEILING,
-  hall: HALL,
-  textLayer: (key) => {
-    if (
-      key.startsWith("terminal") ||
-      key.startsWith("poster") ||
-      key === "placard"
-    )
-      return { layer: 9, v0: 0, v1: 1 };
-    return { layer: 12, v0: 2 / 6, v1: 3 / 6 };
-  },
-};
+/** A context that records the text keys it was asked for. */
+function context(ceiling = CEILING): { ctx: ModelContext; keys: string[] } {
+  const keys: string[] = [];
+  return {
+    keys,
+    ctx: {
+      look: LOOKS.aperture,
+      ceiling,
+      hall: HALL,
+      textLayer: (key) => {
+        keys.push(key);
+        if (
+          key.startsWith("terminal") ||
+          key.startsWith("poster") ||
+          key === "placard"
+        )
+          return { layer: 9, v0: 0, v1: 1 };
+        return { layer: LABEL_LAYER, v0: 2 / 6, v1: 3 / 6 };
+      },
+    },
+  };
+}
 
 const SIDES: readonly Side[] = ["n", "e", "s", "w"];
 const slotOn = (side: Side): WallSlot => ({ x: 3, y: 4, side });
 
 const ADDRESS = { domain: "d", permalink: "p" };
+
+/** The index every fixture is built at, which names its keys. */
+const INDEX = 7;
 
 /** Every fixture the models draw, by a readable name, on a given wall. */
 function fixtures(slot: WallSlot): [string, Fixture][] {
@@ -128,6 +199,17 @@ function fixtures(slot: WallSlot): [string, Fixture][] {
   return out;
 }
 
+/** The one text key each kind of fixture draws. */
+const KEY_OF: Record<Fixture["kind"], string> = {
+  terminal: `terminal:${INDEX}`,
+  door: `door:${INDEX}`,
+  portal: `portal:${INDEX}`,
+  hatch: `hatch:${INDEX}`,
+  machine: `tag:${INDEX}`,
+  poster: `poster:${INDEX}`,
+  placard: "placard",
+};
+
 const DECOR_KINDS: readonly DecorKind[] = [
   "command-console",
   "captain-chair",
@@ -139,50 +221,6 @@ const DECOR_KINDS: readonly DecorKind[] = [
   "lab-island",
   "specimen-tank",
 ];
-
-/** One kit call, as the recording kit saw it. */
-interface Part {
-  method: string;
-  flag: number;
-  points: V3[];
-}
-
-/** Calls a kit primitive by name. */
-function call(kit: Kit, name: string, args: unknown[]) {
-  const fns = kit as unknown as Record<string, (...a: unknown[]) => void>;
-  fns[name]?.(...args);
-}
-
-/**
- * A kit factory that emits into `builder` like the room mesh's, and also
- * records each primitive call with its flag and its own vertices, so the
- * glow check can look at parts rather than at the model's overall box.
- */
-function recorder(builder: ReturnType<typeof createBuilder>) {
-  const parts: Part[] = [];
-  const kitAt = (f: Frame): Kit => {
-    const real = createKit(builder, f);
-    const wrapped = {} as Record<string, (...args: unknown[]) => void>;
-    for (const name of Object.keys(real)) {
-      wrapped[name] = (...args: unknown[]) => {
-        call(real, name, args);
-        const scratch = createBuilder();
-        call(createKit(scratch, f), name, args);
-        const s = args.find(
-          (x): x is Surface =>
-            typeof x === "object" && x !== null && "flag" in x,
-        );
-        parts.push({
-          method: name,
-          flag: s?.flag ?? -1,
-          points: positions(scratch.build()),
-        });
-      };
-    }
-    return wrapped as unknown as Kit;
-  };
-  return { kitAt, parts };
-}
 
 function positions(m: MeshData): V3[] {
   return Array.from({ length: m.count }, (_, i) => {
@@ -200,7 +238,9 @@ function normals(m: MeshData): V3[] {
   });
 }
 
+const add = (p: V3, q: V3): V3 => [p[0] + q[0], p[1] + q[1], p[2] + q[2]];
 const sub = (p: V3, q: V3): V3 => [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+const scale = (p: V3, k: number): V3 => [p[0] * k, p[1] * k, p[2] * k];
 const cross = (p: V3, q: V3): V3 => [
   p[1] * q[2] - p[2] * q[1],
   p[2] * q[0] - p[0] * q[2],
@@ -240,21 +280,55 @@ const inBox = (b: Box, p: V3) =>
 interface Built {
   static: MeshData;
   movers: Mover[];
+  /** The static parts, and each mover's parts, in mover order. */
   parts: Part[];
+  moverParts: Part[][];
+  keys: string[];
 }
 
-function buildOne(fx: Fixture, ctx: ModelContext = CTX): Built {
-  const builder = createBuilder();
-  const { kitAt, parts } = recorder(builder);
-  const movers = buildFixture(kitAt, fx, 7, ctx);
-  return { static: builder.build(), movers, parts };
+/** Splits the recorded parts into the room's and each mover's. */
+function collect(builder: object, movers: readonly Mover[]) {
+  const parts = rec.parts.filter((p) => p.builder === builder);
+  const others: object[] = [];
+  for (const p of rec.parts) {
+    if (p.builder !== builder && !others.includes(p.builder))
+      others.push(p.builder);
+  }
+  const moverParts = others.map((b) =>
+    rec.parts.filter((p) => p.builder === b),
+  );
+  expect(moverParts.length).toBe(movers.length);
+  moverParts.forEach((ps, i) => {
+    const n = ps.reduce((sum, p) => sum + p.points.length, 0);
+    expect(n).toBe(movers[i]?.mesh.count);
+  });
+  return { parts, moverParts };
 }
 
-function buildOneDecor(d: Decor, ctx: ModelContext = CTX): Built {
+function buildOne(fx: Fixture, ceiling = CEILING): Built {
+  rec.parts = [];
   const builder = createBuilder();
-  const { kitAt, parts } = recorder(builder);
-  buildDecor(kitAt, d, ctx);
-  return { static: builder.build(), movers: [], parts };
+  const { ctx, keys } = context(ceiling);
+  const movers = buildFixture((f) => createKit(builder, f), fx, INDEX, ctx);
+  return {
+    static: builder.build(),
+    movers,
+    ...collect(builder, movers),
+    keys,
+  };
+}
+
+function buildOneDecor(d: Decor, ceiling = CEILING): Built {
+  rec.parts = [];
+  const builder = createBuilder();
+  const { ctx, keys } = context(ceiling);
+  buildDecor((f) => createKit(builder, f), d, ctx);
+  return {
+    static: builder.build(),
+    movers: [],
+    ...collect(builder, []),
+    keys,
+  };
 }
 
 const all = (b: Built): MeshData[] => [
@@ -263,69 +337,111 @@ const all = (b: Built): MeshData[] => [
 ];
 const triangleCount = (b: Built) => all(b).reduce((n, m) => n + m.count / 3, 0);
 
-type Bounds = [number, number, number, number, number, number];
-function boundsOf(points: readonly V3[]): Bounds {
-  const b: Bounds = [
-    Infinity,
-    -Infinity,
-    Infinity,
-    -Infinity,
-    Infinity,
-    -Infinity,
-  ];
-  for (const p of points) {
-    b[0] = Math.min(b[0], p[0]);
-    b[1] = Math.max(b[1], p[0]);
-    b[2] = Math.min(b[2], p[1]);
-    b[3] = Math.max(b[3], p[1]);
-    b[4] = Math.min(b[4], p[2]);
-    b[5] = Math.max(b[5], p[2]);
-  }
-  return b;
+/** Every mover's parts moved to where the door is fully open. */
+function opened(b: Built): { mover: Mover; points: V3[] }[] {
+  return b.movers.map((mover, i) => ({
+    mover,
+    points: (b.moverParts[i] ?? []).flatMap((p) =>
+      p.points.map((q) => add(q, scale(mover.axis, mover.travel))),
+    ),
+  }));
 }
-const TOUCH = 2e-3;
-const touches = (p: Bounds, q: Bounds) =>
-  p[0] <= q[1] + TOUCH &&
-  q[0] <= p[1] + TOUCH &&
-  p[2] <= q[3] + TOUCH &&
-  q[2] <= p[3] + TOUCH &&
-  p[4] <= q[5] + TOUCH &&
-  q[4] <= p[5] + TOUCH;
+
+/** The closest point on triangle `a b c` to `p` (Ericson's method). */
+function closestOnTriangle(p: V3, a: V3, b: V3, c: V3): V3 {
+  const ab = sub(b, a);
+  const ac = sub(c, a);
+  const ap = sub(p, a);
+  const d1 = dot(ab, ap);
+  const d2 = dot(ac, ap);
+  if (d1 <= 0 && d2 <= 0) return a;
+  const bp = sub(p, b);
+  const d3 = dot(ab, bp);
+  const d4 = dot(ac, bp);
+  if (d3 >= 0 && d4 <= d3) return b;
+  const vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) return add(a, scale(ab, d1 / (d1 - d3)));
+  const cp = sub(p, c);
+  const d5 = dot(ab, cp);
+  const d6 = dot(ac, cp);
+  if (d6 >= 0 && d5 <= d6) return c;
+  const vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) return add(a, scale(ac, d2 / (d2 - d6)));
+  const va = d3 * d6 - d5 * d4;
+  if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+    return add(b, scale(sub(c, b), (d4 - d3) / (d4 - d3 + (d5 - d6))));
+  }
+  const denom = 1 / (va + vb + vc);
+  return add(a, add(scale(ab, vb * denom), scale(ac, vc * denom)));
+}
+
+/** How close two parts must come to count as touching, in metres. */
+const CONTACT = 0.03;
+
+/** A part's points with their bounds, measured once. */
+interface Shape {
+  points: readonly V3[];
+  lo: V3;
+  hi: V3;
+}
+
+function shape(points: readonly V3[]): Shape {
+  const lo: V3 = [Infinity, Infinity, Infinity];
+  const hi: V3 = [-Infinity, -Infinity, -Infinity];
+  for (const p of points) {
+    for (const k of [0, 1, 2] as const) {
+      lo[k] = Math.min(lo[k], p[k]);
+      hi[k] = Math.max(hi[k], p[k]);
+    }
+  }
+  return { points, lo, hi };
+}
+
+/** Whether a point lies within `CONTACT` of a shape's bounds. */
+const nearBounds = (p: V3, s: Shape) =>
+  ([0, 1, 2] as const).every(
+    (k) => p[k] >= s.lo[k] - CONTACT && p[k] <= s.hi[k] + CONTACT,
+  );
+
+/** Whether any vertex of `from` lies within `CONTACT` of a triangle of `to`. */
+function reaches(from: Shape, to: Shape): boolean {
+  const near = from.points.filter((p) => nearBounds(p, to));
+  if (near.length === 0) return false;
+  const pts = to.points;
+  for (let t = 0; t + 2 < pts.length; t += 3) {
+    const [a, b, c] = [pts[t], pts[t + 1], pts[t + 2]];
+    if (!a || !b || !c) continue;
+    for (const p of near) {
+      const q = closestOnTriangle(p, a, b, c);
+      if (Math.hypot(...sub(p, q)) <= CONTACT) return true;
+    }
+  }
+  return false;
+}
 
 const GLOWING: readonly number[] = [FLAG.emissive, FLAG.frame, FLAG.portal];
 
 /**
- * Every glowing part is held: it touches a part that is not glowing, or
- * (for a wall fixture) the wall itself, or a glowing part that is held
- * (the portal surface in its glowing ring). Nothing glows in mid-air.
+ * Every glowing part is in contact with a lit host part (a vertex of one
+ * within `CONTACT` of a triangle of the other, either way round) or, for a
+ * wall fixture, with the wall plane. Mover parts count as hosts. Nothing
+ * glows in mid-air.
  */
 function floatingGlow(b: Built, wall: Frame | null): string[] {
-  const glow = b.parts
-    .map((p, i) => ({ i, p, box: boundsOf(p.points) }))
-    .filter(({ p }) => GLOWING.includes(p.flag) && p.points.length > 0);
-  const solid = b.parts
-    .filter((p) => !GLOWING.includes(p.flag))
-    .map((p) => boundsOf(p.points));
-  const held = new Set<number>();
-  for (const { i, p, box } of glow) {
-    const onWall =
-      wall !== null &&
-      Math.min(...p.points.map((q) => toLocal(wall, q)[1])) < 0.035;
-    if (onWall || solid.some((s) => touches(box, s))) held.add(i);
-  }
-  for (let grew = true; grew;) {
-    grew = false;
-    for (const { i, box } of glow) {
-      if (held.has(i)) continue;
-      if (glow.some((g) => held.has(g.i) && touches(box, g.box))) {
-        held.add(i);
-        grew = true;
-      }
-    }
-  }
-  return glow
-    .filter(({ i }) => !held.has(i))
-    .map(({ i, p }) => `${i}:${p.method}`);
+  const every = [...b.parts, ...b.moverParts.flat()];
+  const hosts = every
+    .filter((p) => !GLOWING.includes(p.flag) && p.points.length > 0)
+    .map((p) => shape(p.points));
+  return every
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => GLOWING.includes(p.flag) && p.points.length > 0)
+    .filter(({ p }) => {
+      if (wall && p.points.some((q) => toLocal(wall, q)[1] <= CONTACT))
+        return false;
+      const glow = shape(p.points);
+      return !hosts.some((h) => reaches(glow, h) || reaches(h, glow));
+    })
+    .map(({ p, i }) => `${i}:${p.method}`);
 }
 
 describe("fixture models", () => {
@@ -337,14 +453,14 @@ describe("fixture models", () => {
     for (const [name, fx] of fixtures(slot)) {
       describe(`${name} on the ${side} wall`, () => {
         const built = buildOne(fx);
+        const own = footprintOf(fx);
+        const inside = (p: V3) =>
+          inBox(band, p) || (own !== null && inBox(own, p));
 
         it("stays inside its footprint and the wall band, under the ceiling", () => {
-          const own = footprintOf(fx);
           for (const m of all(built)) {
             for (const p of positions(m)) {
-              expect(inBox(band, p) || (own !== null && inBox(own, p))).toBe(
-                true,
-              );
+              expect(inside(p)).toBe(true);
               expect(p[1]).toBeGreaterThanOrEqual(-EPS);
               expect(p[1]).toBeLessThanOrEqual(CEILING - HEADROOM + EPS);
             }
@@ -360,18 +476,21 @@ describe("fixture models", () => {
         });
 
         it("stays under the triangle budget", () => {
-          const n = triangleCount(built);
-          expect(n).toBeLessThan(4000);
+          expect(triangleCount(built)).toBeLessThan(4000);
         });
 
         it("glows only on or in its body", () => {
           expect(floatingGlow(built, wall)).toEqual([]);
         });
 
+        it("asks for its own text key", () => {
+          expect(built.keys).toEqual([KEY_OF[fx.kind]]);
+        });
+
         it("returns movers only for an open door", () => {
           const { movers } = built;
           for (const m of movers) {
-            expect(m.key).toBe("door:7");
+            expect(m.key).toBe(`door:${INDEX}`);
             expect(Math.hypot(...m.axis)).toBeCloseTo(1, 9);
           }
           if (fx.kind !== "door" || fx.address === null) {
@@ -382,7 +501,10 @@ describe("fixture models", () => {
           switch (fx.style) {
             case "sliding":
               expect(movers).toHaveLength(2);
-              expect(movers.map((m) => m.travel)).toEqual([0.8, 0.8]);
+              expect(movers.map((m) => m.travel)).toEqual([
+                SLIDE_TRAVEL,
+                SLIDE_TRAVEL,
+              ]);
               expect(axes.map((a) => dot(a, wall.along)).sort()).toEqual([
                 -1, 1,
               ]);
@@ -390,15 +512,54 @@ describe("fixture models", () => {
             case "bulkhead":
               expect(movers).toHaveLength(1);
               expect(axes[0]).toEqual([0, 1, 0]);
-              expect(movers[0]?.travel).toBe(2.3);
+              expect(movers[0]?.travel).toBeGreaterThan(0);
+              expect(movers[0]?.travel).toBeLessThanOrEqual(BULKHEAD_TRAVEL);
               break;
             case "blast":
               expect(movers).toHaveLength(2);
-              expect(axes.map((a) => a[1]).sort()).toEqual([-1, 1]);
-              expect(movers.map((m) => m.travel)).toEqual([1.3, 1.3]);
+              expect(axes.map((a) => a[1])).toEqual([1, -1]);
+              expect(movers.map((m) => m.travel)).toEqual([
+                BLAST_UP_TRAVEL,
+                BLAST_DOWN_TRAVEL,
+              ]);
               break;
           }
         });
+
+        if (fx.kind === "door" && fx.address !== null) {
+          for (const ceiling of [CEILING, HIGH_CEILING]) {
+            it(`opens cleanly under a ${ceiling} m ceiling`, () => {
+              const b = ceiling === CEILING ? built : buildOne(fx, ceiling);
+              const label = b.parts.find((p) => p.layer === LABEL_LAYER);
+              if (!label) throw new Error("no label");
+              const lab = label.points.map((q) => toLocal(wall, q));
+              const [la0, la1] = [
+                Math.min(...lab.map((q) => q[0])),
+                Math.max(...lab.map((q) => q[0])),
+              ];
+              const [lh0, lh1] = [
+                Math.min(...lab.map((q) => q[2])),
+                Math.max(...lab.map((q) => q[2])),
+              ];
+              const labelD = Math.min(...lab.map((q) => q[1]));
+              for (const { mover, points } of opened(b)) {
+                for (const p of points) {
+                  expect(inside(p)).toBe(true);
+                  expect(p[1]).toBeLessThanOrEqual(ceiling - HEADROOM + EPS);
+                  // Only a leaf sinking into the floor goes below it.
+                  if (mover.axis[1] >= 0)
+                    expect(p[1]).toBeGreaterThanOrEqual(-EPS);
+                  const [a, d, h] = toLocal(wall, p);
+                  // Behind the housing front, and never over the label.
+                  if (fx.style !== "sliding")
+                    expect(d).toBeLessThan(HOUSING_DEPTH);
+                  if (a > la0 && a < la1 && h > lh0 && h < lh1)
+                    expect(d).toBeLessThan(labelD);
+                }
+              }
+            });
+          }
+        }
       });
     }
   }
@@ -435,12 +596,15 @@ describe("decor models", () => {
         });
 
         it("stays under the triangle budget", () => {
-          const n = triangleCount(built);
-          expect(n).toBeLessThan(4000);
+          expect(triangleCount(built)).toBeLessThan(4000);
         });
 
         it("glows only on or in its body", () => {
           expect(floatingGlow(built, null)).toEqual([]);
+        });
+
+        it("asks for no text", () => {
+          expect(built.keys).toEqual([]);
         });
       });
     }
@@ -457,10 +621,10 @@ describe("decor models", () => {
 
   it("hangs pipe runs under a higher ceiling too", () => {
     const d: Decor = { kind: "pipe-run", x: 4.5, y: 3, turn: 0, seed: 1 };
-    const built = buildOneDecor(d, { ...CTX, ceiling: 5 });
+    const built = buildOneDecor(d, HIGH_CEILING);
     for (const p of positions(built.static)) {
-      expect(p[1]).toBeGreaterThan(5 - PIPE_DROP - 0.2);
-      expect(p[1]).toBeLessThanOrEqual(5 - HEADROOM + EPS);
+      expect(p[1]).toBeGreaterThan(HIGH_CEILING - PIPE_DROP - 0.2);
+      expect(p[1]).toBeLessThanOrEqual(HIGH_CEILING - HEADROOM + EPS);
     }
   });
 });
@@ -474,30 +638,10 @@ describe("text rows", () => {
     const vs: number[] = [];
     for (let i = 0; i < m.count; i++) {
       const o = i * FLOATS_PER_VERTEX;
-      if (m.vertices[o + 8] === 12) vs.push(m.vertices[o + 7] ?? NaN);
+      if (m.vertices[o + 8] === LABEL_LAYER) vs.push(m.vertices[o + 7] ?? NaN);
     }
     expect(vs.length).toBe(6);
     expect(Math.min(...vs)).toBeCloseTo(2 / 6, 6);
     expect(Math.max(...vs)).toBeCloseTo(3 / 6, 6);
-  });
-
-  it("prints the per-model triangle counts", () => {
-    // Every fixture on a north wall and every decor at turn 0, for the report.
-    const counts = [
-      ...fixtures(slotOn("n")).map(
-        ([name, fx]) => [name, triangleCount(buildOne(fx))] as const,
-      ),
-      ...DECOR_KINDS.map(
-        (kind) =>
-          [
-            kind,
-            triangleCount(
-              buildOneDecor({ kind, x: 4.5, y: 3, turn: 0, seed: 11 }),
-            ),
-          ] as const,
-      ),
-    ];
-    console.log(counts.map(([k, v]) => `${k}: ${v}`).join("\n"));
-    for (const [, n] of counts) expect(n).toBeLessThan(4000);
   });
 });

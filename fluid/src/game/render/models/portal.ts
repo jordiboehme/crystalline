@@ -4,7 +4,8 @@
  * A ring emitter stands on a cradle between two pylons, the pylons on a
  * base plinth and joined by a header bar that carries the label. Inside
  * the ring the portal surface shimmers in the portal colour (the cross
- * domain colour for a link into another domain), and the ring glows with
+ * domain colour for a link into another domain) in front of a dark back
+ * plate, and the ring glows with
  * a frame edge in the same colour. A sealed portal has a hazard plate
  * where the surface would be and a padlock-shaped block across it.
  */
@@ -13,7 +14,13 @@ import type { Fixture } from "../../world/types";
 import { FLAG, type Surface } from "../geometry";
 import { frameForSlot } from "../kit";
 import { LAYER } from "../layers";
-import { label, surfaces, type KitAt, type ModelContext } from "./common";
+import {
+  label,
+  shade,
+  surfaces,
+  type KitAt,
+  type ModelContext,
+} from "./common";
 
 type Portal = Extract<Fixture, { kind: "portal" }>;
 
@@ -96,6 +103,8 @@ export function buildPortal(
       return [Math.sin(t) * DISC_R, RING_H + Math.cos(t) * DISC_R];
     },
   );
+  // The emitter's dark back plate, which holds the surface in the ring.
+  k.extrude(disc, 0.02, RING_D - 0.01, s.tinted(shade(p.metal, 0.2)));
   if (fx.sealedLabel === null) {
     k.extrude(disc, RING_D - 0.01, RING_D + 0.01, {
       layer: LAYER.portal,

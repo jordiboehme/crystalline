@@ -22,7 +22,7 @@
  * budget.
  */
 
-import type { Decor, Fixture } from "../../world/types";
+import type { Fixture } from "../../world/types";
 import type { KitAt, ModelContext, Mover } from "./common";
 import { buildDoor } from "./doors";
 import { buildHatch } from "./hatch";
@@ -40,7 +40,13 @@ export {
   type TextSlot,
 } from "./common";
 export { PIPE_DROP, buildDecor, pipeLength } from "./decor";
-export { BLAST_TRAVEL, BULKHEAD_TRAVEL, SLIDE_TRAVEL } from "./doors";
+export {
+  BLAST_DOWN_TRAVEL,
+  BLAST_UP_TRAVEL,
+  BULKHEAD_TRAVEL,
+  HOUSING_DEPTH,
+  SLIDE_TRAVEL,
+} from "./doors";
 
 /**
  * Builds one fixture of a room: its static parts into the kits `kitAt`
@@ -79,6 +85,3 @@ export function buildFixture(
       return [];
   }
 }
-
-/** Re-exported so callers need one import for both entry points. */
-export type { Decor };
