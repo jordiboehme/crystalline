@@ -31,6 +31,13 @@ export interface Input {
   takeLook(): { dx: number; dy: number };
   /** Whether the pointer is locked to the target. */
   readonly locked: boolean;
+  /**
+   * Forgets every held key, every unconsumed press and the mouse movement
+   * gathered so far. The session calls it when an overlay that read the
+   * keys itself (the CRT reader) closes, so a key pressed for the overlay
+   * is not replayed as a command or a step once the game has the keys back.
+   */
+  clear(): void;
   /** Asks for pointer lock. Call from a user gesture (a click). */
   requestLock(): void;
   /** Removes every listener and releases the lock. */
@@ -101,6 +108,12 @@ export function createInput(
     },
     get locked() {
       return isLocked();
+    },
+    clear() {
+      down.clear();
+      edges.clear();
+      dx = 0;
+      dy = 0;
     },
     requestLock() {
       // `requestPointerLock` is feature-detected: jsdom and browsers without

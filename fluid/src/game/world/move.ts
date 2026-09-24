@@ -561,3 +561,14 @@ export function headBob(p: Player): number {
   const speed = Math.min(1, Math.hypot(p.vx, p.vz) / MAX_SPEED);
   return Math.sin(p.bob) * 0.045 * speed;
 }
+
+/**
+ * The vertical look handed to `stepPlayer`, after the player's choice of
+ * inverted look (key I): the mouse's and the arrow keys' `dy` as they came,
+ * or negated when inverted, so moving the mouse forward looks down instead
+ * of up. Kept apart from `stepPlayer` so the choice lives in one place and
+ * the session only passes a flag.
+ */
+export function lookDelta(dy: number, inverted: boolean): number {
+  return inverted ? -dy : dy;
+}

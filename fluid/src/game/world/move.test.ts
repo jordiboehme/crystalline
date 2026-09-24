@@ -14,6 +14,7 @@ import {
   decorFootprint,
   footprintOf,
   headBob,
+  lookDelta,
   scaffoldBoxes,
   spawnPlayer,
   stepPlayer,
@@ -604,5 +605,22 @@ describe("sliding around corners", () => {
     const p = runIn(hub, at(wall + 3, 3), { ...idle, strafe: -1 }, 60);
     expect(p.x).toBeCloseTo(wall + PLAYER_RADIUS, 6);
     expect(p.vx).toBeCloseTo(0, 6);
+  });
+});
+
+describe("lookDelta", () => {
+  it("passes the vertical look through, or negates it when inverted", () => {
+    expect(lookDelta(12, false)).toBe(12);
+    expect(lookDelta(-3, false)).toBe(-3);
+    expect(lookDelta(12, true)).toBe(-12);
+    expect(lookDelta(-3, true)).toBe(3);
+  });
+
+  it("turns the pitch the other way when inverted", () => {
+    const p = spawnPlayer(room);
+    const down = run(p, { ...idle, lookDy: lookDelta(40, false) }, 1);
+    const up = run(p, { ...idle, lookDy: lookDelta(40, true) }, 1);
+    expect(down.pitch).toBeLessThan(0);
+    expect(up.pitch).toBeGreaterThan(0);
   });
 });

@@ -1,277 +1,71 @@
 /**
- * The look demo's engine room: everything that is not React.
+ * The look demo's engine room: the session on the canned bridge.
  *
- * `startDemo` builds the canned bridge, makes a context, wires input,
- * movement, light specials and the renderer to the 35 Hz loop, and returns
- * the one function that undoes all of it. That function is the whole
- * contract with the React shell: StrictMode mounts, unmounts and mounts the
- * shell again in development, which is the only mode this demo exists in, so
- * a cleanup that missed a listener or a frame request would leave two
- * stations running on one canvas.
+ * `startDemo` starts a session with no query client, shows the canned
+ * bridge and returns the one function that undoes all of it. That function
+ * is the whole contract with the React shell: StrictMode mounts, unmounts
+ * and mounts the shell again in development, which is the only mode this
+ * demo exists in, so a cleanup that missed a listener or a frame request
+ * would leave two stations running on one canvas.
+ *
+ * Everything the game does in a room works here: the doors open, the
+ * terminals open the CRT reader, the keys are the game's. Only travel goes
+ * nowhere, since there is no client to load a place with: walking through a
+ * door says `SIGNAL LOST` and leaves the player on the bridge.
  *
  * Keys: 1, 2 and 4 pick the look, R toggles the retired condition (the
  * canned bridge is `stable`; retired shows it `archived`, the derelict end
  * of the scale), WASD walks, the arrows turn, the mouse looks once the
- * canvas is clicked.
+ * canvas is clicked, E uses what the player faces and I inverts the
+ * vertical look.
  */
 
-import { createInput } from "../core/input";
-import { createLoop } from "../core/loop";
-import { backbufferSize } from "../device";
-import { createContext } from "../gl/context";
-import { createLights, type LightState } from "../render/lights";
-import { LOOKS, lookForKey, type LookId } from "../render/looks";
-import { createRenderer, type Renderer } from "../render/renderer";
+import { createSession, type HudSink, type Session } from "../session";
 import { CANNED_BRIDGE } from "../world/canned";
-import { generateRoom } from "../world/generate";
-import {
-  EYE_HEIGHT,
-  blockersFor,
-  headBob,
-  spawnPlayer,
-  stepPlayer,
-  type Player,
-} from "../world/move";
-import type { RoomSpec } from "../world/types";
-
-/**
- * The demo's doors, all shut: the look demo has no interaction, so no door
- * ever opens and every mover draws at its closed position. The game proper
- * hands the renderer the live open fractions instead.
- */
-const CLOSED_DOORS: ReadonlyMap<string, number> = new Map();
-
-/**
- * Where the demo writes its heads-up text: the look, condition and mouse
- * hint (`status`), the frame time and the colour format of the render
- * targets (`frame`), and a centred notice over the canvas for a missing or
- * lost GPU (`notice`, null hides it). The React shell writes these straight
- * into the DOM, so calling them every quarter second costs no render.
- */
-export interface DemoHud {
-  status(text: string): void;
-  frame(text: string): void;
-  notice(text: string | null): void;
-}
 
 /** The status R switches to. */
 const RETIRED_STATUS = "archived";
 
 /**
- * Starts the look demo on `canvas` and returns its cleanup.
+ * Starts the look demo on `canvas` and returns its cleanup and the session,
+ * which the shell needs to close the CRT reader.
  *
  * `options.forceRgba8` skips the half-float probe, so the RGBA8 bloom path
- * Safari takes can be judged on any browser. When the canvas gives no
- * context the notice says so and nothing runs; when the GPU drops the
- * context the loop stops, and it starts again on a fresh renderer when the
- * browser restores it. The cleanup stops the loop, removes every listener
- * and frees the renderer's GPU objects, but leaves the context itself alone:
- * StrictMode's second mount asks the same canvas for its context and must
- * get a live one back.
+ * Safari takes can be judged on any browser. `options.openFluid` is where F
+ * sends the engram's Fluid page. R shows the same bridge again with its
+ * status swapped, which keeps the player where they stand.
  */
 export function startDemo(
   canvas: HTMLCanvasElement,
-  hud: DemoHud,
-  options: { forceRgba8: boolean },
-): () => void {
-  let lookId: LookId = "aperture";
+  hud: HudSink,
+  options: { forceRgba8: boolean; openFluid: (path: string) => void },
+): { session: Session; stop: () => void } {
   let retired = false;
-  let room: RoomSpec = generateRoom(CANNED_BRIDGE);
-  let blockers = blockersFor(room);
-  let lights: LightState = createLights(room.lights);
-  let player: Player = spawnPlayer(room);
-  let previous: Player = player;
-  let renderer: Renderer | null = null;
-  let colorFormat = "";
-  let frameSum = 0;
-  let frameCount = 0;
-  let lastReport = performance.now();
-  const started = performance.now();
+  const session = createSession({
+    canvas,
+    client: null,
+    hud,
+    navigate: () => {},
+    openFluid: options.openFluid,
+    forceRgba8: options.forceRgba8,
+  });
+  session.showCanned(CANNED_BRIDGE);
 
-  const input = createInput(canvas);
-  const onClick = () => input.requestLock();
-  canvas.addEventListener("click", onClick);
-
-  const showStatus = () => {
-    hud.status(
-      `${LOOKS[lookId].name.toUpperCase()}  |  ${room.condition.toUpperCase()}  |  ${
-        input.locked ? "ESC RELEASES THE MOUSE" : "CLICK TO LOOK AROUND"
-      }`,
-    );
-  };
-
-  const rebuildRoom = () => {
-    room = generateRoom({
+  const onKey = (event: KeyboardEvent) => {
+    if (event.code !== "KeyR" || event.repeat) return;
+    retired = !retired;
+    session.showCanned({
       ...CANNED_BRIDGE,
       status: retired ? RETIRED_STATUS : CANNED_BRIDGE.status,
     });
-    blockers = blockersFor(room);
-    lights = createLights(room.lights);
-    renderer?.setRoom(room, LOOKS[lookId]);
-    showStatus();
   };
+  window.addEventListener("keydown", onKey);
 
-  // Sizes the backbuffer to the canvas's CSS size times the pixel ratio and
-  // says whether it changed. `resize` rebuilds the renderer's targets only
-  // then: the ResizeObserver fires once right after `observe` with the size
-  // `boot` already set, and a rebuild for nothing would cost every target.
-  const sizeCanvas = (): boolean => {
-    const { width, height } = backbufferSize(
-      canvas.clientWidth,
-      canvas.clientHeight,
-      window.devicePixelRatio,
-      1,
-    );
-    if (canvas.width === width && canvas.height === height) return false;
-    canvas.width = width;
-    canvas.height = height;
-    return true;
-  };
-
-  const resize = () => {
-    if (sizeCanvas()) renderer?.resize(canvas.width, canvas.height);
-  };
-
-  // Dragging the window between a Retina and a 1x display changes only the
-  // pixel ratio, which the ResizeObserver does not see. A resolution query
-  // for the current ratio fires once when that ratio stops matching; the
-  // listener resizes and re-arms itself on a query for the new ratio.
-  let ratioQuery: MediaQueryList | null = null;
-  const onRatioChange = () => {
-    resize();
-    watchRatio();
-  };
-  const watchRatio = () => {
-    ratioQuery?.removeEventListener("change", onRatioChange);
-    ratioQuery = window.matchMedia(
-      `(resolution: ${window.devicePixelRatio}dppx)`,
-    );
-    ratioQuery.addEventListener("change", onRatioChange);
-  };
-
-  // A context that exists can still refuse the renderer (a render target
-  // that cannot be created during a failed restore throws), so a throw is
-  // shown as the same notice as a missing context and the loop stays
-  // stopped, with whatever the renderer did build freed again. A fresh
-  // renderer has no targets yet, so its resize runs unconditionally here,
-  // after the canvas is sized, even when the size did not change.
-  const boot = (): boolean => {
-    const context = createContext(canvas, options);
-    if (context === null) {
-      hud.notice("?DEVICE NOT PRESENT ERROR");
-      return false;
-    }
-    try {
-      renderer = createRenderer(context.gl, context.caps);
-      renderer.setRoom(room, LOOKS[lookId]);
-      sizeCanvas();
-      renderer.resize(canvas.width, canvas.height);
-    } catch {
-      renderer?.dispose();
-      renderer = null;
-      hud.notice("?DEVICE NOT PRESENT ERROR");
-      return false;
-    }
-    hud.notice(null);
-    colorFormat = context.caps.color.toUpperCase();
-    hud.frame(colorFormat);
-    return true;
-  };
-
-  const loop = createLoop({
-    tick() {
-      for (const code of ["Digit1", "Digit2", "Digit4"]) {
-        if (input.pressed(code)) {
-          const next = lookForKey(code);
-          if (next !== null && next !== lookId) {
-            lookId = next;
-            renderer?.setRoom(room, LOOKS[lookId]);
-            showStatus();
-          }
-        }
-      }
-      if (input.pressed("KeyR")) {
-        retired = !retired;
-        rebuildRoom();
-      }
-      const axis = (plus: string, minus: string) =>
-        (input.held(plus) ? 1 : 0) - (input.held(minus) ? 1 : 0);
-      const look = input.takeLook();
-      previous = player;
-      player = stepPlayer(
-        player,
-        {
-          forward: axis("KeyW", "KeyS"),
-          strafe: axis("KeyD", "KeyA"),
-          turn: axis("ArrowLeft", "ArrowRight"),
-          lookDx: look.dx,
-          lookDy: look.dy + axis("ArrowDown", "ArrowUp") * 12,
-        },
-        room,
-        blockers,
-      );
-      lights.tick();
+  return {
+    session,
+    stop: () => {
+      window.removeEventListener("keydown", onKey);
+      session.dispose();
     },
-    render(alpha, frameMs) {
-      frameSum += frameMs;
-      frameCount++;
-      const now = performance.now();
-      if (now - lastReport > 250) {
-        const ms = frameSum / frameCount;
-        hud.frame(
-          `${colorFormat}  ${ms.toFixed(1)} MS  ${Math.round(1000 / ms)} FPS`,
-        );
-        frameSum = 0;
-        frameCount = 0;
-        lastReport = now;
-        showStatus();
-      }
-      const lerp = (a: number, b: number) => a + (b - a) * alpha;
-      renderer?.draw(
-        {
-          eye: [
-            lerp(previous.x, player.x),
-            EYE_HEIGHT + headBob(player),
-            lerp(previous.z, player.z),
-          ],
-          yaw: lerp(previous.yaw, player.yaw),
-          pitch: lerp(previous.pitch, player.pitch),
-        },
-        lights.levels,
-        (now - started) / 1000,
-        CLOSED_DOORS,
-      );
-    },
-  });
-
-  const observer = new ResizeObserver(resize);
-  observer.observe(canvas);
-  watchRatio();
-  const onLost = (e: Event) => {
-    e.preventDefault();
-    loop.stop();
-    renderer = null;
-    hud.notice("SIGNAL LOST - WAITING FOR THE GPU");
-  };
-  const onRestored = () => {
-    if (boot()) loop.start();
-  };
-  canvas.addEventListener("webglcontextlost", onLost);
-  canvas.addEventListener("webglcontextrestored", onRestored);
-
-  if (boot()) loop.start();
-  showStatus();
-
-  return () => {
-    loop.stop();
-    observer.disconnect();
-    ratioQuery?.removeEventListener("change", onRatioChange);
-    ratioQuery = null;
-    canvas.removeEventListener("click", onClick);
-    canvas.removeEventListener("webglcontextlost", onLost);
-    canvas.removeEventListener("webglcontextrestored", onRestored);
-    input.dispose();
-    renderer?.dispose();
-    renderer = null;
   };
 }

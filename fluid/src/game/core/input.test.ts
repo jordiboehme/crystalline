@@ -67,4 +67,13 @@ describe("createInput", () => {
     expect(() => input?.requestLock()).not.toThrow();
     expect(input.locked).toBe(false);
   });
+
+  it("forgets held keys and unconsumed presses on clear", () => {
+    input = createInput(document.createElement("canvas"));
+    key("keydown", "KeyW");
+    key("keydown", "KeyF");
+    input.clear();
+    expect(input.held("KeyW")).toBe(false);
+    expect(input.pressed("KeyF")).toBe(false);
+  });
 });
