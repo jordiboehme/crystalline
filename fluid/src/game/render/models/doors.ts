@@ -4,9 +4,9 @@
  * - A sliding door (salience 0 to 3) is two light leaves that part
  *   sideways into wide jambs, with seams in the look's door colour and a
  *   track in the floor.
- * - A bulkhead (4 to 6) is one heavy leaf that rises into a door-head
- *   housing, in a thick bevelled frame over a hazard-striped sill, with a
- *   handwheel.
+ * - A bulkhead (4 to 6) is two heavy leaves with hazard-striped leading
+ *   edges that part sideways into bevelled side housings, over a
+ *   hazard-striped sill, with a handwheel on the left leaf.
  * - A blast door (7 to 10) is two thick halves with chevron faces, the
  *   upper one rising into a door-head housing and the lower one sinking
  *   into the floor, in a massive frame lined with a neon border.
@@ -45,12 +45,11 @@ type Door = Extract<Fixture, { kind: "door" }>;
  */
 export const SLIDE_TRAVEL = 0.5;
 /**
- * How far a bulkhead leaf rises when there is room: its height and a
- * little more, so it clears the opening and parks inside the housing.
- * Under a low ceiling the travel is clamped to what the housing holds (see
- * `riseUnder`), and the bulkhead opens only part of the way.
+ * How far each bulkhead leaf slides sideways, in metres: its own width,
+ * so a parked leaf sits wholly inside its side housing and the door opens
+ * fully under any ceiling.
  */
-export const BULKHEAD_TRAVEL = 2.04;
+export const BULKHEAD_TRAVEL = 0.5;
 /**
  * How far the upper half of a blast door rises into its housing: its
  * height and a little more. It fits under the lowest ceiling (3.0 m).
@@ -62,8 +61,9 @@ export const BLAST_UP_TRAVEL = 0.75;
  */
 export const BLAST_DOWN_TRAVEL = 1.49;
 /**
- * How far a door-head housing stands out from the wall. Rising leaves
- * pass behind its front face, and the door's label sits on it.
+ * How far a door housing stands out from the wall: the blast door's head
+ * housing and the bulkhead's side and lintel housings. Moving leaves pass
+ * behind its front face, and the door's label sits on it.
  */
 export const HOUSING_DEPTH = 0.29;
 
@@ -186,8 +186,13 @@ function housing(
 /** The sliding door's opening: half width and height. */
 const SLIDE_HALF = 0.5;
 const SLIDE_TOP = 2.4;
-/** Each leaf's width: a hair under the opening's half, so no face meets the jamb's. */
-const SLIDE_LEAF = SLIDE_HALF - 0.01;
+/**
+ * The gap each leaf keeps from the door's centre line, in metres. A leaf
+ * runs from `LEAF_GAP` to its half of the opening less `LEAF_GAP`, so
+ * after sliding its own half width it stops just inside the jamb or
+ * housing and no leaf face ever lies in the plane of a jamb face.
+ */
+const LEAF_GAP = 0.005;
 /** The jambs' outer edge (the slot's edge), the frame depth and the lintel. */
 const SLIDE_JAMB = 1.0;
 const SLIDE_FRAME_D = 0.12;
@@ -227,7 +232,10 @@ function sliding(st: Style) {
 
   const leaf = s.tinted(p.door, LAYER.metal);
   for (const dir of [-1, 1] as const) {
-    const [a0, a1] = dir < 0 ? [-SLIDE_LEAF, 0] : [0, SLIDE_LEAF];
+    const [a0, a1] =
+      dir < 0
+        ? [-SLIDE_HALF + LEAF_GAP, -LEAF_GAP]
+        : [LEAF_GAP, SLIDE_HALF - LEAF_GAP];
     out.add(dir < 0 ? neg(f.along) : [...f.along], SLIDE_TRAVEL, (m) => {
       m.bevelBox(a0, a1, SLIDE_D0, SLIDE_D1, 0.02, SLIDE_TOP, 0.012, leaf);
       // A window slot, a kick plate and the pull recess by the meeting edge.
@@ -268,100 +276,120 @@ function sliding(st: Style) {
 }
 
 /** The bulkhead's opening: half width, sill height and top. */
-const BULK_HALF = 0.7;
+const BULK_HALF = 0.5;
 const BULK_SILL = 0.18;
 const BULK_TOP = 2.2;
-/** How far the leaf reaches past the opening each side, into the jambs. */
-const BULK_LAP = 0.02;
-/** The thick frame's outer half width and depth. */
-const BULK_JAMB = 0.98;
-const BULK_FRAME_D = 0.26;
-/** The leaf's depth range. */
+/** The side housings' outer edge (the slot's edge) and the lintel's top. */
+const BULK_JAMB = 1.0;
+const BULK_LINTEL = 2.6;
+/** The leaves' depth range, inside the housings'. */
 const BULK_D0 = 0.1;
 const BULK_D1 = 0.2;
-/** The handwheel's height, radius and depth. */
+/** The hazard-striped leading edge on each leaf: its width and depth. */
+const EDGE = 0.07;
+const EDGE_D = 0.01;
+/** The handwheel on the left leaf: centre along, height, radius, depth. */
+const WHEEL_A = -BULK_HALF / 2;
 const WHEEL_H = 1.25;
-const WHEEL_R = 0.2;
+const WHEEL_R = 0.18;
 const WHEEL_D = 0.26;
+/** The label on the lintel housing: half width and margin. */
+const BULK_LABEL_HALF = 0.85;
+const BULK_LABEL_MARGIN = 0.05;
 
 /**
- * The bulkhead: one heavy leaf with stiffening ribs and a handwheel that
- * rises into the door-head housing over the opening, in a thick bevelled
- * frame that glows at its edges, over a hazard-striped sill. The housing
- * reaches up to where the leaf parks, or the ceiling less `HEADROOM`,
- * whichever is lower, and carries the label.
+ * The bulkhead: the heavy counterpart of the sliding door. Two thick
+ * leaves with stiffening ribs and hazard-striped leading edges part
+ * sideways by their own width into bevelled side housings that stand out
+ * to `HOUSING_DEPTH`, so the door opens fully under any ceiling. A
+ * handwheel sits on the left leaf, the sill is hazard striped and the
+ * label sits on the lintel housing, in front of the leaves' path. The
+ * side housings glow at their edges in the door colour; the lintel is
+ * plain, so the label reads on it.
  */
 function bulkhead(st: Style) {
-  const { k, out, s, ctx, sealed } = st;
+  const { k, f, out, s, ctx, sealed, key } = st;
   const p = ctx.look.palette;
   const frame: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.frame };
-  const [j, t] = [BULK_JAMB, BULK_FRAME_D];
-  const travel = riseUnder(ctx, BULK_TOP, BULKHEAD_TRAVEL);
-  recess(k, BULK_HALF, BULK_SILL, BULK_TOP);
-  k.bevelBox(-j, -BULK_HALF, 0, t, 0, BULK_TOP, 0.04, frame);
-  k.bevelBox(BULK_HALF, j, 0, t, 0, BULK_TOP, 0.04, frame);
-  housing(st, j, BULK_TOP, BULK_TOP + travel, s.body);
-  // The hazard-striped sill, with a dark step plate on it.
-  k.box(-BULK_HALF, BULK_HALF, 0, t, 0, BULK_SILL, s.hazard);
-  k.box(
-    -BULK_HALF,
-    BULK_HALF,
-    t - 0.06,
-    t,
-    BULK_SILL,
-    BULK_SILL + 0.01,
-    s.dark,
+  const [w, j, t] = [BULK_HALF, BULK_JAMB, HOUSING_DEPTH];
+  recess(k, w, BULK_SILL, BULK_TOP);
+  // The side housings, the lintel housing and the label on its face.
+  k.bevelBox(-j, -w, 0, t, 0, BULK_TOP, 0.04, frame);
+  k.bevelBox(w, j, 0, t, 0, BULK_TOP, 0.04, frame);
+  k.bevelBox(-j, j, 0, t, BULK_TOP, BULK_LINTEL, 0.04, s.body);
+  const h0 = BULK_TOP + BULK_LABEL_MARGIN;
+  const h1 = Math.min(
+    h0 + (2 * BULK_LABEL_HALF) / ASPECT.label,
+    BULK_LINTEL - BULK_LABEL_MARGIN,
   );
+  textPanel(k, ctx, key, -BULK_LABEL_HALF, BULK_LABEL_HALF, t + 0.001, h0, h1, {
+    tint: [1, 1, 1],
+    flag: FLAG.emissive,
+  });
+  // The hazard-striped sill, with a dark step plate on it.
+  k.box(-w, w, 0, t, 0, BULK_SILL, s.hazard);
+  k.box(-w, w, t - 0.06, t, BULK_SILL, BULK_SILL + 0.01, s.dark);
 
   const plate = s.tinted(shade(p.metal, 0.85), LAYER.metal);
-  const lap = BULK_HALF + BULK_LAP;
-  out.add(UP, travel, (m) => {
-    m.bevelBox(-lap, lap, BULK_D0, BULK_D1, BULK_SILL, BULK_TOP, 0.03, plate);
-    // Two stiffening ribs, then the handwheel: hub, spokes and rim.
-    for (const h of [0.45, 1.8]) {
+  for (const dir of [-1, 1] as const) {
+    const [a0, a1] =
+      dir < 0
+        ? [-BULK_HALF + LEAF_GAP, -LEAF_GAP]
+        : [LEAF_GAP, BULK_HALF - LEAF_GAP];
+    const [e0, e1] = dir < 0 ? [a1 - EDGE, a1] : [a0, a0 + EDGE];
+    out.add(dir < 0 ? neg(f.along) : [...f.along], BULKHEAD_TRAVEL, (m) => {
+      m.bevelBox(a0, a1, BULK_D0, BULK_D1, BULK_SILL, BULK_TOP, 0.02, plate);
+      m.box(e0, e1, BULK_D1, BULK_D1 + EDGE_D, BULK_SILL, BULK_TOP, s.hazard);
+      // Two stiffening ribs across the leaf.
+      const [r0, r1] = dir < 0 ? [a0 + 0.04, e0] : [e1, a1 - 0.04];
+      for (const h of [0.45, 1.8]) {
+        m.bevelBox(r0, r1, BULK_D1, BULK_D1 + 0.03, h, h + 0.1, 0.01, s.metal);
+      }
+      if (dir > 0) return;
+      // The handwheel: hub, spokes and rim.
+      const [wa, wh, wr] = [WHEEL_A, WHEEL_H, WHEEL_R];
       m.bevelBox(
-        -BULK_HALF + 0.05,
-        BULK_HALF - 0.05,
+        wa - 0.05,
+        wa + 0.05,
         BULK_D1,
-        BULK_D1 + 0.03,
-        h,
-        h + 0.1,
+        WHEEL_D + 0.02,
+        wh - 0.05,
+        wh + 0.05,
         0.01,
+        s.dark,
+      );
+      m.box(
+        wa - wr,
+        wa + wr,
+        WHEEL_D - 0.01,
+        WHEEL_D + 0.01,
+        wh - 0.012,
+        wh + 0.012,
         s.metal,
       );
-    }
-    m.bevelBox(
-      -0.05,
-      0.05,
-      BULK_D1,
-      WHEEL_D + 0.02,
-      WHEEL_H - 0.05,
-      WHEEL_H + 0.05,
-      0.01,
-      s.dark,
-    );
-    m.box(
-      -WHEEL_R,
-      WHEEL_R,
-      WHEEL_D - 0.01,
-      WHEEL_D + 0.01,
-      WHEEL_H - 0.012,
-      WHEEL_H + 0.012,
-      s.metal,
-    );
-    m.box(
-      -0.012,
-      0.012,
-      WHEEL_D - 0.01,
-      WHEEL_D + 0.01,
-      WHEEL_H - WHEEL_R,
-      WHEEL_H + WHEEL_R,
-      s.metal,
-    );
-    m.ring(0, WHEEL_D, WHEEL_H, WHEEL_R, 0.02, 6, 20, s.metal, "inward");
-  });
+      m.box(
+        wa - 0.012,
+        wa + 0.012,
+        WHEEL_D - 0.01,
+        WHEEL_D + 0.01,
+        wh - wr,
+        wh + wr,
+        s.metal,
+      );
+      m.ring(wa, WHEEL_D, wh, wr, 0.02, 6, 20, s.metal, "inward");
+    });
+  }
   if (sealed) {
-    k.panel(-0.6, 0.6, BULK_D1 + 0.001, 0.62, 0.98, s.hazard, 1.2, 0.36);
+    k.panel(
+      -0.4,
+      0.4,
+      BULK_D1 + EDGE_D + 0.002,
+      0.62,
+      0.98,
+      s.hazard,
+      0.8,
+      0.36,
+    );
   }
 }
 

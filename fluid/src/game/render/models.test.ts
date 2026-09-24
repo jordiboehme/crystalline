@@ -136,6 +136,13 @@ const slotOn = (side: Side): WallSlot => ({ x: 3, y: 4, side });
 
 const ADDRESS = { domain: "d", permalink: "p" };
 
+/** Each door style's clear opening: half width and height range. */
+const OPENING: Record<DoorStyle, { half: number; h0: number; h1: number }> = {
+  sliding: { half: 0.5, h0: 0.02, h1: 2.4 },
+  bulkhead: { half: 0.5, h0: 0.18, h1: 2.2 },
+  blast: { half: 0.8, h0: 0, h1: 2.2 },
+};
+
 /** The index every fixture is built at, which names its keys. */
 const INDEX = 7;
 
@@ -510,10 +517,14 @@ describe("fixture models", () => {
               ]);
               break;
             case "bulkhead":
-              expect(movers).toHaveLength(1);
-              expect(axes[0]).toEqual([0, 1, 0]);
-              expect(movers[0]?.travel).toBeGreaterThan(0);
-              expect(movers[0]?.travel).toBeLessThanOrEqual(BULKHEAD_TRAVEL);
+              expect(movers).toHaveLength(2);
+              expect(movers.map((m) => m.travel)).toEqual([
+                BULKHEAD_TRAVEL,
+                BULKHEAD_TRAVEL,
+              ]);
+              expect(axes.map((a) => dot(a, wall.along)).sort()).toEqual([
+                -1, 1,
+              ]);
               break;
             case "blast":
               expect(movers).toHaveLength(2);
@@ -528,7 +539,7 @@ describe("fixture models", () => {
 
         if (fx.kind === "door" && fx.address !== null) {
           for (const ceiling of [CEILING, HIGH_CEILING]) {
-            it(`opens cleanly under a ${ceiling} m ceiling`, () => {
+            it(`opens fully and cleanly under a ${ceiling} m ceiling`, () => {
               const b = ceiling === CEILING ? built : buildOne(fx, ceiling);
               const label = b.parts.find((p) => p.layer === LABEL_LAYER);
               if (!label) throw new Error("no label");
@@ -555,6 +566,13 @@ describe("fixture models", () => {
                     expect(d).toBeLessThan(HOUSING_DEPTH);
                   if (a > la0 && a < la1 && h > lh0 && h < lh1)
                     expect(d).toBeLessThan(labelD);
+                  // Nothing is left standing in the opening.
+                  const o = OPENING[fx.style];
+                  expect(
+                    Math.abs(a) < o.half - EPS &&
+                      h > o.h0 + EPS &&
+                      h < o.h1 - EPS,
+                  ).toBe(false);
                 }
               }
             });
