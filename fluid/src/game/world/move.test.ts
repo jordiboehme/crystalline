@@ -1,17 +1,26 @@
 import { describe, expect, it } from "vitest";
 
-import { CANNED_BRIDGE } from "./canned";
+import { createRng } from "../core/seed";
+import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
 import { CELL, generateRoom } from "./generate";
+import { isFloor } from "./layout";
 import {
+  FIXTURE_DEPTH,
+  FIXTURE_WIDTH,
+  FOOTPRINTS,
   MAX_PITCH,
   PLAYER_RADIUS,
   blockersFor,
-  footprint,
+  decorFootprint,
+  footprintOf,
+  scaffoldBoxes,
   spawnPlayer,
   stepPlayer,
+  type Box,
   type Intent,
   type Player,
 } from "./move";
+import type { RoomSpec } from "./types";
 
 const room = generateRoom(CANNED_BRIDGE);
 const blockers = blockersFor(room);
@@ -78,7 +87,7 @@ describe("stepPlayer", () => {
     // terminal and machine sits off to the side), so this drives the player
     // sideways into one of each kind instead: north to a fixture's depth,
     // then into its wall. The target box comes straight from the room's own
-    // fixtures via `footprint`, not from `blockers`, so this stays a live
+    // fixtures via `footprintOf`, not from `blockers`, so this stays a live
     // check of `stepPlayer`'s collision even if `blockersFor` broke.
     const terminalFixture = room.fixtures.find((f) => f.kind === "terminal");
     const machineFixture = room.fixtures.find((f) => f.kind === "machine");
@@ -88,7 +97,8 @@ describe("stepPlayer", () => {
       );
     }
 
-    const terminal = footprint(terminalFixture.slot);
+    const terminal = footprintOf(terminalFixture);
+    if (terminal === null) throw new Error("a terminal has a footprint");
     const terminalZ = (terminal.z0 + terminal.z1) / 2;
     let west = walkUntil(
       spawnPlayer(room),
@@ -98,7 +108,8 @@ describe("stepPlayer", () => {
     west = run(west, { ...idle, strafe: -1 }, 400);
     expect(west.x).toBeGreaterThanOrEqual(terminal.x1 + PLAYER_RADIUS - 1e-6);
 
-    const machine = footprint(machineFixture.slot);
+    const machine = footprintOf(machineFixture);
+    if (machine === null) throw new Error("a machine has a footprint");
     const machineZ = (machine.z0 + machine.z1) / 2;
     let east = walkUntil(
       spawnPlayer(room),
@@ -137,5 +148,261 @@ describe("stepPlayer", () => {
       Math.hypot(straight.vx, straight.vz),
       3,
     );
+  });
+});
+
+/** One tick's travel at full speed, in metres: how short of contact a stop can land. */
+const STEP = 7 / 35 + 1e-6;
+
+/** A player standing still at a point, facing north. */
+function at(x: number, z: number): Player {
+  return { x, z, vx: 0, vz: 0, yaw: 0, pitch: 0, bob: 0 };
+}
+
+function runIn(r: RoomSpec, p: Player, intent: Intent, ticks: number) {
+  const bs = blockersFor(r);
+  let q = p;
+  for (let i = 0; i < ticks; i++) q = stepPlayer(q, intent, r, bs);
+  return q;
+}
+
+/** True when the player's circle overlaps a void cell or the outside. */
+function touchesVoid(r: RoomSpec, p: Player) {
+  const R = PLAYER_RADIUS - 1e-6;
+  for (
+    let y = Math.floor((p.z - R) / CELL);
+    y <= Math.floor((p.z + R) / CELL);
+    y++
+  ) {
+    for (
+      let x = Math.floor((p.x - R) / CELL);
+      x <= Math.floor((p.x + R) / CELL);
+      x++
+    ) {
+      if (isFloor(r.grid, x, y)) continue;
+      const nx = Math.max(x * CELL, Math.min(p.x, (x + 1) * CELL));
+      const nz = Math.max(y * CELL, Math.min(p.z, (y + 1) * CELL));
+      if (Math.hypot(p.x - nx, p.z - nz) < R) return true;
+    }
+  }
+  return false;
+}
+
+const hub = generateRoom(CANNED_HUB);
+
+describe("walking on the grid", () => {
+  it("enters the backlink corridor through its doorway, not beside it", () => {
+    const hall = hub.hall;
+    const doorway = hall.x0 - 1;
+    const rows = hub.grid
+      .map((_, y) => y)
+      .filter((y) => isFloor(hub.grid, doorway, y));
+    expect(rows.length).toBe(2);
+    const [first] = rows as [number, number];
+
+    // Down the middle of the two corridor rows: through the doorway and on.
+    const through = runIn(
+      hub,
+      at((hall.x0 + 1) * CELL, (first + 1) * CELL),
+      { ...idle, strafe: -1 },
+      400,
+    );
+    expect(through.x).toBeLessThan(doorway * CELL);
+
+    // One row north of the doorway: the void column stops the player.
+    const beside = runIn(
+      hub,
+      at((hall.x0 + 1) * CELL, (first - 0.5) * CELL),
+      { ...idle, strafe: -1 },
+      400,
+    );
+    expect(beside.x).toBeGreaterThanOrEqual(
+      hall.x0 * CELL + PLAYER_RADIUS - 1e-6,
+    );
+    expect(beside.x).toBeLessThanOrEqual(hall.x0 * CELL + PLAYER_RADIUS + STEP);
+  });
+
+  it("walks into a bay through its doorway and stops at the wall beside it", () => {
+    const hall = hub.hall;
+    // The first bay's doorway is the hall's east neighbour column, rows 3 and 4.
+    expect(isFloor(hub.grid, hall.x1, 3)).toBe(true);
+    expect(isFloor(hub.grid, hall.x1, 4)).toBe(true);
+    expect(isFloor(hub.grid, hall.x1, 2)).toBe(false);
+
+    const through = runIn(
+      hub,
+      at((hall.x1 - 1) * CELL, 4 * CELL),
+      { ...idle, strafe: 1 },
+      400,
+    );
+    expect(through.x).toBeGreaterThan((hall.x1 + 1) * CELL);
+
+    const beside = runIn(
+      hub,
+      at((hall.x1 - 1) * CELL, 2.5 * CELL),
+      { ...idle, strafe: 1 },
+      400,
+    );
+    expect(beside.x).toBeLessThanOrEqual(hall.x1 * CELL - PLAYER_RADIUS + 1e-6);
+    expect(beside.x).toBeGreaterThanOrEqual(
+      hall.x1 * CELL - PLAYER_RADIUS - STEP,
+    );
+  });
+
+  it("stops at a terminal's own footprint, not the old fixed box", () => {
+    const terminal = room.fixtures.find((f) => f.kind === "terminal");
+    if (terminal === undefined) throw new Error("the bridge has terminals");
+    expect(terminal.slot.side).toBe("w");
+    const wall = terminal.slot.x * CELL;
+    const cz = (terminal.slot.y + 0.5) * CELL;
+
+    // Head on: the desk's 0.9 m depth plus the radius.
+    const head = runIn(room, at(wall + 3, cz), { ...idle, strafe: -1 }, 400);
+    expect(head.x).toBeGreaterThanOrEqual(wall + 0.9 + PLAYER_RADIUS - 1e-6);
+    expect(head.x).toBeLessThanOrEqual(wall + 0.9 + PLAYER_RADIUS + STEP);
+
+    // A lane 1.2 m off its centre clears the 1.4 m desk and reaches the wall,
+    // where the old 2 m box would have stopped the player 0.9 m short.
+    const lane = runIn(
+      room,
+      at(wall + 3, cz + 1.2),
+      { ...idle, strafe: -1 },
+      400,
+    );
+    expect(lane.x).toBeLessThanOrEqual(wall + PLAYER_RADIUS + STEP);
+  });
+
+  it("sizes machines per kind", () => {
+    const slot = { x: 4, y: 3, side: "e" as const };
+    const box = (machine: "server-rack" | "workbench") =>
+      footprintOf({
+        kind: "machine",
+        slot,
+        machine,
+        tag: "t",
+        hue: 0,
+        seed: 1,
+      }) as Box;
+    const rack = box("server-rack");
+    const bench = box("workbench");
+    expect(rack.z1 - rack.z0).toBeCloseTo(0.8);
+    expect(rack.x1 - rack.x0).toBeCloseTo(1.0);
+    expect(rack.z1 - rack.z0).toBeLessThan(FIXTURE_WIDTH);
+    expect(rack.z1 - rack.z0).toBeLessThan(bench.z1 - bench.z0);
+    expect(bench.z1 - bench.z0).toBeCloseTo(1.8);
+    expect(bench.x1 - bench.x0).toBeCloseTo(0.9);
+    // Against the east wall: flush with the cell's east edge.
+    expect(rack.x1).toBeCloseTo(5 * CELL);
+    expect(FOOTPRINTS.machine["comms-array"]).toEqual({ along: 1.2, out: 0.6 });
+    expect(FIXTURE_DEPTH).toBe(0.9);
+  });
+
+  it("leaves flush fixtures out of the blockers", () => {
+    for (const f of hub.fixtures) {
+      const flush =
+        f.kind === "door" ||
+        f.kind === "portal" ||
+        f.kind === "hatch" ||
+        f.kind === "poster" ||
+        f.kind === "placard";
+      expect(footprintOf(f) === null).toBe(flush);
+    }
+  });
+
+  it("turns decor footprints with the piece", () => {
+    const d = { kind: "lab-island" as const, x: 5, y: 6, seed: 1 };
+    const north = decorFootprint({ ...d, turn: 0 }) as Box;
+    const east = decorFootprint({ ...d, turn: 1 }) as Box;
+    expect(north).toEqual({ x0: 8.5, x1: 11.5, z0: 11.3, z1: 12.7 });
+    expect(east).toEqual({ x0: 9.3, x1: 10.7, z0: 10.5, z1: 13.5 });
+    expect(FOOTPRINTS.decor["shelf-row"]).toEqual({ width: 4, depth: 0.8 });
+  });
+
+  it("is blocked by a council chair and walks under a pipe run", () => {
+    const council = generateRoom({ ...CANNED_HUB, type: "decision" });
+    const chair = council.decor.find((d) => d.kind === "council-chair");
+    if (chair === undefined) throw new Error("a council has chairs");
+    const box = decorFootprint(chair);
+    if (box === null) throw new Error("a chair blocks");
+    expect(blockersFor(council)).toContainEqual(box);
+    // The first chair sits north of the table: walk south into it.
+    const cx = (box.x0 + box.x1) / 2;
+    const stopped = runIn(
+      council,
+      at(cx, box.z0 - 3),
+      { ...idle, forward: -1 },
+      400,
+    );
+    expect(stopped.z).toBeLessThanOrEqual(box.z0 - PLAYER_RADIUS + 1e-6);
+    expect(stopped.z).toBeGreaterThanOrEqual(box.z0 - PLAYER_RADIUS - STEP);
+
+    const engineering = generateRoom({ ...CANNED_HUB, type: "runbook" });
+    const pipe = engineering.decor.find((d) => d.kind === "pipe-run");
+    if (pipe === undefined) throw new Error("engineering has pipe runs");
+    expect(pipe.turn).toBe(0);
+    expect(decorFootprint(pipe)).toBeNull();
+    // Beside the generator, south across the pipe run's line.
+    const px = pipe.x * CELL + 3;
+    const pz = pipe.y * CELL;
+    const under = runIn(
+      engineering,
+      at(px, pz - 2),
+      { ...idle, forward: -1 },
+      30,
+    );
+    expect(under.z).toBeGreaterThan(pz + 1);
+  });
+
+  it("puts two scaffold frames in the hall's interior band of a room under construction", () => {
+    const built = generateRoom({ ...CANNED_HUB, status: "draft" });
+    expect(built.condition).toBe("construction");
+    const frames = scaffoldBoxes(built);
+    expect(frames).toHaveLength(2);
+    const h = built.hall;
+    for (const f of frames) {
+      expect(f.x1 - f.x0).toBeCloseTo(1.4);
+      expect(f.z1 - f.z0).toBeCloseTo(1.4);
+      expect(f.x0).toBeGreaterThanOrEqual((h.x0 + 2) * CELL);
+      expect(f.x1).toBeLessThanOrEqual((h.x1 - 2) * CELL);
+      expect(f.z0).toBeGreaterThanOrEqual((h.y0 + 2) * CELL);
+      expect(f.z1).toBeLessThanOrEqual((h.y1 - 2) * CELL);
+      expect(blockersFor(built)).toContainEqual(f);
+    }
+    expect(scaffoldBoxes(built)).toEqual(frames);
+    expect(scaffoldBoxes(hub)).toEqual([]);
+    // The smallest hall still fits its frames.
+    const small = generateRoom({ ...CANNED_BRIDGE, status: "draft" });
+    expect(scaffoldBoxes(small)).toHaveLength(2);
+  });
+
+  it("never ends inside a void cell, whatever it is asked", () => {
+    for (const place of [
+      CANNED_HUB,
+      { ...CANNED_HUB, status: "draft" },
+      { ...CANNED_BRIDGE, status: "draft" },
+    ]) {
+      const r = generateRoom(place);
+      const bs = blockersFor(r);
+      const rng = createRng(2026);
+      let p = spawnPlayer(r);
+      expect(touchesVoid(r, p)).toBe(false);
+      for (let i = 0; i < 2000; i++) {
+        const intent: Intent = {
+          forward: rng.int(-1, 1),
+          strafe: rng.int(-1, 1),
+          turn: rng.int(-1, 1),
+          lookDx: rng.range(-40, 40),
+          lookDy: 0,
+        };
+        const ticks = rng.int(1, 12);
+        for (let t = 0; t < ticks; t++) {
+          p = stepPlayer(p, intent, r, bs);
+          expect(touchesVoid(r, p)).toBe(false);
+          expect(
+            isFloor(r.grid, Math.floor(p.x / CELL), Math.floor(p.z / CELL)),
+          ).toBe(true);
+        }
+      }
+    }
   });
 });
