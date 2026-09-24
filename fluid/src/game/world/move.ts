@@ -272,9 +272,13 @@ export function decorFootprint(decor: Decor): Box | null {
  * stands in), inset by half a frame so the whole frame stays inside it. The
  * smallest hall's band is one by two cells, still wide enough for a frame.
  *
+ * A frame that would overlap a piece of the decor (`decorFootprint`) or the
+ * frame kept before it is skipped rather than moved, so a room under
+ * construction shows two frames, one or none. A skipped frame still uses its
+ * two draws, so whether the first frame is kept never moves the second.
+ *
  * The room mesh builds its poles at exactly these boxes, so what the player
- * sees is what blocks the player. Frames are not kept clear of the decor:
- * a building site is allowed to be in the way.
+ * sees is what blocks the player.
  */
 export function scaffoldBoxes(room: RoomSpec): Box[] {
   if (room.condition !== "construction") return [];
@@ -283,14 +287,27 @@ export function scaffoldBoxes(room: RoomSpec): Box[] {
   const x1 = (room.hall.x1 - BAND_MARGIN) * CELL - half;
   const z0 = (room.hall.y0 + BAND_MARGIN) * CELL + half;
   const z1 = (room.hall.y1 - BAND_MARGIN) * CELL - half;
+  const taken: Box[] = [];
+  for (const d of room.decor) {
+    const box = decorFootprint(d);
+    if (box !== null) taken.push(box);
+  }
   const rng = createRng(room.seed);
   const out: Box[] = [];
   for (let i = 0; i < SCAFFOLD_FRAMES; i++) {
     const x = rng.range(x0, x1);
     const z = rng.range(z0, z1);
-    out.push({ x0: x - half, x1: x + half, z0: z - half, z1: z + half });
+    const frame = { x0: x - half, x1: x + half, z0: z - half, z1: z + half };
+    if (taken.some((b) => intersects(frame, b))) continue;
+    taken.push(frame);
+    out.push(frame);
   }
   return out;
+}
+
+/** True when two boxes share floor; touching edges do not count. */
+function intersects(a: Box, b: Box) {
+  return a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
 }
 
 /**
@@ -323,15 +340,17 @@ function overlaps(x: number, z: number, b: Box) {
 }
 
 /**
- * True when the player's circle at (x, z) overlaps a void cell (anything
- * outside the grid counts) or a blocker.
+ * Every box the player's circle at (x, z) could touch: the void cells under
+ * its bounding square (anything outside the grid counts as void) and the
+ * blockers.
  */
-function hits(
+function nearbySolids(
   x: number,
   z: number,
   grid: readonly string[],
   blockers: readonly Box[],
-) {
+): Box[] {
+  const out: Box[] = [];
   const cx0 = Math.floor((x - PLAYER_RADIUS) / CELL);
   const cx1 = Math.floor((x + PLAYER_RADIUS) / CELL);
   const cz0 = Math.floor((z - PLAYER_RADIUS) / CELL);
@@ -339,23 +358,127 @@ function hits(
   for (let cy = cz0; cy <= cz1; cy++) {
     for (let cx = cx0; cx <= cx1; cx++) {
       if (isFloor(grid, cx, cy)) continue;
-      const cell = {
+      out.push({
         x0: cx * CELL,
         x1: (cx + 1) * CELL,
         z0: cy * CELL,
         z1: (cy + 1) * CELL,
-      };
-      if (overlaps(x, z, cell)) return true;
+      });
     }
   }
-  return blockers.some((b) => overlaps(x, z, b));
+  for (const b of blockers) out.push(b);
+  return out;
+}
+
+/**
+ * True when the player's circle at (x, z) overlaps a void cell or a
+ * blocker.
+ */
+function hits(
+  x: number,
+  z: number,
+  grid: readonly string[],
+  blockers: readonly Box[],
+) {
+  return nearbySolids(x, z, grid, blockers).some((b) => overlaps(x, z, b));
+}
+
+/** How many push-outs one tick may take before it gives up on them. */
+const PUSH_ITERATIONS = 8;
+/** A push-out lands this far past touching, so rounding never re-overlaps. */
+const PUSH_SLACK = 1e-9;
+/**
+ * How far a corner push is turned when the player walks dead on at the
+ * corner, in radians: enough to pick a side, too little to be seen.
+ */
+const CORNER_TIE_TURN = 0.05;
+
+/**
+ * Pushes the player's circle at (x, z) out of whatever it overlaps, the
+ * deepest overlap first, each along the shortest way out: straight off a
+ * face, or away from a corner along the line from the corner to the centre.
+ * Pushing away from a corner is what makes the player slide round it, since
+ * the push is never straight back along the walk unless the walk points
+ * dead at the corner. That one case is a tie, and it is broken by turning
+ * the push a little to the walk's left, always the same way, so the player
+ * slides off instead of balancing on the point. `(mx, mz)` is the move this
+ * tick. Returns the free position, or null when a few pushes did not find
+ * one (a gap narrower than the player).
+ */
+function pushOut(
+  x: number,
+  z: number,
+  mx: number,
+  mz: number,
+  grid: readonly string[],
+  blockers: readonly Box[],
+): [number, number] | null {
+  const R = PLAYER_RADIUS;
+  for (let i = 0; i < PUSH_ITERATIONS; i++) {
+    let deepest: Box | null = null;
+    let deepestD = Infinity;
+    for (const b of nearbySolids(x, z, grid, blockers)) {
+      if (!overlaps(x, z, b)) continue;
+      const nx = Math.max(b.x0, Math.min(x, b.x1));
+      const nz = Math.max(b.z0, Math.min(z, b.z1));
+      const d = Math.hypot(x - nx, z - nz);
+      if (d < deepestD) {
+        deepestD = d;
+        deepest = b;
+      }
+    }
+    if (deepest === null) return [x, z];
+    const b = deepest;
+    const nx = Math.max(b.x0, Math.min(x, b.x1));
+    const nz = Math.max(b.z0, Math.min(z, b.z1));
+    if (deepestD === 0) {
+      // The centre is inside the box: out through the nearest face.
+      const exits = [
+        { d: x - b.x0, x: b.x0 - R - PUSH_SLACK, z },
+        { d: b.x1 - x, x: b.x1 + R + PUSH_SLACK, z },
+        { d: z - b.z0, x, z: b.z0 - R - PUSH_SLACK },
+        { d: b.z1 - z, x, z: b.z1 + R + PUSH_SLACK },
+      ];
+      exits.sort((a, c) => a.d - c.d);
+      const exit = exits[0];
+      if (exit === undefined) return null;
+      x = exit.x;
+      z = exit.z;
+      continue;
+    }
+    let ux = (x - nx) / deepestD;
+    let uz = (z - nz) / deepestD;
+    const corner = (nx === b.x0 || nx === b.x1) && (nz === b.z0 || nz === b.z1);
+    const len = Math.hypot(mx, mz);
+    if (corner && len > 0) {
+      // Dead on at the corner: the push points straight back along the walk.
+      const cross = (ux * mz - uz * mx) / len;
+      const dot = (ux * mx + uz * mz) / len;
+      if (Math.abs(cross) < 1e-3 && dot < 0) {
+        const c = Math.cos(CORNER_TIE_TURN);
+        const s = Math.sin(CORNER_TIE_TURN);
+        [ux, uz] = [ux * c - uz * s, ux * s + uz * c];
+      }
+    }
+    x = nx + ux * (R + PUSH_SLACK);
+    z = nz + uz * (R + PUSH_SLACK);
+  }
+  return hits(x, z, grid, blockers) ? null : [x, z];
 }
 
 /**
  * One tick of movement: turn and pitch from the intent, blend the velocity
- * towards the wished one, then move along x and along z in turn, each axis
- * refused when the player's circle would overlap a void cell or a blocker.
- * A refused axis keeps the old coordinate and loses its velocity.
+ * towards the wished one, then move.
+ *
+ * The move is taken on both axes at once and the player's circle is then
+ * pushed out of every void cell and blocker it overlaps (`pushOut`), so the
+ * player slides along a wall walked into at an angle, slides round a corner
+ * instead of snagging on it, and stops head on exactly at the wall's edge
+ * plus the radius. The velocity becomes what the player really moved, so
+ * the part of it that went into a wall is gone. Should the push-out find no
+ * free place, milestone 1's rule takes over as a backstop: x then z, each
+ * axis refused when it would overlap, which never leaves the player inside
+ * anything. The grid's bounding rectangle is clamped to first.
  */
 export function stepPlayer(
   p: Player,
@@ -379,25 +502,43 @@ export function stepPlayer(
     wz /= len;
   }
   // Blend towards the wished velocity: most of the way in one tick.
-  const vx = p.vx * FRICTION + wx * MAX_SPEED * (1 - FRICTION);
-  const vz = p.vz * FRICTION + wz * MAX_SPEED * (1 - FRICTION);
+  let vx = p.vx * FRICTION + wx * MAX_SPEED * (1 - FRICTION);
+  let vz = p.vz * FRICTION + wz * MAX_SPEED * (1 - FRICTION);
 
   const minX = PLAYER_RADIUS;
   const maxX = room.width * CELL - PLAYER_RADIUS;
   const minZ = PLAYER_RADIUS;
   const maxZ = room.depth * CELL - PLAYER_RADIUS;
+  const clampX = (v: number) => Math.max(minX, Math.min(maxX, v));
+  const clampZ = (v: number) => Math.max(minZ, Math.min(maxZ, v));
 
-  let x = Math.max(minX, Math.min(maxX, p.x + vx * DT));
-  if (hits(x, p.z, room.grid, blockers)) x = p.x;
-  let z = Math.max(minZ, Math.min(maxZ, p.z + vz * DT));
-  if (hits(x, z, room.grid, blockers)) z = p.z;
+  const tx = clampX(p.x + vx * DT);
+  const tz = clampZ(p.z + vz * DT);
+  let x = tx;
+  let z = tz;
+  if (hits(tx, tz, room.grid, blockers)) {
+    const pushed = pushOut(tx, tz, tx - p.x, tz - p.z, room.grid, blockers);
+    const free =
+      pushed !== null &&
+      !hits(clampX(pushed[0]), clampZ(pushed[1]), room.grid, blockers);
+    if (pushed !== null && free) {
+      x = clampX(pushed[0]);
+      z = clampZ(pushed[1]);
+    } else {
+      // Backstop: milestone 1's axis by axis rule.
+      x = hits(tx, p.z, room.grid, blockers) ? p.x : tx;
+      z = hits(x, tz, room.grid, blockers) ? p.z : tz;
+    }
+    vx = (x - p.x) / DT;
+    vz = (z - p.z) / DT;
+  }
 
   const speed = Math.hypot(x - p.x, z - p.z) / DT;
   return {
     x,
     z,
-    vx: x === p.x ? 0 : vx,
-    vz: z === p.z ? 0 : vz,
+    vx,
+    vz,
     yaw,
     pitch,
     bob: p.bob + speed * DT * 2.2,

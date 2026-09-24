@@ -20,7 +20,7 @@ import {
   type Intent,
   type Player,
 } from "./move";
-import type { RoomSpec } from "./types";
+import type { Decor, RoomSpec } from "./types";
 
 const room = generateRoom(CANNED_BRIDGE);
 const blockers = blockersFor(room);
@@ -188,7 +188,52 @@ function touchesVoid(r: RoomSpec, p: Player) {
   return false;
 }
 
+/** True when the player's circle overlaps one of the blockers. */
+function touchesBlocker(bs: readonly Box[], p: Player) {
+  const R = PLAYER_RADIUS - 1e-6;
+  return bs.some((b) => {
+    const nx = Math.max(b.x0, Math.min(p.x, b.x1));
+    const nz = Math.max(b.z0, Math.min(p.z, b.z1));
+    return Math.hypot(p.x - nx, p.z - nz) < R;
+  });
+}
+
 const hub = generateRoom(CANNED_HUB);
+
+/** A world direction on the diagonal: -1 or 1 along x and along z. */
+type Diagonal = readonly [-1 | 1, -1 | 1];
+
+/**
+ * Holds the diagonal intent that walks the unturned player along `dir` (x
+ * is strafe, z is back) for `ticks`, starting 0.45 m short of `corner` on
+ * that diagonal and `offset` metres to one side of it. Fails on any tick
+ * that ends overlapping void or a blocker; returns where the player ended.
+ */
+function diagonalInto(
+  r: RoomSpec,
+  corner: { x: number; z: number },
+  dir: Diagonal,
+  offset: number,
+  ticks = 60,
+) {
+  const bs = blockersFor(r);
+  const [dx, dz] = dir;
+  const k = 0.45 / Math.SQRT2;
+  const side = offset / Math.SQRT2;
+  let p = at(corner.x - dx * k - dz * side, corner.z - dz * k + dx * side);
+  expect(touchesVoid(r, p)).toBe(false);
+  expect(touchesBlocker(bs, p)).toBe(false);
+  const intent: Intent = { ...idle, strafe: dx, forward: -dz };
+  for (let i = 0; i < ticks; i++) {
+    p = stepPlayer(p, intent, r, bs);
+    expect(touchesVoid(r, p)).toBe(false);
+    expect(touchesBlocker(bs, p)).toBe(false);
+  }
+  return p;
+}
+
+const distance = (p: Player, c: { x: number; z: number }) =>
+  Math.hypot(p.x - c.x, p.z - c.z);
 
 describe("walking on the grid", () => {
   it("enters the backlink corridor through its doorway, not beside it", () => {
@@ -353,11 +398,13 @@ describe("walking on the grid", () => {
     expect(under.z).toBeGreaterThan(pz + 1);
   });
 
-  it("puts two scaffold frames in the hall's interior band of a room under construction", () => {
+  it("puts up to two scaffold frames in the hall's interior band of a room under construction", () => {
     const built = generateRoom({ ...CANNED_HUB, status: "draft" });
     expect(built.condition).toBe("construction");
     const frames = scaffoldBoxes(built);
-    expect(frames).toHaveLength(2);
+    // Its shelf rows may take a frame (see the next test), never both.
+    expect(frames.length).toBeGreaterThanOrEqual(1);
+    expect(frames.length).toBeLessThanOrEqual(2);
     const h = built.hall;
     for (const f of frames) {
       expect(f.x1 - f.x0).toBeCloseTo(1.4);
@@ -370,9 +417,44 @@ describe("walking on the grid", () => {
     }
     expect(scaffoldBoxes(built)).toEqual(frames);
     expect(scaffoldBoxes(hub)).toEqual([]);
-    // The smallest hall still fits its frames.
+    // The smallest hall has no decor, so its first frame always stands; its
+    // band is so small that the second one mostly overlaps the first.
     const small = generateRoom({ ...CANNED_BRIDGE, status: "draft" });
-    expect(scaffoldBoxes(small)).toHaveLength(2);
+    expect(scaffoldBoxes(small).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("skips a scaffold frame that would stand in the decor or the other frame", () => {
+    const share = (a: Box, b: Box) =>
+      a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
+    let skipped = 0;
+    for (const type of [
+      "manifest",
+      "decision",
+      "runbook",
+      "reference",
+      "guide",
+    ]) {
+      for (let i = 0; i < 12; i++) {
+        const r = generateRoom({
+          ...CANNED_HUB,
+          type,
+          status: "draft",
+          permalink: `site-${i}`,
+        });
+        const frames = scaffoldBoxes(r);
+        const decor = r.decor
+          .map(decorFootprint)
+          .filter((b): b is Box => b !== null);
+        for (const f of frames) {
+          for (const d of decor) expect(share(f, d)).toBe(false);
+        }
+        const [a, b] = frames;
+        if (a !== undefined && b !== undefined) expect(share(a, b)).toBe(false);
+        skipped += 2 - frames.length;
+      }
+    }
+    // Sixty building sites among the shelves and tables: some frame had to go.
+    expect(skipped).toBeGreaterThan(0);
   });
 
   it("never ends inside a void cell, whatever it is asked", () => {
@@ -398,11 +480,96 @@ describe("walking on the grid", () => {
         for (let t = 0; t < ticks; t++) {
           p = stepPlayer(p, intent, r, bs);
           expect(touchesVoid(r, p)).toBe(false);
+          expect(touchesBlocker(bs, p)).toBe(false);
           expect(
             isFloor(r.grid, Math.floor(p.x / CELL), Math.floor(p.z / CELL)),
           ).toBe(true);
         }
       }
     }
+  });
+});
+
+describe("sliding around corners", () => {
+  // Each case walks diagonally at a convex corner from the one quadrant
+  // that is open floor, both a little to either side of the corner and dead
+  // on it, and must get past it instead of freezing there.
+  const offsets = [-0.06, 0, 0.06];
+
+  it("slides past each jamb of a bay doorway", () => {
+    const X = hub.hall.x1 * CELL;
+    const jambs: [{ x: number; z: number }, Diagonal][] = [
+      [{ x: X, z: 3 * CELL }, [1, -1]],
+      [{ x: X, z: 5 * CELL }, [1, 1]],
+      [{ x: X + CELL, z: 3 * CELL }, [-1, -1]],
+      [{ x: X + CELL, z: 5 * CELL }, [-1, 1]],
+    ];
+    for (const [corner, dir] of jambs) {
+      for (const offset of offsets) {
+        const p = diagonalInto(hub, corner, dir, offset);
+        expect(distance(p, corner)).toBeGreaterThan(1);
+      }
+    }
+  });
+
+  it("slides past both room-side corners of a terminal", () => {
+    const terminal = room.fixtures.find((f) => f.kind === "terminal");
+    if (terminal === undefined) throw new Error("the bridge has terminals");
+    const box = footprintOf(terminal) as Box;
+    const corners: [{ x: number; z: number }, Diagonal][] = [
+      [{ x: box.x1, z: box.z0 }, [-1, 1]],
+      [{ x: box.x1, z: box.z1 }, [-1, -1]],
+    ];
+    for (const [corner, dir] of corners) {
+      for (const offset of offsets) {
+        const p = diagonalInto(room, corner, dir, offset, 40);
+        // Past the corner, or slid along the desk into the pocket between
+        // it and the wall; frozen at the corner is neither.
+        const inPocket =
+          Math.abs(p.x - (terminal.slot.x * CELL + PLAYER_RADIUS)) < 1e-6;
+        expect(inPocket || distance(p, corner) > 1).toBe(true);
+      }
+    }
+  });
+
+  it("slides past every corner of a council chair", () => {
+    const council = generateRoom({ ...CANNED_HUB, type: "decision" });
+    const chairs = council.decor.filter((d) => d.kind === "council-chair");
+    // The chairs due north and due south of the table.
+    const north = decorFootprint(chairs[0] as Decor) as Box;
+    const south = decorFootprint(chairs[3] as Decor) as Box;
+    const corners: [{ x: number; z: number }, Diagonal][] = [
+      [{ x: north.x0, z: north.z0 }, [1, 1]],
+      [{ x: north.x1, z: north.z0 }, [-1, 1]],
+      [{ x: south.x0, z: south.z1 }, [1, -1]],
+      [{ x: south.x1, z: south.z1 }, [-1, -1]],
+    ];
+    for (const [corner, dir] of corners) {
+      for (const offset of offsets) {
+        const p = diagonalInto(council, corner, dir, offset, 40);
+        expect(distance(p, corner)).toBeGreaterThan(1);
+      }
+    }
+  });
+
+  it("walks diagonally into a hall corner and settles in it", () => {
+    // The bridge's north-west corner has no fixture near it.
+    const corner = { x: room.hall.x0 * CELL, z: room.hall.y0 * CELL };
+    const p = diagonalInto(
+      room,
+      { x: corner.x + 3, z: corner.z + 3 },
+      [-1, -1],
+      0.3,
+      80,
+    );
+    expect(p.x).toBeCloseTo(corner.x + PLAYER_RADIUS, 3);
+    expect(p.z).toBeCloseTo(corner.z + PLAYER_RADIUS, 3);
+  });
+
+  it("stops head on at a wall's edge plus the radius", () => {
+    const wall = hub.hall.x0 * CELL;
+    const p = runIn(hub, at(wall + 3, 3), { ...idle, strafe: -1 }, 60);
+    expect(p.x).toBeCloseTo(wall + PLAYER_RADIUS, 6);
+    expect(p.vx).toBeCloseTo(0, 6);
   });
 });
