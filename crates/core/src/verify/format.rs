@@ -263,6 +263,7 @@ mod tests {
                 .map(|p| scanned_file_from_source(Path::new(p), DOC))
                 .collect(),
             config: crate::config::DomainConfig::default(),
+            config_problems: Vec::new(),
         };
         let mut issues = Vec::new();
         let mut summary = crate::verify::Summary::default();

@@ -273,6 +273,7 @@ mod tests {
             manifest_index: None,
             files: Vec::new(),
             config: crate::config::DomainConfig::default(),
+            config_problems: Vec::new(),
         };
         let engram = file.parsed.as_ref().expect("fixture parses");
         let lines = crate::parse::body_lines(&engram.body, body_line_start(&file.source));

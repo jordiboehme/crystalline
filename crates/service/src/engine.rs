@@ -24,8 +24,8 @@ use crystalline_core::config::registration::{
     Registration, RegistrationRequest, decide_registration, validate_domain_name,
 };
 use crystalline_core::config::{
-    DomainConfig, DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
-    ResponseFormat, ShareIdentityMode, VerifyConfig,
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig, ResponseFormat,
+    ShareIdentityMode, VerifyConfig,
 };
 use crystalline_core::emit::{
     append_body, insert_after_section_reporting, insert_before_section, prepend_body,
@@ -11439,6 +11439,27 @@ impl Engine {
             }
         }
 
+        // The domain's own verify settings, checked the way `crystalline
+        // verify` checks them: a severity word it does not know, or a file
+        // that does not parse, is one M108 warning each. Only on a
+        // whole-domain run, since the file is about the domain and not about
+        // any one engram.
+        if p.identifier.is_none()
+            && let ContentSource::File { root } = &source
+        {
+            for problem in crystalline_core::verify::load_domain_config(root).problems {
+                issues.push(json!({
+                    "permalink": Value::Null,
+                    "path": crystalline_core::verify::DOMAIN_CONFIG_FILE,
+                    "severity": crystalline_core::Severity::Warning,
+                    "kind": "M108",
+                    "field": Value::Null,
+                    "message": problem.message,
+                    "line": Value::Null,
+                }));
+            }
+        }
+
         let mut response = json!({
             "domain": p.domain,
             "checked": checked,
@@ -21413,20 +21434,18 @@ fn parse_rules(requested: &[String]) -> Result<Vec<&'static str>> {
     Ok(out)
 }
 
-/// A domain's verify overrides, read from the `.crystalline.yaml` at its root.
-/// A virtual domain has no root and therefore no overrides, so its engrams take
-/// the default budget.
+/// A domain's verify overrides, read from the `.crystalline.yaml` at its root
+/// through the loader `crystalline verify` uses, so a file that does not parse
+/// means no overrides here as there (validate reports it as `M108`). A virtual
+/// domain has no root and therefore no overrides, so its engrams take the
+/// default budget.
 fn domain_verify_config(source: &ContentSource) -> Option<VerifyConfig> {
     let ContentSource::File { root } = source else {
         return None;
     };
-    let path = root.join(".crystalline.yaml");
-    if !path.is_file() {
-        return None;
-    }
-    crystalline_core::config::load_yaml::<DomainConfig>(&path)
-        .ok()
-        .and_then(|c| c.verify)
+    crystalline_core::verify::load_domain_config(root)
+        .config
+        .verify
 }
 
 /// The approximate token budget for one engram, resolved exactly the way

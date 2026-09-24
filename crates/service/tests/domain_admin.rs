@@ -11,7 +11,7 @@ use crystalline_core::config::{
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
-use crystalline_service::params::{ListDomainsParams, ReadParams, SearchParams};
+use crystalline_service::params::{ListDomainsParams, ReadParams, SearchParams, ValidateParams};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -985,4 +985,38 @@ async fn a_grandfathered_name_is_re_added_without_error() {
         .await
         .unwrap();
     assert_eq!(report["adopted"], true, "{report}");
+}
+
+/// validate_engrams reads the domain's `.crystalline.yaml` through the same
+/// loader `crystalline verify` does, so a typo there is reported the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_reports_a_verify_config_typo_as_m108() {
+    let (tmp, engine) = engine().await;
+    std::fs::write(
+        tmp.path().join("eng/.crystalline.yaml"),
+        "verify:\n  rules:\n    E007: of\n",
+    )
+    .unwrap();
+
+    let report = engine
+        .validate_engrams(
+            &ValidateParams {
+                domain: "eng".to_string(),
+                identifier: None,
+                engram_type: None,
+                drift: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let m108: Vec<_> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "M108")
+        .collect();
+    assert_eq!(m108.len(), 1, "{report}");
+    assert_eq!(m108[0]["path"], ".crystalline.yaml");
+    assert!(m108[0]["message"].as_str().unwrap().contains("'of'"));
 }
