@@ -190,8 +190,8 @@ function wayOf(ref: PlaceReference): {
 function postersOf(place: PlaceInput): { category: string; lines: string[] }[] {
   const posters = new Map<string, string[]>();
   for (const o of place.observations) {
-    const category =
-      o.category === null || o.category.trim() === "" ? NOTES : o.category;
+    const trimmed = o.category?.trim() ?? "";
+    const category = trimmed === "" ? NOTES : trimmed;
     const lines = posters.get(category) ?? [];
     if (lines.length < POSTER_LINES) lines.push(o.content);
     posters.set(category, lines);
@@ -325,12 +325,17 @@ function decorFor(archetype: Archetype, hall: Rect, roomSeed: number): Decor[] {
 
 /**
  * The light zones of a grid: one per block of four by four cells that holds
- * any floor, none over void alone. A zone's seed is keyed by its corner, not
- * a running count, so a room that grows keeps the lights it already had.
+ * any floor, none over void alone. The blocks are aligned to the hall's
+ * north-west corner (a block west of it may be cut short at the grid's
+ * edge), and a zone's seed is keyed by its corner relative to that corner,
+ * not by a running count or a grid position. So a room that grows keeps the
+ * lights it already had, and one whose hatches move into a corridor, which
+ * shifts the hall east in the grid, keeps the hall's lights too.
  */
 function lightsFor(
   roomSeed: number,
   grid: readonly string[],
+  hall: Rect,
   width: number,
   depth: number,
   salience: number,
@@ -338,15 +343,19 @@ function lightsFor(
 ): LightZone[] {
   const base = Math.min(255, Math.round(150 + salience * 10));
   const zones: LightZone[] = [];
-  for (let y0 = 0; y0 < depth; y0 += LIGHT_BLOCK) {
-    for (let x0 = 0; x0 < width; x0 += LIGHT_BLOCK) {
-      const x1 = Math.min(width, x0 + LIGHT_BLOCK);
-      const y1 = Math.min(depth, y0 + LIGHT_BLOCK);
+  const startX = hall.x0 - LIGHT_BLOCK * Math.ceil(hall.x0 / LIGHT_BLOCK);
+  const startY = hall.y0 - LIGHT_BLOCK * Math.ceil(hall.y0 / LIGHT_BLOCK);
+  for (let by = startY; by < depth; by += LIGHT_BLOCK) {
+    for (let bx = startX; bx < width; bx += LIGHT_BLOCK) {
+      const x0 = Math.max(0, bx);
+      const y0 = Math.max(0, by);
+      const x1 = Math.min(width, bx + LIGHT_BLOCK);
+      const y1 = Math.min(depth, by + LIGHT_BLOCK);
       let floor = false;
       for (let y = y0; y < y1 && !floor; y++)
         for (let x = x0; x < x1 && !floor; x++) floor = isFloor(grid, x, y);
       if (!floor) continue;
-      const seed = seedFor(roomSeed, "light", x0, y0);
+      const seed = seedFor(roomSeed, "light", bx - hall.x0, by - hall.y0);
       const rng = createRng(seed);
       let level = base;
       let special: LightSpecial = "steady";
@@ -512,6 +521,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     lights: lightsFor(
       seed,
       layout.grid,
+      layout.hall,
       layout.width,
       layout.depth,
       salience,

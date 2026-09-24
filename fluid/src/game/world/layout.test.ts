@@ -158,8 +158,20 @@ describe("planLayout", () => {
     expect(oneMore.bays.length).toBeGreaterThan(0);
     const slots = drain(oneMore);
     expect(slots.length).toBeGreaterThanOrEqual(11 * 3 + 20);
-    // One bay fewer would not have held them.
-    expect(oneMore.bays.length).toBeLessThanOrEqual(MAX_BAYS);
+    // One bay fewer would not have held them: the same hall without bays
+    // (`any` does not size the hall) has fewer slots than the need.
+    expect(oneMore.bays).toHaveLength(1);
+    expect(drain(hallOnly).length).toBeLessThan(11 * 3 + 20);
+  });
+
+  it("widens the hall so eight hatches fit on its south wall", () => {
+    const layout = planLayout({ ...none, south: 8, hatches: 8 });
+    const pool = createSlotPool(layout);
+    for (let i = 0; i < 8; i++) {
+      const slot = pool.take("south");
+      expect(slot?.side).toBe("s");
+      expect(slot?.y).toBe(layout.hall.y1 - 1);
+    }
   });
 
   it("caps the hall at 24 by 24 cells", () => {

@@ -390,6 +390,69 @@ describe("generateRoom determinism", () => {
     }
   });
 
+  it("puts up to eight hatches on the hall's south wall", () => {
+    const room = generateRoom({
+      ...CANNED_BRIDGE,
+      inbound: Array.from({ length: 8 }, (_, i) => ({
+        address: { domain: "station", permalink: `log-${i}` },
+        title: `Log ${i}`,
+        relType: "links_to",
+      })),
+      inboundTotal: 8,
+    });
+    const hatches = room.fixtures.filter((f) => f.kind === "hatch");
+    expect(hatches).toHaveLength(8);
+    for (const h of hatches) {
+      expect(h.slot.side).toBe("s");
+      expect(h.slot.y).toBe(room.hall.y1 - 1);
+    }
+  });
+
+  it("keeps the hall's light seeds when the hatches move into a corridor", () => {
+    const withHatches = (n: number) =>
+      generateRoom({
+        ...CANNED_BRIDGE,
+        inbound: Array.from({ length: n }, (_, i) => ({
+          address: { domain: "station", permalink: `log-${i}` },
+          title: `Log ${i}`,
+          relType: "links_to",
+        })),
+        inboundTotal: n,
+      });
+    const hallSeeds = (r: RoomSpec) =>
+      new Map(
+        r.lights
+          .filter((z) => z.x0 >= r.hall.x0 && z.x1 <= r.hall.x1)
+          .map((z) => [`${z.x0 - r.hall.x0},${z.y0}`, z.seed]),
+      );
+    const plain = withHatches(8);
+    const corridor = withHatches(12);
+    expect(plain.hall.x0).toBe(0);
+    expect(corridor.hall.x0).toBeGreaterThan(0);
+    // Eight hatches widen the hall for the south wall; twelve leave it
+    // narrow, so compare the corners both halls have.
+    const a = hallSeeds(plain);
+    const b = hallSeeds(corridor);
+    const shared = [...b.keys()].filter((corner) => a.has(corner));
+    expect(shared.length).toBeGreaterThan(0);
+    for (const corner of shared) expect(b.get(corner)).toBe(a.get(corner));
+  });
+
+  it("merges categories that differ only by surrounding spaces", () => {
+    const room = generateRoom({
+      ...CANNED_BRIDGE,
+      observations: [
+        { category: "warning", content: "one" },
+        { category: " warning ", content: "two" },
+      ],
+    });
+    expect(
+      room.fixtures.flatMap((f) =>
+        f.kind === "poster" ? [[f.category, f.lines]] : [],
+      ),
+    ).toEqual([["warning", ["one", "two"]]]);
+  });
+
   it("gathers observations into one poster per category, notes for none", () => {
     const room = generateRoom(CANNED_HUB);
     expect(

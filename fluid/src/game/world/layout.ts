@@ -5,11 +5,13 @@
  * Milestone 1's room was one rectangle. A room now grows in parts, and the
  * parts are laid out by these rules, in this order:
  *
- * - **Hall.** `width = clamp(2*north + 1, 5, 24)` cells and
- *   `depth = clamp(2*max(west, east) + 2, 6, 24)`, as in milestone 1: the
- *   doors and portals on the north wall set its width, the terminals on the
- *   west and the machines on the east set its depth. It sits at grid x offset
- *   `ox` and y offset 0.
+ * - **Hall.** `width = clamp(max(2*north + 1, 2*south + 3), 5, 24)` cells
+ *   and `depth = clamp(2*max(west, east) + 2, 6, 24)`: the doors and portals
+ *   on the north wall set its width, as in milestone 1, unless the south wall
+ *   needs more, since up to eight hatches share it with the entrance and the
+ *   placard and must all fit there; the terminals on the west and the
+ *   machines on the east set its depth. It sits at grid x offset `ox` and y
+ *   offset 0.
  * - **Entrance and placard.** The entrance is on the hall's south wall at
  *   `ox + floor(width/2)`; the placard sits one cell west of it. Both slots
  *   are reserved and never handed out.
@@ -36,8 +38,10 @@
  *   maximal straight runs, walked clockwise (north walls west to east, east
  *   walls north to south, south walls east to west, west walls south to
  *   north), and every second cell of a run is a slot, starting at the run's
- *   second cell. In a plain rectangle that is exactly milestone 1's slots, and
- *   fixtures never stand side by side. A corridor's south wall runs on into
+ *   second cell. In a plain rectangle that is exactly milestone 1's slots,
+ *   and two slots are never neighbours; only the placard, which sits one
+ *   cell west of the entrance whatever the slot pattern, can stand next to a
+ *   slot. A corridor's south wall runs on into
  *   the hall's, and walking it from the hall's east end keeps the hall's
  *   slots where they would be without a corridor.
  * - **Slot pool.** `north`, `west`, `east` and `south` ask for that wall of
@@ -139,7 +143,11 @@ export function isFloor(
 
 /** The plan with exactly `bayCount` bays. */
 function build(need: LayoutNeed, bayCount: number): Layout {
-  const hallWidth = clamp(2 * need.north + 1, MIN_WIDTH, HALL_CAP);
+  const hallWidth = clamp(
+    Math.max(2 * need.north + 1, 2 * need.south + 3),
+    MIN_WIDTH,
+    HALL_CAP,
+  );
   const hallDepth = clamp(
     2 * Math.max(need.west, need.east) + 2,
     MIN_DEPTH,
