@@ -9,7 +9,7 @@
 
 import type { Rect } from "../../world/types";
 import { FLAG, type MeshData, type Surface, type V3 } from "../geometry";
-import type { Frame, Kit } from "../kit";
+import { DECAL_LIFT, type Frame, type Kit } from "../kit";
 import { ASPECT, LAYER } from "../layers";
 import type { Look, Rgb } from "../looks";
 
@@ -213,7 +213,7 @@ export function label(
     h1 + PLATE_MARGIN,
     surfaces(ctx.look).dark,
   );
-  textPanel(kit, ctx, key, a0, a1, d + 0.001, h0, h1, {
+  textPanel(kit, ctx, key, a0, a1, d, h0, h1, {
     tint,
     flag: FLAG.emissive,
   });
@@ -221,7 +221,10 @@ export function label(
 
 /**
  * A quad showing a text key's row: the whole width of the layer, `v0` to
- * `v1` of its height, facing into the room at depth `d`.
+ * `v1` of its height, facing into the room on a backing whose face is at
+ * depth `backing`. The quad itself stands `DECAL_LIFT` in front of that
+ * face, so no caller picks its own lift and none can pick one too small
+ * to survive the depth buffer at a distance.
  */
 export function textPanel(
   kit: Kit,
@@ -229,7 +232,7 @@ export function textPanel(
   key: string,
   a0: number,
   a1: number,
-  d: number,
+  backing: number,
   h0: number,
   h1: number,
   look: { tint: Rgb; flag: Surface["flag"] },
@@ -238,7 +241,7 @@ export function textPanel(
   kit.panel(
     a0,
     a1,
-    d,
+    backing + DECAL_LIFT,
     h0,
     h1,
     { layer: slot.layer, tint: look.tint, flag: look.flag },

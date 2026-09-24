@@ -12,7 +12,7 @@ import { createRng, type Rng } from "../../core/seed";
 import { FOOTPRINTS } from "../../world/footprints";
 import type { Fixture, MachineKind } from "../../world/types";
 import type { Surface } from "../geometry";
-import { frameForSlot, type Frame, type Kit } from "../kit";
+import { DECAL_LIFT, frameForSlot, type Frame, type Kit } from "../kit";
 import { LAYER } from "../layers";
 import { hueToRgb, type Rgb } from "../looks";
 import {
@@ -451,7 +451,7 @@ function cryoPod({ k, s, ctx, out }: Recipe) {
   k.panel(
     -C.windowHalf + 0.06,
     C.windowHalf - 0.06,
-    front + 0.031,
+    front + 0.03 + DECAL_LIFT,
     w0 + 0.07,
     w1 - 0.07,
     s.glow(shade(ctx.look.palette.portalAlt, 0.55)),
@@ -526,7 +526,7 @@ function fabricator({ k, s, hue, half, out }: Recipe) {
   k.panel(
     side1 + 0.04,
     a1 - 0.04,
-    d1 + 0.001,
+    d1 + DECAL_LIFT,
     0.95,
     1.2,
     s.glow(shade(hue, 0.8)),
@@ -903,7 +903,7 @@ function medScanner({ k, kitAt, f, s, ctx, hue, half, out }: Recipe) {
   k.panel(
     a0 + 0.08,
     a0 + 0.42,
-    0.081,
+    0.08 + DECAL_LIFT,
     m0 + 0.03,
     m1 - 0.03,
     s.glow(ctx.look.palette.screenText),

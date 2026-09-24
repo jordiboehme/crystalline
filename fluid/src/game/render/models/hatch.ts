@@ -11,7 +11,7 @@
 
 import type { Fixture } from "../../world/types";
 import { FLAG } from "../geometry";
-import { frameForSlot } from "../kit";
+import { DECAL_LIFT, frameForSlot } from "../kit";
 import { ASPECT, LAYER } from "../layers";
 import { PICTOGRAM } from "../text";
 import {
@@ -128,7 +128,7 @@ export function buildHatch(
   k.panel(
     -PLATE_HALF,
     -PLATE_HALF + pictogram,
-    PLATE_D + 0.001,
+    PLATE_D + DECAL_LIFT,
     PLATE_H0,
     PLATE_H0 + pictogram,
     { layer: LAYER.pictogram, tint: p.panel, flag: FLAG.lit },
@@ -144,7 +144,7 @@ export function buildHatch(
     `hatch:${index}`,
     PLATE_HALF - labelW,
     PLATE_HALF,
-    PLATE_D + 0.001,
+    PLATE_D,
     mid - labelH / 2,
     mid + labelH / 2,
     {

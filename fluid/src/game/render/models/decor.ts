@@ -13,7 +13,7 @@ import { createRng } from "../../core/seed";
 import { FOOTPRINTS } from "../../world/footprints";
 import { CELL } from "../../world/units";
 import type { Decor, DecorKind, Rect } from "../../world/types";
-import { frameForDecor, type Frame, type Kit } from "../kit";
+import { DECAL_LIFT, frameForDecor, type Frame, type Kit } from "../kit";
 import type { Surface } from "../geometry";
 import { hueToRgb } from "../looks";
 import {
@@ -134,7 +134,7 @@ function commandConsole({ kitAt, f, s, ctx }: Recipe) {
     k.panel(
       a0 + 0.08,
       a1 - 0.08,
-      HOUSING_D + 0.001,
+      HOUSING_D + DECAL_LIFT,
       SCREEN[0],
       SCREEN[1],
       screen,

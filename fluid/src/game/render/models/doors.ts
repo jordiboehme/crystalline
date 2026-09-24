@@ -23,7 +23,13 @@
 
 import type { Fixture } from "../../world/types";
 import { FLAG, createBuilder, type Surface, type V3 } from "../geometry";
-import { createKit, frameForSlot, type Frame, type Kit } from "../kit";
+import {
+  DECAL_LIFT,
+  createKit,
+  frameForSlot,
+  type Frame,
+  type Kit,
+} from "../kit";
 import { ASPECT, LAYER } from "../layers";
 import {
   HEADROOM,
@@ -139,7 +145,7 @@ export function buildDoor(
 
 /** The dark passage behind the leaves, just in front of the wall. */
 function recess(k: Kit, half: number, h0: number, h1: number) {
-  k.panel(-half, half, 0.002, h0, h1, {
+  k.panel(-half, half, DECAL_LIFT, h0, h1, {
     layer: LAYER.panel,
     tint: RECESS,
     flag: FLAG.lit,
@@ -176,7 +182,7 @@ function housing(
     key,
     -HOUSING_LABEL_HALF,
     HOUSING_LABEL_HALF,
-    HOUSING_DEPTH + 0.001,
+    HOUSING_DEPTH,
     h0,
     h1,
     { tint: [1, 1, 1], flag: FLAG.emissive },
@@ -262,7 +268,9 @@ function sliding(st: Style) {
     });
   }
   if (sealed) {
-    k.panel(-0.4, 0.4, SLIDE_D1 + 0.018, 0.9, 1.3, s.hazard, 0.8, 0.4);
+    // Over the pull recesses, the frontmost faces of the leaves.
+    const d = SLIDE_D1 + 0.015 + DECAL_LIFT;
+    k.panel(-0.4, 0.4, d, 0.9, 1.3, s.hazard, 0.8, 0.4);
   }
   label(
     k,
@@ -322,7 +330,7 @@ function bulkhead(st: Style) {
     h0 + (2 * BULK_LABEL_HALF) / ASPECT.label,
     BULK_LINTEL - BULK_LABEL_MARGIN,
   );
-  textPanel(k, ctx, key, -BULK_LABEL_HALF, BULK_LABEL_HALF, t + 0.001, h0, h1, {
+  textPanel(k, ctx, key, -BULK_LABEL_HALF, BULK_LABEL_HALF, t, h0, h1, {
     tint: [1, 1, 1],
     flag: FLAG.emissive,
   });
@@ -383,7 +391,7 @@ function bulkhead(st: Style) {
     k.panel(
       -0.4,
       0.4,
-      BULK_D1 + EDGE_D + 0.002,
+      BULK_D1 + EDGE_D + DECAL_LIFT,
       0.62,
       0.98,
       s.hazard,
@@ -460,7 +468,7 @@ function blast(st: Style) {
       m.panel(
         -w + 0.05,
         w - 0.05,
-        LEAF_D1 + 0.001,
+        LEAF_D1 + DECAL_LIFT,
         h0 + 0.03,
         h1 - 0.03,
         s.hazard,

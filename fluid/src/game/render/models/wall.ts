@@ -13,7 +13,7 @@
 
 import type { Fixture } from "../../world/types";
 import { FLAG } from "../geometry";
-import { frameForSlot, type Kit } from "../kit";
+import { DECAL_LIFT, frameForSlot, type Kit } from "../kit";
 import { ASPECT } from "../layers";
 import type { Rgb } from "../looks";
 import {
@@ -61,7 +61,7 @@ export function buildPoster(
     `poster:${index}`,
     -SHEET_HALF,
     SHEET_HALF,
-    POSTER_D + 0.001,
+    POSTER_D,
     SHEET_BOTTOM,
     top,
     {
@@ -69,14 +69,14 @@ export function buildPoster(
       flag: FLAG.lit,
     },
   );
-  // A pin in each corner of the sheet.
+  // A pin in each corner of the sheet, standing proud of the lifted text.
   for (const a of [-SHEET_HALF + 0.03, SHEET_HALF - 0.05]) {
     for (const h of [SHEET_BOTTOM + 0.03, top - 0.05]) {
       k.bevelBox(
         a,
         a + 0.02,
         POSTER_D,
-        POSTER_D + 0.012,
+        POSTER_D + DECAL_LIFT + 0.012,
         h,
         h + 0.02,
         0.004,
@@ -123,7 +123,7 @@ export function buildPlacard(
     "placard",
     -PLAQUE_HALF,
     PLAQUE_HALF,
-    PLAQUE_D1 + 0.001,
+    PLAQUE_D1,
     PLAQUE_BOTTOM,
     top,
     {

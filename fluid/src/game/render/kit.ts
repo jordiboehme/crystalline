@@ -43,6 +43,22 @@ export interface Frame {
   inward: V3;
 }
 
+/**
+ * How far, in metres, a decal stands off the face it is laid on: every
+ * `panel` that shows text, a pictogram, a screen or a hazard stripe on top
+ * of a body, a plate or the wall, and every text panel of `textPanel`.
+ *
+ * The station draws with a near plane of 0.02 m into a 24-bit depth
+ * buffer, so the depth buffer's steps grow with the square of the
+ * distance: about 1 mm at 18 m, 10 mm at 58 m. A 1 mm lift lost that race
+ * from about 18 m on and the text flickered through its backing across a
+ * hub's hall; 10 mm holds to about 58 m, where a poster is a dozen pixels
+ * tall. It is also the one number the models test measures every decal
+ * against, so a new flush prop that forgets it fails there rather than on
+ * screen.
+ */
+export const DECAL_LIFT = 0.01;
+
 /** A point in a frame's local terms: `[a, d, h]`. */
 type Local = readonly [a: number, d: number, h: number];
 

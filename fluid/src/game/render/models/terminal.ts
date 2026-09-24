@@ -190,7 +190,7 @@ export function buildTerminal(
   k.box(-bw, bw, CRT_BODY, CRT_FRONT, s1, b1, s.body);
   k.box(-bw, -sw, CRT_BODY, CRT_FRONT, s0, s1, s.body);
   k.box(sw, bw, CRT_BODY, CRT_FRONT, s0, s1, s.body);
-  textPanel(k, ctx, `terminal:${index}`, -sw, sw, CRT_BODY + 0.005, s0, s1, {
+  textPanel(k, ctx, `terminal:${index}`, -sw, sw, CRT_BODY, s0, s1, {
     tint: [1, 1, 1],
     flag: FLAG.emissive,
   });

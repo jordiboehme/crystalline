@@ -21,7 +21,13 @@ import {
   type Surface,
   type V3,
 } from "./geometry";
-import { createKit, frameForDecor, frameForSlot, type Frame } from "./kit";
+import {
+  DECAL_LIFT,
+  createKit,
+  frameForDecor,
+  frameForSlot,
+  type Frame,
+} from "./kit";
 import { LOOKS } from "./looks";
 import {
   BLAST_DOWN_TRAVEL,
@@ -448,6 +454,71 @@ function floatingGlow(b: Built, wall: Frame | null): string[] {
     .map(({ p, i }) => `${i}:${p.method}`);
 }
 
+/** A unit vector along `p`. */
+const unit = (p: V3): V3 => scale(p, 1 / Math.hypot(...p));
+
+/** How much two ranges share; negative when they are apart. */
+const shared = (lo0: number, hi0: number, lo1: number, hi1: number) =>
+  Math.min(hi0, hi1) - Math.max(lo0, lo1);
+
+/** The least two faces must share each way to count as overlapping. */
+const OVERLAP = 1e-4;
+
+/**
+ * Every decal (a `panel` part: text, pictogram, screen or hazard stripe)
+ * that sits closer than `DECAL_LIFT` to a face it covers. A face counts
+ * when it faces the same way as the decal, lies within `DECAL_LIFT` of the
+ * decal's plane on either side and shares a patch of the decal's extent
+ * with it; for a wall fixture the wall plane counts too. Such a pair is
+ * what z-fights at a distance, so the list must be empty. Mover parts are
+ * measured where the door is closed.
+ */
+function sunkDecals(b: Built, wall: Frame | null): string[] {
+  const every = [...b.parts, ...b.moverParts.flat()];
+  const out: string[] = [];
+  every.forEach((decal, i) => {
+    if (decal.method !== "panel") return;
+    const [p0, p1, p2] = decal.points;
+    if (!p0 || !p1 || !p2) return;
+    const n = unit(cross(sub(p1, p0), sub(p2, p0)));
+    const u = unit(
+      Math.abs(n[1]) < 0.9 ? cross(n, [0, 1, 0]) : cross(n, [1, 0, 0]),
+    );
+    const v = cross(n, u);
+    const plane = dot(n, p0);
+    const span = (ps: readonly V3[], axis: V3) => {
+      const ds = ps.map((p) => dot(p, axis));
+      return [Math.min(...ds), Math.max(...ds)] as const;
+    };
+    const [u0, u1] = span(decal.points, u);
+    const [v0, v1] = span(decal.points, v);
+    if (wall && dot(n, wall.inward) > 0.999) {
+      const lift = Math.min(...decal.points.map((q) => toLocal(wall, q)[1]));
+      if (lift < DECAL_LIFT - 1e-6) out.push(`${i}:panel on the wall`);
+    }
+    every.forEach((face, j) => {
+      if (j === i) return;
+      const pts = face.points;
+      for (let t = 0; t + 2 < pts.length; t += 3) {
+        const [a, bb, c] = [pts[t], pts[t + 1], pts[t + 2]];
+        if (!a || !bb || !c) continue;
+        const g = cross(sub(bb, a), sub(c, a));
+        if (Math.hypot(...g) < 1e-9) continue;
+        if (dot(unit(g), n) < 0.999) continue;
+        const gap = plane - dot(n, a);
+        if (Math.abs(gap) >= DECAL_LIFT - 1e-6) continue;
+        const [fu0, fu1] = span([a, bb, c], u);
+        const [fv0, fv1] = span([a, bb, c], v);
+        if (shared(u0, u1, fu0, fu1) <= OVERLAP) continue;
+        if (shared(v0, v1, fv0, fv1) <= OVERLAP) continue;
+        out.push(`${i}:panel ${gap.toFixed(4)} m from ${j}:${face.method}`);
+        return;
+      }
+    });
+  });
+  return out;
+}
+
 describe("fixture models", () => {
   for (const side of SIDES) {
     const slot = slotOn(side);
@@ -485,6 +556,10 @@ describe("fixture models", () => {
 
         it("glows only on or in its body", () => {
           expect(floatingGlow(built, wall)).toEqual([]);
+        });
+
+        it("lifts every decal DECAL_LIFT off what it covers", () => {
+          expect(sunkDecals(built, wall)).toEqual([]);
         });
 
         it("asks for its own text key", () => {
@@ -616,6 +691,10 @@ describe("decor models", () => {
 
         it("glows only on or in its body", () => {
           expect(floatingGlow(built, null)).toEqual([]);
+        });
+
+        it("lifts every decal DECAL_LIFT off what it covers", () => {
+          expect(sunkDecals(built, null)).toEqual([]);
         });
 
         it("asks for no text", () => {
