@@ -242,7 +242,7 @@ describe("placeFromDetail inbound", () => {
     ]);
   });
 
-  it("deduplicates by address and keeps the first relation in page order", () => {
+  it("deduplicates by address and keeps the smallest relation", () => {
     const place = placeFromDetail({
       ...SOURCES,
       inbound: page(
@@ -255,10 +255,21 @@ describe("placeFromDetail inbound", () => {
       ),
     });
     expect(place.inbound.map((h) => [h.address.permalink, h.relType])).toEqual([
-      ["a", "supersedes"],
+      ["a", "links_to"],
       ["b", "links_to"],
     ]);
     expect(place.inboundTotal).toBe(3);
+  });
+
+  it("picks the same relation for one address whatever order the page lists it in", () => {
+    const relsFor = (hits: InboundRefHit[]) =>
+      placeFromDetail({ ...SOURCES, inbound: page(hits, 2) }).inbound.map(
+        (h) => h.relType,
+      );
+    const relates = hit("eng", "a", "relates_to");
+    const depends = hit("eng", "a", "depends_on");
+    expect(relsFor([relates, depends])).toEqual(["depends_on"]);
+    expect(relsFor([depends, relates])).toEqual(["depends_on"]);
   });
 
   it("gives no hatches and the detail's count without an inbound page", () => {

@@ -98,7 +98,6 @@ function compare(a: string, b: string): number {
 function placeReference(
   reference: EngramReference,
   resolve: WikilinkResolver,
-  titles: ReadonlyMap<string, string>,
   targetSalience: ReadonlyMap<string, number | null>,
 ): PlaceReference {
   const resolution = resolve(innerOf(reference.target));
@@ -136,7 +135,9 @@ function placeReference(
     ...base,
     resolved: true,
     address,
-    targetTitle: titles.get(key) ?? resolution.label,
+    // The resolver's label is the reading screen's label: the node's title,
+    // or the bracket text for a node that carries none.
+    targetTitle: resolution.label,
     targetSalience: targetSalience.get(key) ?? null,
   };
 }
@@ -145,15 +146,18 @@ function placeReference(
  * The hatches: the inbound page deduplicated by address, sorted by domain and
  * then permalink, and capped at `HATCH_CAP`.
  *
- * Deduplicated first, over the page's own order, so a source that points here
- * twice keeps the relation the server listed first. Sorted before the cap, so
- * which hatches make it does not depend on the order the page arrived in.
+ * A source that points here with more than one relation keeps the
+ * alphabetically smallest of them, not the one the page happened to list
+ * first, so a page that arrives in another order builds the same hatch. Sorted
+ * before the cap, so which hatches make it does not depend on that order
+ * either.
  */
 function hatchesOf(page: InboundRefPage): PlaceInbound[] {
   const seen = new Map<string, PlaceInbound>();
   for (const hit of page.hits) {
     const key = placeKeyOf(hit.domain, hit.permalink);
-    if (!seen.has(key)) {
+    const known = seen.get(key);
+    if (known === undefined || compare(hit.rel, known.relType) < 0) {
       seen.set(key, {
         address: { domain: hit.domain, permalink: hit.permalink },
         title: hit.title,
@@ -169,21 +173,19 @@ function hatchesOf(page: InboundRefPage): PlaceInbound[] {
 
 /**
  * Build the generator's input for one engram from the payloads the reading
- * screen already fetches. Pure and deterministic: the order of the graph's
- * nodes and of the inbound hits does not change the result.
+ * screen already fetches. Pure and deterministic: the order of the inbound
+ * hits never changes the result, and the order of the graph's nodes does not
+ * either as long as titles are unique within a domain. Two nodes sharing a
+ * title are told apart by the shared resolver, which keeps the first node it
+ * finds under that title, so for them the node order decides where a link
+ * written by title lands.
  */
 export function placeFromDetail(input: PlaceSources): PlaceInput {
   const { detail, graph, domains, inbound, targetSalience } = input;
   const resolve = buildWikilinkResolver(detail, graph ?? undefined, domains);
 
-  // Node titles by address, for the label of a located target.
-  const titles = new Map<string, string>();
-  for (const node of graph?.nodes ?? []) {
-    titles.set(placeKeyOf(node.domain, node.permalink), node.title);
-  }
-
   const map = (reference: EngramReference) =>
-    placeReference(reference, resolve, titles, targetSalience);
+    placeReference(reference, resolve, targetSalience);
 
   const { frontmatter } = detail;
   return {
