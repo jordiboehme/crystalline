@@ -6,50 +6,79 @@
  * `GAME_VERSION` gives the same room every time it is entered and the tests
  * can pin it byte for byte.
  *
- * The layout is deliberately plain for milestone 1: a rectangle of cells
- * whose far (north) wall carries the doors and then the portals, whose west
- * wall carries the terminals and whose east wall carries the machines, with
- * the entrance and its placard on the south wall. Fixtures stand on every
- * second cell so they never touch. The room grows until each wall fits its
- * fixtures, up to `ROOM_CAP` cells a side; a fixture that still finds no
- * slot on its own wall takes the next free one going round the room, and
- * one that finds none at all is left out (annex bays, which make room for
- * those, are milestone 2).
+ * The floor plan comes from `layout.ts`: a main hall sized by its doors,
+ * terminals and machines, a backlink corridor west of it past eight hatches,
+ * and overflow bays east of it for what the hall's walls cannot hold. The
+ * fixtures are then placed in this order, each asking the slot pool for the
+ * wall it belongs on:
  *
- * Every fixture's look comes from a seed of its own - a machine's from its
- * tag alone, so the same tag is the same machine in every room - and every
- * list is sorted before placement, so the order the API happened to return
- * things in never moves a door.
+ * 1. the placard, at the entrance;
+ * 2. doors for the outgoing relations, north;
+ * 3. portals for the prose wikilinks, north;
+ * 4. terminals for the `## ` sections, west;
+ * 5. machines for the tags, east;
+ * 6. hatches for the inbound references, south while there are eight or
+ *    fewer, in the corridor beyond;
+ * 7. posters for the observations, one per category, anywhere.
+ *
+ * A fixture whose wall is full takes any free slot of the hall and then of
+ * the bays; one that finds none at all is left out and counted in `dropped`.
+ *
+ * Every fixture's look comes from a seed keyed by a name - a door's or
+ * portal's target, a hatch's address, a poster's category, a terminal's
+ * heading and occurrence, a machine's tag alone, so the same tag is the same
+ * machine in every room - and every list is sorted before placement, so the
+ * order the API happened to return things in never moves a door.
+ *
+ * The hall also gets its archetype's furniture (see `decorFor`), and the
+ * grid is lit in blocks of four by four cells.
  */
 
 import { isRetired } from "../../lifecycle";
 import { createRng, seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
+import {
+  SOUTH_HATCHES,
+  createSlotPool,
+  isFloor,
+  planLayout,
+  type SlotPref,
+} from "./layout";
 import { sectionsOf } from "./sections";
-import type {
-  Archetype,
-  Condition,
-  DoorStyle,
-  Fixture,
-  LightSpecial,
-  LightZone,
-  MachineKind,
-  PlaceInput,
-  PlaceReference,
-  RoomSpec,
-  Side,
-  WallSlot,
+import {
+  HATCH_CAP,
+  type Archetype,
+  type Condition,
+  type Decor,
+  type DecorKind,
+  type DoorStyle,
+  type Fixture,
+  type LightSpecial,
+  type LightZone,
+  type MachineKind,
+  type PlaceAddress,
+  type PlaceInbound,
+  type PlaceInput,
+  type PlaceReference,
+  type Rect,
+  type RoomSpec,
+  type WallSlot,
 } from "./types";
 
 /** Metres per cell. */
 export const CELL = 2;
 
-/** The largest room, in cells a side. */
-export const ROOM_CAP = 24;
+/** How many observations a poster shows. */
+export const POSTER_LINES = 6;
 
-/** The smallest room, so even an empty engram is a room to stand in. */
-const MIN_WIDTH = 5;
-const MIN_DEPTH = 6;
+/** The poster category of an observation that names none. */
+export const NOTES = "NOTES";
+
+/** What a sealed way says: the target was never resolved. */
+export const NOT_FOUND = "?FILE NOT FOUND";
+
+/** What a sealed way says: resolved, but the graph did not locate it. */
+export const NO_ROUTE = "NO ROUTE";
 
 /** Cells a side of one light zone. */
 const LIGHT_BLOCK = 4;
@@ -128,34 +157,180 @@ function byTarget(a: PlaceReference, b: PlaceReference) {
   return ka < kb ? -1 : ka > kb ? 1 : 0;
 }
 
-/**
- * The free slots of a room, handed out wall by wall. Each wall offers every
- * second cell; `take` serves a wall's own slots first and then any free slot
- * going round north, east, south, west.
- */
-function slotPool(width: number, depth: number, reserved: WallSlot[]) {
-  const walls: Record<Side, WallSlot[]> = { n: [], e: [], s: [], w: [] };
-  for (let x = 1; x < width; x += 2) walls.n.push({ x, y: 0, side: "n" });
-  for (let y = 1; y < depth; y += 2)
-    walls.e.push({ x: width - 1, y, side: "e" });
-  for (let x = width - 2; x >= 0; x -= 2)
-    walls.s.push({ x, y: depth - 1, side: "s" });
-  for (let y = depth - 2; y >= 0; y -= 2) walls.w.push({ x: 0, y, side: "w" });
-  const used = new Set(reserved.map((s) => `${s.x},${s.y},${s.side}`));
-  const free = (s: WallSlot) => !used.has(`${s.x},${s.y},${s.side}`);
-  const order: Side[] = ["n", "e", "s", "w"];
-  return {
-    take(side: Side): WallSlot | null {
-      const own = walls[side].find(free);
-      const slot = own ?? order.flatMap((o) => walls[o]).find(free) ?? null;
-      if (slot !== null) used.add(`${slot.x},${slot.y},${slot.side}`);
-      return slot;
-    },
-  };
+function addressKey(a: PlaceAddress) {
+  return `${a.domain}\u0000${a.permalink}`;
 }
 
+function byAddress(a: PlaceInbound, b: PlaceInbound) {
+  const ka = addressKey(a.address);
+  const kb = addressKey(b.address);
+  return ka < kb ? -1 : ka > kb ? 1 : 0;
+}
+
+/**
+ * Where a reference leads and, when it leads nowhere, why: an unresolved
+ * target is not found, a resolved one the graph did not locate has no route.
+ * The address is kept only for a way that is open, so `sealedLabel` is null
+ * exactly when there is an address.
+ */
+function wayOf(ref: PlaceReference): {
+  address: PlaceAddress | null;
+  sealedLabel: string | null;
+} {
+  if (!ref.resolved) return { address: null, sealedLabel: NOT_FOUND };
+  if (ref.address === null) return { address: null, sealedLabel: NO_ROUTE };
+  return { address: ref.address, sealedLabel: null };
+}
+
+/**
+ * The observations as posters: one per category in order of first
+ * appearance, with up to `POSTER_LINES` of its observations. An observation
+ * without a category goes on the `NOTES` poster.
+ */
+function postersOf(place: PlaceInput): { category: string; lines: string[] }[] {
+  const posters = new Map<string, string[]>();
+  for (const o of place.observations) {
+    const category =
+      o.category === null || o.category.trim() === "" ? NOTES : o.category;
+    const lines = posters.get(category) ?? [];
+    if (lines.length < POSTER_LINES) lines.push(o.content);
+    posters.set(category, lines);
+  }
+  return [...posters].map(([category, lines]) => ({ category, lines }));
+}
+
+/** The placard: title, type, status, salience, validity and inbound overflow. */
+function placardLines(place: PlaceInput, inboundMore: number): string[] {
+  const lines = [
+    place.title,
+    `TYPE ${place.type ?? "-"}`,
+    `STATUS ${place.status ?? "-"}`,
+    `SALIENCE ${place.salience ?? "-"}`,
+  ];
+  if (place.validFrom !== null || place.validTo !== null) {
+    // An open end is left blank rather than written as a date: absent means
+    // always valid before, or valid forever after.
+    const range = [place.validFrom, "-", place.validTo].filter(
+      (part) => part !== null,
+    );
+    lines.push(`VALID ${range.join(" ")}`);
+  }
+  if (inboundMore > 0) lines.push(`+${inboundMore} MORE INBOUND`);
+  return lines;
+}
+
+/** Rounds a decor coordinate, so the golden is the same on every engine. */
+function round3(v: number) {
+  return Math.round(v * 1000) / 1000;
+}
+
+/**
+ * The archetype's furniture, placed in the hall's interior band: the hall
+ * without a two-cell margin on every side, which keeps the entrance lane
+ * and the doors on the north wall clear and every piece away from the wall
+ * fixtures. A hall whose band is smaller than three by three cells gets
+ * none. Positions follow `Decor`'s convention (continuous cell units, turn 0
+ * facing north with the first footprint dimension along `x`).
+ *
+ * - bridge: the command console across the hall's north third, and the
+ *   captain's chair behind it (south), both facing north;
+ * - council: a round table at the centre and six chairs round it, each
+ *   turned to face the table as near as a quarter turn allows;
+ * - engineering: a generator at the centre and two pipe runs on the ceiling
+ *   either side of it, along the hall's longer axis;
+ * - archive: rows of shelves two cells long across the width, every third
+ *   row, leaving a two-cell aisle up the centre that the entrance opens on;
+ * - lab: one island at the centre and a specimen tank in each north corner
+ *   of the band.
+ *
+ * A piece's seed is keyed by its kind and its index among pieces of that
+ * kind. That is safe here, unlike for fixtures, because how many pieces
+ * there are depends only on the hall's size, never on the content.
+ */
+function decorFor(archetype: Archetype, hall: Rect, roomSeed: number): Decor[] {
+  const band = {
+    x0: hall.x0 + 2,
+    x1: hall.x1 - 2,
+    y0: hall.y0 + 2,
+    y1: hall.y1 - 2,
+  };
+  if (band.x1 - band.x0 < 3 || band.y1 - band.y0 < 3) return [];
+  const cx = (hall.x0 + hall.x1) / 2;
+  const cy = (band.y0 + band.y1) / 2;
+  const out: Decor[] = [];
+  const counts = new Map<DecorKind, number>();
+  const put = (kind: DecorKind, x: number, y: number, turn: number) => {
+    const n = counts.get(kind) ?? 0;
+    counts.set(kind, n + 1);
+    out.push({
+      kind,
+      x: round3(x),
+      y: round3(y),
+      turn,
+      seed: seedFor(roomSeed, "decor", kind, n),
+    });
+  };
+  switch (archetype) {
+    case "bridge": {
+      const y = clamp((hall.y1 - hall.y0) / 3, band.y0 + 0.5, band.y1 - 1.75);
+      put("command-console", cx, y, 0);
+      put("captain-chair", cx, y + 1.25, 0);
+      break;
+    }
+    case "council": {
+      put("round-table", cx, cy, 0);
+      for (let k = 0; k < 6; k++) {
+        const angle = (k * Math.PI) / 3;
+        // Facing the table is facing back along the angle it sits at.
+        const turn = Math.round((angle + Math.PI) / (Math.PI / 2)) % 4;
+        put(
+          "council-chair",
+          cx + 1.25 * Math.sin(angle),
+          cy - 1.25 * Math.cos(angle),
+          turn,
+        );
+      }
+      break;
+    }
+    case "engineering": {
+      put("generator", cx, cy, 0);
+      const alongX = hall.x1 - hall.x0 >= hall.y1 - hall.y0;
+      for (const side of [-1.25, 1.25]) {
+        if (alongX) put("pipe-run", cx, cy + side, 0);
+        else put("pipe-run", cx + side, cy, 1);
+      }
+      break;
+    }
+    case "archive": {
+      const aisle = Math.floor(cx - 1);
+      for (let y = band.y0 + 0.5; y + 0.5 <= band.y1; y += 3) {
+        for (let x1 = aisle; x1 - 2 >= band.x0; x1 -= 2) {
+          put("shelf-row", x1 - 1, y, 0);
+        }
+        for (let x0 = aisle + 2; x0 + 2 <= band.x1; x0 += 2) {
+          put("shelf-row", x0 + 1, y, 0);
+        }
+      }
+      break;
+    }
+    case "lab": {
+      put("lab-island", cx, cy, 0);
+      put("specimen-tank", band.x0 + 0.5, band.y0 + 0.5, 0);
+      put("specimen-tank", band.x1 - 0.5, band.y0 + 0.5, 0);
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * The light zones of a grid: one per block of four by four cells that holds
+ * any floor, none over void alone. A zone's seed is keyed by its corner, not
+ * a running count, so a room that grows keeps the lights it already had.
+ */
 function lightsFor(
   roomSeed: number,
+  grid: readonly string[],
   width: number,
   depth: number,
   salience: number,
@@ -165,8 +340,12 @@ function lightsFor(
   const zones: LightZone[] = [];
   for (let y0 = 0; y0 < depth; y0 += LIGHT_BLOCK) {
     for (let x0 = 0; x0 < width; x0 += LIGHT_BLOCK) {
-      // Keyed by the zone's corner, not a running count, so a room that
-      // grows wider keeps the lights it already had.
+      const x1 = Math.min(width, x0 + LIGHT_BLOCK);
+      const y1 = Math.min(depth, y0 + LIGHT_BLOCK);
+      let floor = false;
+      for (let y = y0; y < y1 && !floor; y++)
+        for (let x = x0; x < x1 && !floor; x++) floor = isFloor(grid, x, y);
+      if (!floor) continue;
       const seed = seedFor(roomSeed, "light", x0, y0);
       const rng = createRng(seed);
       let level = base;
@@ -182,25 +361,18 @@ function lightsFor(
         const roll = rng.next();
         special = roll < 0.4 ? "failing" : roll < 0.7 ? "strobe" : "steady";
       }
-      zones.push({
-        x0,
-        y0,
-        x1: Math.min(width, x0 + LIGHT_BLOCK),
-        y1: Math.min(depth, y0 + LIGHT_BLOCK),
-        level,
-        special,
-        seed,
-      });
+      zones.push({ x0, y0, x1, y1, level, special, seed });
     }
   }
   return zones;
 }
 
-/** The room a place becomes. */
+/** The room a place becomes. See the module doc for the rules. */
 export function generateRoom(place: PlaceInput): RoomSpec {
   const seed = seedFor(GAME_VERSION, place.domain, place.permalink);
   const salience = clamp(place.salience ?? 3, 0, 10);
   const condition = conditionFor(place.status);
+  const archetype = archetypeFor(place.type);
   const sections = sectionsOf(place.content);
   const relations = place.relations
     .filter((r) => r.relType !== null)
@@ -210,31 +382,37 @@ export function generateRoom(place: PlaceInput): RoomSpec {
   const tags = [
     ...new Set(place.tags.map((t) => t.trim()).filter((t) => t !== "")),
   ].sort();
+  const inbound = place.inbound.slice().sort(byAddress).slice(0, HATCH_CAP);
+  const inboundMore = Math.max(0, place.inboundTotal - inbound.length);
+  const posters = postersOf(place);
+  const hatchesInCorridor = inbound.length > SOUTH_HATCHES;
 
-  const north = relations.length + links.length;
-  const sides = Math.max(sections.length, tags.length);
-  const width = clamp(2 * north + 1, MIN_WIDTH, ROOM_CAP);
-  const depth = clamp(2 * sides + 2, MIN_DEPTH, ROOM_CAP);
+  const layout = planLayout({
+    north: relations.length + links.length,
+    west: sections.length,
+    east: tags.length,
+    south: hatchesInCorridor ? 0 : inbound.length,
+    any: posters.length,
+    hatches: inbound.length,
+  });
+  const pool = createSlotPool(layout);
+  let dropped = 0;
+  const take = (pref: SlotPref): WallSlot | null => {
+    const slot = pool.take(pref);
+    if (slot === null) dropped++;
+    return slot;
+  };
 
-  const spawnX = Math.floor(width / 2);
-  const entrance: WallSlot = { x: spawnX, y: depth - 1, side: "s" };
-  const placardSlot: WallSlot = { x: spawnX - 1, y: depth - 1, side: "s" };
-  const pool = slotPool(width, depth, [entrance, placardSlot]);
   const fixtures: Fixture[] = [
     {
       kind: "placard",
-      slot: placardSlot,
-      lines: [
-        place.title,
-        `TYPE ${place.type ?? "-"}`,
-        `STATUS ${place.status ?? "-"}`,
-        `SALIENCE ${place.salience ?? "-"}`,
-      ],
+      slot: layout.placard,
+      lines: placardLines(place, inboundMore),
     },
   ];
 
   for (const r of relations) {
-    const slot = pool.take("n");
+    const slot = take("north");
     if (slot === null) continue;
     const relType = r.relType ?? "";
     fixtures.push({
@@ -243,44 +421,45 @@ export function generateRoom(place: PlaceInput): RoomSpec {
       style: doorStyleFor(r.targetSalience),
       relType,
       label: `${relType} ${r.targetTitle ?? r.target.target}`,
-      target: r.target.target,
+      ...wayOf(r),
       seed: seedFor(seed, "door", targetKey(r)),
     });
   }
   for (const l of links) {
-    const slot = pool.take("n");
+    const slot = take("north");
     if (slot === null) continue;
+    const way = wayOf(l);
     fixtures.push({
       kind: "portal",
       slot,
-      label: l.resolved
-        ? (l.targetTitle ?? l.target.target)
-        : "?FILE NOT FOUND",
-      target: l.target.target,
+      label: l.targetTitle ?? l.target.target,
+      address: way.address,
       crossDomain: l.target.domain !== null && l.target.domain !== place.domain,
-      sealed: !l.resolved,
+      sealedLabel: way.sealedLabel,
       seed: seedFor(seed, "portal", targetKey(l)),
     });
   }
   // A terminal's seed is its heading plus how many sections of the same
   // heading came before it, never its position, so a section inserted
-  // above leaves the terminals below it as they were.
+  // above leaves the terminals below it as they were. The same occurrence
+  // count is what the CRT reader finds the section by.
   const headingsSeen = new Map<string, number>();
   for (const s of sections) {
     const nth = headingsSeen.get(s.heading) ?? 0;
     headingsSeen.set(s.heading, nth + 1);
-    const slot = pool.take("w");
+    const slot = take("west");
     if (slot === null) continue;
     fixtures.push({
       kind: "terminal",
       slot,
       heading: s.heading,
       lines: s.lines,
+      section: nth,
       seed: seedFor(seed, "terminal", s.heading, nth),
     });
   }
   for (const tag of tags) {
-    const slot = pool.take("e");
+    const slot = take("east");
     if (slot === null) continue;
     fixtures.push({
       kind: "machine",
@@ -291,6 +470,28 @@ export function generateRoom(place: PlaceInput): RoomSpec {
       seed: seedFor(seed, "tag", tag),
     });
   }
+  for (const h of inbound) {
+    const slot = take(hatchesInCorridor ? "corridor" : "south");
+    if (slot === null) continue;
+    fixtures.push({
+      kind: "hatch",
+      slot,
+      label: `${h.title} ${h.relType}`,
+      address: h.address,
+      seed: seedFor(seed, "hatch", h.address.domain, h.address.permalink),
+    });
+  }
+  for (const p of posters) {
+    const slot = take("any");
+    if (slot === null) continue;
+    fixtures.push({
+      kind: "poster",
+      slot,
+      category: p.category,
+      lines: p.lines,
+      seed: seedFor(seed, "poster", p.category),
+    });
+  }
 
   return {
     version: GAME_VERSION,
@@ -298,13 +499,25 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     domain: place.domain,
     permalink: place.permalink,
     title: place.title,
-    archetype: archetypeFor(place.type),
+    archetype,
     condition,
-    width,
-    depth,
+    width: layout.width,
+    depth: layout.depth,
+    grid: layout.grid,
+    hall: layout.hall,
     ceiling: Math.round((3 + salience * 0.2) * 100) / 100,
-    spawn: { x: spawnX, y: depth - 1, yaw: 0 },
+    spawn: { x: layout.entrance.x, y: layout.entrance.y, yaw: 0 },
     fixtures,
-    lights: lightsFor(seed, width, depth, salience, condition),
+    decor: decorFor(archetype, layout.hall, seed),
+    lights: lightsFor(
+      seed,
+      layout.grid,
+      layout.width,
+      layout.depth,
+      salience,
+      condition,
+    ),
+    dropped,
+    inboundMore,
   };
 }

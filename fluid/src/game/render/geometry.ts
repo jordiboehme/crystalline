@@ -404,7 +404,7 @@ function fixture(
         0.08,
         0.1,
         2.55,
-        fx.sealed
+        fx.sealedLabel !== null
           ? { layer: LAYER.hazard, tint: p.metal, flag: FLAG.lit }
           : { layer: LAYER.portal, tint: colour, flag: FLAG.portal },
         1.7,
@@ -473,6 +473,40 @@ function fixture(
       );
       break;
     }
+    case "hatch": {
+      // Stopgap until the modelling kit: a hazard-striped panel low on the
+      // wall and its label above it.
+      localPanel(b, f, -0.5, 0.5, 0.02, 0.2, 1.2, {
+        layer: LAYER.hazard,
+        tint: p.metal,
+        flag: FLAG.lit,
+      });
+      localPanel(
+        b,
+        f,
+        -0.9,
+        0.9,
+        0.021,
+        1.3,
+        1.3 + 1.8 / ASPECT.label,
+        text(`hatch:${index}`, FLAG.emissive, [1, 1, 1]),
+      );
+      break;
+    }
+    case "poster": {
+      // Stopgap until the modelling kit: a flat sheet on the wall.
+      localPanel(
+        b,
+        f,
+        -0.5,
+        0.5,
+        0.02,
+        1.2,
+        1.2 + 1 / ASPECT.placard,
+        text(`poster:${index}`, FLAG.lit, p.panel),
+      );
+      break;
+    }
     case "placard": {
       localPanel(
         b,
@@ -495,31 +529,57 @@ function fixture(
  * of a room under construction, and every fixture. Text quads take their
  * layer from `textRequests`, request `i` in layer `TEXT_BASE + i`. Pure and
  * deterministic: the same room and look give the same floats.
+ *
+ * Stopgap until the grid mesh: the shell is the main hall's rectangle only
+ * (`room.hall`), so a room with bays or a corridor shows their fixtures
+ * outside its walls. The mesh built per floor cell replaces this.
  */
 export function buildRoomMesh(room: RoomSpec, look: Look): MeshData {
   const b = createBuilder();
   const p = look.palette;
-  const W = room.width * CELL;
-  const D = room.depth * CELL;
+  const X0 = room.hall.x0 * CELL;
+  const Z0 = room.hall.y0 * CELL;
+  const W = room.hall.x1 * CELL;
+  const D = room.hall.y1 * CELL;
   const H = room.ceiling;
   const wall: Surface = { layer: LAYER.panel, tint: p.panel, flag: FLAG.lit };
+  const w = W - X0;
+  const d = D - Z0;
 
   // Floor (facing up) and ceiling (facing down), uv in metres.
-  b.quad([0, 0, D], [W, 0, D], [W, 0, 0], [0, 0, 0], [0, 1, 0], W, D, {
+  b.quad([X0, 0, D], [W, 0, D], [W, 0, Z0], [X0, 0, Z0], [0, 1, 0], w, d, {
     layer: LAYER.floor,
     tint: p.floor,
     flag: FLAG.lit,
   });
-  b.quad([0, H, 0], [W, H, 0], [W, H, D], [0, H, D], [0, -1, 0], W, D, {
+  b.quad([X0, H, Z0], [W, H, Z0], [W, H, D], [X0, H, D], [0, -1, 0], w, d, {
     layer: LAYER.ceiling,
     tint: p.ceiling,
     flag: FLAG.lit,
   });
   // The four walls, facing in.
-  b.quad([0, 0, 0], [W, 0, 0], [W, H, 0], [0, H, 0], [0, 0, 1], W, H, wall);
-  b.quad([W, 0, D], [0, 0, D], [0, H, D], [W, H, D], [0, 0, -1], W, H, wall);
-  b.quad([0, 0, D], [0, 0, 0], [0, H, 0], [0, H, D], [1, 0, 0], D, H, wall);
-  b.quad([W, 0, 0], [W, 0, D], [W, H, D], [W, H, 0], [-1, 0, 0], D, H, wall);
+  b.quad(
+    [X0, 0, Z0],
+    [W, 0, Z0],
+    [W, H, Z0],
+    [X0, H, Z0],
+    [0, 0, 1],
+    w,
+    H,
+    wall,
+  );
+  b.quad([W, 0, D], [X0, 0, D], [X0, H, D], [W, H, D], [0, 0, -1], w, H, wall);
+  b.quad(
+    [X0, 0, D],
+    [X0, 0, Z0],
+    [X0, H, Z0],
+    [X0, H, D],
+    [1, 0, 0],
+    d,
+    H,
+    wall,
+  );
+  b.quad([W, 0, Z0], [W, 0, D], [W, H, D], [W, H, Z0], [-1, 0, 0], d, H, wall);
 
   // One lamp panel in the middle of every light zone, just under the ceiling.
   for (const z of room.lights) {
@@ -546,29 +606,29 @@ export function buildRoomMesh(room: RoomSpec, look: Look): MeshData {
       flag: FLAG.lit,
     };
     b.quad(
-      [0, 0, 0.01],
-      [W, 0, 0.01],
-      [W, 0.3, 0.01],
-      [0, 0.3, 0.01],
+      [X0, 0, Z0 + 0.01],
+      [W, 0, Z0 + 0.01],
+      [W, 0.3, Z0 + 0.01],
+      [X0, 0.3, Z0 + 0.01],
       [0, 0, 1],
-      W,
+      w,
       0.3,
       hazard,
     );
     b.quad(
       [W, 0, D - 0.01],
-      [0, 0, D - 0.01],
-      [0, 0.3, D - 0.01],
+      [X0, 0, D - 0.01],
+      [X0, 0.3, D - 0.01],
       [W, 0.3, D - 0.01],
       [0, 0, -1],
-      W,
+      w,
       0.3,
       hazard,
     );
     const rng = createRng(room.seed);
     for (let i = 0; i < 2; i++) {
-      const x = rng.range(CELL * 1.5, W - CELL * 1.5);
-      const z = rng.range(CELL * 1.5, D - CELL * 1.5);
+      const x = rng.range(X0 + CELL * 1.5, W - CELL * 1.5);
+      const z = rng.range(Z0 + CELL * 1.5, D - CELL * 1.5);
       const s: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.lit };
       for (const [dx, dz] of [
         [-0.6, -0.6],

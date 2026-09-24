@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import golden from "./golden/bridge.json?raw";
-import { CANNED_BRIDGE } from "./canned";
+import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
 import {
   MACHINE_KINDS,
-  ROOM_CAP,
   archetypeFor,
   conditionFor,
   doorStyleFor,
   generateRoom,
 } from "./generate";
-import type { Fixture, PlaceInput } from "./types";
+import { HALL_CAP, isFloor } from "./layout";
+import type { Fixture, PlaceInput, RoomSpec } from "./types";
 
 function kinds(fixtures: Fixture[]) {
   return fixtures.map((f) => f.kind).sort();
@@ -63,28 +63,57 @@ describe("doorStyleFor", () => {
 describe("generateRoom on the canned bridge", () => {
   const room = generateRoom(CANNED_BRIDGE);
 
-  it("holds what milestone 1 asks for", () => {
+  it("holds milestone 1's fixtures plus a poster and a hatch", () => {
     expect(room.archetype).toBe("bridge");
     expect(room.condition).toBe("clean");
     expect(kinds(room.fixtures)).toEqual(
       [
         "door",
         "door",
+        "hatch",
         "machine",
         "machine",
         "placard",
         "portal",
+        "poster",
         "terminal",
         "terminal",
       ].sort(),
     );
+    expect(room.dropped).toBe(0);
+    expect(room.inboundMore).toBe(0);
   });
 
   it("gives the low-salience target a sliding door and the high one a blast door", () => {
     const doors = room.fixtures.filter((f) => f.kind === "door");
-    expect(doors.map((d) => [d.target, d.style])).toEqual([
+    expect(doors.map((d) => [d.address?.permalink, d.style])).toEqual([
       ["old-bridge", "sliding"],
       ["reactor-core", "blast"],
+    ]);
+    expect(doors.every((d) => d.sealedLabel === null)).toBe(true);
+  });
+
+  it("leads its hatch back to the engram that points here", () => {
+    const hatch = room.fixtures.find((f) => f.kind === "hatch");
+    expect(hatch?.kind === "hatch" && hatch.address).toEqual({
+      domain: "station",
+      permalink: "crew-handbook",
+    });
+  });
+
+  it("numbers each terminal's section by its heading's occurrence", () => {
+    const room = generateRoom({
+      ...CANNED_BRIDGE,
+      content: "## Notes\none\n## Log\nx\n## Notes\ntwo\n",
+    });
+    expect(
+      room.fixtures.flatMap((f) =>
+        f.kind === "terminal" ? [[f.heading, f.section]] : [],
+      ),
+    ).toEqual([
+      ["Notes", 0],
+      ["Log", 0],
+      ["Notes", 1],
     ]);
   });
 
@@ -93,32 +122,199 @@ describe("generateRoom on the canned bridge", () => {
     expect(portal?.kind === "portal" && portal.crossDomain).toBe(true);
   });
 
-  it("never puts two fixtures in one slot and keeps every slot inside the room", () => {
-    const keys = room.fixtures.map(slotKey);
-    expect(new Set(keys).size).toBe(keys.length);
-    for (const f of room.fixtures) {
-      expect(f.slot.x).toBeGreaterThanOrEqual(0);
-      expect(f.slot.x).toBeLessThan(room.width);
-      expect(f.slot.y).toBeGreaterThanOrEqual(0);
-      expect(f.slot.y).toBeLessThan(room.depth);
-    }
+  it("never puts two fixtures in one slot and keeps every slot on a floor cell", () => {
+    expectSlotsSound(room);
   });
 
   it("matches the committed golden byte for byte", () => {
     expect(JSON.stringify(room, null, 2) + "\n").toBe(golden);
   });
 
-  it("covers every cell with exactly one light zone", () => {
-    const covered = new Map<string, number>();
-    for (const z of room.lights) {
-      for (let y = z.y0; y < z.y1; y++)
-        for (let x = z.x0; x < z.x1; x++) {
-          const k = `${x},${y}`;
-          covered.set(k, (covered.get(k) ?? 0) + 1);
-        }
+  it("covers every floor cell with exactly one light zone", () => {
+    expectLightsCoverFloor(room);
+  });
+
+  it("is a plain hall with the entrance at its south wall", () => {
+    expect(room.grid).toEqual(Array.from({ length: 6 }, () => "......."));
+    expect(room.hall).toEqual({ x0: 0, y0: 0, x1: 7, y1: 6 });
+    expect(room.spawn).toEqual({ x: 3, y: 5, yaw: 0 });
+  });
+});
+
+function expectSlotsSound(room: RoomSpec) {
+  const keys = room.fixtures.map(slotKey);
+  expect(new Set(keys).size).toBe(keys.length);
+  for (const f of room.fixtures) {
+    expect(isFloor(room.grid, f.slot.x, f.slot.y)).toBe(true);
+  }
+}
+
+function expectLightsCoverFloor(room: RoomSpec) {
+  const covered = new Map<string, number>();
+  for (const z of room.lights) {
+    let floor = 0;
+    for (let y = z.y0; y < z.y1; y++)
+      for (let x = z.x0; x < z.x1; x++) {
+        if (!isFloor(room.grid, x, y)) continue;
+        floor++;
+        const k = `${x},${y}`;
+        covered.set(k, (covered.get(k) ?? 0) + 1);
+      }
+    expect(floor).toBeGreaterThan(0);
+  }
+  const floorCells = room.grid
+    .join("")
+    .split("")
+    .filter((c) => c === ".");
+  expect(covered.size).toBe(floorCells.length);
+  expect([...covered.values()].every((n) => n === 1)).toBe(true);
+}
+
+/** Decor footprints in cells (metres / 2), first along x at turn 0. */
+const DECOR_SIZE: Record<string, [number, number]> = {
+  "command-console": [1.5, 0.5],
+  "captain-chair": [0.4, 0.4],
+  "round-table": [1.2, 1.2],
+  "council-chair": [0.35, 0.35],
+  generator: [1, 1],
+  "pipe-run": [0, 0],
+  "shelf-row": [2, 0.4],
+  "lab-island": [1.5, 0.7],
+  "specimen-tank": [0.45, 0.45],
+};
+
+describe("generateRoom on the canned hub", () => {
+  const room = generateRoom(CANNED_HUB);
+
+  it("grows a corridor and bays", () => {
+    expect(room.hall.x0).toBeGreaterThan(0);
+    expect(room.hall.x1 - room.hall.x0).toBe(HALL_CAP);
+    expect(room.width).toBeGreaterThan(room.hall.x1);
+    // The corridor: floor west of the hall on its last two rows only.
+    expect(isFloor(room.grid, 0, room.hall.y1 - 1)).toBe(true);
+    expect(isFloor(room.grid, 0, room.hall.y1 - 3)).toBe(false);
+  });
+
+  it("puts twenty-four hatches in the corridor and names the rest", () => {
+    const hatches = room.fixtures.filter((f) => f.kind === "hatch");
+    expect(hatches).toHaveLength(24);
+    expect(hatches.every((h) => h.slot.x < room.hall.x0)).toBe(true);
+    expect(room.inboundMore).toBe(276);
+    const placard = room.fixtures.find((f) => f.kind === "placard");
+    expect(placard?.kind === "placard" && placard.lines).toContain(
+      "+276 MORE INBOUND",
+    );
+  });
+
+  it("gives every placed fixture its own slot and counts the rest as dropped", () => {
+    expectSlotsSound(room);
+    const wanted = 1 + 20 + 2 + 4 + 40 + 24 + 3;
+    expect(room.fixtures.length + room.dropped).toBe(wanted);
+  });
+
+  it("covers exactly the floor cells with light zones", () => {
+    expectLightsCoverFloor(room);
+  });
+
+  it("keeps the decor of every archetype inside the hall's interior band", () => {
+    for (const type of [
+      "manifest",
+      "decision",
+      "runbook",
+      "reference",
+      "guide",
+    ]) {
+      const r = generateRoom({ ...CANNED_HUB, type });
+      expect(r.decor.length).toBeGreaterThan(0);
+      const band = {
+        x0: r.hall.x0 + 2,
+        x1: r.hall.x1 - 2,
+        y0: r.hall.y0 + 2,
+        y1: r.hall.y1 - 2,
+      };
+      for (const d of r.decor) {
+        const [w, h] = DECOR_SIZE[d.kind] ?? [0, 0];
+        const [hx, hy] = d.turn % 2 === 0 ? [w / 2, h / 2] : [h / 2, w / 2];
+        expect(d.x - hx).toBeGreaterThanOrEqual(band.x0 - 1e-9);
+        expect(d.x + hx).toBeLessThanOrEqual(band.x1 + 1e-9);
+        expect(d.y - hy).toBeGreaterThanOrEqual(band.y0 - 1e-9);
+        expect(d.y + hy).toBeLessThanOrEqual(band.y1 + 1e-9);
+        expect([0, 1, 2, 3]).toContain(d.turn);
+      }
     }
-    expect(covered.size).toBe(room.width * room.depth);
-    expect([...covered.values()].every((n) => n === 1)).toBe(true);
+  });
+
+  it("seats six council chairs round the table", () => {
+    const r = generateRoom({ ...CANNED_HUB, type: "decision" });
+    const count = (kind: string) =>
+      r.decor.filter((d) => d.kind === kind).length;
+    expect(count("round-table")).toBe(1);
+    expect(count("council-chair")).toBe(6);
+  });
+
+  it("leaves the aisle up from the entrance free of shelves", () => {
+    const r = generateRoom({ ...CANNED_HUB, type: "reference" });
+    const shelves = r.decor.filter((d) => d.kind === "shelf-row");
+    expect(shelves.length).toBeGreaterThan(0);
+    const x = r.spawn.x + 0.5;
+    for (const s of shelves)
+      expect(Math.abs(s.x - x)).toBeGreaterThanOrEqual(1);
+  });
+
+  it("drops what even four bays cannot hold", () => {
+    const r = generateRoom({
+      ...CANNED_HUB,
+      tags: Array.from({ length: 200 }, (_, i) => `many-${i}`),
+    });
+    expect(r.dropped).toBeGreaterThan(0);
+    expectSlotsSound(r);
+    const wanted = 1 + 20 + 2 + 4 + 200 + 24 + 3;
+    expect(r.fixtures.length + r.dropped).toBe(wanted);
+  });
+});
+
+describe("generateRoom decor", () => {
+  it("places none in a hall too small for it", () => {
+    expect(generateRoom(CANNED_BRIDGE).decor).toEqual([]);
+  });
+});
+
+describe("generateRoom sealed ways", () => {
+  const room = generateRoom(CANNED_HUB);
+  const door = (permalink: string) =>
+    room.fixtures.find((f) => f.kind === "door" && f.label.includes(permalink));
+
+  it("seals an unresolved target as not found and an unlocated one as no route", () => {
+    const lost = door("deck-18");
+    expect(lost?.kind === "door" && [lost.address, lost.sealedLabel]).toEqual([
+      null,
+      "?FILE NOT FOUND",
+    ]);
+    const unlocated = door("deck-19");
+    expect(
+      unlocated?.kind === "door" && [unlocated.address, unlocated.sealedLabel],
+    ).toEqual([null, "NO ROUTE"]);
+  });
+
+  it("keeps sealedLabel null exactly where there is an address", () => {
+    for (const f of room.fixtures) {
+      if (f.kind === "door" || f.kind === "portal") {
+        expect(f.sealedLabel === null).toBe(f.address !== null);
+      }
+    }
+  });
+
+  it("styles doors by target salience", () => {
+    const styles = new Map(
+      room.fixtures.flatMap((f) =>
+        f.kind === "door" && f.address !== null
+          ? [[f.address.permalink, f.style] as const]
+          : [],
+      ),
+    );
+    expect(styles.get("deck-02")).toBe("sliding");
+    expect(styles.get("deck-05")).toBe("bulkhead");
+    expect(styles.get("deck-09")).toBe("blast");
   });
 });
 
@@ -141,6 +337,80 @@ describe("generateRoom determinism", () => {
         b?.kind === "machine" && b.hue,
       );
     }
+  });
+
+  it("keeps the other hatches' seeds when an inbound reference is added", () => {
+    const seeds = (r: RoomSpec) =>
+      new Map(
+        r.fixtures.flatMap((f) =>
+          f.kind === "hatch" ? [[f.address.permalink, f.seed] as const] : [],
+        ),
+      );
+    const before = seeds(generateRoom(CANNED_BRIDGE));
+    const after = seeds(
+      generateRoom({
+        ...CANNED_BRIDGE,
+        inbound: [
+          {
+            address: { domain: "station", permalink: "airlock" },
+            title: "Airlock",
+            relType: "links_to",
+          },
+          ...CANNED_BRIDGE.inbound,
+        ],
+        inboundTotal: 2,
+      }),
+    );
+    expect(after.has("airlock")).toBe(true);
+    for (const [permalink, seed] of before) {
+      expect(after.get(permalink)).toBe(seed);
+    }
+  });
+
+  it("keeps the other posters' seeds when an observation category is added", () => {
+    const seeds = (r: RoomSpec) =>
+      new Map(
+        r.fixtures.flatMap((f) =>
+          f.kind === "poster" ? [[f.category, f.seed] as const] : [],
+        ),
+      );
+    const before = seeds(generateRoom(CANNED_BRIDGE));
+    const after = seeds(
+      generateRoom({
+        ...CANNED_BRIDGE,
+        observations: [
+          { category: "idea", content: "A window in the mess." },
+          ...CANNED_BRIDGE.observations,
+        ],
+      }),
+    );
+    expect(after.has("idea")).toBe(true);
+    for (const [category, seed] of before) {
+      expect(after.get(category)).toBe(seed);
+    }
+  });
+
+  it("gathers observations into one poster per category, notes for none", () => {
+    const room = generateRoom(CANNED_HUB);
+    expect(
+      room.fixtures.flatMap((f) =>
+        f.kind === "poster" ? [[f.category, f.lines.length]] : [],
+      ),
+    ).toEqual([
+      ["decision", 2],
+      ["warning", 1],
+      ["NOTES", 1],
+    ]);
+  });
+
+  it("orders hatches by address whatever order they arrive in", () => {
+    const reversed = generateRoom({
+      ...CANNED_HUB,
+      inbound: [...CANNED_HUB.inbound].reverse(),
+    });
+    expect(JSON.stringify(reversed)).toBe(
+      JSON.stringify(generateRoom(CANNED_HUB)),
+    );
   });
 
   it("gives the same tag the same machine in any room", () => {
@@ -241,7 +511,7 @@ describe("generateRoom determinism", () => {
 });
 
 describe("generateRoom limits", () => {
-  it("caps the room at 24 by 24 cells and still gives every placed fixture its own slot", () => {
+  it("caps the hall at 24 by 24 cells and still gives every placed fixture its own slot", () => {
     const tags = Array.from({ length: 60 }, (_, i) => `tag-${i}`);
     const relations = Array.from({ length: 30 }, (_, i) => ({
       relType: "relates_to",
@@ -252,10 +522,9 @@ describe("generateRoom limits", () => {
       targetSalience: null,
     }));
     const room = generateRoom({ ...CANNED_BRIDGE, tags, relations });
-    expect(room.width).toBeLessThanOrEqual(ROOM_CAP);
-    expect(room.depth).toBeLessThanOrEqual(ROOM_CAP);
-    const keys = room.fixtures.map(slotKey);
-    expect(new Set(keys).size).toBe(keys.length);
+    expect(room.hall.x1 - room.hall.x0).toBeLessThanOrEqual(HALL_CAP);
+    expect(room.hall.y1 - room.hall.y0).toBeLessThanOrEqual(HALL_CAP);
+    expectSlotsSound(room);
   });
 
   it("builds a bare room for an engram with nothing in it", () => {
@@ -266,6 +535,9 @@ describe("generateRoom limits", () => {
       content: "",
       relations: [],
       links: [],
+      inbound: [],
+      inboundTotal: 0,
+      observations: [],
     });
     expect(room.width).toBeGreaterThanOrEqual(5);
     expect(room.fixtures.map((f) => f.kind)).toEqual(["placard"]);
@@ -286,7 +558,35 @@ describe("generateRoom limits", () => {
       ],
     });
     const portal = room.fixtures.find((f) => f.kind === "portal");
-    expect(portal?.kind === "portal" && portal.sealed).toBe(true);
-    expect(portal?.kind === "portal" && portal.label).toBe("?FILE NOT FOUND");
+    expect(portal?.kind === "portal" && portal.address).toBeNull();
+    expect(portal?.kind === "portal" && portal.sealedLabel).toBe(
+      "?FILE NOT FOUND",
+    );
+  });
+
+  it("writes the validity and the inbound overflow on the placard", () => {
+    const placard = (p: PlaceInput) =>
+      generateRoom(p).fixtures.find((f) => f.kind === "placard");
+    const plain = placard(CANNED_BRIDGE);
+    expect(plain?.kind === "placard" && plain.lines).toEqual([
+      "Station Crystalline",
+      "TYPE manifest",
+      "STATUS stable",
+      "SALIENCE 7",
+    ]);
+    const dated = placard({
+      ...CANNED_BRIDGE,
+      validFrom: null,
+      validTo: "2027-01-01",
+      inboundTotal: 9,
+    });
+    expect(dated?.kind === "placard" && dated.lines.slice(4)).toEqual([
+      "VALID - 2027-01-01",
+      "+8 MORE INBOUND",
+    ]);
+    const open = placard({ ...CANNED_BRIDGE, validFrom: "2026-01-01" });
+    expect(open?.kind === "placard" && open.lines[4]).toBe(
+      "VALID 2026-01-01 -",
+    );
   });
 });

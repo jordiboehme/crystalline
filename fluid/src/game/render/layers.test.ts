@@ -11,7 +11,8 @@ describe("textRequests", () => {
   it("asks for one text layer per text-bearing fixture, placard first", () => {
     expect(requests[0]?.kind).toBe("placard");
     expect(requests.filter((r) => r.kind === "screen")).toHaveLength(2);
-    expect(requests.filter((r) => r.kind === "label")).toHaveLength(5);
+    expect(requests.filter((r) => r.kind === "label")).toHaveLength(6);
+    expect(requests.filter((r) => r.kind === "placard")).toHaveLength(2);
   });
 
   it("gives every request its own key", () => {

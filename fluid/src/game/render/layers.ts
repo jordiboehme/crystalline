@@ -55,7 +55,8 @@ export const ASPECT = { screen: 1.25, label: 6, placard: 1.4 } as const;
 /**
  * One piece of text to draw into a layer: a stable key naming the quad it
  * belongs to (`placard`, `terminal:<i>`, `door:<i>`, `portal:<i>`,
- * `tag:<i>` with `i` the fixture's index in `room.fixtures`), the kind of
+ * `hatch:<i>`, `tag:<i>`, `poster:<i>` with `i` the fixture's index in
+ * `room.fixtures`), the kind of
  * quad, which sets its aspect and style, and the lines to draw.
  */
 export interface TextRequest {
@@ -67,9 +68,10 @@ export interface TextRequest {
 /**
  * The text layers a room needs, in layer order: the placard first, then the
  * fixtures in `room.fixtures` order - a terminal gives a screen with its
- * heading on the first line, a door, a portal and a machine a one-line
- * label. The order is the contract: request `i` lives in layer
- * `TEXT_BASE + i`.
+ * heading on the first line, a door, a portal, a hatch and a machine a
+ * one-line label (a sealed door or portal says why it is sealed instead),
+ * and a poster a placard-shaped sheet with its category on the first line.
+ * The order is the contract: request `i` lives in layer `TEXT_BASE + i`.
  */
 export function textRequests(room: RoomSpec): TextRequest[] {
   const out: TextRequest[] = [];
@@ -87,10 +89,28 @@ export function textRequests(room: RoomSpec): TextRequest[] {
         });
         break;
       case "door":
-        out.push({ key: `door:${i}`, kind: "label", lines: [f.label] });
+        out.push({
+          key: `door:${i}`,
+          kind: "label",
+          lines: [f.sealedLabel ?? f.label],
+        });
         break;
       case "portal":
-        out.push({ key: `portal:${i}`, kind: "label", lines: [f.label] });
+        out.push({
+          key: `portal:${i}`,
+          kind: "label",
+          lines: [f.sealedLabel ?? f.label],
+        });
+        break;
+      case "hatch":
+        out.push({ key: `hatch:${i}`, kind: "label", lines: [f.label] });
+        break;
+      case "poster":
+        out.push({
+          key: `poster:${i}`,
+          kind: "placard",
+          lines: [f.category, ...f.lines],
+        });
         break;
       case "machine":
         out.push({ key: `tag:${i}`, kind: "label", lines: [f.tag] });

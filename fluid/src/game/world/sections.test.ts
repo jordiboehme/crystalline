@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { crtLines } from "../ui/crt";
 import { sectionsOf } from "./sections";
 
 describe("sectionsOf", () => {
@@ -40,5 +41,68 @@ describe("sectionsOf", () => {
 
   it("returns nothing for a body without sections", () => {
     expect(sectionsOf("just text")).toEqual([]);
+  });
+
+  it("closes a fence only on the marker that opened it", () => {
+    const md = [
+      "## A",
+      "```",
+      "~~~",
+      "## inside backticks",
+      "~~~",
+      "```",
+      "## B",
+      "~~~",
+      "```",
+      "## inside tildes",
+      "```",
+      "~~~",
+      "## C",
+    ].join("\n");
+    expect(sectionsOf(md).map((s) => s.heading)).toEqual(["A", "B", "C"]);
+  });
+
+  it("finds the same headings and occurrences as the CRT reader", () => {
+    const md = [
+      "---",
+      "## not in frontmatter",
+      "---",
+      "## Notes",
+      "one",
+      "```js",
+      "## not in backticks",
+      "~~~",
+      "## still not",
+      "```",
+      "## **Bold** heading ##",
+      "~~~",
+      "```",
+      "## not in tildes",
+      "~~~",
+      "### Sub",
+      "## Notes",
+      "two",
+      "## Trailing #",
+    ].join("\n");
+    const fromSections = new Map<string, number>();
+    const ours = sectionsOf(md).map((s) => {
+      const nth = fromSections.get(s.heading) ?? 0;
+      fromSections.set(s.heading, nth + 1);
+      return [s.heading, nth] as const;
+    });
+    const { sections } = crtLines(md);
+    const theirs = [...sections.entries()]
+      .flatMap(([heading, at]) =>
+        at.map((line, nth) => ({ heading, nth, line })),
+      )
+      .sort((a, b) => a.line - b.line)
+      .map((e) => [e.heading, e.nth] as const);
+    expect(ours).toEqual(theirs);
+    expect(ours).toEqual([
+      ["Notes", 0],
+      ["**Bold** heading", 0],
+      ["Notes", 1],
+      ["Trailing", 0],
+    ]);
   });
 });

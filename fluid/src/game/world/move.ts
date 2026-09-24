@@ -7,6 +7,9 @@
  * frame rate.
  *
  * Collision is against the room's rectangle and against one box per fixture.
+ * For now that rectangle is the bounding box of the room's whole grid, void
+ * cells included: colliding with the grid's void cells comes with the per
+ * cell room mesh.
  * The two axes are resolved one after the other, which is what lets the
  * player slide along a wall instead of stopping dead when walking into it at
  * an angle.

@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "seed": 1019962908996269,
+  "version": 2,
+  "seed": 4969199804483884,
   "domain": "station",
   "permalink": "manifest",
   "title": "Station Crystalline",
@@ -8,6 +8,20 @@
   "condition": "clean",
   "width": 7,
   "depth": 6,
+  "grid": [
+    ".......",
+    ".......",
+    ".......",
+    ".......",
+    ".......",
+    "......."
+  ],
+  "hall": {
+    "x0": 0,
+    "y0": 0,
+    "x1": 7,
+    "y1": 6
+  },
   "ceiling": 4.4,
   "spawn": {
     "x": 3,
@@ -39,8 +53,12 @@
       "style": "sliding",
       "relType": "supersedes",
       "label": "supersedes The Old Bridge",
-      "target": "old-bridge",
-      "seed": 1144790679644866
+      "address": {
+        "domain": "station",
+        "permalink": "old-bridge"
+      },
+      "sealedLabel": null,
+      "seed": 1868917302888202
     },
     {
       "kind": "door",
@@ -52,8 +70,12 @@
       "style": "blast",
       "relType": "depends_on",
       "label": "depends_on Reactor Core",
-      "target": "reactor-core",
-      "seed": 1212656729200579
+      "address": {
+        "domain": "station",
+        "permalink": "reactor-core"
+      },
+      "sealedLabel": null,
+      "seed": 442472345378148
     },
     {
       "kind": "portal",
@@ -63,10 +85,13 @@
         "side": "n"
       },
       "label": "Cargo Manifest",
-      "target": "Cargo Manifest",
+      "address": {
+        "domain": "logistics",
+        "permalink": "cargo-manifest"
+      },
       "crossDomain": true,
-      "sealed": false,
-      "seed": 4609396990385548
+      "sealedLabel": null,
+      "seed": 8517280116312970
     },
     {
       "kind": "terminal",
@@ -80,7 +105,8 @@
         "Everything the crew learned while keeping the station alive.",
         "Decisions, runbooks and the odd warning about the reactor."
       ],
-      "seed": 2161236867691379
+      "section": 0,
+      "seed": 619261139462864
     },
     {
       "kind": "terminal",
@@ -94,7 +120,8 @@
         "Engineering questions go to the reactor deck.",
         "Cargo questions go through the portal to logistics."
       ],
-      "seed": 7631377307112311
+      "section": 0,
+      "seed": 1516193241575896
     },
     {
       "kind": "machine",
@@ -106,7 +133,7 @@
       "machine": "containment",
       "tag": "navigation",
       "hue": 196,
-      "seed": 8704530662821028
+      "seed": 7940395711040613
     },
     {
       "kind": "machine",
@@ -118,9 +145,37 @@
       "machine": "fabricator",
       "tag": "reactor",
       "hue": 152,
-      "seed": 7307759528063472
+      "seed": 8041629008444292
+    },
+    {
+      "kind": "hatch",
+      "slot": {
+        "x": 5,
+        "y": 5,
+        "side": "s"
+      },
+      "label": "Crew Handbook links_to",
+      "address": {
+        "domain": "station",
+        "permalink": "crew-handbook"
+      },
+      "seed": 8186061733817658
+    },
+    {
+      "kind": "poster",
+      "slot": {
+        "x": 6,
+        "y": 5,
+        "side": "e"
+      },
+      "category": "warning",
+      "lines": [
+        "The reactor runs hot for an hour after every jump."
+      ],
+      "seed": 8535066849268707
     }
   ],
+  "decor": [],
   "lights": [
     {
       "x0": 0,
@@ -129,7 +184,7 @@
       "y1": 4,
       "level": 220,
       "special": "steady",
-      "seed": 3296270800691091
+      "seed": 8101526731634864
     },
     {
       "x0": 4,
@@ -138,7 +193,7 @@
       "y1": 4,
       "level": 220,
       "special": "steady",
-      "seed": 2984858170967357
+      "seed": 1609555751484937
     },
     {
       "x0": 0,
@@ -147,7 +202,7 @@
       "y1": 6,
       "level": 220,
       "special": "steady",
-      "seed": 6291000386637734
+      "seed": 1584117278387558
     },
     {
       "x0": 4,
@@ -156,7 +211,9 @@
       "y1": 6,
       "level": 220,
       "special": "steady",
-      "seed": 6472859271415783
+      "seed": 4422568095028690
     }
-  ]
+  ],
+  "dropped": 0,
+  "inboundMore": 0
 }

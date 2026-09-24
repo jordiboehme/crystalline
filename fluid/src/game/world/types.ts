@@ -140,13 +140,35 @@ export type MachineKind =
   | "med-scanner"
   | "containment";
 
-/** Anything placed in a room. */
+/**
+ * Anything placed in a room.
+ *
+ * Every fixture stands in a wall slot and carries a seed of its own, keyed by
+ * a name (a target, a tag, an address, a category, a heading and its
+ * occurrence), never by its position in a list, so adding one thing leaves
+ * the others as they were.
+ *
+ * - A `terminal` shows a `## ` section: its heading, its first lines, and in
+ *   `section` how many sections of the same heading came before it, which is
+ *   how the CRT reader finds the right one of two equal headings.
+ * - A `door` is an outgoing relation and a `portal` a prose wikilink. Both
+ *   carry the place they open onto in `address`; when it is null the way is
+ *   sealed and `sealedLabel` says why: `?FILE NOT FOUND` for a target the
+ *   index did not resolve, `NO ROUTE` for one it resolved but the graph did
+ *   not locate. `sealedLabel` is null exactly when `address` is set.
+ * - A `hatch` is an inbound reference: it leads back to the engram that
+ *   points here, which is why it always has an address.
+ * - A `machine` is a tag, a `poster` the observations of one category, and
+ *   the `placard` at the entrance the frontmatter.
+ */
 export type Fixture =
   | {
       kind: "terminal";
       slot: WallSlot;
       heading: string;
       lines: string[];
+      /** The occurrence of this heading among the sections, from 0. */
+      section: number;
       seed: number;
     }
   | {
@@ -155,16 +177,24 @@ export type Fixture =
       style: DoorStyle;
       relType: string;
       label: string;
-      target: string;
+      address: PlaceAddress | null;
+      sealedLabel: string | null;
       seed: number;
     }
   | {
       kind: "portal";
       slot: WallSlot;
       label: string;
-      target: string;
+      address: PlaceAddress | null;
       crossDomain: boolean;
-      sealed: boolean;
+      sealedLabel: string | null;
+      seed: number;
+    }
+  | {
+      kind: "hatch";
+      slot: WallSlot;
+      label: string;
+      address: PlaceAddress;
       seed: number;
     }
   | {
@@ -175,7 +205,67 @@ export type Fixture =
       hue: number;
       seed: number;
     }
+  | {
+      kind: "poster";
+      slot: WallSlot;
+      category: string;
+      lines: string[];
+      seed: number;
+    }
   | { kind: "placard"; slot: WallSlot; lines: string[] };
+
+/**
+ * The free-standing furniture of each archetype: the command console and
+ * captain's chair of a bridge, the round table and chairs of a council
+ * chamber, the generator and ceiling pipe runs of an engineering bay, the
+ * shelf rows of an archive, and the island and specimen tanks of a lab.
+ */
+export type DecorKind =
+  | "command-console"
+  | "captain-chair"
+  | "round-table"
+  | "council-chair"
+  | "generator"
+  | "pipe-run"
+  | "shelf-row"
+  | "lab-island"
+  | "specimen-tank";
+
+/**
+ * A free-standing piece of furniture, centred on a floor point, turned by
+ * quarter turns.
+ *
+ * `x` and `y` are continuous cell units, not cell indices: the point
+ * `(x, y)` lies at `(x * CELL, y * CELL)` metres, so the centre of cell
+ * `(3, 4)` is `(3.5, 4.5)` and a piece centred on a cell border has a whole
+ * number there.
+ *
+ * At `turn` 0 a piece faces north (towards smaller `y`), and the first
+ * dimension of its footprint runs along `x` and the second along `y`. Each
+ * turn rotates it a quarter clockwise seen from above (north, east, south,
+ * west), so at turns 1 and 3 the two dimensions swap axes.
+ */
+export interface Decor {
+  kind: DecorKind;
+  /** East-west position of its centre, in cell units. */
+  x: number;
+  /** North-south position of its centre, in cell units. */
+  y: number;
+  /** 0-3 quarter turns clockwise from facing north. */
+  turn: number;
+  seed: number;
+}
+
+/**
+ * A rectangle of cells, `x1` and `y1` exclusive, in grid coordinates (the
+ * same convention as a light zone).
+ */
+export interface Rect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
 
 /** DOOM's light specials, the ones the station uses. */
 export type LightSpecial = "steady" | "glow" | "flicker" | "strobe" | "failing";
@@ -194,7 +284,15 @@ export interface LightZone {
   seed: number;
 }
 
-/** A room, ready to be meshed. */
+/**
+ * A room, ready to be meshed.
+ *
+ * The room is a grid of cells (see `world/layout.ts`): a main hall, and
+ * where the content needs them, overflow bays east of it and a backlink
+ * corridor west of it. `width` and `depth` are the grid's, `hall` is the
+ * main hall's rectangle inside it, and `grid` says per cell whether it is
+ * floor. Bays and the corridor share the hall's ceiling.
+ */
 export interface RoomSpec {
   version: number;
   seed: number;
@@ -203,14 +301,24 @@ export interface RoomSpec {
   title: string;
   archetype: Archetype;
   condition: Condition;
-  /** Cells east to west. */
+  /** Cells west to east, of the whole grid. */
   width: number;
-  /** Cells north to south. */
+  /** Cells north to south, of the whole grid. */
   depth: number;
+  /** One string per row, `"."` for floor and `" "` for void, each `width` long. */
+  grid: string[];
+  /** The main hall inside the grid; the entrance is on its south wall. */
+  hall: Rect;
   /** Ceiling height in metres. */
   ceiling: number;
   /** Where the player enters: a cell, facing into the room. */
   spawn: { x: number; y: number; yaw: number };
   fixtures: Fixture[];
+  /** The archetype's free-standing furniture, in the hall. */
+  decor: Decor[];
   lights: LightZone[];
+  /** How many fixtures found no wall slot and were left out. */
+  dropped: number;
+  /** Inbound references past the hatches, named on the placard. */
+  inboundMore: number;
 }
