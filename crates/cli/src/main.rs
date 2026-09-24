@@ -170,8 +170,9 @@ enum Command {
         #[command(subcommand)]
         command: OriginCommand,
     },
-    /// Show, set or reset an agent-adjustable setting (see the settings
-    /// registry, currently the `github.*` block).
+    /// Show, set or reset an instance setting: any key in the settings
+    /// registry, from `service.*` and `auth.*` to `github.*` and `recall.*`
+    /// (`config show` lists every one with its current value).
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -1619,6 +1620,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let cli = Cli::parse();
+    init_cli_tracing(cli.command.as_ref());
     match cli.command {
         None => {
             Cli::command().print_help()?;
@@ -4076,6 +4078,32 @@ async fn domain_remove_dispatch(
     .await?;
     cmd::print_domain_remove(&name, &report, json);
     Ok(())
+}
+
+/// Logging for every command that does not install its own: stderr only,
+/// since stdout carries `prompt system`'s routing block, hook output and data
+/// a caller parses, and filtered by `RUST_LOG` with a default of `warn`.
+///
+/// `serve` and `mcp` are left alone (`serve` is the only command that calls
+/// `crystalline_service::run_serve`, main.rs:1747): each installs its own subscriber (`info`
+/// and `warn` by default), and the first subscriber installed is the one that
+/// stays, so installing one here would cap the daemon's log and switch its
+/// `RUST_LOG` off. A lifecycle hook logs only when `RUST_LOG` asks for it: a
+/// hook with nothing to say must say nothing on either stream.
+fn init_cli_tracing(command: Option<&Command>) {
+    use tracing_subscriber::EnvFilter;
+    let filter = match command {
+        Some(Command::Serve { .. } | Command::Mcp { .. }) => return,
+        Some(Command::Hook { .. }) => match EnvFilter::try_from_default_env() {
+            Ok(filter) => filter,
+            Err(_) => return,
+        },
+        _ => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
 }
 
 fn run_verify(

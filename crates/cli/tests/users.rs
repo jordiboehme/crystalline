@@ -893,3 +893,50 @@ impl Drop for Holder {
         let _ = self.0.wait();
     }
 }
+
+/// RUST_LOG reaches the plain CLI: the credential sweep's debug line, silent
+/// by default, shows on stderr when asked for, and never on stdout.
+#[test]
+fn rust_log_reaches_the_cli_on_stderr_only() {
+    let home = tempfile::tempdir().unwrap();
+    // A name the account store takes and a GitHub identity cannot address,
+    // so the sweep takes its debug branch.
+    users_ok(
+        home.path(),
+        &["add", "ann+lee", "--role", "editor", "--password-stdin"],
+        Some("ann-password-1"),
+    );
+    users_ok(
+        home.path(),
+        &["add", "bob+lee", "--role", "editor", "--password-stdin"],
+        Some("bob-password-1"),
+    );
+
+    let mut quiet = bin();
+    isolate(&mut quiet, home.path());
+    let quiet = quiet
+        .env_remove("RUST_LOG")
+        .args(["users", "disable", "ann+lee"])
+        .output()
+        .unwrap();
+    assert!(quiet.status.success(), "{quiet:?}");
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("cannot address a credential"),
+        "the default filter is warn"
+    );
+
+    let mut loud = bin();
+    isolate(&mut loud, home.path());
+    let loud = loud
+        .env("RUST_LOG", "debug")
+        .args(["users", "disable", "bob+lee"])
+        .output()
+        .unwrap();
+    assert!(loud.status.success(), "{loud:?}");
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("cannot address a credential"),
+        "{}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&loud.stdout).contains("cannot address a credential"));
+}
