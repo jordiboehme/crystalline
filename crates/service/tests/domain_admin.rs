@@ -11,7 +11,7 @@ use crystalline_core::config::{
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
-use crystalline_service::params::{ListDomainsParams, ReadParams, SearchParams};
+use crystalline_service::params::{ListDomainsParams, ReadParams, SearchParams, ValidateParams};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -938,4 +938,85 @@ async fn adding_through_the_engine_sees_a_domain_registered_after_startup() {
         .await
         .unwrap();
     assert_eq!(report["adopted"], true, "{report}");
+}
+
+/// A new name is checked before anything touches the disk: the default folder
+/// is `<domains_root>/<name>`, so `../up` would otherwise create a folder
+/// beside the root before any refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_domain_name_is_checked_before_anything_touches_the_disk() {
+    let (tmp, engine) = engine().await;
+
+    let err = engine
+        .domain_add_local(Some("../up"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_service::engine::EngineError::Invalid(_)),
+        "{err}"
+    );
+    assert!(err.to_string().contains("cannot name a domain"), "{err}");
+    assert!(!tmp.path().join("up").exists(), "no folder beside the root");
+
+    let err = engine.domain_add_virtual("a b").await.unwrap_err();
+    assert!(
+        err.to_string().starts_with("'a b' cannot name a domain"),
+        "{err}"
+    );
+    assert!(!engine.config().domains.contains_key("a b"));
+}
+
+/// A name registered before the rules existed is adopted as it is: the
+/// decision runs first and only a new name is validated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grandfathered_name_is_re_added_without_error() {
+    let (tmp, engine) = engine().await;
+    let config_path = tmp.path().join("config.yaml");
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let dir = tmp.path().join("old notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST.replace("eng", "old")).unwrap();
+    file.domains
+        .insert("my notes".to_string(), DomainEntry::file(dir.clone()));
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    let report = engine
+        .domain_add_local(Some("my notes"), Some(dir.to_str().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(report["adopted"], true, "{report}");
+}
+
+/// validate_engrams reads the domain's `.crystalline.yaml` through the same
+/// loader `crystalline verify` does, so a typo there is reported the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_reports_a_verify_config_typo_as_m108() {
+    let (tmp, engine) = engine().await;
+    std::fs::write(
+        tmp.path().join("eng/.crystalline.yaml"),
+        "verify:\n  rules:\n    E007: of\n",
+    )
+    .unwrap();
+
+    let report = engine
+        .validate_engrams(
+            &ValidateParams {
+                domain: "eng".to_string(),
+                identifier: None,
+                engram_type: None,
+                drift: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let m108: Vec<_> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "M108")
+        .collect();
+    assert_eq!(m108.len(), 1, "{report}");
+    assert_eq!(m108[0]["path"], ".crystalline.yaml");
+    assert!(m108[0]["message"].as_str().unwrap().contains("'of'"));
 }

@@ -174,6 +174,12 @@ struct Inner {
     etag_counter: u64,
     commit_counter: u64,
     current_user: String,
+    /// What `default_branch` answers; `None` answers `main`, the branch every
+    /// fixture in this suite seeds. Set through `MockProvider::set_default_branch`.
+    default_branch: Option<String>,
+    /// Whether `default_branch` fails with `RemoteError::Offline`. Set through
+    /// `MockProvider::fail_default_branch`.
+    default_branch_fails: bool,
     /// Branches whose `branch_head` probe should fail with
     /// `RemoteError::Offline`, simulating a live network outage. Set through
     /// `MockProvider::fail_branch_head_offline`.
@@ -339,6 +345,17 @@ impl MockProvider {
                 ..Inner::default()
             }),
         }
+    }
+
+    /// Makes `default_branch` answer `branch`, for a repository whose default
+    /// is not `main`.
+    pub fn set_default_branch(&self, branch: &str) {
+        self.inner.lock().unwrap().default_branch = Some(branch.to_string());
+    }
+
+    /// Makes every `default_branch` call fail with `RemoteError::Offline`.
+    pub fn fail_default_branch(&self) {
+        self.inner.lock().unwrap().default_branch_fails = true;
     }
 
     /// Adds a commit built from repo-relative path to content pairs and
@@ -1063,6 +1080,17 @@ impl Provider for MockProvider {
 
     async fn current_user(&self) -> Result<String, RemoteError> {
         Ok(self.inner.lock().unwrap().current_user.clone())
+    }
+
+    async fn default_branch(&self, _repo: &str) -> Result<String, RemoteError> {
+        let inner = self.inner.lock().unwrap();
+        if inner.default_branch_fails {
+            return Err(RemoteError::Offline);
+        }
+        Ok(inner
+            .default_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string()))
     }
 
     fn commit_url(&self, origin: &OriginSpec, sha: &str) -> Option<String> {

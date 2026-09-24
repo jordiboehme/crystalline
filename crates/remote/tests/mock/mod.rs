@@ -1119,6 +1119,10 @@ impl Provider for MockProvider {
         Ok("mock-user".to_string())
     }
 
+    async fn default_branch(&self, _repo: &str) -> Result<String, RemoteError> {
+        Ok("main".to_string())
+    }
+
     fn commit_url(&self, origin: &OriginSpec, sha: &str) -> Option<String> {
         Some(format!("https://forge.test/{}/commit/{sha}", origin.repo))
     }

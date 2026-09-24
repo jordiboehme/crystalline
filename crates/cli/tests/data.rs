@@ -2036,3 +2036,166 @@ fn the_exit_a_damaged_index_refusal_prints_runs_end_to_end() {
         "the file domain rebuilt from its files: {search}"
     );
 }
+
+// --- domain add: adopt, conflict and name rules (issues 97 and 98) -----------
+
+/// A config holding one team domain `eng` at `root`, with the three keys a
+/// plain re-add used to drop. Written through the core's own serializer so the
+/// path is valid YAML on every platform.
+fn team_config(config: &Path, root: &Path) {
+    use crystalline_core::config::{DomainEntry, GlobalConfig, OriginConfig, ReviewMode};
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(std::fs::canonicalize(root).unwrap());
+    entry.origin = Some(OriginConfig {
+        repo: "acme/kb".to_string(),
+        path: None,
+        branch: Some("trunk".to_string()),
+        poll_secs: None,
+    });
+    entry.provision = Some(true);
+    entry.review = Some(ReviewMode::Overlay);
+    cfg.domains.insert("eng".to_string(), entry);
+    crystalline_core::config::save_yaml(config, &cfg).unwrap();
+}
+
+#[test]
+fn a_team_domain_re_added_without_origin_keeps_origin_provision_and_review() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    bin()
+        .args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+    let config = work.path().join("config.yaml");
+    team_config(&config, &root);
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    let out = bin()
+        .args(["--json", "domain", "add", "eng"])
+        .arg(&root)
+        .args(["--no-sync", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["adopted"], true, "{report}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        "the registration is left exactly as it was"
+    );
+}
+
+#[test]
+fn domain_add_refuses_a_name_registered_at_another_folder() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    let other = work.path().join("other");
+    for (dir, name) in [(&root, "eng"), (&other, "eng")] {
+        bin()
+            .args(["domain", "init"])
+            .arg(dir)
+            .args(["--name", name])
+            .assert()
+            .success();
+    }
+    let config = work.path().join("config.yaml");
+    team_config(&config, &root);
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    let out = bin()
+        .args(["domain", "add", "eng"])
+        .arg(&other)
+        .args(["--no-sync", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already registered at a different folder"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+}
+
+#[test]
+fn domain_add_refuses_a_bad_name_with_the_shared_message() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    bin()
+        .args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "kb"])
+        .assert()
+        .success();
+    let config = work.path().join("config.yaml");
+
+    let out = bin()
+        .args(["domain", "add", "a b"])
+        .arg(&root)
+        .args(["--no-sync", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("'a b' cannot name a domain: use letters"),
+        "the message the JSON API and add_domain give: {stderr}"
+    );
+
+    let out = bin()
+        .args(["domain", "add", "CON", "--virtual", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot name a domain"));
+}
+
+#[test]
+fn a_grandfathered_name_is_re_added_without_error() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("old notes");
+    bin()
+        .args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "old"])
+        .assert()
+        .success();
+    let config = work.path().join("config.yaml");
+    let mut cfg = crystalline_core::config::GlobalConfig::default();
+    cfg.domains.insert(
+        "my notes".to_string(),
+        crystalline_core::config::DomainEntry::file(std::fs::canonicalize(&root).unwrap()),
+    );
+    crystalline_core::config::save_yaml(&config, &cfg).unwrap();
+
+    bin()
+        .args(["domain", "add", "my notes"])
+        .arg(&root)
+        .args(["--no-sync", "--config"])
+        .arg(&config)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("already registered"));
+}
+
+#[test]
+fn domain_init_refuses_a_bad_name() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    let out = bin()
+        .args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "a/b"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot name a domain"));
+    assert!(!root.join("MANIFEST.md").exists(), "nothing scaffolded");
+}

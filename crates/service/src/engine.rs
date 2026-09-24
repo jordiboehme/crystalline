@@ -20,9 +20,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
+use crystalline_core::config::registration::{
+    Registration, RegistrationRequest, decide_registration, validate_domain_name,
+};
 use crystalline_core::config::{
-    DomainConfig, DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
-    ResponseFormat, ShareIdentityMode, VerifyConfig,
+    DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig, ResponseFormat,
+    ShareIdentityMode, VerifyConfig,
 };
 use crystalline_core::emit::{
     append_body, insert_after_section_reporting, insert_before_section, prepend_body,
@@ -11436,6 +11439,31 @@ impl Engine {
             }
         }
 
+        // The domain's own verify settings, checked the way `crystalline
+        // verify` checks them: a severity word it does not know, or a file
+        // that does not parse, is one M108 warning each. Only on a
+        // whole-domain run, since the file is about the domain and not about
+        // any one engram.
+        if p.identifier.is_none()
+            && let ContentSource::File { root } = &source
+        {
+            for problem in crystalline_core::verify::load_domain_config(root).problems {
+                let message = match &problem.fix {
+                    Some(fix) => format!("{} (fix: {fix})", problem.message),
+                    None => problem.message,
+                };
+                issues.push(json!({
+                    "permalink": Value::Null,
+                    "path": crystalline_core::verify::DOMAIN_CONFIG_FILE,
+                    "severity": crystalline_core::Severity::Warning,
+                    "kind": "M108",
+                    "field": Value::Null,
+                    "message": message,
+                    "line": Value::Null,
+                }));
+            }
+        }
+
         let mut response = json!({
             "domain": p.domain,
             "checked": checked,
@@ -14442,6 +14470,31 @@ impl Engine {
             ));
         }
 
+        // Against every registration this instance has, not the startup
+        // snapshot alone: a domain the CLI registered after this engine
+        // started is in the file and would otherwise be re-registered over,
+        // or handed a name derived as if it were free.
+        let mut cfg = self.config();
+        cfg.domains = self.registered_domain_entries();
+
+        if let Some(n) = name {
+            // An env-defined domain of this name is owned by its variable.
+            if let Some(env) = self.overlay.env_domain(n) {
+                return Err(EngineError::Conflict(format!(
+                    "domain '{n}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                    env.var
+                )));
+            }
+            // A name nothing holds is a new registration, and a new name is
+            // checked before anything touches the disk: the default folder is
+            // `<domains_root>/<name>`, so `../up` would otherwise be created
+            // beside the root before the refusal. A registered name is never
+            // re-checked here; the decision below adopts or refuses it.
+            if !cfg.domains.contains_key(n) {
+                validate_domain_name(n).map_err(EngineError::Invalid)?;
+            }
+        }
+
         // An explicit folder wins; otherwise a named domain lands under the
         // configured root at `<root>/<name>`.
         let root = match folder {
@@ -14458,46 +14511,22 @@ impl Engine {
             .map_err(|e| EngineError::Internal(format!("resolving {}: {e}", root.display())))?;
 
         // Decide the domain name and whether we adopt an existing registration.
-        // Against every registration this instance has, not the startup
-        // snapshot alone: a domain the CLI registered after this engine
-        // started is in the file and would otherwise be re-registered over,
-        // or handed a name derived as if it were free.
-        let (domain_name, adopted) = {
-            let mut cfg = self.config();
-            cfg.domains = self.registered_domain_entries();
-            match name {
-                Some(n) => {
-                    // An env-defined domain of this name is owned by its variable.
-                    if let Some(env) = self.overlay.env_domain(n) {
-                        return Err(EngineError::Conflict(format!(
-                            "domain '{n}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-                            env.var
-                        )));
-                    }
-                    match cfg.domains.get(n) {
-                        None => (n.to_string(), false),
-                        Some(entry) if entry.is_virtual() => {
-                            return Err(EngineError::Conflict(format!(
-                                "domain '{n}' is a virtual domain; pass a different name"
-                            )));
-                        }
-                        Some(entry) => match canonicalized_file_path(entry) {
-                            Some(p) if p == canonical => (n.to_string(), true),
-                            _ => {
-                                return Err(EngineError::Conflict(format!(
-                                    "domain '{n}' is already registered at a different folder; pass a different name or omit the folder to connect it in place"
-                                )));
-                            }
-                        },
-                    }
-                }
-                // No name: adopt an existing registration of this exact folder,
-                // else derive a fresh unique name from the folder basename.
-                None => match existing_file_domain_at(&canonical, &cfg) {
-                    Some(existing) => (existing.to_string(), true),
-                    None => (unique_domain_name(&canonical, &cfg), false),
-                },
-            }
+        let (domain_name, adopted) = match name {
+            Some(n) => match decide_registration(
+                n,
+                cfg.domains.get(n),
+                &RegistrationRequest::File { root: &canonical },
+            ) {
+                Registration::Adopt => (n.to_string(), true),
+                Registration::Register => (n.to_string(), false),
+                Registration::Conflict(msg) => return Err(EngineError::Conflict(msg)),
+            },
+            // No name: adopt an existing registration of this exact folder,
+            // else derive a fresh unique name from the folder basename.
+            None => match existing_file_domain_at(&canonical, &cfg) {
+                Some(existing) => (existing.to_string(), true),
+                None => (unique_domain_name(&canonical, &cfg), false),
+            },
         };
 
         // Create-or-adopt: scaffold a MANIFEST.md only when the folder lacks one.
@@ -14563,24 +14592,25 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let is_new = {
-            let cfg = self.config.read().unwrap();
-            if let Some(env) = self.overlay.env_domain(name) {
-                return Err(EngineError::Conflict(format!(
-                    "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-                    env.var
-                )));
-            }
-            match cfg.domains.get(name) {
-                None => true,
-                Some(entry) if entry.is_virtual() => false,
-                Some(_) => {
-                    return Err(EngineError::Conflict(format!(
-                        "domain '{name}' is a file domain; pass a different name"
-                    )));
+        if let Some(env) = self.overlay.env_domain(name) {
+            return Err(EngineError::Conflict(format!(
+                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                env.var
+            )));
+        }
+        // The same source this path always read (this instance's own
+        // config), not `registered_domain_entries()`: a discovered-only entry
+        // must not be adopted here without being written to the config.
+        let existing = self.config.read().unwrap().domains.get(name).cloned();
+        let is_new =
+            match decide_registration(name, existing.as_ref(), &RegistrationRequest::Virtual) {
+                Registration::Adopt => false,
+                Registration::Register => {
+                    validate_domain_name(name).map_err(EngineError::Invalid)?;
+                    true
                 }
-            }
-        };
+                Registration::Conflict(msg) => return Err(EngineError::Conflict(msg)),
+            };
 
         // Register before scaffolding: `scaffold_virtual_manifest` reads the
         // content source, which requires the domain to already be registered.
@@ -16624,7 +16654,8 @@ impl Engine {
     /// `domain` defaults to the repository's own name segment; `folder`
     /// defaults to `~/Documents/Crystalline/<domain>`. `path` is the
     /// subfolder within the repository that is the domain root (absent means
-    /// the repository root); `branch` defaults to `main`.
+    /// the repository root); `branch` defaults to the repository's default
+    /// branch, asked from the forge and recorded in the entry.
     ///
     /// Refuses with `github.enabled`'s message when collaboration is off,
     /// and with `EngineError::ReadOnly` on a read-only instance (this both
@@ -16678,11 +16709,18 @@ impl Engine {
             Some(d) => d.to_string(),
             None => origin::default_domain_name(repo),
         };
+        // A name nothing holds is a new registration: check it before the
+        // default folder is derived from it. A derived name passes by
+        // construction (`origin::default_domain_name`); an explicit one may
+        // not.
+        if self.domain_entry(&domain_name).is_err() {
+            validate_domain_name(&domain_name).map_err(EngineError::Invalid)?;
+        }
         // A registered name is adoptable when it is an origin-less file
         // domain and the caller does not point somewhere else: the origin
         // attaches to the existing root in place and local knowledge is
         // kept. Anything else stays a conflict.
-        let existing_root = match self.domain_entry(&domain_name) {
+        let existing = match self.domain_entry(&domain_name) {
             Err(_) => None,
             Ok(entry) => {
                 // An env-defined domain names the variable that owns it, so
@@ -16725,7 +16763,7 @@ impl Engine {
                         )));
                     }
                 }
-                Some(registered_root)
+                Some((registered_root, entry))
             }
         };
 
@@ -16755,26 +16793,39 @@ impl Engine {
             )));
         }
 
-        let adopts_registered = existing_root.is_some();
-        let root = match existing_root {
-            Some(r) => r,
-            None => match folder {
-                Some(f) => crystalline_core::config::expand_tilde(f),
-                None => {
-                    let domains_root = self.config.read().unwrap().domains_root();
-                    origin::default_domain_folder(&domains_root, &domain_name)
-                }
-            },
+        let adopts_registered = existing.is_some();
+        let (root, adopted_entry) = match existing {
+            Some((r, entry)) => (r, Some(entry)),
+            None => (
+                match folder {
+                    Some(f) => crystalline_core::config::expand_tilde(f),
+                    None => {
+                        let domains_root = self.config.read().unwrap().domains_root();
+                        origin::default_domain_folder(&domains_root, &domain_name)
+                    }
+                },
+                None,
+            ),
         };
-        let branch_name = branch.unwrap_or("main").to_string();
+        let provider = self.resolve_origin_provider()?;
+        // No branch named: ask the forge which branch the repository calls its
+        // default and record that, so the entry says what it tracks. Never a
+        // silent `main`: a repository whose default is `trunk` would track a
+        // branch that does not exist. A failed lookup refuses the add.
+        let branch_name = match branch {
+            Some(b) => b.to_string(),
+            None => provider
+                .default_branch(repo)
+                .await
+                .inspect_err(|e| self.drop_github_credential_on_auth(e))
+                .map_err(|e| default_branch_refusal(repo, e))?,
+        };
         let spec = OriginSpec {
             repo: repo.to_string(),
             subpath: path.map(str::to_string),
-            branch: branch_name,
+            branch: branch_name.clone(),
         };
         let state_dir = self.origin_state_dir(&domain_name)?;
-
-        let provider = self.resolve_origin_provider()?;
         progress_at(1, &format!("downloading {repo}"));
         let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir)
             .await
@@ -16793,6 +16844,16 @@ impl Engine {
         {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard);
+            // Adopting a registered domain keeps the decisions already made
+            // about it: whether its artifacts are provisioned, and whether it
+            // reviews changes. Read from the file when it holds the entry,
+            // else from the entry this call adopted.
+            let (provision, review) = file
+                .domains
+                .get(&domain_name)
+                .or(adopted_entry.as_ref())
+                .map(|e| (e.provision, e.review))
+                .unwrap_or((None, None));
             file.domains.insert(
                 domain_name.clone(),
                 DomainEntry {
@@ -16801,11 +16862,11 @@ impl Engine {
                     origin: Some(OriginConfig {
                         repo: repo.to_string(),
                         path: path.map(str::to_string),
-                        branch: branch.map(str::to_string),
+                        branch: Some(branch_name.clone()),
                         poll_secs: None,
                     }),
-                    provision: None,
-                    review: None,
+                    provision,
+                    review,
                 },
             );
             self.persist_config(&file)?;
@@ -16853,10 +16914,11 @@ impl Engine {
     /// Whether a registered domain's origin matches this connect request
     /// exactly, so a retry answers idempotently instead of re-connecting.
     /// GitHub treats owner/name case insensitively, so the repo compares that
-    /// way; the subpath compares exactly and an absent branch means main on
-    /// both sides; an omitted folder always matches, a given one must resolve
-    /// to the registered root. Shared by the pre-lock guard and the re-read
-    /// under the lock so both sites judge a match identically.
+    /// way; the subpath compares exactly, an absent requested branch matches
+    /// any stored one, and an absent stored branch means main; an omitted
+    /// folder always matches, a given one must resolve to the registered root.
+    /// Shared by the pre-lock guard and the re-read under the lock so both
+    /// sites judge a match identically.
     fn origin_matches_request(
         entry: &DomainEntry,
         origin_cfg: &OriginConfig,
@@ -16867,8 +16929,14 @@ impl Engine {
     ) -> bool {
         let same_repo = origin_cfg.repo.eq_ignore_ascii_case(repo);
         let same_path = origin_cfg.path.as_deref() == path;
-        let same_branch =
-            origin_cfg.branch.as_deref().unwrap_or("main") == branch.unwrap_or("main");
+        // No branch asked for matches whatever the entry tracks: a connect
+        // without one records the repository default it resolved, and a retry
+        // of that connect is the same request. A stored entry with no branch
+        // still means main, since it was written under that rule.
+        let same_branch = match branch {
+            None => true,
+            Some(b) => origin_cfg.branch() == b,
+        };
         let same_folder = match (folder, entry.file_path()) {
             (None, _) => true,
             (Some(f), Some(r)) => crystalline_core::config::expand_tilde(f) == r,
@@ -21371,20 +21439,18 @@ fn parse_rules(requested: &[String]) -> Result<Vec<&'static str>> {
     Ok(out)
 }
 
-/// A domain's verify overrides, read from the `.crystalline.yaml` at its root.
-/// A virtual domain has no root and therefore no overrides, so its engrams take
-/// the default budget.
+/// A domain's verify overrides, read from the `.crystalline.yaml` at its root
+/// through the loader `crystalline verify` uses, so a file that does not parse
+/// means no overrides here as there (validate reports it as `M108`). A virtual
+/// domain has no root and therefore no overrides, so its engrams take the
+/// default budget.
 fn domain_verify_config(source: &ContentSource) -> Option<VerifyConfig> {
     let ContentSource::File { root } = source else {
         return None;
     };
-    let path = root.join(".crystalline.yaml");
-    if !path.is_file() {
-        return None;
-    }
-    crystalline_core::config::load_yaml::<DomainConfig>(&path)
-        .ok()
-        .and_then(|c| c.verify)
+    crystalline_core::verify::load_domain_config(root)
+        .config
+        .verify
 }
 
 /// The approximate token budget for one engram, resolved exactly the way
@@ -21619,8 +21685,7 @@ fn lock_key(abs: &Path) -> String {
 }
 
 fn canonicalized_file_path(entry: &DomainEntry) -> Option<PathBuf> {
-    let path = entry.file_path()?;
-    Some(std::fs::canonicalize(&path).unwrap_or(path))
+    crystalline_core::config::registration::canonical_root(entry)
 }
 
 /// The name of the file domain already rooted at `canonical`, if any: the
@@ -21642,33 +21707,41 @@ fn name_taken_by_other(name: &str, canonical: &Path, cfg: &GlobalConfig) -> bool
     }
 }
 
+/// What a connect without a branch answers when the forge could not say which
+/// branch is the repository's default. An error about the connection itself
+/// (expired, missing, or blocked by an organization) passes through
+/// unchanged, since naming a branch fixes none of them and its own message
+/// names the fix; every other failure is refused with the way around it.
+/// Never a fall back to `main`.
+fn default_branch_refusal(repo: &str, e: RemoteError) -> EngineError {
+    match e {
+        RemoteError::AuthExpired
+        | RemoteError::NotConnected
+        | RemoteError::SsoAuthorizationRequired { .. }
+        | RemoteError::OauthAppRestricted { .. } => e.into(),
+        other => RemoteError::Refused(format!(
+            "could not read the default branch of {repo} ({other}), so nothing was added; \
+             name the branch to track (--branch on the command line, branch in add_domain \
+             and in the JSON API) and try again"
+        ))
+        .into(),
+    }
+}
+
 /// Derive a domain name from a folder's basename using the same slug rules as a
 /// permalink, falling back to `domain` for a basename that slugifies to nothing
 /// (a root path, or one made only of punctuation). Appends `-2`, `-3`... when
 /// the name is already registered to a different path, so a derived name never
-/// silently collides with an unrelated domain.
+/// silently collides with an unrelated domain, and the name always passes
+/// `validate_domain_name` (a folder called `CON` becomes `con-2`).
 fn unique_domain_name(canonical: &Path, cfg: &GlobalConfig) -> String {
     let basename = canonical
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| canonical.display().to_string());
-    let base = slugify(&basename);
-    let base = if base.is_empty() {
-        "domain".to_string()
-    } else {
-        base
-    };
-    if !name_taken_by_other(&base, canonical, cfg) {
-        return base;
-    }
-    let mut n = 2;
-    loop {
-        let candidate = format!("{base}-{n}");
-        if !name_taken_by_other(&candidate, canonical, cfg) {
-            return candidate;
-        }
-        n += 1;
-    }
+    crystalline_core::config::registration::derive_domain_name(&basename, |candidate| {
+        name_taken_by_other(candidate, canonical, cfg)
+    })
 }
 
 /// Every `.md` file under `root` as `(forward-slashed relative path, absolute

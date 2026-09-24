@@ -170,8 +170,9 @@ enum Command {
         #[command(subcommand)]
         command: OriginCommand,
     },
-    /// Show, set or reset an agent-adjustable setting (see the settings
-    /// registry, currently the `github.*` block).
+    /// Show, set or reset an instance setting: any key in the settings
+    /// registry, from `service.*` and `auth.*` to `github.*` and `recall.*`
+    /// (`config show` lists every one with its current value).
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -754,13 +755,14 @@ enum PromptKind {
     /// that read and write them.
     System {
         /// The workspace path to route for. Defaults to the current
-        /// directory. Scoping comes from the global config's `prompt.rules`:
-        /// each key is a path glob, and the include and exclude lists of
-        /// every rule whose glob matches this path decide which registered
-        /// domains are rendered. A workspace no rule matches gets every
-        /// registered domain. A `.crystalline.yaml` in the workspace does
-        /// not scope: its `preferred_domains` reorder what is rendered,
-        /// preferred first.
+        /// directory; a relative path is made absolute first. Scoping comes
+        /// from the global config's `prompt.rules`: each key is a path glob,
+        /// and the include and exclude lists of every rule whose glob matches
+        /// this path decide which registered domains are rendered. A key
+        /// ending in `/**` matches the folder itself as well as everything
+        /// under it. A workspace no rule matches gets every registered
+        /// domain. A `.crystalline.yaml` in the workspace does not scope: its
+        /// `preferred_domains` reorder what is rendered, preferred first.
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Render only these registered domains, in the configured
@@ -1041,8 +1043,15 @@ enum DomainCommand {
     /// subtree. A non-empty target folder, or a domain name that is already
     /// registered without an origin, connects in place: local files are kept
     /// and ones that differ from the repository become shareable local changes.
+    /// Adding a name that is already registered at the same folder (or as the
+    /// same virtual domain) changes nothing and indexes it again, so the
+    /// command is safe to repeat; a name registered at another folder or as
+    /// the other kind is refused, naming what holds it. A new name uses
+    /// letters, digits, hyphens, underscores and dots, 64 characters at most.
     Add {
-        /// The domain name used everywhere it is referenced.
+        /// The domain name used everywhere it is referenced. Adding a name
+        /// that is already registered here adopts it as it is; a new name
+        /// must follow the naming rule above.
         name: String,
         /// The domain root directory. Omitted for a virtual domain. For a
         /// file domain, defaults to <domains_root>/<name>
@@ -1060,7 +1069,7 @@ enum DomainCommand {
         #[arg(long)]
         origin: Option<String>,
         /// The branch to track. Only meaningful with --origin; defaults to
-        /// main.
+        /// the repository's default branch, asked from GitHub and recorded.
         #[arg(long)]
         branch: Option<String>,
         /// Register only; skip indexing (run `crystalline sync` later). Applies
@@ -1611,6 +1620,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let cli = Cli::parse();
+    init_cli_tracing(cli.command.as_ref());
     match cli.command {
         None => {
             Cli::command().print_help()?;
@@ -3426,7 +3436,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
                 _ => None,
             };
-            domain_add_dispatch(
+            let adopted = domain_add_dispatch(
                 name.clone(),
                 path,
                 is_virtual,
@@ -3439,6 +3449,14 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             )
             .await?;
             if let Some(owner) = closing {
+                // An adopted registration is somebody's existing domain, not a
+                // new one this command may close: making a shared domain
+                // private is its own decision, with its own verb.
+                if adopted {
+                    anyhow::bail!(
+                        "domain '{name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {name} private --owner {owner}"
+                    );
+                }
                 // The name is re-resolved against the config the registration
                 // just wrote rather than trusted as typed, which is what the
                 // REST path does by reading the engine's own report: a name
@@ -3814,7 +3832,7 @@ async fn domain_add_dispatch(
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if let Some(origin_spec) = origin {
         return domain_add_origin_dispatch(
             name,
@@ -3839,7 +3857,7 @@ async fn domain_add_dispatch(
                 "`domain add --virtual` takes no path; a virtual domain has no directory"
             );
         }
-        let markdown = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
         let scaffold = crystalline_service::scaffold_virtual_manifest(
             &name,
             &markdown,
@@ -3847,18 +3865,18 @@ async fn domain_add_dispatch(
             config.as_deref(),
         )
         .await?;
-        cmd::print_domain_add_virtual(&name, &scaffold, json);
-        return Ok(());
+        cmd::print_domain_add_virtual(&name, adopted, &scaffold, json);
+        return Ok(adopted);
     }
 
     // An absent path defaults to `<domains_root>/<name>` inside
     // `domain_add_register`, mirroring the MCP `add_domain` tool's default
     // placement; the resolved directory still needs a pre-scaffolded
     // MANIFEST.md either way.
-    let abs = cmd::domain_add_register(&name, path.as_deref(), config.as_deref())?;
+    let (abs, adopted) = cmd::domain_add_register(&name, path.as_deref(), config.as_deref())?;
     if no_sync {
-        cmd::print_domain_add_no_sync(&name, &abs, json);
-        return Ok(());
+        cmd::print_domain_add_no_sync(&name, &abs, adopted, json);
+        return Ok(adopted);
     }
 
     // Index over the daemon only when no explicit --config/--db override was
@@ -3884,8 +3902,8 @@ async fn domain_add_dispatch(
             cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
         };
 
-    cmd::print_domain_add(&name, &abs, &report, json);
-    Ok(())
+    cmd::print_domain_add(&name, &abs, adopted, &report, json);
+    Ok(adopted)
 }
 
 /// `domain add --origin`: connects a team domain to a GitHub repository
@@ -3906,7 +3924,7 @@ async fn domain_add_origin_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if is_virtual {
         anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
     }
@@ -3922,6 +3940,14 @@ async fn domain_add_origin_dispatch(
     };
     let folder_str = folder.as_ref().map(|p| p.display().to_string());
 
+    // Read before dispatching to the engine: a name already in the config
+    // file is an existing registration the origin connects to in place, not
+    // a new domain this command may close under `--private`.
+    let already_registered = cmd::load(config.as_deref())?
+        .file
+        .domains
+        .contains_key(&name);
+
     let data = crystalline_service::origin_add(
         &repo,
         Some(&name),
@@ -3933,7 +3959,12 @@ async fn domain_add_origin_dispatch(
     )
     .await?;
     cmd::print_origin_add(&repo, &data, json);
-    Ok(())
+    // Adopted when the name was already registered before this call (a
+    // shared origin-less domain connected in place) or the engine answers a
+    // retry with `already_connected`: either way `--private`'s caller must
+    // refuse rather than close an existing domain.
+    let already_connected = data["already_connected"].as_bool().unwrap_or(false);
+    Ok(already_registered || already_connected)
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one
@@ -4058,6 +4089,33 @@ async fn domain_remove_dispatch(
     .await?;
     cmd::print_domain_remove(&name, &report, json);
     Ok(())
+}
+
+/// Logging for every command that does not install its own: stderr only,
+/// since stdout carries `prompt system`'s routing block, hook output and data
+/// a caller parses, and filtered by `RUST_LOG` with a default of `warn`.
+///
+/// `serve` and `mcp` are left alone (`serve` is the only command that calls
+/// `crystalline_service::run_serve`, in the `Command::Serve` dispatch arm):
+/// each installs its own subscriber (`info` and `warn` by default), and the
+/// first subscriber installed is the one that stays, so installing one here
+/// would cap the daemon's log and switch its `RUST_LOG` off. A lifecycle
+/// hook logs only when `RUST_LOG` asks for it: a hook with nothing to say
+/// must say nothing on either stream.
+fn init_cli_tracing(command: Option<&Command>) {
+    use tracing_subscriber::EnvFilter;
+    let filter = match command {
+        Some(Command::Serve { .. } | Command::Mcp { .. }) => return,
+        Some(Command::Hook { .. }) => match EnvFilter::try_from_default_env() {
+            Ok(filter) => filter,
+            Err(_) => return,
+        },
+        _ => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
 }
 
 fn run_verify(

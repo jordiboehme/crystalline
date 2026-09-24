@@ -257,9 +257,14 @@ pub async fn run_serve(
     take_over: bool,
     exit_when_idle: bool,
 ) -> anyhow::Result<()> {
+    // RUST_LOG filters the daemon's log (the tracing `EnvFilter` syntax),
+    // `info` when it is unset or does not parse.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .try_init();
 
     // The single load chokepoint: parse the environment overlay, resolve the

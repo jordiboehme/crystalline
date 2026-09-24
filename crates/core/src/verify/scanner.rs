@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-use crate::config::{self, DomainConfig};
+use crate::config::DomainConfig;
 use crate::engram::Engram;
 use crate::parse::{self, ParseError};
 
@@ -46,6 +46,11 @@ pub(crate) struct Domain {
     /// The domain's `.crystalline.yaml`, or the default when absent or when
     /// `VerifyOptions::config_override` is set.
     pub config: DomainConfig,
+    /// What went wrong reading the domain's `.crystalline.yaml`, reported by
+    /// `run_rules` as `M108`. Always empty under
+    /// `VerifyOptions::config_override`, whose file the CLI already refuses
+    /// outright when it does not parse.
+    pub config_problems: Vec<super::ConfigProblem>,
 }
 
 /// An error scanning the given paths: a usage or IO failure, distinct from a
@@ -118,15 +123,11 @@ where
             });
         }
 
-        let domain_config = if let Some(over) = &options.config_override {
-            over.clone()
+        let (domain_config, config_problems) = if let Some(over) = &options.config_override {
+            (over.clone(), Vec::new())
         } else {
-            let cfg_path = root.join(".crystalline.yaml");
-            if cfg_path.is_file() {
-                config::load_yaml(&cfg_path).unwrap_or_default()
-            } else {
-                DomainConfig::default()
-            }
+            let load = super::load_domain_config(&root);
+            (load.config, load.problems)
         };
 
         domains.push(Domain {
@@ -135,6 +136,7 @@ where
             manifest_index,
             files: scanned,
             config: domain_config,
+            config_problems,
         });
     }
 

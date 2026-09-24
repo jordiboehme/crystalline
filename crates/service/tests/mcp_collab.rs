@@ -458,8 +458,15 @@ async fn hidden_write_collab_tools_route_to_read_only_when_enabled_and_read_only
     let (client, _server) = connect(eng).await;
     let peer = client.peer();
 
+    // Even a bare configure: a read-only instance shows its settings to
+    // nobody it serves, and the refusal says who reads them and how.
     let err = call(peer, "configure", json!({})).await.unwrap_err();
     assert!(err.contains("read-only"), "{err}");
+    assert!(
+        err.contains("does not show its configuration to connected agents"),
+        "{err}"
+    );
+    assert!(err.contains("crystalline config show"), "{err}");
 
     // add_domain refuses read-only in every mode: team (repo), local and virtual.
     let err = call(peer, "add_domain", json!({"repo": "acme/brand-knowledge"}))

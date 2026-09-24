@@ -6,6 +6,8 @@
 //! XDG-aware default paths. It computes paths only; there is no daemon logic
 //! here.
 
+pub mod registration;
+
 use std::path::{Path, PathBuf};
 
 use etcetera::BaseStrategy;

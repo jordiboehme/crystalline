@@ -18,10 +18,10 @@ crystalline connect github
 Bring a team repository in as a domain:
 
 ```sh
-crystalline domain add design --origin acme/design-knowledge --branch main
+crystalline domain add design --origin acme/design-knowledge
 ```
 
-`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository. The local folder defaults to `<domains_root>/<name>` (the domains root is `~/Documents/Crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool.
+`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository. The local folder defaults to `<domains_root>/<name>` (the domains root is `~/Documents/Crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool. Without `--branch` the domain tracks the repository's default branch, which is asked from GitHub once and written into the domain's entry.
 
 From there, `crystalline origin` covers the team domain lifecycle:
 
@@ -80,7 +80,7 @@ domains:
     origin:
       repo: acme/design-knowledge   # the GitHub repository, owner/name
       path: knowledge               # optional subfolder; absent means the repository root
-      branch: main                  # optional; absent means main
+      branch: main                  # optional; domain add writes the repository's default branch here; absent means main
       poll_secs: 600                # optional per-domain poll interval override
 github:
   enabled: true                     # turns team domains on; absent means off
@@ -117,5 +117,5 @@ flowchart LR
 
 None of this needs a second person to be worth using. A one-person instance may put a domain in review mode too: with the agent authenticating as its own person, agent and person share the same draft and the same GitHub identity, so an owner-and-agent pair gates nothing extra by default. Review mode is simply the pause the owner already wanted before their own and their agent's work lands, made structural instead of a habit. Be honest about the one thing it does not stop: a file dropped straight into the folder by hand, outside any draft, still lands there (the folder is still the operator's), and `origin_status` names it under `out_of_band` rather than pretending review caught it.
 
-A draft stays private to its author, with one deliberate door out: hand somebody a draft share-link (`dl_...`) and they pass it as `share_link` on `read_engram` or `edit_engram` to open that one draft of that one engram instead of a copy of their own. That is a grant scoped to a single page, revocable by the author, and the only way anyone but the author sees inside a draft before it is shared. Opening the same engram in Fluid, or reading it through a share-link, may land you in a live document instead: when somebody has that page open in the editor, an agent's read and its edits go through what they are looking at rather than the file behind it, landing under their cursor and naming the agent in the participant strip for a minute after each call (a colour chip over HTTP, "owner (agent: <client>)" when the agent is a local stdio session acting as the machine owner). That holds from the CLI too: `crystalline write --overwrite` onto a page somebody has open lands in their live document rather than replacing the file behind the room, and a retirement (delete or supersede) composes into it the same quiet way. A wholesale replace through the agent tools asks first rather than landing over unsaved work, and a client that cannot be asked is refused outright instead of overwriting silently.
+A draft stays private to its author, with one deliberate door out: hand somebody a draft share-link (`dl_...`) and they pass it as `share_link` on `read_engram` or `edit_engram` to open that one draft of that one engram instead of a copy of their own. That is a grant scoped to a single page, revocable by the author, and the only way anyone but the author sees inside a draft before it is shared. Opening the same engram in Fluid, or reading it through a share-link, may land you in a live document instead: when somebody has that page open in the editor, an agent's read and its edits go through what they are looking at rather than the file behind it, landing under their cursor and naming the agent in the participant strip for a minute after each call (a colour chip over HTTP, "you (agent: <client>)" when the agent is a local stdio session acting as the machine owner). That holds from the CLI too: `crystalline write --overwrite` onto a page somebody has open lands in their live document rather than replacing the file behind the room, and a retirement (delete or supersede) composes into it the same quiet way. A wholesale replace through the agent tools asks first rather than landing over unsaved work, and a client that cannot be asked is refused outright instead of overwriting silently.
 

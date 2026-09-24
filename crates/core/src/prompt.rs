@@ -47,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use globset::Glob;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
 use crate::config::{GlobalConfig, RepoConfig, expand_tilde};
@@ -253,17 +253,22 @@ fn included_domain_names(global: &GlobalConfig, workspace: &Path) -> BTreeSet<St
         return all;
     }
 
+    // Rule keys are absolute patterns (or `~/`), so a relative workspace (the
+    // default `.`, or `--workspace .`) is made absolute first or it would match
+    // nothing but a bare `**`. `absolute` rather than `canonicalize`: it works
+    // on a path that does not exist, and on Windows it never returns the
+    // `\\?\` verbatim form that no pattern is written in.
+    let workspace = std::path::absolute(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+
     let mut included: BTreeSet<String> = BTreeSet::new();
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     let mut any_matched = false;
 
     for (glob_key, rule) in &prompt_cfg.rules {
-        let expanded = expand_tilde(glob_key);
-        let Ok(glob) = Glob::new(&expanded.to_string_lossy()) else {
+        let Some(matcher) = rule_matcher(&expand_tilde(glob_key).to_string_lossy()) else {
             continue;
         };
-        let matcher = glob.compile_matcher();
-        if !matcher.is_match(workspace) {
+        if !matcher.is_match(&workspace) {
             continue;
         }
         any_matched = true;
@@ -280,6 +285,23 @@ fn included_domain_names(global: &GlobalConfig, workspace: &Path) -> BTreeSet<St
     }
     let base = if included.is_empty() { all } else { included };
     base.difference(&excluded).cloned().collect()
+}
+
+/// The matcher for one `prompt.rules` key. A key ending in `/**` also matches
+/// the folder itself: globset compiles `a/**` to `a/.*`, which leaves out `a`,
+/// and a session started in the repository root is exactly the one a
+/// `~/work/website/**` rule is written for. A bare `**` has no folder part and
+/// is compiled as it is. `None` for a key that is not a valid glob, which is
+/// skipped the way it always was.
+fn rule_matcher(pattern: &str) -> Option<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    builder.add(Glob::new(pattern).ok()?);
+    if let Some(folder) = pattern.strip_suffix("/**")
+        && !folder.is_empty()
+    {
+        builder.add(Glob::new(folder).ok()?);
+    }
+    builder.build().ok()
 }
 
 fn load_repo_config(workspace: &Path) -> Option<RepoConfig> {
@@ -1243,6 +1265,85 @@ mod tests {
             render_minimal_instructions(),
             text,
             "deterministic, like every other renderer here"
+        );
+    }
+
+    // --- prompt.rules matching (issue 95) -----------------------------------
+
+    /// A pattern string for `dir` with forward slashes, so the glob reads the
+    /// same on Windows (globset treats `\` as an escape on unix and a literal
+    /// elsewhere, and matches candidate paths with `/` separators).
+    fn pattern_for(dir: &std::path::Path, suffix: &str) -> String {
+        format!("{}{suffix}", dir.display()).replace('\\', "/")
+    }
+
+    /// The fixture's alpha and beta, with one rule keyed by `pattern` that
+    /// excludes beta.
+    fn with_exclude_rule(pattern: String) -> (tempfile::TempDir, GlobalConfig) {
+        let (tmp, mut global) = fixture();
+        let mut rules = indexmap::IndexMap::new();
+        rules.insert(
+            pattern,
+            crate::config::PromptRule {
+                include: None,
+                exclude: Some(vec!["beta".to_string()]),
+            },
+        );
+        global.prompt = Some(crate::config::PromptConfig { rules });
+        (tmp, global)
+    }
+
+    fn rendered_names(global: &GlobalConfig, workspace: &std::path::Path) -> Vec<String> {
+        generate_prompt(global, workspace, &BTreeMap::new())
+            .domains
+            .into_iter()
+            .map(|d| d.name)
+            .collect()
+    }
+
+    #[test]
+    fn a_trailing_double_star_rule_matches_the_folder_itself() {
+        let site = tempfile::tempdir().unwrap();
+        let website = site.path().join("website");
+        std::fs::create_dir_all(&website).unwrap();
+        let (_tmp, global) = with_exclude_rule(pattern_for(&website, "/**"));
+        assert_eq!(rendered_names(&global, &website), vec!["alpha"]);
+    }
+
+    #[test]
+    fn a_trailing_double_star_rule_still_matches_a_subfolder() {
+        let site = tempfile::tempdir().unwrap();
+        let website = site.path().join("website");
+        let src = website.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let (_tmp, global) = with_exclude_rule(pattern_for(&website, "/**"));
+        assert_eq!(rendered_names(&global, &src), vec!["alpha"]);
+    }
+
+    #[test]
+    fn a_trailing_double_star_rule_skips_a_sibling_with_a_shared_prefix() {
+        let site = tempfile::tempdir().unwrap();
+        let website = site.path().join("website");
+        let website2 = site.path().join("website2");
+        std::fs::create_dir_all(&website2).unwrap();
+        let (_tmp, global) = with_exclude_rule(pattern_for(&website, "/**"));
+        assert_eq!(rendered_names(&global, &website2), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_bare_double_star_rule_matches_every_workspace() {
+        let site = tempfile::tempdir().unwrap();
+        let (_tmp, global) = with_exclude_rule("**".to_string());
+        assert_eq!(rendered_names(&global, site.path()), vec!["alpha"]);
+    }
+
+    #[test]
+    fn a_relative_workspace_is_matched_as_an_absolute_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let (_tmp, global) = with_exclude_rule(pattern_for(&cwd, "/**"));
+        assert_eq!(
+            rendered_names(&global, std::path::Path::new(".")),
+            vec!["alpha"]
         );
     }
 }

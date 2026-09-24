@@ -40,6 +40,9 @@ const OUTSIDER_PASSWORD =
 /** The domain the same script registers and closes to `USER`. */
 const DOMAIN = process.env.FLUID_E2E_PRIVATE_DOMAIN ?? "smoke-vault";
 
+/** A private domain the peer owns, which the peer unregisters. */
+const OWNED_DOMAIN = process.env.FLUID_E2E_OWNED_DOMAIN ?? "peer-shelf";
+
 /**
  * The shared fixture domain every account on this instance can read.
  *
@@ -220,4 +223,35 @@ test("an invitation is what makes a private domain visible", async ({
     await expect(badge(homeArticle(page))).toHaveCount(0);
     await expect(badge(sidebarLink(page))).toHaveCount(0);
   }
+});
+
+test("the owner of a private domain unregisters it from the danger zone", async ({
+  browser,
+}) => {
+  const context = await browser.newContext();
+  const peer = await context.newPage();
+  await signIn(peer, PEER, PEER_PASSWORD);
+
+  await peer.goto(`/d/${OWNED_DOMAIN}`);
+  await expect(
+    peer.getByRole("heading", { name: OWNED_DOMAIN, level: 1 }),
+  ).toBeVisible();
+
+  // An editor, so only ownership can put this control here.
+  const dangerZone = peer.getByRole("region", { name: "Danger zone" });
+  await dangerZone.getByRole("button", { name: "Unregister domain" }).click();
+  await dangerZone
+    .getByLabel(new RegExp(`Type ${OWNED_DOMAIN} to confirm`))
+    .fill(OWNED_DOMAIN);
+  await dangerZone.getByRole("button", { name: "Confirm unregister" }).click();
+
+  await expect(
+    peer.getByRole("heading", { name: "Home", level: 1 }),
+  ).toBeVisible();
+  await listingLoaded(peer);
+  await expect(
+    peer
+      .getByRole("navigation", { name: "Domains" })
+      .getByRole("link", { name: new RegExp(`^${OWNED_DOMAIN}`) }),
+  ).toHaveCount(0);
 });

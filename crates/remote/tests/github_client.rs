@@ -572,6 +572,44 @@ async fn not_found_on_a_repo_scoped_endpoint_maps_to_repo_not_found() {
     }
 }
 
+// --- default_branch ------------------------------------------------------------
+
+#[tokio::test]
+async fn default_branch_reads_the_repository_default() {
+    async fn handler() -> Json<serde_json::Value> {
+        Json(serde_json::json!({"name": "brand-knowledge", "default_branch": "trunk"}))
+    }
+    let app = Router::new().route("/repos/acme/brand-knowledge", get(handler));
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    assert_eq!(
+        provider
+            .default_branch("acme/brand-knowledge")
+            .await
+            .unwrap(),
+        "trunk"
+    );
+}
+
+#[tokio::test]
+async fn default_branch_of_a_missing_repository_is_repo_not_found() {
+    async fn handler() -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"message": "Not Found"})),
+        )
+    }
+    let app = Router::new().route("/repos/acme/brand-knowledge", get(handler));
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    match provider.default_branch("acme/brand-knowledge").await {
+        Err(RemoteError::RepoNotFound { repo }) => assert_eq!(repo, "acme/brand-knowledge"),
+        other => panic!("expected RepoNotFound, got {other:?}"),
+    }
+}
+
 /// The body GitHub sends when a SAML-enforced organization refuses a token
 /// that is not authorized for it, verbatim.
 const SAML_BODY: &str = "Resource protected by organization SAML enforcement. \

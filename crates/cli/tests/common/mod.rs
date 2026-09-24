@@ -71,6 +71,8 @@ pub fn isolate(cmd: &mut Command, home: &Path) {
     for (name, value) in isolation_env(home) {
         cmd.env(name, value);
     }
+    // A child logs by the filter the test gives it, never by the runner's.
+    cmd.env_remove("RUST_LOG");
 }
 
 /// The name in [`isolation_env`] that governs where a child isolated by

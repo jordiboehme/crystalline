@@ -11,9 +11,12 @@
 //!
 //! Severities are `Error`, `Warning` and `Info`. A domain's
 //! `.crystalline.yaml` can override a rule's severity (including turning it
-//! off); `--strict` additionally promotes every rule whose default severity
-//! is `Warning` to `Error`.
+//! off); a value that is not a severity word, or a file that does not parse,
+//! is reported as `M108` (a warning) and otherwise changes nothing. `--strict`
+//! additionally promotes every rule whose default severity is `Warning` to
+//! `Error`, `M108` included.
 
+mod domain_config;
 mod format;
 mod links;
 mod manifest_rules;
@@ -32,6 +35,9 @@ use serde::Serialize;
 use crate::engram::Engram;
 use crate::parse::{BodyLine, body_lines};
 
+pub use domain_config::{
+    ConfigProblem, DOMAIN_CONFIG_FILE, DomainConfigLoad, config_problems, load_domain_config,
+};
 pub use report::{Format, render, to_github, to_human, to_json};
 pub use scanner::ScanError;
 
@@ -338,6 +344,20 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
             domain.config.verify.as_ref(),
             options.strict,
         );
+        // The domain's own settings first: a severity word verify does not
+        // know, or a file that does not parse, silently took an override
+        // away. One `M108` per problem, against the file itself.
+        let config_path = domain.root.join(DOMAIN_CONFIG_FILE);
+        for problem in &domain.config_problems {
+            sink.emit(
+                &config_path,
+                None,
+                "M108",
+                Severity::Warning,
+                problem.message.clone(),
+                problem.fix.clone(),
+            );
+        }
         manifest_rules::check(domain, &mut sink);
         schema_rules::check(domain, &mut sink);
         format::check_domain(domain, &mut sink);

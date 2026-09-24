@@ -98,6 +98,12 @@ FLUID_E2E_OUTSIDER_PASSWORD="${FLUID_E2E_OUTSIDER_PASSWORD:-outsider-password}"
 # own text - a domain whose name carried it could not be told apart from a
 # domain wearing it.
 FLUID_E2E_PRIVATE_DOMAIN="${FLUID_E2E_PRIVATE_DOMAIN:-smoke-vault}"
+# A private domain owned by the peer, an editor rather than an admin: the one
+# account the danger zone's unregister control exists for beyond the admins.
+# Its own domain, because the step unregisters it. The name starts with
+# neither `fluid-smoke` nor `smoke-vault` (the sidebar matches by prefix) and
+# does not contain the badge's word.
+FLUID_E2E_OWNED_DOMAIN="${FLUID_E2E_OWNED_DOMAIN:-peer-shelf}"
 # The label the single sign-on button wears, which is the whole of what the
 # sso spec asserts. The provider it names is never contacted: the button is a
 # link, the spec only reads it, and discovery does not happen until somebody
@@ -108,7 +114,7 @@ export FLUID_E2E_SSO_NAME
 export FLUID_E2E_USER FLUID_E2E_PASSWORD FLUID_E2E_DOMAIN
 export FLUID_E2E_PEER FLUID_E2E_PEER_PASSWORD
 export FLUID_E2E_OUTSIDER FLUID_E2E_OUTSIDER_PASSWORD
-export FLUID_E2E_PRIVATE_DOMAIN
+export FLUID_E2E_PRIVATE_DOMAIN FLUID_E2E_OWNED_DOMAIN
 
 bin="${CRYSTALLINE_BIN:-}"
 if [ -z "$bin" ]; then
@@ -190,6 +196,8 @@ domain_root="$run_dir/domain"
 cp -R "$here/fixtures/domain" "$domain_root"
 private_root="$run_dir/private-domain"
 cp -R "$here/fixtures/private-domain" "$private_root"
+owned_root="$run_dir/owned-domain"
+cp -R "$here/fixtures/owned-domain" "$owned_root"
 
 echo "smoke: registering the fixture domains"
 "${isolated[@]}" "$bin" domain add "$FLUID_E2E_DOMAIN" "$domain_root"
@@ -199,6 +207,7 @@ echo "smoke: registering the fixture domains"
 # an account to name. The acl row is read fresh on every request, so no restart
 # stands between the two halves.
 "${isolated[@]}" "$bin" domain add "$FLUID_E2E_PRIVATE_DOMAIN" "$private_root"
+"${isolated[@]}" "$bin" domain add "$FLUID_E2E_OWNED_DOMAIN" "$owned_root"
 
 # The daemon comes up before any account exists, which is the state a real
 # first run is in: the admin below is created through the daemon's own setup
@@ -339,6 +348,10 @@ printf '%s' "$FLUID_E2E_OUTSIDER_PASSWORD" \
 echo "smoke: making $FLUID_E2E_PRIVATE_DOMAIN private"
 "${isolated[@]}" "$bin" domain visibility "$FLUID_E2E_PRIVATE_DOMAIN" private \
     --owner "$FLUID_E2E_USER"
+
+echo "smoke: handing $FLUID_E2E_OWNED_DOMAIN to $FLUID_E2E_PEER"
+"${isolated[@]}" "$bin" domain visibility "$FLUID_E2E_OWNED_DOMAIN" private \
+    --owner "$FLUID_E2E_PEER"
 
 # The embedded web UI, checked against the daemon's own port before the browser
 # journeys start. Playwright drives `vite preview` (the compose scenario, where

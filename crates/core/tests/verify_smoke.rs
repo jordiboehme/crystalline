@@ -263,6 +263,102 @@ fn strict_promotes_warning_rules_to_error() {
     assert_eq!(report.exit_code(), 1);
 }
 
+// --- The domain's own verify settings (M108, issue 101) ------------------------
+
+const CLEAN_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Gardening facts\n\n## When to Use\n\n- When asked about gardens\n";
+
+#[test]
+fn an_unknown_severity_word_is_one_m108_warning_naming_rule_and_word() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", CLEAN_MANIFEST);
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    E007: of\n    L003: warnig\n    M101: off\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m108: Vec<_> = report.issues.iter().filter(|i| i.rule == "M108").collect();
+    assert_eq!(m108.len(), 2, "{:#?}", report.issues);
+    assert!(m108.iter().all(|i| i.severity == Severity::Warning));
+    assert!(
+        m108.iter()
+            .all(|i| i.path.to_string_lossy().ends_with(".crystalline.yaml")),
+        "{m108:#?}"
+    );
+    assert!(m108[0].message.contains("E007") && m108[0].message.contains("'of'"));
+    assert!(m108[1].message.contains("L003") && m108[1].message.contains("'warnig'"));
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "a config typo never fails verify on its own"
+    );
+}
+
+#[test]
+fn a_config_file_that_does_not_parse_is_one_m108_warning() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", CLEAN_MANIFEST);
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules: [unclosed\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m108: Vec<_> = report.issues.iter().filter(|i| i.rule == "M108").collect();
+    assert_eq!(m108.len(), 1, "{:#?}", report.issues);
+    assert!(
+        m108[0].message.contains("does not parse"),
+        "{}",
+        m108[0].message
+    );
+    // The fix hint is about the YAML that failed to parse, not the
+    // severity-word hint every unknown-word M108 carries: a parse failure
+    // pointed at "off, error, warning or info" is a fix for a problem the
+    // file does not have.
+    let fix = m108[0].fix.as_deref().unwrap_or("");
+    assert!(fix.contains("YAML"), "{fix}");
+    assert!(
+        !fix.to_lowercase().contains("off")
+            && !fix.to_lowercase().contains("error")
+            && !fix.to_lowercase().contains("warning")
+            && !fix.to_lowercase().contains("info"),
+        "the parse-failure hint must not mention severity words: {fix}"
+    );
+}
+
+#[test]
+fn strict_promotes_m108_and_a_typo_no_longer_skips_the_promotion() {
+    let dir = tempdir().unwrap();
+    // No `## When to Use`: M101, a Warning-default rule, fires.
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Gardening facts\n",
+    );
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    M101: warnig\n",
+    );
+
+    let strict = VerifyOptions {
+        strict: true,
+        ..Default::default()
+    };
+    let report = verify::verify_paths([dir.path()], &strict).unwrap();
+    let m101 = report.issues.iter().find(|i| i.rule == "M101").unwrap();
+    assert_eq!(
+        m101.severity,
+        Severity::Error,
+        "a word verify does not know keeps the default, and --strict still promotes it"
+    );
+    let m108 = report.issues.iter().find(|i| i.rule == "M108").unwrap();
+    assert_eq!(m108.severity, Severity::Error);
+    assert_eq!(report.exit_code(), 1);
+}
+
 #[test]
 fn reporters_render_without_panicking() {
     let dir = tempdir().unwrap();

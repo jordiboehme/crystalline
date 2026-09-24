@@ -78,10 +78,13 @@ similar = { workspace = true }
 chrono = { workspace = true }
 walkdir = { workspace = true }
 dunce = { workspace = true }
-# Only the best-effort credential sweeps log through this: a failure there must
-# never fail the command that triggered it, and a swallowed error still has to
-# be findable with RUST_LOG.
+# Logs go to stderr only (stdout carries the routing block, hook output and
+# data a caller parses), filtered by RUST_LOG with a default of warn; a
+# lifecycle hook logs only when RUST_LOG is set, so a hook with nothing to
+# say says nothing on either stream. The best-effort credential sweeps log a
+# swallowed error at debug, so RUST_LOG=debug finds it.
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

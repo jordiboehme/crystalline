@@ -2682,13 +2682,14 @@ impl McpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if self.engine.read_only() {
-            return Err(to_error(EngineError::ReadOnly));
+            return Err(ErrorData::invalid_params(CONFIGURE_READ_ONLY_REFUSAL, None));
         }
 
         // A bare `configure` is the settings page, which is a read and stays
-        // open to every caller. Everything that CHANGES this instance - a set,
-        // an unset, and the three connect fields that decide which GitHub
-        // identity it acts as - is an instance change and is gated as one.
+        // open to every caller of a read-write instance. Everything that
+        // CHANGES this instance - a set, an unset, and the three connect
+        // fields that decide which GitHub identity it acts as - is an
+        // instance change and is gated as one.
         let changes = !p.set.is_empty()
             || !p.unset.is_empty()
             || p.connect.is_some()
@@ -4510,6 +4511,17 @@ fn delete_question(preview: &Value) -> String {
 /// the way out, because an agent that reads this has to be able to tell its
 /// user what to ask for.
 const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it, its settings and what it provisions into the harnesses on its machine - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
+
+/// What `configure` answers on a read-only instance, for every call including
+/// a bare one. Deliberate, not an oversight: an agent here can act on none of
+/// the settings, whatever affects it reaches it another way (the response
+/// format through the instructions, `github.enabled` through the tool list, a
+/// refused write through its own message), and read-only is the public
+/// serving mode, where even masked settings would show paths, the sign-in
+/// setup and service addresses to anonymous readers.
+const CONFIGURE_READ_ONLY_REFUSAL: &str = "this instance is read-only, and a read-only instance \
+     does not show its configuration to connected agents; whoever runs it reads the settings \
+     on the server with `crystalline config show`";
 
 /// The sentence `remove_domain` asks before it acts, rendered from
 /// [`crate::engine::Engine::domain_remove_preview`].

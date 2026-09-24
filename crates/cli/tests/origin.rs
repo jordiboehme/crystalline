@@ -650,6 +650,111 @@ fn origin_discard_previews_then_needs_yes_off_a_terminal_and_restores() {
     ));
 }
 
+// --- domain add --origin on an already-registered name -----------------------
+
+/// A config holding one team domain `eng`, already connected to `acme/kb` on
+/// `trunk` at `root`, with `github.enabled`. Written through the core's own
+/// serializer so the path is valid YAML on every platform.
+fn already_connected_team_config(config: &Path, root: &Path) {
+    use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig, OriginConfig};
+    let mut cfg = GlobalConfig::default();
+    let mut entry = DomainEntry::file(std::fs::canonicalize(root).unwrap());
+    entry.origin = Some(OriginConfig {
+        repo: "acme/kb".to_string(),
+        path: None,
+        branch: Some("trunk".to_string()),
+        poll_secs: None,
+    });
+    cfg.domains.insert("eng".to_string(), entry);
+    cfg.github = Some(GitHubConfig {
+        enabled: Some(true),
+        ..Default::default()
+    });
+    crystalline_core::config::save_yaml(config, &cfg).unwrap();
+}
+
+/// `domain add --origin` on a name already registered must not let
+/// `--private` close it (the issue this test pins: it used to always report
+/// "not adopted" and go on to close whatever `domain add` had just touched,
+/// even an existing registration). Here the retry is exact - same repo,
+/// branch and folder as the entry already on file - so the engine answers
+/// `already_connected` lock-free, with no GitHub call: the one shape this
+/// crate can drive without a GitHub mock (see the file header).
+///
+/// The other half of the fix's `true` condition - a fresh, origin-less
+/// domain adopted in place by `--origin`, which needs a real connect to
+/// reach - is covered at the engine level by the `adopted: true` assertion
+/// in `crates/service/tests/origin.rs`, against a mock provider this crate
+/// has no harness for; both conditions feed the same `already_registered ||
+/// already_connected` return in `domain_add_origin_dispatch`, and this test
+/// exercises the CLI-only half of the fix, the `--private` refusal in
+/// `run_domain`, that neither engine-level test reaches.
+#[test]
+fn domain_add_origin_on_an_already_connected_domain_refuses_private_and_does_not_close_it() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("kb");
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args(["domain", "init"])
+        .arg(&root)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+    already_connected_team_config(&config, &root);
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "users",
+        "add",
+        "ada",
+        "--role",
+        "editor",
+        "--password-stdin",
+    ])
+    .write_stdin("s3cret\n")
+    .assert()
+    .success();
+
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    cmd.args([
+        "domain",
+        "add",
+        "eng",
+        "--origin",
+        "acme/kb",
+        "--branch",
+        "trunk",
+        "--private",
+        "--owner",
+        "ada",
+        "--config",
+    ])
+    .arg(&config)
+    .args(["--db"])
+    .arg(&db)
+    .assert()
+    .failure()
+    .stderr(predicates::str::contains("domain visibility"));
+
+    // The refusal ran before any close: the domain is still shared.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["domain", "members", "eng", "list", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let listed = String::from_utf8(out.stdout).unwrap();
+    assert!(listed.contains("is shared"), "{listed}");
+}
+
 // --- chain rendering, against a stand-in daemon ------------------------------
 
 /// The stacked-chain render paths, driven end to end through the real binary

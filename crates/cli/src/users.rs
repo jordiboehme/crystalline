@@ -243,7 +243,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
 /// resolve or delete is an orphan rather than a failure - it addresses nothing
 /// once no account carries the name, and reconnecting overwrites it.
 ///
-/// Silent by design (a debug log, findable with `RUST_LOG`): the command's own
+/// Silent by design (a debug log, findable with `RUST_LOG=debug`): the command's own
 /// confirmation line is about the account, and a person who never connected an
 /// identity - the common case - must not be told about a credential that was
 /// never there. The name is folded exactly as the auth store folds it, so the
