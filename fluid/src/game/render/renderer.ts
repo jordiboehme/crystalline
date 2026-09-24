@@ -2,8 +2,9 @@
  * Frames from a room: the scene pass, the bloom and the final composite.
  *
  * `setRoom` does the expensive work once per room or look - it builds the
- * mesh, fills the texture array (procedural layers, pictogram, one text
- * layer per label and screen) and keeps the look's numbers - and `draw` is
+ * mesh, fills the texture array (procedural layers, pictogram, and the text
+ * layers of `layerPlan`: one per screen, poster and placard, one per six
+ * labels) and keeps the look's numbers - and `draw` is
  * then a handful of uniform uploads and six full-screen passes. The scene is
  * rendered at the canvas size handed to `resize`, the bloom at half of that
  * and below.
@@ -22,14 +23,8 @@ import { createTarget, type Target } from "../gl/target";
 import { createTextureArray, type TextureArray } from "../gl/textureArray";
 import { CELL } from "../world/generate";
 import type { RoomSpec } from "../world/types";
-import { buildRoomMesh } from "./geometry";
-import {
-  LAYER,
-  LAYER_SIZE,
-  TEXT_BASE,
-  layerCount,
-  textRequests,
-} from "./layers";
+import { FLOATS_PER_VERTEX, buildRoomMesh, type MeshData } from "./geometry";
+import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
 import { C64_PALETTE, applyCondition, type Look } from "./looks";
 import {
   BRIGHT_FS,
@@ -41,7 +36,7 @@ import {
   SCENE_VS,
   UP_FS,
 } from "./shaders";
-import { drawPictogramLayer, drawTextLayer } from "./text";
+import { drawPictogramLayer, drawTextLayers } from "./text";
 import { baseLayers } from "./textures";
 
 /**
@@ -68,6 +63,22 @@ export interface Renderer {
   resize(width: number, height: number): void;
   draw(camera: Camera, levels: Float32Array, seconds: number): void;
   dispose(): void;
+}
+
+/**
+ * Several meshes as one vertex array, in order. A bridge until the renderer
+ * draws each door's movers on their own: until then the panels are appended
+ * to the static room at their closed position.
+ */
+function joinMeshes(meshes: readonly MeshData[]): MeshData {
+  const count = meshes.reduce((n, m) => n + m.count, 0);
+  const vertices = new Float32Array(count * FLOATS_PER_VERTEX);
+  let at = 0;
+  for (const m of meshes) {
+    vertices.set(m.vertices, at);
+    at += m.vertices.length;
+  }
+  return { vertices, count };
 }
 
 /** Vertical field of view: 70 degrees, a little wider than DOOM's feel on a tall screen. */
@@ -164,22 +175,28 @@ export function createRenderer(
       room = nextRoom;
       look = applyCondition(nextLook, nextRoom.condition);
       mesh?.dispose();
-      mesh = createMesh(gl, buildRoomMesh(nextRoom, look));
+      // Bridge until the renderer draws movers: the door panels are drawn
+      // closed, appended to the static mesh as one draw call.
+      const built = buildRoomMesh(nextRoom, look);
+      mesh = createMesh(
+        gl,
+        joinMeshes([built.static, ...built.movers.map((m) => m.mesh)]),
+      );
       textures?.dispose();
-      const count = Math.min(layerCount(nextRoom), caps.maxLayers);
+      const plan = layerPlan(nextRoom);
+      const count = Math.min(plan.count, caps.maxLayers);
       textures = createTextureArray(gl, LAYER_SIZE, count);
       base.forEach((pixels, i) => {
         if (i !== LAYER.pictogram) textures?.setLayer(i, pixels);
       });
       textures.setLayer(LAYER.pictogram, pictogram);
-      textRequests(nextRoom).forEach((request, i) => {
-        if (TEXT_BASE + i < count) {
-          textures?.setLayer(
-            TEXT_BASE + i,
-            drawTextLayer(request, nextLook, LAYER_SIZE),
-          );
-        }
-      });
+      for (const { layer, pixels } of drawTextLayers(
+        plan,
+        nextLook,
+        LAYER_SIZE,
+      )) {
+        if (layer < count) textures.setLayer(layer, pixels);
+      }
       textures.finish();
       zoneRects.fill(0);
       nextRoom.lights.slice(0, MAX_ZONES).forEach((z, i) => {

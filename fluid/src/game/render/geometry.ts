@@ -1,12 +1,15 @@
 /**
- * A `RoomSpec` becomes triangles: the 2D cell layout extruded into walls,
- * floor and ceiling, with every fixture built from boxes and flat panels.
+ * A `RoomSpec` becomes triangles: the room's cell grid built into floor,
+ * ceiling and walls, the detailed models of every fixture and piece of
+ * furniture, the lamps, and the scaffolding of a room under construction.
  *
- * Everything is emitted into one interleaved, non-indexed vertex array in
- * world space, so the whole room is one draw call. Per vertex: position,
- * normal, a uv in metres (so panel seams fall on whole numbers and the
- * shader can draw edge lines there), the texture array layer, a tint from
- * the look, and a flag that tells the shader how the surface is lit:
+ * Everything static is emitted into one interleaved, non-indexed vertex
+ * array in world space, so the whole room is one draw call; the panels of
+ * the doors that open come back as movers, each its own small mesh, for the
+ * renderer to slide. Per vertex: position, normal, a uv in metres (so panel
+ * seams fall on whole numbers and the shader can draw edge lines there), the
+ * texture array layer, a tint from the look, and a flag that tells the
+ * shader how the surface is lit:
  *
  * - `lit`: ordinary surface under the zone's light.
  * - `emissive`: screens and tag strips, full brightness whatever the light.
@@ -19,18 +22,28 @@
  * into the room, so the renderer can cull back faces. The geometry test
  * checks every triangle's winding against its stored normal.
  *
- * Fixture recipes are written in a wall-local frame - `a` along the wall,
- * `d` out from it, `h` up - and turned into world space by the slot's wall,
- * which keeps every recipe independent of the side it stands on.
+ * The shell is built cell by cell: a floor and a ceiling quad per floor
+ * cell and a wall quad on every edge where a floor cell meets void or the
+ * grid's edge, the same rule `wallSlots` uses for the walls fixtures stand
+ * against. The uv of every shell quad is its world position in metres, so
+ * the seams run on unbroken across cells. The models themselves are built
+ * by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
-import { createRng } from "../core/seed";
 import { CELL } from "../world/generate";
-import { FIXTURE_DEPTH, FIXTURE_WIDTH } from "../world/move";
-import type { Fixture, MachineKind, RoomSpec } from "../world/types";
-import { frameForSlot, type Frame } from "./kit";
-import { ASPECT, LAYER, TEXT_BASE, textRequests } from "./layers";
-import { hueToRgb, type Look, type Rgb } from "./looks";
+import { BAY, isFloor } from "../world/layout";
+import { scaffoldBoxes, type Box } from "../world/move";
+import type { RoomSpec, Side } from "../world/types";
+import { createKit } from "./kit";
+import { LAYER, layerPlan } from "./layers";
+import type { Look, Rgb } from "./looks";
+import {
+  buildDecor,
+  buildFixture,
+  type KitAt,
+  type ModelContext,
+  type Mover,
+} from "./models";
 
 /**
  * Floats per vertex in the interleaved array: position 3, normal 3, uv 2,
@@ -75,9 +88,6 @@ export interface Surface {
   tint: Rgb;
   flag: Flag;
 }
-
-/** How far below the ceiling the top of a label stays. */
-const LABEL_CLEARANCE = 0.05;
 
 /**
  * Grows a plain number array of interleaved vertices, turned into a
@@ -215,421 +225,326 @@ export function createBuilder() {
 /** The builder `createBuilder` returns, as the modelling kit takes it. */
 export type Builder = ReturnType<typeof createBuilder>;
 
-function local(f: Frame, a: number, d: number, h: number): V3 {
-  return [
-    f.origin[0] + f.along[0] * a + f.inward[0] * d,
-    h,
-    f.origin[2] + f.along[2] * a + f.inward[2] * d,
-  ];
+/**
+ * The height of a doorway between the hall and a bay or the backlink
+ * corridor: above it a lintel closes the gap to the ceiling on both faces of
+ * the opening, so the way through reads as a doorway and not as a gap in
+ * the wall.
+ */
+export const LINTEL = 2.4;
+
+/** How tall the hazard-striped baseboards of a room under construction are. */
+const BASEBOARD = 0.3;
+/** How far the baseboards stand off their wall, against z-fighting. */
+const BASEBOARD_INSET = 0.01;
+
+/** The lamp panel's half width (along x) and half depth (along z). */
+const LAMP_HALF_W = 0.8;
+const LAMP_HALF_D = 0.3;
+/** How far below the ceiling a lamp panel hangs, against z-fighting. */
+const LAMP_DROP = 0.01;
+
+/** A scaffold pole's thickness and its inset from its frame's corner. */
+const POLE = 0.08;
+const POLE_INSET = 0.06;
+/** How far below the ceiling the scaffold poles stop. */
+const POLE_CLEARANCE = 0.2;
+/** Heights of the scaffold's rails: a mid rail and the top frame. */
+const MID_RAIL = 1.1;
+const TOP_RAIL = 2.2;
+
+/**
+ * The static room and its moving parts: `static` is the one vertex array
+ * of shell, lamps, scaffolding and every model's fixed parts; `movers` are
+ * the panels of every door that opens, at their closed position, keyed
+ * `door:<fixtureIndex>`.
+ */
+export interface RoomMesh {
+  static: MeshData;
+  movers: Mover[];
 }
 
-/** A box given in wall-local ranges, emitted as a world-space box. */
-function localBox(
-  b: Builder,
-  f: Frame,
-  a0: number,
-  a1: number,
-  d0: number,
-  d1: number,
-  h0: number,
-  h1: number,
-  s: Surface,
-) {
-  const p = local(f, a0, d0, h0);
-  const q = local(f, a1, d1, h1);
-  b.box(
-    [Math.min(p[0], q[0]), h0, Math.min(p[2], q[2])],
-    [Math.max(p[0], q[0]), h1, Math.max(p[2], q[2])],
-    s,
-  );
+/**
+ * The grid columns of the doorways: the void column between the corridor
+ * and the hall (only when there is a corridor, which pushes the hall east)
+ * and the one before each bay, which `planLayout` opens on two rows. The
+ * floor cells in these columns are the doorways.
+ */
+function doorwayColumns(room: RoomSpec): Set<number> {
+  const cols = new Set<number>();
+  if (room.hall.x0 > 0) cols.add(room.hall.x0 - 1);
+  for (let x = room.hall.x1; x < room.width; x += BAY + 1) cols.add(x);
+  return cols;
 }
 
-/** A flat panel facing into the room at depth `d`, with a whole-layer uv. */
-function localPanel(
-  b: Builder,
-  f: Frame,
-  a0: number,
-  a1: number,
-  d: number,
-  h0: number,
-  h1: number,
-  s: Surface,
-  uw = 1,
-  vh = 1,
-) {
-  b.quad(
-    local(f, a0, d, h0),
-    local(f, a1, d, h0),
-    local(f, a1, d, h1),
-    local(f, a0, d, h1),
-    f.inward,
-    uw,
-    vh,
-    s,
-  );
-}
-
-/** Per machine kind: body proportions (width, depth, height) and a glowing detail height. */
-const MACHINES: Record<
-  MachineKind,
-  { w: number; d: number; h: number; glow: number }
-> = {
-  workbench: { w: 1.8, d: 0.8, h: 0.9, glow: 1.3 },
-  "lab-bench": { w: 1.6, d: 0.7, h: 1.0, glow: 1.6 },
-  "server-rack": { w: 0.8, d: 0.8, h: 2.2, glow: 1.8 },
-  "cryo-pod": { w: 1.0, d: 0.9, h: 2.0, glow: 1.2 },
-  fabricator: { w: 1.6, d: 0.9, h: 1.6, glow: 1.0 },
-  hydroponics: { w: 1.8, d: 0.6, h: 1.2, glow: 1.1 },
-  "nav-table": { w: 1.4, d: 0.9, h: 1.0, glow: 1.05 },
-  "comms-array": { w: 1.2, d: 0.5, h: 2.4, glow: 2.1 },
-  "reactor-coupling": { w: 1.2, d: 0.9, h: 1.9, glow: 0.9 },
-  "cargo-loader": { w: 1.8, d: 0.9, h: 1.4, glow: 1.5 },
-  "med-scanner": { w: 1.0, d: 0.9, h: 1.8, glow: 1.4 },
-  containment: { w: 1.2, d: 0.9, h: 2.1, glow: 1.0 },
+/** The neighbour across each side of a cell. */
+const STEP: Record<Side, readonly [number, number]> = {
+  n: [0, -1],
+  e: [1, 0],
+  s: [0, 1],
+  w: [-1, 0],
 };
+const SIDES: readonly Side[] = ["n", "e", "s", "w"];
 
-function fixture(
+/**
+ * One vertical quad on a side of cell `(x, y)`, from `h0` to `h1`, `inset`
+ * metres into the cell, facing into it. Its uv is the world position along
+ * the wall and the height, in metres, so neighbouring quads continue each
+ * other's seams.
+ */
+function edgeQuad(
   b: Builder,
-  room: RoomSpec,
-  fx: Fixture,
-  index: number,
-  textLayer: Map<string, number>,
-  look: Look,
+  x: number,
+  y: number,
+  side: Side,
+  h0: number,
+  h1: number,
+  inset: number,
+  s: Surface,
 ) {
-  const f = frameForSlot(fx.slot);
-  const p = look.palette;
-  const metal: Surface = { layer: LAYER.metal, tint: p.metal, flag: FLAG.lit };
-  const text = (key: string, flag: Flag, tint: Rgb): Surface => ({
-    layer: textLayer.get(key) ?? LAYER.panel,
-    tint,
-    flag,
-  });
-  // A label above a door, portal or tag strip, clamped under a low ceiling.
-  const labelTop = (bottom: number) =>
-    Math.min(bottom + 1.8 / ASPECT.label, room.ceiling - LABEL_CLEARANCE);
-  switch (fx.kind) {
-    case "terminal": {
-      localBox(b, f, -0.6, 0.6, 0, 0.7, 0, 0.9, metal);
-      localBox(b, f, -0.6, 0.6, 0, 0.15, 0.9, 1.95, metal);
-      const h = 0.8 / ASPECT.screen;
-      localPanel(
-        b,
-        f,
-        -0.5,
-        0.5,
-        0.151,
-        1.02,
-        1.02 + h * 1.25,
-        text(`terminal:${index}`, FLAG.emissive, [1, 1, 1]),
-      );
+  const X0 = x * CELL;
+  const X1 = X0 + CELL;
+  const Z0 = y * CELL;
+  const Z1 = Z0 + CELL;
+  // Bottom-left and bottom-right seen from inside the cell, and the normal.
+  let l: [number, number];
+  let r: [number, number];
+  let n: V3;
+  switch (side) {
+    case "n":
+      [l, r, n] = [
+        [X0, Z0 + inset],
+        [X1, Z0 + inset],
+        [0, 0, 1],
+      ];
       break;
-    }
-    case "door": {
-      const frame: Surface = {
-        layer: LAYER.metal,
-        tint: fx.style === "sliding" ? p.metal : p.door,
-        flag:
-          fx.style === "blast" || look.edge.everywhere ? FLAG.frame : FLAG.lit,
-      };
-      const t =
-        fx.style === "sliding" ? 0.12 : fx.style === "bulkhead" ? 0.22 : 0.3;
-      localBox(b, f, -1, -0.8, 0, t, 0, 2.6, frame);
-      localBox(b, f, 0.8, 1, 0, t, 0, 2.6, frame);
-      localBox(b, f, -1, 1, 0, t, 2.4, 2.6, frame);
-      localPanel(
-        b,
-        f,
-        -0.8,
-        0.8,
-        0.04,
-        0,
-        2.4,
-        {
-          layer: fx.style === "bulkhead" ? LAYER.hazard : LAYER.metal,
-          tint: p.door,
-          flag: FLAG.lit,
-        },
-        1.6,
-        2.4,
-      );
-      localPanel(
-        b,
-        f,
-        -0.9,
-        0.9,
-        t + 0.001,
-        2.62,
-        labelTop(2.62),
-        text(`door:${index}`, FLAG.emissive, [1, 1, 1]),
-      );
+    case "s":
+      [l, r, n] = [
+        [X1, Z1 - inset],
+        [X0, Z1 - inset],
+        [0, 0, -1],
+      ];
       break;
-    }
-    case "portal": {
-      const colour = fx.crossDomain ? p.portalAlt : p.portal;
-      const frame: Surface = {
-        layer: LAYER.metal,
-        tint: colour,
-        flag: FLAG.frame,
-      };
-      localBox(b, f, -1, -0.85, 0, 0.18, 0, 2.7, frame);
-      localBox(b, f, 0.85, 1, 0, 0.18, 0, 2.7, frame);
-      localBox(b, f, -1, 1, 0, 0.18, 2.55, 2.7, frame);
-      localBox(b, f, -1, 1, 0, 0.18, 0, 0.1, frame);
-      localPanel(
-        b,
-        f,
-        -0.85,
-        0.85,
-        0.08,
-        0.1,
-        2.55,
-        fx.sealedLabel !== null
-          ? { layer: LAYER.hazard, tint: p.metal, flag: FLAG.lit }
-          : { layer: LAYER.portal, tint: colour, flag: FLAG.portal },
-        1.7,
-        2.45,
-      );
-      localPanel(
-        b,
-        f,
-        -0.9,
-        0.9,
-        0.181,
-        2.72,
-        labelTop(2.72),
-        text(`portal:${index}`, FLAG.emissive, [1, 1, 1]),
-      );
+    case "w":
+      [l, r, n] = [
+        [X0 + inset, Z1],
+        [X0 + inset, Z0],
+        [1, 0, 0],
+      ];
       break;
-    }
-    case "machine": {
-      const m = MACHINES[fx.machine];
-      const rng = createRng(fx.seed);
-      const hw = m.w / 2;
-      const depth = Math.min(m.d, FIXTURE_DEPTH);
-      const body: Surface = {
-        layer: LAYER.panel,
-        tint: p.machine,
-        flag: FLAG.lit,
-      };
-      localBox(b, f, -hw, hw, 0.05, depth, 0, m.h, body);
-      const hue = hueToRgb(fx.hue, 0.85, 0.55);
-      const detailW = rng.range(0.3, hw * 0.8);
-      localPanel(
-        b,
-        f,
-        -detailW,
-        detailW,
-        depth + 0.002,
-        m.glow,
-        m.glow + 0.12,
-        {
-          layer: LAYER.panel,
-          tint: hue,
-          flag: FLAG.emissive,
-        },
-      );
-      // The tag strip along the wall above, in the tag's colour, and its name.
-      localBox(
-        b,
-        f,
-        -FIXTURE_WIDTH / 2 + 0.05,
-        FIXTURE_WIDTH / 2 - 0.05,
-        0,
-        0.03,
-        2.5,
-        2.58,
-        { layer: LAYER.panel, tint: hue, flag: FLAG.emissive },
-      );
-      localPanel(
-        b,
-        f,
-        -0.9,
-        0.9,
-        0.031,
-        2.6,
-        labelTop(2.6),
-        text(`tag:${index}`, FLAG.emissive, hue),
-      );
+    case "e":
+      [l, r, n] = [
+        [X1 - inset, Z0],
+        [X1 - inset, Z1],
+        [-1, 0, 0],
+      ];
       break;
-    }
-    case "hatch": {
-      // Stopgap until the modelling kit: a hazard-striped panel low on the
-      // wall and its label above it.
-      localPanel(b, f, -0.5, 0.5, 0.02, 0.2, 1.2, {
-        layer: LAYER.hazard,
-        tint: p.metal,
-        flag: FLAG.lit,
-      });
-      localPanel(
-        b,
-        f,
-        -0.9,
-        0.9,
-        0.021,
-        1.3,
-        1.3 + 1.8 / ASPECT.label,
-        text(`hatch:${index}`, FLAG.emissive, [1, 1, 1]),
-      );
-      break;
-    }
-    case "poster": {
-      // Stopgap until the modelling kit: a flat sheet on the wall.
-      localPanel(
-        b,
-        f,
-        -0.5,
-        0.5,
-        0.02,
-        1.2,
-        1.2 + 1 / ASPECT.placard,
-        text(`poster:${index}`, FLAG.lit, p.panel),
-      );
-      break;
-    }
-    case "placard": {
-      localPanel(
-        b,
-        f,
-        -0.5,
-        0.5,
-        0.02,
-        1.3,
-        1.3 + 1 / ASPECT.placard,
-        text("placard", FLAG.lit, p.panel),
-      );
-      break;
-    }
+  }
+  const u = (p: [number, number]) =>
+    side === "n" || side === "s" ? p[0] : p[1];
+  b.vertex([l[0], h0, l[1]], n, u(l), h0, s);
+  b.vertex([r[0], h0, r[1]], n, u(r), h0, s);
+  b.vertex([r[0], h1, r[1]], n, u(r), h1, s);
+  b.vertex([l[0], h0, l[1]], n, u(l), h0, s);
+  b.vertex([r[0], h1, r[1]], n, u(r), h1, s);
+  b.vertex([l[0], h1, l[1]], n, u(l), h1, s);
+}
+
+/**
+ * A horizontal quad over the floor rectangle `x0..x1` by `z0..z1` at height
+ * `h`, facing up or down, with its world x and z as uv.
+ */
+function flatQuad(
+  b: Builder,
+  x0: number,
+  x1: number,
+  z0: number,
+  z1: number,
+  h: number,
+  up: boolean,
+  s: Surface,
+) {
+  // Counter-clockwise seen from above for the floor, from below for the ceiling.
+  const corners: [number, number][] = up
+    ? [
+        [x0, z1],
+        [x1, z1],
+        [x1, z0],
+        [x0, z0],
+      ]
+    : [
+        [x0, z0],
+        [x1, z0],
+        [x1, z1],
+        [x0, z1],
+      ];
+  const n: V3 = [0, up ? 1 : -1, 0];
+  for (const i of [0, 1, 2, 0, 2, 3]) {
+    const c = corners[i];
+    if (c !== undefined) b.vertex([c[0], h, c[1]], n, c[0], c[1], s);
   }
 }
 
 /**
- * The whole room as one vertex array: floor and ceiling, the four walls
- * facing in, a lamp panel per light zone, the hazard baseboards and scaffold
- * of a room under construction, and every fixture. Text quads take their
- * layer from `textRequests`, request `i` in layer `TEXT_BASE + i`. Pure and
+ * Where a zone's lamp hangs: centred on the zone's floor cells, when the
+ * whole panel lies over floor that is not a doorway; otherwise over the
+ * middle of the zone's floor cell nearest that centre, so a zone of odd
+ * shape never hangs its lamp over a wall or across a lintel. Null for a
+ * zone with no floor, which the generator never makes.
+ */
+function lampCentre(
+  room: RoomSpec,
+  zone: { x0: number; y0: number; x1: number; y1: number },
+  doorways: Set<number>,
+): [number, number] | null {
+  const cells: [number, number][] = [];
+  for (let y = zone.y0; y < zone.y1; y++)
+    for (let x = zone.x0; x < zone.x1; x++)
+      if (isFloor(room.grid, x, y) && !doorways.has(x)) cells.push([x, y]);
+  if (cells.length === 0) return null;
+  const cx = (cells.reduce((a, [x]) => a + x, 0) / cells.length + 0.5) * CELL;
+  const cz = (cells.reduce((a, [, y]) => a + y, 0) / cells.length + 0.5) * CELL;
+  const open = (px: number, pz: number) => {
+    const x = Math.floor(px / CELL);
+    return isFloor(room.grid, x, Math.floor(pz / CELL)) && !doorways.has(x);
+  };
+  const fits = [-1, 1].every((sx) =>
+    [-1, 1].every((sz) =>
+      open(cx + sx * (LAMP_HALF_W - 1e-3), cz + sz * (LAMP_HALF_D - 1e-3)),
+    ),
+  );
+  if (fits) return [cx, cz];
+  let best: [number, number] = [cx, cz];
+  let bestD = Infinity;
+  for (const [x, y] of cells) {
+    const mx = (x + 0.5) * CELL;
+    const mz = (y + 0.5) * CELL;
+    const d = Math.hypot(mx - cx, mz - cz);
+    if (d < bestD) [best, bestD] = [[mx, mz], d];
+  }
+  return best;
+}
+
+/**
+ * A scaffold frame standing on `box`: a pole in each corner, a rail round
+ * the top and one along each long side halfway up, all inside the box so
+ * what is drawn is exactly what `scaffoldBoxes` makes the player walk
+ * around.
+ */
+function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
+  const top = ceiling - POLE_CLEARANCE;
+  const xs = [box.x0 + POLE_INSET, box.x1 - POLE_INSET - POLE];
+  const zs = [box.z0 + POLE_INSET, box.z1 - POLE_INSET - POLE];
+  for (const x of xs)
+    for (const z of zs) b.box([x, 0, z], [x + POLE, top, z + POLE], s);
+  const [ax, bx] = [xs[0] ?? box.x0, (xs[1] ?? box.x1) + POLE];
+  const [az, bz] = [zs[0] ?? box.z0, (zs[1] ?? box.z1) + POLE];
+  const rail = Math.min(TOP_RAIL, top - POLE);
+  // The top frame: two rails along x, two along z.
+  for (const z of zs) b.box([ax, rail, z], [bx, rail + POLE, z + POLE], s);
+  for (const x of xs) b.box([x, rail, az], [x + POLE, rail + POLE, bz], s);
+  // Mid rails along x.
+  for (const z of zs)
+    b.box([ax, MID_RAIL, z], [bx, MID_RAIL + POLE, z + POLE], s);
+}
+
+/**
+ * The whole room: the shell built on the grid, a lamp panel per light zone,
+ * the hazard baseboards and scaffold frames of a room under construction,
+ * and every fixture and piece of furniture as its detailed model. Text
+ * quads take their layer and row from `layerPlan(room)`. Pure and
  * deterministic: the same room and look give the same floats.
  *
- * Stopgap until the grid mesh: the shell is the main hall's rectangle only
- * (`room.hall`), so a room with bays or a corridor shows their fixtures
- * outside its walls. The mesh built per floor cell replaces this.
+ * Shell rules: every floor cell gets a floor and a ceiling quad; every edge
+ * of a floor cell whose neighbour is void or outside the grid gets a wall
+ * quad from the floor to the ceiling, facing into the cell, so no wall ever
+ * stands between two floor cells. Where a doorway cell (see
+ * `doorwayColumns`) meets the hall, a bay or the corridor, a lintel runs
+ * from `LINTEL` to the ceiling on both faces of the edge. Lamps and
+ * scaffolding share the hall's ceiling height, which bays and the corridor
+ * share too.
  */
-export function buildRoomMesh(room: RoomSpec, look: Look): MeshData {
+export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
   const b = createBuilder();
   const p = look.palette;
-  const X0 = room.hall.x0 * CELL;
-  const Z0 = room.hall.y0 * CELL;
-  const W = room.hall.x1 * CELL;
-  const D = room.hall.y1 * CELL;
   const H = room.ceiling;
+  const doorways = doorwayColumns(room);
   const wall: Surface = { layer: LAYER.panel, tint: p.panel, flag: FLAG.lit };
-  const w = W - X0;
-  const d = D - Z0;
-
-  // Floor (facing up) and ceiling (facing down), uv in metres.
-  b.quad([X0, 0, D], [W, 0, D], [W, 0, Z0], [X0, 0, Z0], [0, 1, 0], w, d, {
-    layer: LAYER.floor,
-    tint: p.floor,
-    flag: FLAG.lit,
-  });
-  b.quad([X0, H, Z0], [W, H, Z0], [W, H, D], [X0, H, D], [0, -1, 0], w, d, {
+  const floor: Surface = { layer: LAYER.floor, tint: p.floor, flag: FLAG.lit };
+  const ceiling: Surface = {
     layer: LAYER.ceiling,
     tint: p.ceiling,
     flag: FLAG.lit,
-  });
-  // The four walls, facing in.
-  b.quad(
-    [X0, 0, Z0],
-    [W, 0, Z0],
-    [W, H, Z0],
-    [X0, H, Z0],
-    [0, 0, 1],
-    w,
-    H,
-    wall,
+  };
+  const building = room.condition === "construction";
+  const hazard: Surface = {
+    layer: LAYER.hazard,
+    tint: [1, 1, 1] as Rgb,
+    flag: FLAG.lit,
+  };
+  // Wall slots that are ways through keep their wall clear of baseboards.
+  const openings = new Set(
+    room.fixtures
+      .filter(
+        (f) => f.kind === "door" || f.kind === "portal" || f.kind === "hatch",
+      )
+      .map((f) => `${f.slot.x},${f.slot.y},${f.slot.side}`),
   );
-  b.quad([W, 0, D], [X0, 0, D], [X0, H, D], [W, H, D], [0, 0, -1], w, H, wall);
-  b.quad(
-    [X0, 0, D],
-    [X0, 0, Z0],
-    [X0, H, Z0],
-    [X0, H, D],
-    [1, 0, 0],
-    d,
-    H,
-    wall,
-  );
-  b.quad([W, 0, Z0], [W, 0, D], [W, H, D], [W, H, Z0], [-1, 0, 0], d, H, wall);
 
-  // One lamp panel in the middle of every light zone, just under the ceiling.
+  for (let y = 0; y < room.depth; y++) {
+    for (let x = 0; x < room.width; x++) {
+      if (!isFloor(room.grid, x, y)) continue;
+      const X0 = x * CELL;
+      const Z0 = y * CELL;
+      flatQuad(b, X0, X0 + CELL, Z0, Z0 + CELL, 0, true, floor);
+      flatQuad(b, X0, X0 + CELL, Z0, Z0 + CELL, H, false, ceiling);
+      for (const side of SIDES) {
+        const [dx, dy] = STEP[side];
+        const nx = x + dx;
+        const ny = y + dy;
+        if (!isFloor(room.grid, nx, ny)) {
+          edgeQuad(b, x, y, side, 0, H, 0, wall);
+          if (building && !openings.has(`${x},${y},${side}`))
+            edgeQuad(b, x, y, side, 0, BASEBOARD, BASEBOARD_INSET, hazard);
+        } else if (doorways.has(x) !== doorways.has(nx) && H > LINTEL) {
+          edgeQuad(b, x, y, side, LINTEL, H, 0, wall);
+        }
+      }
+    }
+  }
+
+  // One lamp panel per light zone, just under the ceiling.
   for (const z of room.lights) {
-    const cx = ((z.x0 + z.x1) / 2) * CELL;
-    const cz = ((z.y0 + z.y1) / 2) * CELL;
-    const y = H - 0.01;
-    b.quad(
-      [cx - 0.8, y, cz - 0.3],
-      [cx + 0.8, y, cz - 0.3],
-      [cx + 0.8, y, cz + 0.3],
-      [cx - 0.8, y, cz + 0.3],
-      [0, -1, 0],
-      1,
-      1,
+    const c = lampCentre(room, z, doorways);
+    if (c === null) continue;
+    flatQuad(
+      b,
+      c[0] - LAMP_HALF_W,
+      c[0] + LAMP_HALF_W,
+      c[1] - LAMP_HALF_D,
+      c[1] + LAMP_HALF_D,
+      H - LAMP_DROP,
+      false,
       { layer: LAYER.ceiling, tint: p.lamp, flag: FLAG.lamp },
     );
   }
 
-  // Under construction: hazard-striped baseboards and two scaffold frames.
-  if (room.condition === "construction") {
-    const hazard: Surface = {
-      layer: LAYER.hazard,
-      tint: [1, 1, 1],
-      flag: FLAG.lit,
-    };
-    b.quad(
-      [X0, 0, Z0 + 0.01],
-      [W, 0, Z0 + 0.01],
-      [W, 0.3, Z0 + 0.01],
-      [X0, 0.3, Z0 + 0.01],
-      [0, 0, 1],
-      w,
-      0.3,
-      hazard,
-    );
-    b.quad(
-      [W, 0, D - 0.01],
-      [X0, 0, D - 0.01],
-      [X0, 0.3, D - 0.01],
-      [W, 0.3, D - 0.01],
-      [0, 0, -1],
-      w,
-      0.3,
-      hazard,
-    );
-    const rng = createRng(room.seed);
-    for (let i = 0; i < 2; i++) {
-      const x = rng.range(X0 + CELL * 1.5, W - CELL * 1.5);
-      const z = rng.range(Z0 + CELL * 1.5, D - CELL * 1.5);
-      const s: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.lit };
-      for (const [dx, dz] of [
-        [-0.6, -0.6],
-        [0.6, -0.6],
-        [-0.6, 0.6],
-        [0.6, 0.6],
-      ] as const) {
-        b.box(
-          [x + dx - 0.04, 0, z + dz - 0.04],
-          [x + dx + 0.04, H - 0.2, z + dz + 0.04],
-          s,
-        );
-      }
-      b.box([x - 0.7, 2.2, z - 0.7], [x + 0.7, 2.28, z + 0.7], s);
-    }
-  }
+  // Under construction: the scaffold frames the player walks around.
+  const pole: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.lit };
+  for (const box of scaffoldBoxes(room)) scaffold(b, box, H, pole);
 
-  const textLayer = new Map(
-    textRequests(room).map((r, i) => [r.key, TEXT_BASE + i]),
-  );
+  const plan = layerPlan(room);
+  const ctx: ModelContext = {
+    look,
+    ceiling: H,
+    hall: room.hall,
+    textLayer: (key) => plan.lookup(key),
+  };
+  const kitAt: KitAt = (f) => createKit(b, f);
+  const movers: Mover[] = [];
   room.fixtures.forEach((fx, i) => {
-    fixture(b, room, fx, i, textLayer, look);
+    movers.push(...buildFixture(kitAt, fx, i, ctx));
   });
-  return b.build();
+  for (const d of room.decor) buildDecor(kitAt, d, ctx);
+  return { static: b.build(), movers };
 }
