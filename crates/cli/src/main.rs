@@ -754,13 +754,14 @@ enum PromptKind {
     /// that read and write them.
     System {
         /// The workspace path to route for. Defaults to the current
-        /// directory. Scoping comes from the global config's `prompt.rules`:
-        /// each key is a path glob, and the include and exclude lists of
-        /// every rule whose glob matches this path decide which registered
-        /// domains are rendered. A workspace no rule matches gets every
-        /// registered domain. A `.crystalline.yaml` in the workspace does
-        /// not scope: its `preferred_domains` reorder what is rendered,
-        /// preferred first.
+        /// directory; a relative path is made absolute first. Scoping comes
+        /// from the global config's `prompt.rules`: each key is a path glob,
+        /// and the include and exclude lists of every rule whose glob matches
+        /// this path decide which registered domains are rendered. A key
+        /// ending in `/**` matches the folder itself as well as everything
+        /// under it. A workspace no rule matches gets every registered
+        /// domain. A `.crystalline.yaml` in the workspace does not scope: its
+        /// `preferred_domains` reorder what is rendered, preferred first.
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Render only these registered domains, in the configured
