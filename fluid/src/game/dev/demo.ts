@@ -67,7 +67,7 @@ export function startDemo(
   hud: DemoHud,
   options: { forceRgba8: boolean },
 ): () => void {
-  let lookId: LookId = "day";
+  let lookId: LookId = "aperture";
   let retired = false;
   let room: RoomSpec = generateRoom(CANNED_BRIDGE);
   let blockers = blockersFor(room);
