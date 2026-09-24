@@ -2,31 +2,39 @@
  * The station's GLSL: one shader for every surface, four small ones for the
  * bloom and the final picture.
  *
- * The surface shader does DOOM's diminishing light: the zone's level minus a
+ * The surface shader does DOOM's diminishing light: the cell's level minus a
  * term that grows with distance, clamped to the look's floor and quantised
  * into bands, so light falls off in visible steps the way DOOM's COLORMAP
- * did. On top come the neon edge lines, drawn where a surface's uv (in
- * metres) crosses a whole number, antialiased with `fwidth`; they are added
- * above 1.0 so the bloom picks them up. The portal surface scrolls its swirl
- * layer and brightens towards its rim.
+ * did. The level comes from the room's light grid, a small R8 texture with
+ * one texel per grid cell that the renderer refills every frame (see
+ * `render/lightgrid.ts`), so a room lights any number of zones at the cost
+ * of one texture read. On top come the neon edge lines, drawn where a
+ * surface's uv (in metres) crosses a whole number, antialiased with the uv's
+ * screen-space derivatives; they are added above 1.0 so the bloom picks them
+ * up. The portal surface scrolls its swirl layer and brightens towards its
+ * rim.
  */
 
+import { CELL } from "../world/generate";
+
 /**
- * How many light zones the surface shader reads, the size of its
- * `uZoneRect` and `uZoneLevel` arrays. A room at the 24 by 24 cap can have
- * up to 36 zones; milestone 1 lights such a room from the first 16 only
- * (every surface takes the nearest of those), and milestone 2 moves the
- * zones into a small data texture that has no such bound.
+ * How far, in metres, the surface shader moves a fragment along its normal
+ * before it picks the light-grid cell: enough to step off a wall's cell
+ * border into the floor cell the wall faces, and far below the 0.3 m a
+ * flush part stands out from its wall, so no part is lit from a cell it
+ * does not stand in.
  */
-export const MAX_ZONES = 16;
+export const LIGHT_NUDGE = 0.05;
 
 /**
  * The surface vertex shader. It reads the 13-float vertex the geometry
  * writes, at the attribute locations `gl/mesh.ts` binds (position 0, normal
- * 1, uv 2, layer 3, tint 4, flag 5), passes the world position on for the
- * distance and zone lookups, and hands layer, tint and flag through flat so
- * a triangle never blends between two surfaces. The flag is rounded to an
- * int once here, so the fragment shader compares whole numbers.
+ * 1, uv 2, layer 3, tint 4, flag 5), moves it by `uModelOffset` (a door
+ * panel's slide while it opens; zero for the static room), passes the moved
+ * world position on for the distance and light-grid lookups, and hands
+ * layer, tint and flag through flat so a triangle never blends between two
+ * surfaces. The flag is rounded to an int once here, so the fragment shader
+ * compares whole numbers.
  */
 export const SCENE_VS = `#version 300 es
 layout(location = 0) in vec3 aPosition;
@@ -36,6 +44,7 @@ layout(location = 3) in float aLayer;
 layout(location = 4) in vec3 aTint;
 layout(location = 5) in float aFlag;
 uniform mat4 uViewProjection;
+uniform vec3 uModelOffset;
 out vec3 vWorld;
 out vec3 vNormal;
 out vec2 vUv;
@@ -43,29 +52,43 @@ flat out float vLayer;
 flat out vec3 vTint;
 flat out int vFlag;
 void main() {
-  vWorld = aPosition;
+  vec3 world = aPosition + uModelOffset;
+  vWorld = world;
   vNormal = aNormal;
   vUv = aUv;
   vLayer = aLayer;
   vTint = aTint;
   vFlag = int(aFlag + 0.5);
-  gl_Position = uViewProjection * vec4(aPosition, 1.0);
+  gl_Position = uViewProjection * vec4(world, 1.0);
 }
 `;
 
 /**
  * The surface fragment shader, one for everything in the room. The flag
  * from `FLAG` in `geometry.ts` picks the path: emissive text and screens
- * ignore the light, a lamp glows with its zone's level, the portal scrolls
+ * ignore the light, a lamp glows with its cell's level, the portal scrolls
  * its swirl and brightens at the rim, and lit surfaces (with frames among
- * them) get the banded, distance-dimmed zone light, optional grime and the
+ * them) get the banded, distance-dimmed cell light, optional grime and the
  * neon edge lines. On an RGBA8 target (`uLdr` 1) the edge lines are toned
  * down, since nothing above 1.0 survives there and the bloom threshold is
  * lower.
+ *
+ * The light grid (`uLightGrid`, R8 with NEAREST filtering, `uGridSize`
+ * cells wide and deep, row 0 the grid's north row) is read at the centre of
+ * the fragment's cell, `floor(world.xz / CELL) + 0.5` over the grid size. A
+ * wall lies exactly on the border between its floor cell and the void cell
+ * behind it, where `floor` would pick either side, so the point is first
+ * nudged `LIGHT_NUDGE` metres along the surface normal, which every wall
+ * turns towards its floor cell. A texel of 0 is legal: a dark cell.
+ *
+ * The uv's screen-space derivatives are taken once, at the top of `main`
+ * before any early return, so they are defined for every fragment of the
+ * quad; the edge lines and the grime lookup (`textureGrad`) share them.
  */
 export const SCENE_FS = `#version 300 es
 precision highp float;
 precision highp sampler2DArray;
+precision highp sampler2D;
 in vec3 vWorld;
 in vec3 vNormal;
 in vec2 vUv;
@@ -75,9 +98,8 @@ flat in int vFlag;
 uniform sampler2DArray uTextures;
 uniform vec3 uEye;
 uniform float uTime;
-uniform vec4 uZoneRect[${MAX_ZONES}];
-uniform float uZoneLevel[${MAX_ZONES}];
-uniform int uZoneCount;
+uniform sampler2D uLightGrid;
+uniform vec2 uGridSize;
 uniform float uLightScale;
 uniform float uFalloff;
 uniform float uMinLight;
@@ -92,28 +114,27 @@ uniform float uGrimeLayer;
 uniform float uLdr;
 out vec4 outColour;
 
-float zoneLevel(vec3 p) {
-  float best = 1e9;
-  float level = 0.5;
-  for (int i = 0; i < ${MAX_ZONES}; i++) {
-    if (i >= uZoneCount) break;
-    vec4 r = uZoneRect[i];
-    vec2 c = clamp(p.xz, r.xy, r.zw);
-    float d = distance(c, p.xz);
-    if (d < best) { best = d; level = uZoneLevel[i]; }
-  }
-  return level;
+const float CELL = ${CELL.toFixed(1)};
+const float LIGHT_NUDGE = ${LIGHT_NUDGE.toFixed(2)};
+
+float cellLevel(vec3 p, vec3 n) {
+  vec2 at = p.xz + normalize(n).xz * LIGHT_NUDGE;
+  vec2 cell = floor(at / CELL) + 0.5;
+  return texture(uLightGrid, cell / uGridSize).r;
 }
 
-float edgeLine(vec2 uv, float width) {
-  vec2 g = abs(fract(uv - 0.5) - 0.5) / max(fwidth(uv), vec2(1e-4));
+float edgeLine(vec2 uv, vec2 fw, float width) {
+  vec2 g = abs(fract(uv - 0.5) - 0.5) / max(fw, vec2(1e-4));
   return 1.0 - clamp(min(g.x, g.y) / width, 0.0, 1.0);
 }
 
 void main() {
+  vec2 dx = dFdx(vUv);
+  vec2 dy = dFdy(vUv);
+  vec2 fw = abs(dx) + abs(dy);
   vec3 texel = texture(uTextures, vec3(vUv, vLayer)).rgb;
   vec3 base = vTint * mix(vec3(1.0), texel, uTextureMix);
-  float level = zoneLevel(vWorld);
+  float level = cellLevel(vWorld, vNormal);
 
   if (vFlag == 1) {
     outColour = vec4(vTint * texel * 1.4, 1.0);
@@ -133,7 +154,7 @@ void main() {
   }
 
   if (uGrime > 0.0) {
-    float grime = texture(uTextures, vec3(vUv * 0.37, uGrimeLayer)).r;
+    float grime = textureGrad(uTextures, vec3(vUv * 0.37, uGrimeLayer), dx * 0.37, dy * 0.37).r;
     base *= 1.0 - uGrime * grime * 0.85;
   }
 
@@ -147,7 +168,7 @@ void main() {
 
   bool framed = vFlag == 3 || (uEdgeEverywhere && vFlag == 0);
   if (framed) {
-    float e = edgeLine(vUv, uEdgeWidth);
+    float e = edgeLine(vUv, fw, uEdgeWidth);
     vec3 edgeColour = vFlag == 3 ? vTint : uEdgeColour;
     colour += edgeColour * e * uEdgeStrength * mix(1.0, 0.45, uLdr);
   }

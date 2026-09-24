@@ -13,6 +13,7 @@ import type { Fixture } from "../../world/types";
 import { FLAG } from "../geometry";
 import { frameForSlot } from "../kit";
 import { ASPECT, LAYER } from "../layers";
+import { PICTOGRAM } from "../text";
 import {
   shade,
   surfaces,
@@ -25,9 +26,10 @@ type Hatch = Extract<Fixture, { kind: "hatch" }>;
 
 /**
  * Where the "SERVICE" pictogram sits in the pictogram layer, as a uv
- * rectangle. The whole layer until the pictogram set packs several.
+ * rectangle: its tile of the pictogram set, which `PICTOGRAM` in
+ * `render/text.ts` lays out and draws, so the plate and the sheet agree.
  */
-export const SERVICE_PICTOGRAM = { u0: 0, v0: 0, uw: 1, vh: 1 } as const;
+export const SERVICE_PICTOGRAM = PICTOGRAM.service;
 
 /** The hatch door: half width, bottom and top. */
 const HALF = 0.5;

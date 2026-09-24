@@ -35,6 +35,13 @@ import {
 import type { RoomSpec } from "../world/types";
 
 /**
+ * The demo's doors, all shut: the look demo has no interaction, so no door
+ * ever opens and every mover draws at its closed position. The game proper
+ * hands the renderer the live open fractions instead.
+ */
+const CLOSED_DOORS: ReadonlyMap<string, number> = new Map();
+
+/**
  * Where the demo writes its heads-up text: the look, condition and mouse
  * hint (`status`), the frame time and the colour format of the render
  * targets (`frame`), and a centred notice over the canvas for a missing or
@@ -232,6 +239,7 @@ export function startDemo(
         },
         lights.levels,
         (now - started) / 1000,
+        CLOSED_DOORS,
       );
     },
   });

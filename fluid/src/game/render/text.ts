@@ -207,29 +207,116 @@ export function drawTextLayers(
 }
 
 /**
- * The pictogram layer: a Semiotic Standard style sign (a square frame with
- * an arrow through a door), drawn as vector paths in white on black so the
- * shader can tint it.
+ * A pictogram's place in the pictogram layer (`LAYER.pictogram`), as the uv
+ * rectangle `kit.panel` takes: `(u0, v0)` its bottom-left corner in texture
+ * space (v 0 at the bottom, as `flipRows` uploads it) and `uw` by `vh` its
+ * size.
+ */
+export interface PictogramRect {
+  u0: number;
+  v0: number;
+  uw: number;
+  vh: number;
+}
+
+/**
+ * The pictogram set, a 2 by 2 sheet of square tiles in the one pictogram
+ * layer, so a square plate shows its sign undistorted: the service hatch
+ * top left, the portal top right, the door bottom left, and the bottom
+ * right tile left dark for a later sign. This is the single source of the
+ * layout: `drawPictogramLayer` draws each sign into the tile named here, and
+ * a model maps its plate to the same rectangle (`SERVICE_PICTOGRAM` in
+ * `models/hatch.ts` is `PICTOGRAM.service`), so the two cannot drift.
+ */
+export const PICTOGRAM = {
+  service: { u0: 0, v0: 0.5, uw: 0.5, vh: 0.5 },
+  portal: { u0: 0.5, v0: 0.5, uw: 0.5, vh: 0.5 },
+  door: { u0: 0, v0: 0, uw: 0.5, vh: 0.5 },
+} as const satisfies Record<string, PictogramRect>;
+
+/** The pictograms of the set, each drawn into a unit tile (0 to 16). */
+const SIGNS: Record<
+  keyof typeof PICTOGRAM,
+  (ctx: CanvasRenderingContext2D) => void
+> = {
+  // A low hatch with an arrow coming out of it: the service way back.
+  service(ctx) {
+    ctx.fillRect(2.5, 8.5, 6.5, 5.5);
+    ctx.beginPath();
+    ctx.moveTo(9.5, 8.5);
+    ctx.lineTo(12, 8.5);
+    ctx.lineTo(12, 6.5);
+    ctx.lineTo(14, 9.25);
+    ctx.lineTo(12, 12);
+    ctx.lineTo(12, 10);
+    ctx.lineTo(9.5, 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(2.5, 5.5);
+    ctx.lineTo(9, 5.5);
+    ctx.stroke();
+  },
+  // A ring with a spiral inside: the way to another domain.
+  portal(ctx) {
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(8, 8, 5.2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.lineWidth = 0.9;
+    ctx.beginPath();
+    for (let t = 0; t <= Math.PI * 4; t += 0.1) {
+      const r = 0.4 + t * 0.28;
+      const x = 8 + Math.cos(t) * r;
+      const y = 8 + Math.sin(t) * r;
+      if (t === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  },
+  // A doorway with an arrow walking through it: milestone 1's sign.
+  door(ctx) {
+    ctx.fillRect(9, 4, 3, 8);
+    ctx.beginPath();
+    ctx.moveTo(3.5, 7);
+    ctx.lineTo(7, 7);
+    ctx.lineTo(7, 5);
+    ctx.lineTo(9, 8);
+    ctx.lineTo(7, 11);
+    ctx.lineTo(7, 9);
+    ctx.lineTo(3.5, 9);
+    ctx.closePath();
+    ctx.fill();
+  },
+};
+
+/**
+ * The pictogram layer: the `PICTOGRAM` set of Semiotic Standard style
+ * signs, each a square frame around its symbol, drawn as vector paths in
+ * white on black so the shader can tint them. Each tile keeps a dark margin
+ * on every side, so the coarser mip levels do not bleed one sign into its
+ * neighbour.
  */
 export function drawPictogramLayer(size: number): Uint8Array {
   const ctx = canvas2d(size);
-  const s = size / 16;
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, size, size);
-  ctx.strokeStyle = "#fff";
-  ctx.fillStyle = "#fff";
-  ctx.lineWidth = s;
-  ctx.strokeRect(s * 1.5, s * 1.5, size - s * 3, size - s * 3);
-  ctx.fillRect(s * 9, s * 4, s * 3, s * 8);
-  ctx.beginPath();
-  ctx.moveTo(s * 3.5, s * 7);
-  ctx.lineTo(s * 7, s * 7);
-  ctx.lineTo(s * 7, s * 5);
-  ctx.lineTo(s * 9, s * 8);
-  ctx.lineTo(s * 7, s * 11);
-  ctx.lineTo(s * 7, s * 9);
-  ctx.lineTo(s * 3.5, s * 9);
-  ctx.closePath();
-  ctx.fill();
+  for (const key of Object.keys(PICTOGRAM) as (keyof typeof PICTOGRAM)[]) {
+    const rect = PICTOGRAM[key];
+    const tile = rect.uw * size;
+    // The canvas's top is texture v 1: a tile at v0 starts this far down.
+    const left = rect.u0 * size;
+    const top = (1 - rect.v0 - rect.vh) * size;
+    ctx.save();
+    ctx.translate(left, top);
+    ctx.scale(tile / 16, (rect.vh * size) / 16);
+    ctx.strokeStyle = "#fff";
+    ctx.fillStyle = "#fff";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(1.5, 1.5, 13, 13);
+    SIGNS[key](ctx);
+    ctx.restore();
+  }
   return pixels(ctx, size);
 }

@@ -2,10 +2,12 @@
  * Frames from a room: the scene pass, the bloom and the final composite.
  *
  * `setRoom` does the expensive work once per room or look - it builds the
- * mesh, fills the texture array (procedural layers, pictogram, and the text
- * layers of `layerPlan`: one per screen, poster and placard, one per six
- * labels) and keeps the look's numbers - and `draw` is
- * then a handful of uniform uploads and six full-screen passes. The scene is
+ * static room mesh and one small mesh per moving door panel, fills the
+ * texture array (procedural layers, the pictogram set, and the text layers
+ * of `layerPlan`: one per screen, poster and placard, one per six labels),
+ * makes the room's light grid texture and keeps the look's numbers - and
+ * `draw` is then a handful of uniform uploads, one small light upload, the
+ * room and its door panels, and six full-screen passes. The scene is
  * rendered at the canvas size handed to `resize`, the bloom at half of that
  * and below.
  *
@@ -21,17 +23,16 @@ import { createFullscreen, createMesh, type Mesh } from "../gl/mesh";
 import { createProgram, type Program } from "../gl/program";
 import { createTarget, type Target } from "../gl/target";
 import { createTextureArray, type TextureArray } from "../gl/textureArray";
-import { CELL } from "../world/generate";
 import type { RoomSpec } from "../world/types";
-import { FLOATS_PER_VERTEX, buildRoomMesh, type MeshData } from "./geometry";
+import { buildRoomMesh, type V3 } from "./geometry";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
+import { fillLightTexels, lightGrid, type LightGrid } from "./lightgrid";
 import { C64_PALETTE, applyCondition, type Look } from "./looks";
 import {
   BRIGHT_FS,
   COMPOSITE_FS,
   DOWN_FS,
   FULLSCREEN_VS,
-  MAX_ZONES,
   SCENE_FS,
   SCENE_VS,
   UP_FS,
@@ -51,47 +52,85 @@ export interface Camera {
 }
 
 /**
- * The station's renderer. `setRoom` builds the mesh and texture array for a
- * room in a look (call it again when either changes), `resize` rebuilds the
- * offscreen targets for a new canvas size in device pixels, `draw` renders
- * one frame with the zones' current light levels (DOOM's 0 to 255 scale, in
- * `room.lights` order) and the time in seconds for the portal's swirl, and
- * `dispose` frees every GPU object. `draw` before `setRoom` draws nothing.
+ * The station's renderer.
+ *
+ * - `setRoom` builds the meshes, the texture array and the light grid for a
+ *   room in a look; call it again when either changes. It throws when the
+ *   room needs more texture layers than the GPU holds (`caps.maxLayers`,
+ *   at least 256 in WebGL2), a limit error like a failed shader: a shorter
+ *   array would make the shader clamp the missing layers to the last one
+ *   and show readable, wrong labels.
+ * - `resize` rebuilds the offscreen targets for a new canvas size in device
+ *   pixels.
+ * - `draw` renders one frame: `levels` holds the zones' current light
+ *   levels (DOOM's 0 to 255 scale, in `room.lights` order), `seconds` the
+ *   time for the portal's swirl, and `doors` each moving door's open
+ *   fraction by its mover key (`door:<fixtureIndex>`), 0 closed to 1 open;
+ *   a key that is missing is a closed door, and a fraction outside 0..1 is
+ *   clamped.
+ * - `dispose` frees every GPU object and may be called more than once.
+ *
+ * `draw` before `setRoom` or after `dispose` draws nothing.
  */
 export interface Renderer {
   setRoom(room: RoomSpec, look: Look): void;
   resize(width: number, height: number): void;
-  draw(camera: Camera, levels: Float32Array, seconds: number): void;
+  draw(
+    camera: Camera,
+    levels: Float32Array,
+    seconds: number,
+    doors: ReadonlyMap<string, number>,
+  ): void;
   dispose(): void;
 }
 
+/** A door panel on the GPU: its mesh, key and slide (`axis * travel`). */
+interface GpuMover {
+  key: string;
+  mesh: Mesh;
+  slide: V3;
+}
+
 /**
- * Several meshes as one vertex array, in order. A bridge until the renderer
- * draws each door's movers on their own: until then the panels are appended
- * to the static room at their closed position.
+ * The room's light on the GPU: an R8 texture of one texel per grid cell,
+ * the grid that maps cells to zones, and the byte array refilled from the
+ * zones' levels before every upload.
  */
-function joinMeshes(meshes: readonly MeshData[]): MeshData {
-  const count = meshes.reduce((n, m) => n + m.count, 0);
-  const vertices = new Float32Array(count * FLOATS_PER_VERTEX);
-  let at = 0;
-  for (const m of meshes) {
-    vertices.set(m.vertices, at);
-    at += m.vertices.length;
-  }
-  return { vertices, count };
+interface GpuLight {
+  texture: WebGLTexture;
+  grid: LightGrid;
+  texels: Uint8Array;
+}
+
+/** The offscreen targets: the scene, three bloom steps down and two up. */
+interface Targets {
+  scene: Target;
+  d0: Target;
+  d1: Target;
+  d2: Target;
+  u0: Target;
+  u1: Target;
 }
 
 /** Vertical field of view: 70 degrees, a little wider than DOOM's feel on a tall screen. */
 const FOV_Y = (70 * Math.PI) / 180;
 
 /**
+ * The near clip plane in metres. Flush door and portal parts stand up to
+ * 0.3 m out from their wall and the eye stops 0.35 m from it, so the plane
+ * must sit well inside 0.05 m or a face-to-the-wall view clips them.
+ */
+const NEAR = 0.02;
+
+/** The far clip plane in metres, past the far end of the largest hub. */
+const FAR = 200;
+
+/**
  * Compiles the five programs and makes the procedural layers once, then
  * returns a renderer bound to `gl`. The offscreen targets use `caps.color`,
  * falling back to RGBA8 per target when the driver refuses a half-float
- * framebuffer, and the texture array is capped at `caps.maxLayers`, so a
- * room with more text than the GPU can hold loses its last labels instead
- * of failing. Throws when a shader does not compile, which is a programming
- * error, or when not even an RGBA8 target can be made.
+ * framebuffer. Throws when a shader does not compile, which is a
+ * programming error, or when not even an RGBA8 target can be made.
  */
 export function createRenderer(
   gl: WebGL2RenderingContext,
@@ -106,14 +145,15 @@ export function createRenderer(
   const base = baseLayers(LAYER_SIZE, 0x5eed);
   const pictogram = drawPictogramLayer(LAYER_SIZE);
 
+  let disposed = false;
   let mesh: Mesh | null = null;
+  let movers: GpuMover[] = [];
   let textures: TextureArray | null = null;
+  let light: GpuLight | null = null;
   let room: RoomSpec | null = null;
   let look: Look | null = null;
-  let targets: { scene: Target; down: Target[]; up: Target[] } | null = null;
+  let targets: Targets | null = null;
   let size = { width: 1, height: 1 };
-  const zoneRects = new Float32Array(MAX_ZONES * 4);
-  const zoneLevels = new Float32Array(MAX_ZONES);
   const projection = mat4();
   const view = mat4();
   const viewProjection = mat4();
@@ -121,9 +161,22 @@ export function createRenderer(
 
   const releaseTargets = () => {
     if (targets === null) return;
-    targets.scene.dispose();
-    for (const t of [...targets.down, ...targets.up]) t.dispose();
+    const { scene: s, d0, d1, d2, u0, u1 } = targets;
+    for (const t of [s, d0, d1, d2, u0, u1]) t.dispose();
     targets = null;
+  };
+
+  const releaseRoom = () => {
+    mesh?.dispose();
+    mesh = null;
+    for (const m of movers) m.mesh.dispose();
+    movers = [];
+    textures?.dispose();
+    textures = null;
+    if (light !== null) gl.deleteTexture(light.texture);
+    light = null;
+    room = null;
+    look = null;
   };
 
   const makeTarget = (w: number, h: number, depth: boolean): Target => {
@@ -139,9 +192,30 @@ export function createRenderer(
     const { width, height } = size;
     targets = {
       scene: makeTarget(width, height, true),
-      down: [2, 4, 8].map((d) => makeTarget(width / d, height / d, false)),
-      up: [2, 4].map((d) => makeTarget(width / d, height / d, false)),
+      d0: makeTarget(width / 2, height / 2, false),
+      d1: makeTarget(width / 4, height / 4, false),
+      d2: makeTarget(width / 8, height / 8, false),
+      u0: makeTarget(width / 2, height / 2, false),
+      u1: makeTarget(width / 4, height / 4, false),
     };
+  };
+
+  /**
+   * The room's light grid texture: immutable R8 storage of one texel per
+   * cell, NEAREST so a cell never blends into its neighbour, clamped so a
+   * point nudged past the grid's edge reads the edge cell.
+   */
+  const makeLight = (nextRoom: RoomSpec): GpuLight => {
+    const grid = lightGrid(nextRoom);
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, grid.width, grid.depth);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return { texture, grid, texels: new Uint8Array(grid.width * grid.depth) };
   };
 
   const pass = (
@@ -172,42 +246,47 @@ export function createRenderer(
 
   return {
     setRoom(nextRoom, nextLook) {
-      room = nextRoom;
-      look = applyCondition(nextLook, nextRoom.condition);
-      mesh?.dispose();
-      // Bridge until the renderer draws movers: the door panels are drawn
-      // closed, appended to the static mesh as one draw call.
-      const built = buildRoomMesh(nextRoom, look);
-      mesh = createMesh(
-        gl,
-        joinMeshes([built.static, ...built.movers.map((m) => m.mesh)]),
-      );
-      textures?.dispose();
+      if (disposed) return;
       const plan = layerPlan(nextRoom);
-      const count = Math.min(plan.count, caps.maxLayers);
-      textures = createTextureArray(gl, LAYER_SIZE, count);
+      if (plan.count > caps.maxLayers) {
+        throw new Error(
+          `room needs ${plan.count} texture layers, the GPU holds ${caps.maxLayers}`,
+        );
+      }
+      releaseRoom();
+      const nextLookApplied = applyCondition(nextLook, nextRoom.condition);
+      const built = buildRoomMesh(nextRoom, nextLookApplied);
+      mesh = createMesh(gl, built.static);
+      movers = built.movers.map((m) => ({
+        key: m.key,
+        mesh: createMesh(gl, m.mesh),
+        slide: [
+          m.axis[0] * m.travel,
+          m.axis[1] * m.travel,
+          m.axis[2] * m.travel,
+        ],
+      }));
+      const array = createTextureArray(gl, LAYER_SIZE, plan.count);
+      textures = array;
       base.forEach((pixels, i) => {
-        if (i !== LAYER.pictogram) textures?.setLayer(i, pixels);
+        if (i !== LAYER.pictogram) array.setLayer(i, pixels);
       });
-      textures.setLayer(LAYER.pictogram, pictogram);
+      array.setLayer(LAYER.pictogram, pictogram);
       for (const { layer, pixels } of drawTextLayers(
         plan,
         nextLook,
         LAYER_SIZE,
       )) {
-        if (layer < count) textures.setLayer(layer, pixels);
+        array.setLayer(layer, pixels);
       }
-      textures.finish();
-      zoneRects.fill(0);
-      nextRoom.lights.slice(0, MAX_ZONES).forEach((z, i) => {
-        zoneRects.set(
-          [z.x0 * CELL, z.y0 * CELL, z.x1 * CELL, z.y1 * CELL],
-          i * 4,
-        );
-      });
+      array.finish();
+      light = makeLight(nextRoom);
+      room = nextRoom;
+      look = nextLookApplied;
     },
 
     resize(width, height) {
+      if (disposed) return;
       size = {
         width: Math.max(1, Math.floor(width)),
         height: Math.max(1, Math.floor(height)),
@@ -215,19 +294,46 @@ export function createRenderer(
       buildTargets();
     },
 
-    draw(camera, levels, seconds) {
-      if (mesh === null || textures === null || room === null || look === null)
+    draw(camera, levels, seconds, doors) {
+      if (
+        disposed ||
+        mesh === null ||
+        textures === null ||
+        light === null ||
+        room === null ||
+        look === null
+      )
         return;
       if (targets === null) buildTargets();
       const t = targets;
       if (t === null) return;
-      const zoneCount = Math.min(room.lights.length, MAX_ZONES);
-      for (let i = 0; i < zoneCount; i++)
-        zoneLevels[i] = (levels[i] ?? 0) / 255;
 
-      perspective(projection, FOV_Y, size.width / size.height, 0.05, 200);
+      perspective(projection, FOV_Y, size.width / size.height, NEAR, FAR);
       fpsView(view, camera.eye, camera.yaw, camera.pitch);
       multiply(viewProjection, projection, view);
+
+      // The light grid, refilled and uploaded on unit 1. Rows of an R8
+      // texture are one byte a texel, so the unpack alignment must be 1
+      // for a grid whose width is not a multiple of four.
+      fillLightTexels(light.grid, levels, light.texels);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, light.texture);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        0,
+        0,
+        light.grid.width,
+        light.grid.depth,
+        gl.RED,
+        gl.UNSIGNED_BYTE,
+        light.texels,
+      );
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      // The texture array on unit 0.
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, textures.texture);
 
       // Scene.
       gl.bindFramebuffer(gl.FRAMEBUFFER, t.scene.framebuffer);
@@ -250,9 +356,13 @@ export function createRenderer(
         camera.eye[2],
       );
       gl.uniform1f(scene.uniform("uTime"), seconds);
-      gl.uniform4fv(scene.uniform("uZoneRect"), zoneRects);
-      gl.uniform1fv(scene.uniform("uZoneLevel"), zoneLevels);
-      gl.uniform1i(scene.uniform("uZoneCount"), zoneCount);
+      gl.uniform1i(scene.uniform("uTextures"), 0);
+      gl.uniform1i(scene.uniform("uLightGrid"), 1);
+      gl.uniform2f(
+        scene.uniform("uGridSize"),
+        light.grid.width,
+        light.grid.depth,
+      );
       gl.uniform1f(scene.uniform("uLightScale"), look.lightScale);
       gl.uniform1f(scene.uniform("uFalloff"), look.falloff);
       gl.uniform1f(scene.uniform("uMinLight"), look.minLight);
@@ -268,56 +378,64 @@ export function createRenderer(
         look.edge.everywhere ? 1 : 0,
       );
       gl.uniform1f(scene.uniform("uLdr"), caps.color === "rgba8" ? 1 : 0);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D_ARRAY, textures.texture);
-      gl.uniform1i(scene.uniform("uTextures"), 0);
+      const offset = scene.uniform("uModelOffset");
+      gl.uniform3f(offset, 0, 0, 0);
       mesh.draw();
+      for (const m of movers) {
+        const open = Math.min(1, Math.max(0, doors.get(m.key) ?? 0));
+        gl.uniform3f(
+          offset,
+          m.slide[0] * open,
+          m.slide[1] * open,
+          m.slide[2] * open,
+        );
+        m.mesh.draw();
+      }
       gl.disable(gl.DEPTH_TEST);
       gl.disable(gl.CULL_FACE);
 
       // Bloom: bright pass, two Kawase steps down, two up.
-      const [d0, d1, d2] = t.down;
-      const [u0, u1] = t.up;
-      if (d0 && d1 && d2 && u0 && u1) {
-        gl.useProgram(bright.program);
-        gl.uniform1f(
-          bright.uniform("uThreshold"),
-          caps.color === "rgba8" ? 0.75 : look.bloom.threshold,
-        );
-        pass(bright, d0, t.scene.texture);
-        pass(down, d1, d0.texture);
-        pass(down, d2, d1.texture);
-        pass(up, u1, d2.texture);
-        pass(up, u0, u1.texture);
+      gl.useProgram(bright.program);
+      gl.uniform1f(
+        bright.uniform("uThreshold"),
+        caps.color === "rgba8" ? 0.75 : look.bloom.threshold,
+      );
+      pass(bright, t.d0, t.scene.texture);
+      pass(down, t.d1, t.d0.texture);
+      pass(down, t.d2, t.d1.texture);
+      pass(up, t.u1, t.d2.texture);
+      pass(up, t.u0, t.u1.texture);
 
-        // Composite to the canvas.
-        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
-        gl.useProgram(composite.program);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, t.scene.texture);
-        gl.uniform1i(composite.uniform("uScene"), 0);
-        gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, u0.texture);
-        gl.uniform1i(composite.uniform("uBloom"), 1);
-        gl.uniform1f(composite.uniform("uBloomStrength"), look.bloom.strength);
-        gl.uniform1i(
-          composite.uniform("uToneMap"),
-          caps.color === "rgba16f" ? 1 : 0,
-        );
-        gl.uniform1i(composite.uniform("uDither"), look.dither ? 1 : 0);
-        gl.uniform3fv(composite.uniform("uPalette"), palette);
-        fullscreen.draw();
-        // Unbind the bloom from unit 1: the next frame renders into it.
-        gl.bindTexture(gl.TEXTURE_2D, null);
-        gl.activeTexture(gl.TEXTURE0);
-      }
+      // Composite to the canvas.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+      gl.useProgram(composite.program);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, t.scene.texture);
+      gl.uniform1i(composite.uniform("uScene"), 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, t.u0.texture);
+      gl.uniform1i(composite.uniform("uBloom"), 1);
+      gl.uniform1f(composite.uniform("uBloomStrength"), look.bloom.strength);
+      gl.uniform1i(
+        composite.uniform("uToneMap"),
+        caps.color === "rgba16f" ? 1 : 0,
+      );
+      gl.uniform1i(composite.uniform("uDither"), look.dither ? 1 : 0);
+      gl.uniform3fv(composite.uniform("uPalette"), palette);
+      fullscreen.draw();
+      // Unbind the bloom from unit 1 and the scene from unit 0: the next
+      // frame renders into both.
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, null);
     },
 
     dispose() {
+      if (disposed) return;
+      disposed = true;
       releaseTargets();
-      mesh?.dispose();
-      textures?.dispose();
+      releaseRoom();
       for (const p of [scene, bright, down, up, composite]) p.dispose();
       fullscreen.dispose();
     },
