@@ -527,6 +527,91 @@ async fn origin_add_connects_a_registered_domain_in_place() {
     assert_eq!(entry.file_path().as_deref(), Some(root.as_path()));
 }
 
+/// Connecting an origin to a registered, origin-less file domain attaches it
+/// in place and keeps the decisions already made about that domain: whether
+/// its artifacts are provisioned, and whether it reviews changes.
+#[tokio::test]
+async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let root = tmp.path().join("brand-knowledge");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("MANIFEST.md"), manifest()).unwrap();
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let mut cfg = config(true);
+    cfg.domains.insert(
+        "brand".to_string(),
+        crystalline_core::config::DomainEntry {
+            kind: crystalline_core::config::DomainKind::File,
+            path: Some(root.clone()),
+            origin: None,
+            provision: Some(false),
+            review: Some(crystalline_core::config::ReviewMode::Overlay),
+        },
+    );
+    let eng = Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path.clone()),
+    )
+    .with_origin_provider(mock)
+    .with_origins_dir(origins_dir);
+
+    eng.origin_add("acme/brand-knowledge", Some("brand"), None, None, None)
+        .await
+        .expect("a registered origin-less domain connects in place");
+
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let entry = on_disk.domains.get("brand").unwrap();
+    assert!(entry.origin.is_some());
+    assert_eq!(
+        entry.provision,
+        Some(false),
+        "the provisioning decision stays"
+    );
+    assert_eq!(
+        entry.review,
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        "review mode stays"
+    );
+}
+
+/// A team domain's derived or explicit name is checked before the folder is
+/// derived from it.
+#[tokio::test]
+async fn origin_add_refuses_a_bad_explicit_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+
+    // A folder under the tempdir, so the red run (which accepts `a/b` and
+    // downloads) never writes into the real home folder.
+    let folder = tmp.path().join("team");
+    let err = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            Some("a/b"),
+            None,
+            None,
+            Some(folder.to_str().unwrap()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    assert!(err.to_string().contains("cannot name a domain"), "{err}");
+}
+
 #[tokio::test]
 async fn origin_add_on_a_registered_domain_refuses_a_different_folder() {
     let tmp = tempfile::tempdir().unwrap();

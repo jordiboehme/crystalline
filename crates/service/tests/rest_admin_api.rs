@@ -312,6 +312,21 @@ async fn a_local_domain_is_created_under_the_domains_root() {
             .unwrap();
         assert_eq!(resp.status(), 422, "{bad:?} must be refused");
     }
+    // The refusal is the engine's, word for word what the CLI and add_domain say.
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "local", "name": "a b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("'a b' cannot name a domain: use letters"),
+        "{problem}"
+    );
 }
 
 /// Virtual create works with a name alone; mode github without a connection

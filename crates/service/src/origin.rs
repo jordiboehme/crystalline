@@ -40,17 +40,12 @@ use crate::poller::DomainPollOutcome;
 
 /// The domain name `origin_add` uses when the caller does not supply one: the
 /// repository's own name segment (the part after the last `/`), run through
-/// the same slug rules a permalink uses. Falls back to `domain` when the
-/// segment slugifies to nothing (an unlikely but possible edge case, for
-/// example a repo name made only of punctuation).
+/// the same slug rules a permalink uses, falling back to `domain`, and
+/// suffixed when the result is not a valid domain name (a repository called
+/// `CON` becomes `con-2`).
 pub(crate) fn default_domain_name(repo: &str) -> String {
     let segment = repo.rsplit('/').next().unwrap_or(repo);
-    let slug = crystalline_core::slugify(segment);
-    if slug.is_empty() {
-        "domain".to_string()
-    } else {
-        slug
-    }
+    crystalline_core::config::registration::derive_domain_name(segment, |_| false)
 }
 
 /// The domain folder a domain-creating call uses when the caller does not
@@ -1572,6 +1567,17 @@ mod tests {
     fn default_domain_name_falls_back_to_domain_when_the_segment_slugifies_to_nothing() {
         assert_eq!(default_domain_name("acme/---"), "domain");
         assert_eq!(default_domain_name(""), "domain");
+    }
+
+    #[test]
+    fn default_domain_name_never_derives_a_windows_device_name() {
+        assert_eq!(default_domain_name("acme/CON"), "con-2");
+        assert!(
+            crystalline_core::config::registration::validate_domain_name(&default_domain_name(
+                &format!("acme/{}", "x".repeat(200))
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

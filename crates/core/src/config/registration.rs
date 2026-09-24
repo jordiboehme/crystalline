@@ -171,7 +171,16 @@ pub fn derive_domain_name(raw: &str, taken: impl Fn(&str) -> bool) -> String {
     }
     let mut n = 2;
     loop {
-        let candidate = format!("{base}-{n}");
+        // Shorten the base by the suffix's length, so a long base keeps every
+        // candidate inside the cap however far the counter climbs (a 60
+        // character base would otherwise overflow from `-1000` on and never
+        // validate again).
+        let suffix = format!("-{n}");
+        let stem: String = base
+            .chars()
+            .take(MAX_DOMAIN_NAME_CHARS.saturating_sub(suffix.len()))
+            .collect();
+        let candidate = format!("{}{suffix}", stem.trim_end_matches('-'));
         if usable(&candidate) {
             return candidate;
         }
@@ -356,5 +365,20 @@ mod tests {
         let long = derive_domain_name(&"x".repeat(200), never);
         assert!(validate_domain_name(&long).is_ok(), "{long}");
         assert_eq!(derive_domain_name("notes", |n| n == "notes"), "notes-2");
+    }
+
+    #[test]
+    fn a_derived_name_stays_inside_the_cap_however_high_the_suffix_climbs() {
+        // The first thousand or so candidates are taken, so the suffix grows
+        // to four digits; every candidate must still fit the cap, or the
+        // search would never find a valid one.
+        let taken = |n: &str| match n.rsplit_once('-') {
+            Some((_, digits)) => digits.parse::<u32>().is_ok_and(|d| d < 1000),
+            None => true,
+        };
+        let name = derive_domain_name(&"x".repeat(200), taken);
+        assert!(validate_domain_name(&name).is_ok(), "{name}");
+        assert!(name.ends_with("-1000"), "{name}");
+        assert_eq!(name.chars().count(), MAX_DOMAIN_NAME_CHARS, "{name}");
     }
 }
