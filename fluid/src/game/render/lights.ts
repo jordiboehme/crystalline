@@ -35,6 +35,11 @@ export const FLICKER_TICS = 4;
  * lit.
  */
 export const FLASH_MIN = 7;
+/**
+ * The upper bound, in tics, on how long a failing light stays lit before it
+ * drops dark again: the hold time is drawn from `1` to `FLASH_MAX + 1`. See
+ * `FLASH_MIN` above for how both bounds come from `P_SpawnLightFlash`.
+ */
 export const FLASH_MAX = 64;
 
 /** The zones' current levels, advanced one tick at a time. */

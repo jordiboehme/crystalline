@@ -100,8 +100,8 @@ export default function LookDemo() {
       />
       <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-between gap-4 p-3 font-mono text-xs text-white/85 [text-shadow:0_1px_2px_black]">
         <span>
-          STATION LOOK DEMO 1 DAY SHIFT 2 APERTURE GRID 4 FREESCAPE 64 R RETIRED
-          WASD ARROWS MOUSE
+          STATION LOOK DEMO · 1 DAY SHIFT · 2 APERTURE GRID · 4 FREESCAPE 64 · R
+          RETIRED · WASD ARROWS MOUSE
         </span>
         <span ref={frameRef} />
       </div>

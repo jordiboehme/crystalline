@@ -24,6 +24,15 @@ function fakeClock() {
       pending = null;
       cb?.(time);
     },
+    /** Delivers the pending frame with timestamp `t`, leaving `now()` alone. */
+    frameAt(t: number) {
+      const cb = pending;
+      pending = null;
+      cb?.(t);
+    },
+    advance(ms: number) {
+      time += ms;
+    },
     get scheduled() {
       return pending !== null;
     },
@@ -89,5 +98,26 @@ describe("createLoop", () => {
     loop.start();
     c.frame(16);
     expect(renders).toBe(1);
+  });
+
+  it("treats a first frame stamped before start() as no time at all", () => {
+    const c = fakeClock();
+    let ticks = 0;
+    const renders: [number, number][] = [];
+    const loop = createLoop(
+      {
+        tick: () => ticks++,
+        render: (alpha, frameMs) => renders.push([alpha, frameMs]),
+      },
+      c.clock,
+    );
+    c.advance(1000);
+    loop.start();
+    c.frameAt(999.5);
+    expect(ticks).toBe(0);
+    expect(renders).toHaveLength(1);
+    const [alpha, frameMs] = renders[0] ?? [NaN, NaN];
+    expect(alpha).toBeGreaterThanOrEqual(0);
+    expect(frameMs).toBe(0);
   });
 });

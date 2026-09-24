@@ -9,7 +9,9 @@
  * and below.
  *
  * Every GPU object is owned here and released in `dispose`, which the demo
- * calls on unmount and before rebuilding after a lost context.
+ * calls on unmount. After a lost context the demo does not call it: the
+ * context took every GPU object with it, so the demo drops the renderer and
+ * builds a fresh one when the context is restored.
  */
 
 import type { GlCaps } from "../gl/context";

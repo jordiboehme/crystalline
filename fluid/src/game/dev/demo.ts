@@ -104,29 +104,67 @@ export function startDemo(
     showStatus();
   };
 
-  const resize = () => {
+  // Sizes the backbuffer to the canvas's CSS size times the pixel ratio and
+  // says whether it changed. `resize` rebuilds the renderer's targets only
+  // then: the ResizeObserver fires once right after `observe` with the size
+  // `boot` already set, and a rebuild for nothing would cost every target.
+  const sizeCanvas = (): boolean => {
     const { width, height } = backbufferSize(
       canvas.clientWidth,
       canvas.clientHeight,
       window.devicePixelRatio,
       1,
     );
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
-    }
-    renderer?.resize(width, height);
+    if (canvas.width === width && canvas.height === height) return false;
+    canvas.width = width;
+    canvas.height = height;
+    return true;
   };
 
+  const resize = () => {
+    if (sizeCanvas()) renderer?.resize(canvas.width, canvas.height);
+  };
+
+  // Dragging the window between a Retina and a 1x display changes only the
+  // pixel ratio, which the ResizeObserver does not see. A resolution query
+  // for the current ratio fires once when that ratio stops matching; the
+  // listener resizes and re-arms itself on a query for the new ratio.
+  let ratioQuery: MediaQueryList | null = null;
+  const onRatioChange = () => {
+    resize();
+    watchRatio();
+  };
+  const watchRatio = () => {
+    ratioQuery?.removeEventListener("change", onRatioChange);
+    ratioQuery = window.matchMedia(
+      `(resolution: ${window.devicePixelRatio}dppx)`,
+    );
+    ratioQuery.addEventListener("change", onRatioChange);
+  };
+
+  // A context that exists can still refuse the renderer (a render target
+  // that cannot be created during a failed restore throws), so a throw is
+  // shown as the same notice as a missing context and the loop stays
+  // stopped, with whatever the renderer did build freed again. A fresh
+  // renderer has no targets yet, so its resize runs unconditionally here,
+  // after the canvas is sized, even when the size did not change.
   const boot = (): boolean => {
     const context = createContext(canvas, options);
     if (context === null) {
       hud.notice("?DEVICE NOT PRESENT ERROR");
       return false;
     }
-    renderer = createRenderer(context.gl, context.caps);
-    renderer.setRoom(room, LOOKS[lookId]);
-    resize();
+    try {
+      renderer = createRenderer(context.gl, context.caps);
+      renderer.setRoom(room, LOOKS[lookId]);
+      sizeCanvas();
+      renderer.resize(canvas.width, canvas.height);
+    } catch {
+      renderer?.dispose();
+      renderer = null;
+      hud.notice("?DEVICE NOT PRESENT ERROR");
+      return false;
+    }
     hud.notice(null);
     colorFormat = context.caps.color.toUpperCase();
     hud.frame(colorFormat);
@@ -200,6 +238,7 @@ export function startDemo(
 
   const observer = new ResizeObserver(resize);
   observer.observe(canvas);
+  watchRatio();
   const onLost = (e: Event) => {
     e.preventDefault();
     loop.stop();
@@ -218,6 +257,8 @@ export function startDemo(
   return () => {
     loop.stop();
     observer.disconnect();
+    ratioQuery?.removeEventListener("change", onRatioChange);
+    ratioQuery = null;
     canvas.removeEventListener("click", onClick);
     canvas.removeEventListener("webglcontextlost", onLost);
     canvas.removeEventListener("webglcontextrestored", onRestored);

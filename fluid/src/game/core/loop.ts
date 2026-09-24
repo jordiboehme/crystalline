@@ -62,7 +62,9 @@ export function createLoop(
   let debt = 0;
 
   const frame = (now: number) => {
-    const frameMs = Math.min(now - last, MAX_FRAME_MS);
+    // The first frame's timestamp can come from before the `now()` read in
+    // `start`, which would make the difference slightly negative.
+    const frameMs = Math.min(Math.max(0, now - last), MAX_FRAME_MS);
     last = now;
     debt += frameMs;
     while (debt >= TICK_MS) {

@@ -234,8 +234,10 @@ void main() {
 
 /**
  * The final picture: scene plus the bloom scaled by its strength, a gentle
- * Reinhard tone map on the half-float path (scaled by 1.6 so a value of 1
- * stays close to 1), and for Freescape 64 an ordered 4x4 Bayer dither on
+ * Reinhard tone map on the half-float path (scaled by 1.6, so a value of
+ * 0.6 maps to itself, darker values are lifted a little, 1 comes out at 0.8
+ * and full white is only reached at about 1.67, which leaves the bloom
+ * headroom above 1), and for Freescape 64 an ordered 4x4 Bayer dither on
  * 2x2 pixel blocks into the sixteen colours of `uPalette`, the C64 palette.
  */
 export const COMPOSITE_FS = `#version 300 es

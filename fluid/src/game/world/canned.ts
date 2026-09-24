@@ -11,6 +11,12 @@
 
 import type { PlaceInput } from "./types";
 
+/**
+ * The station's bridge as the look demo sees it: the place input
+ * `generateRoom` turns into the one room milestone 1 renders. Its status is
+ * `stable`, the healthy end of the condition scale; the demo's R key swaps it
+ * for `archived` to show the derelict end without a second fixture.
+ */
 export const CANNED_BRIDGE: PlaceInput = {
   domain: "station",
   permalink: "manifest",
