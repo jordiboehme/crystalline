@@ -1,0 +1,153 @@
+/**
+ * The service hatch: an engram that points here, a low hatch that leads
+ * back to it.
+ *
+ * A 1.0 by 1.1 m hatch door sits low in a hazard-striped frame, with a
+ * round porthole (a rim that glows dimly in the door colour around dark
+ * glass) and a lever handle. Above it a stencil plate carries the
+ * "SERVICE" pictogram and the label row with the title of the engram the
+ * hatch leads to.
+ */
+
+import type { Fixture } from "../../world/types";
+import { FLAG } from "../geometry";
+import { frameForSlot } from "../kit";
+import { ASPECT, LAYER } from "../layers";
+import {
+  shade,
+  surfaces,
+  textPanel,
+  type KitAt,
+  type ModelContext,
+} from "./common";
+
+type Hatch = Extract<Fixture, { kind: "hatch" }>;
+
+/**
+ * Where the "SERVICE" pictogram sits in the pictogram layer, as a uv
+ * rectangle. The whole layer until the pictogram set packs several.
+ */
+export const SERVICE_PICTOGRAM = { u0: 0, v0: 0, uw: 1, vh: 1 } as const;
+
+/** The hatch door: half width, bottom and top. */
+const HALF = 0.5;
+const BOTTOM = 0.12;
+const TOP = BOTTOM + 1.1;
+/** The frame around it: its margin and depth. */
+const FRAME = 0.1;
+const FRAME_D = 0.08;
+/** The door's front face. */
+const DOOR_D = 0.12;
+/** The porthole's centre height and radius. */
+const PORT_H = 0.85;
+const PORT_R = 0.15;
+/** The stencil plate above: bottom, top, half width. */
+const PLATE_H0 = TOP + FRAME + 0.08;
+const PLATE_HALF = 0.9;
+const PLATE_D = 0.03;
+
+/** Builds a service hatch against its wall slot. */
+export function buildHatch(
+  kitAt: KitAt,
+  fx: Hatch,
+  index: number,
+  ctx: ModelContext,
+): void {
+  const k = kitAt(frameForSlot(fx.slot));
+  const s = surfaces(ctx.look);
+  const p = ctx.look.palette;
+
+  // The frame, hazard striped, and the door with two hinges.
+  k.bevelBox(
+    -HALF - FRAME,
+    -HALF,
+    0,
+    FRAME_D,
+    BOTTOM - FRAME,
+    TOP + FRAME,
+    0.015,
+    s.hazard,
+  );
+  k.bevelBox(
+    HALF,
+    HALF + FRAME,
+    0,
+    FRAME_D,
+    BOTTOM - FRAME,
+    TOP + FRAME,
+    0.015,
+    s.hazard,
+  );
+  k.bevelBox(-HALF, HALF, 0, FRAME_D, TOP, TOP + FRAME, 0.015, s.hazard);
+  k.bevelBox(-HALF, HALF, 0, FRAME_D, BOTTOM - FRAME, BOTTOM, 0.015, s.hazard);
+  k.bevelBox(-HALF, HALF, 0.02, DOOR_D, BOTTOM, TOP, 0.02, s.body);
+  for (const h of [BOTTOM + 0.15, TOP - 0.25]) {
+    k.box(-HALF - 0.04, -HALF + 0.1, DOOR_D, DOOR_D + 0.02, h, h + 0.1, s.dark);
+  }
+
+  // The porthole: dark glass inside a dimly glowing rim.
+  const glass: [number, number][] = Array.from({ length: 12 }, (_, i) => {
+    const t = (2 * Math.PI * i) / 12;
+    return [Math.sin(t) * PORT_R, PORT_H + Math.cos(t) * PORT_R];
+  });
+  k.extrude(glass, DOOR_D, DOOR_D + 0.005, s.tinted(p.screen));
+  k.ring(
+    0,
+    DOOR_D + 0.01,
+    PORT_H,
+    PORT_R + 0.01,
+    0.025,
+    6,
+    16,
+    s.glow(shade(p.door, 0.5)),
+    "inward",
+  );
+
+  // The lever handle on its mount.
+  k.bevelBox(0.22, 0.3, DOOR_D, DOOR_D + 0.06, 0.52, 0.62, 0.01, s.dark);
+  k.cylinderAlong(0.26, 0.44, DOOR_D + 0.045, 0.57, 0.018, 6, s.metal);
+
+  // The stencil plate: the pictogram, then the label row.
+  const pictogram = PLATE_HALF * 0.4;
+  const labelW = 2 * PLATE_HALF - pictogram - 0.1;
+  const labelH = Math.min(labelW / ASPECT.label, pictogram);
+  const plateTop = PLATE_H0 + pictogram + 0.04;
+  k.bevelBox(
+    -PLATE_HALF - 0.02,
+    PLATE_HALF + 0.02,
+    0,
+    PLATE_D,
+    PLATE_H0 - 0.02,
+    plateTop,
+    0.008,
+    s.dark,
+  );
+  const u = SERVICE_PICTOGRAM;
+  k.panel(
+    -PLATE_HALF,
+    -PLATE_HALF + pictogram,
+    PLATE_D + 0.001,
+    PLATE_H0,
+    PLATE_H0 + pictogram,
+    { layer: LAYER.pictogram, tint: p.panel, flag: FLAG.lit },
+    u.uw,
+    u.vh,
+    u.u0,
+    u.v0,
+  );
+  const mid = PLATE_H0 + pictogram / 2;
+  textPanel(
+    k,
+    ctx,
+    `hatch:${index}`,
+    PLATE_HALF - labelW,
+    PLATE_HALF,
+    PLATE_D + 0.001,
+    mid - labelH / 2,
+    mid + labelH / 2,
+    {
+      tint: [1, 1, 1],
+      flag: FLAG.emissive,
+    },
+  );
+}

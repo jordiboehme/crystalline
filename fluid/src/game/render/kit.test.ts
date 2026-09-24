@@ -488,6 +488,44 @@ describe("the modelling kit", () => {
     }
   });
 
+  it("gives a panel the uv rectangle [u0, u0 + uw] x [v0, v0 + vh]", () => {
+    for (const [, f] of FRAMES) {
+      const m = emitIn(f, (k) => {
+        k.panel(-0.5, 0.5, 0.02, 1, 1.6, S, 0.5, 1 / 6, 0.25, 2 / 6);
+      });
+      const uvs = Array.from({ length: m.count }, (_, i) => {
+        const o = i * FLOATS_PER_VERTEX;
+        return [m.vertices[o + 6] ?? NaN, m.vertices[o + 7] ?? NaN] as const;
+      });
+      const us = uvs.map(([u]) => u);
+      const vs = uvs.map(([, v]) => v);
+      expect(Math.min(...us)).toBeCloseTo(0.25, 6);
+      expect(Math.max(...us)).toBeCloseTo(0.75, 6);
+      expect(Math.min(...vs)).toBeCloseTo(2 / 6, 6);
+      expect(Math.max(...vs)).toBeCloseTo(3 / 6, 6);
+      // The bottom-left corner carries (u0, v0) and the top-right (u0 + uw, v0 + vh).
+      for (const v of vertices(m).map((x, i) => ({ ...x, uv: uvs[i] }))) {
+        const [a, , h] = toLocal(f, v.pos);
+        expect(v.uv?.[0]).toBeCloseTo(0.25 + (a + 0.5) * 0.5, 5);
+        expect(v.uv?.[1]).toBeCloseTo(2 / 6 + ((h - 1) / 0.6) * (1 / 6), 5);
+      }
+    }
+  });
+
+  it("keeps a panel's default uv at [0, 1] x [0, 1]", () => {
+    const f = FRAMES[0]?.[1];
+    if (!f) throw new Error("no frame");
+    const m = emitIn(f, (k) => {
+      k.panel(-0.5, 0.5, 0.02, 1, 1.6, S);
+    });
+    const uv = Array.from({ length: m.count }, (_, i) => [
+      m.vertices[i * FLOATS_PER_VERTEX + 6],
+      m.vertices[i * FLOATS_PER_VERTEX + 7],
+    ]);
+    expect(uv.map(([u]) => u).sort()).toEqual([0, 0, 0, 1, 1, 1]);
+    expect(uv.map(([, v]) => v).sort()).toEqual([0, 0, 0, 1, 1, 1]);
+  });
+
   it("turns an open cylinder's and an open lathe's faces away from the axis", () => {
     for (const [, f] of FRAMES) {
       const m = emitIn(f, (k) => {

@@ -169,9 +169,12 @@ export interface Kit {
     s: Surface,
   ): void;
   /**
-   * One flat quad at depth `d` facing inward, with a whole-layer uv of
-   * `uw` by `vh` (default 1 by 1): screens, labels, posters and the text
-   * layers, as milestone 1's wall panel. 6 vertices.
+   * One flat quad at depth `d` facing inward, with a uv rectangle from
+   * `(u0, v0)` at its bottom-left corner to `(u0 + uw, v0 + vh)` at its
+   * top-right (default the whole layer, 0 to 1 both ways): screens,
+   * labels, posters and the text layers, as milestone 1's wall panel. The
+   * offsets let a label use one row of a shared text layer (its `v0` to
+   * `v1`) or one pictogram of a sheet. 6 vertices.
    */
   panel(
     a0: number,
@@ -182,6 +185,8 @@ export interface Kit {
     s: Surface,
     uw?: number,
     vh?: number,
+    u0?: number,
+    v0?: number,
   ): void;
 }
 
@@ -721,17 +726,19 @@ export function createKit(builder: Builder, frame: Frame): Kit {
       });
     },
 
-    panel(a0, a1, d, h0, h1, s, uw = 1, vh = 1) {
-      builder.quad(
-        world([a0, d, h0]),
-        world([a1, d, h0]),
-        world([a1, d, h1]),
-        world([a0, d, h1]),
-        inward,
-        uw,
-        vh,
-        s,
-      );
+    panel(a0, a1, d, h0, h1, s, uw = 1, vh = 1, u0 = 0, v0 = 0) {
+      // Bottom-left, bottom-right, top-right, top-left, as `builder.quad`
+      // winds them, with the uv rectangle moved to start at (u0, v0).
+      const corners = [
+        [world([a0, d, h0]), u0, v0],
+        [world([a1, d, h0]), u0 + uw, v0],
+        [world([a1, d, h1]), u0 + uw, v0 + vh],
+        [world([a0, d, h1]), u0, v0 + vh],
+      ] as const;
+      for (const i of [0, 1, 2, 0, 2, 3]) {
+        const c = corners[i];
+        if (c) builder.vertex(c[0], inward, c[1], c[2], s);
+      }
     },
   };
 }
