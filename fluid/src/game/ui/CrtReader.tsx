@@ -5,7 +5,8 @@
  * markdown flattened by `crtLines` into screen lines. The font is sized so
  * the 80 columns fit the viewport, and the screen shows as many whole lines
  * as fit under it; scrolling moves the first visible line, one line or one
- * screen at a time, never past the last full screen. The two looks are the
+ * screen at a time, never past the last full screen unless the section it
+ * opened at lies in that screen. The two looks are the
  * phosphor green of a 70s terminal on near-black and the C64's light blue on
  * blue, where headings are uppercased as PETSCII would print them. Headings
  * are drawn in reverse video; the scanlines are a CSS repeating gradient and
@@ -17,7 +18,8 @@
  * the reader is mounted, with the page's default action prevented so W, S
  * and the page keys do not also scroll the page: W/S or the arrows move one
  * line, Page Up/Down a screen, the wheel scrolls, F opens the engram in
- * Fluid and Esc closes. Pointer lock is released on open, so the keys and
+ * Fluid and Esc closes. A key pressed with Ctrl, Cmd or Alt is left to the
+ * browser. Pointer lock is released on open, so the keys and
  * the wheel reach the page instead of the game's locked canvas.
  *
  * The engram is data, never markup: every line is a React text child, so an
@@ -86,6 +88,8 @@ export interface CrtReaderProps {
   /**
    * The section the terminal stood for: its `##` heading as written and how
    * many sections of the same heading come before it. Null opens at the top.
+   * It is read once, at mount: the parent mounts a fresh reader for each
+   * terminal (a new `key`), so a later change of this prop moves nothing.
    */
   section: { heading: string; occurrence: number } | null;
   /** Called on F: open the engram in Fluid. */
@@ -118,12 +122,17 @@ export function CrtReader({
     viewport.width,
     viewport.height,
   );
-  const maxTop = Math.max(0, layout.lines.length - rows);
-  const [top, setTop] = useState(() =>
+  // The section's first line, decided once at mount. The scroll limit keeps
+  // the last screen full, but never stops short of the section, so a section
+  // in the last screen still opens at the top with empty rows below it, as a
+  // terminal would show it.
+  const [sectionStart] = useState(() =>
     section === null
       ? 0
       : (layout.sections.get(section.heading)?.[section.occurrence] ?? 0),
   );
+  const maxTop = Math.max(0, layout.lines.length - rows, sectionStart);
+  const [top, setTop] = useState(sectionStart);
   const first = Math.min(Math.max(0, top), maxTop);
   const wheelRest = useRef(0);
 
@@ -146,6 +155,8 @@ export function CrtReader({
       setTop((t) => Math.min(Math.max(0, Math.min(t, maxTop) + by), maxTop));
     };
     const onKey = (event: KeyboardEvent) => {
+      // Cmd+F, Ctrl+W and the like keep their browser meaning.
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
       switch (event.code) {
         case "KeyW":
         case "ArrowUp":

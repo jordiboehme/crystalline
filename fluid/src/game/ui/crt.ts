@@ -26,9 +26,10 @@
  * - Everything else is a paragraph: its lines are joined and word-wrapped to
  *   `columns`, and a word longer than `columns` is hard-broken.
  * - Inline, `[text](url)` keeps the text, `[[Target]]` and
- *   `[[domain:Target|label]]` keep the label or else the target, and the
- *   emphasis and code markers `**`, `__`, `*`, `_` and backticks are
- *   stripped. A `_` inside a word (`snake_case`) is left alone.
+ *   `[[domain:Target|label]]` keep the label or else the target, and
+ *   backticks are stripped. `**`, `__`, `*` and `_` are stripped only as
+ *   emphasis markers around text (`**x**`, `__x__`, `*x*`, `_x_`), so a lone
+ *   `*` as in `2*3` stays, and so does a `_` inside a word (`snake_case`).
  * - Runs of blank lines collapse to one `blank`; none leads or trails.
  *
  * `sections` maps the text of each `##` heading, exactly as written after the
@@ -84,8 +85,14 @@ function plain(text: string): string {
       return parseWikiTarget(bar >= 0 ? inner.slice(0, bar) : inner).target;
     })
     .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/\*\*|__|`|\*/g, "")
-    .replace(/(^|[^\p{L}\p{N}])_+|_+(?=[^\p{L}\p{N}]|$)/gu, "$1");
+    .replace(/`/g, "")
+    .replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "$1")
+    .replace(
+      /(?<![\p{L}\p{N}_])__(?=\S)(.+?)(?<=\S)__(?![\p{L}\p{N}_])/gu,
+      "$1",
+    )
+    .replace(/(?<![\p{L}\p{N}])\*(?=\S)(.+?)(?<=\S)\*(?![\p{L}\p{N}])/gu, "$1")
+    .replace(/(?<![\p{L}\p{N}_])_(?=\S)(.+?)(?<=\S)_(?![\p{L}\p{N}_])/gu, "$1");
 }
 
 /** A string cut into pieces of at most `width` characters. */

@@ -162,7 +162,14 @@ describe("crtLines", () => {
     const md =
       "**bold** __strong__ *em* _under_ `code` stay: snake_case_name 2*3";
     expect(crtLines(md).lines).toEqual([
-      l("text", "bold strong em under code stay: snake_case_name 23"),
+      l("text", "bold strong em under code stay: snake_case_name 2*3"),
+    ]);
+  });
+
+  it("keeps a lone star or underscore that marks no emphasis", () => {
+    const md = "2*3 and 4 * 5, a_b_c and *em* and ***both***";
+    expect(crtLines(md).lines).toEqual([
+      l("text", "2*3 and 4 * 5, a_b_c and em and both"),
     ]);
   });
 

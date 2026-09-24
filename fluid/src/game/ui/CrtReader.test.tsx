@@ -69,6 +69,18 @@ describe("CrtReader", () => {
     expect(visibleLines().slice(0, 2)).toEqual(["Scope", "The second scope."]);
   });
 
+  it("opens at a section in the last screen of a short document", () => {
+    renderReader({
+      markdown: "## A\none\n## B\ntwo",
+      section: { heading: "B", occurrence: 0 },
+    });
+    expect(visibleLines()).toEqual(["B", "two"]);
+    fireEvent.keyDown(window, { code: "KeyS" });
+    expect(visibleLines()[0]).toBe("B");
+    fireEvent.keyDown(window, { code: "KeyW" });
+    expect(visibleLines()[0]).toBe("one");
+  });
+
   it("opens at the top when the section is not in the text", () => {
     renderReader({ section: { heading: "Gone", occurrence: 0 } });
     expect(visibleLines()[0]).toBe("Station log");
@@ -131,6 +143,25 @@ describe("CrtReader", () => {
     expect(onClose).not.toHaveBeenCalled();
     fireEvent.keyDown(window, { code: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves browser shortcuts with a modifier alone", () => {
+    const { onOpenFluid, onClose } = renderReader();
+    for (const modifier of ["metaKey", "ctrlKey", "altKey"] as const) {
+      const event = new KeyboardEvent("keydown", {
+        code: "KeyF",
+        [modifier]: true,
+        cancelable: true,
+      });
+      window.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    fireEvent.keyDown(window, { code: "KeyW", ctrlKey: true });
+    fireEvent.keyDown(window, { code: "Escape", metaKey: true });
+    fireEvent.keyDown(window, { code: "KeyS", altKey: true });
+    expect(onOpenFluid).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(visibleLines()[0]).toBe("Station log");
   });
 
   it("stops listening once unmounted", () => {
