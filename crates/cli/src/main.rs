@@ -1042,8 +1042,15 @@ enum DomainCommand {
     /// subtree. A non-empty target folder, or a domain name that is already
     /// registered without an origin, connects in place: local files are kept
     /// and ones that differ from the repository become shareable local changes.
+    /// Adding a name that is already registered at the same folder (or as the
+    /// same virtual domain) changes nothing and indexes it again, so the
+    /// command is safe to repeat; a name registered at another folder or as
+    /// the other kind is refused, naming what holds it. A new name uses
+    /// letters, digits, hyphens, underscores and dots, 64 characters at most.
     Add {
-        /// The domain name used everywhere it is referenced.
+        /// The domain name used everywhere it is referenced. Adding a name
+        /// that is already registered here adopts it as it is; a new name
+        /// must follow the naming rule above.
         name: String,
         /// The domain root directory. Omitted for a virtual domain. For a
         /// file domain, defaults to <domains_root>/<name>
@@ -3427,7 +3434,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
                 _ => None,
             };
-            domain_add_dispatch(
+            let adopted = domain_add_dispatch(
                 name.clone(),
                 path,
                 is_virtual,
@@ -3440,6 +3447,14 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             )
             .await?;
             if let Some(owner) = closing {
+                // An adopted registration is somebody's existing domain, not a
+                // new one this command may close: making a shared domain
+                // private is its own decision, with its own verb.
+                if adopted {
+                    anyhow::bail!(
+                        "domain '{name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {name} private --owner {owner}"
+                    );
+                }
                 // The name is re-resolved against the config the registration
                 // just wrote rather than trusted as typed, which is what the
                 // REST path does by reading the engine's own report: a name
@@ -3815,7 +3830,7 @@ async fn domain_add_dispatch(
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if let Some(origin_spec) = origin {
         return domain_add_origin_dispatch(
             name,
@@ -3840,7 +3855,7 @@ async fn domain_add_dispatch(
                 "`domain add --virtual` takes no path; a virtual domain has no directory"
             );
         }
-        let markdown = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
         let scaffold = crystalline_service::scaffold_virtual_manifest(
             &name,
             &markdown,
@@ -3848,18 +3863,18 @@ async fn domain_add_dispatch(
             config.as_deref(),
         )
         .await?;
-        cmd::print_domain_add_virtual(&name, &scaffold, json);
-        return Ok(());
+        cmd::print_domain_add_virtual(&name, adopted, &scaffold, json);
+        return Ok(adopted);
     }
 
     // An absent path defaults to `<domains_root>/<name>` inside
     // `domain_add_register`, mirroring the MCP `add_domain` tool's default
     // placement; the resolved directory still needs a pre-scaffolded
     // MANIFEST.md either way.
-    let abs = cmd::domain_add_register(&name, path.as_deref(), config.as_deref())?;
+    let (abs, adopted) = cmd::domain_add_register(&name, path.as_deref(), config.as_deref())?;
     if no_sync {
-        cmd::print_domain_add_no_sync(&name, &abs, json);
-        return Ok(());
+        cmd::print_domain_add_no_sync(&name, &abs, adopted, json);
+        return Ok(adopted);
     }
 
     // Index over the daemon only when no explicit --config/--db override was
@@ -3885,8 +3900,8 @@ async fn domain_add_dispatch(
             cmd::sync_domain_direct(&name, &abs, config.as_deref(), db.as_deref()).await?
         };
 
-    cmd::print_domain_add(&name, &abs, &report, json);
-    Ok(())
+    cmd::print_domain_add(&name, &abs, adopted, &report, json);
+    Ok(adopted)
 }
 
 /// `domain add --origin`: connects a team domain to a GitHub repository
@@ -3907,7 +3922,7 @@ async fn domain_add_origin_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if is_virtual {
         anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
     }
@@ -3934,7 +3949,9 @@ async fn domain_add_origin_dispatch(
     )
     .await?;
     cmd::print_origin_add(&repo, &data, json);
-    Ok(())
+    // A connect in place is the engine's own adoption; leaving nothing here
+    // for `--private` to close by mistake.
+    Ok(false)
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one

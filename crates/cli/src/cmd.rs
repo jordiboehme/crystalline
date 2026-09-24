@@ -12,6 +12,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use crystalline_core::config::{
     self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
+    registration::{Registration, RegistrationRequest, decide_registration, validate_domain_name},
 };
 use crystalline_index::{
     ChunkParams, DomainKind, NoReindexHooks, RebuildKind, Store, apply_scan, configured_model_id,
@@ -286,6 +287,9 @@ pub(crate) fn relative_time(value: &str) -> String {
 /// Scaffold a MANIFEST.md at a domain root if one is absent. Never touches the
 /// global config.
 pub fn domain_init(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
+    if let Some(n) = name {
+        validate_domain_name(n).map_err(|e| anyhow!(e))?;
+    }
     std::fs::create_dir_all(path)
         .with_context(|| format!("creating domain directory {}", path.display()))?;
     let manifest = path.join("MANIFEST.md");
@@ -344,11 +348,17 @@ pub fn domain_init(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
 /// default path still needs a pre-scaffolded `MANIFEST.md`, exactly like an
 /// explicit path does - `domain add` never auto-creates one, `domain init`
 /// does.
+///
+/// Returns the canonical root and whether an existing registration of this
+/// name and folder was adopted rather than written. A name registered to
+/// another folder, or as a virtual domain, is refused naming it; there is no
+/// way to replace a registration here, since `domain remove` then `domain
+/// add` says what it means.
 pub(crate) fn domain_add_register(
     name: &str,
     path: Option<&Path>,
     config_override: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, bool)> {
     // Mutate the file truth and save it back to the resolved path; the
     // environment overlay is never written. An env-defined domain of the same
     // name is refused: it is managed by its variable, not the config file.
@@ -358,6 +368,16 @@ pub(crate) fn domain_add_register(
             "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
             env.var
         );
+    }
+
+    // The decision comes first: a name already registered to this folder is
+    // adopted as it is (origin, provision and review untouched), one
+    // registered elsewhere is refused naming what holds it, and only a new
+    // name is checked against the naming rules - so a name registered before
+    // the rules existed can still be re-added.
+    let existing = loaded.file.domains.get(name).cloned();
+    if existing.is_none() {
+        validate_domain_name(name).map_err(|e| anyhow!(e))?;
     }
 
     let root = match path {
@@ -375,20 +395,31 @@ pub(crate) fn domain_add_register(
     }
     let abs = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
 
-    let mut cfg = loaded.file;
-    cfg.domains
-        .insert(name.to_string(), DomainEntry::file(abs.clone()));
-    config::save_yaml(&loaded.path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
-    Ok(abs)
+    match decide_registration(
+        name,
+        existing.as_ref(),
+        &RegistrationRequest::File { root: &abs },
+    ) {
+        Registration::Adopt => Ok((abs, true)),
+        Registration::Conflict(message) => bail!("{message}"),
+        Registration::Register => {
+            let mut cfg = loaded.file;
+            cfg.domains
+                .insert(name.to_string(), DomainEntry::file(abs.clone()));
+            config::save_yaml(&loaded.path, &cfg)
+                .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
+            Ok((abs, false))
+        }
+    }
 }
 
 /// Register a virtual domain in the global config (database-backed, no path).
-/// Returns the MANIFEST markdown to scaffold into the database.
+/// Returns the MANIFEST markdown to scaffold into the database and whether an
+/// existing registration of this name was adopted rather than written.
 pub(crate) fn domain_add_register_virtual(
     name: &str,
     config_override: Option<&Path>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let loaded = load(config_override)?;
     if let Some(env) = loaded.overlay.env_domain(name) {
         bail!(
@@ -396,31 +427,55 @@ pub(crate) fn domain_add_register_virtual(
             env.var
         );
     }
-    let mut cfg = loaded.file;
-    cfg.domains
-        .insert(name.to_string(), DomainEntry::virtual_domain());
-    config::save_yaml(&loaded.path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
+    let adopted = match decide_registration(
+        name,
+        loaded.file.domains.get(name),
+        &RegistrationRequest::Virtual,
+    ) {
+        Registration::Adopt => true,
+        Registration::Conflict(message) => bail!("{message}"),
+        Registration::Register => {
+            validate_domain_name(name).map_err(|e| anyhow!(e))?;
+            false
+        }
+    };
+    if !adopted {
+        let mut cfg = loaded.file;
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::virtual_domain());
+        config::save_yaml(&loaded.path, &cfg)
+            .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
+    }
     let today = chrono::Utc::now()
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    Ok(crystalline_core::manifest_template(name, &today))
+    Ok((crystalline_core::manifest_template(name, &today), adopted))
 }
 
 /// Print the `domain add --virtual` result.
-pub(crate) fn print_domain_add_virtual(name: &str, scaffold: &serde_json::Value, json: bool) {
+pub(crate) fn print_domain_add_virtual(
+    name: &str,
+    adopted: bool,
+    scaffold: &serde_json::Value,
+    json: bool,
+) {
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "registered": name,
                 "kind": "virtual",
+                "adopted": adopted,
                 "manifest": scaffold,
             })
         );
     } else {
-        println!("Registered virtual domain '{name}' (database-backed, no files)");
+        if adopted {
+            println!("Virtual domain '{name}' was already registered (database-backed, no files)");
+        } else {
+            println!("Registered virtual domain '{name}' (database-backed, no files)");
+        }
         let created = scaffold
             .get("created")
             .and_then(serde_json::Value::as_bool)
@@ -474,6 +529,7 @@ pub(crate) async fn sync_domain_direct(
 pub(crate) fn print_domain_add(
     name: &str,
     path: &Path,
+    adopted: bool,
     report: &crystalline_index::SyncReport,
     json: bool,
 ) {
@@ -483,29 +539,45 @@ pub(crate) fn print_domain_add(
             serde_json::json!({
                 "registered": name,
                 "path": path.display().to_string(),
+                "adopted": adopted,
                 "synced": true,
                 "sync": report,
             })
         );
     } else {
-        println!("Registered domain '{name}' at {}", path.display());
+        if adopted {
+            println!(
+                "Domain '{name}' was already registered at {}",
+                path.display()
+            );
+        } else {
+            println!("Registered domain '{name}' at {}", path.display());
+        }
         print_report(report);
     }
 }
 
 /// Print `domain add --no-sync`'s registration-only output.
-pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, json: bool) {
+pub(crate) fn print_domain_add_no_sync(name: &str, path: &Path, adopted: bool, json: bool) {
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "registered": name,
                 "path": path.display().to_string(),
+                "adopted": adopted,
                 "synced": false,
             })
         );
     } else {
-        println!("Registered domain '{name}' at {}", path.display());
+        if adopted {
+            println!(
+                "Domain '{name}' was already registered at {}",
+                path.display()
+            );
+        } else {
+            println!("Registered domain '{name}' at {}", path.display());
+        }
         println!("Not synced (--no-sync); run: crystalline sync --domain {name}");
     }
 }
