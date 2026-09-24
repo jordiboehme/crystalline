@@ -27,7 +27,8 @@
 import { createRng } from "../core/seed";
 import { CELL } from "../world/generate";
 import { FIXTURE_DEPTH, FIXTURE_WIDTH } from "../world/move";
-import type { Fixture, MachineKind, RoomSpec, WallSlot } from "../world/types";
+import type { Fixture, MachineKind, RoomSpec } from "../world/types";
+import { frameForSlot, type Frame } from "./kit";
 import { ASPECT, LAYER, TEXT_BASE, textRequests } from "./layers";
 import { hueToRgb, type Look, type Rgb } from "./looks";
 
@@ -61,9 +62,15 @@ export interface MeshData {
   count: number;
 }
 
-type V3 = [number, number, number];
+/** A point or direction in world space (or a frame's local space). */
+export type V3 = [number, number, number];
 
-interface Surface {
+/**
+ * What a face is made of: its texture array layer, the look's tint and the
+ * lighting flag. Every vertex of a face carries the same surface, and the
+ * modelling kit takes one per primitive.
+ */
+export interface Surface {
   layer: number;
   tint: Rgb;
   flag: Flag;
@@ -72,8 +79,13 @@ interface Surface {
 /** How far below the ceiling the top of a label stays. */
 const LABEL_CLEARANCE = 0.05;
 
-/** Grows a plain number array; turned into a Float32Array once at the end. */
-function createBuilder() {
+/**
+ * Grows a plain number array of interleaved vertices, turned into a
+ * Float32Array once at the end. The room mesh and the modelling kit
+ * (`kit.ts`) emit into the same builder, so a room with all its models stays
+ * one vertex array and one draw call.
+ */
+export function createBuilder() {
   const data: number[] = [];
   const push = (p: V3, n: V3, u: number, v: number, s: Surface) => {
     data.push(
@@ -110,6 +122,12 @@ function createBuilder() {
     push(p3, n, 0, vh, s);
   };
   return {
+    /**
+     * One vertex: world position, unit normal, uv and surface. Three calls
+     * make a triangle, wound counter-clockwise seen from the side the normal
+     * points to. The modelling kit emits its faces through this.
+     */
+    vertex: push,
     /**
      * A quad from its four corners, counter-clockwise seen from the front:
      * bottom-left, bottom-right, top-right, top-left. `uw`/`vh` are its uv
@@ -194,47 +212,8 @@ function createBuilder() {
   };
 }
 
-type Builder = ReturnType<typeof createBuilder>;
-
-/**
- * A wall-local frame for a slot: `origin` is on the wall at floor level in
- * the middle of the cell, `along` runs along the wall so that `along x up`
- * is `inward`, and `inward` points into the room. That handedness is what
- * makes a panel quad built bottom-left, bottom-right, top-right, top-left in
- * `a` and `h` wind counter-clockwise seen from the room.
- */
-function wallFrame(slot: WallSlot) {
-  const cx = (slot.x + 0.5) * CELL;
-  const cz = (slot.y + 0.5) * CELL;
-  switch (slot.side) {
-    case "n":
-      return {
-        origin: [cx, 0, slot.y * CELL] as V3,
-        along: [1, 0, 0] as V3,
-        inward: [0, 0, 1] as V3,
-      };
-    case "s":
-      return {
-        origin: [cx, 0, (slot.y + 1) * CELL] as V3,
-        along: [-1, 0, 0] as V3,
-        inward: [0, 0, -1] as V3,
-      };
-    case "w":
-      return {
-        origin: [slot.x * CELL, 0, cz] as V3,
-        along: [0, 0, -1] as V3,
-        inward: [1, 0, 0] as V3,
-      };
-    case "e":
-      return {
-        origin: [(slot.x + 1) * CELL, 0, cz] as V3,
-        along: [0, 0, 1] as V3,
-        inward: [-1, 0, 0] as V3,
-      };
-  }
-}
-
-type Frame = ReturnType<typeof wallFrame>;
+/** The builder `createBuilder` returns, as the modelling kit takes it. */
+export type Builder = ReturnType<typeof createBuilder>;
 
 function local(f: Frame, a: number, d: number, h: number): V3 {
   return [
@@ -317,7 +296,7 @@ function fixture(
   textLayer: Map<string, number>,
   look: Look,
 ) {
-  const f = wallFrame(fx.slot);
+  const f = frameForSlot(fx.slot);
   const p = look.palette;
   const metal: Surface = { layer: LAYER.metal, tint: p.metal, flag: FLAG.lit };
   const text = (key: string, flag: Flag, tint: Rgb): Surface => ({
