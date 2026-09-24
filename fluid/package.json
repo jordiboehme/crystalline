@@ -1,7 +1,7 @@
 {
   "name": "fluid",
   "private": true,
-  "version": "0.19.3",
+  "version": "0.19.4",
   "type": "module",
   "packageManager": "pnpm@11.20.0",
   "engines": {
