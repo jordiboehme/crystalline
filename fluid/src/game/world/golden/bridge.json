@@ -80,7 +80,7 @@
         "Everything the crew learned while keeping the station alive.",
         "Decisions, runbooks and the odd warning about the reactor."
       ],
-      "seed": 977334326507227
+      "seed": 2161236867691379
     },
     {
       "kind": "terminal",
@@ -94,7 +94,7 @@
         "Engineering questions go to the reactor deck.",
         "Cargo questions go through the portal to logistics."
       ],
-      "seed": 7722623761929098
+      "seed": 7631377307112311
     },
     {
       "kind": "machine",
@@ -129,7 +129,7 @@
       "y1": 4,
       "level": 220,
       "special": "steady",
-      "seed": 8376600143074028
+      "seed": 3296270800691091
     },
     {
       "x0": 4,
@@ -138,7 +138,7 @@
       "y1": 4,
       "level": 220,
       "special": "steady",
-      "seed": 5751482353676897
+      "seed": 2984858170967357
     },
     {
       "x0": 0,
@@ -147,7 +147,7 @@
       "y1": 6,
       "level": 220,
       "special": "steady",
-      "seed": 5633395912016399
+      "seed": 6291000386637734
     },
     {
       "x0": 4,
@@ -156,7 +156,7 @@
       "y1": 6,
       "level": 220,
       "special": "steady",
-      "seed": 8902552507331590
+      "seed": 6472859271415783
     }
   ]
 }

@@ -163,10 +163,11 @@ function lightsFor(
 ): LightZone[] {
   const base = Math.min(255, Math.round(150 + salience * 10));
   const zones: LightZone[] = [];
-  let i = 0;
   for (let y0 = 0; y0 < depth; y0 += LIGHT_BLOCK) {
     for (let x0 = 0; x0 < width; x0 += LIGHT_BLOCK) {
-      const seed = seedFor(roomSeed, "light", i++);
+      // Keyed by the zone's corner, not a running count, so a room that
+      // grows wider keeps the lights it already had.
+      const seed = seedFor(roomSeed, "light", x0, y0);
       const rng = createRng(seed);
       let level = base;
       let special: LightSpecial = "steady";
@@ -261,17 +262,23 @@ export function generateRoom(place: PlaceInput): RoomSpec {
       seed: seedFor(seed, "portal", targetKey(l)),
     });
   }
-  sections.forEach((s, i) => {
+  // A terminal's seed is its heading plus how many sections of the same
+  // heading came before it, never its position, so a section inserted
+  // above leaves the terminals below it as they were.
+  const headingsSeen = new Map<string, number>();
+  for (const s of sections) {
+    const nth = headingsSeen.get(s.heading) ?? 0;
+    headingsSeen.set(s.heading, nth + 1);
     const slot = pool.take("w");
-    if (slot === null) return;
+    if (slot === null) continue;
     fixtures.push({
       kind: "terminal",
       slot,
       heading: s.heading,
       lines: s.lines,
-      seed: seedFor(seed, "terminal", i, s.heading),
+      seed: seedFor(seed, "terminal", s.heading, nth),
     });
-  });
+  }
   for (const tag of tags) {
     const slot = pool.take("e");
     if (slot === null) continue;

@@ -171,6 +171,63 @@ describe("generateRoom determinism", () => {
     );
   });
 
+  it("keeps the existing terminals' seeds when a section is inserted above them", () => {
+    const before = generateRoom(CANNED_BRIDGE);
+    const after = generateRoom({
+      ...CANNED_BRIDGE,
+      content: CANNED_BRIDGE.content.replace(
+        "## Scope",
+        "## Arrivals\n\nNew crew report here.\n\n## Scope",
+      ),
+    });
+    const terminalSeeds = (r: typeof before) =>
+      new Map(
+        r.fixtures.flatMap((f) =>
+          f.kind === "terminal" ? [[f.heading, f.seed] as const] : [],
+        ),
+      );
+    const a = terminalSeeds(before);
+    const b = terminalSeeds(after);
+    expect(b.has("Arrivals")).toBe(true);
+    for (const heading of ["Scope", "Routing"]) {
+      expect(a.get(heading)).toBeDefined();
+      expect(b.get(heading)).toBe(a.get(heading));
+    }
+  });
+
+  it("gives two sections of the same heading different terminal seeds", () => {
+    const room = generateRoom({
+      ...CANNED_BRIDGE,
+      content: "## Notes\none\n## Notes\ntwo\n",
+    });
+    const seeds = room.fixtures.flatMap((f) =>
+      f.kind === "terminal" ? [f.seed] : [],
+    );
+    expect(seeds).toHaveLength(2);
+    expect(seeds[0]).not.toBe(seeds[1]);
+  });
+
+  it("keeps a light zone's seed when the room gets wider", () => {
+    const before = generateRoom(CANNED_BRIDGE);
+    const extra = Array.from({ length: 6 }, (_, i) => ({
+      relType: "relates_to",
+      target: { domain: null, target: `wide-${i}` },
+      resolved: true,
+      targetTitle: null,
+      targetSalience: null,
+    }));
+    const after = generateRoom({
+      ...CANNED_BRIDGE,
+      relations: [...CANNED_BRIDGE.relations, ...extra],
+    });
+    expect(after.width).toBeGreaterThan(before.width);
+    const byCorner = (r: typeof before) =>
+      new Map(r.lights.map((z) => [`${z.x0},${z.y0}`, z.seed]));
+    const a = byCorner(before);
+    const b = byCorner(after);
+    for (const [corner, seed] of a) expect(b.get(corner)).toBe(seed);
+  });
+
   it("uses every one of the twelve machine kinds for some tag", () => {
     const seen = new Set<string>();
     for (let i = 0; i < 400; i++) {
