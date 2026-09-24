@@ -17,12 +17,23 @@
 import { createRng, type Rng } from "../core/seed";
 import type { LightZone } from "../world/types";
 
+/** How many levels a glow moves per tic. */
 export const GLOWSPEED = 8;
+/** How many tics a strobe stays bright. */
 export const STROBEBRIGHT = 5;
+/** How many tics a fast strobe stays dark. */
 export const FASTDARK = 15;
+/** How many tics a slow strobe stays dark (unused by the specials here, kept for parity with DOOM's table). */
 export const SLOWDARK = 35;
+/** How many tics between one flicker step and the next. */
 export const FLICKER_TICS = 4;
-/** `P_SpawnLightFlash`'s random dark and bright spans, as masks. */
+/**
+ * `P_SpawnLightFlash`'s bounds on a failing light's random hold time, in
+ * tics: `FLASH_MIN` for a dark spell, `FLASH_MAX` for a lit one. DOOM masks
+ * `P_Random` with these; here they bound a uniform draw instead, so the hold
+ * time is `1` to `FLASH_MIN + 1` tics dark and `1` to `FLASH_MAX + 1` tics
+ * lit.
+ */
 export const FLASH_MIN = 7;
 export const FLASH_MAX = 64;
 

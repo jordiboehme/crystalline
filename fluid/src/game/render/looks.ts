@@ -76,7 +76,6 @@ export interface Look {
   terminal: "phosphor" | "petscii";
 }
 
-/** The C64's sixteen colours (the Pepto palette), in VIC-II order. */
 const C64_RAW: readonly (readonly [number, number, number])[] = [
   [0x00, 0x00, 0x00],
   [0xff, 0xff, 0xff],
@@ -96,6 +95,7 @@ const C64_RAW: readonly (readonly [number, number, number])[] = [
   [0x95, 0x95, 0x95],
 ];
 
+/** The C64's sixteen colours (the Pepto palette), in VIC-II order. */
 export const C64_PALETTE: readonly Rgb[] = C64_RAW.map(
   ([r, g, b]) => [r / 255, g / 255, b / 255] as const,
 );
@@ -112,6 +112,7 @@ function hex(value: number): Rgb {
   ];
 }
 
+/** The three looks, keyed by `LookId`. */
 export const LOOKS: Record<LookId, Look> = {
   day: {
     id: "day",
