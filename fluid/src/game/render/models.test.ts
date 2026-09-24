@@ -328,8 +328,6 @@ function floatingGlow(b: Built, wall: Frame | null): string[] {
     .map(({ i, p }) => `${i}:${p.method}`);
 }
 
-const counts: Record<string, number> = {};
-
 describe("fixture models", () => {
   for (const side of SIDES) {
     const slot = slotOn(side);
@@ -363,7 +361,6 @@ describe("fixture models", () => {
 
         it("stays under the triangle budget", () => {
           const n = triangleCount(built);
-          if (side === "n") counts[name] = n;
           expect(n).toBeLessThan(4000);
         });
 
@@ -439,7 +436,6 @@ describe("decor models", () => {
 
         it("stays under the triangle budget", () => {
           const n = triangleCount(built);
-          if (turn === 0) counts[kind] = n;
           expect(n).toBeLessThan(4000);
         });
 
@@ -486,12 +482,22 @@ describe("text rows", () => {
   });
 
   it("prints the per-model triangle counts", () => {
-    // Collected by the budget tests above; printed for the report.
-    console.log(
-      Object.entries(counts)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join("\n"),
-    );
-    expect(Object.keys(counts).length).toBeGreaterThan(0);
+    // Every fixture on a north wall and every decor at turn 0, for the report.
+    const counts = [
+      ...fixtures(slotOn("n")).map(
+        ([name, fx]) => [name, triangleCount(buildOne(fx))] as const,
+      ),
+      ...DECOR_KINDS.map(
+        (kind) =>
+          [
+            kind,
+            triangleCount(
+              buildOneDecor({ kind, x: 4.5, y: 3, turn: 0, seed: 11 }),
+            ),
+          ] as const,
+      ),
+    ];
+    console.log(counts.map(([k, v]) => `${k}: ${v}`).join("\n"));
+    for (const [, n] of counts) expect(n).toBeLessThan(4000);
   });
 });
