@@ -213,6 +213,7 @@ describe("generateRoom determinism", () => {
       relType: "relates_to",
       target: { domain: null, target: `wide-${i}` },
       resolved: true,
+      address: null,
       targetTitle: null,
       targetSalience: null,
     }));
@@ -246,6 +247,7 @@ describe("generateRoom limits", () => {
       relType: "relates_to",
       target: { domain: null, target: `t-${String(i).padStart(2, "0")}` },
       resolved: true,
+      address: null,
       targetTitle: null,
       targetSalience: null,
     }));
@@ -277,6 +279,7 @@ describe("generateRoom limits", () => {
           relType: null,
           target: { domain: null, target: "Nowhere" },
           resolved: false,
+          address: null,
           targetTitle: null,
           targetSalience: null,
         },
