@@ -1,0 +1,162 @@
+{
+  "version": 1,
+  "seed": 1019962908996269,
+  "domain": "station",
+  "permalink": "manifest",
+  "title": "Station Crystalline",
+  "archetype": "bridge",
+  "condition": "clean",
+  "width": 7,
+  "depth": 6,
+  "ceiling": 4.4,
+  "spawn": {
+    "x": 3,
+    "y": 5,
+    "yaw": 0
+  },
+  "fixtures": [
+    {
+      "kind": "placard",
+      "slot": {
+        "x": 2,
+        "y": 5,
+        "side": "s"
+      },
+      "lines": [
+        "Station Crystalline",
+        "TYPE manifest",
+        "STATUS stable",
+        "SALIENCE 7"
+      ]
+    },
+    {
+      "kind": "door",
+      "slot": {
+        "x": 1,
+        "y": 0,
+        "side": "n"
+      },
+      "style": "sliding",
+      "relType": "supersedes",
+      "label": "supersedes The Old Bridge",
+      "target": "old-bridge",
+      "seed": 1144790679644866
+    },
+    {
+      "kind": "door",
+      "slot": {
+        "x": 3,
+        "y": 0,
+        "side": "n"
+      },
+      "style": "blast",
+      "relType": "depends_on",
+      "label": "depends_on Reactor Core",
+      "target": "reactor-core",
+      "seed": 1212656729200579
+    },
+    {
+      "kind": "portal",
+      "slot": {
+        "x": 5,
+        "y": 0,
+        "side": "n"
+      },
+      "label": "Cargo Manifest",
+      "target": "Cargo Manifest",
+      "crossDomain": true,
+      "sealed": false,
+      "seed": 4609396990385548
+    },
+    {
+      "kind": "terminal",
+      "slot": {
+        "x": 0,
+        "y": 4,
+        "side": "w"
+      },
+      "heading": "Scope",
+      "lines": [
+        "Everything the crew learned while keeping the station alive.",
+        "Decisions, runbooks and the odd warning about the reactor."
+      ],
+      "seed": 977334326507227
+    },
+    {
+      "kind": "terminal",
+      "slot": {
+        "x": 0,
+        "y": 2,
+        "side": "w"
+      },
+      "heading": "Routing",
+      "lines": [
+        "Engineering questions go to the reactor deck.",
+        "Cargo questions go through the portal to logistics."
+      ],
+      "seed": 7722623761929098
+    },
+    {
+      "kind": "machine",
+      "slot": {
+        "x": 6,
+        "y": 1,
+        "side": "e"
+      },
+      "machine": "containment",
+      "tag": "navigation",
+      "hue": 196,
+      "seed": 8704530662821028
+    },
+    {
+      "kind": "machine",
+      "slot": {
+        "x": 6,
+        "y": 3,
+        "side": "e"
+      },
+      "machine": "fabricator",
+      "tag": "reactor",
+      "hue": 152,
+      "seed": 7307759528063472
+    }
+  ],
+  "lights": [
+    {
+      "x0": 0,
+      "y0": 0,
+      "x1": 4,
+      "y1": 4,
+      "level": 220,
+      "special": "steady",
+      "seed": 8376600143074028
+    },
+    {
+      "x0": 4,
+      "y0": 0,
+      "x1": 7,
+      "y1": 4,
+      "level": 220,
+      "special": "steady",
+      "seed": 5751482353676897
+    },
+    {
+      "x0": 0,
+      "y0": 4,
+      "x1": 4,
+      "y1": 6,
+      "level": 220,
+      "special": "steady",
+      "seed": 5633395912016399
+    },
+    {
+      "x0": 4,
+      "y0": 4,
+      "x1": 7,
+      "y1": 6,
+      "level": 220,
+      "special": "steady",
+      "seed": 8902552507331590
+    }
+  ]
+}
