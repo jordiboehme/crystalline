@@ -7,12 +7,18 @@
  * WebGL2 is there, and the context and the renderer are stubbed at their
  * modules, so the session's default factory runs without a GPU: the route
  * loads the place in its URL, loads the next one when the URL changes
- * under it, and stops asking the server anything once it is unmounted.
+ * under it (history included, also while a load is still in flight), and
+ * stops asking the server anything once it is unmounted.
  */
 
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { useEffect } from "react";
-import { MemoryRouter, useNavigate, type NavigateFunction } from "react-router";
+import {
+  MemoryRouter,
+  useLocation,
+  useNavigate,
+  type NavigateFunction,
+} from "react-router";
 import {
   afterEach,
   beforeEach,
@@ -24,7 +30,7 @@ import {
 } from "vitest";
 
 import App from "../App";
-import { api } from "../api/client";
+import { ApiProblem, api } from "../api/client";
 import {
   answersFor,
   type Answer,
@@ -52,14 +58,43 @@ vi.mock("./gl/context", async (importOriginal) => {
   };
 });
 
-vi.mock("./render/renderer", () => ({
-  createRenderer: () => ({
-    setRoom: vi.fn(),
-    resize: vi.fn(),
-    draw: vi.fn(),
-    dispose: vi.fn(),
-  }),
+/** Every stub renderer made, and every path a session navigated to. */
+const made = vi.hoisted(() => ({
+  renderers: [] as {
+    setRoom: ReturnType<typeof vi.fn>;
+    dispose: ReturnType<typeof vi.fn>;
+  }[],
+  navigations: [] as string[],
 }));
+
+vi.mock("./render/renderer", () => ({
+  createRenderer: () => {
+    const renderer = {
+      setRoom: vi.fn(),
+      resize: vi.fn(),
+      draw: vi.fn(),
+      dispose: vi.fn(),
+    };
+    made.renderers.push(renderer);
+    return renderer;
+  },
+}));
+
+// The real session, with every URL it asks the route for recorded.
+vi.mock("./session", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session")>();
+  return {
+    ...actual,
+    createSession: (opts: Parameters<typeof actual.createSession>[0]) =>
+      actual.createSession({
+        ...opts,
+        navigate: (path: string) => {
+          made.navigations.push(path);
+          opts.navigate(path);
+        },
+      }),
+  };
+});
 
 const apiMock = vi.mocked(api);
 
@@ -141,7 +176,17 @@ function NavProbe({
   return null;
 }
 
+/** Records the router's pathname each time it changes. */
+function LocationProbe() {
+  const { pathname } = useLocation();
+  useEffect(() => {
+    location = pathname;
+  }, [pathname]);
+  return null;
+}
+
 let navigate: NavigateFunction | null = null;
+let location = "";
 const keepNavigate = (n: NavigateFunction) => {
   navigate = n;
 };
@@ -151,8 +196,41 @@ function renderAt(path: string) {
     <MemoryRouter initialEntries={[path]}>
       <App />
       <NavProbe onNavigate={keepNavigate} />
+      <LocationProbe />
     </MemoryRouter>,
   );
+}
+
+/** Changes the URL under the app, as a link or the history buttons would. */
+function go(to: string | number) {
+  const nav = navigate;
+  if (nav === null) throw new Error("no navigate");
+  act(() => {
+    if (typeof to === "number") void nav(to);
+    else void nav(to);
+  });
+}
+
+/** The permalink of the room the renderer was last handed. */
+function lastRoom(): string | undefined {
+  const renderer = made.renderers.at(-1);
+  const call = renderer?.setRoom.mock.calls.at(-1) as
+    [{ permalink: string }, unknown] | undefined;
+  return call?.[0].permalink;
+}
+
+/** A promise and the function that settles it. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** The `console.error` calls React makes for an update outside `act`. */
+function actWarnings() {
+  return errors.mock.calls.filter((args) => String(args[0]).includes("act("));
 }
 
 /** Settles pending promises and timers the session and the HUD started. */
@@ -167,6 +245,9 @@ let errors: MockInstance<typeof console.error>;
 beforeEach(() => {
   apiMock.mockReset();
   navigate = null;
+  location = "";
+  made.renderers.length = 0;
+  made.navigations.length = 0;
   gl.available = false;
   // jsdom has no `matchMedia`; the device check and the session's
   // pixel-ratio watch both ask it. A fine pointer and no coarse one: a
@@ -199,42 +280,110 @@ describe("GameRoute", () => {
     expect(asked()).not.toContain("/domains/eng/engrams/alpha");
   });
 
-  it("loads the place in its URL, follows the URL, and stops on unmount", async () => {
+  it("loads the place in its URL and follows the URL", async () => {
     gl.available = true;
     serve();
     const view = renderAt("/game/d/eng/e/alpha");
 
     await waitFor(() => {
-      expect(asked()).toContain("/domains/eng/engrams/alpha");
+      expect(lastRoom()).toBe("alpha");
     });
     expect(screen.queryByText("?DEVICE NOT PRESENT ERROR")).toBeNull();
     // The connector's minimum is up and hidden before the next journey.
     await settle(500);
 
-    const nav = navigate;
-    if (nav === null) throw new Error("no navigate");
-    act(() => {
-      void nav("/game/d/eng/e/beta");
+    go("/game/d/eng/e/beta");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("beta");
     });
+    await settle(500);
+    expect(
+      asked().filter((p) => p === "/domains/eng/engrams/beta"),
+    ).toHaveLength(1);
+    expect(location).toBe("/game/d/eng/e/beta");
+    view.unmount();
+    expect(actWarnings()).toEqual([]);
+  });
+
+  it("stops for good when unmounted while a load is in flight", async () => {
+    gl.available = true;
+    const held = deferred<unknown>();
+    serve({ "/domains/eng/engrams/alpha": () => held.promise });
+    const view = renderAt("/game/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(asked()).toContain("/domains/eng/engrams/alpha");
+    });
+
+    view.unmount();
+    expect(made.renderers).toHaveLength(1);
+    expect(made.renderers[0]?.dispose).toHaveBeenCalled();
+    const calls = apiMock.mock.calls.length;
+    held.resolve(detailResponse("alpha", "Alpha"));
+    await settle(500);
+
+    expect(apiMock.mock.calls.length).toBe(calls);
+    expect(made.navigations).toEqual([]);
+    expect(made.renderers[0]?.setRoom).not.toHaveBeenCalled();
+    expect(actWarnings()).toEqual([]);
+  });
+
+  it("follows the history back to the room it is in while another loads", async () => {
+    gl.available = true;
+    const held = deferred<unknown>();
+    serve({ "/domains/eng/engrams/beta": () => held.promise });
+    const view = renderAt("/game/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    await settle(500);
+
+    go("/game/d/eng/e/beta");
+    await waitFor(() => {
+      expect(asked()).toContain("/domains/eng/engrams/beta");
+    });
+    go(-1);
+    await settle(0);
+    held.resolve(detailResponse("beta", "Beta"));
+    await settle(500);
+
+    // Beta's load was dropped: the player is in alpha, and so is the URL.
+    expect(lastRoom()).toBe("alpha");
+    expect(location).toBe("/game/d/eng/e/alpha");
+    expect(made.navigations).not.toContain("/game/d/eng/e/beta");
+    view.unmount();
+  });
+
+  it("follows the history forward to a room that failed to load before", async () => {
+    gl.available = true;
+    let betaMissing = true;
+    serve({
+      "/domains/eng/engrams/beta": () => {
+        if (betaMissing) throw new ApiProblem(404, "not found", "no beta");
+        return detailResponse("beta", "Beta");
+      },
+    });
+    const view = renderAt("/game/d/eng/e/alpha");
+    await waitFor(() => {
+      expect(lastRoom()).toBe("alpha");
+    });
+    await settle(500);
+
+    go("/game/d/eng/e/beta");
     await waitFor(() => {
       expect(asked()).toContain("/domains/eng/engrams/beta");
     });
     await settle(500);
-    // One load of each: the session's own replace after landing on beta does
-    // not start a second journey there.
-    expect(
-      asked().filter((p) => p === "/domains/eng/engrams/beta"),
-    ).toHaveLength(1);
+    expect(lastRoom()).toBe("alpha");
 
-    view.unmount();
-    const after = apiMock.mock.calls.length;
+    go(-1);
     await settle(500);
-    expect(apiMock.mock.calls.length).toBe(after);
-
-    const actWarnings = errors.mock.calls.filter((args) =>
-      String(args[0]).includes("act("),
-    );
-    expect(actWarnings).toEqual([]);
+    betaMissing = false;
+    go(1);
+    await waitFor(() => {
+      expect(lastRoom()).toBe("beta");
+    });
+    await settle(500);
+    view.unmount();
   });
 
   it("does not travel again to the room the session itself put in the URL", async () => {
@@ -252,14 +401,13 @@ describe("GameRoute", () => {
     await settle(500);
     expect(asked()).not.toContain("/domains/eng/engrams/alpha");
 
+    expect(location).toBe("/game/d/eng/e/alpha");
+    expect(lastRoom()).toBe("alpha");
+
     // A URL the session did not put there is still followed.
-    const nav = navigate;
-    if (nav === null) throw new Error("no navigate");
-    act(() => {
-      void nav("/game/d/eng/e/beta");
-    });
+    go("/game/d/eng/e/beta");
     await waitFor(() => {
-      expect(asked()).toContain("/domains/eng/engrams/beta");
+      expect(lastRoom()).toBe("beta");
     });
     await settle(500);
     view.unmount();

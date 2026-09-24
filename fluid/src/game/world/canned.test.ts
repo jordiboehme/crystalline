@@ -9,25 +9,64 @@ import { describe, expect, it } from "vitest";
 
 import { lightGrid } from "../render/lightgrid";
 import { GAME_VERSION } from "../version";
-import { MACHINE_KINDS } from "./generate";
 import { BAY, isFloor } from "./layout";
 import { blockersFor, decorFootprint, footprintOf, type Box } from "./move";
 import { galleryRoom } from "./canned";
-import type { DecorKind, DoorStyle, Fixture, RoomSpec } from "./types";
+import type {
+  DecorKind,
+  DoorStyle,
+  Fixture,
+  MachineKind,
+  RoomSpec,
+} from "./types";
 
-const DECOR_KINDS: readonly DecorKind[] = [
-  "command-console",
-  "captain-chair",
-  "round-table",
-  "council-chair",
-  "generator",
-  "pipe-run",
-  "shelf-row",
-  "lab-island",
-  "specimen-tank",
-];
+/**
+ * Every decor kind and door style, as the keys of a record the compiler
+ * holds to the union: a kind added to `DecorKind` or `DoorStyle` and not
+ * here fails the typecheck, so the gallery test cannot silently miss it.
+ */
+const DECOR_KINDS = Object.keys({
+  "command-console": true,
+  "captain-chair": true,
+  "round-table": true,
+  "council-chair": true,
+  generator: true,
+  "pipe-run": true,
+  "shelf-row": true,
+  "lab-island": true,
+  "specimen-tank": true,
+} satisfies Record<DecorKind, true>) as DecorKind[];
 
-const DOOR_STYLES: readonly DoorStyle[] = ["sliding", "bulkhead", "blast"];
+const DOOR_STYLES = Object.keys({
+  sliding: true,
+  bulkhead: true,
+  blast: true,
+} satisfies Record<DoorStyle, true>) as DoorStyle[];
+
+const FIXTURE_KINDS = Object.keys({
+  door: true,
+  hatch: true,
+  machine: true,
+  placard: true,
+  portal: true,
+  poster: true,
+  terminal: true,
+} satisfies Record<Fixture["kind"], true>) as Fixture["kind"][];
+
+const MACHINES = Object.keys({
+  workbench: true,
+  "lab-bench": true,
+  "server-rack": true,
+  "cryo-pod": true,
+  fabricator: true,
+  hydroponics: true,
+  "nav-table": true,
+  "comms-array": true,
+  "reactor-coupling": true,
+  "cargo-loader": true,
+  "med-scanner": true,
+  containment: true,
+} satisfies Record<MachineKind, true>) as MachineKind[];
 
 function inside(r: RoomSpec["hall"], x: number, y: number) {
   return x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1;
@@ -56,15 +95,7 @@ describe("galleryRoom", () => {
 
   it("carries one of every fixture kind", () => {
     const kinds = new Set(room.fixtures.map((f) => f.kind));
-    expect([...kinds].sort()).toEqual([
-      "door",
-      "hatch",
-      "machine",
-      "placard",
-      "portal",
-      "poster",
-      "terminal",
-    ]);
+    expect([...kinds].sort()).toEqual([...FIXTURE_KINDS].sort());
   });
 
   it("carries every door style open, and both sealed ways", () => {
@@ -87,9 +118,7 @@ describe("galleryRoom", () => {
 
   it("carries every machine kind once, all of them in the bays", () => {
     const machines = of("machine");
-    expect(machines.map((m) => m.machine).sort()).toEqual(
-      [...MACHINE_KINDS].sort(),
-    );
+    expect(machines.map((m) => m.machine).sort()).toEqual([...MACHINES].sort());
     for (const m of machines) {
       expect(inside(room.hall, m.slot.x, m.slot.y)).toBe(false);
     }

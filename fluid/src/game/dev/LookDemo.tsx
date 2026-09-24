@@ -8,7 +8,8 @@
  * without float targets, and `?nogl` shows the refusal screen, so both can
  * be checked on any browser.
  *
- * The HUD is `ui/Hud.tsx`, the game's own: its text lines are written
+ * The screen is `ui/StationView.tsx`, shared with the game route and the
+ * model gallery, and its HUD is `ui/Hud.tsx`, the game's own: its text lines are written
  * straight into the DOM through refs, not through React state, because the
  * frame time changes four times a second and a React render of the shell
  * for each would cost more than the number is worth.
@@ -20,9 +21,8 @@ import { engramRoute } from "../../paths";
 import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
 import type { Session } from "../session";
-import { CrtReader } from "../ui/CrtReader";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
-import { Hud } from "../ui/Hud";
+import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { startDemo } from "./demo";
 
@@ -79,23 +79,14 @@ export default function LookDemo() {
 
   if (refusal !== null) return <DeviceRefusal />;
   return (
-    <div className="fixed inset-0 bg-black">
-      <canvas
-        ref={canvasRef}
-        className="block h-full w-full cursor-crosshair"
-      />
-      <Hud view={view} connector={connector} legend={LEGEND} />
-      {reader !== null && (
-        <CrtReader
-          key={`${reader.section?.heading ?? ""}\u0000${String(reader.section?.occurrence ?? 0)}`}
-          title={reader.title}
-          markdown={reader.content}
-          section={reader.section}
-          look={reader.look === "freescape" ? "petscii" : "phosphor"}
-          onClose={closeReader}
-          onOpenFluid={readerOpenFluid}
-        />
-      )}
-    </div>
+    <StationView
+      canvasRef={canvasRef}
+      view={view}
+      connector={connector}
+      reader={reader}
+      legend={LEGEND}
+      onCloseReader={closeReader}
+      onOpenFluid={readerOpenFluid}
+    />
   );
 }

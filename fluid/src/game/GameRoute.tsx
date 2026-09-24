@@ -14,9 +14,14 @@
  * to the same room and the history is not filled with every door walked
  * through. That replace changes the params too, and the route must not
  * answer it with a second journey to the room the player just entered,
- * which would reload the room and lose where the door put them. So a new
- * URL is followed only when it names neither the place the session is in
- * nor the one this route last sent it to.
+ * which would reload the room and lose where the door put them. So the
+ * route keeps the one address the URL is following: the one it last sent
+ * the session to, or, once the session lands somewhere of its own accord,
+ * that place, set before the session's replace reaches the router. A new
+ * URL is followed exactly when it names another address. It is not
+ * compared with the room the player stands in: going back to that room
+ * while another one is still loading must cancel the load, and going
+ * forward again to a room that failed to load must try it again.
  *
  * The device is refused before the first paint exactly as in the look
  * demo, and the session is created in an effect once the canvas exists and
@@ -69,9 +74,9 @@ export default function GameRoute() {
   const sessionRef = useRef<Session | null>(null);
   const navigateRef = useRef(navigate);
   const addressRef = useRef<PlaceAddress>({ domain, permalink });
-  // The address this route last sent the session to, or the one the
-  // session last landed in of its own accord, so the params effect does not
-  // send it there a second time while it is still loading.
+  // The address the URL is following: the one this route last sent the
+  // session to, or the one the session last landed in of its own accord.
+  // The params effect follows a URL that names any other address.
   const requestedRef = useRef<PlaceAddress | null>(null);
   const { sink, view, connector, reader } = useHud();
   const [refusal] = useState<Refusal | null>(() =>
@@ -117,12 +122,7 @@ export default function GameRoute() {
     const session = sessionRef.current;
     if (session === null) return;
     const address = { domain, permalink };
-    if (
-      samePlace(session.current, address) ||
-      samePlace(requestedRef.current, address)
-    ) {
-      return;
-    }
+    if (samePlace(requestedRef.current, address)) return;
     requestedRef.current = address;
     session.go(address);
   }, [domain, permalink]);
