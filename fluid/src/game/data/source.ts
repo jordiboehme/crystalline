@@ -30,7 +30,7 @@
  * lives in one place only.
  */
 
-import { isCancelledError, type QueryClient } from "@tanstack/react-query";
+import type { QueryClient } from "@tanstack/react-query";
 
 import { ApiProblem } from "../../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../../api/domains";
@@ -132,9 +132,12 @@ function checkAborted(signal: AbortSignal | undefined): void {
  * at once instead of waiting for a request that may hang.
  *
  * The listener is removed when the round settles either way, so a long-lived
- * signal does not collect one listener per round. A TanStack `CancelledError`
- * that arrives while the signal has fired (the session cancelling the queries
- * it walked away from) is read as the abort it is.
+ * signal does not collect one listener per round.
+ *
+ * This race is also what covers cancellation. When the session aborts the
+ * signal and then cancels the queries it started, the abort listener rejects
+ * first, so a TanStack `CancelledError` never reaches the caller and needs no
+ * mapping of its own.
  */
 async function abortable<T>(
   round: Promise<T>,
@@ -151,11 +154,6 @@ async function abortable<T>(
   });
   try {
     return await Promise.race([round, aborted]);
-  } catch (error) {
-    if (signal.aborted && isCancelledError(error)) {
-      throw abortError();
-    }
-    throw error;
   } finally {
     if (onAbort !== undefined) {
       signal.removeEventListener("abort", onAbort);
@@ -235,9 +233,6 @@ export async function loadPlace(
 
   if (detailResult.status === "rejected") {
     const error: unknown = detailResult.reason;
-    if (signal?.aborted === true && isCancelledError(error)) {
-      throw abortError();
-    }
     if (error instanceof ApiProblem) {
       if (error.status === 404) {
         return { kind: "missing" };

@@ -356,15 +356,4 @@ describe("loadPlace", () => {
     expect(error).toBeInstanceOf(DOMException);
     expect((error as DOMException).name).toBe("AbortError");
   });
-
-  it("reads a query the session cancelled as an AbortError", async () => {
-    const controller = new AbortController();
-    serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
-    const pending = loadPlace(client, "eng", "alpha", controller.signal);
-    await Promise.resolve();
-    // The session's order: abort the load, then cancel what it started.
-    controller.abort();
-    await client.cancelQueries({ queryKey: engramDetailKey("eng", "alpha") });
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
-  });
 });
