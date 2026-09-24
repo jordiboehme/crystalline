@@ -310,6 +310,12 @@ pub trait Provider: Send + Sync {
     /// The authenticated user's login, used to report who is connected.
     async fn current_user(&self) -> Result<String, RemoteError>;
 
+    /// The branch the repository `repo` (`owner/name`) calls its default, the
+    /// one a team domain tracks when nobody named a branch. Required, with no
+    /// default body on purpose: a wrapper that forgot to delegate it would
+    /// otherwise answer for a forge it has never asked.
+    async fn default_branch(&self, repo: &str) -> Result<String, RemoteError>;
+
     // The stack verbs below all default to `StacksUnsupported`. Stacking is a
     // forge capability rather than a part of the collaboration contract: a
     // provider that cannot stack proposals implements none of these and its
@@ -511,6 +517,10 @@ mod tests {
         }
 
         async fn current_user(&self) -> Result<String, RemoteError> {
+            Err(RemoteError::Offline)
+        }
+
+        async fn default_branch(&self, _repo: &str) -> Result<String, RemoteError> {
             Err(RemoteError::Offline)
         }
     }

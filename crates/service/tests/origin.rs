@@ -386,6 +386,11 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
     let origin_cfg = entry.origin.as_ref().expect("origin config");
     assert_eq!(origin_cfg.repo, "acme/brand-knowledge");
     assert_eq!(origin_cfg.branch(), "main");
+    assert_eq!(
+        origin_cfg.branch.as_deref(),
+        Some("main"),
+        "the repository default the connect resolved is recorded, not left implicit"
+    );
     assert_eq!(entry.file_path().as_deref(), Some(root.as_path()));
 
     // Indexed: readable through the engine's own read path.
@@ -761,6 +766,78 @@ async fn origin_add_retry_treats_absent_branch_as_main() {
         .await
         .unwrap();
     assert_eq!(second["already_connected"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn origin_add_without_a_branch_tracks_the_repository_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    mock.set_default_branch("trunk");
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("trunk", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+    let root_str = root.to_str().unwrap();
+
+    eng.origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .await
+        .unwrap();
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let origin_cfg = on_disk.domains["brand-knowledge"].origin.clone().unwrap();
+    assert_eq!(origin_cfg.branch.as_deref(), Some("trunk"));
+
+    // A retry without a branch is the same connect, whatever was resolved.
+    let again = eng
+        .origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .await
+        .unwrap();
+    assert_eq!(again["already_connected"], serde_json::json!(true));
+
+    // Naming another branch is a different connect.
+    let err = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            Some("main"),
+            Some(root_str),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+}
+
+#[tokio::test]
+async fn origin_add_without_a_branch_refuses_when_the_default_cannot_be_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    mock.fail_default_branch();
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
+
+    let err = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--branch"), "{err}");
+    assert!(
+        !eng.config().domains.contains_key("brand-knowledge"),
+        "never registered on a guessed branch"
+    );
 }
 
 #[tokio::test]

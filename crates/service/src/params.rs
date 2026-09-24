@@ -582,7 +582,8 @@ pub struct AddDomainParams {
     /// living inside a bigger repository. Defaults to the repository root.
     #[serde(default)]
     pub path: Option<String>,
-    /// The branch to track, for a team domain. Defaults to `main`.
+    /// The branch to track, for a team domain. Defaults to the repository's
+    /// default branch, asked from GitHub when the domain is added.
     #[serde(default)]
     pub branch: Option<String>,
 }

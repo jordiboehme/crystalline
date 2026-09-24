@@ -337,6 +337,10 @@ impl Provider for PinnedHead<'_> {
         self.inner.current_user().await
     }
 
+    async fn default_branch(&self, repo: &str) -> Result<String, RemoteError> {
+        self.inner.default_branch(repo).await
+    }
+
     // The stack verbs are delegated rather than left to the trait's
     // `StacksUnsupported` defaults: a wrapper that answered those defaults would
     // turn a stacking forge into a non-stacking one for exactly the shares that
@@ -374,5 +378,127 @@ impl Provider for PinnedHead<'_> {
         stack_number: u64,
     ) -> Result<(), RemoteError> {
         self.inner.dissolve_stack(origin, stack_number).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A forge that answers only the default-branch question, so a wrapper
+    /// that answered it without asking would be caught returning anything
+    /// but `trunk`.
+    struct TrunkForge;
+
+    #[async_trait::async_trait]
+    impl Provider for TrunkForge {
+        async fn branch_head(
+            &self,
+            _: &OriginSpec,
+            _: Option<&str>,
+        ) -> Result<HeadProbe, RemoteError> {
+            unreachable!()
+        }
+        async fn compare(
+            &self,
+            _: &OriginSpec,
+            _: &str,
+            _: &str,
+        ) -> Result<CompareResult, RemoteError> {
+            unreachable!()
+        }
+        async fn blob(&self, _: &OriginSpec, _: &str) -> Result<Vec<u8>, RemoteError> {
+            unreachable!()
+        }
+        async fn tarball(&self, _: &OriginSpec, _: &str) -> Result<Vec<u8>, RemoteError> {
+            unreachable!()
+        }
+        async fn create_blob(&self, _: &OriginSpec, _: &[u8]) -> Result<String, RemoteError> {
+            unreachable!()
+        }
+        async fn create_tree(
+            &self,
+            _: &OriginSpec,
+            _: &str,
+            _: &[TreeWrite],
+        ) -> Result<String, RemoteError> {
+            unreachable!()
+        }
+        async fn create_commit(
+            &self,
+            _: &OriginSpec,
+            _: &str,
+            _: &str,
+            _: &[String],
+        ) -> Result<String, RemoteError> {
+            unreachable!()
+        }
+        async fn create_branch(&self, _: &OriginSpec, _: &str, _: &str) -> Result<(), RemoteError> {
+            unreachable!()
+        }
+        async fn delete_branch(&self, _: &OriginSpec, _: &str) -> Result<(), RemoteError> {
+            unreachable!()
+        }
+        async fn branch_ref(&self, _: &OriginSpec, _: &str) -> Result<Option<String>, RemoteError> {
+            unreachable!()
+        }
+        async fn update_branch(
+            &self,
+            _: &OriginSpec,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<(), RemoteError> {
+            unreachable!()
+        }
+        async fn update_proposal(
+            &self,
+            _: &OriginSpec,
+            _: u64,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<(), RemoteError> {
+            unreachable!()
+        }
+        async fn close_proposal(&self, _: &OriginSpec, _: u64) -> Result<(), RemoteError> {
+            unreachable!()
+        }
+        async fn proposal_feedback(&self, _: &OriginSpec, _: u64) -> Result<Feedback, RemoteError> {
+            unreachable!()
+        }
+        async fn list_open_proposals(
+            &self,
+            _: &OriginSpec,
+        ) -> Result<Vec<OpenProposalRef>, RemoteError> {
+            unreachable!()
+        }
+        async fn create_proposal(
+            &self,
+            _: &OriginSpec,
+            _: &ProposalRequest,
+        ) -> Result<ProposalHandle, RemoteError> {
+            unreachable!()
+        }
+        async fn proposal_state(
+            &self,
+            _: &OriginSpec,
+            _: u64,
+        ) -> Result<ProposalState, RemoteError> {
+            unreachable!()
+        }
+        async fn current_user(&self) -> Result<String, RemoteError> {
+            unreachable!()
+        }
+        async fn default_branch(&self, repo: &str) -> Result<String, RemoteError> {
+            assert_eq!(repo, "acme/kb");
+            Ok("trunk".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_head_asks_the_real_forge_for_the_default_branch() {
+        let pinned = PinnedHead::new(&TrunkForge, "commit1".to_string());
+        assert_eq!(pinned.default_branch("acme/kb").await.unwrap(), "trunk");
     }
 }

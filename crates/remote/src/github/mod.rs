@@ -39,7 +39,7 @@ use types::{
     BlobResponse, CloseProposalRequest, CommitResponse, CompareFile, CompareResponse,
     CreateBlobRequest, CreateCommitRequest, CreateProposalRequest, CreateProposalResponse,
     CreateRefRequest, CreateTreeRequest, CurrentUserResponse, ErrorBody, IssueCommentResponse,
-    OpenProposalListItem, ProposalStateResponse, RefResponse, ReviewCommentResponse,
+    OpenProposalListItem, ProposalStateResponse, RefResponse, RepoResponse, ReviewCommentResponse,
     ReviewResponse, ShaResponse, StackResponse, StackWriteRequest, TreeEntryRequest,
     UpdateProposalRequest, UpdateRefRequest,
 };
@@ -661,6 +661,15 @@ impl Provider for GitHubProvider {
         let response = self.check(response, None).await?;
         let body: CurrentUserResponse = parse_json(response).await?;
         Ok(body.login)
+    }
+
+    async fn default_branch(&self, repo: &str) -> Result<String, RemoteError> {
+        let (owner, name) = split_repo(repo)?;
+        let path = format!("/repos/{owner}/{name}");
+        let response = self.send(self.request(Method::GET, &path)).await?;
+        let response = self.check(response, Some(repo)).await?;
+        let body: RepoResponse = parse_json(response).await?;
+        Ok(body.default_branch)
     }
 
     async fn list_stacks(

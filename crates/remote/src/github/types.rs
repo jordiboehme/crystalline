@@ -133,6 +133,12 @@ pub(super) struct CurrentUserResponse {
     pub(super) login: String,
 }
 
+/// `GET /repos/{owner}/{repo}` response, trimmed to the one field read.
+#[derive(Debug, Deserialize)]
+pub(super) struct RepoResponse {
+    pub(super) default_branch: String,
+}
+
 /// `PATCH .../git/refs/heads/{name}` request body. `force` is false for a
 /// share-update, which fast-forwards a branch only this machine writes, and
 /// true for a layer branch rewritten on top of a moved base.

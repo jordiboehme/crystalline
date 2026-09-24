@@ -1068,7 +1068,7 @@ enum DomainCommand {
         #[arg(long)]
         origin: Option<String>,
         /// The branch to track. Only meaningful with --origin; defaults to
-        /// main.
+        /// the repository's default branch, asked from GitHub and recorded.
         #[arg(long)]
         branch: Option<String>,
         /// Register only; skip indexing (run `crystalline sync` later). Applies

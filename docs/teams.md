@@ -18,10 +18,10 @@ crystalline connect github
 Bring a team repository in as a domain:
 
 ```sh
-crystalline domain add design --origin acme/design-knowledge --branch main
+crystalline domain add design --origin acme/design-knowledge
 ```
 
-`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository. The local folder defaults to `<domains_root>/<name>` (the domains root is `~/Documents/Crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool.
+`--origin` takes `owner/repo` or `owner/repo/subpath` when the domain is a subfolder of a bigger repository. The local folder defaults to `<domains_root>/<name>` (the domains root is `~/Documents/Crystalline` unless you set `domains_root` or `CRYSTALLINE_DOMAINS_ROOT`), and the domain is downloaded and indexed immediately. An agent does the same with the `add_domain` MCP tool. Without `--branch` the domain tracks the repository's default branch, which is asked from GitHub once and written into the domain's entry.
 
 From there, `crystalline origin` covers the team domain lifecycle:
 
@@ -80,7 +80,7 @@ domains:
     origin:
       repo: acme/design-knowledge   # the GitHub repository, owner/name
       path: knowledge               # optional subfolder; absent means the repository root
-      branch: main                  # optional; absent means main
+      branch: main                  # optional; domain add writes the repository's default branch here; absent means main
       poll_secs: 600                # optional per-domain poll interval override
 github:
   enabled: true                     # turns team domains on; absent means off

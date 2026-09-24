@@ -16629,7 +16629,8 @@ impl Engine {
     /// `domain` defaults to the repository's own name segment; `folder`
     /// defaults to `~/Documents/Crystalline/<domain>`. `path` is the
     /// subfolder within the repository that is the domain root (absent means
-    /// the repository root); `branch` defaults to `main`.
+    /// the repository root); `branch` defaults to the repository's default
+    /// branch, asked from the forge and recorded in the entry.
     ///
     /// Refuses with `github.enabled`'s message when collaboration is off,
     /// and with `EngineError::ReadOnly` on a read-only instance (this both
@@ -16781,15 +16782,25 @@ impl Engine {
                 None,
             ),
         };
-        let branch_name = branch.unwrap_or("main").to_string();
+        let provider = self.resolve_origin_provider()?;
+        // No branch named: ask the forge which branch the repository calls its
+        // default and record that, so the entry says what it tracks. Never a
+        // silent `main`: a repository whose default is `trunk` would track a
+        // branch that does not exist. A failed lookup refuses the add.
+        let branch_name = match branch {
+            Some(b) => b.to_string(),
+            None => provider
+                .default_branch(repo)
+                .await
+                .inspect_err(|e| self.drop_github_credential_on_auth(e))
+                .map_err(|e| default_branch_refusal(repo, e))?,
+        };
         let spec = OriginSpec {
             repo: repo.to_string(),
             subpath: path.map(str::to_string),
-            branch: branch_name,
+            branch: branch_name.clone(),
         };
         let state_dir = self.origin_state_dir(&domain_name)?;
-
-        let provider = self.resolve_origin_provider()?;
         progress_at(1, &format!("downloading {repo}"));
         let report = ops::subscribe(provider.as_ref(), &spec, &root, &state_dir)
             .await
@@ -16826,7 +16837,7 @@ impl Engine {
                     origin: Some(OriginConfig {
                         repo: repo.to_string(),
                         path: path.map(str::to_string),
-                        branch: branch.map(str::to_string),
+                        branch: Some(branch_name.clone()),
                         poll_secs: None,
                     }),
                     provision,
@@ -16878,8 +16889,8 @@ impl Engine {
     /// Whether a registered domain's origin matches this connect request
     /// exactly, so a retry answers idempotently instead of re-connecting.
     /// GitHub treats owner/name case insensitively, so the repo compares that
-    /// way; the subpath compares exactly and an absent branch means main on
-    /// both sides; an omitted folder always matches, a given one must resolve
+    /// way; the subpath compares exactly, an absent requested branch matches
+    /// any stored one, and an absent stored branch means main; an omitted folder always matches, a given one must resolve
     /// to the registered root. Shared by the pre-lock guard and the re-read
     /// under the lock so both sites judge a match identically.
     fn origin_matches_request(
@@ -16892,8 +16903,14 @@ impl Engine {
     ) -> bool {
         let same_repo = origin_cfg.repo.eq_ignore_ascii_case(repo);
         let same_path = origin_cfg.path.as_deref() == path;
-        let same_branch =
-            origin_cfg.branch.as_deref().unwrap_or("main") == branch.unwrap_or("main");
+        // No branch asked for matches whatever the entry tracks: a connect
+        // without one records the repository default it resolved, and a retry
+        // of that connect is the same request. A stored entry with no branch
+        // still means main, since it was written under that rule.
+        let same_branch = match branch {
+            None => true,
+            Some(b) => origin_cfg.branch() == b,
+        };
         let same_folder = match (folder, entry.file_path()) {
             (None, _) => true,
             (Some(f), Some(r)) => crystalline_core::config::expand_tilde(f) == r,
@@ -21663,6 +21680,27 @@ fn name_taken_by_other(name: &str, canonical: &Path, cfg: &GlobalConfig) -> bool
     match cfg.domains.get(name) {
         None => false,
         Some(entry) => canonicalized_file_path(entry).as_deref() != Some(canonical),
+    }
+}
+
+/// What a connect without a branch answers when the forge could not say which
+/// branch is the repository's default. An error about the connection itself
+/// (expired, missing, or blocked by an organization) passes through
+/// unchanged, since naming a branch fixes none of them and its own message
+/// names the fix; every other failure is refused with the way around it.
+/// Never a fall back to `main`.
+fn default_branch_refusal(repo: &str, e: RemoteError) -> EngineError {
+    match e {
+        RemoteError::AuthExpired
+        | RemoteError::NotConnected
+        | RemoteError::SsoAuthorizationRequired { .. }
+        | RemoteError::OauthAppRestricted { .. } => e.into(),
+        other => RemoteError::Refused(format!(
+            "could not read the default branch of {repo} ({other}), so nothing was added; \
+             name the branch to track (--branch on the command line, branch in add_domain \
+             and in the JSON API) and try again"
+        ))
+        .into(),
     }
 }
 
