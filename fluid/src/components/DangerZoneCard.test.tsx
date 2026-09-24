@@ -226,11 +226,14 @@ describe("the danger zone", () => {
     });
   });
 
-  it("gives a non-admin owner no way to unregister the domain", async () => {
+  it("gives a non-admin owner of a private domain the unregister control", async () => {
+    const removed = vi.fn(() => ({ files_kept: true, rooms_closed: 0 }));
     serve(
       {
         "/domains/eng/members": () =>
           membersResponse({ owner: "ada", visibility: "private" }),
+        "/domains/eng": (_path, init) =>
+          init?.method === "DELETE" ? removed() : domainsResponse(),
       },
       "editor",
       "ada",
@@ -239,13 +242,39 @@ describe("the danger zone", () => {
     renderApp("/d/eng");
     const card = await dangerZone();
 
-    // Owning a domain is not administering the instance: `DELETE /domains`
-    // is admin-only, so the trigger for it is not drawn beside a control the
-    // same caller may use.
-    await within(card).findByRole("button", { name: "Share with everyone" });
+    // `DELETE /domains/{domain}` lets the owner of a private domain through as
+    // well as an admin, so the owner is drawn the trigger the server honours.
+    await arm(card, "Unregister domain");
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Confirm unregister" }),
+    );
+    await waitFor(() => {
+      expect(removed).toHaveBeenCalled();
+    });
+  });
+
+  it("offers the owner the same unregister row on the palette", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private" }),
+      },
+      "editor",
+      "ada",
+    );
+    const user = userEvent.setup();
+
+    renderApp("/d/eng");
+    const card = await dangerZone();
+    await user.keyboard("{Meta>}k{/Meta}");
+    await user.click(
+      await screen.findByRole("option", { name: /unregister domain/i }),
+    );
+
+    // The row asks, it does not act: the typed confirmation is armed in the card.
     expect(
-      within(card).queryByRole("button", { name: "Unregister domain" }),
-    ).toBeNull();
+      await within(card).findByLabelText("Type eng to confirm"),
+    ).toBeVisible();
   });
 
   it("gives an admin the same control on an ownerless private domain", async () => {

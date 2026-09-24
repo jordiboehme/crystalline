@@ -60,6 +60,7 @@ import {
   hasFilters,
   hasNextPage,
 } from "../api/engrams";
+import { fetchMembers, membersKey, sameAccount } from "../api/members";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { useAuth } from "../auth/AuthContext";
@@ -182,7 +183,7 @@ function DomainPage({
   domain: string;
   folders: string[];
 }) {
-  const { capabilities } = useAuth();
+  const { user, capabilities } = useAuth();
   const navigate = useNavigate();
   /**
    * What the page the reader came from did before it stopped existing: the
@@ -206,6 +207,17 @@ function DomainPage({
     queryKey: manifestKey(domain),
     queryFn: () => fetchManifest(domain),
   });
+  // The members read the danger zone makes, under the same key, so one
+  // request serves both: the palette's unregister row follows the card's
+  // own rule - an admin, or the owner of a private domain.
+  const members = useQuery({
+    queryKey: membersKey(domain),
+    queryFn: () => fetchMembers(domain),
+  });
+  const owner = members.data?.owner ?? null;
+  const canUnregister =
+    capabilities.canAdminister ||
+    (user !== null && owner !== null && sameAccount(owner, user.name));
   const tags = useQuery({
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
@@ -231,9 +243,10 @@ function DomainPage({
   // The writes this screen offers, on the palette under the gates the
   // buttons are under. The dialog the first opens picks its own folder from
   // the URL, so the keyboard route lands exactly where the pointer route
-  // does. Unregistering rides on the same gates, one role higher: the palette
-  // row does what the button does, which is to ASK - the second press is the
-  // point of the control and the keyboard route does not get to skip it.
+  // does. Unregistering follows the danger zone's own gate (an admin, or a
+  // private domain's owner): the palette row does what the button does,
+  // which is to ASK - the second press is the point of the control and the
+  // keyboard route does not get to skip it.
   // Editing the MANIFEST is behind the same gate as its link, and under the
   // same second condition: a read that landed, or a domain that has no
   // MANIFEST yet, which is precisely what an admin opens the editor to fix.
@@ -280,6 +293,8 @@ function DomainPage({
           setImporting(true);
         },
       });
+    }
+    if (canUnregister) {
       rows.push({
         id: "unregister-domain",
         title: "Unregister domain",
@@ -290,6 +305,7 @@ function DomainPage({
     }
     return rows.length === 0 ? NO_COMMANDS : rows;
   }, [
+    canUnregister,
     capabilities.canAdminister,
     capabilities.canWrite,
     domain,
@@ -486,7 +502,7 @@ function DomainPage({
         Last on the page: a copy of the domain, and the two ways of taking it
         away from the people who read it. Both halves of the archive round
         trip are admin-only endpoints, so that card is gated here. The danger
-        zone gates itself, because one of its two verbs is the owner's as well
+        zone gates itself, because both of its verbs are the owner's as well
         as an admin's and only the members read says who the owner is; it
         draws nothing for a caller who may reach neither. The unregister
         confirmation is the screen's state rather than the card's, because the

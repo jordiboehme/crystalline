@@ -17,12 +17,13 @@
  * may see everything in a domain is another.
  *
  * Who sees what follows the server's own gates rather than one flag for the
- * card. Unregistering is admin-only (`DELETE /domains/{domain}`), so its
- * trigger is drawn for an admin alone. The visibility control needs `Own`,
- * which is the owner or an admin - the same derivation the members card
- * makes off the same read, and the reason an owner who administers nothing
- * can still open its own domain back up. A caller with neither right is
- * drawn no card at all, rather than an empty box headed "Danger zone".
+ * card. Both verbs need `Own`: an instance admin, or the owner of a private
+ * domain. `DELETE /domains/{domain}` checks exactly that in the engine, and
+ * so does the visibility route, so the card derives it once off the members
+ * read - the same derivation the members card makes - and draws both
+ * controls for it. A shared domain has no owner, so there both reduce to
+ * "is an admin". A caller with neither right is drawn no card at all, rather
+ * than an empty box headed "Danger zone".
  *
  * `confirming` is the screen's rather than the control's, because the command
  * palette offers the same unregister row: the keyboard route arms this exact
@@ -181,10 +182,10 @@ export function DangerZoneCard({
       )}
 
       {/*
-        Admin only, the way `DELETE /domains/{domain}` is: an owner owns the
-        domain and does not administer the instance this one is registered on.
+        For an admin or a private domain's owner, the way `DELETE
+        /domains/{domain}` decides it: the engine lets either through.
       */}
-      {capabilities.canAdminister && (
+      {own && (
         <div className="flex flex-col gap-1">
           <DestructiveAction
             label="Unregister domain"
