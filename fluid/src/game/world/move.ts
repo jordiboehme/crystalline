@@ -478,7 +478,10 @@ function pushOut(
  * the part of it that went into a wall is gone. Should the push-out find no
  * free place, milestone 1's rule takes over as a backstop: x then z, each
  * axis refused when it would overlap, which never leaves the player inside
- * anything. The grid's bounding rectangle is clamped to first.
+ * anything. The grid's bounding rectangle is clamped to first, and a
+ * clamp counts as a collision too: a wall on the grid's edge (every hall's
+ * north wall, and its west wall when there is no corridor) takes the
+ * velocity into it just as a wall of void cells does.
  */
 export function stepPlayer(
   p: Player,
@@ -512,11 +515,17 @@ export function stepPlayer(
   const clampX = (v: number) => Math.max(minX, Math.min(maxX, v));
   const clampZ = (v: number) => Math.max(minZ, Math.min(maxZ, v));
 
-  const tx = clampX(p.x + vx * DT);
-  const tz = clampZ(p.z + vz * DT);
+  const rawX = p.x + vx * DT;
+  const rawZ = p.z + vz * DT;
+  const tx = clampX(rawX);
+  const tz = clampZ(rawZ);
   let x = tx;
   let z = tz;
+  // A wall on the grid's edge stops the player through the clamp, not
+  // through `hits`, and must stop the stride just the same.
+  let collided = tx !== rawX || tz !== rawZ;
   if (hits(tx, tz, room.grid, blockers)) {
+    collided = true;
     const pushed = pushOut(tx, tz, tx - p.x, tz - p.z, room.grid, blockers);
     const free =
       pushed !== null &&
@@ -529,6 +538,8 @@ export function stepPlayer(
       x = hits(tx, p.z, room.grid, blockers) ? p.x : tx;
       z = hits(x, tz, room.grid, blockers) ? p.z : tz;
     }
+  }
+  if (collided) {
     vx = (x - p.x) / DT;
     vz = (z - p.z) / DT;
   }

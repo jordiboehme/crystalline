@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { createRng } from "../core/seed";
 import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
 import { CELL, generateRoom } from "./generate";
-import { isFloor } from "./layout";
+import { BAY, isFloor } from "./layout";
 import {
   FIXTURE_DEPTH,
   FIXTURE_WIDTH,
@@ -13,6 +13,7 @@ import {
   blockersFor,
   decorFootprint,
   footprintOf,
+  headBob,
   scaffoldBoxes,
   spawnPlayer,
   stepPlayer,
@@ -552,18 +553,50 @@ describe("sliding around corners", () => {
     }
   });
 
-  it("walks diagonally into a hall corner and settles in it", () => {
-    // The bridge's north-west corner has no fixture near it.
-    const corner = { x: room.hall.x0 * CELL, z: room.hall.y0 * CELL };
+  it("walks diagonally into a corner of void cells and settles in it", () => {
+    // The first bay's south-east corner: void on both sides (the next bay's
+    // doorway column east, the rows below the bay south), no fixture near.
+    const corner = { x: (hub.hall.x1 + 1 + BAY) * CELL, z: BAY * CELL };
+    expect(isFloor(hub.grid, hub.hall.x1 + BAY, BAY - 1)).toBe(true);
+    expect(isFloor(hub.grid, hub.hall.x1 + BAY + 1, BAY - 1)).toBe(false);
+    expect(isFloor(hub.grid, hub.hall.x1 + BAY, BAY)).toBe(false);
     const p = diagonalInto(
-      room,
-      { x: corner.x + 3, z: corner.z + 3 },
-      [-1, -1],
+      hub,
+      { x: corner.x - 3, z: corner.z - 3 },
+      [1, 1],
       0.3,
       80,
     );
-    expect(p.x).toBeCloseTo(corner.x + PLAYER_RADIUS, 3);
-    expect(p.z).toBeCloseTo(corner.z + PLAYER_RADIUS, 3);
+    expect(p.x).toBeCloseTo(corner.x - PLAYER_RADIUS, 3);
+    expect(p.z).toBeCloseTo(corner.z - PLAYER_RADIUS, 3);
+    expect(p.vx).toBeCloseTo(0, 6);
+    expect(p.vz).toBeCloseTo(0, 6);
+    expect(headBob(p)).toBeCloseTo(0, 6);
+  });
+
+  it("stops the stride at a wall on the grid's edge", () => {
+    // The bridge's west wall is the grid's west edge: between its terminals.
+    expect(room.hall.x0).toBe(0);
+    const west = runIn(room, at(3, 7), { ...idle, strafe: -1 }, 60);
+    expect(west.x).toBeCloseTo(PLAYER_RADIUS, 6);
+    expect(west.vx).toBeCloseTo(0, 9);
+    expect(west.vz).toBeCloseTo(0, 9);
+    expect(headBob(west)).toBeCloseTo(0, 9);
+
+    // The hub's north wall is the grid's north edge.
+    const cx = ((hub.hall.x0 + hub.hall.x1) / 2) * CELL;
+    const north = runIn(hub, at(cx, 3), { ...idle, forward: 1 }, 60);
+    expect(north.z).toBeCloseTo(PLAYER_RADIUS, 6);
+    expect(north.vx).toBeCloseTo(0, 9);
+    expect(north.vz).toBeCloseTo(0, 9);
+    expect(headBob(north)).toBeCloseTo(0, 9);
+
+    // Sliding along it diagonally keeps only the speed along the wall.
+    const slide = runIn(hub, north, { ...idle, forward: 1, strafe: 1 }, 20);
+    expect(slide.z).toBeCloseTo(PLAYER_RADIUS, 6);
+    expect(slide.vz).toBeCloseTo(0, 9);
+    expect(slide.vx).toBeCloseTo(7 / Math.SQRT2, 2);
+    expect(slide.x - north.x).toBeGreaterThan(2);
   });
 
   it("stops head on at a wall's edge plus the radius", () => {
