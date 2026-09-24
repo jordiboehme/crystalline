@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 
 import { BLAST_HALF, BULK_HALF, SLIDE_HALF } from "../render/models/doors";
 import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
-import { CELL, NOT_FOUND, generateRoom } from "./generate";
+import { NOT_FOUND, generateRoom } from "./generate";
 import { isFloor } from "./layout";
 import {
   APPROACH,
@@ -31,6 +31,7 @@ import {
 } from "./interact";
 import { PLAYER_RADIUS, blockersFor, type Player } from "./move";
 import type { Fixture, RoomSpec } from "./types";
+import { CELL } from "./units";
 
 const bridge = generateRoom(CANNED_BRIDGE);
 const hub = generateRoom(CANNED_HUB);

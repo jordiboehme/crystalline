@@ -11,7 +11,7 @@
  * stands as far out as the terminal's footprint allows.
  */
 
-import { FOOTPRINTS } from "../../world/move";
+import { FOOTPRINTS } from "../../world/footprints";
 import type { Fixture } from "../../world/types";
 import { FLAG } from "../geometry";
 import { frameForSlot } from "../kit";

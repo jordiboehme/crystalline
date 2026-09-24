@@ -11,7 +11,7 @@
  * solid square, so the walls between the hall, its bays and the backlink
  * corridor stop the player and the doorways between them let the player
  * through. The blockers are one box per free-standing thing: a terminal or
- * machine sized by its kind (`FOOTPRINTS`), each piece of the archetype's
+ * machine sized by its kind (`FOOTPRINTS` in `footprints.ts`), each piece of the archetype's
  * furniture turned with it, and the scaffold frames of a room under
  * construction. The grid's bounding rectangle is still clamped to as a
  * backstop. The two axes are resolved one after the other, which is what
@@ -20,18 +20,11 @@
  */
 
 import { TICK_HZ } from "../core/loop";
-import { createRng } from "../core/seed";
 import { forwardOf, rightOf } from "../gl/math";
-import { CELL } from "./generate";
+import { decorFootprint, footprintOf } from "./footprints";
 import { isFloor } from "./layout";
-import type {
-  Decor,
-  DecorKind,
-  Fixture,
-  MachineKind,
-  RoomSpec,
-  WallSlot,
-} from "./types";
+import type { Box, RoomSpec } from "./types";
+import { CELL } from "./units";
 
 /** The player's state after a tick. */
 export interface Player {
@@ -58,14 +51,6 @@ export interface Intent {
   lookDy: number;
 }
 
-/** An axis-aligned floor rectangle the player cannot enter. */
-export interface Box {
-  x0: number;
-  z0: number;
-  x1: number;
-  z1: number;
-}
-
 /** The player's collision radius, in metres. */
 export const PLAYER_RADIUS = 0.35;
 /** Eye height above the floor, in metres. */
@@ -79,95 +64,6 @@ const MAX_SPEED = 7;
 const FRICTION = 0.55;
 const TURN_SPEED = 3;
 const MOUSE_SENSITIVITY = 0.0025;
-/**
- * How deep a fixture stands out from its wall, in metres: the default
- * wall-fixture footprint, and every machine kind's depth unless
- * `FOOTPRINTS` says otherwise.
- */
-export const FIXTURE_DEPTH = 0.9;
-/**
- * How wide along the wall, in metres: the default wall-fixture footprint of
- * `footprint`, kept from milestone 1. The detailed models are narrower and
- * say so in `FOOTPRINTS`.
- */
-export const FIXTURE_WIDTH = 2;
-
-/**
- * A footprint against a wall, in metres: `along` the wall and `out` from it
- * into the room.
- */
-export interface WallSize {
-  along: number;
-  out: number;
-}
-
-/**
- * A free-standing footprint, in metres, as the piece stands at turn 0
- * (facing north): `width` along x and `depth` along the grid's y (the
- * world's z). A quarter turn swaps the two.
- */
-export interface FloorSize {
-  width: number;
-  depth: number;
-}
-
-/** The shape of `FOOTPRINTS`. */
-export interface Footprints {
-  terminal: WallSize;
-  machine: Readonly<Record<MachineKind, WallSize>>;
-  /** Null for decor the player walks under or past (the ceiling pipe runs). */
-  decor: Readonly<Record<DecorKind, FloorSize | null>>;
-}
-
-/** Every machine kind that is not given a size of its own. */
-const MACHINE_DEFAULT: WallSize = { along: 1.8, out: FIXTURE_DEPTH };
-
-/**
- * The floor each thing that stands in a room takes, in metres: what the
- * player collides with and what the detailed models must stay inside.
- *
- * Terminals and machines stand against their wall slot's wall, centred on
- * the slot's cell; doors, portals, hatches, posters and the placard are flush
- * with the wall and take no floor at all, so they are not listed. A server
- * rack, a cryo pod and a comms array have sizes of their own and every other
- * machine is 1.8 m by 0.9 m. Decor is centred on its point and turned with
- * the piece. A shelf row is two cells long.
- */
-export const FOOTPRINTS: Footprints = {
-  terminal: { along: 1.4, out: 0.9 },
-  machine: {
-    workbench: MACHINE_DEFAULT,
-    "lab-bench": MACHINE_DEFAULT,
-    "server-rack": { along: 0.8, out: 1.0 },
-    "cryo-pod": { along: 1.1, out: 1.0 },
-    fabricator: MACHINE_DEFAULT,
-    hydroponics: MACHINE_DEFAULT,
-    "nav-table": MACHINE_DEFAULT,
-    "comms-array": { along: 1.2, out: 0.6 },
-    "reactor-coupling": MACHINE_DEFAULT,
-    "cargo-loader": MACHINE_DEFAULT,
-    "med-scanner": MACHINE_DEFAULT,
-    containment: MACHINE_DEFAULT,
-  },
-  decor: {
-    "command-console": { width: 3.0, depth: 1.0 },
-    "captain-chair": { width: 0.8, depth: 0.8 },
-    "round-table": { width: 2.4, depth: 2.4 },
-    "council-chair": { width: 0.7, depth: 0.7 },
-    generator: { width: 2.0, depth: 2.0 },
-    "pipe-run": null,
-    "shelf-row": { width: 2 * CELL, depth: 0.8 },
-    "lab-island": { width: 3.0, depth: 1.4 },
-    "specimen-tank": { width: 0.9, depth: 0.9 },
-  },
-};
-
-/** How many scaffold frames a room under construction gets. */
-const SCAFFOLD_FRAMES = 2;
-/** A scaffold frame's side, in metres. */
-export const SCAFFOLD_SIZE = 1.4;
-/** The hall's margin around its interior band, in cells, as for decor. */
-const BAND_MARGIN = 2;
 
 /** The player at the room's entrance. */
 export function spawnPlayer(room: RoomSpec): Player {
@@ -183,138 +79,10 @@ export function spawnPlayer(room: RoomSpec): Player {
 }
 
 /**
- * The floor footprint of something standing against its wall, centred on
- * the slot's cell: `along` metres wide along the wall and `out` metres deep
- * into the room. Without a size it is milestone 1's default wall fixture,
- * `FIXTURE_WIDTH` by `FIXTURE_DEPTH`.
- */
-export function footprint(
-  slot: WallSlot,
-  size: WallSize = { along: FIXTURE_WIDTH, out: FIXTURE_DEPTH },
-): Box {
-  const cx = (slot.x + 0.5) * CELL;
-  const cz = (slot.y + 0.5) * CELL;
-  const half = size.along / 2;
-  switch (slot.side) {
-    case "n":
-      return {
-        x0: cx - half,
-        x1: cx + half,
-        z0: slot.y * CELL,
-        z1: slot.y * CELL + size.out,
-      };
-    case "s":
-      return {
-        x0: cx - half,
-        x1: cx + half,
-        z0: (slot.y + 1) * CELL - size.out,
-        z1: (slot.y + 1) * CELL,
-      };
-    case "w":
-      return {
-        x0: slot.x * CELL,
-        x1: slot.x * CELL + size.out,
-        z0: cz - half,
-        z1: cz + half,
-      };
-    case "e":
-      return {
-        x0: (slot.x + 1) * CELL - size.out,
-        x1: (slot.x + 1) * CELL,
-        z0: cz - half,
-        z1: cz + half,
-      };
-  }
-}
-
-/**
- * The floor a fixture takes, sized by its kind from `FOOTPRINTS`: a
- * terminal's desk, or a machine by its `MachineKind`. Doors, portals,
- * hatches, posters and the placard are flush with their wall and give null:
- * walking up to a door or hatch is how it gets used, so it must not block.
- */
-export function footprintOf(fixture: Fixture): Box | null {
-  switch (fixture.kind) {
-    case "terminal":
-      return footprint(fixture.slot, FOOTPRINTS.terminal);
-    case "machine":
-      return footprint(fixture.slot, FOOTPRINTS.machine[fixture.machine]);
-    case "door":
-    case "portal":
-    case "hatch":
-    case "poster":
-    case "placard":
-      return null;
-  }
-}
-
-/**
- * The floor a piece of furniture takes: its `FOOTPRINTS` size centred on the
- * piece's point, with width and depth swapped at a quarter or three-quarter
- * turn. Null for a pipe run, which hangs from the ceiling.
- */
-export function decorFootprint(decor: Decor): Box | null {
-  const size = FOOTPRINTS.decor[decor.kind];
-  if (size === null) return null;
-  const sideways = decor.turn % 2 === 1;
-  const hx = (sideways ? size.depth : size.width) / 2;
-  const hz = (sideways ? size.width : size.depth) / 2;
-  const cx = decor.x * CELL;
-  const cz = decor.y * CELL;
-  return { x0: cx - hx, x1: cx + hx, z0: cz - hz, z1: cz + hz };
-}
-
-/**
- * The scaffold frames of a room under construction, and none for any other
- * room: two frames, `SCAFFOLD_SIZE` metres square, placed from an rng seeded
- * with `room.seed`. Each frame's centre is drawn x then z inside the hall's
- * interior band (the hall without a two-cell margin, the band the decor
- * stands in), inset by half a frame so the whole frame stays inside it. The
- * smallest hall's band is one by two cells, still wide enough for a frame.
- *
- * A frame that would overlap a piece of the decor (`decorFootprint`) or the
- * frame kept before it is skipped rather than moved, so a room under
- * construction shows two frames, one or none. A skipped frame still uses its
- * two draws, so whether the first frame is kept never moves the second.
- *
- * The room mesh builds its poles at exactly these boxes, so what the player
- * sees is what blocks the player.
- */
-export function scaffoldBoxes(room: RoomSpec): Box[] {
-  if (room.condition !== "construction") return [];
-  const half = SCAFFOLD_SIZE / 2;
-  const x0 = (room.hall.x0 + BAND_MARGIN) * CELL + half;
-  const x1 = (room.hall.x1 - BAND_MARGIN) * CELL - half;
-  const z0 = (room.hall.y0 + BAND_MARGIN) * CELL + half;
-  const z1 = (room.hall.y1 - BAND_MARGIN) * CELL - half;
-  const taken: Box[] = [];
-  for (const d of room.decor) {
-    const box = decorFootprint(d);
-    if (box !== null) taken.push(box);
-  }
-  const rng = createRng(room.seed);
-  const out: Box[] = [];
-  for (let i = 0; i < SCAFFOLD_FRAMES; i++) {
-    const x = rng.range(x0, x1);
-    const z = rng.range(z0, z1);
-    const frame = { x0: x - half, x1: x + half, z0: z - half, z1: z + half };
-    if (taken.some((b) => intersects(frame, b))) continue;
-    taken.push(frame);
-    out.push(frame);
-  }
-  return out;
-}
-
-/** True when two boxes share floor; touching edges do not count. */
-function intersects(a: Box, b: Box) {
-  return a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
-}
-
-/**
  * The boxes the player collides with besides the grid: the terminals and
  * machines (`footprintOf`), the furniture (`decorFootprint`) and the
- * scaffold frames (`scaffoldBoxes`). Flush fixtures and pipe runs are left
- * out. Built once per room, not per tick.
+ * scaffold frames the generator put up (`room.scaffold`). Flush fixtures and
+ * pipe runs are left out. Built once per room, not per tick.
  */
 export function blockersFor(room: RoomSpec): Box[] {
   const out: Box[] = [];
@@ -326,7 +94,7 @@ export function blockersFor(room: RoomSpec): Box[] {
     const box = decorFootprint(d);
     if (box !== null) out.push(box);
   }
-  out.push(...scaffoldBoxes(room));
+  out.push(...room.scaffold);
   return out;
 }
 

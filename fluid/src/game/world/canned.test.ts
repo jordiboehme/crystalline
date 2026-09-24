@@ -10,9 +10,11 @@ import { describe, expect, it } from "vitest";
 import { lightGrid } from "../render/lightgrid";
 import { GAME_VERSION } from "../version";
 import { BAY, isFloor } from "./layout";
-import { blockersFor, decorFootprint, footprintOf, type Box } from "./move";
+import { decorFootprint, footprintOf } from "./footprints";
+import { blockersFor } from "./move";
 import { galleryRoom } from "./canned";
 import type {
+  Box,
   DecorKind,
   DoorStyle,
   Fixture,

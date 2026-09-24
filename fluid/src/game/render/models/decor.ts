@@ -10,8 +10,8 @@
  */
 
 import { createRng } from "../../core/seed";
-import { CELL } from "../../world/generate";
-import { FOOTPRINTS } from "../../world/move";
+import { FOOTPRINTS } from "../../world/footprints";
+import { CELL } from "../../world/units";
 import type { Decor, DecorKind, Rect } from "../../world/types";
 import { frameForDecor, type Frame, type Kit } from "../kit";
 import type { Surface } from "../geometry";

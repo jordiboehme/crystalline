@@ -2,27 +2,28 @@ import { describe, expect, it } from "vitest";
 
 import { createRng } from "../core/seed";
 import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
-import { CELL, generateRoom } from "./generate";
-import { BAY, isFloor } from "./layout";
 import {
   FIXTURE_DEPTH,
   FIXTURE_WIDTH,
   FOOTPRINTS,
+  decorFootprint,
+  footprintOf,
+} from "./footprints";
+import { generateRoom } from "./generate";
+import { BAY, isFloor } from "./layout";
+import {
   MAX_PITCH,
   PLAYER_RADIUS,
   blockersFor,
-  decorFootprint,
-  footprintOf,
   headBob,
   lookDelta,
-  scaffoldBoxes,
   spawnPlayer,
   stepPlayer,
-  type Box,
   type Intent,
   type Player,
 } from "./move";
-import type { Decor, RoomSpec } from "./types";
+import type { Box, Decor, RoomSpec } from "./types";
+import { CELL } from "./units";
 
 const room = generateRoom(CANNED_BRIDGE);
 const blockers = blockersFor(room);
@@ -403,7 +404,7 @@ describe("walking on the grid", () => {
   it("puts up to two scaffold frames in the hall's interior band of a room under construction", () => {
     const built = generateRoom({ ...CANNED_HUB, status: "draft" });
     expect(built.condition).toBe("construction");
-    const frames = scaffoldBoxes(built);
+    const frames = built.scaffold;
     // Its shelf rows may take a frame (see the next test), never both.
     expect(frames.length).toBeGreaterThanOrEqual(1);
     expect(frames.length).toBeLessThanOrEqual(2);
@@ -417,12 +418,15 @@ describe("walking on the grid", () => {
       expect(f.z1).toBeLessThanOrEqual((h.y1 - 2) * CELL);
       expect(blockersFor(built)).toContainEqual(f);
     }
-    expect(scaffoldBoxes(built)).toEqual(frames);
-    expect(scaffoldBoxes(hub)).toEqual([]);
+    // Generated once, the same every time the place is entered.
+    expect(generateRoom({ ...CANNED_HUB, status: "draft" }).scaffold).toEqual(
+      frames,
+    );
+    expect(hub.scaffold).toEqual([]);
     // The smallest hall has no decor, so its first frame always stands; its
     // band is so small that the second one mostly overlaps the first.
     const small = generateRoom({ ...CANNED_BRIDGE, status: "draft" });
-    expect(scaffoldBoxes(small).length).toBeGreaterThanOrEqual(1);
+    expect(small.scaffold.length).toBeGreaterThanOrEqual(1);
   });
 
   it("skips a scaffold frame that would stand in the decor or the other frame", () => {
@@ -443,7 +447,7 @@ describe("walking on the grid", () => {
           status: "draft",
           permalink: `site-${i}`,
         });
-        const frames = scaffoldBoxes(r);
+        const frames = r.scaffold;
         const decor = r.decor
           .map(decorFootprint)
           .filter((b): b is Box => b !== null);

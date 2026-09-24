@@ -15,7 +15,7 @@
  * rim.
  */
 
-import { CELL } from "../world/generate";
+import { CELL } from "../world/units";
 
 /**
  * How far, in metres, the surface shader moves a fragment along its normal

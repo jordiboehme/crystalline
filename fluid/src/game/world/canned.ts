@@ -21,7 +21,7 @@
 
 import { seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
-import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE } from "./generate";
+import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
 import { createSlotPool, planLayout, wallSlots, type SlotPref } from "./layout";
 import type {
   Decor,
@@ -256,6 +256,7 @@ const GALLERY_LIGHT = 210;
  */
 export function galleryRoom(): RoomSpec {
   const seed = seedFor(GAME_VERSION, "gallery");
+  const condition = "clean";
   const layout = planLayout(GALLERY_NEED);
   const pool = createSlotPool(layout);
   const take = (pref: SlotPref): WallSlot => {
@@ -427,7 +428,7 @@ export function galleryRoom(): RoomSpec {
     permalink: GALLERY.permalink,
     title: "Model Gallery",
     archetype: "engineering",
-    condition: "clean",
+    condition,
     width: layout.width,
     depth: layout.depth,
     grid: layout.grid,
@@ -436,6 +437,7 @@ export function galleryRoom(): RoomSpec {
     spawn: { x: layout.entrance.x, y: layout.entrance.y, yaw: 0 },
     fixtures,
     decor,
+    scaffold: scaffoldFor(condition, layout.hall, decor, seed),
     lights,
     dropped: 0,
     inboundMore: 0,

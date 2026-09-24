@@ -30,10 +30,9 @@
  * by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
-import { CELL } from "../world/generate";
 import { BAY, isFloor } from "../world/layout";
-import { scaffoldBoxes, type Box } from "../world/move";
-import type { RoomSpec, Side } from "../world/types";
+import type { Box, RoomSpec, Side } from "../world/types";
+import { CELL } from "../world/units";
 import { createKit } from "./kit";
 import { LAYER, layerPlan } from "./layers";
 import type { Look, Rgb } from "./looks";
@@ -444,9 +443,8 @@ function lampCentre(
 /**
  * A scaffold frame standing on `box`: a pole in each corner, a frame of
  * four rails round the top, and two rails halfway up that run along x on
- * the frame's north and south sides, all inside the box so
- * what is drawn is exactly what `scaffoldBoxes` makes the player walk
- * around.
+ * the frame's north and south sides, all inside the box, so what is
+ * drawn is exactly what `room.scaffold` makes the player walk around.
  */
 function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
   const top = ceiling - POLE_CLEARANCE;
@@ -548,7 +546,7 @@ export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {
 
   // Under construction: the scaffold frames the player walks around.
   const pole: Surface = { layer: LAYER.metal, tint: p.door, flag: FLAG.lit };
-  for (const box of scaffoldBoxes(room)) scaffold(b, box, H, pole);
+  for (const box of room.scaffold) scaffold(b, box, H, pole);
 
   const plan = layerPlan(room);
   const ctx: ModelContext = {

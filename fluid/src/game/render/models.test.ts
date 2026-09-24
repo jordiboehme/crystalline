@@ -1,13 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { CELL, MACHINE_KINDS } from "../world/generate";
-import {
-  decorFootprint,
-  footprint,
-  footprintOf,
-  type Box,
-} from "../world/move";
+import { decorFootprint, footprint, footprintOf } from "../world/footprints";
+import { MACHINE_KINDS } from "../world/generate";
 import type {
+  Box,
   Decor,
   DecorKind,
   DoorStyle,
@@ -16,6 +12,7 @@ import type {
   Side,
   WallSlot,
 } from "../world/types";
+import { CELL } from "../world/units";
 import {
   FLAG,
   FLOATS_PER_VERTEX,

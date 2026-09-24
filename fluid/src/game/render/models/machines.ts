@@ -9,7 +9,7 @@
  */
 
 import { createRng, type Rng } from "../../core/seed";
-import { FOOTPRINTS } from "../../world/move";
+import { FOOTPRINTS } from "../../world/footprints";
 import type { Fixture, MachineKind } from "../../world/types";
 import type { Surface } from "../geometry";
 import { frameForSlot, type Frame, type Kit } from "../kit";

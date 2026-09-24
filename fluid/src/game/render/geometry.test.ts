@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { CANNED_BRIDGE, CANNED_HUB } from "../world/canned";
-import { CELL, generateRoom } from "../world/generate";
+import { generateRoom } from "../world/generate";
 import { BAY, isFloor } from "../world/layout";
-import { scaffoldBoxes } from "../world/move";
 import type { PlaceInput, RoomSpec } from "../world/types";
+import { CELL } from "../world/units";
 import {
   FLAG,
   FLOATS_PER_VERTEX,
@@ -281,7 +281,7 @@ describe("buildRoomMesh details", () => {
       fixtures: [],
       decor: [],
     };
-    const boxes = scaffoldBoxes(room);
+    const boxes = room.scaffold;
     expect(boxes.length).toBeGreaterThan(0);
     const vs = all(buildRoomMesh(room, LOOKS.day).static);
     const metal = vs.filter((v) => v.layer === LAYER.metal);
@@ -313,7 +313,7 @@ describe("buildRoomMesh details", () => {
       }
     }
     expect(vs.some((v) => v.layer === LAYER.hazard)).toBe(true);
-    expect(scaffoldBoxes(generateRoom(CANNED_BRIDGE))).toHaveLength(0);
+    expect(generateRoom(CANNED_BRIDGE).scaffold).toHaveLength(0);
   });
 
   it("builds no scaffold in a room that is not under construction", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { CELL } from "../world/generate";
+import { CELL } from "../world/units";
 import type { Decor } from "../world/types";
 import {
   FLAG,

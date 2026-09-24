@@ -267,6 +267,19 @@ export interface Rect {
   y1: number;
 }
 
+/**
+ * An axis-aligned floor rectangle, in metres (not cells), `x` west to east
+ * and `z` north to south: what a scaffold frame, a fixture's or a piece of
+ * furniture's footprint and the player's blockers are measured in. Unlike a
+ * `Rect` it need not sit on the grid.
+ */
+export interface Box {
+  x0: number;
+  z0: number;
+  x1: number;
+  z1: number;
+}
+
 /** DOOM's light specials, the ones the station uses. */
 export type LightSpecial = "steady" | "glow" | "flicker" | "strobe" | "failing";
 
@@ -316,6 +329,13 @@ export interface RoomSpec {
   fixtures: Fixture[];
   /** The archetype's free-standing furniture, in the hall. */
   decor: Decor[];
+  /**
+   * The scaffold frames of a room under construction, in metres, and none
+   * in any other room. The generator puts them up once (`scaffoldFor` in
+   * `generate.ts`), so the walls the player collides with and the poles the
+   * renderer builds are read from the same boxes.
+   */
+  scaffold: Box[];
   lights: LightZone[];
   /** How many fixtures found no wall slot and were left out. */
   dropped: number;

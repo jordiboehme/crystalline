@@ -21,7 +21,6 @@
  * - A sealed door or portal is offered only to say why it is sealed.
  */
 
-import { CELL } from "./generate";
 import type { Player } from "./move";
 import type {
   DoorStyle,
@@ -30,6 +29,7 @@ import type {
   RoomSpec,
   WallSlot,
 } from "./types";
+import { CELL } from "./units";
 
 /** How far away a fixture can be used, in metres. */
 export const REACH = 2.2;

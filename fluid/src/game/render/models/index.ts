@@ -14,9 +14,10 @@
  * one vertex array; door panels come back as movers, each its own small
  * mesh, for the renderer to slide open.
  *
- * Every model stays inside its footprint (`FOOTPRINTS` in `world/move.ts`)
- * or, for what is mounted on the wall, inside the slot's cell and
- * `FLUSH_DEPTH` from the wall, and below the ceiling less `HEADROOM`.
+ * Every model stays inside its footprint (`FOOTPRINTS` in
+ * `world/footprints.ts`) or, for what is mounted on the wall, inside the
+ * slot's cell and `FLUSH_DEPTH` from the wall, and below the ceiling less
+ * `HEADROOM`.
  * Every glowing part sits on or in a body. The test builds each kind on
  * every wall and turn and checks those rules, the winding and a triangle
  * budget.

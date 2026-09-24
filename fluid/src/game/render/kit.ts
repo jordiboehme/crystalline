@@ -27,7 +27,7 @@
  * pinned vertex count, and a positive enclosed volume for closed shapes.
  */
 
-import { CELL } from "../world/generate";
+import { CELL } from "../world/units";
 import type { Decor, WallSlot } from "../world/types";
 import type { Builder, Surface, V3 } from "./geometry";
 

@@ -64,10 +64,9 @@ import {
   headBob,
   lookDelta,
   stepPlayer,
-  type Box,
   type Player,
 } from "./world/move";
-import type { PlaceAddress, PlaceInput, RoomSpec } from "./world/types";
+import type { Box, PlaceAddress, PlaceInput, RoomSpec } from "./world/types";
 
 export type { Arrival } from "./world/interact";
 

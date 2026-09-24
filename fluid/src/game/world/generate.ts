@@ -44,10 +44,12 @@ import {
   planLayout,
   type SlotPref,
 } from "./layout";
+import { decorFootprint } from "./footprints";
 import { sectionsOf } from "./sections";
 import {
   HATCH_CAP,
   type Archetype,
+  type Box,
   type Condition,
   type Decor,
   type DecorKind,
@@ -64,9 +66,7 @@ import {
   type RoomSpec,
   type WallSlot,
 } from "./types";
-
-/** Metres per cell. */
-export const CELL = 2;
+import { CELL } from "./units";
 
 /** How many observations a poster shows. */
 export const POSTER_LINES = 6;
@@ -376,6 +376,67 @@ function lightsFor(
   return zones;
 }
 
+/** How many scaffold frames a room under construction gets. */
+const SCAFFOLD_FRAMES = 2;
+/** A scaffold frame's side, in metres. */
+export const SCAFFOLD_SIZE = 1.4;
+/** The hall's margin around its interior band, in cells, as for decor. */
+const BAND_MARGIN = 2;
+
+/**
+ * The scaffold frames of a room under construction, and none for any other
+ * condition: two frames, `SCAFFOLD_SIZE` metres square, placed from an rng
+ * seeded with the room's seed. Each frame's centre is drawn x then z inside
+ * the hall's interior band (the hall without a two-cell margin, the band the
+ * decor stands in), inset by half a frame so the whole frame stays inside
+ * it. The smallest hall's band is one by two cells, still wide enough for a
+ * frame.
+ *
+ * A frame that would overlap a piece of the decor (`decorFootprint`) or the
+ * frame kept before it is skipped rather than moved, so a room under
+ * construction shows two frames, one or none. A skipped frame still uses its
+ * two draws, so whether the first frame is kept never moves the second.
+ *
+ * `generateRoom` stores the result as `RoomSpec.scaffold`, and the canned
+ * rooms call it the same way, so the walking code's blockers and the room
+ * mesh's poles are read from exactly these boxes: what the player sees is
+ * what blocks the player.
+ */
+export function scaffoldFor(
+  condition: Condition,
+  hall: Rect,
+  decor: readonly Decor[],
+  roomSeed: number,
+): Box[] {
+  if (condition !== "construction") return [];
+  const half = SCAFFOLD_SIZE / 2;
+  const x0 = (hall.x0 + BAND_MARGIN) * CELL + half;
+  const x1 = (hall.x1 - BAND_MARGIN) * CELL - half;
+  const z0 = (hall.y0 + BAND_MARGIN) * CELL + half;
+  const z1 = (hall.y1 - BAND_MARGIN) * CELL - half;
+  const taken: Box[] = [];
+  for (const d of decor) {
+    const box = decorFootprint(d);
+    if (box !== null) taken.push(box);
+  }
+  const rng = createRng(roomSeed);
+  const out: Box[] = [];
+  for (let i = 0; i < SCAFFOLD_FRAMES; i++) {
+    const x = rng.range(x0, x1);
+    const z = rng.range(z0, z1);
+    const frame = { x0: x - half, x1: x + half, z0: z - half, z1: z + half };
+    if (taken.some((b) => intersects(frame, b))) continue;
+    taken.push(frame);
+    out.push(frame);
+  }
+  return out;
+}
+
+/** True when two boxes share floor; touching edges do not count. */
+function intersects(a: Box, b: Box) {
+  return a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
+}
+
 /** The room a place becomes. See the module doc for the rules. */
 export function generateRoom(place: PlaceInput): RoomSpec {
   const seed = seedFor(GAME_VERSION, place.domain, place.permalink);
@@ -405,6 +466,7 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     hatches: inbound.length,
   });
   const pool = createSlotPool(layout);
+  const decor = decorFor(archetype, layout.hall, seed);
   let dropped = 0;
   const take = (pref: SlotPref): WallSlot | null => {
     const slot = pool.take(pref);
@@ -517,7 +579,8 @@ export function generateRoom(place: PlaceInput): RoomSpec {
     ceiling: Math.round((3 + salience * 0.2) * 100) / 100,
     spawn: { x: layout.entrance.x, y: layout.entrance.y, yaw: 0 },
     fixtures,
-    decor: decorFor(archetype, layout.hall, seed),
+    decor,
+    scaffold: scaffoldFor(condition, layout.hall, decor, seed),
     lights: lightsFor(
       seed,
       layout.grid,
