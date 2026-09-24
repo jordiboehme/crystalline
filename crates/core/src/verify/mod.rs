@@ -355,7 +355,7 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
                 "M108",
                 Severity::Warning,
                 problem.message.clone(),
-                Some("use off, error, warning or info for each rule".to_string()),
+                problem.fix.clone(),
             );
         }
         manifest_rules::check(domain, &mut sink);

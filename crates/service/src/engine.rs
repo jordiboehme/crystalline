@@ -11448,13 +11448,17 @@ impl Engine {
             && let ContentSource::File { root } = &source
         {
             for problem in crystalline_core::verify::load_domain_config(root).problems {
+                let message = match &problem.fix {
+                    Some(fix) => format!("{} (fix: {fix})", problem.message),
+                    None => problem.message,
+                };
                 issues.push(json!({
                     "permalink": Value::Null,
                     "path": crystalline_core::verify::DOMAIN_CONFIG_FILE,
                     "severity": crystalline_core::Severity::Warning,
                     "kind": "M108",
                     "field": Value::Null,
-                    "message": problem.message,
+                    "message": message,
                     "line": Value::Null,
                 }));
             }
@@ -16911,9 +16915,10 @@ impl Engine {
     /// exactly, so a retry answers idempotently instead of re-connecting.
     /// GitHub treats owner/name case insensitively, so the repo compares that
     /// way; the subpath compares exactly, an absent requested branch matches
-    /// any stored one, and an absent stored branch means main; an omitted folder always matches, a given one must resolve
-    /// to the registered root. Shared by the pre-lock guard and the re-read
-    /// under the lock so both sites judge a match identically.
+    /// any stored one, and an absent stored branch means main; an omitted
+    /// folder always matches, a given one must resolve to the registered root.
+    /// Shared by the pre-lock guard and the re-read under the lock so both
+    /// sites judge a match identically.
     fn origin_matches_request(
         entry: &DomainEntry,
         origin_cfg: &OriginConfig,

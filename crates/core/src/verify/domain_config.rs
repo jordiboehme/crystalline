@@ -22,6 +22,11 @@ pub const DOMAIN_CONFIG_FILE: &str = ".crystalline.yaml";
 pub struct ConfigProblem {
     /// The finding's message: the file, what is wrong and what applies instead.
     pub message: String,
+    /// What fixes it: the severity-word hint for an unknown word, or a
+    /// YAML-syntax hint for a file that does not parse. `M108` always carries
+    /// one; the two problem kinds just carry different ones, since a
+    /// finding about broken YAML pointing at severity words is nonsense.
+    pub fix: Option<String>,
 }
 
 /// A domain's config and the problems met loading it. A missing file is the
@@ -53,6 +58,7 @@ pub fn load_domain_config(root: &Path) -> DomainConfigLoad {
                     "`{DOMAIN_CONFIG_FILE}` does not parse, so none of its verify settings \
                      apply and every rule runs at its default: {e}"
                 ),
+                fix: Some(format!("fix the YAML syntax of {DOMAIN_CONFIG_FILE}")),
             }],
         },
     }
@@ -73,6 +79,7 @@ pub fn config_problems(config: &DomainConfig) -> Vec<ConfigProblem> {
                 "`{DOMAIN_CONFIG_FILE}` sets {rule} to '{word}', which is not a severity \
                  (off, error, warning or info), so {rule} keeps its default"
             ),
+            fix: Some("use off, error, warning or info for each rule".to_string()),
         })
         .collect()
 }

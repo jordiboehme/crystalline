@@ -3940,6 +3940,14 @@ async fn domain_add_origin_dispatch(
     };
     let folder_str = folder.as_ref().map(|p| p.display().to_string());
 
+    // Read before dispatching to the engine: a name already in the config
+    // file is an existing registration the origin connects to in place, not
+    // a new domain this command may close under `--private`.
+    let already_registered = cmd::load(config.as_deref())?
+        .file
+        .domains
+        .contains_key(&name);
+
     let data = crystalline_service::origin_add(
         &repo,
         Some(&name),
@@ -3951,9 +3959,12 @@ async fn domain_add_origin_dispatch(
     )
     .await?;
     cmd::print_origin_add(&repo, &data, json);
-    // A connect in place is the engine's own adoption; leaving nothing here
-    // for `--private` to close by mistake.
-    Ok(false)
+    // Adopted when the name was already registered before this call (a
+    // shared origin-less domain connected in place) or the engine answers a
+    // retry with `already_connected`: either way `--private`'s caller must
+    // refuse rather than close an existing domain.
+    let already_connected = data["already_connected"].as_bool().unwrap_or(false);
+    Ok(already_registered || already_connected)
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one
@@ -4085,11 +4096,12 @@ async fn domain_remove_dispatch(
 /// a caller parses, and filtered by `RUST_LOG` with a default of `warn`.
 ///
 /// `serve` and `mcp` are left alone (`serve` is the only command that calls
-/// `crystalline_service::run_serve`, main.rs:1747): each installs its own subscriber (`info`
-/// and `warn` by default), and the first subscriber installed is the one that
-/// stays, so installing one here would cap the daemon's log and switch its
-/// `RUST_LOG` off. A lifecycle hook logs only when `RUST_LOG` asks for it: a
-/// hook with nothing to say must say nothing on either stream.
+/// `crystalline_service::run_serve`, in the `Command::Serve` dispatch arm):
+/// each installs its own subscriber (`info` and `warn` by default), and the
+/// first subscriber installed is the one that stays, so installing one here
+/// would cap the daemon's log and switch its `RUST_LOG` off. A lifecycle
+/// hook logs only when `RUST_LOG` asks for it: a hook with nothing to say
+/// must say nothing on either stream.
 fn init_cli_tracing(command: Option<&Command>) {
     use tracing_subscriber::EnvFilter;
     let filter = match command {

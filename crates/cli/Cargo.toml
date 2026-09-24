@@ -79,9 +79,10 @@ chrono = { workspace = true }
 walkdir = { workspace = true }
 dunce = { workspace = true }
 # Logs go to stderr only (stdout carries the routing block, hook output and
-# data a caller parses), filtered by RUST_LOG with a default of warn. The
-# best-effort credential sweeps log a swallowed error at debug, so
-# RUST_LOG=debug finds it.
+# data a caller parses), filtered by RUST_LOG with a default of warn; a
+# lifecycle hook logs only when RUST_LOG is set, so a hook with nothing to
+# say says nothing on either stream. The best-effort credential sweeps log a
+# swallowed error at debug, so RUST_LOG=debug finds it.
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

@@ -313,6 +313,19 @@ fn a_config_file_that_does_not_parse_is_one_m108_warning() {
         "{}",
         m108[0].message
     );
+    // The fix hint is about the YAML that failed to parse, not the
+    // severity-word hint every unknown-word M108 carries: a parse failure
+    // pointed at "off, error, warning or info" is a fix for a problem the
+    // file does not have.
+    let fix = m108[0].fix.as_deref().unwrap_or("");
+    assert!(fix.contains("YAML"), "{fix}");
+    assert!(
+        !fix.to_lowercase().contains("off")
+            && !fix.to_lowercase().contains("error")
+            && !fix.to_lowercase().contains("warning")
+            && !fix.to_lowercase().contains("info"),
+        "the parse-failure hint must not mention severity words: {fix}"
+    );
 }
 
 #[test]
