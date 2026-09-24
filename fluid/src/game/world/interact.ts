@@ -157,8 +157,20 @@ function relative(w: WallPoint, x: number, z: number) {
 }
 
 /** Whether two addresses name the same place. */
-function samePlace(a: PlaceAddress, b: PlaceAddress): boolean {
+export function samePlace(a: PlaceAddress, b: PlaceAddress): boolean {
   return a.domain === b.domain && a.permalink === b.permalink;
+}
+
+/**
+ * Whether the player is walking up to the way in `slot`: in front of its
+ * wall (never behind it, where a bay or the backlink corridor can lie a
+ * wall's thickness away) and within `APPROACH` of its wall point. It opens
+ * a sliding door and warms the cache for the place behind a door or portal.
+ */
+export function approaches(slot: WallSlot, player: Player): boolean {
+  const w = wallPoint(slot);
+  if (relative(w, player.x, player.z).depth <= 0) return false;
+  return Math.hypot(player.x - w.x, player.z - w.z) < APPROACH;
 }
 
 /**
@@ -244,8 +256,8 @@ export function focusOf(
  * The doors one tick later.
  *
  * Every door of the room gets a state (a door not in `doors` starts shut).
- * A sliding door heads open while the player is within `APPROACH` of its
- * wall point and shut otherwise; a bulkhead or blast door keeps heading
+ * A sliding door heads open while the player `approaches` it (in front
+ * of its wall and within `APPROACH` of its wall point) and shut otherwise; a bulkhead or blast door keeps heading
  * where it was until `pressed`, the index of the fixture E was pressed at
  * this tick, names it, which turns it round. A sealed door always heads
  * shut. Then each door moves `DOOR_STEP` towards where it is heading.
@@ -265,8 +277,7 @@ export function stepDoors(
     if (fixture.address === null) {
       target = 0;
     } else if (fixture.style === "sliding") {
-      const w = wallPoint(fixture.slot);
-      target = Math.hypot(player.x - w.x, player.z - w.z) < APPROACH ? 1 : 0;
+      target = approaches(fixture.slot, player) ? 1 : 0;
     } else {
       target = pressed === index ? (was.target === 1 ? 0 : 1) : was.target;
     }
@@ -287,9 +298,12 @@ export function stepDoors(
  * The way the player is walking through this tick, or null.
  *
  * A door carries the player through once it stands more than 0.9 open and
- * the player is within `DOOR_REACH` of its wall and inside its opening
+ * the player stands in front of its wall, within `DOOR_REACH` of it, and
+ * inside its opening
  * (`DOOR_HALF`). An unsealed portal carries the player through on contact:
- * within `PORTAL_REACH` of its wall and inside its ring (`PORTAL_HALF`).
+ * in front of its wall, within `PORTAL_REACH` of it, and inside its ring
+ * (`PORTAL_HALF`). Nothing carries the player from behind a wall, where a
+ * bay or the backlink corridor may lie.
  * Hatches are crawled through on E instead (`hatchTravel`).
  */
 export function travelOf(
@@ -301,12 +315,20 @@ export function travelOf(
     if (fixture.kind === "door" && fixture.address !== null) {
       if ((doors.get(index)?.open ?? 0) <= OPEN_ENOUGH) continue;
       const r = relative(wallPoint(fixture.slot), player.x, player.z);
-      if (r.depth < DOOR_REACH && Math.abs(r.side) < DOOR_HALF[fixture.style]) {
+      if (
+        r.depth >= 0 &&
+        r.depth < DOOR_REACH &&
+        Math.abs(r.side) < DOOR_HALF[fixture.style]
+      ) {
         return { via: "door", fixture: index, address: fixture.address };
       }
     } else if (fixture.kind === "portal" && fixture.address !== null) {
       const r = relative(wallPoint(fixture.slot), player.x, player.z);
-      if (r.depth < PORTAL_REACH && Math.abs(r.side) < PORTAL_HALF) {
+      if (
+        r.depth >= 0 &&
+        r.depth < PORTAL_REACH &&
+        Math.abs(r.side) < PORTAL_HALF
+      ) {
         return { via: "portal", fixture: index, address: fixture.address };
       }
     }

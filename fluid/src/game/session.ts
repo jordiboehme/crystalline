@@ -11,8 +11,8 @@
  * Places come in two ways. `go` loads one through Fluid's query cache
  * (`loadPlace`), with the connector shown while it loads, and replaces the
  * room when it lands; `showCanned` shows a place that is already in hand (the
- * look demo's bridge) at once. A room is generated once per entry and kept
- * until the next one.
+ * look demo's bridge) at once, and `showRoom` a room built by hand (the model
+ * gallery). A room is generated once per entry and kept until the next one.
  *
  * Loads race, and the session settles every race the same way: each `go`
  * takes a new generation and aborts the load before it, and a load whose
@@ -47,13 +47,13 @@ import { LOOKS, lookForKey, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
 import { NOT_FOUND, generateRoom } from "./world/generate";
 import {
-  APPROACH,
   arrivalSpawn,
   focusOf,
   hatchTravel,
+  approaches,
+  samePlace,
   stepDoors,
   travelOf,
-  wallPoint,
   type Arrival,
   type DoorState,
   type Travel,
@@ -158,15 +158,21 @@ export interface SessionOptions {
  * - `showCanned` shows a place already in hand, with no load. Showing the
  *   place already shown again (the demo's R key) keeps the player where
  *   they stand and the doors as they are.
+ * - `showRoom` shows a room built by hand, with no place behind it (the
+ *   dev-only model gallery): no load, no navigation, the player at the
+ *   room's entrance and every door shut. Its terminals open no reader,
+ *   since there is no engram to read.
+ * - `go`, `showCanned` and `showRoom` close an open CRT reader first.
  * - `closeReader` tells the session the CRT reader was closed, which gives
  *   it the keys back.
- * - `dispose` stops everything and frees the GPU objects; nothing is
- *   written to the HUD after it.
+ * - `dispose` stops everything and frees the GPU objects. It takes the
+ *   reader and the connector down; nothing is written to the HUD after it.
  * - `current` is the place the player is in, null before the first one.
  */
 export interface Session {
   go(address: PlaceAddress, arrival?: Arrival | null): void;
   showCanned(place: PlaceInput): void;
+  showRoom(room: RoomSpec): void;
   closeReader(): void;
   dispose(): void;
   readonly current: PlaceAddress | null;
@@ -236,14 +242,10 @@ function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
-/** Whether two addresses name the same place. */
-function samePlace(a: PlaceAddress | null, b: PlaceAddress): boolean {
-  return a !== null && a.domain === b.domain && a.permalink === b.permalink;
-}
-
 /**
  * Starts a session on `opts.canvas`. See `Session` for what it does and the
- * module doc for how. Nothing is shown until `go` or `showCanned`.
+ * module doc for how. Nothing is shown until `go`, `showCanned` or
+ * `showRoom`.
  */
 export function createSession(opts: SessionOptions): Session {
   const { canvas, client, hud } = opts;
@@ -270,6 +272,8 @@ export function createSession(opts: SessionOptions): Session {
   let generation = 0;
   let controller: AbortController | null = null;
   let loading = false;
+  /** The connector's label while a load is in flight. */
+  let loadingLabel = "";
 
   let renderer: Renderer | null = null;
   let colorFormat = "";
@@ -334,7 +338,11 @@ export function createSession(opts: SessionOptions): Session {
   const labelFor = (address: PlaceAddress): string => {
     if (place !== null) {
       for (const r of [...place.relations, ...place.links]) {
-        if (r.targetTitle !== null && samePlace(r.address, address)) {
+        if (
+          r.targetTitle !== null &&
+          r.address !== null &&
+          samePlace(r.address, address)
+        ) {
           return r.targetTitle;
         }
       }
@@ -347,19 +355,22 @@ export function createSession(opts: SessionOptions): Session {
 
   /**
    * Enters a generated room: hands it to the renderer and resets everything
-   * that belongs to the room before it. `keep` keeps the player and the
-   * doors, for the same place shown again.
+   * that belongs to the room before it. `next` is the place the room was
+   * generated from, or null for a room built by hand (`showRoom`), whose
+   * terminals then open no reader. `keep` keeps the player and the doors,
+   * for the same place shown again.
    */
   const enter = (
-    next: PlaceInput,
+    next: PlaceInput | null,
+    built: RoomSpec,
     arrival: Arrival | null,
     keep: boolean,
   ): void => {
     place = next;
-    room = generateRoom(next);
+    room = built;
     blockers = blockersFor(room);
     lights = createLights(room.lights);
-    current = { domain: next.domain, permalink: next.permalink };
+    current = { domain: built.domain, permalink: built.permalink };
     if (!keep || player === null) {
       const spawn = arrivalSpawn(room, arrival);
       player = { ...spawn, vx: 0, vz: 0, pitch: 0, bob: 0 };
@@ -389,7 +400,7 @@ export function createSession(opts: SessionOptions): Session {
       fail(FAILED[loaded.kind]);
       return;
     }
-    enter(loaded.place, arrival, false);
+    enter(loaded.place, generateRoom(loaded.place), arrival, false);
     const here = loaded.place;
     const path = gameEngramRoute(here.domain, here.permalink);
     if (window.location.pathname !== path) opts.navigate(path);
@@ -413,18 +424,33 @@ export function createSession(opts: SessionOptions): Session {
     }
   };
 
-  const go = (address: PlaceAddress, arrival: Arrival | null = null) => {
-    if (disposed) return;
+  /**
+   * Leaves whatever the session was doing for a new place: closes the CRT
+   * reader, drops the load in flight (a new generation, the old one
+   * aborted) and takes the connector down if it was up.
+   */
+  const leave = (): number => {
+    closeReader();
     const gen = ++generation;
     controller?.abort();
     controller = null;
-    if (client === null) {
+    if (loading) {
       loading = false;
+      hud.connector(false, loadingLabel, lookId);
+    }
+    return gen;
+  };
+
+  const go = (address: PlaceAddress, arrival: Arrival | null = null) => {
+    if (disposed) return;
+    const gen = leave();
+    if (client === null) {
       fail(FAILED.offline);
       return;
     }
     const label = labelFor(address);
     loading = true;
+    loadingLabel = label;
     hud.connector(true, label, lookId);
     const abort = new AbortController();
     controller = abort;
@@ -444,18 +470,17 @@ export function createSession(opts: SessionOptions): Session {
 
   const showCanned = (next: PlaceInput) => {
     if (disposed) return;
-    generation++;
-    controller?.abort();
-    controller = null;
-    if (loading) {
-      loading = false;
-      hud.connector(false, next.title, lookId);
-    }
-    const same = samePlace(current, {
-      domain: next.domain,
-      permalink: next.permalink,
-    });
-    enter(next, null, same);
+    leave();
+    const same =
+      current !== null &&
+      samePlace(current, { domain: next.domain, permalink: next.permalink });
+    enter(next, generateRoom(next), null, same);
+  };
+
+  const showRoom = (built: RoomSpec) => {
+    if (disposed) return;
+    leave();
+    enter(null, built, null, false);
   };
 
   const takeTravel = (travel: Travel) => {
@@ -571,6 +596,7 @@ export function createSession(opts: SessionOptions): Session {
         if (next !== null && next !== lookId) {
           lookId = next;
           if (room !== null) renderer?.setRoom(room, LOOKS[lookId]);
+          if (loading) hud.connector(true, loadingLabel, lookId);
           showStatus();
         }
       }
@@ -638,8 +664,7 @@ export function createSession(opts: SessionOptions): Session {
         }
         const key = placeKeyOf(f.address.domain, f.address.permalink);
         if (prefetched.has(key)) continue;
-        const w = wallPoint(f.slot);
-        if (Math.hypot(player.x - w.x, player.z - w.z) < APPROACH) {
+        if (approaches(f.slot, player)) {
           prefetched.add(key);
           prefetchPlace(client, f.address.domain, f.address.permalink);
         }
@@ -709,9 +734,14 @@ export function createSession(opts: SessionOptions): Session {
   return {
     go,
     showCanned,
+    showRoom,
     closeReader,
     dispose() {
       if (disposed) return;
+      // The host's overlays go down with the session, so a host that
+      // outlives it (StrictMode's second mount) starts clean.
+      hud.reader(null);
+      hud.connector(false, loadingLabel, lookId);
       disposed = true;
       generation++;
       controller?.abort();

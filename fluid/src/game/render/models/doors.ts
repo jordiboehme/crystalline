@@ -184,7 +184,7 @@ function housing(
 }
 
 /** The sliding door's opening: half width and height. */
-const SLIDE_HALF = 0.5;
+export const SLIDE_HALF = 0.5;
 const SLIDE_TOP = 2.4;
 /**
  * The gap each leaf keeps from the door's centre line, in metres. A leaf
@@ -276,7 +276,7 @@ function sliding(st: Style) {
 }
 
 /** The bulkhead's opening: half width, sill height and top. */
-const BULK_HALF = 0.5;
+export const BULK_HALF = 0.5;
 const BULK_SILL = 0.18;
 const BULK_TOP = 2.2;
 /** The side housings' outer edge (the slot's edge) and the lintel's top. */
@@ -394,7 +394,7 @@ function bulkhead(st: Style) {
 }
 
 /** The blast door's opening: half width, top, and where the halves meet. */
-const BLAST_HALF = 0.8;
+export const BLAST_HALF = 0.8;
 const BLAST_TOP = 2.2;
 const BLAST_SPLIT = 1.47;
 /** The massive frame's outer half width and depth. */

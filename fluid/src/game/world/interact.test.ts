@@ -11,13 +11,16 @@
 
 import { describe, expect, it } from "vitest";
 
+import { BLAST_HALF, BULK_HALF, SLIDE_HALF } from "../render/models/doors";
 import { CANNED_BRIDGE, CANNED_HUB } from "./canned";
 import { CELL, NOT_FOUND, generateRoom } from "./generate";
+import { isFloor } from "./layout";
 import {
   APPROACH,
   DOOR_HALF,
   FACING,
   REACH,
+  approaches,
   arrivalSpawn,
   focusOf,
   hatchTravel,
@@ -26,7 +29,7 @@ import {
   wallPoint,
   type DoorState,
 } from "./interact";
-import type { Player } from "./move";
+import { PLAYER_RADIUS, blockersFor, type Player } from "./move";
 import type { Fixture, RoomSpec } from "./types";
 
 const bridge = generateRoom(CANNED_BRIDGE);
@@ -100,8 +103,11 @@ describe("the constants", () => {
   });
 
   it("match the door openings the models cut", () => {
-    // render/models/doors.ts: SLIDE_HALF, BULK_HALF and BLAST_HALF.
-    expect(DOOR_HALF).toEqual({ sliding: 0.5, bulkhead: 0.5, blast: 0.8 });
+    expect(DOOR_HALF).toEqual({
+      sliding: SLIDE_HALF,
+      bulkhead: BULK_HALF,
+      blast: BLAST_HALF,
+    });
   });
 });
 
@@ -339,4 +345,108 @@ describe("arrivalSpawn", () => {
     expectAt(arrivalSpawn(bridge, { via: "hatch", from: handbook }), entrance);
     expectAt(arrivalSpawn(bridge, null), entrance);
   });
+});
+
+/**
+ * A point `metres` behind fixture `index`'s wall, on its axis: the far side
+ * of the wall, where a bay or the corridor may be.
+ */
+function behind(room: RoomSpec, index: number, metres: number): Player {
+  const w = wallPoint(room.fixtures[index]!.slot);
+  return at(
+    w.x - w.inward[0] * metres,
+    w.z - w.inward[1] * metres,
+    yawAlong(w.inward[0], w.inward[1]),
+  );
+}
+
+describe("behind the wall", () => {
+  it("never carries the player through a portal from behind its wall", () => {
+    expect(travelOf(bridge, behind(bridge, portalIndex, 3), new Map())).toBe(
+      null,
+    );
+    expect(travelOf(bridge, behind(bridge, portalIndex, 0.2), new Map())).toBe(
+      null,
+    );
+  });
+
+  it("never carries the player through an open door from behind its wall", () => {
+    const open = new Map([[slidingIndex, { open: 1, target: 1 as const }]]);
+    expect(travelOf(bridge, behind(bridge, slidingIndex, 2), open)).toBe(null);
+  });
+
+  it("does not open a sliding door for a player in the bay behind its wall", () => {
+    // Every located sliding door of the hub whose wall has floor behind it,
+    // one void cell further on: the player stands there against the void,
+    // closer to the door's wall point than APPROACH.
+    const depth = CELL + PLAYER_RADIUS;
+    const cases = hub.fixtures.flatMap((f, index) => {
+      if (f.kind !== "door" || f.style !== "sliding" || f.address === null) {
+        return [];
+      }
+      const p = behind(hub, index, depth);
+      const floor = isFloor(
+        hub.grid,
+        Math.floor(p.x / CELL),
+        Math.floor(p.z / CELL),
+      );
+      return floor ? [{ index, p }] : [];
+    });
+    expect(cases.length).toBeGreaterThan(0);
+    expect(depth).toBeLessThan(APPROACH);
+    for (const { index, p } of cases) {
+      const doors = settle(hub, p, new Map(), 12);
+      expect(doors.get(index)).toEqual({ open: 0, target: 0 });
+    }
+  });
+
+  it("offers nothing behind the wall", () => {
+    expect(focusOf(bridge, behind(bridge, scopeIndex, 1))).toBe(null);
+  });
+
+  it("says a way is approached only from the front", () => {
+    const w = bridge.fixtures[slidingIndex]!.slot;
+    expect(approaches(w, inFront(bridge, slidingIndex, 2))).toBe(true);
+    expect(approaches(w, inFront(bridge, slidingIndex, APPROACH + 0.1))).toBe(
+      false,
+    );
+    expect(approaches(w, behind(bridge, slidingIndex, 1))).toBe(false);
+  });
+});
+
+describe("arrivals land on clear floor", () => {
+  for (const [name, room] of [
+    ["bridge", bridge],
+    ["hub", hub],
+  ] as const) {
+    it(`in the ${name}, in front of every hatch, door and portal`, () => {
+      const blockers = blockersFor(room);
+      let checked = 0;
+      for (const f of room.fixtures) {
+        if (f.kind !== "hatch" && f.kind !== "door" && f.kind !== "portal") {
+          continue;
+        }
+        if (f.address === null) continue;
+        const via = f.kind === "hatch" ? "door" : "hatch";
+        const spot = arrivalSpawn(room, { via, from: f.address });
+        expect(
+          isFloor(
+            room.grid,
+            Math.floor(spot.x / CELL),
+            Math.floor(spot.z / CELL),
+          ),
+        ).toBe(true);
+        for (const b of blockers) {
+          const inside =
+            spot.x > b.x0 - PLAYER_RADIUS &&
+            spot.x < b.x1 + PLAYER_RADIUS &&
+            spot.z > b.z0 - PLAYER_RADIUS &&
+            spot.z < b.z1 + PLAYER_RADIUS;
+          expect(inside, `${f.kind} ${f.label} lands in a blocker`).toBe(false);
+        }
+        checked++;
+      }
+      expect(checked).toBeGreaterThan(0);
+    });
+  }
 });

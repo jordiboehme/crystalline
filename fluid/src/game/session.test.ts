@@ -17,15 +17,18 @@ import { ApiProblem, api } from "../api/client";
 import type { Answer } from "../test/harness";
 import { answersFor, domainsResponse } from "../test/harness";
 import { TICK_MS, type Clock } from "./core/loop";
+import { prefetchPlace } from "./data/source";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
+  NOTICE_MS,
   createSession,
   type HudSink,
   type RendererFactory,
   type Session,
 } from "./session";
 import { CANNED_BRIDGE } from "./world/canned";
+import { generateRoom } from "./world/generate";
 import type { RoomSpec } from "./world/types";
 
 vi.mock("../api/client", async (importOriginal) => {
@@ -33,10 +36,20 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+vi.mock("./data/source", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./data/source")>();
+  return { ...actual, prefetchPlace: vi.fn(actual.prefetchPlace) };
+});
+
 const apiMock = vi.mocked(api);
+const prefetchMock = vi.mocked(prefetchPlace);
 
 /** A detail payload in the engine's own shape, with one section. */
-function detailResponse(permalink: string, title: string) {
+function detailResponse(
+  permalink: string,
+  title: string,
+  relations: unknown[] = [],
+) {
   return {
     domain: "eng",
     permalink,
@@ -53,7 +66,7 @@ function detailResponse(permalink: string, title: string) {
       extra: {},
     },
     observations: [],
-    relations: [],
+    relations,
     links: [],
     inbound: { count: 0, refs: [] },
   };
@@ -203,6 +216,7 @@ async function flush() {
 
 beforeEach(() => {
   apiMock.mockReset();
+  prefetchMock.mockClear();
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   renderer = stubRenderer();
   hud = stubHud();
@@ -270,10 +284,75 @@ describe("go", () => {
     const session = start();
     session.go({ domain: "eng", permalink: "alpha" });
     session.dispose();
+    // Nothing reaches the HUD once the session is gone.
+    for (const writer of Object.values(hud)) writer.mockClear();
     alpha.resolve(detailResponse("alpha", "Alpha"));
     await flush();
+    frames(5);
     expect(navigate).not.toHaveBeenCalled();
     expect(renderer.setRoom).not.toHaveBeenCalled();
+    for (const writer of Object.values(hud)) {
+      expect(writer).not.toHaveBeenCalled();
+    }
+  });
+
+  it("takes the connector down when disposed while loading", () => {
+    serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
+    const session = start();
+    session.go({ domain: "eng", permalink: "alpha" });
+    session.dispose();
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      false,
+      "alpha",
+      expect.any(String),
+    );
+    expect(hud.reader).toHaveBeenLastCalledWith(null);
+  });
+
+  it("redraws the connector in the new look while loading", () => {
+    serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
+    const session = start();
+    session.go({ domain: "eng", permalink: "alpha" });
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
+    key("keydown", "Digit4");
+    frames(1);
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "freescape");
+  });
+
+  it("warms the cache once for the place behind a door the player walks up to", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse("alpha", "Alpha", [
+          {
+            line: 3,
+            rel_type: "depends_on",
+            resolved: true,
+            target: { domain: null, target: "Beta" },
+          },
+        ]),
+      "/graph": () => ({
+        nodes: [
+          { id: 1, domain: "eng", permalink: "alpha", title: "Alpha" },
+          { id: 2, domain: "eng", permalink: "beta", title: "Beta" },
+        ],
+        edges: [{ from: 1, to: 2, rel_type: "depends_on" }],
+        truncated: false,
+      }),
+    });
+    const session = start();
+    // Back from beta through a hatch: the player arrives 1.6 m in front of
+    // the door to beta, well inside the approach distance.
+    session.go(
+      { domain: "eng", permalink: "alpha" },
+      { via: "hatch", from: { domain: "eng", permalink: "beta" } },
+    );
+    await vi.waitFor(() => {
+      expect(session.current?.permalink).toBe("alpha");
+    });
+    expect(prefetchMock).not.toHaveBeenCalled();
+    frames(20);
+    expect(prefetchMock).toHaveBeenCalledTimes(1);
+    expect(prefetchMock).toHaveBeenCalledWith(client, "eng", "beta");
   });
 
   it("stays in the current room with ACCESS DENIED on a 403", async () => {
@@ -340,6 +419,141 @@ describe("go", () => {
       permalink: "manifest",
     });
     expect(apiMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("notices", () => {
+  it("takes an in-room failure notice down after three seconds", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const session = start({ client: null });
+      session.showCanned(CANNED_BRIDGE);
+      session.go({ domain: "station", permalink: "old-bridge" });
+      expect(hud.notice).toHaveBeenLastCalledWith("SIGNAL LOST");
+      vi.advanceTimersByTime(NOTICE_MS - 1);
+      expect(hud.notice).toHaveBeenLastCalledWith("SIGNAL LOST");
+      vi.advanceTimersByTime(1);
+      expect(hud.notice).toHaveBeenLastCalledWith(null);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("showRoom", () => {
+  it("shows a room built by hand with no load and no navigation", () => {
+    const built: RoomSpec = {
+      ...generateRoom(CANNED_BRIDGE),
+      domain: "dev",
+      permalink: "gallery",
+      title: "Gallery",
+    };
+    const session = start();
+    session.showRoom(built);
+    expect(renderer.setRoom).toHaveBeenCalledTimes(1);
+    expect(renderer.setRoom.mock.calls[0]?.[0]).toBe(built);
+    expect(session.current).toEqual({ domain: "dev", permalink: "gallery" });
+    frames(3);
+    expect(lastCamera().eye[0]).toBeCloseTo((built.spawn.x + 0.5) * 2);
+    expect(navigate).not.toHaveBeenCalled();
+    expect(apiMock).not.toHaveBeenCalled();
+  });
+});
+
+/** The eye's floor position in the last frame drawn. */
+function eyeAt(): [number, number] {
+  const eye = lastCamera().eye;
+  return [eye[0], eye[2]];
+}
+
+/**
+ * Walks the canned bridge's entrance to the Scope terminal on the west wall
+ * (its wall point at x 0, z 9) with the keys alone: turn to face west, sidle
+ * north to the terminal's row, walk up until the prompt offers it, and stand
+ * still.
+ */
+function walkToScope() {
+  key("keydown", "ArrowLeft");
+  frames(18);
+  key("keyup", "ArrowLeft");
+  key("keydown", "KeyD");
+  for (let i = 0; i < 60 && eyeAt()[1] > 9.2; i++) frames(1);
+  key("keyup", "KeyD");
+  frames(10);
+  key("keydown", "KeyW");
+  const offered = () =>
+    hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("E READ") === true;
+  for (let i = 0; i < 80 && !offered(); i++) frames(1);
+  key("keyup", "KeyW");
+  frames(15);
+  expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
+}
+
+describe("the reader", () => {
+  it("opens at E, takes the keys while open and gives them back on close", () => {
+    const session = start({ client: null });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    walkToScope();
+    key("keydown", "KeyE");
+    frames(1);
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: "Station Crystalline",
+      content: CANNED_BRIDGE.content,
+      section: { heading: "Scope", occurrence: 0 },
+      look: "aperture",
+    });
+    frames(10);
+
+    // Open: no walking, and F and I belong to the reader.
+    const still = eyeAt();
+    key("keydown", "KeyW");
+    frames(10);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
+    key("keydown", "KeyF");
+    key("keydown", "KeyI");
+    frames(2);
+    expect(openFluid).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(INVERT_KEY)).toBe(null);
+    expect(hud.notice).not.toHaveBeenCalledWith("LOOK INVERTED");
+
+    // Closed: the W still down from before is forgotten, a new press walks.
+    session.closeReader();
+    expect(hud.reader).toHaveBeenLastCalledWith(null);
+    frames(5);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(openFluid).not.toHaveBeenCalled();
+    key("keyup", "KeyW");
+    key("keydown", "KeyW");
+    frames(5);
+    expect(eyeAt()[0]).not.toBeCloseTo(still[0], 2);
+    key("keyup", "KeyW");
+    key("keydown", "KeyF");
+    frames(1);
+    expect(openFluid).toHaveBeenCalledWith("/d/station/e/manifest");
+  });
+
+  it("is closed by travel and by showing a place", () => {
+    const session = start({ client: null });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    walkToScope();
+    key("keydown", "KeyE");
+    frames(1);
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    session.go({ domain: "station", permalink: "old-bridge" });
+    expect(hud.reader).toHaveBeenLastCalledWith(null);
+
+    key("keydown", "KeyE");
+    frames(1);
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    session.showCanned({ ...CANNED_BRIDGE, status: "archived" });
+    expect(hud.reader).toHaveBeenLastCalledWith(null);
   });
 });
 
