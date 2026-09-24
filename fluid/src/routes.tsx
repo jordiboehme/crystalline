@@ -83,6 +83,19 @@ const Profile = lazy(() => import("./screens/Profile"));
 const GrantedDraft = lazy(() => import("./screens/GrantedDraft"));
 
 /**
+ * The station's look demo, and only in development.
+ *
+ * `import.meta.env.DEV` is a constant the build replaces, so in a production
+ * build this is `null`, the import below is dead code, and the whole game
+ * folder never becomes a chunk. The route sits inside `RequireAuth` like
+ * every other screen but outside `Layout`: the station is full screen, with
+ * no frame around it.
+ */
+const LookDemo = import.meta.env.DEV
+  ? lazy(() => import("./game/dev/LookDemo"))
+  : null;
+
+/**
  * The MANIFEST's old address. The document is read on the domain page now,
  * so a link that still points here lands there rather than on the not-found
  * screen; the editor keeps its own segment beneath it.
@@ -130,6 +143,20 @@ export function AppRoutes() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route element={<RequireAuth />}>
+        {/*
+          The look demo, full screen and so outside `Layout`. In a
+          production build `LookDemo` is null and the route does not exist.
+        */}
+        {LookDemo === null ? null : (
+          <Route
+            path="/game/dev"
+            element={
+              <Suspense fallback={null}>
+                <LookDemo />
+              </Suspense>
+            }
+          />
+        )}
         <Route element={<Layout />}>
           <Route index element={<Home />} />
           <Route path="/d/:domain" element={<DomainHome />} />
