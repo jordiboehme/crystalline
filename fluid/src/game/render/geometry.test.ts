@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { CANNED_BRIDGE, CANNED_HUB } from "../world/canned";
 import { CELL, generateRoom } from "../world/generate";
-import { isFloor } from "../world/layout";
+import { BAY, isFloor } from "../world/layout";
 import { scaffoldBoxes } from "../world/move";
 import type { PlaceInput, RoomSpec } from "../world/types";
 import {
@@ -233,14 +233,45 @@ describe("buildRoomMesh details", () => {
         Math.abs(Math.max(...ys) - room.ceiling) < EPS
       );
     });
-    // The hub has a corridor and bays, each doorway two rows wide with a
-    // lintel on both faces of both of its edges.
-    expect(lintels.length).toBeGreaterThan(0);
-    for (const [a] of lintels) {
-      const alongX = Math.abs(a.normal[2]) > 0.5;
-      const plane = alongX ? a.pos[2] : a.pos[0];
-      expect(plane / CELL).toBeCloseTo(Math.round(plane / CELL), 5);
+    // Each lintel face, keyed by the cell it faces into and that side.
+    const faces = new Map<string, number>();
+    for (const [a, b, c] of lintels) {
+      const n = a.normal;
+      const mx = (a.pos[0] + b.pos[0] + c.pos[0]) / 3;
+      const mz = (a.pos[2] + b.pos[2] + c.pos[2]) / 3;
+      // Step half a cell along the normal from the face into its cell.
+      const x = Math.floor((mx + (n[0] * CELL) / 2) / CELL);
+      const y = Math.floor((mz + (n[2] * CELL) / 2) / CELL);
+      const side =
+        n[0] > 0.5 ? "w" : n[0] < -0.5 ? "e" : n[2] > 0.5 ? "n" : "s";
+      const key = `${x},${y},${side}`;
+      faces.set(key, (faces.get(key) ?? 0) + 1);
     }
+    // The doorway columns: west of the hall when there is a corridor, and
+    // before each bay east of it.
+    const doorways = new Set<number>();
+    if (room.hall.x0 > 0) doorways.add(room.hall.x0 - 1);
+    for (let x = room.hall.x1; x < room.width; x += BAY + 1) doorways.add(x);
+    expect(doorways.size).toBeGreaterThan(1);
+    // One lintel face on each side of every edge where a doorway cell
+    // meets another floor cell: both faces of both ends of every doorway.
+    const expected: string[] = [];
+    for (let y = 0; y < room.depth; y++) {
+      for (let x = 0; x < room.width; x++) {
+        if (!isFloor(room.grid, x, y)) continue;
+        for (const [side, dx] of [
+          ["w", -1],
+          ["e", 1],
+        ] as const) {
+          const nx = x + dx;
+          if (isFloor(room.grid, nx, y) && doorways.has(x) !== doorways.has(nx))
+            expected.push(`${x},${y},${side}`);
+        }
+      }
+    }
+    expect([...faces.keys()].sort()).toEqual(expected.sort());
+    // Two triangles per face: exactly one quad, never a doubled one.
+    for (const count of faces.values()) expect(count).toBe(2);
   }, 20_000);
 
   it("stands the scaffold poles exactly on the scaffold boxes", () => {
@@ -283,6 +314,22 @@ describe("buildRoomMesh details", () => {
     }
     expect(vs.some((v) => v.layer === LAYER.hazard)).toBe(true);
     expect(scaffoldBoxes(generateRoom(CANNED_BRIDGE))).toHaveLength(0);
+  });
+
+  it("builds no scaffold in a room that is not under construction", () => {
+    // Without fixtures and furniture, scaffold poles are the only metal.
+    for (const status of ["stable", "archived", "deprecated"]) {
+      const room: RoomSpec = {
+        ...generateRoom({ ...CANNED_BRIDGE, status }),
+        fixtures: [],
+        decor: [],
+      };
+      expect(room.condition).not.toBe("construction");
+      const metal = all(buildRoomMesh(room, LOOKS.day).static).filter(
+        (v) => v.layer === LAYER.metal,
+      );
+      expect(metal).toHaveLength(0);
+    }
   });
 
   it("tints the cross-domain portal in the look's other portal colour", () => {

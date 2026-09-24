@@ -89,30 +89,42 @@ export interface Surface {
   flag: Flag;
 }
 
+/** Floats the builder reserves at first: room for 1024 vertices. */
+const INITIAL_FLOATS = 1024 * FLOATS_PER_VERTEX;
+
 /**
- * Grows a plain number array of interleaved vertices, turned into a
- * Float32Array once at the end. The room mesh and the modelling kit
- * (`kit.ts`) emit into the same builder, so a room with all its models stays
- * one vertex array and one draw call.
+ * Writes interleaved vertices straight into a Float32Array that doubles its
+ * capacity whenever it fills, and hands out a trimmed copy at the end. The
+ * room mesh and the modelling kit (`kit.ts`) emit into the same builder, so
+ * a room with all its models stays one vertex array and one draw call. A
+ * hub's worth of models is millions of floats, which is why they never go
+ * through a plain number array first.
  */
 export function createBuilder() {
-  const data: number[] = [];
+  let data = new Float32Array(INITIAL_FLOATS);
+  let length = 0;
   const push = (p: V3, n: V3, u: number, v: number, s: Surface) => {
-    data.push(
-      p[0],
-      p[1],
-      p[2],
-      n[0],
-      n[1],
-      n[2],
-      u,
-      v,
-      s.layer,
-      s.tint[0],
-      s.tint[1],
-      s.tint[2],
-      s.flag,
-    );
+    if (length + FLOATS_PER_VERTEX > data.length) {
+      const grown = new Float32Array(data.length * 2);
+      grown.set(data);
+      data = grown;
+    }
+    const d = data;
+    let i = length;
+    d[i++] = p[0];
+    d[i++] = p[1];
+    d[i++] = p[2];
+    d[i++] = n[0];
+    d[i++] = n[1];
+    d[i++] = n[2];
+    d[i++] = u;
+    d[i++] = v;
+    d[i++] = s.layer;
+    d[i++] = s.tint[0];
+    d[i++] = s.tint[1];
+    d[i++] = s.tint[2];
+    d[i++] = s.flag;
+    length = i;
   };
   const quad = (
     p0: V3,
@@ -213,10 +225,14 @@ export function createBuilder() {
         s,
       );
     },
+    /**
+     * The vertices so far, trimmed to their length. A copy, so the builder
+     * can go on growing without changing a mesh already handed out.
+     */
     build(): MeshData {
       return {
-        vertices: new Float32Array(data),
-        count: data.length / FLOATS_PER_VERTEX,
+        vertices: data.slice(0, length),
+        count: length / FLOATS_PER_VERTEX,
       };
     },
   };
@@ -426,8 +442,9 @@ function lampCentre(
 }
 
 /**
- * A scaffold frame standing on `box`: a pole in each corner, a rail round
- * the top and one along each long side halfway up, all inside the box so
+ * A scaffold frame standing on `box`: a pole in each corner, a frame of
+ * four rails round the top, and two rails halfway up that run along x on
+ * the frame's north and south sides, all inside the box so
  * what is drawn is exactly what `scaffoldBoxes` makes the player walk
  * around.
  */

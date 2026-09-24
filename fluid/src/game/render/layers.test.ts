@@ -3,7 +3,14 @@ import { describe, expect, it } from "vitest";
 import { CANNED_BRIDGE, CANNED_HUB } from "../world/canned";
 import { generateRoom } from "../world/generate";
 import type { RoomSpec } from "../world/types";
-import { LABEL_ROWS, TEXT_BASE, layerPlan, textRequests } from "./layers";
+import {
+  LABEL_ROWS,
+  LAYER_SIZE,
+  ROW_HEIGHT,
+  TEXT_BASE,
+  layerPlan,
+  textRequests,
+} from "./layers";
 
 const bridge = generateRoom(CANNED_BRIDGE);
 const hub = generateRoom(CANNED_HUB);
@@ -127,13 +134,14 @@ describe("layerPlan", () => {
         }
       });
 
-      it("gives whole layers the whole height and labels one sixth or less", () => {
+      it("gives whole layers the whole height and labels their row less one texel", () => {
         for (const key of whole) {
           expect(plan.lookup(key)).toMatchObject({ v0: 0, v1: 1 });
         }
         for (const key of labels) {
           const { v0, v1 } = plan.lookup(key);
           expect(v1 - v0).toBeLessThanOrEqual(1 / LABEL_ROWS);
+          expect(v1 - v0).toBeCloseTo((ROW_HEIGHT - 1) / LAYER_SIZE, 9);
         }
       });
 

@@ -62,6 +62,13 @@ export const LABEL_ROWS = 6;
 export const ROW_HEIGHT = Math.floor(LAYER_SIZE / LABEL_ROWS);
 
 /**
+ * How far a label's v range stays inside its row, in texels: half a texel
+ * at each edge, so linear filtering and the coarser mip levels sample the
+ * label's own row and not the edge of its neighbour.
+ */
+export const ROW_INSET = 0.5;
+
+/**
  * Width over height of each kind of text quad. The text renderer stretches
  * its lines vertically by this factor (inside the square layer, or inside
  * its row for a label) and the quad of that aspect squeezes them back, so
@@ -78,15 +85,6 @@ export const ASPECT = {
 
 /** The kinds of text, which set a request's aspect and its drawing style. */
 export type TextKind = keyof typeof ASPECT;
-
-/**
- * Where one label lives: its layer and its row in that layer, row 0 at the
- * top of the layer as the canvas draws it.
- */
-export interface LabelSlot {
-  layer: number;
-  row: number;
-}
 
 /**
  * One piece of text to draw: a stable key naming the quad it belongs to
@@ -109,7 +107,9 @@ export interface TextRequest {
  * the texture array needs (procedural, whole and label layers), `text` every
  * request in drawing order, and `lookup` a key's layer and the part of its
  * height the key's quad shows, `v0` to `v1` in texture v (0 at the bottom of
- * the layer, as `flipRows` uploads it). A whole layer shows 0 to 1. `lookup`
+ * the layer, as `flipRows` uploads it). A whole layer shows 0 to 1; a
+ * label row is inset by `ROW_INSET` at both edges, so it shows its row
+ * less one texel. `lookup`
  * throws on a key the room has no text for: a quad asking for text that was
  * never drawn is a bug, and a silent fallback would hide it.
  */
@@ -206,8 +206,8 @@ export function layerPlan(room: RoomSpec): LayerPlan {
       const layer = TEXT_BASE + wholes + Math.floor(label++ / LABEL_ROWS);
       slots.set(r.key, {
         layer,
-        v0: 1 - ((r.row + 1) * ROW_HEIGHT) / LAYER_SIZE,
-        v1: 1 - (r.row * ROW_HEIGHT) / LAYER_SIZE,
+        v0: 1 - ((r.row + 1) * ROW_HEIGHT - ROW_INSET) / LAYER_SIZE,
+        v1: 1 - (r.row * ROW_HEIGHT + ROW_INSET) / LAYER_SIZE,
       });
     }
   }
