@@ -38,6 +38,14 @@ export interface Input {
    * is not replayed as a command or a step once the game has the keys back.
    */
   clear(): void;
+  /**
+   * Forgets every unconsumed press and leaves held keys and the mouse as
+   * they are. The session calls it when it enters a room, so a command key
+   * pressed for the room left behind (an E hit while the next room was
+   * loading) is not replayed in the new one, while a W held through the
+   * door keeps walking.
+   */
+  dropPresses(): void;
   /** Asks for pointer lock. Call from a user gesture (a click). */
   requestLock(): void;
   /** Removes every listener and releases the lock. */
@@ -114,6 +122,9 @@ export function createInput(
       edges.clear();
       dx = 0;
       dy = 0;
+    },
+    dropPresses() {
+      edges.clear();
     },
     requestLock() {
       // `requestPointerLock` is feature-detected: jsdom and browsers without

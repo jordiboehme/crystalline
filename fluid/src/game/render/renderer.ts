@@ -59,7 +59,9 @@ export interface Camera {
  *   room needs more texture layers than the GPU holds (`caps.maxLayers`,
  *   at least 256 in WebGL2), a limit error like a failed shader: a shorter
  *   array would make the shader clamp the missing layers to the last one
- *   and show readable, wrong labels.
+ *   and show readable, wrong labels. That throw, and one from building the
+ *   meshes, come before the old room is released, so the old room stays
+ *   drawn; only a failure on the GPU itself leaves nothing to draw.
  * - `resize` rebuilds the offscreen targets for a new canvas size in device
  *   pixels.
  * - `draw` renders one frame: `levels` holds the zones' current light
@@ -253,9 +255,11 @@ export function createRenderer(
           `room needs ${plan.count} texture layers, the GPU holds ${caps.maxLayers}`,
         );
       }
-      releaseRoom();
+      // The meshes are built before the old room is let go, so a room that
+      // cannot be built leaves the old one on the GPU and drawn.
       const nextLookApplied = applyCondition(nextLook, nextRoom.condition);
       const built = buildRoomMesh(nextRoom, nextLookApplied);
+      releaseRoom();
       mesh = createMesh(gl, built.static);
       movers = built.movers.map((m) => ({
         key: m.key,

@@ -76,4 +76,16 @@ describe("createInput", () => {
     expect(input.held("KeyW")).toBe(false);
     expect(input.pressed("KeyF")).toBe(false);
   });
+
+  it("forgets unconsumed presses but keeps held keys on dropPresses", () => {
+    input = createInput(document.createElement("canvas"));
+    key("keydown", "KeyW");
+    key("keydown", "KeyE");
+    input.dropPresses();
+    expect(input.held("KeyW")).toBe(true);
+    expect(input.pressed("KeyE")).toBe(false);
+    expect(input.pressed("KeyW")).toBe(false);
+    key("keydown", "KeyE");
+    expect(input.pressed("KeyE")).toBe(true);
+  });
 });

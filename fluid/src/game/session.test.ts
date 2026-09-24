@@ -422,6 +422,150 @@ describe("go", () => {
   });
 });
 
+describe("a load in flight", () => {
+  /** Beta's one reference into Alpha: a hatch back to Beta in Alpha's room. */
+  const FROM_BETA = {
+    total: 1,
+    page: 1,
+    limit: 24,
+    count: 1,
+    types: [{ rel: "relates_to", count: 1 }],
+    hits: [
+      {
+        domain: "eng",
+        permalink: "beta",
+        title: "Beta",
+        path: "beta.md",
+        rel: "relates_to",
+        status: "stable",
+      },
+    ],
+  };
+
+  it("forgets an E pressed while loading instead of using it in the new room", async () => {
+    const alpha = deferred<unknown>();
+    serve({
+      "/domains/eng/engrams/alpha": () => alpha.promise,
+      "/domains/eng/inbound/alpha": () => FROM_BETA,
+    });
+    const session = start();
+    // Through a door from Beta: the player arrives in front of the hatch
+    // back to Beta, facing into the room.
+    session.go(
+      { domain: "eng", permalink: "alpha" },
+      { via: "door", from: { domain: "eng", permalink: "beta" } },
+    );
+    frames(2);
+    key("keydown", "KeyE");
+    key("keyup", "KeyE");
+    frames(2);
+    alpha.resolve(detailResponse("alpha", "Alpha"));
+    await vi.waitFor(() => {
+      expect(session.current?.permalink).toBe("alpha");
+    });
+    // Turn round to the hatch: a stale E would crawl back the moment it is
+    // in front of the player.
+    const offered = () =>
+      hud.prompt.mock.calls.at(-1)?.[0] === "E CRAWL Beta relates_to";
+    key("keydown", "ArrowLeft");
+    for (let i = 0; i < 60 && !offered(); i++) frames(1);
+    key("keyup", "ArrowLeft");
+    frames(5);
+    expect(hud.prompt).toHaveBeenLastCalledWith("E CRAWL Beta relates_to");
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      false,
+      "alpha",
+      expect.any(String),
+    );
+    expect(roomsSet()).toEqual(["alpha"]);
+
+    // A fresh E in the new room still crawls back.
+    key("keydown", "KeyE");
+    frames(1);
+    expect(hud.connector).toHaveBeenLastCalledWith(
+      true,
+      "Beta",
+      expect.any(String),
+    );
+  });
+
+  it("forgets an E pressed while loading when the load fails", async () => {
+    const beta = deferred<unknown>();
+    serve({ "/domains/eng/engrams/beta": () => beta.promise });
+    const session = start();
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    walkToScope();
+    session.go({ domain: "eng", permalink: "beta" });
+    frames(2);
+    key("keydown", "KeyE");
+    key("keyup", "KeyE");
+    frames(2);
+    beta.resolve(Promise.reject(new ApiProblem(403, "no", "denied")));
+    await vi.waitFor(() => {
+      expect(hud.notice).toHaveBeenCalledWith("ACCESS DENIED");
+    });
+    // Still in front of the Scope terminal: the E pressed for the load's
+    // room must not open the reader here.
+    frames(5);
+    expect(session.current?.permalink).toBe("manifest");
+    expect(hud.reader).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Station Crystalline" }),
+    );
+    expect(hud.prompt).toHaveBeenLastCalledWith("E READ Scope");
+  });
+});
+
+describe("a room the renderer refuses", () => {
+  it("keeps the player in the old room and says ?LOAD ERROR", async () => {
+    serve();
+    const session = start();
+    session.go({ domain: "eng", permalink: "alpha" });
+    await vi.waitFor(() => {
+      expect(session.current?.permalink).toBe("alpha");
+    });
+    frames(3);
+    const before = eyeAt();
+    renderer.setRoom.mockImplementation(() => {
+      throw new Error("room needs 999 texture layers, the GPU holds 256");
+    });
+    session.go({ domain: "eng", permalink: "beta" });
+    await vi.waitFor(() => {
+      expect(hud.notice).toHaveBeenCalledWith("?LOAD ERROR");
+    });
+    expect(session.current).toEqual({ domain: "eng", permalink: "alpha" });
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(navigate).toHaveBeenLastCalledWith("/game/d/eng/e/alpha");
+    // The player stands where they stood, in Alpha, and still walks there.
+    frames(3);
+    expect(eyeAt()[0]).toBeCloseTo(before[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(before[1], 6);
+    expect(hud.status).toHaveBeenLastCalledWith(
+      expect.stringMatching(/^ALPHA {2}\|/),
+    );
+    key("keydown", "KeyW");
+    frames(5);
+    key("keyup", "KeyW");
+    expect(eyeAt()[1]).toBeLessThan(before[1] - 0.5);
+  });
+
+  it("keeps the look the renderer refuses the room in from being taken", () => {
+    const session = start({ client: null });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    renderer.setRoom.mockImplementation(() => {
+      throw new Error("no");
+    });
+    key("keydown", "Digit4");
+    frames(1);
+    expect(hud.notice).toHaveBeenLastCalledWith("?LOAD ERROR");
+    expect(hud.status).toHaveBeenLastCalledWith(
+      expect.stringContaining("APERTURE"),
+    );
+    expect(session.current?.permalink).toBe("manifest");
+  });
+});
+
 describe("notices", () => {
   it("takes an in-room failure notice down after three seconds", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

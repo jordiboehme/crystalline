@@ -353,18 +353,47 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   /**
+   * Hands a room in a look to the renderer and says whether it took it. A
+   * renderer that throws (a room that needs more texture layers than the
+   * GPU holds, a mesh it cannot build) refuses the room; with no renderer
+   * at all (no GPU yet, or a lost context) there is nothing to refuse, and
+   * `boot` hands the room over when a renderer is made.
+   */
+  const present = (next: RoomSpec, id: LookId): boolean => {
+    if (renderer === null) return true;
+    try {
+      renderer.setRoom(next, LOOKS[id]);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
    * Enters a generated room: hands it to the renderer and resets everything
    * that belongs to the room before it. `next` is the place the room was
    * generated from, or null for a room built by hand (`showRoom`), whose
    * terminals then open no reader. `keep` keeps the player and the doors,
    * for the same place shown again.
+   *
+   * The renderer is asked first. When it refuses the room, nothing of the
+   * session has changed yet: the player stays in the room they were in,
+   * with its blockers, lights and doors, and `fail` says `?LOAD ERROR`.
+   * Returns whether the room was entered. Every press not yet consumed is
+   * dropped on the way in, so a key hit for the room left behind (an E
+   * while this one loaded) does nothing here.
    */
   const enter = (
     next: PlaceInput | null,
     built: RoomSpec,
     arrival: Arrival | null,
     keep: boolean,
-  ): void => {
+  ): boolean => {
+    if (!present(built, lookId)) {
+      fail(LOAD_ERROR);
+      return false;
+    }
+    input.dropPresses();
     place = next;
     room = built;
     blockers = blockersFor(room);
@@ -381,8 +410,8 @@ export function createSession(opts: SessionOptions): Session {
     latched = null;
     placeNotice = null;
     showStanding();
-    renderer?.setRoom(room, LOOKS[lookId]);
     showStatus();
+    return true;
   };
 
   const settle = (
@@ -399,7 +428,9 @@ export function createSession(opts: SessionOptions): Session {
       fail(FAILED[loaded.kind]);
       return;
     }
-    enter(loaded.place, generateRoom(loaded.place), arrival, false);
+    if (!enter(loaded.place, generateRoom(loaded.place), arrival, false)) {
+      return;
+    }
     const here = loaded.place;
     const path = gameEngramRoute(here.domain, here.permalink);
     if (window.location.pathname !== path) opts.navigate(path);
@@ -589,15 +620,23 @@ export function createSession(opts: SessionOptions): Session {
       for (const code of COMMAND_KEYS) input.pressed(code);
       input.takeLook();
     } else {
+      // Nothing takes E while a place loads. Its press is dropped here
+      // rather than kept for the room that loads or, when the load fails,
+      // for this one.
+      if (loading) input.pressed("KeyE");
       for (const code of LOOK_KEYS) {
         if (!input.pressed(code)) continue;
         const next = lookForKey(code);
-        if (next !== null && next !== lookId) {
-          lookId = next;
-          if (room !== null) renderer?.setRoom(room, LOOKS[lookId]);
-          if (loading) hud.connector(true, loadingLabel, lookId);
-          showStatus();
+        if (next === null || next === lookId) continue;
+        // A look the renderer refuses the room in is not taken: the room
+        // stays in the look it has.
+        if (room !== null && !present(room, next)) {
+          fail(LOAD_ERROR);
+          continue;
         }
+        lookId = next;
+        if (loading) hud.connector(true, loadingLabel, lookId);
+        showStatus();
       }
       if (input.pressed("KeyI")) {
         inverted = !inverted;
