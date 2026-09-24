@@ -135,7 +135,74 @@ interface Case {
   bounds: Bounds;
   /** The enclosed volume when the shape is closed: a number to match, or `true` for "above zero". */
   closed?: number | true;
+  /**
+   * How far a triangle faces out, from its centroid and its stored normal
+   * (both local `[a, d, h]`): positive for every triangle of a primitive
+   * wound outward. This is the orientation check that does not lean on the
+   * kit's own normals agreeing with its winding.
+   */
+  outward: (centroid: V3, normal: V3) => number;
 }
+
+/** Outwardness measured from an interior reference point chosen per triangle. */
+const awayFrom =
+  (ref: (c: V3) => V3) =>
+  (c: V3, n: V3): number =>
+    dot(sub(c, ref(c)), n);
+
+/** Outwardness from the centre of a convex shape's bounds. */
+const fromCentre = ([a0, a1, d0, d1, h0, h1]: Bounds) =>
+  awayFrom(() => [(a0 + a1) / 2, (d0 + d1) / 2, (h0 + h1) / 2]);
+
+/**
+ * Outwardness of a torus: from the nearest point on the tube's centre
+ * circle, which lies in the plane of the two axes named by `u` and `v`.
+ */
+const fromTube =
+  (centre: V3, radius: number, u: 0 | 2, v: 1 | 2) =>
+  (c: V3, n: V3): number => {
+    const du = c[u] - centre[u];
+    const dv = c[v] - centre[v];
+    const len = Math.hypot(du, dv);
+    const ref: V3 = [centre[0], centre[1], centre[2]];
+    ref[u] += (du / len) * radius;
+    ref[v] += (dv / len) * radius;
+    return dot(sub(c, ref), n);
+  };
+
+/**
+ * Outwardness of an extrusion: the front must face `+d`, the back `-d`,
+ * and each side must face the same way as the outward normal of the
+ * outline edge it stands on. A triangle on no edge scores -1.
+ */
+const fromOutline =
+  (polygon: readonly (readonly [number, number])[], d0: number, d1: number) =>
+  (c: V3, n: V3): number => {
+    if (Math.abs(n[1]) > 0.5) return c[1] > (d0 + d1) / 2 ? n[1] : -n[1];
+    let area = 0;
+    polygon.forEach((p, i) => {
+      const q = polygon[(i + 1) % polygon.length] ?? p;
+      area += p[0] * q[1] - q[0] * p[1];
+    });
+    for (let i = 0; i < polygon.length; i++) {
+      const p = polygon[i];
+      const q = polygon[(i + 1) % polygon.length];
+      if (!p || !q) continue;
+      const [ea, eh] = [q[0] - p[0], q[1] - p[1]];
+      const t = Math.min(
+        1,
+        Math.max(
+          0,
+          ((c[0] - p[0]) * ea + (c[2] - p[1]) * eh) / (ea * ea + eh * eh),
+        ),
+      );
+      const off = Math.hypot(c[0] - p[0] - t * ea, c[2] - p[1] - t * eh);
+      if (off > 1e-5) continue;
+      const sign = area > 0 ? 1 : -1;
+      return sign * (n[0] * eh - n[2] * ea);
+    }
+    return -1;
+  };
 
 /** The area of a regular polygon of `sides` sides inscribed in radius `r`. */
 const ngon = (sides: number, r: number) =>
@@ -160,6 +227,7 @@ const CASES: Case[] = [
     count: 36,
     bounds: [-0.4, 0.6, 0.1, 0.5, 0, 1.2],
     closed: 1 * 0.4 * 1.2,
+    outward: fromCentre([-0.4, 0.6, 0.1, 0.5, 0, 1.2]),
   },
   {
     name: "bevel box",
@@ -169,6 +237,7 @@ const CASES: Case[] = [
     count: 132,
     bounds: [-0.5, 0.5, 0, 0.6, 0.2, 1.1],
     closed: true,
+    outward: fromCentre([-0.5, 0.5, 0, 0.6, 0.2, 1.1]),
   },
   {
     name: "capped cylinder",
@@ -178,6 +247,7 @@ const CASES: Case[] = [
     count: 12 * 6 + 12 * 6,
     bounds: [-0.05, 0.45, 0.05, 0.55, 0.1, 0.9],
     closed: ngon(12, 0.25) * 0.8,
+    outward: fromCentre([-0.05, 0.45, 0.05, 0.55, 0.1, 0.9]),
   },
   {
     name: "open cylinder",
@@ -186,6 +256,7 @@ const CASES: Case[] = [
     },
     count: 12 * 6,
     bounds: [-0.05, 0.45, 0.05, 0.55, 0.1, 0.9],
+    outward: fromCentre([-0.05, 0.45, 0.05, 0.55, 0.1, 0.9]),
   },
   {
     name: "cylinder along the wall",
@@ -195,6 +266,7 @@ const CASES: Case[] = [
     count: 8 * 12,
     bounds: [-0.6, 0.4, 0.15, 0.25, 1.25, 1.35],
     closed: ngon(8, 0.05) * 1,
+    outward: fromCentre([-0.6, 0.4, 0.15, 0.25, 1.25, 1.35]),
   },
   {
     name: "ring facing inward",
@@ -204,6 +276,7 @@ const CASES: Case[] = [
     count: 16 * 8 * 6,
     bounds: [-0.44, 0.44, 0.06, 0.14, 1.06, 1.94],
     closed: true,
+    outward: fromTube([0, 0.1, 1.5], 0.4, 0, 2),
   },
   {
     name: "ring facing up",
@@ -213,6 +286,7 @@ const CASES: Case[] = [
     count: 12 * 6 * 6,
     bounds: [-0.23, 0.43, -0.03, 0.63, 0.77, 0.83],
     closed: true,
+    outward: fromTube([0.1, 0.3, 0.8], 0.3, 0, 1),
   },
   {
     name: "closed lathe",
@@ -234,6 +308,7 @@ const CASES: Case[] = [
     count: 12 * (3 + 6 + 6 + 3),
     bounds: [-0.2, 0.4, -0.1, 0.5, 0, 1.2],
     closed: true,
+    outward: fromCentre([-0.2, 0.4, -0.1, 0.5, 0, 1.2]),
   },
   {
     name: "open lathe",
@@ -252,6 +327,7 @@ const CASES: Case[] = [
     },
     count: 10 * 2 * 6,
     bounds: [-0.2, 0.4, -0.1, 0.5, 0, 1],
+    outward: awayFrom((c) => [0.1, 0.2, c[2]]),
   },
   {
     name: "concave extrusion",
@@ -261,6 +337,7 @@ const CASES: Case[] = [
     count: 12 * L_SHAPE.length - 12,
     bounds: [-0.5, 0.5, 0.05, 0.25, 0, 1],
     closed: L_AREA * 0.2,
+    outward: fromOutline(L_SHAPE, 0.05, 0.25),
   },
   {
     name: "clockwise extrusion",
@@ -270,6 +347,55 @@ const CASES: Case[] = [
     count: 12 * L_SHAPE.length - 12,
     bounds: [-0.5, 0.5, 0.05, 0.25, 0, 1],
     closed: L_AREA * 0.2,
+    outward: fromOutline(L_SHAPE, 0.05, 0.25),
+  },
+  {
+    name: "pinched lathe touching the axis mid-way",
+    emit: (k) => {
+      k.lathe(
+        0.1,
+        0.2,
+        [
+          [0, 0],
+          [0.3, 0],
+          [0.3, 0.4],
+          [0, 0.5],
+          [0.3, 0.6],
+          [0.3, 1],
+          [0, 1],
+        ],
+        12,
+        S,
+      );
+    },
+    count: 12 * (3 + 6 + 3 + 3 + 6 + 3),
+    bounds: [-0.2, 0.4, -0.1, 0.5, 0, 1],
+    closed: true,
+    // Each half is convex: measure from the axis at the middle of its half.
+    outward: awayFrom((c) => [0.1, 0.2, c[2] < 0.5 ? 0.25 : 0.75]),
+  },
+  {
+    name: "lathe with a segment on the axis",
+    emit: (k) => {
+      k.lathe(
+        0.1,
+        0.2,
+        [
+          [0, 0],
+          [0.3, 0],
+          [0.3, 1],
+          [0, 1],
+          [0, 1.5],
+        ],
+        12,
+        S,
+      );
+    },
+    // The last segment lies on the axis and emits nothing.
+    count: 12 * (3 + 6 + 3),
+    bounds: [-0.2, 0.4, -0.1, 0.5, 0, 1],
+    closed: ngon(12, 0.3) * 1,
+    outward: fromCentre([-0.2, 0.4, -0.1, 0.5, 0, 1]),
   },
   {
     name: "panel",
@@ -278,6 +404,7 @@ const CASES: Case[] = [
     },
     count: 6,
     bounds: [-0.5, 0.5, 0.02, 0.02, 1, 1.6],
+    outward: awayFrom((c) => [c[0], -1, c[2]]),
   },
 ];
 
@@ -316,6 +443,24 @@ describe("the modelling kit", () => {
             expect(h).toBeGreaterThanOrEqual(h0 - eps);
             expect(h).toBeLessThanOrEqual(h1 + eps);
           }
+        });
+
+        it(`points every triangle outward (${where})`, () => {
+          let worst = Infinity;
+          for (const [a, b, t] of triangles(m)) {
+            const [pa, pb, pc] = [a, b, t].map((v) => toLocal(f, v.pos));
+            if (!pa || !pb || !pc) throw new Error("short triangle");
+            const centroid: V3 = [
+              (pa[0] + pb[0] + pc[0]) / 3,
+              (pa[1] + pb[1] + pc[1]) / 3,
+              (pa[2] + pb[2] + pc[2]) / 3,
+            ];
+            worst = Math.min(
+              worst,
+              c.outward(centroid, dirToLocal(f, a.normal)),
+            );
+          }
+          expect(worst).toBeGreaterThan(0);
         });
 
         if (c.closed !== undefined) {
@@ -390,6 +535,36 @@ describe("the modelling kit", () => {
       expect(ca > 0 && ch > 0.3).toBe(false);
     }
     expect(front).toBeCloseTo(L_AREA, 5);
+  });
+
+  it("rejects an outline whose edges cross or that encloses nothing", () => {
+    const f = FRAMES[0]?.[1];
+    if (!f) throw new Error("no frame");
+    const bowtie: [number, number][] = [
+      [0, 0],
+      [1, 1],
+      [1, 0],
+      [0, 1],
+    ];
+    expect(() =>
+      emitIn(f, (k) => {
+        k.extrude(bowtie, 0, 0.1, S);
+      }),
+    ).toThrow(/simple/);
+    expect(() =>
+      emitIn(f, (k) => {
+        k.extrude(
+          [
+            [0, 0],
+            [1, 0],
+            [2, 0],
+          ],
+          0,
+          0.1,
+          S,
+        );
+      }),
+    ).toThrow(/area/);
   });
 
   it("keeps a bevel box whole when the bevel is as large as the box allows", () => {

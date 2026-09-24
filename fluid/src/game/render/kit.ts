@@ -137,9 +137,12 @@ export interface Kit {
   /**
    * A profile of `[radius, height]` points revolved around the vertical
    * axis at `(a, d)`: flasks, specimen tanks, pods, lamp shades, domes.
-   * Walk the profile so the outside is on the right with radius to the
-   * right and height up, that is from the bottom up; start and end it at
-   * radius 0 to close the ends. Each segment gives `sides * 6` vertices, or
+   * The side of the profile on the right of its direction of travel (with
+   * radius to the right and height up) faces out. So an open lathe, such
+   * as a vase wall or a lamp shade, must run from the bottom up to face
+   * outward; run it from the top down to get the inside of a bowl. Start
+   * and end the profile at radius 0 to close the ends, walking out along
+   * the bottom, up the side and back in across the top. Each segment gives `sides * 6` vertices, or
    * `sides * 3` where one end sits on the axis; a segment of no length or
    * lying on the axis gives none.
    */
@@ -155,7 +158,8 @@ export interface Kit {
    * wall between depths `d0` and `d1`: console bodies with a sloped deck,
    * door frames, brackets, signs. The outline must be simple (it may be
    * concave) and may run either way round; repeated and collinear points
-   * are dropped. With `n` points left: a front and a back face of `n - 2`
+   * are dropped, and an outline whose edges cross or that encloses no area
+   * throws. With `n` points left: a front and a back face of `n - 2`
    * triangles each and `n` side quads, `12 * n - 12` vertices.
    */
   extrude(
@@ -223,9 +227,45 @@ const cross2 = (
   r: readonly [number, number],
 ) => (q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1]);
 
+/** Whether `r` lies on the segment `p q`, given that the three are collinear. */
+const within = (
+  p: readonly [number, number],
+  q: readonly [number, number],
+  r: readonly [number, number],
+) =>
+  r[0] >= Math.min(p[0], q[0]) - SAME &&
+  r[0] <= Math.max(p[0], q[0]) + SAME &&
+  r[1] >= Math.min(p[1], q[1]) - SAME &&
+  r[1] <= Math.max(p[1], q[1]) + SAME;
+
+/** Whether the segments `p q` and `r t` cross or touch. */
+function segmentsMeet(
+  p: readonly [number, number],
+  q: readonly [number, number],
+  r: readonly [number, number],
+  t: readonly [number, number],
+): boolean {
+  const o1 = cross2(p, q, r);
+  const o2 = cross2(p, q, t);
+  const o3 = cross2(r, t, p);
+  const o4 = cross2(r, t, q);
+  const apart = (x: number, y: number) =>
+    (x > SAME && y < -SAME) || (x < -SAME && y > SAME);
+  if (apart(o1, o2) && apart(o3, o4)) return true;
+  return (
+    (Math.abs(o1) <= SAME && within(p, q, r)) ||
+    (Math.abs(o2) <= SAME && within(p, q, t)) ||
+    (Math.abs(o3) <= SAME && within(r, t, p)) ||
+    (Math.abs(o4) <= SAME && within(r, t, q))
+  );
+}
+
 /**
  * A plane outline made clean for extrusion: repeated and collinear points
- * dropped, then turned counter-clockwise.
+ * dropped, then turned counter-clockwise. Throws when two edges that are
+ * not neighbours cross or touch (a bowtie, a figure eight) or when what is
+ * left encloses no area, since recipes are code and a broken one should
+ * fail loudly rather than emit garbage.
  */
 function cleanOutline(
   polygon: readonly (readonly [number, number])[],
@@ -246,11 +286,23 @@ function cleanOutline(
       }
     }
   }
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 2; j < n; j++) {
+      if (i === 0 && j === n - 1) continue;
+      const [p, q] = [pts[i], pts[(i + 1) % n]];
+      const [r, t] = [pts[j], pts[(j + 1) % n]];
+      if (p && q && r && t && segmentsMeet(p, q, r, t))
+        throw new Error("extrude: the outline is not a simple polygon");
+    }
+  }
   let area = 0;
   pts.forEach((p, i) => {
     const q = pts[(i + 1) % pts.length] ?? p;
     area += p[0] * q[1] - q[0] * p[1];
   });
+  if (pts.length < 3 || Math.abs(area) / 2 < SAME)
+    throw new Error("extrude: the outline encloses no area");
   if (area < 0) pts = pts.reverse();
   return pts;
 }
@@ -259,8 +311,8 @@ function cleanOutline(
  * Triangulates a simple counter-clockwise outline by ear clipping: a
  * convex corner whose triangle holds no other point of the outline is cut
  * off, until three points remain. Returns `n - 2` counter-clockwise index
- * triples. Throws on an outline that is not simple, since recipes are code
- * and a broken one should fail loudly.
+ * triples. `cleanOutline` has already rejected crossing edges; the throw
+ * here is a last guard should clipping still stall.
  */
 function earClip(pts: readonly [number, number][]): [number, number, number][] {
   const idx = pts.map((_, i) => i);
@@ -634,7 +686,6 @@ export function createKit(builder: Builder, frame: Frame): Kit {
     extrude(polygon, d0, d1, s) {
       const [D0, D1] = [Math.min(d0, d1), Math.max(d0, d1)];
       const pts = cleanOutline(polygon);
-      if (pts.length < 3) return;
       const tris = earClip(pts);
       const aMin = Math.min(...pts.map((p) => p[0]));
       const aMax = Math.max(...pts.map((p) => p[0]));
