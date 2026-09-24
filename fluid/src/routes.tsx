@@ -96,6 +96,29 @@ const LookDemo = import.meta.env.DEV
   : null;
 
 /**
+ * The station itself, one engram's room at `/game/d/<domain>/e/<permalink>`,
+ * and only in development until the game gets a way in of its own.
+ *
+ * Gated the way the look demo is, so a production build has neither the
+ * chunk nor the route. It sits inside `RequireAuth`, since every room is an
+ * engram the account reads, and outside `Layout`, full screen. The splat
+ * carries the permalink with its slashes, as the reading screen's route
+ * does, so the two addresses convert by adding or dropping `/game`.
+ */
+const GameRoute = import.meta.env.DEV
+  ? lazy(() => import("./game/GameRoute"))
+  : null;
+
+/**
+ * The model gallery at `/game/dev/gallery`: one room with every model the
+ * station draws, for judging them. A development tool, like the look demo,
+ * and gated the same way for good.
+ */
+const Gallery = import.meta.env.DEV
+  ? lazy(() => import("./game/dev/Gallery"))
+  : null;
+
+/**
  * The MANIFEST's old address. The document is read on the domain page now,
  * so a link that still points here lands there rather than on the not-found
  * screen; the editor keeps its own segment beneath it.
@@ -153,6 +176,29 @@ export function AppRoutes() {
             element={
               <Suspense fallback={null}>
                 <LookDemo />
+              </Suspense>
+            }
+          />
+        )}
+        {/*
+          The gallery and the station itself, gated and placed the same way.
+        */}
+        {Gallery === null ? null : (
+          <Route
+            path="/game/dev/gallery"
+            element={
+              <Suspense fallback={null}>
+                <Gallery />
+              </Suspense>
+            }
+          />
+        )}
+        {GameRoute === null ? null : (
+          <Route
+            path="/game/d/:domain/e/*"
+            element={
+              <Suspense fallback={null}>
+                <GameRoute />
               </Suspense>
             }
           />

@@ -15,19 +15,16 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router";
 
 import { engramRoute } from "../../paths";
 import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
 import type { Session } from "../session";
 import { CrtReader } from "../ui/CrtReader";
+import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { Hud } from "../ui/Hud";
 import { useHud } from "../ui/useHud";
 import { startDemo } from "./demo";
-
-const C64_BLUE = "#352879";
-const C64_LIGHT_BLUE = "#6c5eb5";
 
 /** The keys, along the top of the screen. */
 const LEGEND =
@@ -36,32 +33,6 @@ const LEGEND =
 /** Opens a Fluid page in a new tab, as the F key does in the game. */
 function openFluid(path: string) {
   window.open(path, "_blank", "noopener");
-}
-
-/**
- * The C64's answer to a device that cannot run the station: the error in
- * light blue on the dark blue screen, and RUN/STOP back to the app.
- */
-function DeviceRefusal() {
-  return (
-    <div
-      className="fixed inset-0 flex items-center justify-center p-8 font-mono text-lg uppercase"
-      style={{ background: C64_LIGHT_BLUE }}
-    >
-      <div
-        className="w-full max-w-2xl p-8"
-        style={{ background: C64_BLUE, color: C64_LIGHT_BLUE }}
-      >
-        <p>?DEVICE NOT PRESENT ERROR</p>
-        <p>READY.</p>
-        <p className="mt-6">
-          <Link to="/" className="underline">
-            RUN/STOP
-          </Link>
-        </p>
-      </div>
-    </div>
-  );
 }
 
 /**
