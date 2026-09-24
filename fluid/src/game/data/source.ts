@@ -4,8 +4,8 @@
  * The game fetches nothing through a channel of its own. The detail and the
  * neighbourhood graph are read with `client.fetchQuery` under the very keys the
  * reading screen uses (`engramDetailKey`, `graphKey`), so a room entered from
- * the page it mirrors costs no second request while that request is still in
- * flight, and the page and the room cannot disagree about which version of the
+ * the page it mirrors costs no second request while the cached answer is fresh
+ * (`GAME_STALE_MS`), and the page and the room cannot disagree about which version of the
  * engram they are holding. The domain listing is the sidebar's, under
  * `DOMAINS_QUERY_KEY`. Only the inbound page has a key of the game's own,
  * because it asks for a page size (`HATCH_CAP`) no screen asks for.
@@ -15,11 +15,10 @@
  * own (`missing`, `denied`, `offline`), and anything else is a fault and is
  * rethrown. The graph and the inbound page are furniture: when either fails
  * the room is still built, with every resolved reference sealed or with no
- * hatches. The domain listing is neither. Without it the resolver cannot tell
- * a domain prefix from a colon in a title, and an empty list would be a claim
- * that no prefix is a domain, so a failed listing is rethrown rather than
- * guessed around - once the detail has been read, so a missing engram still
- * reads as missing.
+ * hatches. A failed domain listing degrades too, to "cannot tell" rather
+ * than to an empty list: an empty list would claim that no prefix names a
+ * domain, while an unknown listing lets the resolver behave as the reading
+ * screen does before its own listing lands.
  *
  * Door style needs each relation target's salience, which the graph does not
  * carry. So once the room's own payloads are in, every located relation target
@@ -31,7 +30,7 @@
  * lives in one place only.
  */
 
-import type { QueryClient } from "@tanstack/react-query";
+import { isCancelledError, type QueryClient } from "@tanstack/react-query";
 
 import { ApiProblem } from "../../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../../api/domains";
@@ -73,6 +72,18 @@ export type LoadedPlace =
  */
 export const TARGET_TIMEOUT_MS = 3000;
 
+/**
+ * How long a payload the game fetched counts as fresh, in milliseconds.
+ *
+ * Every `fetchQuery` here passes it. At the default of zero a cached entry is
+ * refetched on every read, so the prefetch fired when the player walks up to
+ * a door would buy nothing once it had landed: stepping through would ask the
+ * server again. Thirty seconds covers the walk from a door to the next room
+ * and back. A room is built once per entry and live changes are milestone 4,
+ * so a room that is a little behind the server is expected until then.
+ */
+export const GAME_STALE_MS = 30_000;
+
 /** The cache key of the inbound page the game asks for. */
 function inboundKey(domain: string, permalink: string): readonly unknown[] {
   return ["game", "inbound", domain, permalink];
@@ -86,6 +97,7 @@ function detailQuery(domain: string, permalink: string) {
   return {
     queryKey: engramDetailKey(domain, permalink),
     queryFn: () => fetchEngramDetail(domain, permalink),
+    staleTime: GAME_STALE_MS,
   };
 }
 
@@ -94,6 +106,7 @@ function graphQuery(domain: string, permalink: string) {
   return {
     queryKey: graphKey(domain, permalink, NEIGHBORHOOD_DEPTH),
     queryFn: () => fetchGraph(domain, permalink),
+    staleTime: GAME_STALE_MS,
   };
 }
 
@@ -111,6 +124,42 @@ function abortError(): DOMException {
 function checkAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted === true) {
     throw abortError();
+  }
+}
+
+/**
+ * Race one round of requests against the signal, so a cancelled load rejects
+ * at once instead of waiting for a request that may hang.
+ *
+ * The listener is removed when the round settles either way, so a long-lived
+ * signal does not collect one listener per round. A TanStack `CancelledError`
+ * that arrives while the signal has fired (the session cancelling the queries
+ * it walked away from) is read as the abort it is.
+ */
+async function abortable<T>(
+  round: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) {
+    return round;
+  }
+  checkAborted(signal);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([round, aborted]);
+  } catch (error) {
+    if (signal.aborted && isCancelledError(error)) {
+      throw abortError();
+    }
+    throw error;
+  } finally {
+    if (onAbort !== undefined) {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 }
 
@@ -164,23 +213,31 @@ export async function loadPlace(
 ): Promise<LoadedPlace> {
   checkAborted(signal);
   const [detailResult, graphResult, domainsResult, inboundResult] =
-    await Promise.allSettled([
-      client.fetchQuery(detailQuery(domain, permalink)),
-      client.fetchQuery(graphQuery(domain, permalink)),
-      client.fetchQuery({
-        queryKey: DOMAINS_QUERY_KEY,
-        queryFn: fetchDomains,
-      }),
-      client.fetchQuery({
-        queryKey: inboundKey(domain, permalink),
-        queryFn: () =>
-          fetchInbound(domain, permalink, { page: 1, limit: HATCH_CAP }),
-      }),
-    ]);
+    await abortable(
+      Promise.allSettled([
+        client.fetchQuery(detailQuery(domain, permalink)),
+        client.fetchQuery(graphQuery(domain, permalink)),
+        client.fetchQuery({
+          queryKey: DOMAINS_QUERY_KEY,
+          queryFn: fetchDomains,
+          staleTime: GAME_STALE_MS,
+        }),
+        client.fetchQuery({
+          queryKey: inboundKey(domain, permalink),
+          queryFn: () =>
+            fetchInbound(domain, permalink, { page: 1, limit: HATCH_CAP }),
+          staleTime: GAME_STALE_MS,
+        }),
+      ]),
+      signal,
+    );
   checkAborted(signal);
 
   if (detailResult.status === "rejected") {
     const error: unknown = detailResult.reason;
+    if (signal?.aborted === true && isCancelledError(error)) {
+      throw abortError();
+    }
     if (error instanceof ApiProblem) {
       if (error.status === 404) {
         return { kind: "missing" };
@@ -194,14 +251,13 @@ export async function loadPlace(
     }
     throw error;
   }
-  if (domainsResult.status === "rejected") {
-    throw domainsResult.reason;
-  }
-
   const sources = {
     detail: detailResult.value,
     graph: valueOr(graphResult),
-    domains: domainsResult.value.domains.map((entry) => entry.name),
+    domains:
+      domainsResult.status === "fulfilled"
+        ? domainsResult.value.domains.map((entry) => entry.name)
+        : undefined,
     inbound: valueOr(inboundResult),
   };
 
@@ -215,11 +271,14 @@ export async function loadPlace(
     }
   }
 
-  const saliences = await Promise.all(
-    [...located].map(
-      async ([key, address]) =>
-        [key, await targetSalience(client, address)] as const,
+  const saliences = await abortable(
+    Promise.all(
+      [...located].map(
+        async ([key, address]) =>
+          [key, await targetSalience(client, address)] as const,
+      ),
     ),
+    signal,
   );
   checkAborted(signal);
 
@@ -234,8 +293,9 @@ export async function loadPlace(
  * and its graph, under the reading screen's keys.
  *
  * Fire and forget. `prefetchQuery` never rejects, so a failed warm-up costs
- * nothing, and `loadPlace` on the same place joins a request still in flight
- * instead of starting a second one.
+ * nothing, and `loadPlace` on the same place joins a request still in flight,
+ * or reads the answer it left while that is fresh, instead of starting a
+ * second one.
  */
 export function prefetchPlace(
   client: QueryClient,

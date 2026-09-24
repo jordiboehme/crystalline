@@ -19,17 +19,12 @@ import { ApiProblem, api } from "../../api/client";
 import { engramDetailKey } from "../../api/engram";
 import type { Answer } from "../../test/harness";
 import { answersFor, domainsResponse } from "../../test/harness";
-import { loadPlace, TARGET_TIMEOUT_MS } from "./source";
+import { GAME_STALE_MS, loadPlace, TARGET_TIMEOUT_MS } from "./source";
 
 vi.mock("../../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api/client")>();
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
-
-/** The graph renderer paints to a canvas, which jsdom has none of. */
-vi.mock("../../components/GraphCanvas", () => ({
-  default: () => null,
-}));
 
 const apiMock = vi.mocked(api);
 
@@ -50,6 +45,7 @@ function detailResponse(
   title: string,
   salience: number | null,
   relations: unknown[] = [],
+  links: unknown[] = [],
 ) {
   return {
     domain: "eng",
@@ -62,26 +58,32 @@ function detailResponse(
     frontmatter: frontmatter(title, salience),
     observations: [],
     relations,
-    links: [],
+    links,
     inbound: { count: 1, refs: [] },
   };
 }
 
-/** Alpha, with two relations the graph locates. */
-const ALPHA = detailResponse("alpha", "Alpha", 5, [
-  {
-    line: 3,
-    rel_type: "depends_on",
-    resolved: true,
-    target: { domain: null, target: "Beta" },
-  },
-  {
-    line: 4,
-    rel_type: "supersedes",
-    resolved: true,
-    target: { domain: null, target: "Gamma" },
-  },
-]);
+/** Alpha, with two relations the graph locates and one bare prose link. */
+const ALPHA = detailResponse(
+  "alpha",
+  "Alpha",
+  5,
+  [
+    {
+      line: 3,
+      rel_type: "depends_on",
+      resolved: true,
+      target: { domain: null, target: "Beta" },
+    },
+    {
+      line: 4,
+      rel_type: "supersedes",
+      resolved: true,
+      target: { domain: null, target: "Gamma" },
+    },
+  ],
+  [{ line: 5, resolved: true, target: { domain: null, target: "Beta" } }],
+);
 
 /** The neighbourhood: Alpha and its two targets, one hop out. */
 const GRAPH = {
@@ -297,5 +299,72 @@ describe("loadPlace", () => {
       loadPlace(client, "eng", "alpha", controller.signal),
     ).rejects.toMatchObject({ name: "AbortError" });
     expect(apiMock).not.toHaveBeenCalled();
+  });
+  it("still builds the room when the domain listing fails", async () => {
+    serve({
+      "/domains": () => {
+        throw new ApiProblem(500, "boom", "listing failed");
+      },
+    });
+    const loaded = await loadPlace(client, "eng", "alpha");
+    expect(loaded.kind).toBe("place");
+    if (loaded.kind !== "place") {
+      return;
+    }
+    // A bare link still resolves without the listing.
+    expect(loaded.place.links[0]?.address).toEqual({
+      domain: "eng",
+      permalink: "notes/beta",
+    });
+  });
+
+  it("reuses a fresh detail on a second load within the stale window", async () => {
+    serve();
+    await loadPlace(client, "eng", "alpha");
+    await loadPlace(client, "eng", "alpha");
+    const detailCalls = requested().filter(
+      (path) => path === "/domains/eng/engrams/alpha",
+    );
+    expect(detailCalls).toHaveLength(1);
+    expect(requested().filter((path) => path === GAMMA_PATH)).toHaveLength(1);
+    expect(GAME_STALE_MS).toBe(30_000);
+  });
+
+  it("rejects at once when aborted while the detail still hangs", async () => {
+    const controller = new AbortController();
+    serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
+    const pending = loadPlace(client, "eng", "alpha", controller.signal);
+    await Promise.resolve();
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("rejects with an AbortError when aborted during the target round", async () => {
+    const controller = new AbortController();
+    serve({
+      [GAMMA_PATH]: () => {
+        controller.abort();
+        return detailResponse("gamma", "Gamma", 8);
+      },
+    });
+    const error: unknown = await loadPlace(
+      client,
+      "eng",
+      "alpha",
+      controller.signal,
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DOMException);
+    expect((error as DOMException).name).toBe("AbortError");
+  });
+
+  it("reads a query the session cancelled as an AbortError", async () => {
+    const controller = new AbortController();
+    serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
+    const pending = loadPlace(client, "eng", "alpha", controller.signal);
+    await Promise.resolve();
+    // The session's order: abort the load, then cancel what it started.
+    controller.abort();
+    await client.cancelQueries({ queryKey: engramDetailKey("eng", "alpha") });
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });

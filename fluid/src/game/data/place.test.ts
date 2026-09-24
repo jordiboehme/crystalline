@@ -292,6 +292,22 @@ describe("placeFromDetail without a graph", () => {
   });
 });
 
+describe("placeFromDetail without a domain listing", () => {
+  it("still locates bare and prefixed links when the listing is unknown", () => {
+    const place = placeFromDetail({ ...SOURCES, domains: undefined });
+    const link = byTarget(place.links);
+    const relation = byTarget(place.relations);
+    expect(relation("Reactor Core")?.address).toEqual({
+      domain: "eng",
+      permalink: "reactor-core",
+    });
+    expect(link("Runbook")?.address).toEqual({
+      domain: "ops",
+      permalink: "runbook",
+    });
+  });
+});
+
 describe("placeFromDetail fields", () => {
   const place = placeFromDetail(SOURCES);
 

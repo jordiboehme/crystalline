@@ -50,11 +50,17 @@ import {
  * built, with every resolved reference sealed and no hatches. `targetSalience`
  * holds each located target's salience keyed by `placeKeyOf`, null (or no
  * entry) where it could not be fetched; it picks the door style.
+ *
+ * `domains` is undefined when the domain listing could not be read. That is
+ * not the same as an empty list: an empty list tells the resolver that no
+ * prefix names a domain, while undefined tells it this caller cannot tell, and
+ * it falls back to the behaviour the reading screen has before its listing
+ * lands. A listing outage therefore degrades the room instead of failing it.
  */
 export interface PlaceSources {
   detail: EngramDetail;
   graph: GraphNeighborhood | null;
-  domains: readonly string[];
+  domains: readonly string[] | undefined;
   inbound: InboundRefPage | null;
   targetSalience: ReadonlyMap<string, number | null>;
 }
