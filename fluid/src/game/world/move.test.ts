@@ -6,6 +6,7 @@ import {
   MAX_PITCH,
   PLAYER_RADIUS,
   blockersFor,
+  footprint,
   spawnPlayer,
   stepPlayer,
   type Intent,
@@ -19,6 +20,15 @@ const idle: Intent = { forward: 0, strafe: 0, turn: 0, lookDx: 0, lookDy: 0 };
 function run(p: Player, intent: Intent, ticks: number) {
   let q = p;
   for (let i = 0; i < ticks; i++) q = stepPlayer(q, intent, room, blockers);
+  return q;
+}
+
+/** Steps until `stop` is true or 2000 ticks pass, whichever comes first. */
+function walkUntil(p: Player, intent: Intent, stop: (q: Player) => boolean) {
+  let q = p;
+  for (let i = 0; i < 2000 && !stop(q); i++) {
+    q = stepPlayer(q, intent, room, blockers);
+  }
   return q;
 }
 
@@ -64,16 +74,39 @@ describe("stepPlayer", () => {
   });
 
   it("does not walk through a fixture", () => {
-    let p = spawnPlayer(room);
-    p = run(p, { ...idle, forward: 1 }, 400);
-    for (const b of blockers) {
-      const inside =
-        p.x > b.x0 - PLAYER_RADIUS + 1e-6 &&
-        p.x < b.x1 + PLAYER_RADIUS - 1e-6 &&
-        p.z > b.z0 - PLAYER_RADIUS + 1e-6 &&
-        p.z < b.z1 + PLAYER_RADIUS - 1e-6;
-      expect(inside).toBe(false);
+    // A straight walk up the spawn column never meets a fixture (every
+    // terminal and machine sits off to the side), so this drives the player
+    // sideways into one of each kind instead: north to a fixture's depth,
+    // then into its wall. The target box comes straight from the room's own
+    // fixtures via `footprint`, not from `blockers`, so this stays a live
+    // check of `stepPlayer`'s collision even if `blockersFor` broke.
+    const terminalFixture = room.fixtures.find((f) => f.kind === "terminal");
+    const machineFixture = room.fixtures.find((f) => f.kind === "machine");
+    if (!terminalFixture || !machineFixture) {
+      throw new Error(
+        "the canned room has no terminal or machine to walk into",
+      );
     }
+
+    const terminal = footprint(terminalFixture.slot);
+    const terminalZ = (terminal.z0 + terminal.z1) / 2;
+    let west = walkUntil(
+      spawnPlayer(room),
+      { ...idle, forward: 1 },
+      (p) => p.z <= terminalZ,
+    );
+    west = run(west, { ...idle, strafe: -1 }, 400);
+    expect(west.x).toBeGreaterThanOrEqual(terminal.x1 + PLAYER_RADIUS - 1e-6);
+
+    const machine = footprint(machineFixture.slot);
+    const machineZ = (machine.z0 + machine.z1) / 2;
+    let east = walkUntil(
+      spawnPlayer(room),
+      { ...idle, forward: 1 },
+      (p) => p.z <= machineZ,
+    );
+    east = run(east, { ...idle, strafe: 1 }, 400);
+    expect(east.x).toBeLessThanOrEqual(machine.x0 - PLAYER_RADIUS + 1e-6);
   });
 
   it("slides along a wall instead of sticking to it", () => {
