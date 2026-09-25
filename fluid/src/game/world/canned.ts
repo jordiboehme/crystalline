@@ -592,9 +592,13 @@ export function galleryRoom(): RoomSpec {
  * sword's blue stand (`light-sword` 1) instead, the nearest legal kind
  * (`curioFits`) that isn't already shown elsewhere in the gallery.
  *
- * Every seed is `seedFor(seed, "curio", host, j)`, `j` the surface's own
- * index in its host's table. No host is added beyond what the gallery
- * already carries.
+ * Every seed is `seedFor(seed, "curio", host, j, s.key[0], s.key[1])`, `j`
+ * the surface's own index in its host's table and `s.key`'s anchor ints
+ * the surface's own position (C9): `host` and `j` alone collide for a kind
+ * whose per-variant table always holds one surface (the filing cabinet's
+ * top, `j` always 0), since two instances of the same prop kind then share
+ * both; the anchor ints tell them apart, since no two hosts stand at the
+ * same point. No host is added beyond what the gallery already carries.
  */
 function galleryCurios(seed: number, room: RoomSpec): Curio[] {
   const surfaces = hostSurfaces(room);
@@ -616,7 +620,14 @@ function galleryCurios(seed: number, room: RoomSpec): Curio[] {
     variant: number,
     j: number,
   ): Curio =>
-    curioOn(s, kind, variant, 0.5, 0.5, seedFor(seed, "curio", s.host, j));
+    curioOn(
+      s,
+      kind,
+      variant,
+      0.5,
+      0.5,
+      seedFor(seed, "curio", s.host, j, s.key[0], s.key[1]),
+    );
 
   return [
     place(firstOf("terminal", "desk"), "pocket-console", 0, 0),
@@ -1047,14 +1058,23 @@ export function heroHallRoom(): RoomSpec {
  * extent along the row's axis is simply its `width` when the row runs along
  * the host's local `a` axis and its `depth` when it runs along `d`.
  * `curioOn` places each item's centre at the cumulative offset, centred on
- * the cross axis. Every curio in a row takes the surface's own turn.
+ * the cross axis. Every curio in a row takes the surface's own turn. Throws,
+ * naming the host and the kind, when an item does not fit the row's own
+ * budget (`surfaceLen - 2 * CURIO_MARGIN`), whether because the item alone
+ * is too big for the surface or because the items before it in the row
+ * already used the space: a hand-built row is trusted arithmetic (H15's own
+ * "fits by the Baselines numbers"), so a row that does not fit is a bug in
+ * this file, never a silent overlap. Exported for `canned.test.ts`'s own
+ * direct test of the throw; `heroHallCurios` is its only production
+ * caller.
  */
-function row(
+export function row(
   s: HostSurface,
   items: readonly { kind: CurioKind; variant: number; seed: number }[],
 ): Curio[] {
   const alongX = s.box.x1 - s.box.x0 >= s.box.z1 - s.box.z0;
   const surfaceLen = alongX ? s.box.x1 - s.box.x0 : s.box.z1 - s.box.z0;
+  const budget = surfaceLen - 2 * CURIO_MARGIN;
   const sideways = (((Math.round(s.turn) % 4) + 4) % 4) % 2 === 1;
   const extentOf = (kind: CurioKind, variant: number): number => {
     const size = CURIO_CATALOGUE[kind].sizes[variant];
@@ -1069,6 +1089,11 @@ function row(
   const out: Curio[] = [];
   for (const it of items) {
     const len = extentOf(it.kind, it.variant);
+    if (pos + len > budget) {
+      throw new Error(
+        `row: ${it.kind} does not fit ${s.host} (over budget by ${(pos + len - budget).toFixed(3)} m)`,
+      );
+    }
     const slack = surfaceLen - len - 2 * CURIO_MARGIN;
     const frac = slack > 0 ? pos / slack : 0;
     out.push(

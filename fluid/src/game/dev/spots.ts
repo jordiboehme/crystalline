@@ -21,16 +21,17 @@
  * pitch is always 0).
  */
 
-import { curioBox, curioSize } from "../world/curios";
+import { curioBox, curioSize, hostSurfaces } from "../world/curios";
 import {
   HERO_FRONT,
+  decorFootprint,
   footprint,
   footprintOf,
   heroFootprint,
   heroTurn,
   propFootprint,
 } from "../world/footprints";
-import { HERO_KINDS } from "../world/heroes";
+import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn, wallPoint } from "../world/interact";
 import { isFloor } from "../world/layout";
 import {
@@ -203,14 +204,185 @@ export const CURIO_STEP = 0.1;
 /** How many `CURIO_STEP` steps `frameCurio` tries, from `CURIO_NEAR` to `CURIO_FAR` inclusive. */
 const CURIO_STEPS = Math.round((CURIO_FAR - CURIO_NEAR) / CURIO_STEP);
 
+/** An axis-aligned 3D box: `Box` (world x/z) plus a floor-to-ceiling height range. */
+interface Volume extends Box {
+  y0: number;
+  y1: number;
+}
+
 /**
- * A spot that frames curio `c` close and tilted down (C18): along each of
+ * How thick a host's own top surface is treated as, in metres, for the
+ * sight-line check (`occludersFor`): thin enough that it never reaches into
+ * the space a curio standing on it occupies, thick enough to be a real 3D
+ * box a line can be tested against rather than a degenerate plane.
+ */
+const SLAB_THICKNESS = 0.05;
+
+/**
+ * Every solid volume in `room` a curio-framing sight line must not cross,
+ * other than `c`'s own box (H15's browser-shots review, item 4): every
+ * fixture's, decor piece's and floor prop's footprint (`footprintOf`,
+ * `decorFootprint`, `propFootprint`) stood up from the floor to
+ * `EYE_HEIGHT` (the room model carries no taller per-kind height for these,
+ * and nothing here needs to see over furniture taller than a standing
+ * eye), every hero's footprint stood up to its own `HERO_CATALOGUE[kind]
+ * .top`, and every host surface's own box as a thin slab at its own `h`
+ * (`hostSurfaces`, `SLAB_THICKNESS`) - the desktop a curio sits under
+ * counts as an occluder this way, without a new geometry table, since it
+ * is already in the room model curios are placed from.
+ *
+ * The one host `c` itself stands on or under (found the way
+ * `canned.test.ts`'s own `hostOf` does, by its box and height) is left out
+ * twice over: its fixture, decor, prop or hero record is skipped from the
+ * footprint pass (so a sight line is free to reach in under or past the
+ * very thing `c` is mounted to), and its own surface is skipped from the
+ * slab pass (so `c` never occludes the line drawn to its own centre).
+ */
+function occludersFor(room: RoomSpec, c: Curio): Volume[] {
+  const surfaces = hostSurfaces(room);
+  const box = curioBox(c);
+  const ownSurface = surfaces.find(
+    (s) =>
+      Math.abs(s.h - c.h) < 1e-6 &&
+      box.x0 >= s.box.x0 - 1e-6 &&
+      box.x1 <= s.box.x1 + 1e-6 &&
+      box.z0 >= s.box.z0 - 1e-6 &&
+      box.z1 <= s.box.z1 + 1e-6,
+  );
+  const ownAnchor: object | undefined = ownSurface?.anchorOf;
+  const out: Volume[] = [];
+  for (const f of room.fixtures) {
+    if ((f as object) === ownAnchor) continue;
+    const fp = footprintOf(f);
+    if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
+  }
+  for (const d of room.decor) {
+    if ((d as object) === ownAnchor) continue;
+    const fp = decorFootprint(d);
+    if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
+  }
+  for (const p of room.props) {
+    if ((p as object) === ownAnchor) continue;
+    const fp = propFootprint(p);
+    if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
+  }
+  for (const h of room.heroes) {
+    if ((h as object) === ownAnchor) continue;
+    out.push({
+      ...heroFootprint(h),
+      y0: 0,
+      y1: HERO_CATALOGUE[h.kind].top,
+    });
+  }
+  for (const s of surfaces) {
+    if (s === ownSurface) continue;
+    out.push({ ...s.box, y0: s.h, y1: s.h + SLAB_THICKNESS });
+  }
+  return out;
+}
+
+/** The tolerance `segmentHitsBox` treats a near-parallel or near-zero span as exactly zero. */
+const EPS = 1e-9;
+
+/** A point in world metres, `y` up. */
+interface Point3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/**
+ * Shrinks `[tMin, tMax]` (a segment's own parameter range, `P(t) = p0 + t *
+ * (p1 - p0)`) to where the segment lies between `lo` and `hi` on one axis,
+ * given that axis's own two coordinates: `[NaN, NaN]` when the segment runs
+ * parallel to the axis and outside the slab there (never crosses on any
+ * axis), the unchanged range when parallel and inside it (that axis never
+ * narrows the range), else the ordinary two-plane intersection. One call
+ * per axis is `segmentHitsBox`'s slab method.
+ */
+function narrowRange(
+  tMin: number,
+  tMax: number,
+  p0: number,
+  p1: number,
+  lo: number,
+  hi: number,
+): readonly [number, number] {
+  const d = p1 - p0;
+  if (Math.abs(d) < EPS) {
+    return p0 < lo || p0 > hi ? [NaN, NaN] : [tMin, tMax];
+  }
+  const a = (lo - p0) / d;
+  const b = (hi - p0) / d;
+  const t0 = Math.min(a, b);
+  const t1 = Math.max(a, b);
+  return [Math.max(tMin, t0), Math.min(tMax, t1)];
+}
+
+/**
+ * True when the segment from `p0` to `p1` (world metres) crosses `v`'s
+ * interior: the standard slab method, narrowing `[tMin, tMax]` on each axis
+ * in turn (`narrowRange`). `tMin < tMax` (not `<=`) at the end means merely
+ * touching a face, as a segment ending exactly on a volume's boundary does,
+ * does not count as crossing it.
+ */
+function segmentHitsBox(p0: Point3, p1: Point3, v: Volume): boolean {
+  let [tMin, tMax] = narrowRange(0, 1, p0.x, p1.x, v.x0, v.x1);
+  [tMin, tMax] = narrowRange(tMin, tMax, p0.y, p1.y, v.y0, v.y1);
+  [tMin, tMax] = narrowRange(tMin, tMax, p0.z, p1.z, v.z0, v.z1);
+  return tMin < tMax;
+}
+
+/**
+ * True when the segment from `eye` to `target` crosses none of `occluders`:
+ * the shared predicate both `frameCurio`'s own search (given the occluders
+ * it computed once for its curio) and `curioSightClear` (given a fresh
+ * `occludersFor`, for a test's one-off check) apply.
+ */
+function sightClear(
+  eye: Point3,
+  target: Point3,
+  occluders: readonly Volume[],
+): boolean {
+  return !occluders.some((v) => segmentHitsBox(eye, target, v));
+}
+
+/**
+ * True when the sight line from world point `from` at eye height to curio
+ * `c`'s middle crosses no occluding volume (`occludersFor`): the exact
+ * predicate `frameCurio`'s own search applies at every candidate, exported
+ * so `spots.test.ts` can check a forced curio's chosen spot with it
+ * directly (2.6b's browser-shots review, item 4).
+ */
+export function curioSightClear(
+  room: RoomSpec,
+  from: { x: number; z: number },
+  c: Curio,
+): boolean {
+  const box = curioBox(c);
+  const cx = (box.x0 + box.x1) / 2;
+  const cz = (box.z0 + box.z1) / 2;
+  const midY = c.h + curioSize(c).top / 2;
+  return sightClear(
+    { x: from.x, y: EYE_HEIGHT, z: from.z },
+    { x: cx, y: midY, z: cz },
+    occludersFor(room, c),
+  );
+}
+
+/**
+ * A spot that frames curio `c` close and tilted down (C18), with a clear
+ * sight line to it (2.6b's browser-shots review, item 4): along each of
  * `sidesOf(c)`'s four directions (front, right, left, back; back first
  * when `back`), the distance from the curio's centre grows from
- * `CURIO_NEAR` by `CURIO_STEP` up to `CURIO_FAR`, and the first spot whose
- * player circle is on the floor and clear of every blocker wins. Its pitch
- * looks at the curio's middle (`c.h` plus half its top height), clamped to
- * `MAX_PITCH`. Null when nothing along any side and distance works.
+ * `CURIO_NEAR` by `CURIO_STEP` up to `CURIO_FAR`. Among the spots whose
+ * player circle is on the floor and clear of every blocker, the first one
+ * whose sight line (eye height to the curio's middle) crosses no volume of
+ * `occludersFor` wins (`sightClear`); when none does, the search's first
+ * standable spot wins instead, exactly as it did before this ruling, so
+ * the seam never gives up a spot it used to find. Its pitch looks at the
+ * curio's middle (`c.h` plus half its top height), clamped to `MAX_PITCH`.
+ * Null when no side and distance stands the player at all.
  */
 function frameCurio(
   room: RoomSpec,
@@ -226,6 +398,10 @@ function frameCurio(
   const all = sidesOf(front);
   const order = back ? [3, 0, 1, 2] : [0, 1, 2, 3];
   const top = curioSize(c).top;
+  const midY = c.h + top / 2;
+  const target: Point3 = { x: cx, y: midY, z: cz };
+  const occluders = occludersFor(room, c);
+  let fallback: { spawn: RoomSpec["spawn"]; pitch: number } | null = null;
   for (const i of order) {
     const dir = all[i];
     if (dir === undefined) continue;
@@ -234,25 +410,29 @@ function frameCurio(
       const px = cx + dir[0] * dist;
       const pz = cz + dir[1] * dist;
       if (
-        onFloor(px, pz) &&
-        !blockers.some((b) => circleOverlapsBox(px, pz, b))
+        !onFloor(px, pz) ||
+        blockers.some((b) => circleOverlapsBox(px, pz, b))
       ) {
-        const pitch = Math.max(
-          -MAX_PITCH,
-          Math.min(MAX_PITCH, -Math.atan2(EYE_HEIGHT - (c.h + top / 2), dist)),
-        );
-        return {
-          spawn: {
-            x: px / CELL - 0.5,
-            y: pz / CELL - 0.5,
-            yaw: Math.atan2(dir[0], dir[1]),
-          },
-          pitch,
-        };
+        continue;
       }
+      const pitch = Math.max(
+        -MAX_PITCH,
+        Math.min(MAX_PITCH, -Math.atan2(EYE_HEIGHT - midY, dist)),
+      );
+      const found = {
+        spawn: {
+          x: px / CELL - 0.5,
+          y: pz / CELL - 0.5,
+          yaw: Math.atan2(dir[0], dir[1]),
+        },
+        pitch,
+      };
+      fallback ??= found;
+      const eye: Point3 = { x: px, y: EYE_HEIGHT, z: pz };
+      if (sightClear(eye, target, occluders)) return found;
     }
   }
-  return null;
+  return fallback;
 }
 
 /**

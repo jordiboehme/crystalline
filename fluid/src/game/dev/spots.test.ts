@@ -10,7 +10,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { galleryRoom, heroHallRoom } from "../world/canned";
+import {
+  CANNED_BRIDGE,
+  CANNED_HUB,
+  CANNED_WORKSHOP,
+  galleryRoom,
+  heroHallRoom,
+} from "../world/canned";
 import { curioBox, curioSize, CURIO_KINDS } from "../world/curios";
 import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
 import { HERO_KINDS } from "../world/heroes";
@@ -18,12 +24,15 @@ import { wallFacingSpawn } from "../world/interact";
 import { isFloor } from "../world/layout";
 import { blockersFor, EYE_HEIGHT, MAX_PITCH, spawnPlayer } from "../world/move";
 import { PROP_KINDS } from "../world/props";
-import type { Box, Fixture, RoomSpec } from "../world/types";
+import type { Box, Curio, Fixture, Hero, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
+import { GAME_VERSION } from "../version";
+import { roomWithForcedCurio } from "./demo";
 import {
   CURIO_FAR,
   SPOT_KINDS,
   circleOverlapsBox,
+  curioSightClear,
   spotSpawn,
   spotView,
 } from "./spots";
@@ -245,5 +254,120 @@ describe("spotView (C18)", () => {
         false,
       );
     }
+  });
+});
+
+describe("frameCurio's sight line (browser-shots review item 4)", () => {
+  /**
+   * A bare 10 by 10 floor, one curio at its centre and, unless overridden,
+   * nothing else: enough of a `RoomSpec` for `spotView`'s curio branch,
+   * `blockersFor` and `occludersFor` to run on.
+   */
+  function bareRoom(curios: Curio[], heroes: Hero[] = []): RoomSpec {
+    return {
+      version: GAME_VERSION,
+      seed: 0,
+      domain: "test",
+      permalink: "sight-line",
+      title: "Sight Line",
+      archetype: "engineering",
+      condition: "clean",
+      width: 10,
+      depth: 10,
+      grid: Array.from({ length: 10 }, () => ".".repeat(10)),
+      hall: { x0: 0, y0: 0, x1: 10, y1: 10 },
+      bays: [],
+      corridor: null,
+      entrance: { x: 5, y: 9 },
+      ceiling: 4,
+      spawn: { x: 5, y: 9, yaw: 0 },
+      fixtures: [],
+      decor: [],
+      scaffold: [],
+      heroes,
+      props: [],
+      curios,
+      lights: [],
+      dropped: 0,
+      inboundMore: 0,
+    };
+  }
+
+  it("moves the spot on when a box sits on the first candidate's sight line", () => {
+    // A star ball at cell (5, 5) (world 10, 10), turn 0 (front north, -z).
+    const curio: Curio = {
+      kind: "star-ball",
+      variant: 0,
+      x: 5,
+      y: 5,
+      h: 0.7,
+      turn: 0,
+      seed: 1,
+    };
+    // A flush hero (no movement collision, `heroBlocker` null for
+    // `HERO_FOOTING["eye-panel"] === "flush"`) whose footprint still
+    // stands in `occludersFor`: a 0.9 by 0.25 m panel spanning world z
+    // 9.30 to 9.55, squarely between the curio (z 10) and every one of the
+    // front side's candidates (z 9.2 down to 7.0, `CURIO_NEAR` to
+    // `CURIO_FAR` north of it), so the whole front side is blocked and the
+    // search must move to the right side instead, where nothing stands.
+    const panel: Hero = {
+      kind: "eye-panel",
+      variant: 0,
+      x: 5,
+      y: 4.775,
+      turn: 0,
+      seed: 2,
+    };
+    const room = bareRoom([curio], [panel]);
+
+    const view = spotView(room, "prop:star-ball:0");
+    expect(view).not.toBeNull();
+    if (view === null) return;
+    const player = spawnPlayer({ ...room, spawn: view.spawn });
+    // The right side's first candidate, 0.8 m east of the curio's centre.
+    expect(player.x).toBeCloseTo(10.8, 6);
+    expect(player.z).toBeCloseTo(10, 6);
+    expect(curioSightClear(room, { x: player.x, z: player.z }, curio)).toBe(
+      true,
+    );
+
+    // The front side's own first candidate (the pre-fix answer) is not
+    // where the player ends up, and is indeed blocked by the panel.
+    expect(curioSightClear(room, { x: 10, z: 9.2 }, curio)).toBe(false);
+  });
+});
+
+describe("frameCurio's sight line on real rooms (browser-shots review item 4)", () => {
+  /** The forced curio's own spot, the world point `spotView` sent the player to. */
+  function forcedSpot(room: RoomSpec, kind: string) {
+    const view = spotView(room, `prop:${kind}:0`);
+    if (view === null) throw new Error(`no spot for ${kind}`);
+    const player = spawnPlayer({ ...room, spawn: view.spawn });
+    return { x: player.x, z: player.z };
+  }
+
+  it("finds a clear spot for a forced trap-box in the canned bridge", () => {
+    const { room, placed } = roomWithForcedCurio(CANNED_BRIDGE, "trap-box");
+    expect(placed).toBe("trap-box");
+    const c = room.curios.find((x) => x.kind === "trap-box");
+    if (c === undefined) throw new Error("no trap-box placed");
+    expect(curioSightClear(room, forcedSpot(room, "trap-box"), c)).toBe(true);
+  });
+
+  it("finds a clear spot for a forced trap-box in the canned workshop", () => {
+    const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, "trap-box");
+    expect(placed).toBe("trap-box");
+    const c = room.curios.find((x) => x.kind === "trap-box");
+    if (c === undefined) throw new Error("no trap-box placed");
+    expect(curioSightClear(room, forcedSpot(room, "trap-box"), c)).toBe(true);
+  });
+
+  it("finds a clear spot for a forced fuel-case in the hub", () => {
+    const { room, placed } = roomWithForcedCurio(CANNED_HUB, "fuel-case");
+    expect(placed).toBe("fuel-case");
+    const c = room.curios.find((x) => x.kind === "fuel-case");
+    if (c === undefined) throw new Error("no fuel-case placed");
+    expect(curioSightClear(room, forcedSpot(room, "fuel-case"), c)).toBe(true);
   });
 });

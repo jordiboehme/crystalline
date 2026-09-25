@@ -29,6 +29,7 @@ import {
   curioFits,
   curiosClash,
   hostSurfaces,
+  type HostSurface,
 } from "./curios";
 import {
   dressingSites,
@@ -37,7 +38,7 @@ import {
   turnForSide,
   wallAnchor,
 } from "./sites";
-import { galleryRoom, heroHallRoom } from "./canned";
+import { galleryRoom, heroHallRoom, row } from "./canned";
 import type {
   Box,
   DecorKind,
@@ -366,6 +367,22 @@ function circleOverlapsBox(x: number, z: number, b: Box): boolean {
   return dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS;
 }
 
+/**
+ * The host surface a curio's box sits exactly inside, or undefined: shared
+ * by the hero hall's and the gallery's own curio tests.
+ */
+function hostOf(room: RoomSpec, c: RoomSpec["curios"][number]) {
+  const box = curioBox(c);
+  return hostSurfaces(room).find(
+    (s) =>
+      Math.abs(s.h - c.h) < 1e-6 &&
+      box.x0 >= s.box.x0 - 1e-6 &&
+      box.x1 <= s.box.x1 + 1e-6 &&
+      box.z0 >= s.box.z0 - 1e-6 &&
+      box.z1 <= s.box.z1 + 1e-6,
+  );
+}
+
 describe("heroHallRoom", () => {
   const hall = heroHallRoom();
 
@@ -420,19 +437,6 @@ describe("heroHallRoom", () => {
     expect(JSON.stringify(heroHallRoom())).toBe(JSON.stringify(hall));
   });
 
-  /** The host surface a curio's box sits exactly inside, or undefined. */
-  function hostOf(room: RoomSpec, c: (typeof hall.curios)[number]) {
-    const box = curioBox(c);
-    return hostSurfaces(room).find(
-      (s) =>
-        Math.abs(s.h - c.h) < 1e-6 &&
-        box.x0 >= s.box.x0 - 1e-6 &&
-        box.x1 <= s.box.x1 + 1e-6 &&
-        box.z0 >= s.box.z0 - 1e-6 &&
-        box.z1 <= s.box.z1 + 1e-6,
-    );
-  }
-
   it("holds one of every curio kind and variant, each fitting its hero's surface", () => {
     const counts = new Map<string, number>();
     for (const c of hall.curios) {
@@ -466,23 +470,10 @@ describe("heroHallRoom", () => {
 describe("galleryRoom curios", () => {
   const room = galleryRoom();
 
-  /** The host surface a curio's box sits exactly inside, or undefined. */
-  function hostOf(c: (typeof room.curios)[number]) {
-    const box = curioBox(c);
-    return hostSurfaces(room).find(
-      (s) =>
-        Math.abs(s.h - c.h) < 1e-6 &&
-        box.x0 >= s.box.x0 - 1e-6 &&
-        box.x1 <= s.box.x1 + 1e-6 &&
-        box.z0 >= s.box.z0 - 1e-6 &&
-        box.z1 <= s.box.z1 + 1e-6,
-    );
-  }
-
   it("shows a curio on every non-hero host kind", () => {
     const hosts = new Set<string>();
     for (const c of room.curios) {
-      const s = hostOf(c);
+      const s = hostOf(room, c);
       expect(s, c.kind).toBeDefined();
       if (s === undefined) continue;
       expect(curioFits(room, c, s), c.kind).toBe(true);
@@ -502,7 +493,9 @@ describe("galleryRoom curios", () => {
 
     const heights = (host: string) =>
       new Set(
-        room.curios.filter((c) => hostOf(c)?.host === host).map((c) => c.h),
+        room.curios
+          .filter((c) => hostOf(room, c)?.host === host)
+          .map((c) => c.h),
       );
     // terminal: a top and the knee space.
     expect(heights("terminal").size).toBe(2);
@@ -512,5 +505,54 @@ describe("galleryRoom curios", () => {
     expect(heights("prop:storage-shelf").size).toBe(2);
     // prop:filing-cabinet: its two variants' tops.
     expect(heights("prop:filing-cabinet").size).toBe(2);
+  });
+
+  it("gives every curio its own seed, in the gallery and in the hero hall", () => {
+    const hall = heroHallRoom();
+    for (const [name, curios] of [
+      ["gallery", room.curios],
+      ["hero hall", hall.curios],
+    ] as const) {
+      const seeds = curios.map((c) => c.seed);
+      expect(new Set(seeds).size, name).toBe(seeds.length);
+    }
+  });
+});
+
+describe("row", () => {
+  /** A free-standing 0.5 by 0.5 m desk surface, turn 0, for a synthetic row. */
+  const NARROW_DESK: HostSurface = {
+    host: "test:narrow-desk",
+    anchorOf: {},
+    box: { x0: 0, x1: 0.5, z0: 0, z1: 0.5 },
+    h: 0.7,
+    clear: 1.3,
+    cls: "desk",
+    turn: 0,
+    free: true,
+    key: [0, 0, "test-0"],
+  };
+
+  it("throws, naming the host and the kind, when a row does not fit", () => {
+    // The pocket console (0.1 m) fits alone; the laptop (0.41 m) also fits
+    // the 0.46 m budget alone, but not after the console and two gaps have
+    // already used 0.16 m of it (0.16 + 0.41 = 0.57 m, over the 0.46 m
+    // budget): a cumulative overflow `curioOn`'s own per-item size check
+    // never sees, since it only ever looks at one item against the bare
+    // surface.
+    expect(() =>
+      row(NARROW_DESK, [
+        { kind: "pocket-console", variant: 0, seed: 1 },
+        { kind: "beige-laptop", variant: 0, seed: 2 },
+      ]),
+    ).toThrowError(/beige-laptop.*test:narrow-desk/);
+  });
+
+  it("still lays out a row that fits", () => {
+    const curios = row(NARROW_DESK, [
+      { kind: "pocket-console", variant: 0, seed: 1 },
+    ]);
+    expect(curios).toHaveLength(1);
+    expect(curios[0]?.kind).toBe("pocket-console");
   });
 });
