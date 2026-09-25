@@ -944,3 +944,56 @@ fn the_manifest_rules_over_one_text_honour_the_domains_overrides() {
     assert!(found.iter().all(|i| i.rule != "M103"), "{found:#?}");
     assert!(found.iter().any(|i| i.rule == "M004"), "{found:#?}");
 }
+
+#[test]
+fn cross_domain_links_resolve_against_the_manifest_domain_name() {
+    // `a-knowledge/` declares `domain_name: a`, so offline verify must judge
+    // cross-domain links against `a`, not the folder name: `[[a:runbook]]`
+    // resolves cleanly, while `[[a-knowledge:runbook]]` now names a domain
+    // outside the scan set (L006, informational) rather than the domain
+    // itself (which would be L001, a broken link within a known domain).
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a-knowledge");
+    let b = dir.path().join("b");
+    write(
+        &a,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\ndomain_name: a\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+    );
+    write(
+        &a,
+        "runbook.md",
+        "---\ntype: engram\ntitle: Runbook\npermalink: runbook\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Runbook\n\nSome runbook content that is long enough to pass the quality checks.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+    write(
+        &b,
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n",
+    );
+    write(
+        &b,
+        "linker.md",
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[a:runbook]] and [[a-knowledge:runbook]] for details on this thing.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+
+    let report =
+        verify::verify_paths([a.as_path(), b.as_path()], &VerifyOptions::default()).unwrap();
+
+    let link_issues: Vec<_> = report
+        .issues
+        .iter()
+        .filter(|i| i.rule == "L001" || i.rule == "L006")
+        .collect();
+    assert_eq!(
+        link_issues.len(),
+        1,
+        "expected exactly one link issue: {:#?}",
+        report.issues
+    );
+    let issue = link_issues[0];
+    assert_eq!(issue.rule, "L006");
+    assert_eq!(
+        issue.message,
+        "link references domain `a-knowledge`, which is outside the scan set"
+    );
+}
