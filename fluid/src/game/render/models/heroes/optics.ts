@@ -36,7 +36,12 @@ import {
   type KitAt,
   type Surfaces,
 } from "../common";
-import { heroHalf, type HeroRecipe } from "./common";
+import {
+  heroHalf,
+  STATUS_AMBER,
+  STATUS_GREEN,
+  type HeroRecipe,
+} from "./common";
 
 /** The turret's shell: a clean glossy white, the same in every look. */
 const WHITE_SHELL: Rgb = [0.92, 0.92, 0.9];
@@ -94,12 +99,6 @@ const RIG_GREY: Rgb = [0.65, 0.65, 0.63];
 
 /** The laser desk's monitor: a dark cyan glow, a terminal late at night. */
 const DARK_CYAN: Rgb = [0.1, 0.42, 0.48];
-
-/** A status light that says all is well. */
-const STATUS_GREEN: Rgb = [0.25, 1.0, 0.35];
-
-/** A status light that says wait. */
-const STATUS_AMBER: Rgb = [1.0, 0.6, 0.12];
 
 /** The office chair's cushions: a charcoal fabric. */
 const CHAIR_FABRIC: Rgb = [0.16, 0.16, 0.18];

@@ -1,16 +1,18 @@
 /**
  * The workshop heroes' shape tests: what `heroModels.test.ts` does not
  * check for every kind. The gun bench's and the tube bench's catalogue
- * tops lie on an upward face of their mesh; the core wall's light cells
- * cover all eight twinkle groups and never overlap; the big gun is
- * exactly the same part sizes on the rack and the bench, only placed
- * differently; and the tube bench's three tubes all reach the one hub
- * they meet at.
+ * tops lie on an upward face of their mesh; the core wall's lamps cover
+ * all eight twinkle groups and never overlap; the big gun, taken from the
+ * built rack and bench, is the same parts only moved; the tube bench's
+ * three tubes meet at one round hub, two arms up and the stem down; and no
+ * part of any workshop hero floats: each stands on the floor, on its wall
+ * or on another part.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { heroSurfaces } from "../../../world/heroes";
+import { HERO_FOOTING } from "../../../world/footprints";
+import { HERO_CATALOGUE, heroSurfaces } from "../../../world/heroes";
 import type { Hero, HeroKind } from "../../../world/types";
 import { CELL } from "../../../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "../../geometry";
@@ -22,12 +24,12 @@ import {
   reaches,
   recordingKitAt,
   shape,
+  sub,
   toLocal,
   type Part,
+  type Shape,
 } from "../../modelChecks";
-import { surfaces } from "../common";
 import { buildHero, buildHeroMesh } from ".";
-import { bigGun } from "./workshop";
 
 /** A free hero at turn 0, centred on the middle of a cell's width on a row line. */
 function heroAt(kind: HeroKind): Hero {
@@ -38,10 +40,40 @@ function heroAt(kind: HeroKind): Hero {
 const anchorOf = (h: Hero): V3 => [h.x * CELL, 0, h.y * CELL];
 
 /** A hero's recorded parts, built at the origin at turn 0. */
-function partsOf(kind: HeroKind): Part[] {
+function partsOf(kind: HeroKind, variant = 0): Part[] {
   const parts: Part[] = [];
-  buildHero(recordingKitAt(createBuilder(), parts), kind, 0, LOOKS.aperture);
+  buildHero(
+    recordingKitAt(createBuilder(), parts),
+    kind,
+    variant,
+    LOOKS.aperture,
+  );
   return parts;
+}
+
+/** Whether a part is a light in one of the eight blink groups. */
+const blinks = (p: Part) => p.flag >= FLAG.blink && p.flag < FLAG.blink + 8;
+
+/** How far two points lie apart. */
+const gap = (p: V3, q: V3) => Math.hypot(...sub(p, q));
+
+/** The offset that moves part `p` onto part `q` (their first points). */
+const offsetOf = (p: Part, q: Part): V3 =>
+  sub(q.points[0] ?? [0, 0, 0], p.points[0] ?? [0, 0, 0]);
+
+/**
+ * Whether part `q` is part `p` moved by one vector: the same primitive,
+ * the same flag and every point shifted by the same offset (to 1e-6).
+ */
+function sameMoved(p: Part, q: Part): boolean {
+  if (p.method !== q.method || p.flag !== q.flag) return false;
+  if (p.points.length === 0 || p.points.length !== q.points.length)
+    return false;
+  const shift = offsetOf(p, q);
+  return p.points.every((a, i) => {
+    const b = q.points[i];
+    return b !== undefined && gap(sub(b, a), shift) < 1e-6;
+  });
 }
 
 /**
@@ -74,6 +106,15 @@ function upwardFaceAt(mesh: MeshData, x: number, z: number, h: number) {
   return false;
 }
 
+/** The workshop kinds, each tested in every variant. */
+const WORKSHOP_KINDS = [
+  "core-wall",
+  "gun-rack",
+  "gun-bench",
+  "tube-bench",
+  "field-pack",
+] as const satisfies readonly HeroKind[];
+
 describe("workshop hero models", () => {
   it("puts every surface on an upward face of the mesh", () => {
     for (const kind of ["gun-bench", "tube-bench"] as const) {
@@ -93,98 +134,134 @@ describe("workshop hero models", () => {
     }
   });
 
-  it("the core wall's light cells cover all eight groups", () => {
-    const cells = partsOf("core-wall").filter(
-      (p) => p.flag >= FLAG.blink && p.flag < FLAG.blink + 8,
-    );
-    const groups = new Set(cells.map((p) => p.flag - FLAG.blink));
+  it("the core wall's lamps cover all eight groups, many small ones to a cabinet", () => {
+    const lamps = partsOf("core-wall").filter(blinks);
+    const groups = new Set(lamps.map((p) => p.flag - FLAG.blink));
     expect(groups).toEqual(new Set([0, 1, 2, 3, 4, 5, 6, 7]));
-    // BAY_COUNT bays of BAY_ROWS rows each, one glowing strip per row.
-    expect(cells).toHaveLength(6 * 10);
+    // Six cabinets, each a grid of six columns by thirteen rows.
+    expect(lamps).toHaveLength(6 * 6 * 13);
+    for (const lamp of lamps) {
+      const b = shape(lamp.points);
+      expect(b.hi[0] - b.lo[0]).toBeLessThan(0.06);
+      expect(b.hi[1] - b.lo[1]).toBeLessThan(0.06);
+    }
   });
 
-  it("no cell overlaps another", () => {
-    // Every row strip is a flat panel at its bay's own depth, so the
-    // overlap that matters is in the wall's own face, (a, h).
+  it("no lamp overlaps another", () => {
+    // Every lamp is a flat quad on its cabinet's plate, so the overlap that
+    // matters is in the wall's own face, (a, h).
     const f = frameAt([0, 0, 0], 0);
-    const cells = partsOf("core-wall")
-      .filter((p) => p.flag >= FLAG.blink && p.flag < FLAG.blink + 8)
-      .map((p) => p.points.map((q) => toLocal(f, q)));
-    const bounds = (pts: V3[]) =>
-      ([0, 2] as const).map((k) => ({
-        lo: Math.min(...pts.map((p) => p[k])),
-        hi: Math.max(...pts.map((p) => p[k])),
-      }));
-    const overlaps = (p: V3[], q: V3[]) => {
-      const [bp, bq] = [bounds(p), bounds(q)];
-      return bp.every((b, k) => {
-        const c = bq[k];
-        if (!c) return false;
-        return b.lo < c.hi - 1e-6 && c.lo < b.hi - 1e-6;
+    const boxes = partsOf("core-wall")
+      .filter(blinks)
+      .map((p) => {
+        const pts = p.points.map((q) => toLocal(f, q));
+        return ([0, 2] as const).map((k) => ({
+          lo: Math.min(...pts.map((q) => q[k])),
+          hi: Math.max(...pts.map((q) => q[k])),
+        }));
       });
-    };
-    for (let i = 0; i < cells.length; i++)
-      for (let j = i + 1; j < cells.length; j++) {
-        const [ci, cj] = [cells[i], cells[j]];
-        if (!ci || !cj) continue;
-        expect(overlaps(ci, cj), `${String(i)} vs ${String(j)}`).toBe(false);
+    const overlaps = (
+      p: { lo: number; hi: number }[],
+      q: { lo: number; hi: number }[],
+    ) =>
+      p.every((b, k) => {
+        const c = q[k];
+        return c !== undefined && b.lo < c.hi - 1e-6 && c.lo < b.hi - 1e-6;
+      });
+    for (let i = 0; i < boxes.length; i++)
+      for (let j = i + 1; j < boxes.length; j++) {
+        const [bi, bj] = [boxes[i], boxes[j]];
+        if (!bi || !bj) continue;
+        expect(overlaps(bi, bj), `${String(i)} vs ${String(j)}`).toBe(false);
       }
   });
 
   it("the big gun is the same on the rack and the bench", () => {
-    const gunParts = (
-      a0: number,
-      a1: number,
-      d0: number,
-      d1: number,
-      h0: number,
-    ): Part[] => {
-      const builder = createBuilder();
-      const parts: Part[] = [];
-      const kit = recordingKitAt(builder, parts)(frameAt([0, 0, 0], 0));
-      bigGun(kit, surfaces(LOOKS.aperture), a0, a1, d0, d1, h0);
-      return parts;
-    };
-    const rack = gunParts(-0.8, 0.85, 0.06, 0.28, 1.15);
-    const bench = gunParts(-0.5, 0.9, 0.32, 0.54, 0.96);
-    expect(rack.length).toBeGreaterThan(0);
-    expect(rack.length).toBe(bench.length);
-    const extent = (pts: readonly V3[]) =>
-      ([0, 1, 2] as const).map(
-        (k) =>
-          Math.max(...pts.map((p) => p[k])) - Math.min(...pts.map((p) => p[k])),
-      );
-    rack.forEach((p, i) => {
-      const q = bench[i];
-      if (!q) throw new Error(`no matching bench part ${String(i)}`);
-      expect(p.method, `part ${String(i)}`).toBe(q.method);
-      expect(p.flag, `part ${String(i)}`).toBe(q.flag);
-      const [ep, eq] = [extent(p.points), extent(q.points)];
-      ep.forEach((v, k) => {
-        expect(v, `part ${String(i)} axis ${String(k)}`).toBeCloseTo(
-          eq[k] ?? NaN,
-          5,
-        );
-      });
-    });
+    // The longest run of parts, in build order, that the bench repeats from
+    // the rack, each moved by one and the same offset: that run is the gun.
+    const rack = partsOf("gun-rack");
+    const bench = partsOf("gun-bench");
+    let best = { i: 0, j: 0, n: 0 };
+    for (let i = 0; i < rack.length; i++)
+      for (let j = 0; j < bench.length; j++) {
+        const [r0, b0] = [rack[i], bench[j]];
+        if (!r0 || !b0 || !sameMoved(r0, b0)) continue;
+        const shift = offsetOf(r0, b0);
+        let n = 0;
+        for (;;) {
+          const [r, b] = [rack[i + n], bench[j + n]];
+          if (!r || !b || !sameMoved(r, b)) break;
+          if (gap(offsetOf(r, b), shift) > 1e-6) break;
+          n++;
+        }
+        if (n > best.n) best = { i, j, n };
+      }
+    // Stock, body, spine, bezel, window, barrel, three collars, four vent
+    // slots, the muzzle and the grip.
+    expect(best.n).toBe(15);
+    // Every light of either model is the gun's core, all inside the run.
+    const lights = rack.filter(blinks);
+    expect(lights.length).toBeGreaterThan(0);
+    expect(rack.slice(best.i, best.i + best.n).filter(blinks)).toEqual(lights);
+    expect(bench.slice(best.j, best.j + best.n).filter(blinks)).toEqual(
+      bench.filter(blinks),
+    );
   });
 
-  it("the tube bench's three tubes meet at one hub", () => {
+  it("the tube bench's three tubes meet at one round hub, two arms up and the stem down", () => {
     const parts = partsOf("tube-bench");
-    const hub = parts.find(
-      (p) => p.method === "cylinder" && p.flag === FLAG.lit,
-    );
-    if (!hub) throw new Error("no hub part");
-    const hubShape = shape(hub.points);
-    const tubes = parts.filter(
-      (p) => p.flag >= FLAG.blink && p.flag < FLAG.blink + 3,
-    );
+    const tubes = parts
+      .filter(
+        (p) =>
+          p.method === "extrude" &&
+          p.flag >= FLAG.blink &&
+          p.flag < FLAG.blink + 3,
+      )
+      .map((p) => shape(p.points));
     expect(tubes).toHaveLength(3);
-    for (const tube of tubes) {
-      const tubeShape = shape(tube.points);
-      expect(reaches(tubeShape, hubShape) || reaches(hubShape, tubeShape)).toBe(
-        true,
-      );
-    }
+    const hub = parts.find((p) => {
+      if (p.method !== "extrude" || p.flag !== FLAG.lit) return false;
+      const h = shape(p.points);
+      return tubes.every((t) => reaches(t, h) || reaches(h, t));
+    });
+    if (!hub) throw new Error("no hub that all three tubes reach");
+    const hb = shape(hub.points);
+    // Round in the wall's plane: as wide along the wall as it is tall.
+    expect(hb.hi[0] - hb.lo[0]).toBeCloseTo(hb.hi[1] - hb.lo[1], 2);
+    const hubH = (hb.lo[1] + hb.hi[1]) / 2;
+    expect(tubes.filter((t) => t.hi[1] > hubH + 0.05)).toHaveLength(2);
+    expect(tubes.filter((t) => t.lo[1] < hubH - 0.05)).toHaveLength(1);
+  });
+
+  it("stands every part on the floor, its wall or another part", () => {
+    const f = frameAt([0, 0, 0], 0);
+    for (const kind of WORKSHOP_KINDS)
+      for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++) {
+        const parts = partsOf(kind, v).filter((p) => p.points.length > 0);
+        const shapes: Shape[] = parts.map((p) => shape(p.points));
+        const onWall = HERO_FOOTING[kind] !== "free";
+        const held = shapes.map(
+          (s) =>
+            s.lo[1] <= 1e-4 ||
+            (onWall && s.points.some((q) => toLocal(f, q)[1] <= 1e-4)),
+        );
+        for (let changed = true; changed;) {
+          changed = false;
+          shapes.forEach((s, i) => {
+            if (held[i]) return;
+            if (
+              shapes.some((o, j) => held[j] && (reaches(s, o) || reaches(o, s)))
+            ) {
+              held[i] = true;
+              changed = true;
+            }
+          });
+        }
+        const loose = parts
+          .map((p, i) => ({ p, i }))
+          .filter(({ i }) => !held[i])
+          .map(({ p, i }) => `${String(i)}:${p.method}`);
+        expect(loose, `${kind} ${String(v)}`).toEqual([]);
+      }
   });
 });

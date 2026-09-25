@@ -1,6 +1,8 @@
 /**
  * What every hero recipe shares: the shape of a recipe, each kind's blink
- * bank, the sizes a recipe reads and the blockout every kind starts as.
+ * bank, the sizes a recipe reads, the blockout every kind starts as, and
+ * the small pieces more than one batch uses (the status light colours and
+ * `cornerPosts`, a bench's or a rack's legs).
  *
  * A hero mesh is built like a prop's: once per kind, variant and look, at
  * the origin in `frameAt([0, 0, 0], 0)`, and drawn instanced, turned by
@@ -27,9 +29,35 @@ import { FOOTPRINTS, HERO_FOOTING } from "../../../world/footprints";
 import { HERO_CATALOGUE } from "../../../world/heroes";
 import type { HeroKind } from "../../../world/types";
 import type { BlinkBank } from "../../blink";
+import type { Surface } from "../../geometry";
 import type { Kit } from "../../kit";
 import type { Look, Rgb } from "../../looks";
 import type { KitAt, Surfaces } from "../common";
+
+/** A status light that says all is well, shared by every hero that shows one. */
+export const STATUS_GREEN: Rgb = [0.25, 1.0, 0.35];
+
+/** A status light that says wait, shared by every hero that shows one. */
+export const STATUS_AMBER: Rgb = [1.0, 0.6, 0.12];
+
+/**
+ * Square posts standing at every pairing of `as` and `ds` (the outer loop
+ * over `as`, the inner over `ds`), each `2 * half` on a side, from `h0` up
+ * to `h1`: a bench's or a rack's legs.
+ */
+export function cornerPosts(
+  k: Kit,
+  as: readonly number[],
+  ds: readonly number[],
+  half: number,
+  h0: number,
+  h1: number,
+  s: Surface,
+): void {
+  for (const a of as)
+    for (const d of ds)
+      k.box(a - half, a + half, d - half, d + half, h0, h1, s);
+}
 
 /** One hero kind's recipe: builds `variant` of `kind` with `k` in `frameAt([0, 0, 0], 0)`. Pure in kind, variant and look. */
 export type HeroRecipe = (r: {
