@@ -14,7 +14,7 @@
 
 import { FOOTPRINTS, type FloorSize } from "../../../world/footprints";
 import type { FloorPropKind } from "../../../world/types";
-import { sideways, tiltedBar, yawed } from "../common";
+import { profileAlong, tiltedBar, yawed } from "../common";
 import { frameAt, type Kit } from "../../kit";
 import type { Rgb } from "../../looks";
 import type { PropRecipe } from "./common";
@@ -37,11 +37,9 @@ const GLASS: Rgb = [0.85, 0.9, 0.86];
 
 /**
  * A straight rail leaning from `(d0, h0)` to `(d1, h1)`, `thick` wide along
- * `a` and centred there, built by extruding a tilted bar in the `(d, h)`
- * plane through the `sideways` frame: `sideways` maps its `a'` to the old
- * `d` and its extrusion depth to the old `a`, so a profile drawn in `(d, h)`
- * and extruded from `-(a + thick / 2)` to `-(a - thick / 2)` lands exactly
- * on the old `a` band `a - thick / 2 .. a + thick / 2`.
+ * `a` and centred there: a tilted bar drawn in the `(d, h)` side view and
+ * extruded along the wall by `profileAlong`, which owns the side frame's
+ * sign flip, so the rail leans the same way as the rungs laid along it.
  */
 function leaningRail(
   kitAt: Parameters<PropRecipe>[0]["kitAt"],
@@ -58,10 +56,12 @@ function leaningRail(
   const angle = Math.atan2(h1 - h0, d1 - d0);
   const length = Math.hypot(d1 - d0, h1 - h0);
   const bar = tiltedBar(cx, cy, angle, length, thick);
-  kitAt(sideways(frameAt([0, 0, 0], 0))).extrude(
+  profileAlong(
+    kitAt,
+    frameAt([0, 0, 0], 0),
     bar,
-    -(a + thick / 2),
-    -(a - thick / 2),
+    a - thick / 2,
+    a + thick / 2,
     s,
   );
 }

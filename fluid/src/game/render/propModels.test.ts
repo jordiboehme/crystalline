@@ -18,7 +18,9 @@ import {
   floatingGlow,
   inBox,
   positions,
+  reaches,
   recordingKitAt,
+  shape,
   toLocal,
   worstWinding,
   type Part,
@@ -186,5 +188,25 @@ describe("prop models", () => {
     expect(() => buildPropMesh("duct", -1, LOOKS.aperture)).toThrow(
       /no variant -1/,
     );
+  });
+
+  it("lays every ladder rung across both rails, on both variants", () => {
+    // The rails lean in the (d, h) side view and the rungs follow the same
+    // line; a side frame with the wrong sign mirrors the rails in depth, so
+    // they cross the rungs like an X and only the middle rung meets them.
+    for (let variant = 0; variant < PROP_CATALOGUE.ladder.variants; variant++) {
+      const { parts } = buildRecorded("ladder", variant);
+      const rungs = parts.filter((p) => p.method === "cylinderAlong");
+      const rails = parts.filter((p) => p.method === "extrude");
+      expect(rungs.length, `variant ${String(variant)}`).toBeGreaterThan(0);
+      for (const rung of rungs) {
+        const r = shape(rung.points);
+        const touching = rails.filter((rail) => reaches(r, shape(rail.points)));
+        expect(
+          touching.length,
+          `variant ${String(variant)}`,
+        ).toBeGreaterThanOrEqual(2);
+      }
+    }
   });
 });
