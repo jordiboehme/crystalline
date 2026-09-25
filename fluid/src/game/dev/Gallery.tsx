@@ -17,16 +17,22 @@
  * the gallery is no engram. `?bloom=rgba8` forces the RGBA8 bloom path as
  * in the look demo.
  *
- * Two more parameters are dev-only and not on the legend. `?at=<kind>:<n>`
- * (see `spotSpawn`) puts the player in front of the n-th fixture of that
- * kind, facing it, instead of the room's own entrance; use it to judge a
- * malfunctioning fixture without walking across the hall. `?fault=missing`
- * or `?fault=denied` answers every travel with that failure instead of
- * `SIGNAL LOST`, so every open door, portal and hatch in the gallery
- * malfunctions once the player walks into or crawls through it, and stays
- * broken for the rest of the visit. The sealed sliding door (`door:4`) and
- * the sealed portal (`portal:2`) malfunction from the start, with or
- * without `?fault=`.
+ * Three more parameters are dev-only and not on the legend. `?hall=heroes`
+ * shows `heroHallRoom()` (H15) instead of `galleryRoom()`: one of every hero
+ * kind and variant, for judging them and for the `?at=` shots below.
+ * `?at=prop:<kind>:<n>` (H16, see `spotSpawn`) puts the player in front of
+ * the n-th hero or prop of that kind in whichever room is shown, framed
+ * from its front instead of just facing it; `?at=<kind>:<n>` still puts the
+ * player in front of the n-th fixture of that kind, facing it, instead of
+ * the room's own entrance, to judge a malfunctioning fixture without
+ * walking across the hall. `?fault=missing` or `?fault=denied` answers
+ * every travel with that failure instead of `SIGNAL LOST`, so every open
+ * door, portal and hatch in the gallery malfunctions once the player walks
+ * into or crawls through it, and stays broken for the rest of the visit.
+ * The sealed sliding door (`door:4`) and the sealed portal (`portal:2`)
+ * malfunction from the start, with or without `?fault=`. `?fault=` and
+ * `?hall=heroes` are not meant together: the hero hall carries no
+ * malfunctioning fixture.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -37,7 +43,7 @@ import { createSession, type PlaceLoader, type Session } from "../session";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
-import { galleryRoom } from "../world/canned";
+import { galleryRoom, heroHallRoom } from "../world/canned";
 import { spotSpawn } from "./spots";
 
 /** The keys, along the top of the screen. */
@@ -64,7 +70,8 @@ export default function Gallery() {
     const canvas = canvasRef.current;
     if (refusal !== null || canvas === null) return;
     const params = new URLSearchParams(window.location.search);
-    const base = galleryRoom();
+    const base =
+      params.get("hall") === "heroes" ? heroHallRoom() : galleryRoom();
     const at = params.get("at");
     const spawn = at === null ? null : spotSpawn(base, at);
     const fault = params.get("fault");

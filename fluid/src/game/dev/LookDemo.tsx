@@ -17,6 +17,15 @@
  * undressed. The HUD's frame line carries the comparison's other half,
  * `BUILD <ms> MS`: `session.ts` times every `renderer.setRoom` itself.
  *
+ * `?hero=<kind>` (the controller's ruling) forces that hero into the shown
+ * room, through the hero pass's own forced-draws path
+ * (`roomWithForcedHero` in `dev/demo.ts`), so a hero can be judged standing
+ * in a real generated room rather than only in the hand-built hero hall the
+ * model gallery's `?hall=heroes` shows. A kind that finds no fitting place
+ * in this room's archetype or hall falls back to the room drawn without it,
+ * never throwing; the HUD's frame line names the hero once it lands
+ * (`HERO <KIND>`). An unknown kind is ignored, same as an absent `?hero=`.
+ *
  * The screen is `ui/StationView.tsx`, shared with the game route and the
  * model gallery, and its HUD is `ui/Hud.tsx`, the game's own: its text lines are written
  * straight into the DOM through refs, not through React state, because the
@@ -34,7 +43,8 @@ import { DeviceRefusal } from "../ui/DeviceRefusal";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
 import { CANNED_BRIDGE, CANNED_HUB, CANNED_WORKSHOP } from "../world/canned";
-import type { PlaceInput } from "../world/types";
+import { HERO_KINDS } from "../world/heroes";
+import type { HeroKind, PlaceInput } from "../world/types";
 import { startDemo } from "./demo";
 
 /** The keys, along the top of the screen. */
@@ -71,6 +81,14 @@ function placeFor(params: URLSearchParams): PlaceInput {
   };
 }
 
+/** The hero kind `?hero=` names, or undefined for an absent or unknown one. */
+function heroFor(params: URLSearchParams): HeroKind | undefined {
+  const raw = params.get("hero");
+  return raw !== null && (HERO_KINDS as readonly string[]).includes(raw)
+    ? (raw as HeroKind)
+    : undefined;
+}
+
 /**
  * The demo screen. The refusal is decided once, in a lazy state
  * initialiser: the lazy route only renders in a browser, where `window` is
@@ -94,11 +112,13 @@ export default function LookDemo() {
     const canvas = canvasRef.current;
     if (refusal !== null || canvas === null) return;
     const params = new URLSearchParams(window.location.search);
+    const hero = heroFor(params);
     const { session, stop } = startDemo(canvas, sink, {
       forceRgba8: params.get("bloom") === "rgba8",
       openFluid,
       place: placeFor(params),
       props: params.get("props") !== "0",
+      ...(hero === undefined ? {} : { hero }),
     });
     sessionRef.current = session;
     return () => {

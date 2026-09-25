@@ -24,17 +24,24 @@
  * model gallery: one of every model the station draws, machines in bays 1
  * and 2 and set dressing in bays 3 and 4, so each can be walked up to and
  * judged without an engram that happens to need it.
+ *
+ * `heroHallRoom` (H15) is the gallery's second hand-built room, for the
+ * `?hall=heroes` dev route: one of every hero kind and variant, hand-placed
+ * in a 23 by 24 hall with no other fixture, no decor and no props, so
+ * nothing competes with a hero for a screenshot.
  */
 
 import { seedFor } from "../core/seed";
 import { GAME_VERSION } from "../version";
 import { PROP_ORDER } from "./dress";
 import { MACHINE_KINDS, NOT_FOUND, NO_ROUTE, scaffoldFor } from "./generate";
+import { HERO_ORDER } from "./heroes";
 import {
   createSlotPool,
   planLayout,
   wallRuns,
   wallSlots,
+  type Layout,
   type SlotPref,
 } from "./layout";
 import { PROP_CATALOGUE, PROP_KINDS } from "./props";
@@ -43,6 +50,8 @@ import type {
   Decor,
   DecorKind,
   Fixture,
+  Hero,
+  HeroKind,
   LightZone,
   PlaceAddress,
   PlaceInput,
@@ -781,4 +790,179 @@ function galleryProps(
   }
 
   return [...wall, ...floor, ...ceiling].sort(PROP_ORDER);
+}
+
+/**
+ * The need the hero hall's floor plan is sized from (H15). It is not what
+ * the room carries: eleven on the north wall and eleven on the west give
+ * `planLayout` a 23 by 24 hall with no bays and its entrance on column 11,
+ * the hall's own centre column (checked against `planLayout` directly;
+ * `canned.test.ts` does not repin it since only `heroHallRoom`'s own tests
+ * read this hall), which is what lets the slab stand exactly where H9
+ * places it without dodging the entrance lane.
+ */
+const HERO_HALL_NEED = {
+  north: 11,
+  west: 11,
+  east: 0,
+  south: 3,
+  any: 0,
+  hatches: 0,
+};
+
+/** The hero hall's one light level, steady everywhere, as `galleryRoom`'s. */
+const HERO_HALL_LIGHT = 210;
+
+/**
+ * The quarter turn that faces a corner hero towards the hall's centre, as
+ * near as a quarter turn allows (H10): the same rule `placeHeroes` turns a
+ * corner hero by (`faceCentre` in `heroes.ts`), copied here since the hero
+ * hall is hand-built rather than generated and that helper is private to
+ * `heroes.ts`.
+ */
+function faceHallCentre(hall: Rect, x: number, y: number): number {
+  const dx = (hall.x0 + hall.x1) / 2 - x;
+  const dy = (hall.y0 + hall.y1) / 2 - y;
+  if (Math.abs(dy) >= Math.abs(dx)) return dy < 0 ? 0 : 2;
+  return dx > 0 ? 1 : 3;
+}
+
+/** One steady light zone per four by four block that holds any floor, as `galleryRoom`'s. */
+function heroHallLights(roomSeed: number, layout: Layout): LightZone[] {
+  const lights: LightZone[] = [];
+  for (let y0 = 0; y0 < layout.depth; y0 += 4) {
+    for (let x0 = 0; x0 < layout.width; x0 += 4) {
+      const x1 = Math.min(layout.width, x0 + 4);
+      const y1 = Math.min(layout.depth, y0 + 4);
+      const floor = layout.grid
+        .slice(y0, y1)
+        .some((row) => row.slice(x0, x1).includes("."));
+      if (!floor) continue;
+      lights.push({
+        x0,
+        y0,
+        x1,
+        y1,
+        level: HERO_HALL_LIGHT,
+        special: "steady",
+        seed: seedFor(roomSeed, "light", x0, y0),
+      });
+    }
+  }
+  return lights;
+}
+
+/**
+ * The hero hall (H15): a room built by hand rather than generated, holding
+ * one of every hero kind and variant, for judging them in the dev-only
+ * route `/game/dev/gallery?hall=heroes` and for the `?at=prop:<kind>:<n>`
+ * spots that frame each one (`spotSpawn` in `dev/spots.ts`).
+ *
+ * `planLayout(HERO_HALL_NEED)` gives a 23 by 24 hall with no bays and its
+ * entrance on column 11, the hall's own centre column, so the slab stands at
+ * the hall's centre x with its south face touching the entrance lane's north
+ * end (H9) with nothing to shift: had the entrance not fallen on column 11
+ * the slab would move to the hall's centre x and the laser desk off the
+ * column, but it does, so neither moves.
+ *
+ * Every hero is hand-placed at a fixed point: the wall-anchored ones
+ * through `wallAnchor` of a fixed edge (the core wall's two north-wall
+ * edges, x 6 and x 7, combined the way `heroEdges`'s two-edge case combines
+ * them, into the anchor `(7, 0)` at turn 2), the band, corner and centre
+ * ones at fixed coordinates directly, and the turret turned to face the
+ * hall's centre the way a generated room's corner hero would
+ * (`faceHallCentre`, H10). Every hero's seed is `seedFor(seed, "hero",
+ * kind, variant)`, keyed by its kind and variant since a hand-placed room
+ * has no candidate to key a seed by anchor with, and the list is sorted by
+ * `HERO_ORDER`, the order a generated room's own heroes keep.
+ *
+ * No fixture but the placard, which tells the visitor how to frame one hero
+ * at a time (`?AT=PROP:KIND:N`); no decor and no props, so nothing but the
+ * heroes themselves stands between the camera and what is being judged. One
+ * steady light zone per four by four block, as `galleryRoom`'s. The same
+ * call gives the same room byte for byte.
+ */
+export function heroHallRoom(): RoomSpec {
+  const seed = seedFor(GAME_VERSION, "hero-hall");
+  const layout = planLayout(HERO_HALL_NEED);
+  const hall = layout.hall;
+
+  const at = (
+    kind: HeroKind,
+    variant: number,
+    x: number,
+    y: number,
+    turn: number,
+  ): Hero => ({
+    kind,
+    variant,
+    x,
+    y,
+    turn,
+    seed: seedFor(seed, "hero", kind, variant),
+  });
+
+  const wall = (kind: HeroKind, variant: number, edge: WallSlot): Hero => {
+    const a = wallAnchor(edge);
+    return at(kind, variant, a.x, a.y, a.turn);
+  };
+
+  const heroes: Hero[] = [
+    wall("eye-panel", 0, { x: 3, y: 0, side: "n" }),
+    // The core wall's two north-wall edges, x 6 and x 7, anchored between
+    // them, as `heroEdges`'s two-edge case anchors a two-edge wall hero.
+    at("core-wall", 0, 7, 0, 2),
+    wall("gun-rack", 0, { x: 10, y: 0, side: "n" }),
+    wall("photo-console", 0, { x: 13, y: 0, side: "n" }),
+    wall("tube-bench", 0, { x: 16, y: 0, side: "n" }),
+    wall("gun-bench", 0, { x: 19, y: 0, side: "n" }),
+    wall("arcade-cabinet", 0, { x: 0, y: 6, side: "w" }),
+    wall("arcade-cabinet", 1, { x: 0, y: 9, side: "w" }),
+    wall("arcade-cabinet", 2, { x: 0, y: 12, side: "w" }),
+    wall("recruit-cabinet", 0, { x: 0, y: 15, side: "w" }),
+    at("helper-robot", 0, 6.5, 8.5, 1),
+    at("laser-desk", 0, 11.5, 9, 2),
+    at("dome-planters", 0, 6.5, 13.5, 0),
+    at("dome-planters", 1, 16.5, 13.5, 0),
+    // H9: the slab's south face is on the hall's centre line.
+    at("black-slab", 0, 11.5, 11.925, 2),
+    at("sleep-ring", 0, 6.5, 19, 0),
+    at("mess-table", 0, 16.5, 19, 0),
+    at("turret", 0, 21.5, 22.5, faceHallCentre(hall, 21.5, 22.5)),
+    at("field-pack", 0, 1.5, 22.5, 1),
+    at("field-pack", 1, 21.5, 1.5, 2),
+  ].sort(HERO_ORDER);
+
+  return {
+    version: GAME_VERSION,
+    seed,
+    domain: "station",
+    permalink: "hero-hall",
+    title: "Hero Hall",
+    archetype: "engineering",
+    condition: "clean",
+    width: layout.width,
+    depth: layout.depth,
+    grid: layout.grid,
+    hall: layout.hall,
+    bays: layout.bays,
+    corridor: layout.corridor,
+    entrance: { x: layout.entrance.x, y: layout.entrance.y },
+    ceiling: 4,
+    spawn: { x: layout.entrance.x, y: layout.entrance.y, yaw: 0 },
+    fixtures: [
+      {
+        kind: "placard",
+        slot: layout.placard,
+        lines: ["Hero Hall", "ONE OF EVERY", "HERO PROP", "?AT=PROP:KIND:N"],
+      },
+    ],
+    decor: [],
+    scaffold: [],
+    heroes,
+    props: [],
+    lights: heroHallLights(seed, layout),
+    dropped: 0,
+    inboundMore: 0,
+  };
 }

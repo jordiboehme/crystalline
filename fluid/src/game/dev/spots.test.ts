@@ -4,34 +4,24 @@
  * such ordinal, no ordinal at all, or a negative one) gives null. Every
  * spot it accepts on the gallery room, including a terminal or a machine
  * backed off clear of its own footprint, leaves the player's circle
- * overlapping none of the room's blockers.
+ * overlapping none of the room's blockers. `prop:<kind>:<n>` (H16) frames a
+ * hero or a prop instead, from a spot clear of every blocker.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { galleryRoom } from "../world/canned";
+import { galleryRoom, heroHallRoom } from "../world/canned";
+import { heroFootprint, propFootprint } from "../world/footprints";
 import { wallFacingSpawn } from "../world/interact";
-import { PLAYER_RADIUS, blockersFor, spawnPlayer } from "../world/move";
+import { blockersFor, spawnPlayer } from "../world/move";
 import type { Box, Fixture, RoomSpec } from "../world/types";
-import { SPOT_KINDS, spotSpawn } from "./spots";
+import { SPOT_KINDS, circleOverlapsBox, spotSpawn } from "./spots";
 
 /** The slot of the n-th fixture of `kind`, in fixture order. */
 function slotOf(room: RoomSpec, kind: Fixture["kind"], n: number) {
   const f = room.fixtures.filter((x) => x.kind === kind)[n];
   if (f === undefined) throw new Error(`no ${kind} ${String(n)}`);
   return f.slot;
-}
-
-/**
- * True when a circle of the player's radius at (x, z) overlaps the box, the
- * same clamp-and-distance check `move.ts` collides the player with.
- */
-function circleOverlapsBox(x: number, z: number, b: Box): boolean {
-  const nx = Math.max(b.x0, Math.min(x, b.x1));
-  const nz = Math.max(b.z0, Math.min(z, b.z1));
-  const dx = x - nx;
-  const dz = z - nz;
-  return dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS;
 }
 
 describe("spotSpawn", () => {
@@ -95,5 +85,57 @@ describe("spotSpawn", () => {
     const room = galleryRoom();
     const kinds = new Set(room.fixtures.map((f) => f.kind));
     expect(Object.keys(SPOT_KINDS).sort()).toEqual([...kinds].sort());
+  });
+});
+
+describe("prop spots (H16)", () => {
+  const hall = heroHallRoom();
+  const gallery = galleryRoom();
+
+  const looksAt = (room: RoomSpec, spot: string, box: Box) => {
+    const spawn = spotSpawn(room, spot);
+    if (spawn === null) throw new Error(`no spot for ${spot}`);
+    const player = spawnPlayer({ ...room, spawn });
+    const cx = (box.x0 + box.x1) / 2 - player.x;
+    const cz = (box.z0 + box.z1) / 2 - player.z;
+    const len = Math.hypot(cx, cz);
+    // yaw 0 looks north, (-sin yaw, -cos yaw)
+    const dot = (-Math.sin(player.yaw) * cx - Math.cos(player.yaw) * cz) / len;
+    return { player, dot };
+  };
+
+  it("frames every hero of the hero hall, from a spot clear of every blocker", () => {
+    const blockers = blockersFor(hall);
+    const counts = new Map<string, number>();
+    for (const h of hall.heroes) {
+      const n = counts.get(h.kind) ?? 0;
+      counts.set(h.kind, n + 1);
+      const { player, dot } = looksAt(
+        hall,
+        `prop:${h.kind}:${String(n)}`,
+        heroFootprint(h),
+      );
+      expect(dot, h.kind).toBeGreaterThan(0.99);
+      expect(
+        blockers.some((b) => circleOverlapsBox(player.x, player.z, b)),
+        h.kind,
+      ).toBe(false);
+    }
+  });
+
+  it("frames a floor prop of the gallery the same way", () => {
+    const crate = gallery.props.find((p) => p.kind === "crate");
+    if (crate === undefined) throw new Error("the gallery has a crate");
+    const box = propFootprint(crate);
+    if (box === null) throw new Error("a crate has a box");
+    const { dot } = looksAt(gallery, "prop:crate:0", box);
+    expect(dot).toBeGreaterThan(0.99);
+  });
+
+  it("gives null for a kind the room lacks, past the last one, or a bad name", () => {
+    expect(spotSpawn(gallery, "prop:turret:0")).toBeNull();
+    expect(spotSpawn(hall, "prop:turret:1")).toBeNull();
+    expect(spotSpawn(hall, "prop:nothing:0")).toBeNull();
+    expect(spotSpawn(hall, "prop:turret")).toBeNull();
   });
 });

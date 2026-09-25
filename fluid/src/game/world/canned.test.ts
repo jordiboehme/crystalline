@@ -9,17 +9,32 @@ import { describe, expect, it } from "vitest";
 
 import { lightGrid } from "../render/lightgrid";
 import { GAME_VERSION } from "../version";
-import { BAY, isFloor } from "./layout";
-import { decorFootprint, footprintOf, propFootprint } from "./footprints";
-import { blockersFor } from "./move";
+import { BAY, isFloor, wallRuns } from "./layout";
+import {
+  decorFootprint,
+  footprintOf,
+  heroBlocker,
+  heroFootprint,
+  HERO_FOOTING,
+  propFootprint,
+} from "./footprints";
+import { HERO_CATALOGUE, HERO_KINDS, heroEdges } from "./heroes";
+import { blockersFor, PLAYER_RADIUS, spawnPlayer } from "./move";
 import { PROP_CATALOGUE, PROP_KINDS } from "./props";
-import { dressingSites, edgeKey, turnForSide, wallAnchor } from "./sites";
-import { galleryRoom } from "./canned";
+import {
+  dressingSites,
+  edgeKey,
+  fitsFloor,
+  turnForSide,
+  wallAnchor,
+} from "./sites";
+import { galleryRoom, heroHallRoom } from "./canned";
 import type {
   Box,
   DecorKind,
   DoorStyle,
   Fixture,
+  Hero,
   MachineKind,
   Prop,
   RoomSpec,
@@ -327,5 +342,72 @@ describe("galleryRoom", () => {
 
   it("is the same room every time", () => {
     expect(JSON.stringify(galleryRoom())).toBe(JSON.stringify(room));
+  });
+});
+
+/**
+ * True when a circle of the player's radius at (x, z) overlaps the box, the
+ * same clamp-and-distance check `move.ts` collides the player with.
+ */
+function circleOverlapsBox(x: number, z: number, b: Box): boolean {
+  const nx = Math.max(b.x0, Math.min(x, b.x1));
+  const nz = Math.max(b.z0, Math.min(z, b.z1));
+  const dx = x - nx;
+  const dz = z - nz;
+  return dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS;
+}
+
+describe("heroHallRoom", () => {
+  const hall = heroHallRoom();
+
+  it("holds one of every hero kind and variant", () => {
+    const counts = new Map<string, number>();
+    for (const h of hall.heroes) {
+      const key = `${h.kind}:${String(h.variant)}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    const expected = new Map<string, number>();
+    for (const kind of HERO_KINDS)
+      for (let variant = 0; variant < HERO_CATALOGUE[kind].variants; variant++)
+        expected.set(`${kind}:${String(variant)}`, 1);
+    expect(counts).toEqual(expected);
+  });
+
+  it("lets no blocking hero overlap another, and stands every hero on the hall's floor", () => {
+    const blockers: { h: Hero; box: Box }[] = [];
+    for (const h of hall.heroes) {
+      const box = heroBlocker(h);
+      if (box !== null) blockers.push({ h, box });
+    }
+    for (let i = 0; i < blockers.length; i++)
+      for (let j = i + 1; j < blockers.length; j++) {
+        const a = blockers[i];
+        const b = blockers[j];
+        if (a === undefined || b === undefined) continue;
+        expect(overlaps(a.box, b.box), `${a.h.kind} ${b.h.kind}`).toBe(false);
+      }
+
+    const wallEdges = new Set(wallRuns(hall.grid).flat().map(edgeKey));
+    for (const h of hall.heroes) {
+      if (heroBlocker(h) !== null) {
+        expect(fitsFloor(hall, heroFootprint(h)), h.kind).toBe(true);
+      }
+      if (HERO_FOOTING[h.kind] === "free") continue;
+      for (const e of heroEdges(h)) {
+        expect(wallEdges.has(edgeKey(e)), h.kind).toBe(true);
+      }
+    }
+  });
+
+  it("keeps the entrance and the spawn clear", () => {
+    const blockers = blockersFor(hall);
+    const player = spawnPlayer(hall);
+    for (const b of blockers) {
+      expect(circleOverlapsBox(player.x, player.z, b)).toBe(false);
+    }
+  });
+
+  it("is the same room on every call", () => {
+    expect(JSON.stringify(heroHallRoom())).toBe(JSON.stringify(hall));
   });
 });
