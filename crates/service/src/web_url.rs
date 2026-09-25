@@ -27,7 +27,6 @@ use axum::http::HeaderMap;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 
-use crate::rest::OriginRule;
 use crate::serving::{HttpBinding, loopback_connect_addr};
 
 /// The one sentence an unresolved outcome carries, naming the setting that
@@ -59,6 +58,20 @@ pub enum WebBase {
     NoPage,
 }
 
+/// The rule that answers what this instance is called, as the engine needs
+/// it: the configured public address, and the base for one HTTP caller.
+///
+/// The JSON API's `OriginRule` implements it, and the daemon installs that
+/// rule on the engine once it has built the HTTP surface. A trait rather than
+/// the type, because the rule lives with the request handling it shares with
+/// OAuth, above the engine, while the engine is what every surface asks.
+pub trait WebOrigin: Send + Sync {
+    /// `service.public_url` as the rule was built with it.
+    fn public_url(&self) -> Option<&str>;
+    /// The base for the HTTP caller these headers came from.
+    fn request_base(&self, headers: &HeaderMap, ui_enabled: bool) -> WebBase;
+}
+
 /// The base for a caller on this machine: a stdio bridge, the daemon's own
 /// socket, the CLI through the control socket.
 ///
@@ -78,25 +91,6 @@ pub fn local_base(
             WebBase::Known(format!("http://{}", loopback_connect_addr(addr)))
         }
         _ => WebBase::NoPage,
-    }
-}
-
-/// The base for the HTTP caller these headers came from.
-///
-/// The same rule that names the OAuth resource identifier, so the address a
-/// client is told to open and the address its token works at are one answer.
-/// A `Host` this instance does not answer to is a refusal, not a guess, and
-/// reads as [`WebBase::Unresolved`].
-pub fn request_base(rule: &OriginRule, headers: &HeaderMap, ui_enabled: bool) -> WebBase {
-    if let Some(url) = rule.public_url() {
-        return WebBase::Known(url.to_string());
-    }
-    if !ui_enabled {
-        return WebBase::NoPage;
-    }
-    match rule.origin(headers) {
-        Ok(origin) => WebBase::Known(origin),
-        Err(_) => WebBase::Unresolved,
     }
 }
 
@@ -176,32 +170,9 @@ pub fn attach_template(value: &mut Value, base: &WebBase) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header;
-    use crystalline_core::config::{GlobalConfig, ServiceConfig};
 
     fn bound(addr: &str) -> HttpBinding {
         HttpBinding::Bound(addr.to_string())
-    }
-
-    fn headers_with(host: Option<&str>, forwarded: Option<&str>) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        if let Some(host) = host {
-            headers.insert(header::HOST, host.parse().unwrap());
-        }
-        if let Some(proto) = forwarded {
-            headers.insert("x-forwarded-proto", proto.parse().unwrap());
-        }
-        headers
-    }
-
-    fn config_with_public_url(public_url: Option<&str>) -> GlobalConfig {
-        GlobalConfig {
-            service: Some(ServiceConfig {
-                public_url: public_url.map(str::to_string),
-                ..ServiceConfig::default()
-            }),
-            ..GlobalConfig::default()
-        }
     }
 
     #[test]
@@ -270,54 +241,6 @@ mod tests {
             local_base(Some("https://kb.example.com"), None, false),
             WebBase::Known("https://kb.example.com".to_string())
         );
-    }
-
-    #[test]
-    fn a_request_base_follows_the_origin_rule() {
-        let listed = ["kb.example.com".to_string()];
-        let rule = OriginRule::from_config(&config_with_public_url(None), &listed);
-        assert_eq!(
-            request_base(
-                &rule,
-                &headers_with(Some("kb.example.com"), Some("https")),
-                true
-            ),
-            WebBase::Known("https://kb.example.com".to_string())
-        );
-        assert_eq!(
-            request_base(&rule, &headers_with(Some("evil.example"), None), true),
-            WebBase::Unresolved,
-            "a Host this instance does not answer to names no page"
-        );
-        assert_eq!(
-            request_base(&rule, &headers_with(None, None), true),
-            WebBase::Unresolved,
-            "and a request that says nothing about where it arrived names none either"
-        );
-        assert_eq!(
-            request_base(
-                &rule,
-                &headers_with(Some("kb.example.com"), Some("https")),
-                false
-            ),
-            WebBase::NoPage,
-            "with the UI off and no configured address there is no page at all"
-        );
-
-        let configured = OriginRule::from_config(
-            &config_with_public_url(Some("https://kb.example.com")),
-            &listed,
-        );
-        for headers in [
-            headers_with(Some("evil.example"), None),
-            headers_with(None, None),
-        ] {
-            assert_eq!(
-                request_base(&configured, &headers, true),
-                WebBase::Known("https://kb.example.com".to_string()),
-                "the configured address answers whatever the request says"
-            );
-        }
     }
 
     #[test]

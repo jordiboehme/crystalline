@@ -950,7 +950,7 @@ pub struct Engine {
     // `http_base`. It answers what this instance is called, for a local caller
     // and an HTTP one alike; absent in every process that serves no HTTP
     // surface, which is the same set that never had one to disagree with.
-    web_origin: std::sync::OnceLock<Arc<crate::rest::OriginRule>>,
+    web_origin: std::sync::OnceLock<Arc<dyn crate::web_url::WebOrigin>>,
     // The sessions currently working inside somebody else's draft. Always
     // present rather than a `OnceLock` like the resolver above: it is a plain
     // in-memory registry with no store behind it, so an engine that nobody
@@ -1784,7 +1784,7 @@ impl Engine {
     /// (the value the daemon STARTED with, so a runtime configure of the key
     /// changes nothing until the next start, on every surface at once) and an
     /// HTTP caller's derived origin.
-    pub fn set_web_origin(&self, rule: Arc<crate::rest::OriginRule>) {
+    pub fn set_web_origin(&self, rule: Arc<dyn crate::web_url::WebOrigin>) {
         let _ = self.web_origin.set(rule);
     }
 
@@ -1812,7 +1812,7 @@ impl Engine {
     pub fn request_web_base(&self, headers: &axum::http::HeaderMap) -> crate::web_url::WebBase {
         let ui_enabled = self.config.read().unwrap().ui_enabled();
         match self.web_origin.get() {
-            Some(rule) => crate::web_url::request_base(rule, headers, ui_enabled),
+            Some(rule) => rule.request_base(headers, ui_enabled),
             None => crate::web_url::WebBase::Unresolved,
         }
     }

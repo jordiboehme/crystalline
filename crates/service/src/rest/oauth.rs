@@ -105,6 +105,8 @@ use crystalline_core::config::GlobalConfig;
 use openidconnect::url::{Host, Url};
 use serde_json::{Value, json};
 
+use crate::web_url::WebBase;
+
 use super::auth::{Identity, NoStore, no_store, request_origin};
 use super::auth_store::normalize_resource;
 use super::{ApiError, ApiJson, ApiPath, ApiQuery, AuthStore, ProblemDetail, RestState};
@@ -645,6 +647,35 @@ impl OriginRule {
     /// in the statement decide, so no branch in Rust can forget the check.
     pub fn same_resource(a: &str, b: &str) -> bool {
         normalize_resource(a) == normalize_resource(b)
+    }
+}
+
+/// The base for the HTTP caller these headers came from.
+///
+/// The same rule that names the OAuth resource identifier, so the address a
+/// client is told to open and the address its token works at are one answer.
+/// A `Host` this instance does not answer to is a refusal, not a guess, and
+/// reads as [`WebBase::Unresolved`].
+pub fn request_base(rule: &OriginRule, headers: &HeaderMap, ui_enabled: bool) -> WebBase {
+    if let Some(url) = rule.public_url() {
+        return WebBase::Known(url.to_string());
+    }
+    if !ui_enabled {
+        return WebBase::NoPage;
+    }
+    match rule.origin(headers) {
+        Ok(origin) => WebBase::Known(origin),
+        Err(_) => WebBase::Unresolved,
+    }
+}
+
+impl crate::web_url::WebOrigin for OriginRule {
+    fn public_url(&self) -> Option<&str> {
+        OriginRule::public_url(self)
+    }
+
+    fn request_base(&self, headers: &HeaderMap, ui_enabled: bool) -> WebBase {
+        request_base(self, headers, ui_enabled)
     }
 }
 
@@ -4499,5 +4530,82 @@ mod tests {
                 && printed.contains("https://kb.example"),
             "the client, the grant type and the resource are what a log line is for: {printed}"
         );
+    }
+}
+
+#[cfg(test)]
+mod web_base_tests {
+    use super::*;
+    use crate::web_url::WebBase;
+    use axum::http::header;
+    use crystalline_core::config::{GlobalConfig, ServiceConfig};
+
+    fn headers_with(host: Option<&str>, forwarded: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(header::HOST, host.parse().unwrap());
+        }
+        if let Some(proto) = forwarded {
+            headers.insert("x-forwarded-proto", proto.parse().unwrap());
+        }
+        headers
+    }
+
+    fn config_with_public_url(public_url: Option<&str>) -> GlobalConfig {
+        GlobalConfig {
+            service: Some(ServiceConfig {
+                public_url: public_url.map(str::to_string),
+                ..ServiceConfig::default()
+            }),
+            ..GlobalConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_request_base_follows_the_origin_rule() {
+        let listed = ["kb.example.com".to_string()];
+        let rule = OriginRule::from_config(&config_with_public_url(None), &listed);
+        assert_eq!(
+            request_base(
+                &rule,
+                &headers_with(Some("kb.example.com"), Some("https")),
+                true
+            ),
+            WebBase::Known("https://kb.example.com".to_string())
+        );
+        assert_eq!(
+            request_base(&rule, &headers_with(Some("evil.example"), None), true),
+            WebBase::Unresolved,
+            "a Host this instance does not answer to names no page"
+        );
+        assert_eq!(
+            request_base(&rule, &headers_with(None, None), true),
+            WebBase::Unresolved,
+            "and a request that says nothing about where it arrived names none either"
+        );
+        assert_eq!(
+            request_base(
+                &rule,
+                &headers_with(Some("kb.example.com"), Some("https")),
+                false
+            ),
+            WebBase::NoPage,
+            "with the UI off and no configured address there is no page at all"
+        );
+
+        let configured = OriginRule::from_config(
+            &config_with_public_url(Some("https://kb.example.com")),
+            &listed,
+        );
+        for headers in [
+            headers_with(Some("evil.example"), None),
+            headers_with(None, None),
+        ] {
+            assert_eq!(
+                request_base(&configured, &headers, true),
+                WebBase::Known("https://kb.example.com".to_string()),
+                "the configured address answers whatever the request says"
+            );
+        }
     }
 }
