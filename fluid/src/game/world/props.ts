@@ -26,8 +26,9 @@
  *   the fume cabinet still sits in a regular palette;
  * - the density and geometry constants placement reads: `PROP_CAP`,
  *   `WALL_SHARE`, `WALL_SIDE_SHARE`, `LOOP_SHARE`, `EXTINGUISHER_EVERY`,
- *   `LANE_WIDTH`, `LANE_DEPTH` and the cluster constants (`CLUSTER_BLOCK`,
- *   `CLUSTER_SHARE`, `CLUSTER_MIN`, `CLUSTER_MAX` and `CLUSTER_CLEAR`).
+ *   `LANE_WIDTH`, `LANE_DEPTH`, the cluster constants (`CLUSTER_BLOCK`,
+ *   `CLUSTER_SHARE`, `CLUSTER_MIN`, `CLUSTER_MAX` and `CLUSTER_CLEAR`) and
+ *   the span constants (`SPAN_CELLS`, `SPAN_HALF` and `SPAN_SHARE`).
  *
  * Every kind gets 2 variants, the crate 3 and the sign plate 6, its six
  * pictograms (ruling 13).
@@ -87,6 +88,12 @@ export interface Palette {
   floor: readonly (readonly [FloorPropKind, number])[];
   /** The ceiling run kind, or null. */
   ceilingRun: "duct" | "ceiling-tray" | null;
+  /**
+   * The ceiling span kind hung across a large hall (D9), or null for none:
+   * engineering's decor already runs pipes along its ceiling, and the
+   * council's ceiling stays bare.
+   */
+  ceilingSpan: "span-duct" | "span-tray" | null;
   /** Corner-zone props: 1 always (bridge) or 1 to 2. */
   cornerMax: 1 | 2;
   /** Chance a free wall-side cell gets a floor prop. */
@@ -593,6 +600,7 @@ export const PALETTES = {
       ["crate", 3],
     ],
     ceilingRun: "ceiling-tray",
+    ceilingSpan: "span-tray",
     cornerMax: 1,
     wallSide: 1 / 8,
     cluster: [
@@ -615,6 +623,7 @@ export const PALETTES = {
       ["trolley", 3],
     ],
     ceilingRun: "duct",
+    ceilingSpan: null,
     cornerMax: 2,
     wallSide: 1 / 4,
     cluster: [
@@ -636,6 +645,7 @@ export const PALETTES = {
       ["crate", 3],
     ],
     ceilingRun: "ceiling-tray",
+    ceilingSpan: "span-tray",
     cornerMax: 2,
     wallSide: 1 / 4,
     cluster: [
@@ -660,6 +670,7 @@ export const PALETTES = {
       ["trolley", 3],
     ],
     ceilingRun: "duct",
+    ceilingSpan: "span-duct",
     cornerMax: 2,
     wallSide: 1 / 4,
     cluster: [
@@ -678,6 +689,7 @@ export const PALETTES = {
       ["bench", 3],
     ],
     ceilingRun: null,
+    ceilingSpan: null,
     cornerMax: 2,
     wallSide: 1 / 4,
     cluster: [
@@ -767,3 +779,9 @@ export const SPAN_CELLS = 2;
  * keeps clear of lamps and decor (D9).
  */
 export const SPAN_HALF = 0.35;
+/**
+ * Chance a large hall whose palette has a `ceilingSpan` hangs one span line
+ * (D9), drawn first from the room's own span stream, so some large halls
+ * carry one and the rest stay clear overhead.
+ */
+export const SPAN_SHARE = 2 / 3;

@@ -59,6 +59,21 @@
  *   spots are its inner 2 by 2 cells, row by row, with `wall: null` and
  *   `zone: null`; an inner cell that is not floor is left out, and a block
  *   is kept even when that leaves it none. A small hall has no blocks.
+ * - **Span lines** (D9), in a large hall only: first every row `y` from
+ *   `hall.y0 + 1` to `hall.y1 - 2`, north to south, whose cells from
+ *   `hall.x0 + 1` to `hall.x1 - 2` are cut into `SPAN_CELLS`-cell segments
+ *   from the west end, a leftover odd cell at the east end dropped; then
+ *   every column `x` from `hall.x0 + 1` to `hall.x1 - 2`, west to east, cut
+ *   the same way from the north end over the rows `hall.y0 + 1` to
+ *   `hall.y1 - 2`. A line is kept only when none of its segments'
+ *   `spanBox`es overlaps a decor footprint, a box of `room.scaffold` or a
+ *   lamp's box (`lampBoxes`): the lab island's duct, the specimen tanks and
+ *   the scaffold poles reach the ceiling, and a span under a lamp would
+ *   hide it. A line is dropped whole, never cut short. Every span stays at
+ *   least one full cell (2 m) off every hall wall, past the ceiling band
+ *   along the walls (1.2 m) where the runs, loops, beacon and loose cables
+ *   hang. Which palette hangs a span, and on which line, is the pass's
+ *   choice; this module only lists the lines.
  * - **Long walls** (ruling 11). When the hall's width is at least its
  *   depth, the hall's `n` edges (west to east) and its `s` edges (east to
  *   west); otherwise its `w` edges (south to north) and its `e` edges (north
@@ -68,12 +83,13 @@
  * Coordinates follow `Decor` (ruling 1): cells for spots and anchors,
  * metres for boxes. Pure and deterministic.
  *
- * This is the generator side: it imports `footprints.ts`, `layout.ts`,
- * `props.ts`, `types.ts` and `units.ts`, and never `move.ts`, `generate.ts`
- * or `interact.ts` (ruling 20). `sites.test.ts` keeps it so.
+ * This is the generator side: it imports `footprints.ts`, `lamps.ts`,
+ * `layout.ts`, `props.ts`, `types.ts` and `units.ts`, and never `move.ts`,
+ * `generate.ts` or `interact.ts` (ruling 20). `sites.test.ts` keeps it so.
  */
 
 import { decorFootprint, footprint, footprintOf } from "./footprints";
+import { lampBoxes } from "./lamps";
 import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
   CLUSTER_BLOCK,
@@ -81,6 +97,8 @@ import {
   LANE_WIDTH,
   SHEET_LANE_DEPTH,
   SHEET_LANE_WIDTH,
+  SPAN_CELLS,
+  SPAN_HALF,
 } from "./props";
 import type { Box, Rect, RoomSpec, Side, WallSlot } from "./types";
 import { CELL } from "./units";
@@ -119,6 +137,19 @@ export interface ClusterBlock {
 }
 
 /**
+ * A clear line a ceiling span may hang on (D9): a row (`axis` "x", the
+ * line runs west to east at row `index`) or a column (`axis` "y", north to
+ * south at column `index`) of a large hall, one cell in from every hall
+ * wall. `segments` holds each `SPAN_CELLS`-cell segment's first cell, from
+ * the west or north end; its plan box is `spanBox(axis, segment)`.
+ */
+export interface SpanLine {
+  axis: "x" | "y";
+  index: number;
+  segments: { x: number; y: number }[];
+}
+
+/**
  * Everything the dressing pass needs to know about where props may go,
  * worked out once per room by `dressingSites`. See the module doc for the
  * rules behind each field.
@@ -144,6 +175,8 @@ export interface DressingSites {
   longWalls: [WallSlot[], WallSlot[]];
   /** Mid-hall cluster blocks, row by row; empty unless the hall is large (D6). */
   clusterBlocks: ClusterBlock[];
+  /** Clear span lines, rows then columns; empty unless the hall is large (D9). */
+  spanLines: SpanLine[];
 }
 
 /**
@@ -230,8 +263,8 @@ export function fitsFloor(room: RoomBase, box: Box): boolean {
 
 /**
  * Where props may go in a room: runs, free edges, lanes, taken footprints,
- * corner zones, wall-side cells, long walls and cluster blocks. See the
- * module doc for the rules.
+ * corner zones, wall-side cells, long walls, cluster blocks and span lines.
+ * See the module doc for the rules.
  */
 export function dressingSites(room: RoomBase): DressingSites {
   const runs = wallRuns(room.grid);
@@ -378,7 +411,74 @@ export function dressingSites(room: RoomBase): DressingSites {
     wallSide,
     longWalls: [hallEdges(a), hallEdges(b)],
     clusterBlocks,
+    spanLines: spanLines(room),
   };
+}
+
+/**
+ * The clear span lines of a large hall (D9), rows first and then columns;
+ * none in a hall that is not large. See the module doc's "Span lines".
+ */
+function spanLines(room: RoomBase): SpanLine[] {
+  const hall = room.hall;
+  if (!isLargeHall(hall)) return [];
+  const solid: Box[] = [];
+  for (const d of room.decor) {
+    const box = decorFootprint(d);
+    if (box !== null) solid.push(box);
+  }
+  solid.push(...room.scaffold, ...lampBoxes(room));
+  const lines: SpanLine[] = [];
+  const keep = (line: SpanLine) => {
+    const clear = line.segments.every((c) => {
+      const b = spanBox(line.axis, c);
+      return !solid.some((s) => overlaps(b, s));
+    });
+    if (clear) lines.push(line);
+  };
+  for (let y = hall.y0 + 1; y <= hall.y1 - 2; y++) {
+    const segments: SpanLine["segments"] = [];
+    for (
+      let x = hall.x0 + 1;
+      x + SPAN_CELLS - 1 <= hall.x1 - 2;
+      x += SPAN_CELLS
+    )
+      segments.push({ x, y });
+    keep({ axis: "x", index: y, segments });
+  }
+  for (let x = hall.x0 + 1; x <= hall.x1 - 2; x++) {
+    const segments: SpanLine["segments"] = [];
+    for (
+      let y = hall.y0 + 1;
+      y + SPAN_CELLS - 1 <= hall.y1 - 2;
+      y += SPAN_CELLS
+    )
+      segments.push({ x, y });
+    keep({ axis: "y", index: x, segments });
+  }
+  return lines;
+}
+
+/**
+ * The plan box of a span segment whose first cell is `c`, in metres (D9):
+ * `SPAN_CELLS` cells along its axis from the cell's west (axis "x") or
+ * north (axis "y") edge, and `SPAN_HALF` either side of the cell's middle
+ * across it. `sites.ts` keeps it clear of decor, scaffolding and lamps.
+ */
+export function spanBox(axis: "x" | "y", c: { x: number; y: number }): Box {
+  return axis === "x"
+    ? {
+        x0: c.x * CELL,
+        x1: (c.x + SPAN_CELLS) * CELL,
+        z0: (c.y + 0.5) * CELL - SPAN_HALF,
+        z1: (c.y + 0.5) * CELL + SPAN_HALF,
+      }
+    : {
+        x0: (c.x + 0.5) * CELL - SPAN_HALF,
+        x1: (c.x + 0.5) * CELL + SPAN_HALF,
+        z0: c.y * CELL,
+        z1: (c.y + SPAN_CELLS) * CELL,
+      };
 }
 
 /**

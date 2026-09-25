@@ -79,10 +79,21 @@
  *     when the palette has one, drawn as in step 3 from `"ceiling"`, token
  *     `ceiling-<side>`; under each ceiling tray segment a cable loop when
  *     `createRng` of the loop's own seed (token `loop-<side>`) draws
- *     `LOOP_SHARE`; the beacon on the entrance edge, token `beacon-s`; and
- *     the loose cables of step 6 on the hall's wall edges that carry
- *     neither a fixture nor a ceiling segment nor the beacon, in the order
- *     of their own seeds (token `loose-<side>`).
+ *     `LOOP_SHARE`; then one span line (D9) when the palette has a
+ *     `ceilingSpan` and the hall has clear `sites.spanLines` (a large hall
+ *     only): `createRng(seedFor(roomSeed, "prop-runs", "span"))` draws a
+ *     chance of `SPAN_SHARE` and then the variant every segment shares,
+ *     and the line is the first of `sites.spanLines` in the order of
+ *     `seedFor(roomSeed, "prop-span", axis, index)`. Each segment is
+ *     anchored at its middle under the ceiling, `(x + 1, y + 0.5)` with
+ *     turn 0 along a row and `(x + 0.5, y + 1)` with turn 1 along a column,
+ *     seeded with token `span` at its first cell. A span line keeps a full
+ *     cell (2 m) off every hall wall, clear of the ceiling band along the
+ *     walls, and clear of lamps, decor and scaffolding (`sites.ts`); then
+ *     the beacon on the entrance edge, token `beacon-s`; and the loose
+ *     cables of step 6 on the hall's wall edges that carry neither a
+ *     fixture nor a ceiling segment nor the beacon, in the order of their
+ *     own seeds (token `loose-<side>`).
  * 11. The cap: `capProps(candidates, PROP_CAP)`. Readers, door and hatch
  *     signs, the step-2 extinguishers and the beacon are mandatory,
  *     everything else optional.
@@ -128,6 +139,8 @@ import {
   PALETTES,
   PROP_CAP,
   PROP_CATALOGUE,
+  SPAN_CELLS,
+  SPAN_SHARE,
   WALL_PROP_DEPTH,
   WALL_SHARE,
 } from "./props";
@@ -140,6 +153,7 @@ import {
   wallAnchor,
   type FloorSpot,
   type RoomBase,
+  type SpanLine,
 } from "./sites";
 import type {
   Box,
@@ -534,6 +548,34 @@ export function dressCandidates(
         prop: atWall("cable-loop", e, variantOf("cable-loop", rng), seed),
         mandatory: false,
       });
+    }
+  }
+  const span = palette.ceilingSpan;
+  if (span !== null && sites.spanLines.length > 0) {
+    const rng = createRng(seedFor(room.seed, "prop-runs", "span"));
+    if (rng.chance(SPAN_SHARE)) {
+      const variant = variantOf(span, rng);
+      const order = (l: SpanLine) =>
+        seedFor(room.seed, "prop-span", l.axis, l.index);
+      const line = [...sites.spanLines].sort(
+        (a, b) => order(a) - order(b) || a.index - b.index,
+      )[0];
+      if (line !== undefined)
+        for (const c of line.segments) {
+          const along = line.axis === "x";
+          out.push({
+            prop: {
+              kind: span,
+              variant,
+              anchor: "ceiling",
+              x: along ? c.x + SPAN_CELLS / 2 : c.x + 0.5,
+              y: along ? c.y + 0.5 : c.y + SPAN_CELLS / 2,
+              turn: along ? 0 : 1,
+              seed: propSeed(c.x, c.y, "span"),
+            },
+            mandatory: false,
+          });
+        }
     }
   }
   const entrance: WallSlot = { ...room.entrance, side: "s" };

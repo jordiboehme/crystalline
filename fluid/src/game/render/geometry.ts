@@ -30,6 +30,7 @@
  * by the recipes in `models/`, with the modelling kit of `kit.ts`.
  */
 
+import { LAMP_HALF_D, LAMP_HALF_W, lampCentre } from "../world/lamps";
 import { STEP, doorwayColumns, isFloor } from "../world/layout";
 import type { Box, RoomSpec, Side } from "../world/types";
 import { CELL } from "../world/units";
@@ -253,9 +254,6 @@ const BASEBOARD = 0.3;
 /** How far the baseboards stand off their wall, against z-fighting. */
 const BASEBOARD_INSET = 0.01;
 
-/** The lamp panel's half width (along x) and half depth (along z). */
-const LAMP_HALF_W = 0.8;
-const LAMP_HALF_D = 0.3;
 /** How far below the ceiling a lamp panel hangs, against z-fighting. */
 const LAMP_DROP = 0.01;
 
@@ -378,46 +376,6 @@ function flatQuad(
     const c = corners[i];
     if (c !== undefined) b.vertex([c[0], h, c[1]], n, c[0], c[1], s);
   }
-}
-
-/**
- * Where a zone's lamp hangs: centred on the zone's floor cells, when the
- * whole panel lies over floor that is not a doorway; otherwise over the
- * middle of the zone's floor cell nearest that centre, so a zone of odd
- * shape never hangs its lamp over a wall or across a lintel. Null for a
- * zone with no floor, which the generator never makes.
- */
-function lampCentre(
-  room: RoomSpec,
-  zone: { x0: number; y0: number; x1: number; y1: number },
-  doorways: Set<number>,
-): [number, number] | null {
-  const cells: [number, number][] = [];
-  for (let y = zone.y0; y < zone.y1; y++)
-    for (let x = zone.x0; x < zone.x1; x++)
-      if (isFloor(room.grid, x, y) && !doorways.has(x)) cells.push([x, y]);
-  if (cells.length === 0) return null;
-  const cx = (cells.reduce((a, [x]) => a + x, 0) / cells.length + 0.5) * CELL;
-  const cz = (cells.reduce((a, [, y]) => a + y, 0) / cells.length + 0.5) * CELL;
-  const open = (px: number, pz: number) => {
-    const x = Math.floor(px / CELL);
-    return isFloor(room.grid, x, Math.floor(pz / CELL)) && !doorways.has(x);
-  };
-  const fits = [-1, 1].every((sx) =>
-    [-1, 1].every((sz) =>
-      open(cx + sx * (LAMP_HALF_W - 1e-3), cz + sz * (LAMP_HALF_D - 1e-3)),
-    ),
-  );
-  if (fits) return [cx, cz];
-  let best: [number, number] = [cx, cz];
-  let bestD = Infinity;
-  for (const [x, y] of cells) {
-    const mx = (x + 0.5) * CELL;
-    const mz = (y + 0.5) * CELL;
-    const d = Math.hypot(mx - cx, mz - cz);
-    if (d < bestD) [best, bestD] = [[mx, mz], d];
-  }
-  return best;
 }
 
 /**

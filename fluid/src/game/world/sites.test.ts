@@ -9,6 +9,7 @@ import {
 import { decorFootprint, footprint, footprintOf } from "./footprints";
 import { generateRoom } from "./generate";
 import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
+import { lampBoxes } from "./lamps";
 import { STEP, doorwayColumns, isFloor, wallRuns, wallSlots } from "./layout";
 import { PLAYER_RADIUS } from "./move";
 import {
@@ -25,6 +26,7 @@ import {
   interiorBand,
   isLargeHall,
   overlaps,
+  spanBox,
   turnForSide,
   wallAnchor,
   type RoomBase,
@@ -585,6 +587,37 @@ describe("cluster blocks", () => {
     expect(dressingSites(generateRoom(CANNED_BRIDGE)).clusterBlocks).toEqual(
       [],
     );
+  });
+});
+
+describe("span lines", () => {
+  it("lists only lines that stay a cell off every hall wall and clear of decor, scaffolding and lamps", () => {
+    for (const room of [
+      generateRoom(CANNED_WORKSHOP),
+      generateRoom(CANNED_HUB),
+    ]) {
+      const sites = dressingSites(room);
+      const h = room.hall;
+      const solid = [
+        ...room.decor.map(decorFootprint).filter((b) => b !== null),
+        ...room.scaffold,
+        ...lampBoxes(room),
+      ];
+      expect(sites.spanLines.length).toBeGreaterThan(0);
+      for (const line of sites.spanLines)
+        for (const c of line.segments) {
+          const b = spanBox(line.axis, c);
+          expect(b.x0).toBeGreaterThanOrEqual((h.x0 + 1) * CELL - 1e-9);
+          expect(b.x1).toBeLessThanOrEqual((h.x1 - 1) * CELL + 1e-9);
+          expect(b.z0).toBeGreaterThanOrEqual((h.y0 + 1) * CELL - 1e-9);
+          expect(b.z1).toBeLessThanOrEqual((h.y1 - 1) * CELL + 1e-9);
+          for (const s of solid) expect(overlaps(b, s)).toBe(false);
+        }
+    }
+  });
+
+  it("gives a small hall none", () => {
+    expect(dressingSites(generateRoom(CANNED_BRIDGE)).spanLines).toEqual([]);
   });
 });
 

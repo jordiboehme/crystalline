@@ -121,6 +121,15 @@ describe("the prop catalogue", () => {
     }
   });
 
+  it("gives every palette a span kind or none, and engineering and council none", () => {
+    for (const a of ARCHETYPES) {
+      const span = PALETTES[a].ceilingSpan;
+      if (span !== null) expect(PROP_CATALOGUE[span].span, a).toBe(true);
+    }
+    expect(PALETTES.engineering.ceilingSpan).toBeNull();
+    expect(PALETTES.council.ceilingSpan).toBeNull();
+  });
+
   it("makes spans ceiling kinds that are neither runs nor extras", () => {
     const spans = PROP_KINDS.filter((k) => PROP_CATALOGUE[k].span);
     expect(spans.sort()).toEqual(["span-duct", "span-tray"]);

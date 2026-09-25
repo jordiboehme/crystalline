@@ -28,6 +28,7 @@ import {
 import { generateRoom } from "./generate";
 import generateSource from "./generate.ts?raw";
 import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
+import { lampBoxes } from "./lamps";
 import { doorwayColumns, isFloor, wallSlots } from "./layout";
 import { PLAYER_RADIUS, blockersFor } from "./move";
 import {
@@ -46,6 +47,7 @@ import {
   interiorBand,
   isLargeHall,
   overlaps,
+  spanBox,
   turnForSide,
   wallAnchor,
   type DressingSites,
@@ -1039,6 +1041,65 @@ describe("mid-hall clusters", () => {
   });
 });
 
+describe("ceiling spans", () => {
+  it("hang one straight line of the palette's span in some large halls only", () => {
+    let eligible = 0;
+    let withSpan = 0;
+    for (const room of [
+      ...SEEDS,
+      ...HUBS.map((h) => h.room),
+      ...BRIDGES.map((b) => b.room),
+    ]) {
+      const spans = room.props.filter((p) => PROP_CATALOGUE[p.kind].span);
+      const kind = PALETTES[room.archetype].ceilingSpan;
+      if (kind === null || !isLargeHall(room.hall)) {
+        expect(spans).toEqual([]);
+        continue;
+      }
+      eligible++;
+      if (spans.length === 0) continue;
+      withSpan++;
+      for (const p of spans) expect(p.kind).toBe(kind);
+      expect(new Set(spans.map((p) => p.variant)).size).toBe(1);
+      expect(new Set(spans.map((p) => p.turn)).size).toBe(1);
+      const turn = spans[0]?.turn;
+      // One line: every segment on the same row (turn 0) or column.
+      expect(new Set(spans.map((p) => (turn === 0 ? p.y : p.x))).size).toBe(1);
+    }
+    expect(eligible).toBeGreaterThan(50);
+    expect(withSpan / eligible).toBeGreaterThanOrEqual(0.5);
+    expect(withSpan / eligible).toBeLessThanOrEqual(0.8);
+  });
+
+  it("keeps every span box clear of the ceiling band along the walls, lamps, decor and scaffolding", () => {
+    for (const room of SEEDS.slice(0, 60)) {
+      const h = room.hall;
+      const solid = [
+        ...room.decor.map(decorFootprint).filter((b) => b !== null),
+        ...room.scaffold,
+        ...lampBoxes(room),
+      ];
+      for (const p of room.props.filter((q) => PROP_CATALOGUE[q.kind].span)) {
+        const axis = p.turn === 0 ? "x" : "y";
+        const first =
+          axis === "x"
+            ? { x: p.x - 1, y: p.y - 0.5 }
+            : { x: p.x - 0.5, y: p.y - 1 };
+        const b = spanBox(axis, first);
+        // CEILING_OUT (1.2 m) along every wall, plus 0.5 m.
+        const off = Math.min(
+          b.x0 - h.x0 * CELL,
+          h.x1 * CELL - b.x1,
+          b.z0 - h.y0 * CELL,
+          h.y1 * CELL - b.z1,
+        );
+        expect(off).toBeGreaterThanOrEqual(1.7);
+        for (const s of solid) expect(overlaps(b, s)).toBe(false);
+      }
+    }
+  });
+});
+
 describe("mandatory props", () => {
   it("gives the workshop the hall it was made for", () => {
     expect(workshop.hall).toEqual({ x0: 0, y0: 0, x1: 13, y1: 10 });
@@ -1334,6 +1395,12 @@ describe("locality", () => {
 
     const cellOf = (p: Prop) => {
       if (p.anchor === "floor") return [Math.floor(p.x), Math.floor(p.y)];
+      // A span maps to its segment's first cell, not to a wall edge.
+      if (PROP_CATALOGUE[p.kind].span)
+        return [
+          Math.floor(p.x - (p.turn === 0 ? 1 : 0.5)),
+          Math.floor(p.y - (p.turn === 0 ? 0.5 : 1)),
+        ];
       const e = edgeOf(p);
       return [e.x, e.y];
     };
@@ -1381,6 +1448,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
         walls += expectWallInvariants(name, room);
         expectFloorInvariants(name, room);
         expect(measureDensity(room).bandProps, name).toBe(0);
+        expect(measureDensity(room).spanSegments, name).toBe(0);
       }
     expect(walls).toBeGreaterThan(0);
   });
@@ -1412,6 +1480,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
     for (const p of wallProps(room))
       expect(slotSet.has(edgeKey(edgeOf(p)))).toBe(false);
     expectFloorInvariants("full", room);
+    expect(measureDensity(room).spanSegments).toBe(0);
   });
 
   it("dresses a narrow, deep hall, keeping every invariant", () => {
@@ -1428,6 +1497,7 @@ describe("degenerate rooms (Review Focus 5)", () => {
       expect(expectWallInvariants(`narrow ${status}`, room)).toBeGreaterThan(0);
       expectFloorInvariants(`narrow ${status}`, room);
       expect(measureDensity(room).bandProps).toBe(0);
+      expect(measureDensity(room).spanSegments).toBe(0);
     }
   });
 
