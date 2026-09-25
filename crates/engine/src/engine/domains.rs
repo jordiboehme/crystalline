@@ -483,26 +483,7 @@ impl Engine {
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`
     /// engram in the database. Empty when there is no MANIFEST engram yet.
     async fn virtual_routing_bullets_for(&self, name: &str) -> Vec<String> {
-        let content = {
-            let store = self.store.lock().await;
-            match store.find_engram(name, "manifest").await.ok().flatten() {
-                Some(d) => store
-                    .engram_content(d.domain_id, &d.path)
-                    .await
-                    .ok()
-                    .flatten(),
-                None => None,
-            }
-        };
-        let Some(source) = content else {
-            return Vec::new();
-        };
-        let Ok(engram) = parse_engram(&source) else {
-            return Vec::new();
-        };
-        Manifest::from_engram(&engram, &source)
-            .routing_bullets()
-            .to_vec()
+        self.virtual_manifest_facts(name).await.0
     }
 
     /// Routing bullets for every virtual domain, keyed by domain name. Supplied
@@ -571,9 +552,13 @@ impl Engine {
     /// the embedded stdio stack call this off the async path (at each MCP
     /// connection's initialize, and after every write that touches a virtual
     /// source) so the sync render only ever reads the cache under the lock.
+    ///
+    /// The same MANIFEST read carries the domain's declared name, so this is
+    /// [`Engine::refresh_names`]: both caches from one pass, then the name
+    /// table and its spellings in the index. The push writes only when the
+    /// table changed, so a refresh per connection costs reads.
     pub async fn refresh_routing_cache(&self) {
-        let bullets = self.virtual_routing_bullets().await;
-        *self.routing_virtual.write().unwrap() = bullets;
+        self.refresh_names().await;
     }
 
     /// The routing instructions a fresh MCP connection is handed at initialize:

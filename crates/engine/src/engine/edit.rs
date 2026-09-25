@@ -480,11 +480,9 @@ impl Engine {
             }
         }
 
-        // A virtual edit may have rewritten this domain's MANIFEST engram, so
-        // refresh the routing cache. The store locks above are all released.
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        // An edit may have rewritten this domain's MANIFEST, its routing and
+        // its declared name. The store locks above are all released.
+        self.after_source_write(source, &desc.path).await;
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
         self.refresh_index_files(&desc.domain).await;

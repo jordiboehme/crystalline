@@ -503,10 +503,9 @@ impl Engine {
 
         // A virtual write may have landed or replaced this domain's MANIFEST
         // engram, the source of its routing bullets, so refresh the cache the
-        // sync `routing_text` reads. The store locks above are all released.
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        // sync `routing_text` reads; a MANIFEST of either kind may declare a
+        // new name. The store locks above are all released.
+        self.after_source_write(&source, &rel).await;
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
         self.nudge_embed();
@@ -781,11 +780,9 @@ impl Engine {
             receipt_permalink(found, desc.permalink.clone())
         };
 
-        // A save can rewrite the MANIFEST engram of a virtual domain or the
-        // titles a folder index lists, same as an edit.
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        // A save can rewrite a MANIFEST or the titles a folder index lists,
+        // same as an edit.
+        self.after_source_write(&source, &desc.path).await;
         self.refresh_index_files(&desc.domain).await;
         self.nudge_embed();
 
@@ -1037,9 +1034,7 @@ impl Engine {
                     .await?;
             }
         }
-        if matches!(source, ContentSource::Virtual) {
-            self.refresh_routing_cache().await;
-        }
+        self.after_source_write(&source, path).await;
         self.refresh_index_files(domain).await;
 
         // Read back after the reindex, exactly as a save does: the index takes

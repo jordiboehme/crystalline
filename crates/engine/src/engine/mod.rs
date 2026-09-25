@@ -902,6 +902,25 @@ pub struct Engine {
     // virtual-source write, and read here under the lock. Empty at construction
     // and for an engine that never serves MCP.
     routing_virtual: std::sync::RwLock<BTreeMap<String, Vec<String>>>,
+    // The name table over every registered domain: local names, the canonical
+    // names MANIFESTs declare and machine-local aliases, each resolved to one
+    // local name. Rebuilt from the registrations when `names_stale` is set and
+    // read everywhere else, so a lookup never touches the store. Never held
+    // while `store` or `config` is taken: the Arc is cloned out first. See
+    // `Engine::name_table`.
+    names: std::sync::RwLock<Arc<crystalline_core::names::NameTable>>,
+    // Set when a registration or a declared name may have changed; the next
+    // `Engine::name_table` rebuilds. Starts `true`, so the first lookup builds.
+    names_stale: std::sync::atomic::AtomicBool,
+    // Each virtual domain's declared valid `domain_name`, keyed by local name.
+    // A virtual MANIFEST lives in the database, so the sync table build cannot
+    // read it; `Engine::refresh_names` reads it in the same pass that caches
+    // the routing bullets above.
+    virtual_domain_names: std::sync::RwLock<BTreeMap<String, String>>,
+    // The test seam for the spelling push: how many times it replaced the
+    // index's spellings. See `Engine::spelling_replaces_issued`.
+    #[cfg(any(test, feature = "testing"))]
+    spelling_replaces: std::sync::atomic::AtomicU64,
     // A live view of what this engine is doing (sync, embed, reindex), fed by
     // RAII guards from the maintenance operations and read by `status_report`'s
     // activity block. Behind an `Arc` so a guard owns its own handle and a
@@ -1622,6 +1641,11 @@ impl Engine {
             github_tokens: Arc::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
+            names: std::sync::RwLock::new(Arc::default()),
+            names_stale: std::sync::atomic::AtomicBool::new(true),
+            virtual_domain_names: std::sync::RwLock::new(BTreeMap::new()),
+            #[cfg(any(test, feature = "testing"))]
+            spelling_replaces: std::sync::atomic::AtomicU64::new(0),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
             domain_admin: tokio::sync::Mutex::new(()),
@@ -3488,6 +3512,7 @@ impl Engine {
             .write()
             .unwrap()
             .insert(name.to_string(), entry.clone());
+        self.mark_names_stale();
         if let Some(tx) = &self.watch_tx
             && let Some(root) = entry.file_path()
             && !entry.is_virtual()
@@ -3688,6 +3713,7 @@ impl Engine {
     /// daemon's sweep. A reindex is never the remedy for a row.
     pub fn forget_domain(&self, name: &str) {
         self.discovered_domains.write().unwrap().remove(name);
+        self.mark_names_stale();
         if let Some(tx) = &self.watch_tx {
             let _ = tx.send(WatchEvent::Remove(name.to_string()));
         }
@@ -4090,6 +4116,7 @@ mod edit;
 mod evolve;
 mod github;
 mod move_;
+mod names;
 mod origins;
 mod read;
 mod review_mode;

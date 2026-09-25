@@ -196,6 +196,9 @@ impl Engine {
                     EngineError::Internal(format!("resolving forward references failed: {e}"))
                 })?;
         }
+        // A synced MANIFEST may declare a new name, and a domain synced for
+        // the first time has just been given the row its spellings hang on.
+        self.refresh_names().await;
         let reports: Vec<SyncReport> = applied.into_iter().map(|(_, report)| report).collect();
         Ok(json!({
             "reports": serde_json::to_value(&reports).unwrap_or(Value::Null),
@@ -253,6 +256,7 @@ impl Engine {
             let snapshot = store.file_stamps(domain).await?;
             (domain, snapshot)
         };
+        let manifest_touched = Self::touches_manifest(&paths);
         let scan = scan_paths(name, &root, snapshot, paths, &self.chunk_params).await;
         let report = {
             let store = self.store.lock().await;
@@ -264,6 +268,11 @@ impl Engine {
         // generated index should say.
         if changed_anything(&report) {
             self.refresh_index_files(name).await;
+        }
+        // An edit of the MANIFEST outside any verb may change the name the
+        // domain declares.
+        if manifest_touched {
+            self.refresh_names().await;
         }
         Ok(report)
     }
