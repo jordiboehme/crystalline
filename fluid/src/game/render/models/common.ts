@@ -209,6 +209,30 @@ export function tiltedBar(
 }
 
 /**
+ * A regular polygon outline of `sides` corners on a circle of radius `r`
+ * around `(a0, h0)`: a flat disc for `k.extrude` to push out of the wall
+ * plane, facing the room (a gauge face, a lens, an eye socket, a portal's
+ * surface). By default the corners start on `+a` and run counter-clockwise;
+ * `"top"` starts them straight above the centre and runs them clockwise,
+ * the order the portal's disc and its mover were first built in, kept so
+ * that mesh stays the same float for float.
+ */
+export function discOutline(
+  a0: number,
+  h0: number,
+  r: number,
+  sides = 12,
+  from: "right" | "top" = "right",
+): [number, number][] {
+  return Array.from({ length: sides }, (_, i) => {
+    const t = (2 * Math.PI * i) / sides;
+    return from === "right"
+      ? [a0 + r * Math.cos(t), h0 + r * Math.sin(t)]
+      : [a0 + r * Math.sin(t), h0 + r * Math.cos(t)];
+  });
+}
+
+/**
  * Extrudes a profile of `[d, h]` points (depth out from the wall, height),
  * drawn in the frame's side view, along the wall from `a0` to `a1`: the
  * wedge of a keyboard deck, the slant of a nav table, a half ring standing

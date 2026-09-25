@@ -17,7 +17,7 @@ import { LAYER } from "../../layers";
 import type { Rgb } from "../../looks";
 import { PICTOGRAM, SIGN_PICTOGRAMS } from "../../text";
 import type { WallPropKind } from "../../../world/types";
-import { shade, tiltedBar, yawed } from "../common";
+import { discOutline, shade, tiltedBar, yawed } from "../common";
 import { RUN_BAND, type PropRecipe } from "./common";
 
 /** A warm hazard red: the extinguisher's cylinder and the first-aid cross. */
@@ -742,19 +742,6 @@ function conduitCabinet({ k, s, variant }: Parameters<PropRecipe>[0]): void {
     }
     k.cylinderAlong(-0.88, 0.88, d, C.runH, 0.035, 8, s.metal);
   }
-}
-
-/** A regular polygon outline in the (a, h) plane, for a flat disc `extrude` faces the room with. */
-function discOutline(
-  a0: number,
-  h0: number,
-  r: number,
-  sides = 12,
-): [number, number][] {
-  return Array.from({ length: sides }, (_, i) => {
-    const t = (2 * Math.PI * i) / sides;
-    return [a0 + r * Math.cos(t), h0 + r * Math.sin(t)];
-  });
 }
 
 /** The pipe riser: the pipes' depth and its mounting strap's height. */

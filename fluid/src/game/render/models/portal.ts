@@ -21,6 +21,7 @@ import { FLAG, createBuilder, type Surface } from "../geometry";
 import { DECAL_LIFT, createKit, frameForSlot } from "../kit";
 import { LAYER } from "../layers";
 import {
+  discOutline,
   label,
   shade,
   surfaces,
@@ -114,13 +115,7 @@ export function buildPortal(
   // The emitter ring and what it holds.
   const ring: Surface = { layer: LAYER.metal, tint: colour, flag: FLAG.frame };
   k.ring(0, RING_D, RING_H, RING_R, RING_TUBE, 8, 28, ring, "inward");
-  const disc: [number, number][] = Array.from(
-    { length: DISC_SIDES },
-    (_, i) => {
-      const t = (2 * Math.PI * i) / DISC_SIDES;
-      return [Math.sin(t) * DISC_R, RING_H + Math.cos(t) * DISC_R];
-    },
-  );
+  const disc = discOutline(0, RING_H, DISC_R, DISC_SIDES, "top");
   // The emitter's dark back plate, which holds the surface in the ring.
   k.extrude(disc, 0.02, RING_D - 0.01, s.tinted(shade(p.metal, 0.2)));
   // The swirl surface, its own mover, open or sealed.

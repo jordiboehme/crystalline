@@ -56,6 +56,13 @@ function one(parts: readonly Part[]): Part {
   return p;
 }
 
+/** The bounds of a list of local points. */
+function bounds(points: readonly V3[]): { lo: V3; hi: V3 } {
+  const lo = (k: 0 | 1 | 2) => Math.min(...points.map((p) => p[k]));
+  const hi = (k: 0 | 1 | 2) => Math.max(...points.map((p) => p[k]));
+  return { lo: [lo(0), lo(1), lo(2)], hi: [hi(0), hi(1), hi(2)] };
+}
+
 /** The middle of a list of local points' bounds. */
 function centre(points: readonly V3[]): V3 {
   const mid = (k: 0 | 1 | 2) =>
@@ -107,13 +114,32 @@ describe("optics hero models", () => {
 
   it("keeps the laser desk's catalogue top clear in the recipe's own terms", () => {
     // The catalogue's top: a -1.1 to -0.35, d -0.2 to 0.4, at h 0.74. The
-    // arm passes high over it (h 1.95); nothing may stand on it below that.
+    // arm passes high over it (from h 1.92); nothing may stand on it below
+    // that, neither a vertex nor a part whose bounds span the area (a long
+    // box whose corners all lie outside it).
+    const [a0, a1, d0, d1, h0, h1] = [-1.1, -0.35, -0.2, 0.4, 0.74, 1.9];
+    const parts = partsOf("laser-desk");
     const inside = (p: V3) =>
-      p[0] > -1.1 && p[0] < -0.35 && p[1] > -0.2 && p[1] < 0.4;
-    const above = partsOf("laser-desk")
-      .flatMap(local)
-      .filter((p) => inside(p) && p[2] > 0.74 + 1e-6 && p[2] < 1.9);
-    expect(above).toEqual([]);
+      p[0] > a0 &&
+      p[0] < a1 &&
+      p[1] > d0 &&
+      p[1] < d1 &&
+      p[2] > h0 + 1e-6 &&
+      p[2] < h1;
+    expect(parts.flatMap(local).filter(inside)).toEqual([]);
+    const over = parts
+      .map((p, i) => ({ i, method: p.method, b: bounds(local(p)) }))
+      .filter(
+        ({ b }) =>
+          b.lo[0] < a1 &&
+          b.hi[0] > a0 &&
+          b.lo[1] < d1 &&
+          b.hi[1] > d0 &&
+          b.lo[2] < h1 &&
+          b.hi[2] > h0 + 1e-6,
+      )
+      .map(({ i, method }) => `${String(i)}:${method}`);
+    expect(over).toEqual([]);
   });
 
   it("the slab is 1 : 4 : 9", () => {
