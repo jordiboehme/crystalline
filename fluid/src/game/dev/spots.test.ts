@@ -22,13 +22,7 @@ import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
 import { HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn } from "../world/interact";
 import { isFloor } from "../world/layout";
-import {
-  blockersFor,
-  EYE_HEIGHT,
-  MAX_PITCH,
-  PLAYER_RADIUS,
-  spawnPlayer,
-} from "../world/move";
+import { blockersFor, EYE_HEIGHT, MAX_PITCH, spawnPlayer } from "../world/move";
 import { PROP_KINDS } from "../world/props";
 import type { Box, Curio, Fixture, Hero, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
@@ -36,8 +30,6 @@ import { GAME_VERSION } from "../version";
 import { roomWithForcedCurio } from "./demo";
 import {
   CURIO_FAR,
-  CURIO_NEAR,
-  CURIO_STEP,
   SPOT_KINDS,
   circleOverlapsBox,
   curioSightClear,
@@ -355,57 +347,6 @@ describe("frameCurio's sight line on real rooms (browser-shots review item 4)", 
     return { x: player.x, z: player.z };
   }
 
-  /** `frameCurio`'s own four search directions, reimplemented for these tests alone. */
-  function sidesOfCurio(
-    front: readonly [number, number],
-  ): readonly (readonly [number, number])[] {
-    return [
-      front,
-      [front[1] * -1, front[0]],
-      [front[1], -front[0]],
-      [-front[0], -front[1]],
-    ];
-  }
-
-  /** True when `(px, pz)` is on the floor and clear of every 2D blocker. */
-  function isStandable(room: RoomSpec, px: number, pz: number): boolean {
-    const onFloor = [px - PLAYER_RADIUS, px + PLAYER_RADIUS].every((x) =>
-      [pz - PLAYER_RADIUS, pz + PLAYER_RADIUS].every((z) =>
-        isFloor(room.grid, Math.floor(x / CELL), Math.floor(z / CELL)),
-      ),
-    );
-    return (
-      onFloor && !blockersFor(room).some((b) => circleOverlapsBox(px, pz, b))
-    );
-  }
-
-  /**
-   * True when every standable spot on every side, from `CURIO_NEAR` out to
-   * `farDist` (which may run past `CURIO_FAR`, to check whether raising it
-   * would help), fails `curioSightClear`: an exhaustive check that no
-   * framing spot exists at all, not just that the search's own answer
-   * happens to be one.
-   */
-  function everyStandableSpotOccluded(
-    room: RoomSpec,
-    c: Curio,
-    farDist: number,
-  ): boolean {
-    const box = curioBox(c);
-    const cx = (box.x0 + box.x1) / 2;
-    const cz = (box.z0 + box.z1) / 2;
-    const front = HERO_FRONT[c.turn] ?? [0, -1];
-    for (const dir of sidesOfCurio(front)) {
-      for (let dist = CURIO_NEAR; dist <= farDist + 1e-9; dist += CURIO_STEP) {
-        const px = cx + dir[0] * dist;
-        const pz = cz + dir[1] * dist;
-        if (!isStandable(room, px, pz)) continue;
-        if (curioSightClear(room, { x: px, z: pz }, c)) return false;
-      }
-    }
-    return true;
-  }
-
   it("finds a clear spot for a forced green-pistol on the workshop's guide terminal", () => {
     const place = { ...CANNED_WORKSHOP, type: "guide" };
     const { room, placed } = roomWithForcedCurio(place, "green-pistol");
@@ -425,43 +366,35 @@ describe("frameCurio's sight line on real rooms (browser-shots review item 4)", 
     expect(curioSightClear(room, forcedSpot(room, "fuel-case"), c)).toBe(true);
   });
 
-  // The bridge's and the workshop's forced trap-box have no clear spot at
-  // all (documented in the report): the terminal's own chair sits between
-  // the wall-mounted knee space and the only side with any floor at all
-  // (the curio sits within PLAYER_RADIUS of the wall, so right, left and
-  // back never clear the wall itself), and the curio's floor-level height
-  // means the sight line to it never rises above the chair's backrest at
-  // any distance along a straight front approach - checked out to 15 m,
-  // five times CURIO_FAR, so raising CURIO_FAR would not help either.
-  const NO_CLEAR_SPOT_FAR = 15;
+  // Fix round 3: a terminal carries no under spot any more (`world/
+  // curios.ts`'s `FIXTURE_SURFACES.terminal`), since its knee space is
+  // where the model draws the swivel chair and no standing player could
+  // ever see past it (round 2's finding, kept in that module's own doc).
+  // The bridge and the canned workshop, at their own default archetype and
+  // condition, draw neither a workbench (the under slot's only other
+  // fixture host) nor a hero whose own `under` spot is occupied, so the
+  // forced under-desk kind now finds no host anywhere in these rooms: the
+  // slot stays empty and the room is drawn without it, exactly the "room
+  // with no host for the drawn kind" case (`placeCurios` never throws on
+  // it). These three tests replace round 2's "documented limit" ones,
+  // which pinned a curio that occlusion made unseeable; that curio is no
+  // longer placed at all, so there is nothing left to frame.
 
-  it("has no clear spot at all for a forced trap-box in the canned bridge (a documented limit, not a bug)", () => {
+  it("draws no host at all for a forced trap-box in the canned bridge", () => {
     const { room, placed } = roomWithForcedCurio(CANNED_BRIDGE, "trap-box");
-    expect(placed).toBe("trap-box");
-    const c = room.curios.find((x) => x.kind === "trap-box");
-    if (c === undefined) throw new Error("no trap-box placed");
-    expect(everyStandableSpotOccluded(room, c, NO_CLEAR_SPOT_FAR)).toBe(true);
-    // Mutation evidence: the chosen (fallback) spot is at least correctly
-    // recognised as occluded now, not silently accepted the way round 1
-    // did.
-    expect(curioSightClear(room, forcedSpot(room, "trap-box"), c)).toBe(false);
+    expect(placed).toBeNull();
+    expect(room.curios.some((c) => c.kind === "trap-box")).toBe(false);
   });
 
-  it("has no clear spot at all for a forced trap-box in the canned workshop (a documented limit, not a bug)", () => {
+  it("draws no host at all for a forced trap-box in the canned workshop", () => {
     const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, "trap-box");
-    expect(placed).toBe("trap-box");
-    const c = room.curios.find((x) => x.kind === "trap-box");
-    if (c === undefined) throw new Error("no trap-box placed");
-    expect(everyStandableSpotOccluded(room, c, NO_CLEAR_SPOT_FAR)).toBe(true);
-    expect(curioSightClear(room, forcedSpot(room, "trap-box"), c)).toBe(false);
+    expect(placed).toBeNull();
+    expect(room.curios.some((c) => c.kind === "trap-box")).toBe(false);
   });
 
-  it("has no clear spot at all for a forced fuel-case in the canned workshop (a documented limit, not a bug)", () => {
+  it("draws no host at all for a forced fuel-case in the canned workshop", () => {
     const { room, placed } = roomWithForcedCurio(CANNED_WORKSHOP, "fuel-case");
-    expect(placed).toBe("fuel-case");
-    const c = room.curios.find((x) => x.kind === "fuel-case");
-    if (c === undefined) throw new Error("no fuel-case placed");
-    expect(everyStandableSpotOccluded(room, c, NO_CLEAR_SPOT_FAR)).toBe(true);
-    expect(curioSightClear(room, forcedSpot(room, "fuel-case"), c)).toBe(false);
+    expect(placed).toBeNull();
+    expect(room.curios.some((c) => c.kind === "fuel-case")).toBe(false);
   });
 });

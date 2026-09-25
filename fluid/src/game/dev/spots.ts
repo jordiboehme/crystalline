@@ -245,12 +245,14 @@ const SLAB_THICKNESS = 0.05;
  * turned into a world volume (`turnedBox`, the fixture's own `wallAnchor`)
  * and added instead of the fixture's plain footprint: the pedestals, the
  * keyboard deck, the CRT and the chair all still occlude, while the desk
- * top and the open knee space between the pedestals, which
- * `TERMINAL_OCCLUDERS` never covers, stay clear for a curio standing on or
- * under them. A fixture kind with no parts table (every other kind, for
- * now) keeps the old whole-footprint skip. `c`'s own surface is still
- * skipped from the slab pass on top of this, so `c` never occludes the
- * line drawn to its own centre.
+ * top, which `TERMINAL_OCCLUDERS` never covers, stays clear for a curio
+ * standing on it. (The knee space the chair fills carries no curio host
+ * any more, fix round 3, `world/curios.ts`'s `FIXTURE_SURFACES.terminal`;
+ * this check would still find it occluded by the chair if it did.) A
+ * fixture kind with no parts table (every other kind, for now) keeps the
+ * old whole-footprint skip. `c`'s own surface is still skipped from the
+ * slab pass on top of this, so `c` never occludes the line drawn to its
+ * own centre.
  */
 function occludersFor(room: RoomSpec, c: Curio): Volume[] {
   const surfaces = hostSurfaces(room);

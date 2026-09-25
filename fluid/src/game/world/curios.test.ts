@@ -84,6 +84,7 @@ import type {
   Prop,
   RoomSpec,
   Side,
+  SurfaceSpec,
   WallSlot,
 } from "./types";
 import { CELL } from "./units";
@@ -132,6 +133,16 @@ describe("curio catalogue", () => {
     const [end] = FIXTURE_SURFACES.terminal;
     if (laptop === undefined || end === undefined) throw new Error("tables");
     expect(end.a1 - end.a0).toBeLessThan(Math.min(laptop.width, laptop.depth));
+  });
+
+  it("carries no under spot on a terminal (fix round 3)", () => {
+    // The model draws the swivel chair in the terminal's knee space
+    // (`render/models/terminal.ts`'s `TERMINAL_OCCLUDERS`), so no standing
+    // player could ever see a curio placed there (round 2's finding). An
+    // under-desk curio's only hosts are the workbench's lower shelf and a
+    // hero's own `under` spots.
+    const terminal: readonly SurfaceSpec[] = FIXTURE_SURFACES.terminal;
+    expect(terminal.some((s) => s.cls === "under")).toBe(false);
   });
 });
 
@@ -544,11 +555,55 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
       const b = base(room);
       const got = placeCurios(b, ALL_FORCED);
       const slots = new Set(got.map((c) => CURIO_CATALOGUE[c.kind].slot));
-      for (const slot of ["retro", "gear", "under"] as const)
+      for (const slot of ["retro", "gear"] as const)
         expect(slots.has(slot), `${name} ${slot}`).toBe(true);
+      // The under slot needs a workbench's lower shelf or a hero's under
+      // spot (fix round 3: a terminal carries none any more), which not
+      // every canned room draws, so it is checked only where one exists.
+      const hasUnderHost = hostSurfaces(b).some((s) => s.cls === "under");
+      expect(slots.has("under"), `${name} under`).toBe(hasUnderHost);
       expectInvariants(b, got, name);
       expect(placeCurios(b, ALL_FORCED), name).toEqual(got);
     }
+  });
+
+  it("never stands an under-slot curio on a terminal, across a sweep of generated rooms (fix round 3)", () => {
+    // A wide sweep: every room `ROOMS` already varies by archetype and
+    // condition, plus the gallery and the hero hall (the two rooms with a
+    // workbench and hero under spots, hand-built rather than generated),
+    // reseeded a few times each and at a few rolls, so the under slot's
+    // pool picks both kinds and its candidates come up in different
+    // orders (`candidatesOf`'s seed order depends on `room.seed`).
+    const rooms: readonly { name: string; room: RoomSpec }[] = [
+      ...ROOMS,
+      { name: "gallery", room: galleryRoom() },
+      { name: "hero hall", room: heroHallRoom() },
+    ];
+    let underCurios = 0;
+    for (const { name, room } of rooms) {
+      for (const roll of [0, 0.5, 0.99]) {
+        for (let i = 0; i < 5; i++) {
+          const b = reseed(room, "under-sweep", roll, i);
+          const got = placeCurios(b, {
+            ...ALL_FORCED,
+            under: { take: true, roll },
+          });
+          const surfaces = hostSurfaces(b);
+          for (const c of got) {
+            if (CURIO_CATALOGUE[c.kind].slot !== "under") continue;
+            underCurios++;
+            const hosts = hostsOf(surfaces, c).filter((s) =>
+              curioFits(b, c, s),
+            );
+            for (const s of hosts)
+              expect(s.host, `${name} ${roll} ${String(i)}`).not.toBe(
+                "terminal",
+              );
+          }
+        }
+      }
+    }
+    expect(underCurios).toBeGreaterThan(0);
   });
 
   it("places the floor ball in a free corner only, and falls back to the surfaces", () => {
@@ -686,8 +741,13 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
     });
     expect(got.some((c) => c.kind === "beige-laptop")).toBe(false);
     const slots = new Set(got.map((c) => CURIO_CATALOGUE[c.kind].slot));
-    for (const slot of ["gear", "ball", "under"] as const)
+    for (const slot of ["gear", "ball"] as const)
       expect(slots.has(slot), slot).toBe(true);
+    // The bridge draws no workbench and no hero under spot (fix round 3:
+    // a terminal carries no under spot any more), so the under slot is
+    // exactly the "nothing fits" case this test is named for.
+    expect(hostSurfaces(bridge).some((s) => s.cls === "under")).toBe(false);
+    expect(slots.has("under")).toBe(false);
     expectInvariants(bridge, got, "bridge");
   });
 
@@ -781,8 +841,12 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
   it("puts a curio where it is told on a surface, and throws where it cannot stand (curioOn)", () => {
     const surfaces = hostSurfaces(base(generateRoom(CANNED_WORKSHOP)));
     const desk = surfaces.find((s) => s.cls === "desk");
-    const under = surfaces.find((s) => s.cls === "under");
-    if (desk === undefined || under === undefined) throw new Error("surfaces");
+    if (desk === undefined) throw new Error("surfaces");
+    // No terminal carries an under spot any more (fix round 3), so the
+    // "cannot stand" probe below borrows the gallery's workbench shelf,
+    // the only surviving under-class surface.
+    const under = hostSurfaces(galleryRoom()).find((s) => s.cls === "under");
+    if (under === undefined) throw new Error("no under surface");
     const c = curioOn(desk, "pocket-console", 0, 0, 1, 7);
     expect(c.h).toBe(desk.h);
     expect(c.turn).toBe(desk.turn);
@@ -1007,11 +1071,14 @@ describe("the curio pass (C6, C7, C9, C10, C12)", () => {
  * The forced council workshop's curios (C11), written from the pass's
  * output after a look at each host: the upright green sword and the
  * laptop on two places of the round table (its places 2 and 1, the laptop
- * an exact fit, facing the table's front), the star ball on the desk end
- * of the west terminal at row 8, and the trap in the knee space of the
- * west terminal at row 10, facing out of the wall. The mess table stands
- * at (3.5, 7.5) turned 3; no curio's first fitting candidate is on it, by
- * the seed order of C9.
+ * an exact fit, facing the table's front), and the star ball on the desk
+ * end of the west terminal at row 8. The mess table stands at (3.5, 7.5)
+ * turned 3; no curio's first fitting candidate is on it, by the seed
+ * order of C9. The under slot draws `trap-box` but places nothing (fix
+ * round 3): this room has no workbench and the mess table's own under
+ * spot is empty, so the terminal it would once have used is now the
+ * room's only host for anything, and a terminal carries no under spot any
+ * more.
  */
 const PINNED: Curio[] = [
   {
@@ -1041,24 +1108,16 @@ const PINNED: Curio[] = [
     turn: 0,
     seed: 2159271467005853,
   },
-  {
-    kind: "trap-box",
-    variant: 0,
-    x: 0.123,
-    y: 10.557,
-    h: 0,
-    turn: 1,
-    seed: 1546703114626784,
-  },
 ];
 
 /**
  * The forced engineering workshop's curios with the mess table at (3.5,
  * 7.5) turned 3: the laptop on the table's top (h 0.76), turned to face
- * the table's back (a free host's `fixed` curio faces front or back), the
- * star ball and the lying sword on the two desk ends of the west terminal
- * at row 8, and the trap in the knee space of the west terminal at row
- * 10.
+ * the table's back (a free host's `fixed` curio faces front or back), and
+ * the star ball and the lying sword on the two desk ends of the west
+ * terminal at row 8. The under slot draws `trap-box` but places nothing
+ * (fix round 3, the same reason as `PINNED`): no workbench, an empty mess
+ * table under spot, and the terminal's own under spot is gone.
  */
 const PINNED_ON_HERO: Curio[] = [
   {
@@ -1087,14 +1146,5 @@ const PINNED_ON_HERO: Curio[] = [
     h: 0.78,
     turn: 0,
     seed: 2159271467005853,
-  },
-  {
-    kind: "trap-box",
-    variant: 0,
-    x: 0.123,
-    y: 10.557,
-    h: 0,
-    turn: 1,
-    seed: 1546703114626784,
   },
 ];

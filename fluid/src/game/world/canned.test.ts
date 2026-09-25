@@ -497,9 +497,10 @@ describe("galleryRoom curios", () => {
           .filter((c) => hostOf(room, c)?.host === host)
           .map((c) => c.h),
       );
-    // terminal: a top and the knee space.
-    expect(heights("terminal").size).toBe(2);
-    // machine:workbench: top and shelf.
+    // terminal: its desk end only (fix round 3: no under spot any more).
+    expect(heights("terminal").size).toBe(1);
+    // machine:workbench: top and shelf (the shelf now carries both
+    // under-desk curios, the trap and the fuel case, side by side).
     expect(heights("machine:workbench").size).toBe(2);
     // prop:storage-shelf: a v1 level and the v0 top.
     expect(heights("prop:storage-shelf").size).toBe(2);

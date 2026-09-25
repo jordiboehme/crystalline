@@ -87,12 +87,14 @@ export interface TerminalPart {
  * seat and back, out to `CHAIR_FOOT_R` and up to `CHAIR_TOP`) - everything
  * the model builds solid, except the desk top itself (already a curio
  * host surface, `world/curios.ts`'s `FIXTURE_SURFACES.terminal`) and the
- * open knee space between the pedestals (where an under-desk curio
- * stands). `dev/spots.ts`'s curio-framing sight-line check turns these
- * into occluding volumes the way `hostSurfaces` turns a `SurfaceSpec`
- * into a world box, so a chair pulled up to the desk, or the monitor and
- * keyboard on top of it, blocks a framing spot's view exactly as it
- * blocks a player's in the rendered room.
+ * open knee space between the pedestals, which the chair itself fills, is
+ * why a terminal carries no curio host there any more (fix round 3): no
+ * standing player can ever see past the chair into it. `dev/spots.ts`'s
+ * curio-framing sight-line check turns these parts into occluding volumes
+ * the way `hostSurfaces` turns a `SurfaceSpec` into a world box, so a
+ * chair pulled up to the desk, or the monitor and keyboard on top of it,
+ * blocks a framing spot's view exactly as it blocks a player's in the
+ * rendered room.
  */
 export const TERMINAL_OCCLUDERS: readonly TerminalPart[] = [
   // The left pedestal (the modesty panel's own support).

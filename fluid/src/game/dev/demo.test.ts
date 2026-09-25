@@ -65,9 +65,17 @@ describe("roomWithForcedHero", () => {
 describe("roomWithForcedCurio", () => {
   // The workshop has no terminal or table (only benches and desks); a
   // terminal's desk ends are too narrow for the laptop even where a
-  // terminal exists (C8), so it is the one kind the workshop never has a
-  // host for.
-  const NO_HOST_IN_WORKSHOP: readonly string[] = ["beige-laptop"];
+  // terminal exists (C8), so it never has a host for the laptop. Its
+  // default archetype and condition (engineering, construction) also
+  // draws no workbench and no hero whose own under spot is filled (fix
+  // round 3: a terminal carries no under spot any more, `world/curios.ts`'s
+  // `FIXTURE_SURFACES.terminal`), so neither under-desk kind has a host
+  // here either.
+  const NO_HOST_IN_WORKSHOP: readonly string[] = [
+    "beige-laptop",
+    "trap-box",
+    "fuel-case",
+  ];
 
   it("forces every curio kind into the workshop where it has a host, and leaves heroes and props alone", () => {
     const base = generateRoom(CANNED_WORKSHOP);

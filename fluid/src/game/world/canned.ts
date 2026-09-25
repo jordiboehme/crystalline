@@ -26,7 +26,9 @@
  * judged without an engram that happens to need it. Task 7 (2.6b) adds one
  * curio on the first host of every non-hero host kind it carries
  * (`galleryCurios`), so a curio can be judged sitting on a terminal, a
- * machine, a piece of decor and a floor prop alike.
+ * machine, a piece of decor and a floor prop alike. A terminal carries no
+ * under spot (fix round 3), so both under-desk curios sit in a row on the
+ * workbench's lower shelf instead.
  *
  * `heroHallRoom` (H15) is the gallery's second hand-built room, for the
  * `?hall=heroes` dev route: one of every hero kind and variant, hand-placed
@@ -579,11 +581,14 @@ export function galleryRoom(): RoomSpec {
  * The gallery's curios (2.6b, task 7): one curio on the first host surface
  * of every non-hero host kind the gallery carries (`hostSurfaces`,
  * `curioOn`), at the surface's own centre (`u = v = 0.5`): the terminal's
- * first desk end and its knee space, the workbench's top and its shelf,
- * one end of the lab bench, the lab island, the round table's first spot,
- * the lower level of the second storage shelf (v1, at `h` 1.08) and the top
- * of the first (v0), and the tops of both filing cabinets (v0 and v1, told
- * apart by their different `h`).
+ * first desk end, the workbench's top, one end of the lab bench, the lab
+ * island, the round table's first spot, the lower level of the second
+ * storage shelf (v1, at `h` 1.08) and the top of the first (v0), and the
+ * tops of both filing cabinets (v0 and v1, told apart by their different
+ * `h`). A terminal carries no under spot (fix round 3), so both under-desk
+ * curios (the trap and the fuel case) sit side by side in a row
+ * (`row`) on the workbench's lower shelf instead, its only surface left
+ * of that class.
  *
  * The lab bench's top is `cls: "bench"`, and neither ball kind
  * (`CURIO_CATALOGUE["star-ball"|"catch-ball"].classes`) nor the pink
@@ -592,13 +597,18 @@ export function galleryRoom(): RoomSpec {
  * sword's blue stand (`light-sword` 1) instead, the nearest legal kind
  * (`curioFits`) that isn't already shown elsewhere in the gallery.
  *
- * Every seed is `seedFor(seed, "curio", host, j, s.key[0], s.key[1])`, `j`
- * the surface's own index in its host's table and `s.key`'s anchor ints
- * the surface's own position (C9): `host` and `j` alone collide for a kind
- * whose per-variant table always holds one surface (the filing cabinet's
- * top, `j` always 0), since two instances of the same prop kind then share
- * both; the anchor ints tell them apart, since no two hosts stand at the
- * same point. No host is added beyond what the gallery already carries.
+ * Every single-item seed is `seedFor(seed, "curio", host, j, s.key[0],
+ * s.key[1])`, `j` the surface's own index in its host's table and
+ * `s.key`'s anchor ints the surface's own position (C9): `host` and `j`
+ * alone collide for a kind whose per-variant table always holds one
+ * surface (the filing cabinet's top, `j` always 0), since two instances of
+ * the same prop kind then share both; the anchor ints tell them apart,
+ * since no two hosts stand at the same point. The row's two items share
+ * one surface (`machine:workbench`'s under spot, `j` 1, the same host and
+ * `j` the standalone fuel case used before this round), so `j` alone no
+ * longer tells them apart; each seed adds the curio's own kind as a fifth
+ * token instead. No host is added beyond what the gallery already
+ * carries.
  */
 function galleryCurios(seed: number, room: RoomSpec): Curio[] {
   const surfaces = hostSurfaces(room);
@@ -628,12 +638,39 @@ function galleryCurios(seed: number, room: RoomSpec): Curio[] {
       0.5,
       seedFor(seed, "curio", s.host, j, s.key[0], s.key[1]),
     );
+  const underShelf = firstOf("machine:workbench", "under");
 
   return [
     place(firstOf("terminal", "desk"), "pocket-console", 0, 0),
-    place(firstOf("terminal", "under"), "trap-box", 0, 2),
     place(firstOf("machine:workbench", "bench"), "beige-laptop", 0, 0),
-    place(firstOf("machine:workbench", "under"), "fuel-case", 0, 1),
+    ...row(underShelf, [
+      {
+        kind: "trap-box",
+        variant: 0,
+        seed: seedFor(
+          seed,
+          "curio",
+          underShelf.host,
+          1,
+          underShelf.key[0],
+          underShelf.key[1],
+          "trap-box",
+        ),
+      },
+      {
+        kind: "fuel-case",
+        variant: 0,
+        seed: seedFor(
+          seed,
+          "curio",
+          underShelf.host,
+          1,
+          underShelf.key[0],
+          underShelf.key[1],
+          "fuel-case",
+        ),
+      },
+    ]),
     place(firstOf("machine:lab-bench", "bench"), "light-sword", 1, 0),
     place(firstOf("decor:lab-island", "bench"), "green-pistol", 0, 0),
     place(firstOf("decor:round-table", "table"), "video-tape", 0, 0),

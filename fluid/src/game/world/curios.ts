@@ -20,7 +20,11 @@
  *   per variant (`PROP_SURFACES`) and the heroes' (`HERO_CATALOGUE[kind]
  *   .surfaces` and `.under`). Each has its height, its free height `clear`
  *   (`OPEN_CLEAR` for an open top) and its class. Nothing is read off a
- *   mesh at run time.
+ *   mesh at run time. A terminal carries no under spot (fix round 3): its
+ *   knee space is where the model draws the swivel chair, so no standing
+ *   player can ever see a curio placed there (`dev/spots.test.ts`'s
+ *   documented-limit tests, round 2). An under-desk curio's only hosts are
+ *   now the workbench's lower shelf and a hero's `under` spots.
  * - **C4. One transform.** Every local point goes to the world through
  *   `turnedPoint` (`footprints.ts`), a wall host from its slot's wall
  *   anchor and a free host from its centre (`hostSurfaces`).
@@ -377,9 +381,15 @@ export const CURIO_CEILING_GAP = 0.3;
 /**
  * The tops and under spots of the fixtures that have any (C3), local to
  * their wall slot (`d` from the wall): a terminal's two desk ends beside
- * its screen and key deck and its knee space, a workbench's top and lower
- * shelf, and a lab bench's two clear ends. The terminal's ends are 0.22 m
- * wide, too narrow for the laptop (C8).
+ * its screen and key deck, a workbench's top and lower shelf, and a lab
+ * bench's two clear ends. The terminal's ends are 0.22 m wide, too narrow
+ * for the laptop (C8). A terminal carries no under spot: the model draws
+ * its swivel chair in that knee space (`render/models/terminal.ts`'s
+ * `TERMINAL_OCCLUDERS`), which sits between the wall and every standable
+ * spot on the only side with any floor at all, so no curio placed there
+ * could ever be seen (fix round 3, `dev/spots.test.ts`'s documented-limit
+ * tests from round 2). The workbench's lower shelf is the only fixture
+ * `under` spot left.
  */
 export const FIXTURE_SURFACES = {
   terminal: [
@@ -401,7 +411,6 @@ export const FIXTURE_SURFACES = {
       clear: OPEN_CLEAR,
       cls: "desk",
     },
-    { a0: -0.48, a1: 0.28, d0: 0.06, d1: 0.46, h: 0, clear: 0.7, cls: "under" },
   ],
   machine: {
     workbench: [
