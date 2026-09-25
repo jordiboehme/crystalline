@@ -35,21 +35,24 @@ import {
   type V3,
 } from "./geometry";
 import { createKit, turnPoint, type Frame, type Kit } from "./kit";
-import { LOOKS } from "./looks";
+import { LOOKS, type Rgb } from "./looks";
 import type { KitAt } from "./models";
 import { buildHero } from "./models/heroes";
 
 /**
  * One kit call, as a recording kit saw it: the builder it emitted into
- * (the room's, or a mover's own), the primitive's name, the layer and flag
- * of its surface (-1 where it took none) and the world positions of the
- * vertices it emitted, three per triangle.
+ * (the room's, or a mover's own), the primitive's name, the layer, flag
+ * and tint of its surface (-1, -1 and null where it took none) and the
+ * world positions of the vertices it emitted, three per triangle. The tint
+ * lets a shape test tell parts of one flag apart by their colour (a
+ * curio's keys, pads or mark).
  */
 export interface Part {
   builder: object;
   method: string;
   layer: number;
   flag: number;
+  tint: Rgb | null;
   points: V3[];
 }
 
@@ -543,7 +546,7 @@ const call = (kit: Kit, name: string, args: unknown[]) => {
 /**
  * A kit factory that emits into `builder` like `(f) => createKit(builder,
  * f)` and also records every primitive call into `parts`: its name, its
- * surface's layer and flag, and its own vertices, emitted a second time
+ * surface's layer, flag and tint, and its own vertices, emitted a second time
  * into a scratch builder so each part's points are known apart from the
  * mesh.
  */
@@ -568,6 +571,7 @@ export function recordingKitAt(builder: Builder, parts: Part[]): KitAt {
           method: name,
           layer: s?.layer ?? -1,
           flag: s?.flag ?? -1,
+          tint: s?.tint ?? null,
           points,
         });
       };

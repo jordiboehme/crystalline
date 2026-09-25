@@ -1,38 +1,36 @@
 /**
  * The retro curios' shape tests: what `curioModels.test.ts` does not check
- * for every kind. The console's two screen pictures never share a quad and
- * its battery light sits left of the screen; the tape drive has five keys
- * along its front edge, one of them the darker record key; the tape player
- * has two foam pads and one orange button; the video tape carries no text,
- * and bare it shows two reels; the laptop's "<=>" is exactly the font's
- * runs, lying on the back plane of its tilted lid, its two drive slots sit
- * either side of the latch and it stays under 900 triangles.
+ * for every kind. The console's two screen pictures never share a quad,
+ * show dark pixels on a pale screen, and its battery light sits left of
+ * the screen; the tape drive has five keys along its front edge, one of
+ * them the darker record key, and stands 0.045 high there; the tape player
+ * has two foam pads, one orange button, its buttons flush with its top end
+ * and its label strip along its hubs; the video tape carries no text, and
+ * bare it shows two reels; the laptop's "<=>" is exactly the font's runs,
+ * lying on the back plane of its tilted lid, its lid and mark keep the
+ * brief's numbers, its two drive slots sit either side of the latch, its
+ * keys stand in five rows before a palm rest, and it stays under 900
+ * triangles.
  *
- * Parts are told apart by their colour, so this file records every kit
- * call with its surface's tint (`tintedParts`), which the shared recording
- * kit does not keep.
+ * Parts are told apart by their colour: `recordingKitAt` keeps each kit
+ * call's surface tint.
  */
 
 import { describe, expect, it } from "vitest";
 
 import type { CurioKind } from "../../../world/types";
-import {
-  FLAG,
-  createBuilder,
-  type Builder,
-  type Surface,
-  type V3,
-} from "../../geometry";
-import { DECAL_LIFT, createKit, frameAt, type Kit } from "../../kit";
+import { FLAG, createBuilder, type V3 } from "../../geometry";
+import { DECAL_LIFT, frameAt } from "../../kit";
 import { TEXT_BASE } from "../../layers";
 import { LOOKS, type Rgb } from "../../looks";
-import { toLocal } from "../../modelChecks";
-import type { KitAt } from "../common";
+import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
 import { pixelRuns, textRows } from "../heroes/pixels";
 import { buildCurio, buildCurioMesh } from ".";
 import { curioHalf } from "./common";
 import {
+  CONSOLE_LED,
   CONSOLE_PLAY,
+  CONSOLE_SCREEN,
   CONSOLE_TITLE,
   DRIVE_KEY,
   DRIVE_RECORD_KEY,
@@ -43,66 +41,37 @@ import {
   LAPTOP_SLOT,
   MARK_PX,
   PLAYER_FOAM,
+  PLAYER_LABEL,
   PLAYER_ORANGE,
   TAPE_REEL,
 } from "./retro";
 
-/** One kit call: its primitive, its surface's tint, flag and layer, and its points in `[a, d, h]`. */
-interface TintedPart {
-  method: string;
-  tint: Rgb | null;
-  flag: number;
-  layer: number;
-  points: V3[];
-}
-
-type Fn = (...args: unknown[]) => void;
-
 /**
- * A curio built at the origin, every kit call recorded with its surface:
- * each call is emitted a second time into a scratch builder to learn its
- * own points, as `recordingKitAt` does, and kept in the recipe's local
- * `[a, d, h]`.
+ * A curio's recorded parts (`recordingKitAt`, which keeps each surface's
+ * tint), built at the origin at turn 0, their points put into the
+ * recipe's local `[a, d, h]`.
  */
-function tintedParts(kind: CurioKind, variant = 0): TintedPart[] {
-  const parts: TintedPart[] = [];
+function partsOf(kind: CurioKind, variant = 0): Part[] {
+  const parts: Part[] = [];
+  buildCurio(
+    recordingKitAt(createBuilder(), parts),
+    kind,
+    variant,
+    LOOKS.aperture,
+  );
   const origin = frameAt([0, 0, 0], 0);
-  const kitAt: KitAt = (f) => {
-    const wrapped: Record<string, Fn> = {};
-    for (const name of Object.keys(createKit(createBuilder(), f))) {
-      wrapped[name] = (...args: unknown[]) => {
-        const points: V3[] = [];
-        const scratch = {
-          vertex: (p: V3) => points.push(toLocal(origin, p)),
-        } as unknown as Builder;
-        (createKit(scratch, f) as unknown as Record<string, Fn | undefined>)[
-          name
-        ]?.(...args);
-        const s = args.find(
-          (x): x is Surface =>
-            typeof x === "object" && x !== null && "flag" in x,
-        );
-        parts.push({
-          method: name,
-          tint: s?.tint ?? null,
-          flag: s?.flag ?? -1,
-          layer: s?.layer ?? -1,
-          points,
-        });
-      };
-    }
-    return wrapped as unknown as Kit;
-  };
-  buildCurio(kitAt, kind, variant, LOOKS.aperture);
-  return parts;
+  return parts.map((p) => ({
+    ...p,
+    points: p.points.map((q) => toLocal(origin, q)),
+  }));
 }
 
 /** Whether a part is drawn in exactly this colour. */
-const inTint = (p: TintedPart, c: Rgb) =>
+const inTint = (p: Part, c: Rgb) =>
   p.tint !== null && p.tint.every((x, i) => x === c[i]);
 
 /** A part's bounds in `[a, d, h]`: lowest and highest of each. */
-function bounds(p: TintedPart): { lo: V3; hi: V3 } {
+function bounds(p: Part): { lo: V3; hi: V3 } {
   const lo: V3 = [Infinity, Infinity, Infinity];
   const hi: V3 = [-Infinity, -Infinity, -Infinity];
   for (const q of p.points)
@@ -114,7 +83,7 @@ function bounds(p: TintedPart): { lo: V3; hi: V3 } {
 }
 
 /** Whether two parts' `(a, h)` bounds share any area (touching edges do not count). */
-function overlapAH(p: TintedPart, q: TintedPart): boolean {
+function overlapAH(p: Part, q: Part): boolean {
   const e = 1e-9;
   const x = bounds(p);
   const y = bounds(q);
@@ -128,8 +97,8 @@ function overlapAH(p: TintedPart, q: TintedPart): boolean {
 
 describe("retro curio models", () => {
   describe("pocket console", () => {
-    const parts = tintedParts("pocket-console");
-    const group = (p: TintedPart) => p.flag - FLAG.blink;
+    const parts = partsOf("pocket-console");
+    const group = (p: Part) => p.flag - FLAG.blink;
     const title = parts.filter((p) => group(p) >= 0 && group(p) < 4);
     const play = parts.filter((p) => group(p) >= 4 && group(p) < 8);
 
@@ -156,10 +125,32 @@ describe("retro curio models", () => {
         for (const q of play) expect(overlapAH(t, q)).toBe(false);
     });
 
+    it("shows dark pixels on a pale screen: each pixel the screen's own tint, dark only while its group is low", () => {
+      const screens = parts.filter(
+        (p) => p.flag === FLAG.signal && inTint(p, CONSOLE_SCREEN),
+      );
+      expect(screens).toHaveLength(1);
+      const pixels = [...title, ...play];
+      expect(pixels.length).toBeGreaterThan(0);
+      for (const p of pixels) expect(inTint(p, CONSOLE_SCREEN)).toBe(true);
+      // The screen is pale, so a pixel at the swap bank's low gain reads dark.
+      expect(Math.min(...CONSOLE_SCREEN)).toBeGreaterThan(0.4);
+      const screen = bounds(screens[0] as Part);
+      for (const p of pixels) {
+        const b = bounds(p);
+        expect(b.lo[0]).toBeGreaterThanOrEqual(screen.lo[0]);
+        expect(b.hi[0]).toBeLessThanOrEqual(screen.hi[0]);
+        expect(b.lo[2]).toBeGreaterThanOrEqual(screen.lo[2]);
+        expect(b.hi[2]).toBeLessThanOrEqual(screen.hi[2]);
+        expect(b.lo[1]).toBeCloseTo(screen.hi[1] + DECAL_LIFT, 9);
+      }
+    });
+
     it("lights its battery light left of the screen", () => {
-      const leds = parts.filter((p) => p.flag === FLAG.signal);
+      const leds = parts.filter((p) => inTint(p, CONSOLE_LED));
       expect(leds).toHaveLength(1);
-      const led = bounds(leds[0] as TintedPart);
+      expect(leds[0]?.flag).toBe(FLAG.signal);
+      const led = bounds(leds[0] as Part);
       const pixels = [...title, ...play].map(bounds);
       const screenLeft = Math.min(...pixels.map((b) => b.lo[0]));
       const screenLow = Math.min(...pixels.map((b) => b.lo[2]));
@@ -173,7 +164,7 @@ describe("retro curio models", () => {
   describe("tape drive", () => {
     it("has five keys along its front edge, the first the darker record key", () => {
       const { hd } = curioHalf("tape-drive", 0);
-      const parts = tintedParts("tape-drive");
+      const parts = partsOf("tape-drive");
       const keys = parts
         .filter(
           (p) =>
@@ -197,10 +188,20 @@ describe("retro curio models", () => {
         if (next) expect(b.hi[0]).toBeLessThan(bounds(next).lo[0]);
       }
     });
+
+    it("stands 0.045 high at its front edge", () => {
+      const { hd } = curioHalf("tape-drive", 0);
+      const front = partsOf("tape-drive")
+        .filter((p) => p.method === "extrude")
+        .flatMap((p) => p.points)
+        .filter((q) => Math.abs(q[1] - hd) < 1e-9);
+      expect(front.length).toBeGreaterThan(0);
+      expect(Math.max(...front.map((q) => q[2]))).toBeCloseTo(0.045, 9);
+    });
   });
 
   describe("tape player", () => {
-    const parts = tintedParts("tape-player");
+    const parts = partsOf("tape-player");
 
     it("has two foam pads lying flat, one on each earcup", () => {
       const pads = parts.filter((p) => inTint(p, PLAYER_FOAM));
@@ -236,14 +237,43 @@ describe("retro curio models", () => {
       const orange = parts.filter((p) => inTint(p, PLAYER_ORANGE));
       expect(orange).toHaveLength(1);
       const { hw } = curioHalf("tape-player", 0);
-      expect(bounds(orange[0] as TintedPart).hi[0]).toBeLessThan(-hw + 0.088);
+      expect(bounds(orange[0] as Part).hi[0]).toBeLessThan(-hw + 0.088);
+    });
+
+    it("sets its buttons flush with the top end edge, up to the curio's top", () => {
+      const { top } = curioHalf("tape-player", 0);
+      const orange = bounds(
+        parts.find((p) => inTint(p, PLAYER_ORANGE)) as Part,
+      );
+      const buttons = parts
+        .filter((p) => p.method === "box")
+        .map(bounds)
+        .filter(
+          (b) =>
+            Math.abs(b.hi[1] - orange.hi[1]) < 1e-9 &&
+            Math.abs(b.hi[2] - top) < 1e-9,
+        );
+      expect(buttons).toHaveLength(4);
+      const body = parts
+        .filter((p) => p.method === "box")
+        .map(bounds)
+        .filter((b) => b.lo[2] === 0);
+      const end = Math.max(...body.map((b) => b.hi[1]));
+      expect(orange.hi[1]).toBeCloseTo(end, 9);
+    });
+
+    it("runs the cassette's label strip along the line of its two hubs", () => {
+      const label = bounds(parts.find((p) => inTint(p, PLAYER_LABEL)) as Part);
+      expect(label.hi[1] - label.lo[1]).toBeGreaterThan(
+        3 * (label.hi[0] - label.lo[0]),
+      );
     });
   });
 
   describe("video tape", () => {
     it("carries no text and no decal in either variant", () => {
       for (const v of [0, 1]) {
-        const parts = tintedParts("video-tape", v);
+        const parts = partsOf("video-tape", v);
         expect(parts.length).toBeGreaterThan(0);
         for (const p of parts) {
           expect(p.layer).toBeLessThan(TEXT_BASE);
@@ -253,7 +283,7 @@ describe("retro curio models", () => {
     });
 
     it("shows two reels on the bare tape", () => {
-      const reels = tintedParts("video-tape", 1).filter((p) =>
+      const reels = partsOf("video-tape", 1).filter((p) =>
         inTint(p, TAPE_REEL),
       );
       expect(reels).toHaveLength(2);
@@ -263,7 +293,7 @@ describe("retro curio models", () => {
   });
 
   describe("beige laptop", () => {
-    const parts = tintedParts("beige-laptop");
+    const parts = partsOf("beige-laptop");
 
     it("stays under 900 triangles", () => {
       expect(
@@ -342,10 +372,21 @@ describe("retro curio models", () => {
       }
     });
 
-    it("has about 45 chunky keys", () => {
-      const keys = parts.filter((p) => inTint(p, LAPTOP_KEY));
-      expect(keys.length).toBeGreaterThanOrEqual(42);
-      expect(keys.length).toBeLessThanOrEqual(48);
+    it("pins the brief's numbers: 12 mm mark pixels, a lid 15 degrees back, hinged at 0.045", () => {
+      expect(MARK_PX).toBe(0.012);
+      expect((LAPTOP_LID.tilt * 180) / Math.PI).toBeCloseTo(15, 9);
+      expect(LAPTOP_LID.hingeH).toBe(0.045);
+    });
+
+    it("has five rows of chunky keys and a palm rest in front of them", () => {
+      const { hd } = curioHalf("beige-laptop", 0);
+      const keys = parts.filter((p) => inTint(p, LAPTOP_KEY)).map(bounds);
+      expect(keys.length).toBeGreaterThanOrEqual(48);
+      expect(keys.length).toBeLessThanOrEqual(56);
+      const rows = new Set(keys.map((b) => b.lo[1].toFixed(6)));
+      expect(rows.size).toBe(5);
+      const front = Math.max(...keys.map((b) => b.hi[1]));
+      expect(hd - front).toBeGreaterThan(0.06);
     });
   });
 });

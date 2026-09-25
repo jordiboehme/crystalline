@@ -42,7 +42,7 @@ import {
   type Surfaces,
 } from "../common";
 import { heroHalf, type HeroRecipe } from "./common";
-import { pixelPanel, runsOf, textRows } from "./pixels";
+import { blinkPicture, fit, pixelPanel, runsOf, textRows } from "./pixels";
 
 /** A point of a side profile or a side shape: depth out from the wall, height. */
 type DH = readonly [d: number, h: number];
@@ -223,66 +223,6 @@ export const RECRUIT_DEMO: readonly string[] = [
 
 /** The frame every recipe builds in. */
 const ORIGIN: Frame = frameAt([0, 0, 0], 0);
-
-/**
- * Where a pixel picture of `rows` lands when fitted into the box `a0..a1`
- * by `h0..h1`: square pixels as large as both extents allow, the picture
- * centred in the box. Returns the pixel size, the left edge and the top.
- */
-function fit(
-  rows: readonly string[],
-  a0: number,
-  a1: number,
-  h0: number,
-  h1: number,
-): { px: number; left: number; top: number } {
-  const cols = rows[0]?.length ?? 0;
-  const px = Math.min((a1 - a0) / cols, (h1 - h0) / rows.length);
-  return {
-    px,
-    left: (a0 + a1) / 2 - (cols * px) / 2,
-    top: (h0 + h1) / 2 + (rows.length * px) / 2,
-  };
-}
-
-/**
- * Draws a pixel picture fitted into the box `a0..a1` by `h0..h1` at depth
- * `d` as blinking pixels: the columns from its first to its last lit one
- * are cut into four quarters, and quarter `q` blinks in group `group0 +
- * q`. `tintOf` gives a character's colour, or `null` for a dark one.
- */
-function blinkPicture(
-  k: Kit,
-  s: Surfaces,
-  rows: readonly string[],
-  box: readonly [a0: number, a1: number, h0: number, h1: number],
-  d: number,
-  group0: number,
-  tintOf: (ch: string) => Rgb | null,
-): void {
-  const { px, left, top } = fit(rows, ...box);
-  const litCols = rows.flatMap((r) =>
-    [...r].flatMap((ch, i) => (tintOf(ch) === null ? [] : [i])),
-  );
-  const lo = Math.min(...litCols);
-  const span = Math.max(...litCols) + 1 - lo;
-  for (let q = 0; q < 4; q++) {
-    const c0 = lo + Math.round((q * span) / 4);
-    const c1 = lo + Math.round(((q + 1) * span) / 4);
-    pixelPanel(
-      k,
-      rows.map((r) => r.slice(c0, c1)),
-      left + c0 * px,
-      top,
-      px,
-      d,
-      (ch) => {
-        const t = tintOf(ch);
-        return t === null ? null : s.blink(t, group0 + q);
-      },
-    );
-  }
-}
 
 /**
  * A thin shape standing on a cabinet's side: `outline` in the side view's

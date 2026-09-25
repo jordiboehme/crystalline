@@ -204,12 +204,13 @@ describe("touching", () => {
 });
 
 describe("looseParts", () => {
-  /** A flat triangle `Part` at a given height, with no flag or layer. */
+  /** A flat triangle `Part` at a given height, with no flag, layer or tint. */
   const partAt = (method: string, y: number): Part => ({
     builder: {},
     method,
     layer: -1,
     flag: -1,
+    tint: null,
     points: [
       [0, y, 0],
       [0.1, y, 0],
@@ -248,6 +249,7 @@ describe("looseParts", () => {
       method: "empty",
       layer: -1,
       flag: -1,
+      tint: null,
       points: [],
     };
     expect(looseParts([held, empty], null)).toEqual([]);

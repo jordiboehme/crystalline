@@ -1,7 +1,8 @@
 /**
  * The block-pixel font and the pixel pictures built from it: titles and
- * demos on the arcade cabinets' attract screens and marquees (H14), and
- * the small "<=>" mark on the back of the beige laptop's lid (C17).
+ * demos on the arcade cabinets' attract screens and marquees (H14), the
+ * pocket console's two screen pictures (C16), and the small "<=>" mark on
+ * the back of the beige laptop's lid (C17).
  *
  * A picture is a list of rows of characters, row 0 at the top, one
  * character per pixel; `.` is dark, any other character names a colour the
@@ -10,11 +11,15 @@
  * `k.panel` quad (two triangles) per horizontal run of equal characters,
  * so a lit bar of pixels costs the same as one pixel and no texture layer
  * or text key is needed. That merge is what keeps a cabinet's text inside
- * the hero triangle budget.
+ * the hero triangle budget. `fit` centres a picture in a box with square
+ * pixels, and `blinkPicture` draws one as blinking pixels, a group per
+ * column quarter: the one way a screen that swaps two pictures is drawn.
  */
 
 import type { Surface } from "../../geometry";
 import type { Kit } from "../../kit";
+import type { Rgb } from "../../looks";
+import type { Surfaces } from "../common";
 
 /**
  * The block-pixel font: `A` to `Z`, `0` to `9`, the space, a one-pixel
@@ -151,6 +156,68 @@ export function pixelPanel(
       h1 - (r.row + 1) * px,
       h1 - r.row * px,
       s,
+    );
+  }
+}
+
+/**
+ * Where a pixel picture of `rows` lands when fitted into the box `a0..a1`
+ * by `h0..h1`: square pixels as large as both extents allow, the picture
+ * centred in the box. Returns the pixel size, the left edge and the top.
+ */
+export function fit(
+  rows: readonly string[],
+  a0: number,
+  a1: number,
+  h0: number,
+  h1: number,
+): { px: number; left: number; top: number } {
+  const cols = rows[0]?.length ?? 0;
+  const px = Math.min((a1 - a0) / cols, (h1 - h0) / rows.length);
+  return {
+    px,
+    left: (a0 + a1) / 2 - (cols * px) / 2,
+    top: (h0 + h1) / 2 + (rows.length * px) / 2,
+  };
+}
+
+/**
+ * Draws a pixel picture fitted into the box `a0..a1` by `h0..h1` at depth
+ * `d` as blinking pixels: the columns from its first to its last lit one
+ * are cut into four quarters, and quarter `q` blinks in group `group0 +
+ * q`. `tintOf` gives a character's colour, or `null` for a dark one. The
+ * arcade cabinets' attract screens (H14) and the pocket console's screen
+ * (C16) swap two such pictures, one in groups 0 to 3 and one in 4 to 7.
+ */
+export function blinkPicture(
+  k: Kit,
+  s: Surfaces,
+  rows: readonly string[],
+  box: readonly [a0: number, a1: number, h0: number, h1: number],
+  d: number,
+  group0: number,
+  tintOf: (ch: string) => Rgb | null,
+): void {
+  const { px, left, top } = fit(rows, ...box);
+  const litCols = rows.flatMap((r) =>
+    [...r].flatMap((ch, i) => (tintOf(ch) === null ? [] : [i])),
+  );
+  const lo = Math.min(...litCols);
+  const span = Math.max(...litCols) + 1 - lo;
+  for (let q = 0; q < 4; q++) {
+    const c0 = lo + Math.round((q * span) / 4);
+    const c1 = lo + Math.round(((q + 1) * span) / 4);
+    pixelPanel(
+      k,
+      rows.map((r) => r.slice(c0, c1)),
+      left + c0 * px,
+      top,
+      px,
+      d,
+      (ch) => {
+        const t = tintOf(ch);
+        return t === null ? null : s.blink(t, group0 + q);
+      },
     );
   }
 }

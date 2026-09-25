@@ -108,6 +108,7 @@ vi.mock("./kit", async (importOriginal) => {
             method: name,
             layer: s?.layer ?? -1,
             flag: s?.flag ?? -1,
+            tint: s?.tint ?? null,
             points,
           });
         };

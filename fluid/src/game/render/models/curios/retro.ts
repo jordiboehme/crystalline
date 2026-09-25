@@ -8,16 +8,18 @@
  * Each follows its original's shape closely and copies no name or marking:
  * - The console is a tall light grey brick standing upright on a small dark
  *   foot (C15), the lower half 4 mm thinner at the front. Its upper half
- *   holds a grey-green bezel round a dark screen sunk into the body, with a
- *   red battery light on the bezel left of the screen. Below: a black cross
+ *   holds a grey-green bezel round a pale yellow-green screen sunk into
+ *   the body, showing dark pixels, with a red battery light on the bezel
+ *   left of the screen. Below: a black cross
  *   pad, two round maroon buttons on a slant, two small dark oblong
  *   buttons in the middle and five slanted speaker slits bottom right. The
  *   screen swaps two block-pixel pictures of our own (C16): a title word
  *   over a row of blocks (`CONSOLE_TITLE`) and a well with a stack and a
  *   falling piece (`CONSOLE_PLAY`).
  * - The tape drive is a low beige wedge with a lid (four thin raised ribs
- *   at the back, a smoky cassette window with two pale reel hubs), five
- *   chunky brown piano keys along the front edge (the first one darker), a
+ *   at the back, a smoky cassette window with two pale reel hubs) and a
+ *   flat key deck at the front, 0.045 high, with five chunky brown piano
+ *   keys along its front edge (the first one darker), a
  *   small counter window with a pale strip and a reset knob, and a thick
  *   dark cable leaving the back and lying along it.
  * - The tape player lies flat: silver faces over a dark blue band round
@@ -33,8 +35,8 @@
  *   tan tape on light hubs, a lighter front flap and the spine label.
  * - The laptop is a thick beige base with bevelled edges, a raised band at
  *   the back holding two dark drive slots either side of a small latch, a
- *   dark key well with 44 chunky light keys in four rows (the front row
- *   with a long bar), and a beige lid tilted back 15 degrees from vertical
+ *   dark key well with 52 chunky light keys in five rows (the front row
+ *   with a long bar), a plain palm rest in front of it, and a beige lid tilted back 15 degrees from vertical
  *   carrying the grey-green screen in a wide bezel in front and a block
  *   pixel "<=>" on its back (C17).
  *
@@ -46,8 +48,10 @@
  *
  * Only the console blinks (C16): its title picture is groups 0 to 3 and
  * its play picture groups 4 to 7 of the `swap` bank, one group per column
- * quarter, and no cell is lit in both. Its battery light is a steady
- * `s.signal` and the laptop's screen a steady `s.glow`; nothing else
+ * quarter (`blinkPicture`), and no cell is in both. Its pixels are dark
+ * on a pale screen, so a picture shows while its own groups are low (see
+ * `CONSOLE_SCREEN`). The screen and the battery light are steady
+ * `s.signal`s and the laptop's screen a steady `s.glow`; nothing else
  * lights.
  */
 
@@ -62,7 +66,7 @@ import {
   type KitAt,
   type Surfaces,
 } from "../common";
-import { pixelPanel, pixelRuns, textRows } from "../heroes/pixels";
+import { blinkPicture, pixelRuns, textRows } from "../heroes/pixels";
 import { curioHalf, type CurioRecipe } from "./common";
 
 /** A point of a side profile: depth `d`, height `h`. */
@@ -139,11 +143,16 @@ const CONSOLE_BODY: Rgb = [0.72, 0.71, 0.68];
 /** The screen's bezel: a darker grey-green round the screen. */
 const CONSOLE_BEZEL: Rgb = [0.55, 0.6, 0.52];
 
-/** The screen between its pixels: a dark olive. */
-const CONSOLE_LCD: Rgb = [0.25, 0.3, 0.2];
-
-/** The screen's lit pixels: a pale yellow-green. */
-const CONSOLE_PIXEL: Rgb = [0.75, 0.85, 0.55];
+/**
+ * The screen: a pale yellow-green, and the colour of its pixels too. The
+ * screen is a steady `s.signal` and each pixel a blinking light of the
+ * same tint, so a pixel whose group is lit matches the screen and vanishes
+ * into it, and one whose group is low (`BLINK_LOW`) reads as a dark olive
+ * dot: dark pixels on a pale screen, like the original's unlit display.
+ * Shown through `SIGNAL_GAIN`, this tint lands near the original's pale
+ * (0.75, 0.8, 0.6).
+ */
+export const CONSOLE_SCREEN: Rgb = [0.54, 0.58, 0.42];
 
 /** The cross pad: all but black. */
 const CONSOLE_PAD: Rgb = [0.08, 0.08, 0.08];
@@ -155,7 +164,7 @@ const CONSOLE_BUTTON: Rgb = [0.35, 0.12, 0.15];
 const CONSOLE_SMALL: Rgb = [0.2, 0.2, 0.2];
 
 /** The battery light: red. */
-const CONSOLE_LED: Rgb = [0.8, 0.1, 0.1];
+export const CONSOLE_LED: Rgb = [0.8, 0.1, 0.1];
 
 /** The speaker slits: a grey a step darker than the body, a groove in shade. */
 const CONSOLE_SLIT: Rgb = [0.38, 0.38, 0.36];
@@ -178,8 +187,8 @@ const CONSOLE_STAND: Rgb = [0.12, 0.12, 0.13];
  * - `bezelFront`: the bezel's face, 1 mm under the body's;
  * - `pixD`: the depth of the screen's pixels, half a millimetre under the
  *   bezel's face; the screen itself stands `DECAL_LIFT` behind them, sunk
- *   into the body, so the pixels sit in the glass plane and the dark
- *   screen shows behind them.
+ *   into the body, so the pixels sit in the glass plane with the pale
+ *   screen behind them.
  */
 const CONSOLE = {
   plate: 0.006,
@@ -203,8 +212,8 @@ const DARK_ROW = ".".repeat(SCREEN_COLS);
 
 /**
  * The console screen's title picture: the word BLOK in the block-pixel
- * font over a row of four blocks, 17 by 16 pixels, `#` lit. Blink groups
- * 0 to 3 of the swap bank, one per column quarter. No cell of it is lit in
+ * font over a row of four blocks, 17 by 16 pixels, `#` a pixel. Blink
+ * groups 0 to 3 of the swap bank, one per column quarter. No cell of it is a pixel in
  * `CONSOLE_PLAY` too, so the two pictures never share a quad.
  */
 export const CONSOLE_TITLE: readonly string[] = [
@@ -225,8 +234,8 @@ export const CONSOLE_TITLE: readonly string[] = [
 /**
  * The console screen's play picture: a well (two walls and a floor), a
  * ragged stack of blocks at its bottom and one T-shaped piece falling near
- * its top, 17 by 16 pixels, `#` lit. Blink groups 4 to 7 of the swap bank,
- * one per column quarter.
+ * its top, 17 by 16 pixels, `#` a pixel. Blink groups 4 to 7 of the swap
+ * bank, one per column quarter.
  */
 export const CONSOLE_PLAY: readonly string[] = [
   "#...............#",
@@ -248,51 +257,11 @@ export const CONSOLE_PLAY: readonly string[] = [
 ];
 
 /**
- * Draws a `#`-lit picture fitted and centred into the box `a0..a1` by
- * `h0..h1` at depth `d`: the columns from its first lit one to its last are
- * cut into four quarters, quarter `q` blinking in group `group0 + q`, each
- * quarter through `pixelPanel`, so a run never crosses a quarter.
- */
-function blinkPicture(
-  k: Kit,
-  s: Surfaces,
-  rows: readonly string[],
-  box: readonly [a0: number, a1: number, h0: number, h1: number],
-  d: number,
-  group0: number,
-  tint: Rgb,
-): void {
-  const [a0, a1, h0, h1] = box;
-  const cols = Math.max(...rows.map((r) => r.length));
-  const px = Math.min((a1 - a0) / cols, (h1 - h0) / rows.length);
-  const left = (a0 + a1) / 2 - (cols * px) / 2;
-  const top = (h0 + h1) / 2 + (rows.length * px) / 2;
-  const lit = rows.flatMap((r) =>
-    [...r].flatMap((ch, i) => (ch === "#" ? [i] : [])),
-  );
-  const lo = Math.min(...lit);
-  const span = Math.max(...lit) + 1 - lo;
-  for (let q = 0; q < 4; q++) {
-    const c0 = lo + Math.round((q * span) / 4);
-    const c1 = lo + Math.round(((q + 1) * span) / 4);
-    pixelPanel(
-      k,
-      rows.map((r) => r.slice(c0, c1)),
-      left + c0 * px,
-      top,
-      px,
-      d,
-      (ch) => (ch === "#" ? s.blink(tint, group0 + q) : null),
-    );
-  }
-}
-
-/**
  * The pocket console, upright on its foot (C15), its screen facing `+d`.
  * The plate fills the curio's box; a lip at its front and a slanted prop
  * behind hold the body. The upper half is built round its screen: a back
  * slab, a body-coloured frame round the bezel, the bezel as a frame round
- * the screen window and the dark screen at the bottom of that window.
+ * the screen window and the pale screen at the bottom of that window.
  */
 const pocketConsole: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   const { hw, hd, top } = curioHalf(kind, variant);
@@ -339,7 +308,7 @@ const pocketConsole: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   k.box(l1, b1, sunk, C.bezelFront, bh0, bh1, bezel);
   k.box(l0, l1, sunk, C.bezelFront, lh1, bh1, bezel);
   k.box(l0, l1, sunk, C.bezelFront, bh0, lh0, bezel);
-  k.box(l0, l1, sunk, lcdFront, lh0, lh1, s.tinted(CONSOLE_LCD));
+  k.box(l0, l1, sunk, lcdFront, lh0, lh1, s.signal(CONSOLE_SCREEN));
 
   // The battery light on the bezel, left of the screen.
   const ledA = (b0 + l0) / 2;
@@ -402,15 +371,19 @@ const pocketConsole: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
       slit,
     );
 
-  // The screen's two pictures, which the swap bank shows in turn.
+  // The screen's two pictures, which the swap bank shows in turn: a
+  // picture's pixels go dark while its own groups are low, so the title
+  // (groups 0 to 3) shows while the play picture's groups are lit and
+  // melt into the screen, and the other way round.
   const screen = [
     l0 + 0.0015,
     l1 - 0.0015,
     lh0 + 0.0015,
     lh1 - 0.0015,
   ] as const;
-  blinkPicture(k, s, CONSOLE_TITLE, screen, C.pixD, 0, CONSOLE_PIXEL);
-  blinkPicture(k, s, CONSOLE_PLAY, screen, C.pixD, 4, CONSOLE_PIXEL);
+  const ink = (ch: string) => (ch === "#" ? CONSOLE_SCREEN : null);
+  blinkPicture(k, s, CONSOLE_TITLE, screen, C.pixD, 0, ink);
+  blinkPicture(k, s, CONSOLE_PLAY, screen, C.pixD, 4, ink);
 };
 
 // --- Tape drive ------------------------------------------------------------
@@ -442,7 +415,10 @@ const DRIVE_CABLE: Rgb = [0.1, 0.1, 0.1];
  * - `lid`, `rib`: the lid's thickness and the ribs' rise above it, so the
  *   body's back top is `top - rib - lid` and the rearmost rib reaches the
  *   curio's top;
- * - `lidFront`: where the lid ends and the key strip begins;
+ * - `lidFront`: where the lid ends and the key deck begins;
+ * - `deck`: the key deck's height, a flat step from the lid's front to the
+ *   body's front edge, so the front stands at 0.045 as the original's does
+ *   (the wedge's own slope would leave it at 0.041);
  * - `cable`: the cable's radius.
  */
 const DRIVE = {
@@ -451,6 +427,7 @@ const DRIVE = {
   lid: 0.003,
   rib: 0.001,
   lidFront: 0.04,
+  deck: 0.045,
   cable: 0.0045,
 } as const;
 
@@ -459,8 +436,8 @@ const DRIVE_KEYS = 5;
 
 /**
  * The tape drive, lying flat with its keys along the front. The body is a
- * wedge (`profileAlong`), the lid a slab on its sloped top from the back
- * edge to the key strip, the ribs and the window thin slabs on the lid, so
+ * wedge (`profileAlong`) whose front strip is a flat key deck, the lid a
+ * slab on its sloped top from the back edge to the deck, the ribs and the window thin slabs on the lid, so
  * each follows the slope.
  */
 const tapeDrive: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
@@ -502,7 +479,9 @@ const tapeDrive: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
     [
       [back, 0],
       [hd, 0],
-      [hd, bodyH(hd)],
+      [hd, D.deck],
+      [D.lidFront, D.deck],
+      [D.lidFront, bodyH(D.lidFront)],
       [back, backH],
     ],
     -hw,
@@ -532,7 +511,15 @@ const tapeDrive: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   for (let i = 0; i < DRIVE_KEYS; i++) {
     const a0 = -0.09 + i * 0.025;
     const key = s.tinted(i === 0 ? DRIVE_RECORD_KEY : DRIVE_KEY);
-    k.box(a0, a0 + 0.022, 0.046, hd - 0.0005, bodyH(hd) - 0.001, 0.049, key);
+    k.box(
+      a0,
+      a0 + 0.022,
+      0.046,
+      hd - 0.0005,
+      D.deck - 0.001,
+      D.deck + 0.007,
+      key,
+    );
   }
 
   // The counter window with its pale strip, and its reset knob.
@@ -541,16 +528,16 @@ const tapeDrive: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
     0.072,
     0.048,
     0.072,
-    bodyH(hd) - 0.001,
-    0.047,
+    D.deck - 0.001,
+    D.deck + 0.004,
     s.tinted(DRIVE_WINDOW),
   );
-  k.box(0.045, 0.067, 0.054, 0.066, 0.047, 0.0475, hub);
+  k.box(0.045, 0.067, 0.054, 0.066, D.deck + 0.004, D.deck + 0.0045, hub);
   k.cylinder(
     0.085,
     0.06,
-    bodyH(hd) - 0.001,
-    0.047,
+    D.deck - 0.001,
+    D.deck + 0.004,
     0.004,
     8,
     s.tinted(DRIVE_KEY),
@@ -584,7 +571,7 @@ const PLAYER_DARK: Rgb = [0.15, 0.15, 0.15];
 export const PLAYER_FOAM: Rgb = [0.95, 0.5, 0.1];
 
 /** The cassette's label strip seen through the lid: an off white. */
-const PLAYER_LABEL: Rgb = [0.85, 0.84, 0.8];
+export const PLAYER_LABEL: Rgb = [0.85, 0.84, 0.8];
 
 /** The lid's window: a smoky blue-grey, light enough for the dark hubs to show. */
 const PLAYER_SMOKE: Rgb = [0.3, 0.31, 0.35];
@@ -640,7 +627,8 @@ const tapePlayer: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   k.box(a0, a1, -dh, dh, P.low, P.high, s.tinted(PLAYER_TRIM));
   k.box(a0, a1, -dh, dh, P.high, P.height, silver);
 
-  // The lid window with the cassette behind it.
+  // The lid window with the cassette behind it: two hubs on a line along
+  // the player, and the pale label strip running beside that line.
   const mid = (a0 + a1) / 2;
   const lidTop = P.height;
   k.box(
@@ -653,10 +641,10 @@ const tapePlayer: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
     s.tinted(PLAYER_SMOKE),
   );
   k.box(
-    mid - 0.03,
-    mid + 0.03,
-    0.012,
-    0.028,
+    mid + 0.011,
+    mid + 0.024,
+    -0.052,
+    0.014,
     lidTop + 0.0006,
     lidTop + 0.0012,
     s.tinted(PLAYER_LABEL),
@@ -664,11 +652,11 @@ const tapePlayer: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   for (const d of [-0.04, 0.002])
     k.cylinder(mid, d, lidTop + 0.0006, lidTop + 0.0014, 0.0065, 6, dark);
 
-  // The row of buttons at the top end, one orange.
+  // The row of buttons flush with the top end edge, one orange.
   for (let i = 0; i < PLAYER_BUTTONS; i++) {
     const b0 = a0 + 0.008 + i * 0.018;
     const face = i === ORANGE_BUTTON ? s.tinted(PLAYER_ORANGE) : dark;
-    k.box(b0, b0 + 0.014, 0.042, 0.058, lidTop, top, face);
+    k.box(b0, b0 + 0.014, dh - 0.013, dh, lidTop, top, face);
   }
 
   // Two jacks and the slide switch on the side facing the headphones.
@@ -884,7 +872,9 @@ export const LAPTOP_MARK: Rgb = [0.3, 0.3, 0.3];
  * The laptop's base in metres: `width` along `a`, `depth` along `d` (its
  * front at the curio's `+d` edge), `height`, the `bevel` of its edges, the
  * raised band's `band` depth and `bandH` top, and the key well's
- * `wellMargin` from the case's sides and `lip` from its front.
+ * `wellMargin` from the case's sides and its `rowPitch`, from one row of
+ * keys to the next; the keys stop after five rows and the plain beige
+ * palm rest runs from there to the front edge.
  */
 const LAPTOP = {
   width: 0.405,
@@ -894,7 +884,7 @@ const LAPTOP = {
   band: 0.05,
   bandH: 0.045,
   wellMargin: 0.0125,
-  lip: 0.045,
+  rowPitch: 0.031,
 } as const;
 
 /**
@@ -934,10 +924,10 @@ export const MARK_PX = 0.012;
 const MARK_TEXT = "<=>";
 
 /** The keyboard's rows from the back: how many keys each holds; the front row holds the bar. */
-const KEY_ROWS = [12, 12, 11] as const;
+const KEY_ROWS = [12, 12, 11, 10] as const;
 
 /** The front row: small keys either side of the bar, and the bar's width in key pitches. */
-const BAR_ROW = { side: 4, bar: 4 } as const;
+const BAR_ROW = { side: 3, bar: 6 } as const;
 
 /** A point `s` up the laptop's lid and `o` through it from its back face, in `(d, h)`. */
 function lidPoint(s: number, o: number): DH {
@@ -1018,16 +1008,18 @@ const beigeLaptop: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
     s.tinted(LAPTOP_LATCH),
   );
 
-  // The key well and the keys: three rows and the front row with the bar.
+  // The key well and the keys: four rows and the front row with the bar,
+  // then the plain beige palm rest to the front edge.
+  const keyRows = KEY_ROWS.length + 1;
   const wellA = half - B.wellMargin;
   const well0 = bandFront + 0.008;
-  const well1 = hd - B.lip;
+  const well1 = well0 + 0.008 + keyRows * B.rowPitch;
   const keyH = B.height + 0.001;
   k.box(-wellA, wellA, well0, well1, B.height, keyH, s.tinted(LAPTOP_WELL));
   const pitch = (2 * wellA - 0.004) / 12;
   const keyW = pitch - 0.004;
-  const rowPitch = (well1 - well0 - 0.008) / 4;
-  const keyD = rowPitch - 0.014;
+  const rowPitch = B.rowPitch;
+  const keyD = rowPitch - 0.006;
   const key = s.tinted(LAPTOP_KEY);
   const rowD = (r: number) => well0 + 0.004 + r * rowPitch;
   KEY_ROWS.forEach((n, r) => {
