@@ -73,6 +73,22 @@ describe("trap box", () => {
     expect(hazard.some((s) => s.lo[1] >= 0)).toBe(true);
   });
 
+  it("touches the hazard panel with the two side tubes, no more than a millimetre apart", () => {
+    const parts = partsOf("trap-box");
+    const panel = parts
+      .filter((p) => p.layer === LAYER.hazard)
+      .map(localShape)
+      .find((s) => s.hi[1] <= 0);
+    if (!panel) throw new Error("back hazard panel missing");
+    const tubes = parts
+      .filter((p) => p.method === "cylinderAlong")
+      .map(localShape)
+      .filter((s) => s.hi[2] < 0.1);
+    expect(tubes).toHaveLength(2);
+    for (const tube of tubes)
+      expect(Math.abs(tube.hi[1] - panel.lo[1])).toBeLessThan(0.001);
+  });
+
   it("keeps the pedal apart from the trap, its cable touching both", () => {
     const parts = partsOf("trap-box");
     const trapBody = parts.find((p) => p.method === "bevelBox");
@@ -110,6 +126,18 @@ describe("fuel case", () => {
     const disc = shapes.filter((s) => diagonal(s) <= 0.025);
     expect(sectors).toHaveLength(3);
     expect(disc).toHaveLength(1);
+  });
+
+  it("bands the lid seam about 0.17 high", () => {
+    const seam = partsOf("fuel-case")
+      .filter((p) => p.method === "box")
+      .map(localShape)
+      .filter((s) => s.lo[2] > 0.16 && s.hi[2] < 0.18);
+    expect(seam).toHaveLength(4);
+    for (const s of seam) {
+      expect(s.hi[2] - s.lo[2]).toBeCloseTo(0.007, 3);
+      expect((s.lo[2] + s.hi[2]) / 2).toBeCloseTo(0.17, 2);
+    }
   });
 
   it("wraps the red stripe round all four faces", () => {

@@ -224,6 +224,26 @@ const catchBall: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   );
 };
 
+/**
+ * A carry handle: two posts rising from `base`, and a bar across them
+ * whose axis is set so its top lands exactly on the curio's own `top`.
+ * Shared by the trap box's lid handle and the fuel case's carry handle.
+ */
+function handle(
+  k: Kit,
+  half: number,
+  base: number,
+  top: number,
+  postR: number,
+  barR: number,
+  sides: number,
+  s: Surface,
+): void {
+  const axis = top - barR;
+  for (const a of [-half, half]) k.cylinder(a, 0, base, axis, postR, sides, s);
+  k.cylinderAlong(-half, half, 0, axis, barR, sides, s);
+}
+
 // --- Trap box and pedal ---------------------------------------------------
 
 /** The trap's body and its cable: a plain black. */
@@ -267,15 +287,30 @@ const BAR_A = [-0.2, -0.12, -0.04];
 const BAR_HALF = 0.02;
 /** The rear beacon's `a` centre. */
 const BEACON_A = -0.12;
-/** Half the rear beacon's width along `a` (a little wider than a bar segment, the "dome"). */
-const BEACON_HALF = 0.03;
+/**
+ * The rear beacon's dome: three stacked rings standing proud of the back
+ * face, each smaller and further out than the last, so it reads as a
+ * rounded dome rather than a flat light.
+ */
+const BEACON_TIERS: readonly { r: number; depth: number }[] = [
+  { r: 0.014, depth: 0.004 },
+  { r: 0.009, depth: 0.004 },
+  { r: 0.005, depth: 0.004 },
+];
+/** The dome's axis height: its widest tier's lower edge lands where the flat bar sits. */
+const BEACON_AXIS_H = LIGHT_H0 + 0.014;
 /** The handle's half span along `a`, and its post and bar radii. */
 const HANDLE_HALF = 0.05;
 const HANDLE_POST_R = 0.004;
 const HANDLE_BAR_R = 0.006;
-/** The two side tubes' radius, their `d` position and their two heights. */
+/**
+ * The two side tubes' radius, their `d` position and their two heights.
+ * `TUBE_D` sets the tube's near edge (`TUBE_D + TUBE_R`) flush against
+ * the hazard panel's own outer face (`TRAP_D0 - DECAL_LIFT`), so the two
+ * touch with no gap rather than sitting `TOUCH`'s own tolerance apart.
+ */
 const TUBE_R = 0.008;
-const TUBE_D = -0.13;
+const TUBE_D = TRAP_D0 - DECAL_LIFT - TUBE_R;
 const TUBE_H = [0.05, 0.09];
 /** The pedal's box, in metres: its `a` and `d` range and its wedge heights. */
 const PEDAL_A0 = 0.16;
@@ -321,20 +356,8 @@ const trapBox: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
   k.box(lidA0, lidA1, 0, TRAP_D1, LID_H0, LID_H1, silver);
   for (const d of [TRAP_D0, TRAP_D1])
     k.cylinderAlong(lidA0, lidA1, d, LID_H1, HINGE_R, 6, silver);
-  // The handle: two short posts and a bar across the lid's middle, its
-  // bar reaching exactly the curio's own top.
-  const handleAxis = top - HANDLE_BAR_R;
-  for (const a of [-HANDLE_HALF, HANDLE_HALF])
-    k.cylinder(a, 0, LID_H1, handleAxis, HANDLE_POST_R, 6, silver);
-  k.cylinderAlong(
-    -HANDLE_HALF,
-    HANDLE_HALF,
-    0,
-    handleAxis,
-    HANDLE_BAR_R,
-    6,
-    silver,
-  );
+  // The handle: two short posts and a bar across the lid's middle.
+  handle(k, HANDLE_HALF, LID_H1, top, HANDLE_POST_R, HANDLE_BAR_R, 6, silver);
   // The hazard stripe panels on both long sides.
   const hazardA0 = trapA0 + HAZARD_INSET;
   const hazardA1 = TRAP_A1 - HAZARD_INSET;
@@ -367,7 +390,7 @@ const trapBox: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
       8,
       s.tinted(TUBES_RED),
     );
-  // The front bar (three amber segments, groups 0 to 2) and the rear beacon (group 3).
+  // The front bar: three amber segments, groups 0 to 2.
   for (const [i, a] of BAR_A.entries())
     k.box(
       a - BAR_HALF,
@@ -378,15 +401,26 @@ const trapBox: CurioRecipe = ({ k, kitAt, s, variant, kind }) => {
       LIGHT_H1,
       s.blink(BAR_AMBER, i),
     );
-  k.box(
-    BEACON_A - BEACON_HALF,
-    BEACON_A + BEACON_HALF,
-    TRAP_D0 - LIGHT_PROUD,
-    TRAP_D0,
-    LIGHT_H0,
-    LIGHT_H1,
-    s.blink(BEACON_RED, 3),
-  );
+  // The rear beacon (group 3): a small stepped dome standing proud of
+  // the back face, rather than a flat light.
+  {
+    const axial = kitAt(yawed(ORIGIN, 0, 0, Math.PI / 2));
+    const beacon = s.blink(BEACON_RED, 3);
+    let outer = TRAP_D0;
+    for (const tier of BEACON_TIERS) {
+      const inner = outer - tier.depth;
+      axial.cylinderAlong(
+        inner,
+        outer,
+        -BEACON_A,
+        BEACON_AXIS_H,
+        tier.r,
+        8,
+        beacon,
+      );
+      outer = inner;
+    }
+  }
   // The pedal: a black wedge with a silver top pad, apart from the trap.
   const wedge: readonly (readonly [d: number, h: number])[] = [
     [PEDAL_D0, 0],
@@ -452,11 +486,12 @@ const CASE_BEVEL = 0.01;
 /** A corner guard's size along each of `a` and `d`, and how far it stands proud past the case body. */
 const GUARD_SIZE = 0.03;
 const GUARD_PROUD = 0.006;
-/** The red stripe's and the lid seam's height ranges. */
+/** The red stripe's height range. */
 const STRIPE_H0 = 0.07;
 const STRIPE_H1 = 0.1;
-const SEAM_H0 = 0.15;
-const SEAM_H1 = 0.157;
+/** The lid seam's height range: a 7 mm band centred on the brief's 0.17. */
+const SEAM_H0 = 0.1665;
+const SEAM_H1 = 0.1735;
 /** A latch's half width, its own depth and its lever's further depth. */
 const LATCH_HALF = 0.015;
 const LATCH_DEPTH = 0.012;
@@ -570,20 +605,8 @@ const fuelCase: CurioRecipe = ({ k, s, variant, kind }) => {
     );
   }
 
-  // A carry handle on top: two posts and a grip bar, its bar reaching
-  // exactly the curio's own top.
-  const postTop = top - HANDLE_BAR_R2;
-  for (const a of [-HANDLE_POST_A, HANDLE_POST_A])
-    k.cylinder(a, 0, bh, postTop, HANDLE_POST_R2, 8, steel);
-  k.cylinderAlong(
-    -HANDLE_POST_A,
-    HANDLE_POST_A,
-    0,
-    postTop,
-    HANDLE_BAR_R2,
-    8,
-    steel,
-  );
+  // A carry handle on top: two posts and a grip bar.
+  handle(k, HANDLE_POST_A, bh, top, HANDLE_POST_R2, HANDLE_BAR_R2, 8, steel);
 
   // The yellow label on the front, above the stripe, and its trefoil.
   const labelHalf = LABEL_SIDE / 2;
