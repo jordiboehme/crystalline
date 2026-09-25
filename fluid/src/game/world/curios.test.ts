@@ -121,7 +121,32 @@ describe("turnedPoint (C4)", () => {
 describe("host surfaces", () => {
   it("finds every host kind of the gallery with its tables' counts", () => {
     const room = galleryRoom();
-    const hosts = new Set(hostSurfaces(room).map((s) => s.host));
+    const all = hostSurfaces(room);
+    const hosts = new Set(all.map((s) => s.host));
+    const count = (o: object) => all.filter((s) => s.anchorOf === o).length;
+    const machines: Partial<Record<string, readonly unknown[]>> =
+      FIXTURE_SURFACES.machine;
+    const decorTable: Partial<Record<string, readonly unknown[]>> =
+      DECOR_SURFACES;
+    const propTable: Partial<Record<string, readonly (readonly unknown[])[]>> =
+      PROP_SURFACES;
+    for (const f of room.fixtures) {
+      const want =
+        f.kind === "terminal"
+          ? FIXTURE_SURFACES.terminal.length
+          : f.kind === "machine"
+            ? (machines[f.machine]?.length ?? 0)
+            : 0;
+      expect(count(f), f.kind).toBe(want);
+    }
+    for (const d of room.decor)
+      expect(count(d), d.kind).toBe(decorTable[d.kind]?.length ?? 0);
+    for (const p of room.props)
+      expect(count(p), `${p.kind} ${String(p.variant)}`).toBe(
+        p.anchor === "floor"
+          ? (propTable[p.kind]?.[p.variant]?.length ?? 0)
+          : 0,
+      );
     for (const h of [
       "terminal",
       "machine:workbench",
@@ -171,12 +196,13 @@ describe("host surfaces", () => {
         hue: 0,
         seed: 1,
       };
-      for (const fx of [term, wb]) {
+      const lab = { ...wb, machine: "lab-bench" as const };
+      for (const fx of [term, wb, lab]) {
         const room = { ...base, fixtures: [fx] };
         const box = footprintOf(fx);
         if (box === null) throw new Error("footprint");
         for (const s of hostSurfaces(room))
-          expect(inside(s.box, box), `${fx.kind} ${side}`).toBe(true);
+          expect(inside(s.box, box), `${s.host} ${side}`).toBe(true);
       }
       for (const kind of Object.keys(
         DECOR_SURFACES,
@@ -210,18 +236,61 @@ describe("host surfaces", () => {
         }
       }
     }
-    for (const h of heroHallRoom().heroes) {
-      const room = { ...heroHallRoom(), heroes: [h] };
-      for (const s of hostSurfaces(room))
-        expect(inside(s.box, heroFootprint(h)), h.kind).toBe(true);
-    }
+    // Every hero at every turn, not only the one the hall stands it at.
+    const hall = heroHallRoom();
+    for (const h0 of hall.heroes)
+      for (let t = 0; t < 4; t++) {
+        const h = { ...h0, turn: t };
+        const room = {
+          ...hall,
+          fixtures: [],
+          decor: [],
+          props: [],
+          heroes: [h],
+        };
+        const got = hostSurfaces(room);
+        const e = HERO_CATALOGUE[h.kind];
+        expect(got.length, `${h.kind} ${String(t)}`).toBe(
+          e.surfaces.length + e.under.length,
+        );
+        for (const s of got)
+          expect(
+            inside(s.box, heroFootprint(h)),
+            `${h.kind} ${String(t)}`,
+          ).toBe(true);
+      }
   });
 
   it("gives open tops OPEN_CLEAR and every shelf level less", () => {
-    for (const s of hostSurfaces(galleryRoom())) {
-      expect(s.clear).toBeGreaterThan(0);
-      expect(s.clear).toBeLessThanOrEqual(OPEN_CLEAR);
+    const all = hostSurfaces(galleryRoom());
+    for (const s of all) {
+      expect(s.clear, s.host).toBeGreaterThan(0);
+      expect(s.clear, s.host).toBeLessThanOrEqual(OPEN_CLEAR);
+      // A desk, bench or table top is always open.
+      if (s.cls === "desk" || s.cls === "bench" || s.cls === "table")
+        expect(s.clear, s.host).toBe(OPEN_CLEAR);
+      if (s.cls === "under") expect(s.clear, s.host).toBeLessThan(OPEN_CLEAR);
     }
+    // A shelf host's highest level is its open top; every level below is
+    // closed by the one above it.
+    const shelves = new Set(
+      all.filter((s) => s.cls === "shelf").map((s) => s.anchorOf),
+    );
+    expect(shelves.size).toBeGreaterThan(0);
+    let closed = 0;
+    for (const host of shelves) {
+      const mine = all
+        .filter((s) => s.anchorOf === host && s.cls === "shelf")
+        .sort((a, b) => a.h - b.h);
+      for (const [i, s] of mine.entries()) {
+        if (i === mine.length - 1) expect(s.clear, s.host).toBe(OPEN_CLEAR);
+        else {
+          expect(s.clear, s.host).toBeLessThan(OPEN_CLEAR);
+          closed++;
+        }
+      }
+    }
+    expect(closed).toBeGreaterThan(0);
   });
 });
 
@@ -242,5 +311,6 @@ describe("curioBox", () => {
     expect(b.x1 - b.x0).toBeCloseTo(size.depth, 9);
     expect(b.z1 - b.z0).toBeCloseTo(size.width, 9);
     expect((b.x0 + b.x1) / 2).toBeCloseTo(4 * CELL, 9);
+    expect((b.z0 + b.z1) / 2).toBeCloseTo(5 * CELL, 9);
   });
 });

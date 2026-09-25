@@ -9,8 +9,8 @@
  *
  * It also holds the one local-to-world transform (`turnedPoint`, C4, and
  * `turnedBox` over it) that the hero helpers and the curios' host surfaces
- * share, and `OPEN_CLEAR`,
- * the free height an open top promises a curio (C3).
+ * share, and `OPEN_CLEAR`, the free height an open top promises a curio
+ * (C3).
  *
  * This is a leaf of the world: it imports only `units.ts` and `types.ts`,
  * so the generator (`generate.ts`) and the walking code (`move.ts`) can both

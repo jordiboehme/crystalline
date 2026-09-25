@@ -65,9 +65,10 @@
  * `clear` and its class `cls`), and `under` the spots below the top (the
  * floor in a knee space, or a lower shelf), which bypass the reserve since
  * they lie inside the hero's own box. `heroSurfaces` and `heroUnder` give
- * them in world metres for the curios (`curios.ts`), through `heroPoint`
- * and so `turnedPoint`. `heroUsePoint` gives a cabinet's use point the same
- * way.
+ * them in world metres for the curios (`curios.ts`), each rectangle
+ * through `turnedBox` (`footprints.ts`), which turns its corners with
+ * `turnedPoint` at the hero's anchor and turn, as `heroPoint` does.
+ * `heroUsePoint` gives a cabinet's use point through `heroPoint`.
  *
  * This is the generator side: it imports `footprints.ts`, `sites.ts`,
  * `types.ts`, `units.ts` and the seeds (and may import `props.ts`), and
@@ -585,8 +586,10 @@ function heroRects(h: Hero, specs: readonly SurfaceSpec[]): HeroSurface[] {
 
 /**
  * The hero's tops (H21) in world metres, each with its height `h`, its
- * free height `clear` and its class `cls`: each top's four corners through
- * `heroPoint`, and its box spanning their extremes.
+ * free height `clear` and its class `cls`: each top through `turnedBox`
+ * (`footprints.ts`), whose four corners go through `turnedPoint` at the
+ * hero's anchor and turn, as `heroPoint` turns a point, and whose box spans
+ * their extremes.
  */
 export function heroSurfaces(h: Hero): HeroSurface[] {
   const specs: readonly SurfaceSpec[] = HERO_CATALOGUE[h.kind].surfaces;
