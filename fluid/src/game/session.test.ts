@@ -1253,6 +1253,101 @@ describe("malfunctions", () => {
     expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
   });
 
+  describe("on the canned bridge", () => {
+    const bridge = generateRoom(CANNED_BRIDGE);
+    /** The blast door straight ahead of the bridge's entrance. */
+    const blast = bridge.fixtures.findIndex(
+      (f) => f.kind === "door" && f.style === "blast",
+    );
+    const blastKey = (() => {
+      const f = bridge.fixtures[blast];
+      if (f?.kind !== "door" || f.address === null) {
+        throw new Error("the bridge has an open blast door");
+      }
+      return f.address.permalink;
+    })();
+
+    /**
+     * Walks from the entrance up to the blast door, opens it with E, walks
+     * in and lets the failed answer land.
+     */
+    const failBlast = async () => {
+      key("keydown", "KeyW");
+      const offered = () =>
+        hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("E OPEN") === true;
+      for (let i = 0; i < 120 && !offered(); i++) frames(1);
+      key("keyup", "KeyW");
+      expect(offered()).toBe(true);
+      pressE();
+      frames(15);
+      walkIn();
+      await flush();
+      expect(hud.notice).toHaveBeenCalledWith("?FILE NOT FOUND");
+      frames(2);
+      expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
+    };
+
+    it("keeps a failed way when the same place is shown again", async () => {
+      expect(blast).toBeGreaterThanOrEqual(0);
+      const session = start({ client: null, load: failing("missing") });
+      session.showCanned(CANNED_BRIDGE);
+      frames(1);
+      await failBlast();
+
+      session.showCanned(CANNED_BRIDGE);
+      const mark = renderer.draw.mock.calls.length;
+      frames(60);
+      expect(hud.prompt).toHaveBeenLastCalledWith("SEALED ?FILE NOT FOUND");
+      expect(faultsSince(mark).some((m) => m.has(blast))).toBe(true);
+      expect(lastDoors().get(`door:${String(blast)}`)).toBe(0);
+    });
+
+    it("warms the cache for a failed way no more", async () => {
+      serve();
+      const session = start({ load: failing("missing") });
+      session.showCanned(CANNED_BRIDGE);
+      frames(1);
+      await failBlast();
+      const warmed = () =>
+        prefetchMock.mock.calls.filter(([, , permalink]) => {
+          return permalink === blastKey;
+        }).length;
+      expect(warmed()).toBe(1);
+
+      // Shown again, the visit keeps its failure but forgets what it
+      // warmed: the player still stands at the failed door, which is not
+      // warmed a second time.
+      session.showCanned(CANNED_BRIDGE);
+      frames(20);
+      expect(warmed()).toBe(1);
+    });
+  });
+
+  it("seals nothing when an outside go fails while a travel is pending", async () => {
+    const first = deferred<{ kind: "missing" }>();
+    let calls = 0;
+    const session = start({
+      client: null,
+      load: () =>
+        ++calls === 1 ? first.promise : Promise.resolve({ kind: "missing" }),
+    });
+    session.showRoom(before(gallery, door0));
+    walkIn();
+    session.go({ domain: "dev", permalink: "elsewhere" });
+    await flush();
+    expect(hud.notice).toHaveBeenCalledWith("?FILE NOT FOUND");
+    first.resolve({ kind: "missing" });
+    await flush();
+    const from = hud.prompt.mock.calls.length;
+    const mark = renderer.draw.mock.calls.length;
+    frames(60);
+    expect(
+      promptsSince(from).some((p) => p?.startsWith("SEALED") === true),
+    ).toBe(false);
+    expect(faultsSince(mark).some((m) => m.has(door0))).toBe(false);
+    expect(lastDoors().get(`door:${String(door0)}`)).toBe(1);
+  });
+
   it("gives the renderer the same frames for the same room on two sessions", () => {
     const seen: ReadonlyMap<number, FaultFrame>[] = [];
     for (let s = 0; s < 2; s++) {

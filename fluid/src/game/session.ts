@@ -12,7 +12,8 @@
  * (`loadPlace`), or through the `load` seam when the session was given one,
  * with the connector shown while it loads, and replaces the room when it
  * lands; `showCanned` shows a place that is already in hand (the look demo's
- * bridge) at once, and `showRoom` a room built by hand (the model gallery). A room is generated once per entry and kept until the next one.
+ * bridge) at once, and `showRoom` a room built by hand (the model gallery).
+ * A room is generated once per entry and kept until the next one.
  *
  * Loads race, and the session settles every race the same way: each `go`
  * takes a new generation and aborts the load before it, and a load whose
@@ -485,7 +486,9 @@ export function createSession(opts: SessionOptions): Session {
     if (loaded.kind !== "place") {
       fail(FAILED[loaded.kind]);
       // Only a missing or denied target breaks the way the travel went
-      // through; the generation guard above already dropped a stale one.
+      // through. A stale answer is dropped twice over: by the generation
+      // guard above, and because `leave` clears `travelling` for every new
+      // place, so `t` can only be this load's own travel (`t.gen === gen`).
       const t = travelling;
       travelling = null;
       if (
