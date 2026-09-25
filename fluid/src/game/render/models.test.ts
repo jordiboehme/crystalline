@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { decorFootprint, footprint, footprintOf } from "../world/footprints";
+import {
+  PIPE_HALF,
+  decorFootprint,
+  footprint,
+  footprintOf,
+  pipeRunBox,
+} from "../world/footprints";
 import { MACHINE_KINDS } from "../world/generate";
 import type {
   Decor,
@@ -512,6 +518,7 @@ describe("decor models", () => {
         it("stays inside its footprint, under the ceiling", () => {
           const own = decorFootprint(decor);
           const half = pipeLength(decor, HALL) / 2;
+          const run = pipeRunBox(decor, HALL);
           for (const p of positions(built.static)) {
             if (own) {
               expect(inBox(own, p)).toBe(true);
@@ -519,7 +526,10 @@ describe("decor models", () => {
             } else {
               const [a, d, h] = toLocal(f, p);
               expect(Math.abs(a)).toBeLessThanOrEqual(half + EPS);
-              expect(Math.abs(d)).toBeLessThanOrEqual(0.4);
+              expect(Math.abs(d)).toBeLessThanOrEqual(PIPE_HALF + EPS);
+              // The plan box the span lines keep clear of (E3).
+              expect(run).not.toBeNull();
+              if (run !== null) expect(inBox(run, p, EPS)).toBe(true);
               expect(h).toBeGreaterThanOrEqual(CEILING - PIPE_DROP - 0.2);
             }
             expect(p[1]).toBeLessThanOrEqual(CEILING - HEADROOM + EPS);

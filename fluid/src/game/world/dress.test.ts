@@ -24,6 +24,7 @@ import {
   decorFootprint,
   footprint,
   footprintOf,
+  pipeRunBox,
   propFootprint,
 } from "./footprints";
 import { generateRoom } from "./generate";
@@ -35,6 +36,7 @@ import { PLAYER_RADIUS, blockersFor } from "./move";
 import {
   CLUSTER_BLOCK,
   CLUSTER_CLEAR,
+  CLUSTER_INNER,
   CLUSTER_MAX,
   CLUSTER_MIN,
   EXTRAS,
@@ -986,8 +988,9 @@ describe("density measure", () => {
   });
 
   it("keeps every large dressed room at or under 22 floor props per 100 floor cells", () => {
-    // The densest room forecast with a cluster in every block is at 19.23
-    // (E9); the ceiling was 16 before the clusters grew.
+    // The densest room measured with a cluster in every block is at 19.87,
+    // the workshop (permalink pipe-shop) engineering derelict (E9); the
+    // ceiling was 16 before the clusters grew.
     const rooms = [
       ...ALL,
       ...BRIDGES,
@@ -1091,7 +1094,8 @@ describe("mid-hall clusters", () => {
         name,
       ).toBeGreaterThanOrEqual(CLUSTER_MIN);
     }
-    expect(members).toBeGreaterThan(300);
+    // 2815 members measured over these rooms.
+    expect(members).toBeGreaterThan(2000);
   }, 20_000);
 
   it("keeps two clusters at least 2 m + twice the widest footprint's inset apart", () => {
@@ -1150,12 +1154,16 @@ describe("ceiling spans", () => {
     expect(withSpan / eligible).toBeLessThanOrEqual(0.8);
   });
 
-  it("keeps every span box clear of the ceiling band along the walls, lamps, decor and scaffolding", () => {
+  it("keeps every span box clear of the ceiling band along the walls, lamps, decor, pipe runs and scaffolding", () => {
     let checked = 0;
     for (const room of [...SEEDS.slice(0, 60), ...HUBS.map((h) => h.room)]) {
       const h = room.hall;
       const solid = [
         ...room.decor.map(decorFootprint).filter((b) => b !== null),
+        ...room.decor.flatMap((d) => {
+          const b = pipeRunBox(d, room.hall);
+          return b === null ? [] : [b];
+        }),
         ...room.scaffold,
         ...lampBoxes(room),
       ];
@@ -1179,6 +1187,14 @@ describe("ceiling spans", () => {
       }
     }
     expect(checked).toBeGreaterThan(0);
+  });
+
+  it("hangs a span in the demo workshop in every archetype but the council", () => {
+    for (const { name, archetype, room } of WORKSHOPS) {
+      const segments = measureDensity(room).spanSegments;
+      if (archetype === "council") expect(segments, name).toBe(0);
+      else expect(segments, name).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -1553,15 +1569,16 @@ describe("locality", () => {
     // tags, and a third relation adds one door at (5,0,n) without moving the
     // hall or any other fixture. The canned rooms do not serve here: a
     // relation grows the workshop's hall, and reshuffles the hub's slots.
-    // Probed over 216 clean pairs (3 span archetypes, 3 to 6 sections, 1 to
-    // 3 relations, 3 to 5 inbound, 0 or 2 tags), every changed prop lay
-    // within 1 cell of the new slot, no cluster member changed and the span
-    // props never did. Under the other conditions the extras move further,
-    // since each goes to the first spot in floor-seed order that accepts it
-    // (ruling 12), so this case is clean.
+    // Probed with a cluster in every block, the 3x3 inner squares and the
+    // engineering span over 288 clean pairs (4 span archetypes, 3 to 6
+    // sections, 1 to 3 relations, 3 to 5 inbound, 0 or 2 tags), every
+    // changed prop lay within 1 cell of the new slot, no cluster member
+    // changed and the span props never did. Under the other conditions the
+    // extras move further, since each goes to the first spot in floor-seed
+    // order that accepts it (ruling 12), so this case is clean.
     const RADIUS = 1;
     let members = 0;
-    for (const type of ["manifest", "reference", "guide"]) {
+    for (const type of ["manifest", "runbook", "reference", "guide"]) {
       const P = place({
         type,
         status: "stable",
@@ -1610,8 +1627,9 @@ describe("locality", () => {
       expect(spans(b), name).toEqual(spans(a));
       expect(dressingSites(b).spanLines, name).toEqual(sites.spanLines);
 
-      // What a block can reach: its inner cells grown by the ring. A member
-      // may change only when that reaches the new door or its lane.
+      // What a block can reach: its inner CLUSTER_INNER by CLUSTER_INNER
+      // cells grown by the ring. A member may change only when that reaches
+      // the new door or its lane.
       const near = [
         footprint(slot, { along: LANE_WIDTH, out: LANE_DEPTH }),
         footprintOf(door),
@@ -1622,9 +1640,9 @@ describe("locality", () => {
         const inner = grow(
           {
             x0: (bl.x + 1) * CELL,
-            x1: (bl.x + CLUSTER_BLOCK - 1) * CELL,
+            x1: (bl.x + 1 + CLUSTER_INNER) * CELL,
             z0: (bl.y + 1) * CELL,
-            z1: (bl.y + CLUSTER_BLOCK - 1) * CELL,
+            z1: (bl.y + 1 + CLUSTER_INNER) * CELL,
           },
           CLUSTER_CLEAR,
         );

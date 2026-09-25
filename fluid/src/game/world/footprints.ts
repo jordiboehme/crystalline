@@ -18,6 +18,7 @@ import type {
   MachineKind,
   Prop,
   PropKind,
+  Rect,
   WallSlot,
 } from "./types";
 
@@ -304,5 +305,49 @@ export function propFootprint(prop: Prop): Box | null {
   const hz = (sideways ? size.width : size.depth) / 2;
   const cx = prop.x * CELL;
   const cz = prop.y * CELL;
+  return { x0: cx - hx, x1: cx + hx, z0: cz - hz, z1: cz + hz };
+}
+
+/** The longest pipe run, in metres. */
+export const PIPE_MAX = 6;
+/** How much shorter than the hall along its run a pipe run stays, in metres. */
+export const PIPE_CLEARANCE = 1;
+/**
+ * Half a pipe run's width across its line, in metres: the brackets that
+ * hang the pipes are the widest part. The model (`render/models/decor.ts`)
+ * builds its brackets to this half-width, and `pipeRunBox` boxes it.
+ */
+export const PIPE_HALF = 0.3;
+
+/**
+ * How long a pipe run is: at most `PIPE_MAX` (6 m), and `PIPE_CLEARANCE`
+ * (1 m) shorter than the hall is along the run (along x at turns 0 and 2,
+ * along the grid's y at 1 and 3), so it never pokes through a wall. It lives
+ * here, on the world side, so the generator can keep ceiling spans off the
+ * pipe runs without importing a model (E3); the model reads it back.
+ */
+export function pipeLength(decor: Decor, hall: Rect): number {
+  const cells = decor.turn % 2 === 0 ? hall.x1 - hall.x0 : hall.y1 - hall.y0;
+  return Math.max(0, Math.min(PIPE_MAX, cells * CELL - PIPE_CLEARANCE));
+}
+
+/**
+ * The plan box of a pipe run, in metres: `pipeLength / 2` either way along
+ * its axis (x at turns 0 and 2, the grid's y at 1 and 3) and `PIPE_HALF`
+ * across, centred on `(decor.x * CELL, decor.y * CELL)`. A pipe run hangs
+ * from the ceiling, so it takes no floor (`decorFootprint` gives null), but
+ * it hangs in the band a ceiling span hangs in: `sites.ts` keeps every span
+ * line off this box. Null for any other kind of decor, and for a run whose
+ * length is 0.
+ */
+export function pipeRunBox(decor: Decor, hall: Rect): Box | null {
+  if (decor.kind !== "pipe-run") return null;
+  const half = pipeLength(decor, hall) / 2;
+  if (half <= 0) return null;
+  const sideways = decor.turn % 2 === 1;
+  const hx = sideways ? PIPE_HALF : half;
+  const hz = sideways ? half : PIPE_HALF;
+  const cx = decor.x * CELL;
+  const cz = decor.y * CELL;
   return { x0: cx - hx, x1: cx + hx, z0: cz - hz, z1: cz + hz };
 }

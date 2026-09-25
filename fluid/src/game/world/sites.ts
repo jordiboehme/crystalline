@@ -71,14 +71,15 @@
  *   every column `x` from `hall.x0 + 1` to `hall.x1 - 2`, west to east, cut
  *   the same way from the north end over the rows `hall.y0 + 1` to
  *   `hall.y1 - 2`. A line is kept only when none of its segments'
- *   `spanBox`es overlaps a decor footprint, a box of `room.scaffold` or a
- *   lamp's box (`lampBoxes`): the lab island's duct, the specimen tanks and
- *   the scaffold poles reach the ceiling, and a span under a lamp would
- *   hide it. A line is dropped whole, never cut short. Every span stays at
- *   least one full cell (2 m) off every hall wall, past the ceiling band
- *   along the walls (1.2 m) where the runs, loops, beacon and loose cables
- *   hang. Which palette hangs a span, and on which line, is the pass's
- *   choice; this module only lists the lines.
+ *   `spanBox`es overlaps a decor footprint, a box of `room.scaffold`, a
+ *   lamp's box (`lampBoxes`) or a pipe run's box (`pipeRunBox`): the lab
+ *   island's duct, the specimen tanks and the scaffold poles reach the
+ *   ceiling, a span under a lamp would hide it, and a pipe run hangs in the
+ *   span band (E3). A line is dropped whole, never cut short. Every span
+ *   stays at least one full cell (2 m) off every hall wall, past the
+ *   ceiling band along the walls (1.2 m) where the runs, loops, beacon and
+ *   loose cables hang. Which palette hangs a span, and on which line, is
+ *   the pass's choice; this module only lists the lines.
  * - **Long walls** (ruling 11). When the hall's width is at least its
  *   depth, the hall's `n` edges (west to east) and its `s` edges (east to
  *   west); otherwise its `w` edges (south to north) and its `e` edges (north
@@ -93,7 +94,12 @@
  * `generate.ts` or `interact.ts` (ruling 20). `sites.test.ts` keeps it so.
  */
 
-import { decorFootprint, footprint, footprintOf } from "./footprints";
+import {
+  decorFootprint,
+  footprint,
+  footprintOf,
+  pipeRunBox,
+} from "./footprints";
 import { lampBoxes } from "./lamps";
 import { BAND_MARGIN, STEP, doorwayColumns, isFloor, wallRuns } from "./layout";
 import {
@@ -437,6 +443,8 @@ function spanLines(room: RoomBase): SpanLine[] {
   for (const d of room.decor) {
     const box = decorFootprint(d);
     if (box !== null) solid.push(box);
+    const run = pipeRunBox(d, hall);
+    if (run !== null) solid.push(run);
   }
   solid.push(...room.scaffold, ...lampBoxes(room));
   const lines: SpanLine[] = [];
@@ -474,7 +482,8 @@ function spanLines(room: RoomBase): SpanLine[] {
  * The plan box of a span segment whose first cell is `c`, in metres (D9):
  * `SPAN_CELLS` cells along its axis from the cell's west (axis "x") or
  * north (axis "y") edge, and `SPAN_HALF` either side of the cell's middle
- * across it. `sites.ts` keeps it clear of decor, scaffolding and lamps.
+ * across it. `sites.ts` keeps it clear of decor, pipe runs, scaffolding and
+ * lamps.
  */
 export function spanBox(axis: "x" | "y", c: { x: number; y: number }): Box {
   return axis === "x"

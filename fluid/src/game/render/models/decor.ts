@@ -10,9 +10,8 @@
  */
 
 import { createRng } from "../../core/seed";
-import { FOOTPRINTS } from "../../world/footprints";
-import { CELL } from "../../world/units";
-import type { Decor, DecorKind, Rect } from "../../world/types";
+import { FOOTPRINTS, PIPE_HALF, pipeLength } from "../../world/footprints";
+import type { Decor, DecorKind } from "../../world/types";
 import { DECAL_LIFT, frameForDecor, type Frame, type Kit } from "../kit";
 import type { Surface } from "../geometry";
 import { hueToRgb } from "../looks";
@@ -57,19 +56,12 @@ export function buildDecor(
 
 /** How far below the ceiling a pipe run's pipes hang (to their axis). */
 export const PIPE_DROP = 0.35;
-/** The longest pipe run, and how much shorter than the hall it stays. */
-const PIPE_MAX = 6;
-const PIPE_CLEARANCE = 1;
 
 /**
- * How long a pipe run is: at most 6 m, and 1 m shorter than the hall is
- * along the run (along x at turns 0 and 2, along the grid's y at 1 and 3),
- * so it never pokes through a wall.
+ * How long a pipe run is (`world/footprints.ts`, E3), re-exported so the
+ * models' index and their tests keep one import path.
  */
-export function pipeLength(decor: Decor, hall: Rect): number {
-  const cells = decor.turn % 2 === 0 ? hall.x1 - hall.x0 : hall.y1 - hall.y0;
-  return Math.max(0, Math.min(PIPE_MAX, cells * CELL - PIPE_CLEARANCE));
-}
+export { pipeLength };
 
 /** Half a decor piece's footprint, width along and depth. */
 function halves(kind: DecorKind): [number, number] {
@@ -346,10 +338,13 @@ const PIPES: readonly (readonly [d: number, r: number])[] = [
   [0, 0.05],
   [0.18, 0.07],
 ];
-/** The spacing of flanged joints and brackets, and the brackets' reach. */
+/**
+ * The spacing of flanged joints and brackets, and how far in from each end
+ * the brackets start. Their half-width across the run is `PIPE_HALF`
+ * (`world/footprints.ts`), the box the span lines keep clear of.
+ */
 const PIPE_JOINT = 1.5;
 const BRACKET_INSET = 0.3;
-const BRACKET_HALF = 0.3;
 
 /**
  * Pipe run: three pipes along the ceiling with flanges at every joint and
@@ -367,7 +362,7 @@ function pipeRun({ k, s, ctx, decor }: Recipe) {
   }
   const span = Math.max(0, 2 * half - 2 * BRACKET_INSET);
   const brackets = Math.max(1, Math.round(span / PIPE_JOINT));
-  const w = BRACKET_HALF;
+  const w = PIPE_HALF;
   for (let i = 0; i <= brackets; i++) {
     const a = -half + BRACKET_INSET + (i * span) / brackets;
     k.box(a - 0.03, a + 0.03, -w, w, h - 0.1, h - 0.07, s.dark);

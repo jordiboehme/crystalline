@@ -1,9 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { FOOTPRINTS, MAX_FLOOR_PROP, propFootprint } from "./footprints";
+import {
+  FOOTPRINTS,
+  MAX_FLOOR_PROP,
+  PIPE_HALF,
+  pipeRunBox,
+  propFootprint,
+} from "./footprints";
 import footprintsSource from "./footprints.ts?raw";
 import unitsSource from "./units.ts?raw";
-import type { Prop } from "./types";
+import type { Decor, Prop } from "./types";
 
 /** Every module specifier a source file imports or re-exports from. */
 function specifiersOf(source: string): string[] {
@@ -147,5 +153,25 @@ describe("propFootprint", () => {
     expect(() => propFootprint(misplaced)).toThrow(
       /propFootprint: duct has no variant 0/,
     );
+  });
+});
+
+describe("pipeRunBox", () => {
+  it("boxes a pipe run along its axis, PIPE_HALF across, and nothing else", () => {
+    const hall = { x0: 0, y0: 0, x1: 13, y1: 12 };
+    const d: Decor = { kind: "pipe-run", x: 6.5, y: 3.75, turn: 0, seed: 1 };
+    expect(pipeRunBox(d, hall)).toEqual({
+      x0: 13 - 3,
+      x1: 13 + 3,
+      z0: 7.5 - PIPE_HALF,
+      z1: 7.5 + PIPE_HALF,
+    });
+    expect(pipeRunBox({ ...d, turn: 1 }, hall)).toEqual({
+      x0: 13 - PIPE_HALF,
+      x1: 13 + PIPE_HALF,
+      z0: 7.5 - 3,
+      z1: 7.5 + 3,
+    });
+    expect(pipeRunBox({ ...d, kind: "generator" }, hall)).toBeNull();
   });
 });

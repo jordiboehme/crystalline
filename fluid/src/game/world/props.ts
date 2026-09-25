@@ -101,11 +101,13 @@ export interface Palette {
   /** The ceiling run kind, or null. */
   ceilingRun: "duct" | "ceiling-tray" | null;
   /**
-   * The ceiling span kind hung across a large hall (D9), or null for none:
-   * engineering's decor already runs pipes along its ceiling, and the
-   * council's ceiling stays bare. An archetype whose decor can include a
-   * `pipe-run` must have none, since the pipe runs already cross its hall
-   * overhead (`props.test.ts` holds the two together).
+   * The ceiling span kind hung across a large hall (D9), or null for none.
+   * A span follows the archetype's ceiling run family: `span-duct` under a
+   * duct, `span-tray` under a ceiling tray. Engineering hangs a span where
+   * its pipe runs leave a line clear (E3): a pipe run hangs in the span
+   * band, so `sites.ts` keeps every span line off its box (`pipeRunBox`),
+   * and a hall whose pipe runs block every line draws none. The council's
+   * ceiling stays bare.
    */
   ceilingSpan: "span-duct" | "span-tray" | null;
   /** Corner-zone props: 1 always (bridge) or 1 to 2. */
@@ -735,7 +737,7 @@ export const PALETTES = {
       ["drum-rack", 2],
     ],
     ceilingRun: "duct",
-    ceilingSpan: null,
+    ceilingSpan: "span-duct",
     cornerMax: 2,
     wallSide: 1 / 2,
     cluster: [
@@ -938,7 +940,7 @@ export const CLUSTER_CLEAR = 1.0;
 export const SPAN_CELLS = 2;
 /**
  * Half a span's width across its line, in metres: the plan box `sites.ts`
- * keeps clear of lamps and decor (D9).
+ * keeps clear of lamps, decor and pipe runs (D9, E3).
  */
 export const SPAN_HALF = 0.35;
 /**

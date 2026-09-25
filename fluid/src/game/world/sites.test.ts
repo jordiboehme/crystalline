@@ -6,7 +6,12 @@ import {
   CANNED_WORKSHOP,
   galleryRoom,
 } from "./canned";
-import { decorFootprint, footprint, footprintOf } from "./footprints";
+import {
+  decorFootprint,
+  footprint,
+  footprintOf,
+  pipeRunBox,
+} from "./footprints";
 import { generateRoom } from "./generate";
 import { ARRIVAL_DISTANCE, wallPoint } from "./interact";
 import { lampBoxes } from "./lamps";
@@ -629,15 +634,23 @@ describe("cluster blocks", () => {
 });
 
 describe("span lines", () => {
-  it("lists only lines that stay a cell off every hall wall and clear of decor, scaffolding and lamps", () => {
+  it("lists only lines that stay a cell off every hall wall and clear of decor, pipe runs, scaffolding and lamps", () => {
+    // The workshop and the hub come out engineering as runbooks, with pipe
+    // runs overhead (E3).
     for (const room of [
       generateRoom(CANNED_WORKSHOP),
       generateRoom(CANNED_HUB),
+      generateRoom({ ...CANNED_WORKSHOP, type: "runbook" }),
+      generateRoom({ ...CANNED_HUB, type: "runbook" }),
     ]) {
       const sites = dressingSites(room);
       const h = room.hall;
       const solid = [
         ...room.decor.map(decorFootprint).filter((b) => b !== null),
+        ...room.decor.flatMap((d) => {
+          const b = pipeRunBox(d, room.hall);
+          return b === null ? [] : [b];
+        }),
         ...room.scaffold,
         ...lampBoxes(room),
       ];

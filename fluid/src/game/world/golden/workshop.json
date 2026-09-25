@@ -979,6 +979,51 @@
       "seed": 6818970778898598
     },
     {
+      "kind": "span-duct",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 3.5,
+      "y": 2,
+      "turn": 1,
+      "seed": 7105585485263335
+    },
+    {
+      "kind": "span-duct",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 3.5,
+      "y": 4,
+      "turn": 1,
+      "seed": 1664678581587625
+    },
+    {
+      "kind": "span-duct",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 3.5,
+      "y": 6,
+      "turn": 1,
+      "seed": 6453403949624661
+    },
+    {
+      "kind": "span-duct",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 3.5,
+      "y": 8,
+      "turn": 1,
+      "seed": 8791752769579637
+    },
+    {
+      "kind": "span-duct",
+      "variant": 0,
+      "anchor": "ceiling",
+      "x": 3.5,
+      "y": 10,
+      "turn": 1,
+      "seed": 5816163790119162
+    },
+    {
       "kind": "beacon",
       "variant": 1,
       "anchor": "ceiling",
