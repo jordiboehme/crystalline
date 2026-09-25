@@ -22,7 +22,12 @@
  */
 
 import { TERMINAL_OCCLUDERS } from "../render/models/terminal";
-import { curioBox, curioSize, hostSurfaces } from "../world/curios";
+import {
+  curioBox,
+  curioSize,
+  hostSurfaces,
+  type HostSurface,
+} from "../world/curios";
 import {
   HERO_FRONT,
   decorFootprint,
@@ -213,51 +218,38 @@ interface Volume extends Box {
 }
 
 /**
- * How thick a host's own top surface is treated as, in metres, for the
- * sight-line check (`occludersFor`): thin enough that it never reaches into
- * the space a curio standing on it occupies, thick enough to be a real 3D
- * box a line can be tested against rather than a degenerate plane.
+ * The volume of `c`'s own host that occludes it (fix round 4, the
+ * controller's host rule): the host's footprint `fp` from `c`'s own
+ * surface's ceiling (`s.h + s.clear`, the free height the surface promises
+ * a curio standing on it) up to `EYE_HEIGHT`, or null when that ceiling is
+ * already at or over the eye. The same rule for every host, fixture, decor,
+ * prop or hero: under a hero's or a workbench's top it is the slab above
+ * the curio, over a shelf's lower level it is the level above it, and over
+ * an open top (`OPEN_CLEAR`, 1.3 m past a top well under a metre) it is
+ * nothing, since no sight line from the eye reaches that high. The null
+ * case matters: `segmentHitsBox` sorts each axis's two plane hits, so an
+ * inverted volume would count as a real box over the eye rather than as
+ * none.
  */
-const SLAB_THICKNESS = 0.05;
+function ceilingVolume(fp: Box, s: HostSurface): Volume | null {
+  const y0 = s.h + s.clear;
+  return y0 < EYE_HEIGHT ? { ...fp, y0, y1: EYE_HEIGHT } : null;
+}
 
 /**
- * Every solid volume in `room` a curio-framing sight line must not cross,
- * other than `c`'s own box (2.6b's browser-shots review, item 4): every
- * fixture's, decor piece's and floor prop's footprint (`footprintOf`,
- * `decorFootprint`, `propFootprint`) stood up from the floor to
- * `EYE_HEIGHT` (the room model carries no taller per-kind height for these,
- * and nothing here needs to see over furniture taller than a standing
- * eye), every hero's footprint stood up to its own `HERO_CATALOGUE[kind]
- * .top`, and every host surface's own box as a thin slab at its own `h`
- * (`hostSurfaces`, `SLAB_THICKNESS`) - the desktop a curio sits under
- * counts as an occluder this way, without a new geometry table, since it
- * is already in the room model curios are placed from.
- *
- * The one host `c` itself stands on or under (found the way
- * `canned.test.ts`'s own `hostOf` does, by its box and height) is not
- * skipped wholesale any more (review round 1's bug): the chair, monitor
- * and keyboard the review's browser pass found hiding a curio are part of
- * that very fixture's own model, so excluding its whole footprint dropped
- * them too, leaving only the thin top slab behind. Instead, for a
- * `"terminal"` fixture (the only host the review's five URLs implicate),
- * every part `TERMINAL_OCCLUDERS` names (`render/models/terminal.ts`'s own
- * box and cylinder calls, read from the model rather than guessed) is
- * turned into a world volume (`turnedBox`, the fixture's own `wallAnchor`)
- * and added instead of the fixture's plain footprint: the pedestals, the
- * keyboard deck, the CRT and the chair all still occlude, while the desk
- * top, which `TERMINAL_OCCLUDERS` never covers, stays clear for a curio
- * standing on it. (The knee space the chair fills carries no curio host
- * any more, fix round 3, `world/curios.ts`'s `FIXTURE_SURFACES.terminal`;
- * this check would still find it occluded by the chair if it did.) A
- * fixture kind with no parts table (every other kind, for now) keeps the
- * old whole-footprint skip. `c`'s own surface is still skipped from the
- * slab pass on top of this, so `c` never occludes the line drawn to its
- * own centre.
+ * The host surface curio `c` stands on, found from its box and height: the
+ * `hostSurfaces` entry at `c.h` whose box holds `c`'s box (`Curio` records
+ * no surface of its own; `canned.test.ts`'s `hostOf` finds it the same
+ * way, and `spots.test.ts` pins that exactly one surface matches every
+ * curio of the gallery and the hero hall). Undefined for a curio that
+ * stands on no surface at all, which `placeCurios` never gives.
  */
-function occludersFor(room: RoomSpec, c: Curio): Volume[] {
-  const surfaces = hostSurfaces(room);
+function surfaceOf(
+  surfaces: readonly HostSurface[],
+  c: Curio,
+): HostSurface | undefined {
   const box = curioBox(c);
-  const ownSurface = surfaces.find(
+  return surfaces.find(
     (s) =>
       Math.abs(s.h - c.h) < 1e-6 &&
       box.x0 >= s.box.x0 - 1e-6 &&
@@ -265,47 +257,62 @@ function occludersFor(room: RoomSpec, c: Curio): Volume[] {
       box.z0 >= s.box.z0 - 1e-6 &&
       box.z1 <= s.box.z1 + 1e-6,
   );
-  const ownAnchor: object | undefined = ownSurface?.anchorOf;
+}
+
+/**
+ * Every solid volume in `room` a curio-framing sight line must not cross
+ * (2.6b's browser-shots review, item 4, and its fix rounds): every
+ * fixture's, decor piece's and floor prop's footprint (`footprintOf`,
+ * `decorFootprint`, `propFootprint`) stood up from the floor to
+ * `EYE_HEIGHT` (the room model carries no taller per-kind height for these,
+ * and the sight line never rises over the eye), and every hero's footprint
+ * stood up to its own `HERO_CATALOGUE[kind].top`. A host's surfaces lie
+ * inside its footprint, below that top, so they occlude as part of it and
+ * need no volume of their own.
+ *
+ * The one host `c` stands on or under (`surfaceOf`) is neither solid nor
+ * skipped: it gives only `ceilingVolume`, its footprint from `c`'s own
+ * surface's ceiling up to the eye (fix round 4, one rule for fixture and
+ * hero hosts alike). Round 1 skipped that host wholesale, so the top of a
+ * bench counted as glass over the case below it and the search passed a
+ * spot that saw only the bench. A `"terminal"` host adds, on top of the
+ * rule, every part `TERMINAL_OCCLUDERS` names (`render/models/terminal.ts`'s
+ * own box and cylinder calls, fix round 2), turned into a world volume
+ * (`turnedBox`, the fixture's own `wallAnchor`): its desk ends are open
+ * tops, so the rule alone leaves the terminal empty, while the pedestals,
+ * the keyboard deck, the CRT and the chair are drawn there and hide a
+ * curio on a desk end from the far side.
+ */
+function occludersFor(room: RoomSpec, c: Curio): Volume[] {
+  const own = surfaceOf(hostSurfaces(room), c);
+  const ownAnchor: object | undefined = own?.anchorOf;
   const out: Volume[] = [];
-  for (const f of room.fixtures) {
-    if ((f as object) === ownAnchor) {
-      if (f.kind === "terminal") {
-        const at = wallAnchor(f.slot);
-        for (const part of TERMINAL_OCCLUDERS) {
-          out.push({
-            ...turnedBox(at.x, at.y, at.turn, part),
-            y0: part.h0,
-            y1: part.h1,
-          });
-        }
-      }
-      continue;
+  const add = (anchor: object, fp: Box | null, top: number) => {
+    if (fp === null) return;
+    if (own === undefined || anchor !== ownAnchor) {
+      out.push({ ...fp, y0: 0, y1: top });
+      return;
     }
-    const fp = footprintOf(f);
-    if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
+    const v = ceilingVolume(fp, own);
+    if (v !== null) out.push(v);
+  };
+  for (const f of room.fixtures) {
+    add(f, footprintOf(f), EYE_HEIGHT);
+    if ((f as object) === ownAnchor && f.kind === "terminal") {
+      const at = wallAnchor(f.slot);
+      for (const part of TERMINAL_OCCLUDERS) {
+        out.push({
+          ...turnedBox(at.x, at.y, at.turn, part),
+          y0: part.h0,
+          y1: part.h1,
+        });
+      }
+    }
   }
-  for (const d of room.decor) {
-    if ((d as object) === ownAnchor) continue;
-    const fp = decorFootprint(d);
-    if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
-  }
-  for (const p of room.props) {
-    if ((p as object) === ownAnchor) continue;
-    const fp = propFootprint(p);
-    if (fp !== null) out.push({ ...fp, y0: 0, y1: EYE_HEIGHT });
-  }
-  for (const h of room.heroes) {
-    if ((h as object) === ownAnchor) continue;
-    out.push({
-      ...heroFootprint(h),
-      y0: 0,
-      y1: HERO_CATALOGUE[h.kind].top,
-    });
-  }
-  for (const s of surfaces) {
-    if (s === ownSurface) continue;
-    out.push({ ...s.box, y0: s.h, y1: s.h + SLAB_THICKNESS });
-  }
+  for (const d of room.decor) add(d, decorFootprint(d), EYE_HEIGHT);
+  for (const p of room.props) add(p, propFootprint(p), EYE_HEIGHT);
+  for (const h of room.heroes)
+    add(h, heroFootprint(h), HERO_CATALOGUE[h.kind].top);
   return out;
 }
 

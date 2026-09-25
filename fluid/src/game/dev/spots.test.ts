@@ -17,13 +17,20 @@ import {
   galleryRoom,
   heroHallRoom,
 } from "../world/canned";
-import { curioBox, curioSize, CURIO_KINDS } from "../world/curios";
+import {
+  curioBox,
+  curioOn,
+  curioSize,
+  CURIO_KINDS,
+  hostSurfaces,
+} from "../world/curios";
 import { HERO_FRONT, heroFootprint, propFootprint } from "../world/footprints";
 import { HERO_KINDS } from "../world/heroes";
 import { wallFacingSpawn } from "../world/interact";
 import { isFloor } from "../world/layout";
 import { blockersFor, EYE_HEIGHT, MAX_PITCH, spawnPlayer } from "../world/move";
 import { PROP_KINDS } from "../world/props";
+import { wallAnchor } from "../world/sites";
 import type { Box, Curio, Fixture, Hero, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
 import { GAME_VERSION } from "../version";
@@ -335,6 +342,125 @@ describe("frameCurio's sight line (browser-shots review item 4)", () => {
     // The front side's own first candidate (the pre-fix answer) is not
     // where the player ends up, and is indeed blocked by the panel.
     expect(curioSightClear(room, { x: 10, z: 9.2 }, curio)).toBe(false);
+  });
+
+  it("hides a curio under its host's top from a line through the top, and frames it from the first spot that sees under the edge (fix round 4)", () => {
+    // A gun bench backed against a north wall edge (its front is +z), with
+    // the fuel case on its under spot: a shelf at h 0.31 with 0.52 of free
+    // height, so the host rule (`occludersFor`) stands the bench's whole
+    // 1.9 by 0.9 m footprint up from 0.83 to the eye. The bench's own top
+    // is no longer glass, as it was while the host was skipped wholesale.
+    const a = wallAnchor({ x: 5, y: 2, side: "n" });
+    const bench: Hero = {
+      kind: "gun-bench",
+      variant: 0,
+      x: a.x,
+      y: a.y,
+      turn: a.turn,
+      seed: 3,
+    };
+    const under = hostSurfaces(bareRoom([], [bench])).find(
+      (s) => s.key[2] === "hero-gun-bench-under-0",
+    );
+    if (under === undefined) throw new Error("no gun-bench under spot");
+    const c = curioOn(under, "fuel-case", 0, 0.5, 0.5, 4);
+    const room = bareRoom([c], [bench]);
+    const box = curioBox(c);
+    const cx = (box.x0 + box.x1) / 2;
+    const cz = (box.z0 + box.z1) / 2;
+    const [fx, fz] = HERO_FRONT[a.turn] ?? [0, -1];
+    const out = (d: number) => ({ x: cx + fx * d, z: cz + fz * d });
+
+    // The case's middle is 0.31 + 0.24 / 2 = 0.43 m up, 0.45 m in from the
+    // bench's front edge (d 0.45 of 0.9). A line from the eye (1.6) passes
+    // under the edge at 0.83 only when 0.43 + 1.17 * 0.45 / dist < 0.83,
+    // that is dist > 1.316 m. Every front candidate from `CURIO_NEAR` (0.8,
+    // the first one clear of the bench's blocker) to 1.3 looks through
+    // the top; 1.4 is the first that sees under it.
+    expect(curioSightClear(room, out(0.8), c)).toBe(false);
+    expect(curioSightClear(room, out(1.3), c)).toBe(false);
+    expect(curioSightClear(room, out(1.4), c)).toBe(true);
+
+    const view = spotView(room, "prop:fuel-case:0");
+    expect(view).not.toBeNull();
+    if (view === null) return;
+    const player = spawnPlayer({ ...room, spawn: view.spawn });
+    expect(player.x).toBeCloseTo(out(1.4).x, 6);
+    expect(player.z).toBeCloseTo(out(1.4).z, 6);
+  });
+});
+
+describe("frameCurio's sight line in the hero hall and the gallery (fix round 4)", () => {
+  /**
+   * Every curio of `room` with its within-kind ordinal, the `n` of
+   * `?at=prop:<kind>:<n>`: the gallery holds two lit swords.
+   */
+  function withOrdinals(room: RoomSpec) {
+    const counts = new Map<string, number>();
+    return room.curios.map((c) => {
+      const n = counts.get(c.kind) ?? 0;
+      counts.set(c.kind, n + 1);
+      return { c, spot: `prop:${c.kind}:${String(n)}` };
+    });
+  }
+
+  it("finds exactly one host surface under every curio, the one the host rule reads", () => {
+    for (const room of [heroHallRoom(), galleryRoom()]) {
+      const surfaces = hostSurfaces(room);
+      for (const { c, spot } of withOrdinals(room)) {
+        const box = curioBox(c);
+        const matches = surfaces.filter(
+          (s) =>
+            Math.abs(s.h - c.h) < 1e-6 &&
+            box.x0 >= s.box.x0 - 1e-6 &&
+            box.x1 <= s.box.x1 + 1e-6 &&
+            box.z0 >= s.box.z0 - 1e-6 &&
+            box.z1 <= s.box.z1 + 1e-6,
+        );
+        expect(matches.length, `${room.permalink} ${spot}`).toBe(1);
+      }
+    }
+  });
+
+  it("frames every curio of both rooms from a spot with a clear sight line under the host rule", () => {
+    for (const room of [heroHallRoom(), galleryRoom()]) {
+      for (const { c, spot } of withOrdinals(room)) {
+        const view = spotView(room, spot);
+        expect(view, `${room.permalink} ${spot}`).not.toBeNull();
+        if (view === null) continue;
+        const player = spawnPlayer({ ...room, spawn: view.spawn });
+        expect(
+          curioSightClear(room, { x: player.x, z: player.z }, c),
+          `${room.permalink} ${spot}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("frames the hero hall's fuel case and trap from past the edge of their hosts' tops", () => {
+    // Pinned apart from the sweep above, since these two are the ones the
+    // host rule moves: both stand under a hero's top, which the old
+    // wholesale skip treated as glass. The distances are the first
+    // `CURIO_STEP` past each top's edge line (the fuel case's is derived
+    // in the gun-bench case above).
+    const hall = heroHallRoom();
+    for (const [kind, dist] of [
+      ["fuel-case", 1.4],
+      ["trap-box", 1.4],
+    ] as const) {
+      const c = hall.curios.find((x) => x.kind === kind);
+      if (c === undefined) throw new Error(`no ${kind} in the hero hall`);
+      const view = spotView(hall, `prop:${kind}:0`);
+      if (view === null) throw new Error(`no spot for ${kind}`);
+      const player = spawnPlayer({ ...hall, spawn: view.spawn });
+      const box = curioBox(c);
+      const got = Math.hypot(
+        player.x - (box.x0 + box.x1) / 2,
+        player.z - (box.z0 + box.z1) / 2,
+      );
+      expect(got, kind).toBeCloseTo(dist, 6);
+      expect(curioSightClear(hall, player, c), kind).toBe(true);
+    }
   });
 });
 
