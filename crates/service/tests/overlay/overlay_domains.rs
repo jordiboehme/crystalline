@@ -6493,6 +6493,7 @@ fn call_sites(needle: &str) -> Vec<(String, String)> {
         let rest = line.trim_start();
         let rest = rest
             .strip_prefix("pub(crate) ")
+            .or_else(|| rest.strip_prefix("pub(super) "))
             .or_else(|| rest.strip_prefix("pub "))
             .unwrap_or(rest);
         let rest = rest.strip_prefix("async ").unwrap_or(rest);
@@ -6505,12 +6506,24 @@ fn call_sites(needle: &str) -> Vec<(String, String)> {
         if entry.path().extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let file = entry
+        // A section file of the engine directory answers as the one file
+        // it was cut from, so the allow-lists below keep naming `engine.rs`
+        // and stay exactly as strict as they were.
+        let in_engine_dir = entry
             .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .is_some_and(|name| name == "engine");
+        let file = if in_engine_dir {
+            "engine.rs".to_string()
+        } else {
+            entry
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        };
         let text = std::fs::read_to_string(entry.path()).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {

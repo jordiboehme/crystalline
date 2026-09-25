@@ -1787,6 +1787,7 @@ fn declared_fn(line: &str) -> Option<&str> {
     let rest = line.trim_start();
     let rest = rest
         .strip_prefix("pub(crate) ")
+        .or_else(|| rest.strip_prefix("pub(super) "))
         .or_else(|| rest.strip_prefix("pub "))
         .unwrap_or(rest);
     let rest = rest.strip_prefix("async ").unwrap_or(rest);
@@ -1835,8 +1836,29 @@ fn declared_fn(line: &str) -> Option<&str> {
 /// stands the same way.
 #[test]
 fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine.rs");
-    let text = std::fs::read_to_string(&src).unwrap();
+    // The engine is a directory of section files: every one of them is
+    // scanned, each on its own, so a function never inherits the last name
+    // of the file before it.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() > 10,
+        "the scan found only {} files under {}, so it is not looking where it thinks it is",
+        files.len(),
+        dir.display()
+    );
+    let mut text = String::new();
+    let mut file_starts = std::collections::HashSet::new();
+    for file in &files {
+        file_starts.insert(text.lines().count());
+        text.push_str(&std::fs::read_to_string(file).unwrap());
+        text.push('\n');
+    }
 
     /// Every way an engine function reaches into a room, all of which take
     /// the same session state lock the room's saver holds across the file
@@ -1866,6 +1888,9 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
     let mut locked: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut composed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, line) in text.lines().enumerate() {
+        if file_starts.contains(&i) {
+            current = "<file scope>".to_string();
+        }
         if let Some(name) = declared_fn(line) {
             current = name.to_string();
         }

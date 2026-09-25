@@ -449,7 +449,8 @@ mod tests {
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src")
-                .join("engine.rs"),
+                .join("engine")
+                .join("evolve.rs"),
         )
         .expect("the engine's own source");
         let body = source
