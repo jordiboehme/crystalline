@@ -340,18 +340,14 @@ const SIGN = { half: 0.15, depth: 0.025, h0: 1.5, h1: 1.8 };
  * (ruling 21). Variant `v` shows `PICTOGRAM[SIGN_PICTOGRAMS[v]]`, one sign
  * per variant.
  */
-function signPlate({ k, variant }: Parameters<PropRecipe>[0]): void {
+function signPlate({ k, s, variant }: Parameters<PropRecipe>[0]): void {
   const P = SIGN;
   const key = SIGN_PICTOGRAMS[variant];
   if (key === undefined) {
     throw new Error(`sign-plate: no pictogram for variant ${String(variant)}`);
   }
   const rect = PICTOGRAM[key];
-  k.bevelBox(-P.half, P.half, 0, P.depth, P.h0, P.h1, 0.01, {
-    layer: LAYER.metal,
-    tint: [0.2, 0.2, 0.22],
-    flag: FLAG.lit,
-  });
+  k.bevelBox(-P.half, P.half, 0, P.depth, P.h0, P.h1, 0.01, s.dark);
   k.panel(
     -P.half + 0.02,
     P.half - 0.02,
